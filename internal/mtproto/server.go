@@ -162,12 +162,16 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 			continue
 		}
 
-		s.touch(ctx, authKeyID, &lastTouch)
-
 		conn.setKey(key)
 		if err := s.rpcHandle(ctx, conn, b, userID); err != nil {
 			return err
 		}
+
+		// Advance last-seen only after rpcHandle has decrypted and dispatched the
+		// frame, so activity reflects MAC-authenticated traffic. A garbage frame
+		// bearing a valid (cleartext) key id fails decryption in rpcHandle and
+		// never reaches here, so it cannot spoof DateActive.
+		s.touch(ctx, authKeyID, &lastTouch)
 	}
 }
 
