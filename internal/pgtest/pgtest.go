@@ -10,8 +10,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -20,9 +22,15 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// Schema is the DDL applied to the template database. Task 2 sets this to
-// store.Schema via internal/pgtest/schema.go. Empty means an empty template.
-var Schema string
+// migration is one Atlas migration file: its name and SQL body.
+type migration struct {
+	name string
+	sql  string
+}
+
+// migrations holds the ordered Atlas migrations applied to the template DB.
+// Loaded once in setup from the repo's migrations/ directory.
+var migrations []migration
 
 const (
 	containerName   = "tg-test-pg"
@@ -37,17 +45,26 @@ var (
 	errSetup     error
 )
 
-// schemaHash returns a short hex digest of the current Schema so the template
-// is content-addressed: an empty Schema and store.Schema map to different
-// template names, so changing Schema builds a new template instead of reusing
-// a stale one from the reusable container.
-func schemaHash() string {
-	sum := sha256.Sum256([]byte(Schema))
+// schemaHash returns a short hex digest of all migration bytes so the template
+// is content-addressed: adding or changing a migration yields a new template
+// name, so the reusable container rebuilds instead of serving a stale template.
+func schemaHash(migs []migration) string {
+	var buf []byte
+	for _, m := range migs {
+		buf = append(buf, m.sql...)
+	}
+	sum := sha256.Sum256(buf)
 	return hex.EncodeToString(sum[:])[:12]
 }
 
 func setup() {
 	ctx := context.Background()
+	migs, err := loadMigrations()
+	if err != nil {
+		errSetup = err
+		return
+	}
+	migrations = migs
 	container, err := postgres.Run(ctx, "postgres:16-alpine",
 		testcontainers.WithReuseByName(containerName),
 		postgres.WithDatabase("postgres"),
@@ -64,7 +81,7 @@ func setup() {
 	if errSetup != nil {
 		return
 	}
-	templateName = templatePrefix + schemaHash()
+	templateName = templatePrefix + schemaHash(migrations)
 	errSetup = ensureTemplate(ctx)
 }
 
@@ -74,7 +91,7 @@ func setup() {
 // means "complete", closing the partial-init-on-crash window. The whole
 // check-build-rename is serialized by a pg advisory lock across parallel test
 // binaries sharing the reusable container.
-// ponytail: old-hash templates from earlier Schema versions are left behind;
+// ponytail: old-hash templates from earlier migration sets are left behind;
 // harmless in an ephemeral test container, GC them if they ever pile up.
 func ensureTemplate(ctx context.Context) error {
 	conn, err := pgx.Connect(ctx, adminDSN)
@@ -107,10 +124,8 @@ func ensureTemplate(ctx context.Context) error {
 	if _, err := conn.Exec(ctx, `CREATE DATABASE `+building); err != nil {
 		return fmt.Errorf("create building: %w", err)
 	}
-	if Schema != "" {
-		if err := applySchema(ctx, building); err != nil {
-			return err
-		}
+	if err := applyMigrations(ctx, building); err != nil {
+		return err
 	}
 	if _, err := conn.Exec(ctx, `ALTER DATABASE `+building+` RENAME TO `+templateName); err != nil {
 		return fmt.Errorf("promote template: %w", err)
@@ -118,16 +133,55 @@ func ensureTemplate(ctx context.Context) error {
 	return nil
 }
 
-func applySchema(ctx context.Context, db string) error {
+// applyMigrations execs each Atlas migration, in filename order, into db. The
+// migrations are plain CREATE/ALTER statements, so no migration engine is
+// needed — a sequential exec reproduces the full schema.
+func applyMigrations(ctx context.Context, db string) error {
 	tconn, err := pgx.Connect(ctx, replaceDBName(adminDSN, db))
 	if err != nil {
 		return fmt.Errorf("template connect: %w", err)
 	}
 	defer func() { _ = tconn.Close(ctx) }() //nolint:errcheck // best-effort close of template conn
-	if _, err := tconn.Exec(ctx, Schema); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
+	for _, m := range migrations {
+		if _, err := tconn.Exec(ctx, m.sql); err != nil {
+			return fmt.Errorf("apply migration %s: %w", m.name, err)
+		}
 	}
 	return nil
+}
+
+// migrationsDir resolves the Atlas migrations directory relative to THIS source
+// file (repo-root/migrations), not the caller's cwd — DSN runs from multiple
+// test packages, each with a different working directory. pgtest lives at
+// <repoRoot>/internal/pgtest, so migrations is two levels up.
+func migrationsDir() string {
+	_, thisFile, _, _ := runtime.Caller(0) //nolint:dogsled // only need the file path
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "migrations")
+}
+
+// loadMigrations reads the *.sql migration files in filename order. os.ReadDir
+// returns entries sorted by name, matching Atlas's lexical ordering; the
+// atlas.sum checksum file is skipped — only SQL is applied.
+func loadMigrations() ([]migration, error) {
+	dir := migrationsDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read migrations dir: %w", err)
+	}
+	var migs []migration
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		// Path is repo-local: dir comes from runtime.Caller, name from a trusted
+		// migrations/ listing — never user input (no G304 risk).
+		b, err := os.ReadFile(filepath.Join(dir, e.Name())) //nolint:gosec // trusted repo-local path
+		if err != nil {
+			return nil, fmt.Errorf("read migration %s: %w", e.Name(), err)
+		}
+		migs = append(migs, migration{name: e.Name(), sql: string(b)})
+	}
+	return migs, nil
 }
 
 // DSN clones a fresh database from the template and returns its connection
