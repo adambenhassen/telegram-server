@@ -25,12 +25,12 @@ const bumpState = `-- name: BumpState :one
 UPDATE update_state
 SET pts = pts + 1, next_local_id = next_local_id + 1, date = now()
 WHERE user_id = $1
-RETURNING pts, next_local_id - 1 AS local_id
+RETURNING pts, (next_local_id - 1)::bigint AS local_id
 `
 
 type BumpStateRow struct {
 	Pts     int64
-	LocalID int32
+	LocalID int64
 }
 
 // BumpState allocates the next local_id and advances pts in one step. It returns

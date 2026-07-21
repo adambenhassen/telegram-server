@@ -10,7 +10,7 @@ SELECT * FROM update_state WHERE user_id = $1;
 UPDATE update_state
 SET pts = pts + 1, next_local_id = next_local_id + 1, date = now()
 WHERE user_id = $1
-RETURNING pts, next_local_id - 1 AS local_id;
+RETURNING pts, (next_local_id - 1)::bigint AS local_id;
 
 -- BumpPtsOnly advances pts without consuming a local_id (edit/delete/read).
 -- name: BumpPtsOnly :one
