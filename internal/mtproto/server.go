@@ -76,6 +76,9 @@ func (s *Server) Key() exchange.PublicKey {
 func (s *Server) Serve(ctx context.Context, l transport.Listener) error {
 	grp := tdsync.NewCancellableGroup(ctx)
 	grp.Go(func(ctx context.Context) error {
+		// Unblock the sibling shutdown goroutine when the accept loop exits
+		// (e.g. listener closed while ctx is still live).
+		defer grp.Cancel()
 		for {
 			conn, err := l.Accept()
 			if err != nil {
@@ -94,7 +97,10 @@ func (s *Server) Serve(ctx context.Context, l transport.Listener) error {
 	})
 	grp.Go(func(ctx context.Context) error {
 		<-ctx.Done()
-		return l.Close()
+		if err := l.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			return err
+		}
+		return nil
 	})
 	return grp.Wait()
 }
@@ -170,10 +176,12 @@ func (s *Server) runExchange(ctx context.Context, tconn transport.Conn, first *b
 	if err != nil {
 		var exErr *exchange.ServerExchangeError
 		if errors.As(err, &exErr) {
+			// Report the failure to the client and close quietly, matching
+			// gotd tgtest: a bad handshake is not a server-side error.
 			if sendErr := s.sendProtoError(ctx, bc, exErr.Code); sendErr != nil {
 				return sendErr
 			}
-			return err
+			return nil
 		}
 		return errors.Join(errors.New("key exchange"), err)
 	}
