@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -12,10 +13,13 @@ import (
 
 // AuthKey is a persisted MTProto auth key. UserID is 0 while the key is
 // unbound; once login binds it to an account UserID holds that user's id.
+// CreatedAt/LastSeenAt back the session dates reported by account.getAuthorizations.
 type AuthKey struct {
-	ID     int64
-	Value  []byte
-	UserID int64
+	ID         int64
+	Value      []byte
+	UserID     int64
+	CreatedAt  time.Time
+	LastSeenAt time.Time
 }
 
 // SaveAuthKey stores value under id, idempotently. Re-saving an existing id
@@ -81,5 +85,11 @@ func authKeyFromDB(k db.AuthKey) AuthKey {
 	if k.UserID != nil {
 		userID = *k.UserID
 	}
-	return AuthKey{ID: k.ID, Value: k.KeyValue, UserID: userID}
+	return AuthKey{
+		ID:         k.ID,
+		Value:      k.KeyValue,
+		UserID:     userID,
+		CreatedAt:  k.CreatedAt.Time,
+		LastSeenAt: k.LastSeenAt.Time,
+	}
 }

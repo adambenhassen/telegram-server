@@ -31,6 +31,8 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger) mtproto.Han
 	register(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
 	register(d, tg.AuthLogOutRequestTypeID, h.handleLogOut)
 	register(d, tg.UsersGetUsersRequestTypeID, h.handleGetUsers)
+	register(d, tg.AccountGetAuthorizationsRequestTypeID, h.handleGetAuthorizations)
+	register(d, tg.AccountResetAuthorizationRequestTypeID, h.handleResetAuthorization)
 	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		id, err := req.Buf.PeekID()
 		if err != nil {
