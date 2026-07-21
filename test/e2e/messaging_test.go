@@ -1,0 +1,502 @@
+package e2e_test
+
+import (
+	"context"
+	"crypto/rsa"
+	"errors"
+	"log/slog"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gotd/td/exchange"
+	"github.com/gotd/td/session"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/telegram/dcs"
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/transport"
+
+	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/adambenhassen/telegram-server/internal/rsakey"
+	"github.com/adambenhassen/telegram-server/internal/store"
+)
+
+// --- per-phone code sink (two clients log in at once) ---
+
+type multiCodeSink struct {
+	mu    sync.Mutex
+	chans map[string]chan string
+}
+
+func newMultiCodeSink() *multiCodeSink { return &multiCodeSink{chans: map[string]chan string{}} }
+
+func (m *multiCodeSink) chFor(phone string) chan string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ch, ok := m.chans[phone]
+	if !ok {
+		ch = make(chan string, 1)
+		m.chans[phone] = ch
+	}
+	return ch
+}
+
+func (m *multiCodeSink) wait(ctx context.Context, phone string) (string, error) {
+	select {
+	case code := <-m.chFor(phone):
+		return code, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (m *multiCodeSink) Logger() *slog.Logger                     { return slog.New(m) }
+func (m *multiCodeSink) Enabled(context.Context, slog.Level) bool { return true }
+func (m *multiCodeSink) WithAttrs([]slog.Attr) slog.Handler       { return m }
+func (m *multiCodeSink) WithGroup(string) slog.Handler            { return m }
+
+func (m *multiCodeSink) Handle(_ context.Context, r slog.Record) error {
+	var phone, code string
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "phone":
+			phone = a.Value.String()
+		case "code":
+			code = a.Value.String()
+		}
+		return true
+	})
+	if phone != "" && code != "" {
+		select {
+		case m.chFor(phone) <- code:
+		default:
+		}
+	}
+	return nil
+}
+
+// --- client-side update collector ---
+
+type updateCollector struct {
+	newMsg     chan *tg.Message
+	editMsg    chan *tg.Message
+	delMsg     chan []int
+	readOutbox chan int
+	typing     chan int64
+}
+
+func newUpdateCollector() *updateCollector {
+	return &updateCollector{
+		newMsg:     make(chan *tg.Message, 4),
+		editMsg:    make(chan *tg.Message, 4),
+		delMsg:     make(chan []int, 4),
+		readOutbox: make(chan int, 4),
+		typing:     make(chan int64, 4),
+	}
+}
+
+func (u *updateCollector) Handle(_ context.Context, upd tg.UpdatesClass) error {
+	switch t := upd.(type) {
+	case *tg.Updates:
+		for _, x := range t.Updates {
+			u.dispatch(x)
+		}
+	case *tg.UpdateShort:
+		u.dispatch(t.Update)
+	}
+	return nil
+}
+
+func (u *updateCollector) dispatch(x tg.UpdateClass) {
+	switch up := x.(type) {
+	case *tg.UpdateNewMessage:
+		if m, ok := up.Message.(*tg.Message); ok {
+			send(u.newMsg, m)
+		}
+	case *tg.UpdateEditMessage:
+		if m, ok := up.Message.(*tg.Message); ok {
+			send(u.editMsg, m)
+		}
+	case *tg.UpdateDeleteMessages:
+		send(u.delMsg, up.Messages)
+	case *tg.UpdateReadHistoryOutbox:
+		send(u.readOutbox, up.MaxID)
+	case *tg.UpdateUserTyping:
+		send(u.typing, up.UserID)
+	}
+}
+
+func send[T any](ch chan T, v T) {
+	select {
+	case ch <- v:
+	default:
+	}
+}
+
+func recvOr[T any](t *testing.T, ch chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		var zero T
+		return zero
+	}
+}
+
+// bootServerWithDelivery boots a server plus its LISTEN/NOTIFY delivery listener,
+// wired to the server's session registry, and returns a stop function.
+func bootServerWithDelivery(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, dsn string, log *slog.Logger, ln net.Listener) func() {
+	t.Helper()
+	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	handler := api.New(st, dcID, tgcfg, log)
+	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
+
+	updater := api.NewUpdater(st, server.Registry(), log)
+	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, log)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+
+	srvCtx, srvCancel := context.WithCancel(ctx)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(srvCtx, transport.Listen(ln)) }()
+
+	var once bool
+	return func() {
+		if once {
+			return
+		}
+		once = true
+		srvCancel()
+		if serr := <-serveErr; serr != nil && !errors.Is(serr, context.Canceled) {
+			t.Errorf("server serve: %v", serr)
+		}
+		if lerr := stopListener(); lerr != nil {
+			t.Errorf("listener stop: %v", lerr)
+		}
+	}
+}
+
+// interactiveClient logs in, publishes its self id, then serves commands from
+// cmds until the channel closes or ctx ends. Pushed updates reach collector on
+// the client's own reader goroutine, independent of the command loop.
+type command struct {
+	fn   func(ctx context.Context, api *tg.Client) error
+	done chan error
+}
+
+func runInteractive(ctx context.Context, client *telegram.Client, flow auth.Flow, selfOut chan<- int64, cmds <-chan command) error {
+	return client.Run(ctx, func(ctx context.Context) error {
+		if err := client.Auth().IfNecessary(ctx, flow); err != nil {
+			return err
+		}
+		self, err := client.Self(ctx)
+		if err != nil {
+			return err
+		}
+		selfOut <- self.ID
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case c, ok := <-cmds:
+				if !ok {
+					return nil
+				}
+				c.done <- c.fn(ctx, client.API())
+			}
+		}
+	})
+}
+
+func TestMessagingRealtime(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := st.Close(); cerr != nil {
+			t.Errorf("store close: %v", cerr)
+		}
+	})
+
+	const dcID = 2
+	codes := newMultiCodeSink()
+	ln := mustListen(t, ctx, "127.0.0.1:0")
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr type = %T", ln.Addr())
+	}
+	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	t.Cleanup(stop)
+
+	newClient := func(collector *updateCollector) *telegram.Client {
+		return telegram.NewClient(1, "hash", telegram.Options{
+			DC:            dcID,
+			DCList:        dcs.List{Options: []tg.DCOption{{ID: dcID, IPAddress: "127.0.0.1", Port: addr.Port}}},
+			PublicKeys:    []telegram.PublicKey{{RSA: &key.PublicKey}},
+			Resolver:      dcs.Plain(dcs.PlainOptions{}),
+			UpdateHandler: collector,
+		})
+	}
+	flowFor := func(phone string) auth.Flow {
+		return auth.NewFlow(
+			auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
+				func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {
+					return codes.wait(ctx, phone)
+				})),
+			auth.SendCodeOptions{},
+		)
+	}
+
+	collA, collB := newUpdateCollector(), newUpdateCollector()
+	clientA, clientB := newClient(collA), newClient(collB)
+	const phoneA, phoneB = "+15551280001", "+15551280002"
+
+	aCmds, bCmds := make(chan command), make(chan command)
+	aID, bID := make(chan int64, 1), make(chan int64, 1)
+	errA, errB := make(chan error, 1), make(chan error, 1)
+	go func() { errA <- runInteractive(ctx, clientA, flowFor(phoneA), aID, aCmds) }()
+	go func() { errB <- runInteractive(ctx, clientB, flowFor(phoneB), bID, bCmds) }()
+
+	var aUserID, bUserID int64
+	select {
+	case aUserID = <-aID:
+	case <-time.After(30 * time.Second):
+		t.Fatal("client A login timeout")
+	}
+	select {
+	case bUserID = <-bID:
+	case <-time.After(30 * time.Second):
+		t.Fatal("client B login timeout")
+	}
+
+	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
+		d := make(chan error, 1)
+		select {
+		case cmds <- command{fn: fn, done: d}:
+		case <-time.After(10 * time.Second):
+			t.Fatal("command enqueue timeout")
+		}
+		return <-d
+	}
+
+	peerB := &tg.InputPeerUser{UserID: bUserID, AccessHash: bUserID}
+	peerA := &tg.InputPeerUser{UserID: aUserID, AccessHash: aUserID}
+
+	// 1. Real-time proof: A sends, B receives updateNewMessage live.
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerB, Message: "hello realtime", RandomID: 12345,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("A send: %v", err)
+	}
+	got := recvOr(t, collB.newMsg, "B updateNewMessage")
+	if got.Message != "hello realtime" {
+		t.Fatalf("B received %q, want %q", got.Message, "hello realtime")
+	}
+
+	// 2. History on both sides shows the message.
+	assertHistory := func(cmds chan command, peer tg.InputPeerClass, who string) {
+		if err := exec(cmds, func(ctx context.Context, c *tg.Client) error {
+			res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peer, Limit: 10})
+			if err != nil {
+				return err
+			}
+			m, ok := res.(*tg.MessagesMessages)
+			if !ok {
+				t.Errorf("%s history type = %T", who, res)
+				return nil
+			}
+			if len(m.Messages) != 1 {
+				t.Errorf("%s history len = %d, want 1", who, len(m.Messages))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("%s getHistory: %v", who, err)
+		}
+	}
+	assertHistory(aCmds, peerB, "A")
+	assertHistory(bCmds, peerA, "B")
+
+	// 3. B reads → A receives updateReadHistoryOutbox.
+	if err := exec(bCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{Peer: peerA, MaxID: got.ID})
+		return err
+	}); err != nil {
+		t.Fatalf("B readHistory: %v", err)
+	}
+	recvOr(t, collA.readOutbox, "A updateReadHistoryOutbox")
+
+	// 4. A edits → B receives updateEditMessage.
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{Peer: peerB, ID: 1, Message: "edited live"})
+		return err
+	}); err != nil {
+		t.Fatalf("A edit: %v", err)
+	}
+	edited := recvOr(t, collB.editMsg, "B updateEditMessage")
+	if edited.Message != "edited live" {
+		t.Fatalf("B edit text = %q", edited.Message)
+	}
+
+	// 5. A typing → B receives updateUserTyping.
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{Peer: peerB, Action: &tg.SendMessageTypingAction{}})
+		return err
+	}); err != nil {
+		t.Fatalf("A setTyping: %v", err)
+	}
+	if from := recvOr(t, collB.typing, "B updateUserTyping"); from != aUserID {
+		t.Fatalf("typing from = %d, want %d", from, aUserID)
+	}
+
+	// 6. A deletes → B receives updateDeleteMessages.
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{1}})
+		return err
+	}); err != nil {
+		t.Fatalf("A delete: %v", err)
+	}
+	recvOr(t, collB.delMsg, "B updateDeleteMessages")
+
+	close(aCmds)
+	close(bCmds)
+	if err := <-errA; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client A run: %v", err)
+	}
+	if err := <-errB; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client B run: %v", err)
+	}
+}
+
+// TestMessagingOfflineBackfill proves the getDifference backstop: a message sent
+// while the recipient is disconnected is returned by updates.getDifference when
+// the recipient reconnects.
+func TestMessagingOfflineBackfill(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := st.Close(); cerr != nil {
+			t.Errorf("store close: %v", cerr)
+		}
+	})
+
+	const dcID = 2
+	codes := newMultiCodeSink()
+	ln := mustListen(t, ctx, "127.0.0.1:0")
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr type = %T", ln.Addr())
+	}
+	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	t.Cleanup(stop)
+
+	sessA, sessB := &session.StorageMemory{}, &session.StorageMemory{}
+	newClient := func(sess *session.StorageMemory) *telegram.Client {
+		return telegram.NewClient(1, "hash", telegram.Options{
+			DC:             dcID,
+			DCList:         dcs.List{Options: []tg.DCOption{{ID: dcID, IPAddress: "127.0.0.1", Port: addr.Port}}},
+			PublicKeys:     []telegram.PublicKey{{RSA: &key.PublicKey}},
+			Resolver:       dcs.Plain(dcs.PlainOptions{}),
+			SessionStorage: sess,
+		})
+	}
+	flowFor := func(phone string) auth.Flow {
+		return auth.NewFlow(
+			auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
+				func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {
+					return codes.wait(ctx, phone)
+				})),
+			auth.SendCodeOptions{},
+		)
+	}
+	const phoneA, phoneB = "+15551282001", "+15551282002"
+
+	// Log in B, capture its id, then disconnect (goes offline).
+	var bUserID int64
+	bClient := newClient(sessB)
+	if err := bClient.Run(ctx, func(ctx context.Context) error {
+		if err := bClient.Auth().IfNecessary(ctx, flowFor(phoneB)); err != nil {
+			return err
+		}
+		self, err := bClient.Self(ctx)
+		if err != nil {
+			return err
+		}
+		bUserID = self.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("B login: %v", err)
+	}
+
+	// A logs in and sends to the now-offline B.
+	aClient := newClient(sessA)
+	if err := aClient.Run(ctx, func(ctx context.Context) error {
+		if err := aClient.Auth().IfNecessary(ctx, flowFor(phoneA)); err != nil {
+			return err
+		}
+		_, err := aClient.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:     &tg.InputPeerUser{UserID: bUserID, AccessHash: bUserID},
+			Message:  "sent while offline",
+			RandomID: 55555,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("A login+send: %v", err)
+	}
+
+	// B reconnects and backfills via getDifference from pts 0.
+	var diff tg.UpdatesDifferenceClass
+	bClient2 := newClient(sessB)
+	if err := bClient2.Run(ctx, func(ctx context.Context) error {
+		d, err := bClient2.API().UpdatesGetDifference(ctx, &tg.UpdatesGetDifferenceRequest{Pts: 0, Date: 0, Qts: 0})
+		if err != nil {
+			return err
+		}
+		diff = d
+		return nil
+	}); err != nil {
+		t.Fatalf("B getDifference: %v", err)
+	}
+
+	full, ok := diff.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("difference type = %T, want *tg.UpdatesDifference", diff)
+	}
+	if len(full.NewMessages) != 1 {
+		t.Fatalf("backfill new messages = %d, want 1", len(full.NewMessages))
+	}
+	m, ok := full.NewMessages[0].(*tg.Message)
+	if !ok || m.Message != "sent while offline" {
+		t.Fatalf("backfilled message = %+v, want text %q", full.NewMessages[0], "sent while offline")
+	}
+}
