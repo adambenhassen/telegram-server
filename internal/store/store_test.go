@@ -77,7 +77,11 @@ func TestCodeLifecycle(t *testing.T) {
 	if err := s.VerifyCode(ctx, phone, hash, code); err != nil {
 		t.Fatalf("verify valid: %v", err)
 	}
-	if err := s.VerifyCode(ctx, phone, hash, "00000"); !errors.Is(err, store.ErrCodeInvalid) {
+	wrong := "00000"
+	if code == wrong {
+		wrong = "11111"
+	}
+	if err := s.VerifyCode(ctx, phone, hash, wrong); !errors.Is(err, store.ErrCodeInvalid) {
 		t.Errorf("want ErrCodeInvalid, got %v", err)
 	}
 	if err := s.VerifyCode(ctx, phone, "wronghash", code); !errors.Is(err, store.ErrCodeInvalid) {
