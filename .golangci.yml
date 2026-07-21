@@ -64,6 +64,8 @@ linters:
       check-blank: true
       check-type-assertions: true
   exclusions:
+    paths:
+      - internal/store/db
     rules:
       - path: _test\.go
         text: "G304:"

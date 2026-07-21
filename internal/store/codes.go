@@ -9,13 +9,43 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
-const codeTTL = 5 * time.Minute
+const (
+	codeTTL = 5 * time.Minute
+	// maxAttempts caps wrong verify attempts per issued code before it is
+	// exhausted (fail-closed against brute force of the 5-digit code).
+	maxAttempts = 3
+	// resendCooldown is the minimum interval between issuing codes for a phone
+	// while a prior code is still active.
+	resendCooldown = 60 * time.Second
+)
 
 // IssueCode generates a 5-digit login code and hash for phone, storing it with
-// a TTL. Returns (hash, code).
+// a TTL. It returns ErrResendTooSoon if an unconsumed prior code was issued
+// within resendCooldown. On success it resets the per-code hardening state
+// (attempts, consumed_at, created_at).
 func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, error) {
+	existing, err := s.q.GetCode(ctx, phone)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// No prior code: nothing blocks a fresh issue.
+	case err != nil:
+		return "", "", fmt.Errorf("issue code: %w", err)
+	default:
+		// Gate on "not consumed", not "still active": an exhausted code (attempts
+		// >= maxAttempts) must keep serving the cooldown, else exhausting a code
+		// with wrong guesses would bypass the limit and reopen the brute force. A
+		// consumed code (successful login) bypasses so a real user can re-login;
+		// an expired code is already >codeTTL old so time.Since clears the window.
+		if !existing.ConsumedAt.Valid && time.Since(existing.CreatedAt.Time) < resendCooldown {
+			return "", "", ErrResendTooSoon
+		}
+	}
+
 	code, err := randDigits5()
 	if err != nil {
 		return "", "", err
@@ -24,43 +54,81 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	if err != nil {
 		return "", "", err
 	}
-	_, err = s.pool.Exec(ctx,
-		`INSERT INTO phone_codes (phone, code_hash, code, expires_at)
-		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT (phone) DO UPDATE
-		   SET code_hash = EXCLUDED.code_hash,
-		       code = EXCLUDED.code,
-		       expires_at = EXCLUDED.expires_at`,
-		phone, hash, code, time.Now().Add(codeTTL),
-	)
+	err = s.q.UpsertCode(ctx, db.UpsertCodeParams{
+		Phone:     phone,
+		CodeHash:  hash,
+		Code:      code,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(codeTTL), Valid: true},
+	})
 	if err != nil {
 		return "", "", fmt.Errorf("issue code: %w", err)
 	}
 	return hash, code, nil
 }
 
-// VerifyCode checks the code+hash for phone. Returns ErrCodeInvalid or
-// ErrCodeExpired on failure.
+// VerifyCode checks the code+hash for phone. It is single-use and fail-closed:
+// an already-consumed, expired, or exhausted code never verifies. The Go-side
+// checks (consumed → expired → exhausted) map the right sentinel in the common
+// sequential case. Success is decided by a compare-and-swap scoped to the exact
+// issued code (phone+hash+code) with the terminal-state guards in the WHERE, so
+// a concurrent resend/consume/expiry that slips between the read and the write
+// makes the swap affect zero rows → ErrCodeInvalid. Both mutations are scoped by
+// code_hash so they can never corrupt a code that a resend replaced. Both a wrong
+// hash and a wrong code return ErrCodeInvalid without revealing which field was
+// wrong, but only a wrong code under the correct hash charges an attempt: because
+// IncrementCodeAttempts is scoped by code_hash, a wrong hash matches no row and
+// charges nothing. The attempt that reaches maxAttempts exhausts the code.
 func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error {
-	var storedCode, storedHash string
-	var expires time.Time
-	err := s.pool.QueryRow(ctx,
-		`SELECT code, code_hash, expires_at FROM phone_codes WHERE phone = $1`,
-		phone,
-	).Scan(&storedCode, &storedHash, &expires)
+	row, err := s.q.GetCode(ctx, phone)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return ErrCodeInvalid
 	case err != nil:
 		return fmt.Errorf("verify code: %w", err)
 	}
-	if time.Now().After(expires) {
+	if row.ConsumedAt.Valid {
+		return ErrCodeInvalid
+	}
+	if time.Now().After(row.ExpiresAt.Time) {
 		return ErrCodeExpired
 	}
-	if hash != storedHash || code != storedCode {
+	if row.Attempts >= maxAttempts {
+		return ErrCodeExhausted
+	}
+	if hash != row.CodeHash || code != row.Code {
+		if err := s.q.IncrementCodeAttempts(ctx, db.IncrementCodeAttemptsParams{
+			Phone:    phone,
+			CodeHash: hash,
+		}); err != nil {
+			return fmt.Errorf("verify code: %w", err)
+		}
+		return ErrCodeInvalid
+	}
+	rows, err := s.q.ConsumeCode(ctx, db.ConsumeCodeParams{
+		Phone:    phone,
+		CodeHash: hash,
+		Code:     code,
+		Attempts: maxAttempts,
+	})
+	if err != nil {
+		return fmt.Errorf("verify code: %w", err)
+	}
+	if rows == 0 {
+		// The code was consumed/expired/exhausted/replaced concurrently between
+		// the read above and this swap. Fail closed.
 		return ErrCodeInvalid
 	}
 	return nil
+}
+
+// DeleteExpiredCodes removes all login codes past their expiry and returns
+// the number of rows deleted.
+func (s *Store) DeleteExpiredCodes(ctx context.Context) (int64, error) {
+	n, err := s.q.DeleteExpiredCodes(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("delete expired codes: %w", err)
+	}
+	return n, nil
 }
 
 func randDigits5() (string, error) {
