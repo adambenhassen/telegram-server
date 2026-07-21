@@ -42,7 +42,7 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 		return
 	}
 	for _, c := range conns {
-		ups, users, state, err := u.h.buildUpdates(ctx, userID, c.LastPushedPts())
+		ups, users, state, _, err := u.h.buildUpdates(ctx, userID, c.LastPushedPts())
 		if err != nil {
 			u.log.Error("deliver build updates", "user_id", userID, "err", err)
 			continue

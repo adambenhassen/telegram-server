@@ -87,6 +87,53 @@ func (q *Queries) EventsSince(ctx context.Context, arg EventsSinceParams) ([]Mes
 	return items, nil
 }
 
+const eventsWindow = `-- name: EventsWindow :many
+SELECT owner_id, pts, type, local_id FROM message_events
+WHERE owner_id = $1 AND pts > $2 AND pts <= $3
+ORDER BY pts
+LIMIT $4::int
+`
+
+type EventsWindowParams struct {
+	OwnerID int64
+	FromPts int64
+	ToPts   int64
+	Lim     int32
+}
+
+// EventsWindow returns events in (from_pts, to_pts] ordered, capped by lim. The
+// upper bound pins the read to a pts snapshot so the difference never advertises
+// a pts past an event it omitted.
+func (q *Queries) EventsWindow(ctx context.Context, arg EventsWindowParams) ([]MessageEvent, error) {
+	rows, err := q.db.Query(ctx, eventsWindow,
+		arg.OwnerID,
+		arg.FromPts,
+		arg.ToPts,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []MessageEvent
+	for rows.Next() {
+		var i MessageEvent
+		if err := rows.Scan(
+			&i.OwnerID,
+			&i.Pts,
+			&i.Type,
+			&i.LocalID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getState = `-- name: GetState :one
 SELECT user_id, pts, seq, date, next_local_id FROM update_state WHERE user_id = $1
 `

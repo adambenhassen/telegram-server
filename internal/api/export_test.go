@@ -24,7 +24,8 @@ func testHandlers(s *store.Store) *handlers {
 
 // BuildUpdatesForTest exposes buildUpdates for the external api_test package.
 func BuildUpdatesForTest(s *store.Store, userID int64, fromPts int) ([]tg.UpdateClass, []tg.UserClass, store.State, error) {
-	return testHandlers(s).buildUpdates(context.Background(), userID, fromPts)
+	ups, users, state, _, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts)
+	return ups, users, state, err
 }
 
 // GetStateForTest exposes handleGetState for the external api_test package.

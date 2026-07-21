@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -117,6 +118,35 @@ func TestSendMessageRandomIDDedup(t *testing.T) {
 	}
 	if st.Pts != 1 {
 		t.Fatalf("sender pts after dup = %d, want 1", st.Pts)
+	}
+}
+
+// TestConcurrentOppositeFirstSends fires A->B and B->A simultaneously across
+// many fresh user pairs: the sorted advisory-lock ordering (plus state rows
+// provisioned at user creation) must keep both first sends deadlock-free.
+func TestConcurrentOppositeFirstSends(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	sendErr := func(from, to store.User, rid int64) error {
+		_, _, _, _, e := s.SendMessage(ctx, from.ID, to.ID, "x", rid)
+		return e
+	}
+
+	for i := range 15 {
+		a := mustUser(t, s, "+1555127"+string(rune('a'+i))+"01")
+		b := mustUser(t, s, "+1555127"+string(rune('a'+i))+"02")
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		wg.Go(func() { errs[0] = sendErr(a, b, int64(2*i+1)) })
+		wg.Go(func() { errs[1] = sendErr(b, a, int64(2*i+2)) })
+		wg.Wait()
+		for j, e := range errs {
+			if e != nil {
+				t.Fatalf("round %d send %d: %v", i, j, e)
+			}
+		}
 	}
 }
 

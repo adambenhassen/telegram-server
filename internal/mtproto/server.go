@@ -172,6 +172,19 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 			return errors.Join(errors.New("get auth key"), err)
 		}
 		if !ok {
+			// A key that previously resolved to a user and is now gone means the
+			// session was revoked (logOut/resetAuthorization). Drop it from the
+			// registry and close the socket so a revoked client can no longer
+			// receive pushes under its cached key.
+			//
+			// ponytail: only closes on the client's next frame; a silent socket
+			// keeps its cached key until it sends again. Full revocation needs a
+			// cross-replica evict signal — deferred to a sessions-hardening pass.
+			if registeredUser != 0 {
+				s.registry.Remove(registeredUser, conn)
+				registeredUser = 0
+				return nil
+			}
 			if err := s.sendProtoError(ctx, tconn, codec.CodeAuthKeyNotFound); err != nil {
 				return err
 			}

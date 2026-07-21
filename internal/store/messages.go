@@ -74,14 +74,17 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
+	// Take the sorted advisory locks before any per-owner insert. Provisioning
+	// state rows before locking could deadlock two opposite-direction first sends
+	// on the update_state unique-key insert; locking first serializes them.
+	if err = lockOwners(ctx, tx, fromID, toID); err != nil {
+		return Message{}, 0, 0, false, err
+	}
 	if err = qtx.EnsureUpdateState(ctx, fromID); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("ensure sender state: %w", err)
 	}
 	if err = qtx.EnsureUpdateState(ctx, toID); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("ensure recipient state: %w", err)
-	}
-	if err = lockOwners(ctx, tx, fromID, toID); err != nil {
-		return Message{}, 0, 0, false, err
 	}
 
 	// Idempotency: a resend with the same random_id returns the original.

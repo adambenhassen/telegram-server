@@ -51,25 +51,39 @@ func stateToTL(s store.State) *tg.UpdatesState {
 	}
 }
 
+// maxDiffEvents caps the events hydrated into one difference/push, bounding the
+// work a stale client can force. A truncated batch is returned as a slice with
+// an intermediate state so the client re-requests the remainder.
+const maxDiffEvents = 500
+
 // buildUpdates hydrates userID's events after fromPts into wire updates plus the
-// referenced users and the user's current state. It is the single delivery path
+// referenced users and the state to advertise. It is the single delivery path
 // shared by updates.getDifference and real-time push.
-func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) ([]tg.UpdateClass, []tg.UserClass, store.State, error) {
-	events, err := h.store.EventsSince(ctx, userID, fromPts)
+//
+// State is read first, then events are bounded to (fromPts, state.pts], so the
+// advertised pts never runs past an event omitted from the response (events and
+// their pts bump commit atomically per owner). more reports that the batch hit
+// the cap and the advertised state is an intermediate one.
+func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) (ups []tg.UpdateClass, users []tg.UserClass, state store.State, more bool, err error) {
+	state, err = h.store.State(ctx, userID)
 	if err != nil {
-		return nil, nil, store.State{}, err
+		return nil, nil, store.State{}, false, err
 	}
-	state, err := h.store.State(ctx, userID)
+	// Fetch one past the cap to detect truncation.
+	events, err := h.store.EventsWindow(ctx, userID, fromPts, state.Pts, maxDiffEvents+1)
 	if err != nil {
-		return nil, nil, store.State{}, err
+		return nil, nil, store.State{}, false, err
+	}
+	if len(events) > maxDiffEvents {
+		events = events[:maxDiffEvents]
+		more = true
 	}
 
-	var ups []tg.UpdateClass
 	peers := map[int64]bool{}
 	for _, ev := range events {
-		up, refs, err := h.eventToUpdate(ctx, userID, ev)
-		if err != nil {
-			return nil, nil, store.State{}, err
+		up, refs, uerr := h.eventToUpdate(ctx, userID, ev)
+		if uerr != nil {
+			return nil, nil, store.State{}, false, uerr
 		}
 		if up == nil {
 			continue
@@ -79,12 +93,16 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 			peers[id] = true
 		}
 	}
-
-	users, err := h.loadUsers(ctx, peers, userID)
-	if err != nil {
-		return nil, nil, store.State{}, err
+	// When truncated, advertise only through the last included event's pts.
+	if more && len(events) > 0 {
+		state.Pts = events[len(events)-1].Pts
 	}
-	return ups, users, state, nil
+
+	users, err = h.loadUsers(ctx, peers, userID)
+	if err != nil {
+		return nil, nil, store.State{}, false, err
+	}
+	return ups, users, state, more, nil
 }
 
 // eventToUpdate builds the wire update for one event owned by userID, returning
@@ -167,21 +185,40 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	ups, users, state, err := h.buildUpdates(r.Ctx, r.UserID, req.Pts)
+	ups, users, state, more, err := h.buildUpdates(r.Ctx, r.UserID, req.Pts)
 	if err != nil {
 		h.log.Error("get difference", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	if req.Pts >= state.Pts {
+	// No pending events (caught up, or a client pts at/ahead of the server which
+	// the single-writer invariant clamps to empty): report empty.
+	if !more && len(ups) == 0 {
 		return &tg.UpdatesDifferenceEmpty{Date: state.Date, Seq: state.Seq}, nil
 	}
-	diff := &tg.UpdatesDifference{State: *stateToTL(state), Users: users}
+
+	var newMessages []tg.MessageClass
+	var other []tg.UpdateClass
 	for _, u := range ups {
 		if nm, ok := u.(*tg.UpdateNewMessage); ok {
-			diff.NewMessages = append(diff.NewMessages, nm.Message)
+			newMessages = append(newMessages, nm.Message)
 		} else {
-			diff.OtherUpdates = append(diff.OtherUpdates, u)
+			other = append(other, u)
 		}
 	}
-	return diff, nil
+	if more {
+		// Partial batch: the client applies it and re-requests from the
+		// intermediate state's pts until caught up.
+		return &tg.UpdatesDifferenceSlice{
+			NewMessages:       newMessages,
+			OtherUpdates:      other,
+			Users:             users,
+			IntermediateState: *stateToTL(state),
+		}, nil
+	}
+	return &tg.UpdatesDifference{
+		NewMessages:  newMessages,
+		OtherUpdates: other,
+		Users:        users,
+		State:        *stateToTL(state),
+	}, nil
 }
