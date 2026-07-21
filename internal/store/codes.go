@@ -76,10 +76,11 @@ func codeActive(row db.PhoneCode) bool {
 // issued code (phone+hash+code) with the terminal-state guards in the WHERE, so
 // a concurrent resend/consume/expiry that slips between the read and the write
 // makes the swap affect zero rows → ErrCodeInvalid. Both mutations are scoped by
-// code_hash so they can never corrupt a code that a resend replaced. A wrong
-// hash or code increments the attempt counter and returns ErrCodeInvalid without
-// revealing which field was wrong; the attempt that reaches maxAttempts exhausts
-// the code.
+// code_hash so they can never corrupt a code that a resend replaced. Both a wrong
+// hash and a wrong code return ErrCodeInvalid without revealing which field was
+// wrong, but only a wrong code under the correct hash charges an attempt: because
+// IncrementCodeAttempts is scoped by code_hash, a wrong hash matches no row and
+// charges nothing. The attempt that reaches maxAttempts exhausts the code.
 func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error {
 	row, err := s.q.GetCode(ctx, phone)
 	switch {
