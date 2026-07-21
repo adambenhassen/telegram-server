@@ -99,3 +99,19 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 		},
 	}, nil
 }
+
+// handleLogOut serves auth.logOut. It deletes the auth key the request arrived
+// on, so the client must re-handshake and is no longer authorized. Telegram
+// allows logOut regardless of authorization state; deleting an unbound key is a
+// no-op, so no UserID check is needed. Returns auth.loggedOut on success.
+func (h *handlers) handleLogOut(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.AuthLogOutRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if err := h.store.DeleteAuthKey(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID)); err != nil {
+		h.log.Error("logout: delete auth key", "err", err)
+		return nil, errInternal
+	}
+	return &tg.AuthLoggedOut{}, nil
+}
