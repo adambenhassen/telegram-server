@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -14,6 +15,24 @@ func mustUser(t *testing.T, s *store.Store, phone string) store.User {
 		t.Fatalf("create user %s: %v", phone, err)
 	}
 	return u
+}
+
+func send(t *testing.T, s *store.Store, from, to store.User, text string, rid int64) store.Message {
+	t.Helper()
+	m, _, _, _, err := s.SendMessage(context.Background(), from.ID, to.ID, text, rid) //nolint:dogsled // only the stored message is needed here
+	if err != nil {
+		t.Fatalf("send %q: %v", text, err)
+	}
+	return m
+}
+
+func msgAt(t *testing.T, s *store.Store, ownerID, localID int64) store.Message {
+	t.Helper()
+	m, ok, err := s.MessageByOwnerLocal(context.Background(), ownerID, localID)
+	if err != nil || !ok {
+		t.Fatalf("message (%d,%d): ok=%v err=%v", ownerID, localID, ok, err)
+	}
+	return m
 }
 
 func TestSendMessageTwoSided(t *testing.T) {
@@ -98,5 +117,125 @@ func TestSendMessageRandomIDDedup(t *testing.T) {
 	}
 	if st.Pts != 1 {
 		t.Fatalf("sender pts after dup = %d, want 1", st.Pts)
+	}
+}
+
+func TestHistoryPaging(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551250001")
+	b := mustUser(t, s, "+15551250002")
+
+	for i, txt := range []string{"m1", "m2", "m3"} {
+		send(t, s, a, b, txt, int64(1000+i))
+	}
+
+	all, err := s.History(ctx, a.ID, b.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("history len = %d, want 3", len(all))
+	}
+	if all[0].LocalID != 3 || all[2].LocalID != 1 {
+		t.Fatalf("history not newest-first: %d..%d", all[0].LocalID, all[2].LocalID)
+	}
+
+	older, err := s.History(ctx, a.ID, b.ID, 2, 10) // strictly older than local_id 2
+	if err != nil {
+		t.Fatalf("history page: %v", err)
+	}
+	if len(older) != 1 || older[0].LocalID != 1 {
+		t.Fatalf("paged history = %+v, want only local_id 1", older)
+	}
+}
+
+func TestEditMessageBothSides(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551250011")
+	b := mustUser(t, s, "+15551250012")
+
+	sender := send(t, s, a, b, "orig", 1)
+
+	peerID, newPts, err := s.EditMessage(ctx, a.ID, sender.LocalID, "edited")
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if peerID != b.ID {
+		t.Fatalf("edit peer = %d, want %d", peerID, b.ID)
+	}
+	if newPts != 2 {
+		t.Fatalf("editor pts = %d, want 2", newPts)
+	}
+
+	own := msgAt(t, s, a.ID, sender.LocalID)
+	if own.Text != "edited" || own.EditDate == nil {
+		t.Fatalf("owner row not edited: %+v", own)
+	}
+	mirror := msgAt(t, s, b.ID, sender.PeerLocalID)
+	if mirror.Text != "edited" || mirror.EditDate == nil {
+		t.Fatalf("mirror row not edited: %+v", mirror)
+	}
+
+	// Edit events on both owners.
+	for _, u := range []int64{a.ID, b.ID} {
+		ev, err := s.EventsSince(ctx, u, 1)
+		if err != nil {
+			t.Fatalf("events owner %d: %v", u, err)
+		}
+		if len(ev) != 1 || ev[0].Type != store.EventEdit {
+			t.Fatalf("owner %d edit event = %+v", u, ev)
+		}
+	}
+
+	// Non-owned / inbound edits fail closed.
+	if _, _, err := s.EditMessage(ctx, a.ID, 999, "x"); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("edit absent: want ErrMessageInvalid, got %v", err)
+	}
+	if _, _, err := s.EditMessage(ctx, b.ID, sender.PeerLocalID, "x"); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("edit inbound: want ErrMessageInvalid, got %v", err)
+	}
+}
+
+func TestDeleteMessagesBothSides(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551250021")
+	b := mustUser(t, s, "+15551250022")
+
+	sender := send(t, s, a, b, "bye", 1)
+
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID})
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if perOwner[a.ID] != 2 || perOwner[b.ID] != 2 {
+		t.Fatalf("delete pts = %+v, want a,b at 2", perOwner)
+	}
+
+	own := msgAt(t, s, a.ID, sender.LocalID)
+	if !own.Deleted {
+		t.Fatal("owner row not deleted")
+	}
+	mirror := msgAt(t, s, b.ID, sender.PeerLocalID)
+	if !mirror.Deleted {
+		t.Fatal("mirror row not deleted")
+	}
+	for _, u := range []int64{a.ID, b.ID} {
+		ev, err := s.EventsSince(ctx, u, 1)
+		if err != nil {
+			t.Fatalf("events owner %d: %v", u, err)
+		}
+		if len(ev) != 1 || ev[0].Type != store.EventDelete {
+			t.Fatalf("owner %d delete event = %+v", u, ev)
+		}
+	}
+
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{999}); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("delete absent: want ErrMessageInvalid, got %v", err)
 	}
 }

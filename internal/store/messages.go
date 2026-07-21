@@ -147,6 +147,161 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 	return messageFromRow(stored), int(sb.Pts), int(rb.Pts), false, nil
 }
 
+// History returns owner's messages with peer, newest-first, excluding deleted.
+// offsetID > 0 pages strictly older than that local_id (0 = from newest).
+func (s *Store) History(ctx context.Context, ownerID, peerID int64, offsetID, limit int) ([]Message, error) {
+	rows, err := s.q.HistoryPage(ctx, db.HistoryPageParams{
+		OwnerID:  ownerID,
+		PeerID:   peerID,
+		OffsetID: int64(offsetID),
+		Lim:      int32(limit), //nolint:gosec // limit is a small validated page size
+
+	})
+	if err != nil {
+		return nil, fmt.Errorf("history page: %w", err)
+	}
+	msgs := make([]Message, len(rows))
+	for i, r := range rows {
+		msgs[i] = messageFromRow(r)
+	}
+	return msgs, nil
+}
+
+// EditMessage edits the caller's own outgoing message and its mirror on the
+// peer's side, bumping both owners' pts with an edit event. Returns the peer id
+// and the editor's new pts. ErrMessageInvalid if the message is absent, deleted,
+// or not an outgoing message the caller authored.
+func (s *Store) EditMessage(ctx context.Context, ownerID, localID int64, text string) (peerID int64, newPts int, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	// Discover the peer to lock; validated again after the lock (fail closed).
+	pre, err := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: ownerID, LocalID: localID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, ErrMessageInvalid
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("load message: %w", err)
+	}
+	peerID = pre.PeerID
+	if err = lockOwners(ctx, tx, ownerID, peerID); err != nil {
+		return 0, 0, err
+	}
+
+	msg, err := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: ownerID, LocalID: localID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, ErrMessageInvalid
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("reload message: %w", err)
+	}
+	if !msg.Out || msg.Deleted {
+		return 0, 0, ErrMessageInvalid
+	}
+
+	if err = qtx.SetEditedText(ctx, db.SetEditedTextParams{OwnerID: ownerID, LocalID: localID, Message: text}); err != nil {
+		return 0, 0, fmt.Errorf("edit owner row: %w", err)
+	}
+	if err = qtx.SetEditedText(ctx, db.SetEditedTextParams{OwnerID: peerID, LocalID: msg.PeerLocalID, Message: text}); err != nil {
+		return 0, 0, fmt.Errorf("edit mirror row: %w", err)
+	}
+
+	ownerPts, err := qtx.BumpPtsOnly(ctx, ownerID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bump owner: %w", err)
+	}
+	if err = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: ownerID, Pts: ownerPts, Type: int16(EventEdit), LocalID: localID}); err != nil {
+		return 0, 0, fmt.Errorf("owner edit event: %w", err)
+	}
+	peerPts, err := qtx.BumpPtsOnly(ctx, peerID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bump peer: %w", err)
+	}
+	if err = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: peerID, Pts: peerPts, Type: int16(EventEdit), LocalID: msg.PeerLocalID}); err != nil {
+		return 0, 0, fmt.Errorf("peer edit event: %w", err)
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return 0, 0, fmt.Errorf("commit: %w", err)
+	}
+	return peerID, int(ownerPts), nil
+}
+
+// DeleteMessages marks the given owner-local messages deleted on both sides,
+// emitting one delete event per message per affected owner. It fails closed
+// (ErrMessageInvalid, no changes) if any id is absent. Returns the resulting
+// pts per affected user (owner and peers) for the caller to notify.
+func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []int64) (map[int64]int, error) {
+	if len(localIDs) == 0 {
+		return map[int64]int{}, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	// Load every target first; a missing id fails the whole batch (fail closed).
+	msgs := make([]db.Message, 0, len(localIDs))
+	peers := map[int64]bool{}
+	for _, id := range localIDs {
+		m, e := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: ownerID, LocalID: id})
+		if errors.Is(e, pgx.ErrNoRows) {
+			return nil, ErrMessageInvalid
+		}
+		if e != nil {
+			return nil, fmt.Errorf("load message %d: %w", id, e)
+		}
+		msgs = append(msgs, m)
+		peers[m.PeerID] = true
+	}
+
+	lockIDs := make([]int64, 0, len(peers)+1)
+	lockIDs = append(lockIDs, ownerID)
+	for p := range peers {
+		lockIDs = append(lockIDs, p)
+	}
+	if err = lockOwners(ctx, tx, lockIDs...); err != nil {
+		return nil, err
+	}
+
+	perOwner := map[int64]int{}
+	for _, m := range msgs {
+		if err = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: ownerID, LocalID: m.LocalID}); err != nil {
+			return nil, fmt.Errorf("delete owner row: %w", err)
+		}
+		if err = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: m.PeerID, LocalID: m.PeerLocalID}); err != nil {
+			return nil, fmt.Errorf("delete mirror row: %w", err)
+		}
+		ownerPts, e := qtx.BumpPtsOnly(ctx, ownerID)
+		if e != nil {
+			return nil, fmt.Errorf("bump owner: %w", e)
+		}
+		if e = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: ownerID, Pts: ownerPts, Type: int16(EventDelete), LocalID: m.LocalID}); e != nil {
+			return nil, fmt.Errorf("owner delete event: %w", e)
+		}
+		perOwner[ownerID] = int(ownerPts)
+		peerPts, e := qtx.BumpPtsOnly(ctx, m.PeerID)
+		if e != nil {
+			return nil, fmt.Errorf("bump peer: %w", e)
+		}
+		if e = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: m.PeerID, Pts: peerPts, Type: int16(EventDelete), LocalID: m.PeerLocalID}); e != nil {
+			return nil, fmt.Errorf("peer delete event: %w", e)
+		}
+		perOwner[m.PeerID] = int(peerPts)
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return perOwner, nil
+}
+
 // currentPts returns both owners' current pts without advancing them.
 func currentPts(ctx context.Context, q *db.Queries, aID, bID int64) (int, int, error) {
 	as, err := q.GetState(ctx, aID)
