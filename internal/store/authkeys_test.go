@@ -1,0 +1,145 @@
+package store_test
+
+import (
+	"bytes"
+	"context"
+	"testing"
+)
+
+func TestSaveAndGetAuthKey(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const id = int64(0x1001)
+	value := []byte{0x00, 0xff, 0x10, 0x20, 0x00}
+
+	if err := s.SaveAuthKey(ctx, id, value); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, ok, err := s.AuthKeyByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if got.ID != id {
+		t.Errorf("id: got %d want %d", got.ID, id)
+	}
+	if !bytes.Equal(got.Value, value) {
+		t.Errorf("value: got %v want %v", got.Value, value)
+	}
+	if got.UserID != 0 {
+		t.Errorf("unbound key has UserID %d, want 0", got.UserID)
+	}
+}
+
+func TestAuthKeyByIDMissing(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	_, ok, err := s.AuthKeyByID(ctx, 0xdead)
+	if err != nil {
+		t.Fatalf("get missing: %v", err)
+	}
+	if ok {
+		t.Error("ok=true for absent key")
+	}
+}
+
+func TestSaveAuthKeyIsIdempotentUpsert(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const id = int64(0x1002)
+
+	if err := s.SaveAuthKey(ctx, id, []byte("first")); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	if err := s.SaveAuthKey(ctx, id, []byte("second")); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	got, ok, err := s.AuthKeyByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(got.Value, []byte("second")) {
+		t.Errorf("value not updated: got %q want %q", got.Value, "second")
+	}
+}
+
+func TestBindAuthKeyUser(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const id = int64(0x1003)
+
+	u, err := s.CreateUser(ctx, "+15551240003")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := s.SaveAuthKey(ctx, id, []byte("k")); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := s.BindAuthKeyUser(ctx, id, u.ID); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	got, ok, err := s.AuthKeyByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if got.UserID != u.ID {
+		t.Errorf("UserID: got %d want %d", got.UserID, u.ID)
+	}
+}
+
+func TestAuthKeysByUser(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	u, err := s.CreateUser(ctx, "+15551240004")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	ids := []int64{0x2001, 0x2002}
+	for _, id := range ids {
+		if err := s.SaveAuthKey(ctx, id, []byte("k")); err != nil {
+			t.Fatalf("save %d: %v", id, err)
+		}
+		if err := s.BindAuthKeyUser(ctx, id, u.ID); err != nil {
+			t.Fatalf("bind %d: %v", id, err)
+		}
+	}
+	keys, err := s.AuthKeysByUser(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(keys) != len(ids) {
+		t.Fatalf("got %d keys, want %d", len(keys), len(ids))
+	}
+	for _, k := range keys {
+		if k.UserID != u.ID {
+			t.Errorf("key %d bound to %d, want %d", k.ID, k.UserID, u.ID)
+		}
+	}
+}
+
+func TestDeleteAuthKey(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const id = int64(0x1004)
+
+	if err := s.SaveAuthKey(ctx, id, []byte("k")); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := s.DeleteAuthKey(ctx, id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	_, ok, err := s.AuthKeyByID(ctx, id)
+	if err != nil {
+		t.Fatalf("get after delete: %v", err)
+	}
+	if ok {
+		t.Error("key still present after delete")
+	}
+}
