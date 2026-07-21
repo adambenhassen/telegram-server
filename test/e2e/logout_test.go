@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -85,15 +86,18 @@ func TestClientLogOut(t *testing.T) {
 			return err
 		}
 		u, ok, err := st.UserByPhone(ctx, phone)
-		if err != nil || !ok {
-			t.Fatalf("user not persisted: ok=%v err=%v", ok, err)
+		if err != nil {
+			return fmt.Errorf("user by phone: %w", err)
+		}
+		if !ok {
+			return fmt.Errorf("user %s not persisted", phone)
 		}
 		keys, err := st.AuthKeysByUser(ctx, u.ID)
 		if err != nil {
-			t.Fatalf("auth keys by user: %v", err)
+			return fmt.Errorf("auth keys by user: %w", err)
 		}
 		if len(keys) != 1 {
-			t.Fatalf("want 1 bound auth key before logout, got %d", len(keys))
+			return fmt.Errorf("want 1 bound auth key before logout, got %d", len(keys))
 		}
 		keyID = keys[0].ID
 		if _, err := client.API().AuthLogOut(ctx); err != nil {

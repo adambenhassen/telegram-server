@@ -2,6 +2,8 @@ package e2e_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -130,19 +132,19 @@ func TestSessionManagement(t *testing.T) {
 			return err
 		}
 		if len(auths.Authorizations) != 2 {
-			t.Fatalf("getAuthorizations returned %d sessions, want 2", len(auths.Authorizations))
+			return fmt.Errorf("getAuthorizations returned %d sessions, want 2", len(auths.Authorizations))
 		}
 		var currents int
 		for _, a := range auths.Authorizations {
 			if a.Current {
 				currents++
 				if a.Hash != client1Key {
-					t.Fatalf("Current session hash = %d, want client1 key %d", a.Hash, client1Key)
+					return fmt.Errorf("Current session hash = %d, want client1 key %d", a.Hash, client1Key)
 				}
 			}
 		}
 		if currents != 1 {
-			t.Fatalf("want exactly 1 Current session, got %d", currents)
+			return fmt.Errorf("want exactly 1 Current session, got %d", currents)
 		}
 
 		// Reset client2's session by its hash.
@@ -151,7 +153,7 @@ func TestSessionManagement(t *testing.T) {
 			return err
 		}
 		if !okReset {
-			t.Fatal("resetAuthorization returned false")
+			return errors.New("resetAuthorization returned false")
 		}
 		return nil
 	}); err != nil {
@@ -175,7 +177,7 @@ func TestSessionManagement(t *testing.T) {
 			return serr
 		}
 		if s.Authorized {
-			t.Fatal("client2 still authorized after its session was reset")
+			return errors.New("client2 still authorized after its session was reset")
 		}
 		return nil
 	}); err != nil {
@@ -190,13 +192,127 @@ func TestSessionManagement(t *testing.T) {
 			return err
 		}
 		if len(auths.Authorizations) != 1 {
-			t.Fatalf("after reset client1 sees %d sessions, want 1", len(auths.Authorizations))
+			return fmt.Errorf("after reset client1 sees %d sessions, want 1", len(auths.Authorizations))
 		}
 		if auths.Authorizations[0].Hash != client1Key {
-			t.Fatalf("remaining session hash = %d, want client1 key %d", auths.Authorizations[0].Hash, client1Key)
+			return fmt.Errorf("remaining session hash = %d, want client1 key %d", auths.Authorizations[0].Hash, client1Key)
 		}
 		return nil
 	}); err != nil {
 		t.Fatalf("client1 still-works run: %v", err)
+	}
+}
+
+// TestResetAuthorizationCrossUserRejected proves account.resetAuthorization is
+// scoped to the caller: a second user (different phone, own session) cannot
+// revoke the first user's session by passing its auth-key hash. The reset must
+// be rejected and the first user's auth_keys row must survive, still bound to
+// that user. If the scope check (key.UserID != r.UserID) in handleResetAuthorization
+// were removed, user B's reset would delete user A's key and this test would fail.
+func TestResetAuthorizationCrossUserRejected(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Open(ctx, pgtest.DSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := st.Close(); cerr != nil {
+			t.Errorf("store close: %v", cerr)
+		}
+	})
+
+	const dcID = 2
+	codes := newCodeSink()
+
+	ln := mustListen(t, ctx, "127.0.0.1:0")
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr type = %T", ln.Addr())
+	}
+	port := addr.Port
+	stop := bootServer(t, ctx, key, dcID, st, codes.Logger(), ln)
+	t.Cleanup(stop)
+
+	newClient := func(sess *session.StorageMemory) *telegram.Client {
+		return telegram.NewClient(1, "hash", telegram.Options{
+			DC:             dcID,
+			DCList:         dcs.List{Options: []tg.DCOption{{ID: dcID, IPAddress: "127.0.0.1", Port: port}}},
+			PublicKeys:     []telegram.PublicKey{{RSA: &key.PublicKey}},
+			Resolver:       dcs.Plain(dcs.PlainOptions{}),
+			SessionStorage: sess,
+		})
+	}
+
+	login := func(sess *session.StorageMemory, phone string) {
+		c := newClient(sess)
+		flow := auth.NewFlow(
+			auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
+				func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {
+					return codes.wait(ctx)
+				})),
+			auth.SendCodeOptions{},
+		)
+		if err := c.Run(ctx, func(ctx context.Context) error {
+			return c.Auth().IfNecessary(ctx, flow)
+		}); err != nil {
+			t.Fatalf("login %s: %v", phone, err)
+		}
+	}
+
+	// User A logs in; capture the auth key bound to A.
+	phoneA := "+15551236666"
+	sessA := &session.StorageMemory{}
+	login(sessA, phoneA)
+	userA, ok, err := st.UserByPhone(ctx, phoneA)
+	if err != nil || !ok {
+		t.Fatalf("user A not persisted: ok=%v err=%v", ok, err)
+	}
+	keysA, err := st.AuthKeysByUser(ctx, userA.ID)
+	if err != nil {
+		t.Fatalf("auth keys for user A: %v", err)
+	}
+	if len(keysA) != 1 {
+		t.Fatalf("want 1 auth key for user A, got %d", len(keysA))
+	}
+	userAKey := keysA[0].ID
+
+	// User B logs in on a different phone (a distinct user) with its own session.
+	phoneB := "+15551236667"
+	sessB := &session.StorageMemory{}
+	login(sessB, phoneB)
+
+	// From user B: attempt to reset user A's session by its auth-key hash. Assert
+	// after Run returns; the callback only records the result (Finding 2 pattern).
+	clientB := newClient(sessB)
+	var resetOK bool
+	var resetErr error
+	if err := clientB.Run(ctx, func(ctx context.Context) error {
+		resetOK, resetErr = clientB.API().AccountResetAuthorization(ctx, userAKey)
+		return nil
+	}); err != nil {
+		t.Fatalf("user B reset run: %v", err)
+	}
+	if resetErr == nil {
+		t.Fatalf("cross-user reset was accepted (ok=%v), want rejection", resetOK)
+	}
+
+	// User A's auth key must survive, still bound to user A.
+	got, ok, err := st.AuthKeyByID(ctx, userAKey)
+	if err != nil {
+		t.Fatalf("auth key by id: %v", err)
+	}
+	if !ok {
+		t.Fatal("user A's auth key was deleted by another user's reset")
+	}
+	if got.UserID != userA.ID {
+		t.Fatalf("user A's auth key rebound to user %d, want %d", got.UserID, userA.ID)
 	}
 }
