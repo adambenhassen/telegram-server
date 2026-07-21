@@ -24,7 +24,7 @@ func TestOpenRejectsUnmigratedSchema(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
-	if _, err := conn.Exec(ctx, `DROP TABLE auth_keys`); err != nil {
+	if _, err := conn.Exec(ctx, `DROP TABLE message_events`); err != nil {
 		t.Fatalf("drop table: %v", err)
 	}
 
