@@ -13,4 +13,5 @@ var (
 	errCodeExpired   = rpcErr(400, "PHONE_CODE_EXPIRED")
 	errInternal      = rpcErr(500, "INTERNAL")
 	errMethodNotImpl = rpcErr(400, "INPUT_METHOD_INVALID")
+	errAuthKeyUnreg  = rpcErr(401, "AUTH_KEY_UNREGISTERED")
 )
