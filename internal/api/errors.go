@@ -20,4 +20,17 @@ var (
 	// errFloodWait rate-limits code resends. Telegram signals resend backoff
 	// with FLOOD_WAIT_<seconds>; 60 matches the store's resendCooldown.
 	errFloodWait = rpcErr(420, "FLOOD_WAIT_60")
+	// errSessionPasswordNeeded is returned by signIn when the account has 2FA:
+	// the client must complete the SRP password step via checkPassword.
+	errSessionPasswordNeeded = rpcErr(401, "SESSION_PASSWORD_NEEDED")
+	// errPasswordHashInvalid rejects a bad SRP proof (wrong password) on
+	// checkPassword, updatePasswordSettings, and getPasswordSettings.
+	errPasswordHashInvalid = rpcErr(400, "PASSWORD_HASH_INVALID")
+	// errSRPIDInvalid rejects an unknown, expired, or already-consumed SRP
+	// challenge id.
+	errSRPIDInvalid = rpcErr(400, "SRP_ID_INVALID")
+	// errNewSaltInvalid rejects malformed salts in a new-password set/change.
+	errNewSaltInvalid = rpcErr(400, "NEW_SALT_INVALID")
+	// errNewPasswordBad rejects a missing/malformed new verifier on set/change.
+	errNewPasswordBad = rpcErr(400, "NEW_PASSWORD_BAD")
 )
