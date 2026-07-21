@@ -9,6 +9,7 @@ import (
 	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/srp"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -17,6 +18,7 @@ type handlers struct {
 	cfg   *tg.Config
 	dcID  int
 	log   *slog.Logger
+	srp   *srp.ChallengeStore
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -24,7 +26,7 @@ type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
 // New builds the RPC handler: dispatcher wrapped with UnpackInvoke so
 // invokeWithLayer/initConnection wrappers are peeled before dispatch.
 func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger) mtproto.Handler {
-	h := &handlers{store: s, cfg: cfg, dcID: dcID, log: log}
+	h := &handlers{store: s, cfg: cfg, dcID: dcID, log: log, srp: srp.NewChallengeStore(srp.DefaultTTL)}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
@@ -33,6 +35,10 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger) mtproto.Han
 	register(d, tg.UsersGetUsersRequestTypeID, h.handleGetUsers)
 	register(d, tg.AccountGetAuthorizationsRequestTypeID, h.handleGetAuthorizations)
 	register(d, tg.AccountResetAuthorizationRequestTypeID, h.handleResetAuthorization)
+	register(d, tg.AccountGetPasswordRequestTypeID, h.handleGetPassword)
+	register(d, tg.AuthCheckPasswordRequestTypeID, h.handleCheckPassword)
+	register(d, tg.AccountUpdatePasswordSettingsRequestTypeID, h.handleUpdatePasswordSettings)
+	register(d, tg.AccountGetPasswordSettingsRequestTypeID, h.handleGetPasswordSettings)
 	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		id, err := req.Buf.PeekID()
 		if err != nil {

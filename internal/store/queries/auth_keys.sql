@@ -19,3 +19,11 @@ DELETE FROM auth_keys WHERE id = $1;
 
 -- name: AuthKeysByUser :many
 SELECT * FROM auth_keys WHERE user_id = $1;
+
+-- name: SetPendingUser :execrows
+UPDATE auth_keys SET user_id = NULL, pending_user_id = $2 WHERE id = $1;
+
+-- name: PromotePendingUser :execrows
+UPDATE auth_keys
+SET user_id = $2, pending_user_id = NULL
+WHERE id = $1 AND pending_user_id = $2;

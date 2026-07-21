@@ -64,19 +64,19 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 //
 // ponytail: presence-check of the newest migration's artifacts, not a version
 // table — pgtest applies raw SQL and has no Atlas revisions table to read. The
-// sentinels track the latest migration (auth_keys table + phone_codes.attempts);
-// update them when a migration adds new schema.
+// sentinels track the latest migration (user_passwords table +
+// auth_keys.pending_user_id); update them when a migration adds new schema.
 func (s *Store) checkSchema(ctx context.Context) error {
-	var hasAuthKeys, hasHardening bool
+	var hasPasswords, hasPending bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT to_regclass('public.auth_keys') IS NOT NULL,
+		SELECT to_regclass('public.user_passwords') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
-		              WHERE table_name = 'phone_codes' AND column_name = 'attempts')`,
-	).Scan(&hasAuthKeys, &hasHardening)
+		              WHERE table_name = 'auth_keys' AND column_name = 'pending_user_id')`,
+	).Scan(&hasPasswords, &hasPending)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasAuthKeys || !hasHardening {
+	if !hasPasswords || !hasPending {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil
