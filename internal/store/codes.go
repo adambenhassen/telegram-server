@@ -25,9 +25,9 @@ const (
 )
 
 // IssueCode generates a 5-digit login code and hash for phone, storing it with
-// a TTL. It returns ErrResendTooSoon if an active (unconsumed, unexpired, not
-// exhausted) code was issued within resendCooldown. On success it resets the
-// per-code hardening state (attempts, consumed_at, created_at).
+// a TTL. It returns ErrResendTooSoon if an unconsumed prior code was issued
+// within resendCooldown. On success it resets the per-code hardening state
+// (attempts, consumed_at, created_at).
 func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, error) {
 	existing, err := s.q.GetCode(ctx, phone)
 	switch {
@@ -36,7 +36,12 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	case err != nil:
 		return "", "", fmt.Errorf("issue code: %w", err)
 	default:
-		if codeActive(existing) && time.Since(existing.CreatedAt.Time) < resendCooldown {
+		// Gate on "not consumed", not "still active": an exhausted code (attempts
+		// >= maxAttempts) must keep serving the cooldown, else exhausting a code
+		// with wrong guesses would bypass the limit and reopen the brute force. A
+		// consumed code (successful login) bypasses so a real user can re-login;
+		// an expired code is already >codeTTL old so time.Since clears the window.
+		if !existing.ConsumedAt.Valid && time.Since(existing.CreatedAt.Time) < resendCooldown {
 			return "", "", ErrResendTooSoon
 		}
 	}
@@ -59,14 +64,6 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 		return "", "", fmt.Errorf("issue code: %w", err)
 	}
 	return hash, code, nil
-}
-
-// codeActive reports whether an issued code can still be verified: not yet
-// consumed, not expired, and under the attempt cap.
-func codeActive(row db.PhoneCode) bool {
-	return !row.ConsumedAt.Valid &&
-		!time.Now().After(row.ExpiresAt.Time) &&
-		row.Attempts < maxAttempts
 }
 
 // VerifyCode checks the code+hash for phone. It is single-use and fail-closed:
