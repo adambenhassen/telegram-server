@@ -8,40 +8,37 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 )
 
-func TestDSNIsIsolated(t *testing.T) {
+// TestDSNIsolatesDatabases proves isolation deterministically: create a table in
+// DB A, then get a second DB B and assert it does not see A's table. Sequential
+// within one test body so B is always requested after A's table exists — unlike
+// two parallel tests, which could race and both pass even if DSN returned the
+// same database.
+func TestDSNIsolatesDatabases(t *testing.T) {
 	t.Parallel()
-	dsn := pgtest.DSN(t)
-
 	ctx := t.Context()
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close in test
 
-	if _, err := conn.Exec(ctx, `CREATE TABLE only_here (id int)`); err != nil {
-		t.Fatalf("exec in isolated db: %v", err)
-	}
-}
-
-func TestDSNSecondDBIsSeparate(t *testing.T) {
-	t.Parallel()
-	// A second isolated DB must not see the first test's table.
-	dsn := pgtest.DSN(t)
-	ctx := t.Context()
-	conn, err := pgx.Connect(ctx, dsn)
+	connA, err := pgx.Connect(ctx, pgtest.DSN(t))
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatalf("connect A: %v", err)
 	}
-	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close in test
+	defer func() { _ = connA.Close(ctx) }() //nolint:errcheck // best-effort close in test
+	if _, err := connA.Exec(ctx, `CREATE TABLE only_here (id int)`); err != nil {
+		t.Fatalf("create table in A: %v", err)
+	}
+
+	connB, err := pgx.Connect(ctx, pgtest.DSN(t))
+	if err != nil {
+		t.Fatalf("connect B: %v", err)
+	}
+	defer func() { _ = connB.Close(ctx) }() //nolint:errcheck // best-effort close in test
 
 	var exists bool
-	if err := conn.QueryRow(ctx,
+	if err := connB.QueryRow(ctx,
 		`SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'only_here')`,
 	).Scan(&exists); err != nil {
-		t.Fatalf("query: %v", err)
+		t.Fatalf("query B: %v", err)
 	}
 	if exists {
-		t.Error("table leaked across isolated databases")
+		t.Error("table leaked from database A into database B")
 	}
 }

@@ -6,6 +6,7 @@ package pgtest
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net/url"
@@ -25,15 +26,25 @@ var Schema string
 
 const (
 	containerName   = "tg-test-pg"
-	templateDB      = "tg_template"
+	templatePrefix  = "tg_template_"
 	advisoryLockKey = 0x7467 // "tg"
 )
 
 var (
-	once     sync.Once
-	adminDSN string // connection string to the admin ("postgres") database
-	errSetup error
+	once         sync.Once
+	adminDSN     string // connection string to the admin ("postgres") database
+	templateName string // content-addressed template DB, resolved at setup
+	errSetup     error
 )
+
+// schemaHash returns a short hex digest of the current Schema so the template
+// is content-addressed: an empty Schema and store.Schema map to different
+// template names, so changing Schema builds a new template instead of reusing
+// a stale one from the reusable container.
+func schemaHash() string {
+	sum := sha256.Sum256([]byte(Schema))
+	return hex.EncodeToString(sum[:])[:12]
+}
 
 func setup() {
 	ctx := context.Background()
@@ -53,9 +64,18 @@ func setup() {
 	if errSetup != nil {
 		return
 	}
+	templateName = templatePrefix + schemaHash()
 	errSetup = ensureTemplate(ctx)
 }
 
+// ensureTemplate builds the content-addressed template crash-safely: the schema
+// is applied to a scratch "<name>_building" database that is only renamed to the
+// canonical templateName once fully built. So the canonical name existing always
+// means "complete", closing the partial-init-on-crash window. The whole
+// check-build-rename is serialized by a pg advisory lock across parallel test
+// binaries sharing the reusable container.
+// ponytail: old-hash templates from earlier Schema versions are left behind;
+// harmless in an ephemeral test container, GC them if they ever pile up.
 func ensureTemplate(ctx context.Context) error {
 	conn, err := pgx.Connect(ctx, adminDSN)
 	if err != nil {
@@ -63,7 +83,6 @@ func ensureTemplate(ctx context.Context) error {
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close of admin conn
 
-	// Serialize template creation across parallel test binaries.
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, advisoryLockKey); err != nil {
 		return fmt.Errorf("lock: %w", err)
 	}
@@ -71,20 +90,36 @@ func ensureTemplate(ctx context.Context) error {
 
 	var exists bool
 	if err := conn.QueryRow(ctx,
-		`SELECT EXISTS (SELECT FROM pg_database WHERE datname = $1)`, templateDB,
+		`SELECT EXISTS (SELECT FROM pg_database WHERE datname = $1)`, templateName,
 	).Scan(&exists); err != nil {
 		return fmt.Errorf("check template: %w", err)
 	}
 	if exists {
 		return nil
 	}
-	if _, err := conn.Exec(ctx, `CREATE DATABASE `+templateDB); err != nil {
-		return fmt.Errorf("create template: %w", err)
+
+	// Identifiers below are built from a constant prefix + hex hash, never user
+	// input; Postgres DDL cannot bind identifiers as parameters (no G201 risk).
+	building := templateName + "_building"
+	if _, err := conn.Exec(ctx, `DROP DATABASE IF EXISTS `+building+` WITH (FORCE)`); err != nil {
+		return fmt.Errorf("drop stale building: %w", err)
 	}
-	if Schema == "" {
-		return nil
+	if _, err := conn.Exec(ctx, `CREATE DATABASE `+building); err != nil {
+		return fmt.Errorf("create building: %w", err)
 	}
-	tconn, err := pgx.Connect(ctx, replaceDBName(adminDSN, templateDB))
+	if Schema != "" {
+		if err := applySchema(ctx, building); err != nil {
+			return err
+		}
+	}
+	if _, err := conn.Exec(ctx, `ALTER DATABASE `+building+` RENAME TO `+templateName); err != nil {
+		return fmt.Errorf("promote template: %w", err)
+	}
+	return nil
+}
+
+func applySchema(ctx context.Context, db string) error {
+	tconn, err := pgx.Connect(ctx, replaceDBName(adminDSN, db))
 	if err != nil {
 		return fmt.Errorf("template connect: %w", err)
 	}
@@ -113,10 +148,10 @@ func DSN(tb testing.TB) string {
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close of admin conn
 
-	// G201 is not a risk here: name is internally-generated hex and templateDB
-	// is a constant; Postgres DDL cannot bind identifiers as parameters.
+	// G201 is not a risk here: name is internally-generated hex and templateName
+	// is a constant prefix + hex hash; Postgres DDL cannot bind identifiers.
 	if _, err := conn.Exec(ctx,
-		fmt.Sprintf(`CREATE DATABASE %s TEMPLATE %s`, name, templateDB),
+		fmt.Sprintf(`CREATE DATABASE %s TEMPLATE %s`, name, templateName),
 	); err != nil {
 		tb.Fatalf("clone db: %v", err)
 	}
