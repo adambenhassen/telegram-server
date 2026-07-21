@@ -11,11 +11,12 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/gotd/td/tgtest"
+	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -57,7 +58,7 @@ func run(log *slog.Logger) error {
 	tgcfg := api.DefaultConfig(cfg.DCID, host, port)
 	handler := api.New(st, cfg.DCID, tgcfg, log)
 
-	server := tgtest.NewServer(tgtest.NewPrivateKey(key), handler, tgtest.ServerOptions{DC: cfg.DCID})
+	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewMemoryAuthKeyStore(), handler, log)
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)
