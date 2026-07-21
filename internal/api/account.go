@@ -7,6 +7,12 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
 
+// authorizationTTLDays is the session lifetime advertised to clients in
+// account.getAuthorizations. The server does not auto-expire sessions, so this
+// is a non-misleading policy value (~1 year) rather than a real expiry, and is
+// not enforced by any sweep.
+const authorizationTTLDays = 365
+
 // handleGetAuthorizations serves account.getAuthorizations. It lists the auth
 // keys bound to the caller's user as sessions. An unbound key (UserID 0) is
 // reported as unregistered so the client starts the auth flow. The session
@@ -34,7 +40,10 @@ func (h *handlers) handleGetAuthorizations(r *mtproto.Request) (bin.Encoder, err
 			DateActive:  int(k.LastSeenAt.Unix()),
 		}
 	}
-	return &tg.AccountAuthorizations{Authorizations: auths}, nil
+	return &tg.AccountAuthorizations{
+		AuthorizationTTLDays: authorizationTTLDays,
+		Authorizations:       auths,
+	}, nil
 }
 
 // handleResetAuthorization serves account.resetAuthorization. It revokes the
