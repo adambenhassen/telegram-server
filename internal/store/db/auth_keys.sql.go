@@ -56,7 +56,7 @@ func (q *Queries) AuthKeysByUser(ctx context.Context, userID *int64) ([]AuthKey,
 	return items, nil
 }
 
-const bindAuthKeyUser = `-- name: BindAuthKeyUser :exec
+const bindAuthKeyUser = `-- name: BindAuthKeyUser :execrows
 UPDATE auth_keys SET user_id = $2 WHERE id = $1
 `
 
@@ -65,9 +65,12 @@ type BindAuthKeyUserParams struct {
 	UserID *int64
 }
 
-func (q *Queries) BindAuthKeyUser(ctx context.Context, arg BindAuthKeyUserParams) error {
-	_, err := q.db.Exec(ctx, bindAuthKeyUser, arg.ID, arg.UserID)
-	return err
+func (q *Queries) BindAuthKeyUser(ctx context.Context, arg BindAuthKeyUserParams) (int64, error) {
+	result, err := q.db.Exec(ctx, bindAuthKeyUser, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteAuthKey = `-- name: DeleteAuthKey :exec

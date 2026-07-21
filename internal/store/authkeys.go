@@ -40,9 +40,15 @@ func (s *Store) AuthKeyByID(ctx context.Context, id int64) (AuthKey, bool, error
 }
 
 // BindAuthKeyUser links the auth key id to userID. The user must already exist.
+// It returns ErrAuthKeyNotFound when no auth-key row matches id (absent key or a
+// concurrent delete), so callers fail closed instead of reporting a false bind.
 func (s *Store) BindAuthKeyUser(ctx context.Context, id, userID int64) error {
-	if err := s.q.BindAuthKeyUser(ctx, db.BindAuthKeyUserParams{ID: id, UserID: &userID}); err != nil {
+	rows, err := s.q.BindAuthKeyUser(ctx, db.BindAuthKeyUserParams{ID: id, UserID: &userID})
+	if err != nil {
 		return fmt.Errorf("bind auth key user: %w", err)
+	}
+	if rows == 0 {
+		return ErrAuthKeyNotFound
 	}
 	return nil
 }

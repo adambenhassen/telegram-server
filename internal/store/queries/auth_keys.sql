@@ -8,7 +8,7 @@ ON CONFLICT (id) DO UPDATE
 -- name: AuthKeyByID :one
 SELECT * FROM auth_keys WHERE id = $1;
 
--- name: BindAuthKeyUser :exec
+-- name: BindAuthKeyUser :execrows
 UPDATE auth_keys SET user_id = $2 WHERE id = $1;
 
 -- name: DeleteAuthKey :exec
