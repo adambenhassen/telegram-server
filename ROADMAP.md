@@ -28,6 +28,24 @@ proven against a real gotd client as the compatibility oracle, with an E2E gate.
   a listener that pushes to that user's local connections. A missed notify loses
   nothing — the next `getDifference` backfills.
 
+## Positioning
+
+Existing open MTProto servers reach production scale by going wide and
+distributed — many microservices, a message broker, a cache tier, service
+discovery, separate object storage. This project takes the opposite bet.
+
+**Design bet:** a small, fully-open, verifiable core that runs on one datastore
+and no message broker. Postgres is the whole backend — rows *and* the realtime
+bus (`LISTEN`/`NOTIFY`) — betting it carries update fan-out far enough that
+Kafka/Redis/etcd stay unnecessary well into groups and channels. If a broker is
+ever needed, it's an optimization behind the same `buildUpdates` path, not a
+rewrite.
+
+**Priorities in order:** correctness and openness first, operational simplicity
+second, feature breadth last. Every milestone stays provable against a real gotd
+client. Breadth is the deliberate trade; a core you can fully run, read, and
+verify is the return.
+
 ## Current RPC surface
 
 Auth & account
@@ -97,7 +115,7 @@ Updates
 ### M5 — Media & files
 - `upload.saveFilePart` / `upload.saveBigFilePart`, `upload.getFile`.
 - Photo/document messages, thumbnails, `messages.sendMedia`.
-- Blob store abstraction: local filesystem first, S3-compatible later.
+- Blob store abstraction: local filesystem first, RustFS (S3-compatible) later.
 - Reference-counted storage; file `access_hash` and expiry.
 
 ### M6 — Group chats (basic)
@@ -130,6 +148,8 @@ Runs in parallel with features; currently the weakest area for production.
   manifests (the design assumes horizontal replicas behind a load balancer).
 - **CI.** No pipeline yet. Add build + `go test ./...` + `golangci-lint` +
   `atlas migrate validate` on every push.
+- **API layer target.** Pin and document a target Telegram API layer, and track
+  the gotd schema version the server is validated against.
 - **Multi-DC.** Config advertises a single DC (self). Real Telegram clients expect
   a DC list and migration; needs a DC registry and `PHONE_MIGRATE`/`NETWORK_MIGRATE`.
 - **Observability.** Structured logs exist; add metrics (connections, pts lag,
