@@ -50,7 +50,7 @@ func TestRestartPersistence(t *testing.T) {
 	}
 
 	// One database for the whole test.
-	st, err := store.Open(ctx, pgtest.DSN(t))
+	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey())
 	if err != nil {
 		t.Fatal(err)
 	}

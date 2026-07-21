@@ -21,12 +21,15 @@ func TestMemoryAuthKeyStoreSaveGet(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	got, ok, err := s.Get(ctx, authKey.ID)
+	got, userID, ok, err := s.Get(ctx, authKey.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if !ok {
 		t.Fatal("expected key present")
+	}
+	if userID != 0 {
+		t.Fatalf("expected unbound userID 0, got %d", userID)
 	}
 	if got.ID != authKey.ID || got.Value != authKey.Value {
 		t.Fatal("returned key does not match saved key")
@@ -34,7 +37,7 @@ func TestMemoryAuthKeyStoreSaveGet(t *testing.T) {
 }
 
 func TestMemoryAuthKeyStoreMiss(t *testing.T) {
-	_, ok, err := mtproto.NewMemoryAuthKeyStore().Get(context.Background(), [8]byte{1, 2, 3})
+	_, _, ok, err := mtproto.NewMemoryAuthKeyStore().Get(context.Background(), [8]byte{1, 2, 3})
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

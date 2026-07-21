@@ -26,6 +26,9 @@ import (
 const (
 	defaultReadTimeout  = 30 * time.Second
 	defaultWriteTimeout = 30 * time.Second
+	// touchInterval throttles per-connection last-seen updates so an active
+	// session writes its activity time at most once per interval, not per frame.
+	touchInterval = 60 * time.Second
 )
 
 // Server is an MTProto server: it accepts transport connections, performs key
@@ -130,6 +133,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 
 	conn := newConn(tconn, s.cipher, s.msgID, s.clock, s.writeTimeout, s.log)
 	b := new(bin.Buffer)
+	var lastTouch time.Time
 	for {
 		if err := s.read(ctx, tconn, b); err != nil {
 			return err
@@ -147,7 +151,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 			continue
 		}
 
-		key, ok, err := s.keys.Get(ctx, authKeyID)
+		key, userID, ok, err := s.keys.Get(ctx, authKeyID)
 		if err != nil {
 			return errors.Join(errors.New("get auth key"), err)
 		}
@@ -158,10 +162,26 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 			continue
 		}
 
+		s.touch(ctx, authKeyID, &lastTouch)
+
 		conn.setKey(key)
-		if err := s.rpcHandle(ctx, conn, b); err != nil {
+		if err := s.rpcHandle(ctx, conn, b, userID); err != nil {
 			return err
 		}
+	}
+}
+
+// touch advances the auth key's last-seen time at most once per touchInterval
+// per connection. It is best-effort: a failed update is logged, never fatal, so
+// activity tracking cannot break an otherwise-healthy session.
+func (s *Server) touch(ctx context.Context, id [8]byte, last *time.Time) {
+	now := s.clock.Now()
+	if now.Sub(*last) < touchInterval {
+		return
+	}
+	*last = now
+	if err := s.keys.Touch(ctx, id); err != nil {
+		s.log.Info("touch auth key", "err", err)
 	}
 }
 

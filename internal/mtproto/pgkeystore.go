@@ -28,30 +28,27 @@ func (p *pgAuthKeyStore) Save(ctx context.Context, key crypto.AuthKey) error {
 	return p.s.SaveAuthKey(ctx, key.IntID(), key.Value[:])
 }
 
-// Get loads the stored key value and reconstructs the AuthKey. The id is
-// recomputed from the key bytes (crypto.Key.WithID), so it round-trips exactly:
-// identical value bytes yield an identical fingerprint and int64 id.
-func (p *pgAuthKeyStore) Get(ctx context.Context, id [8]byte) (crypto.AuthKey, bool, error) {
+// Get loads the stored key value and the bound user in one lookup and
+// reconstructs the AuthKey. The id is recomputed from the key bytes
+// (crypto.Key.WithID), so it round-trips exactly: identical value bytes yield an
+// identical fingerprint and int64 id. userID is 0 when the key is unbound.
+func (p *pgAuthKeyStore) Get(ctx context.Context, id [8]byte) (crypto.AuthKey, int64, bool, error) {
 	row, ok, err := p.s.AuthKeyByID(ctx, AuthKeyIDInt64(id))
 	if err != nil {
-		return crypto.AuthKey{}, false, err
+		return crypto.AuthKey{}, 0, false, err
 	}
 	if !ok {
-		return crypto.AuthKey{}, false, nil
+		return crypto.AuthKey{}, 0, false, nil
 	}
 	if len(row.Value) != len(crypto.Key{}) {
-		return crypto.AuthKey{}, false, fmt.Errorf("auth key %d: stored value is %d bytes, want %d", row.ID, len(row.Value), len(crypto.Key{}))
+		return crypto.AuthKey{}, 0, false, fmt.Errorf("auth key %d: stored value is %d bytes, want %d", row.ID, len(row.Value), len(crypto.Key{}))
 	}
 	var value crypto.Key
 	copy(value[:], row.Value)
-	return value.WithID(), true, nil
+	return value.WithID(), row.UserID, true, nil
 }
 
-// UserID returns the user bound to the auth key, or 0 when unbound/unknown.
-func (p *pgAuthKeyStore) UserID(ctx context.Context, id [8]byte) (int64, error) {
-	row, ok, err := p.s.AuthKeyByID(ctx, AuthKeyIDInt64(id))
-	if err != nil || !ok {
-		return 0, err
-	}
-	return row.UserID, nil
+// Touch advances the key's last-seen time via the store.
+func (p *pgAuthKeyStore) Touch(ctx context.Context, id [8]byte) error {
+	return p.s.TouchAuthKey(ctx, AuthKeyIDInt64(id))
 }

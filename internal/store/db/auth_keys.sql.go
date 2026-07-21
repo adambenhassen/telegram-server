@@ -99,3 +99,12 @@ func (q *Queries) SaveAuthKey(ctx context.Context, arg SaveAuthKeyParams) error 
 	_, err := q.db.Exec(ctx, saveAuthKey, arg.ID, arg.KeyValue)
 	return err
 }
+
+const touchAuthKey = `-- name: TouchAuthKey :exec
+UPDATE auth_keys SET last_seen_at = now() WHERE id = $1
+`
+
+func (q *Queries) TouchAuthKey(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, touchAuthKey, id)
+	return err
+}

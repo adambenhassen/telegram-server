@@ -4,6 +4,7 @@
 package pgtest
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -182,6 +183,22 @@ func loadMigrations() ([]migration, error) {
 		migs = append(migs, migration{name: e.Name(), sql: string(b)})
 	}
 	return migs, nil
+}
+
+// EncKey returns a fixed 32-byte auth-key encryption master key for tests. It is
+// deterministic so a store reopened against the same database (restart tests)
+// decrypts keys written by the prior instance.
+func EncKey() []byte {
+	return bytes.Repeat([]byte{0x2a}, 32)
+}
+
+// Prewarm triggers the one-time container setup (image pull and boot) outside of
+// any test's deadline. Call it from TestMain so a cold container start is not
+// charged against a test's context timeout, which otherwise flakes the first run
+// on a fresh machine. Returns the setup error, if any.
+func Prewarm() error {
+	once.Do(setup)
+	return errSetup
 }
 
 // DSN clones a fresh database from the template and returns its connection

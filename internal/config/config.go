@@ -2,9 +2,12 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"os"
 	"strconv"
+
+	"github.com/adambenhassen/telegram-server/internal/keycrypt"
 )
 
 // Config holds server configuration.
@@ -12,7 +15,9 @@ type Config struct {
 	ListenAddr  string
 	PostgresDSN string
 	RSAKeyPath  string
-	DCID        int
+	// AuthKeyEncKey is the 32-byte master key that encrypts auth keys at rest.
+	AuthKeyEncKey []byte
+	DCID          int
 }
 
 // Load reads configuration from environment variables, applying defaults.
@@ -33,7 +38,29 @@ func Load() (Config, error) {
 	if cfg.PostgresDSN == "" {
 		return Config{}, errors.New("TG_POSTGRES_DSN is required")
 	}
+	encKey, err := decodeEncKey(os.Getenv("TG_AUTHKEY_ENC_KEY"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AuthKeyEncKey = encKey
 	return cfg, nil
+}
+
+// decodeEncKey parses the hex-encoded auth-key encryption master key. It is
+// required and must decode to exactly keycrypt.KeyLen bytes, so the server fails
+// fast rather than starting without at-rest encryption or with a weak key.
+func decodeEncKey(raw string) ([]byte, error) {
+	if raw == "" {
+		return nil, errors.New("TG_AUTHKEY_ENC_KEY is required (64 hex chars = 32 bytes)")
+	}
+	key, err := hex.DecodeString(raw)
+	if err != nil {
+		return nil, errors.New("TG_AUTHKEY_ENC_KEY must be valid hex")
+	}
+	if len(key) != keycrypt.KeyLen {
+		return nil, errors.New("TG_AUTHKEY_ENC_KEY must be 64 hex chars (32 bytes)")
+	}
+	return key, nil
 }
 
 func envOr(key, fallback string) string {

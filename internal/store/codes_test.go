@@ -112,7 +112,7 @@ func TestVerifyCodeExpired(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(ctx, dsn)
+	s, err := store.Open(ctx, dsn, pgtest.EncKey())
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(ctx, dsn)
+	s, err := store.Open(ctx, dsn, pgtest.EncKey())
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

@@ -22,10 +22,15 @@ type AuthKey struct {
 	LastSeenAt time.Time
 }
 
-// SaveAuthKey stores value under id, idempotently. Re-saving an existing id
-// refreshes its value and last-seen time without touching its user binding.
+// SaveAuthKey stores value under id, idempotently. The key value is encrypted at
+// rest with the store's master key. Re-saving an existing id refreshes its value
+// and last-seen time without touching its user binding.
 func (s *Store) SaveAuthKey(ctx context.Context, id int64, value []byte) error {
-	if err := s.q.SaveAuthKey(ctx, db.SaveAuthKeyParams{ID: id, KeyValue: value}); err != nil {
+	enc, err := s.cipher.Seal(value)
+	if err != nil {
+		return fmt.Errorf("save auth key: %w", err)
+	}
+	if err := s.q.SaveAuthKey(ctx, db.SaveAuthKeyParams{ID: id, KeyValue: enc}); err != nil {
 		return fmt.Errorf("save auth key: %w", err)
 	}
 	return nil
@@ -40,7 +45,11 @@ func (s *Store) AuthKeyByID(ctx context.Context, id int64) (AuthKey, bool, error
 	case err != nil:
 		return AuthKey{}, false, fmt.Errorf("auth key by id: %w", err)
 	}
-	return authKeyFromDB(k), true, nil
+	key, err := s.authKeyFromDB(k)
+	if err != nil {
+		return AuthKey{}, false, err
+	}
+	return key, true, nil
 }
 
 // BindAuthKeyUser links the auth key id to userID. The user must already exist.
@@ -53,6 +62,17 @@ func (s *Store) BindAuthKeyUser(ctx context.Context, id, userID int64) error {
 	}
 	if rows == 0 {
 		return ErrAuthKeyNotFound
+	}
+	return nil
+}
+
+// TouchAuthKey advances last_seen_at to now for id. It backs the DateActive
+// field of account.getAuthorizations with real session activity; the mtproto
+// loop throttles calls so this is not written on every frame. Touching a missing
+// id is a no-op.
+func (s *Store) TouchAuthKey(ctx context.Context, id int64) error {
+	if err := s.q.TouchAuthKey(ctx, id); err != nil {
+		return fmt.Errorf("touch auth key: %w", err)
 	}
 	return nil
 }
@@ -73,23 +93,32 @@ func (s *Store) AuthKeysByUser(ctx context.Context, userID int64) ([]AuthKey, er
 	}
 	keys := make([]AuthKey, len(rows))
 	for i, r := range rows {
-		keys[i] = authKeyFromDB(r)
+		key, err := s.authKeyFromDB(r)
+		if err != nil {
+			return nil, err
+		}
+		keys[i] = key
 	}
 	return keys, nil
 }
 
-// authKeyFromDB maps a generated row to the domain type, collapsing a NULL
-// user_id to UserID 0.
-func authKeyFromDB(k db.AuthKey) AuthKey {
+// authKeyFromDB maps a generated row to the domain type, decrypting the stored
+// key value and collapsing a NULL user_id to UserID 0. A decrypt failure (wrong
+// master key or corrupt/tampered row) is returned, never silently swallowed.
+func (s *Store) authKeyFromDB(k db.AuthKey) (AuthKey, error) {
+	value, err := s.cipher.Open(k.KeyValue)
+	if err != nil {
+		return AuthKey{}, fmt.Errorf("decrypt auth key %d: %w", k.ID, err)
+	}
 	var userID int64
 	if k.UserID != nil {
 		userID = *k.UserID
 	}
 	return AuthKey{
 		ID:         k.ID,
-		Value:      k.KeyValue,
+		Value:      value,
 		UserID:     userID,
 		CreatedAt:  k.CreatedAt.Time,
 		LastSeenAt: k.LastSeenAt.Time,
-	}
+	}, nil
 }
