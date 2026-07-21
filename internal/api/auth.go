@@ -36,6 +36,10 @@ func verifyToRPC(err error) *tgerr.Error {
 		return errCodeInvalid
 	case errors.Is(err, store.ErrCodeExpired):
 		return errCodeExpired
+	// An exhausted code maps to the generic invalid error so the attempt cap is
+	// not observable to the client.
+	case errors.Is(err, store.ErrCodeExhausted):
+		return errCodeInvalid
 	default:
 		return errInternal
 	}
@@ -51,6 +55,9 @@ func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	hash, code, err := h.store.IssueCode(r.Ctx, req.PhoneNumber)
 	if err != nil {
+		if errors.Is(err, store.ErrResendTooSoon) {
+			return nil, errFloodWait
+		}
 		h.log.Error("issue code", "phone", req.PhoneNumber, "err", err)
 		return nil, errInternal
 	}
