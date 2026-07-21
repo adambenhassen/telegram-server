@@ -8,6 +8,14 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AuthKey struct {
+	ID         int64
+	KeyValue   []byte
+	UserID     *int64
+	CreatedAt  pgtype.Timestamptz
+	LastSeenAt pgtype.Timestamptz
+}
+
 type PhoneCode struct {
 	Phone     string
 	CodeHash  string
