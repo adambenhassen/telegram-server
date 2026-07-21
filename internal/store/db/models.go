@@ -9,11 +9,12 @@ import (
 )
 
 type AuthKey struct {
-	ID         int64
-	KeyValue   []byte
-	UserID     *int64
-	CreatedAt  pgtype.Timestamptz
-	LastSeenAt pgtype.Timestamptz
+	ID            int64
+	KeyValue      []byte
+	UserID        *int64
+	CreatedAt     pgtype.Timestamptz
+	LastSeenAt    pgtype.Timestamptz
+	PendingUserID *int64
 }
 
 type PhoneCode struct {
@@ -32,4 +33,16 @@ type User struct {
 	FirstName string
 	LastName  string
 	CreatedAt pgtype.Timestamptz
+}
+
+type UserPassword struct {
+	UserID        int64
+	Salt1         []byte
+	Salt2         []byte
+	Verifier      []byte
+	Hint          string
+	RecoveryEmail *string
+	HasRecovery   bool
+	CreatedAt     pgtype.Timestamptz
+	UpdatedAt     pgtype.Timestamptz
 }

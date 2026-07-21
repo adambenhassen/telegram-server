@@ -83,21 +83,31 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("create user", "phone", req.PhoneNumber, "err", err)
 		return nil, errInternal
 	}
-	// Bind the current connection's auth key to the signed-in user so it stays
-	// authorized across reconnects and server restarts.
-	if err := h.store.BindAuthKeyUser(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), user.ID); err != nil {
+	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
+
+	// If the account has a 2FA cloud password, the phone code alone does not
+	// authorize: stage the key as half-authorized (pending, never user_id) and
+	// require the SRP password step via auth.checkPassword.
+	_, hasPassword, err := h.store.PasswordByUser(r.Ctx, user.ID)
+	if err != nil {
+		h.log.Error("sign in: password lookup", "user_id", user.ID, "err", err)
+		return nil, errInternal
+	}
+	if hasPassword {
+		if err := h.store.SetPendingUser(r.Ctx, keyID, user.ID); err != nil {
+			h.log.Error("sign in: set pending", "user_id", user.ID, "err", err)
+			return nil, errInternal
+		}
+		return nil, errSessionPasswordNeeded
+	}
+
+	// No password: bind the auth key to the user so it stays authorized across
+	// reconnects and server restarts.
+	if err := h.store.BindAuthKeyUser(r.Ctx, keyID, user.ID); err != nil {
 		h.log.Error("bind auth key", "user_id", user.ID, "err", err)
 		return nil, errInternal
 	}
-	return &tg.AuthAuthorization{
-		User: &tg.User{
-			ID:         user.ID,
-			Self:       true,
-			Phone:      user.Phone,
-			FirstName:  user.FirstName,
-			AccessHash: user.ID, // M1: self access hash placeholder
-		},
-	}, nil
+	return &tg.AuthAuthorization{User: userTL(user)}, nil
 }
 
 // handleLogOut serves auth.logOut. It deletes the auth key the request arrived

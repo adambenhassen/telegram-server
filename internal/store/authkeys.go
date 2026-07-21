@@ -15,11 +15,15 @@ import (
 // unbound; once login binds it to an account UserID holds that user's id.
 // CreatedAt/LastSeenAt back the session dates reported by account.getAuthorizations.
 type AuthKey struct {
-	ID         int64
-	Value      []byte
-	UserID     int64
-	CreatedAt  time.Time
-	LastSeenAt time.Time
+	ID     int64
+	Value  []byte
+	UserID int64
+	// PendingUserID is the half-authorized user staged by signIn for a 2FA
+	// account; it is 0 unless a password challenge is outstanding and never
+	// grants access on its own.
+	PendingUserID int64
+	CreatedAt     time.Time
+	LastSeenAt    time.Time
 }
 
 // SaveAuthKey stores value under id, idempotently. The key value is encrypted at
@@ -59,6 +63,40 @@ func (s *Store) BindAuthKeyUser(ctx context.Context, id, userID int64) error {
 	rows, err := s.q.BindAuthKeyUser(ctx, db.BindAuthKeyUserParams{ID: id, UserID: &userID})
 	if err != nil {
 		return fmt.Errorf("bind auth key user: %w", err)
+	}
+	if rows == 0 {
+		return ErrAuthKeyNotFound
+	}
+	return nil
+}
+
+// SetPendingUser marks the auth key id as half-authorized for userID: the state
+// between auth.signIn and auth.checkPassword when the account has 2FA. It clears
+// any existing user_id binding so the key is de-authorized until checkPassword
+// promotes it — a re-signIn on an already-bound key must not stay authorized as
+// the old user. It never grants access on its own; only PromotePendingUser
+// authorizes. Returns ErrAuthKeyNotFound when no auth-key row matches id, so
+// callers fail closed.
+func (s *Store) SetPendingUser(ctx context.Context, id, userID int64) error {
+	rows, err := s.q.SetPendingUser(ctx, db.SetPendingUserParams{ID: id, PendingUserID: &userID})
+	if err != nil {
+		return fmt.Errorf("set pending user: %w", err)
+	}
+	if rows == 0 {
+		return ErrAuthKeyNotFound
+	}
+	return nil
+}
+
+// PromotePendingUser authorizes the auth key id by moving pending_user_id to
+// user_id and clearing pending, but only when the key's current pending matches
+// userID. A mismatch or absent pending affects zero rows and returns
+// ErrAuthKeyNotFound, so a checkPassword can never authorize a key that signIn
+// did not stage for this exact user.
+func (s *Store) PromotePendingUser(ctx context.Context, id, userID int64) error {
+	rows, err := s.q.PromotePendingUser(ctx, db.PromotePendingUserParams{ID: id, UserID: &userID})
+	if err != nil {
+		return fmt.Errorf("promote pending user: %w", err)
 	}
 	if rows == 0 {
 		return ErrAuthKeyNotFound
@@ -114,11 +152,16 @@ func (s *Store) authKeyFromDB(k db.AuthKey) (AuthKey, error) {
 	if k.UserID != nil {
 		userID = *k.UserID
 	}
+	var pendingUserID int64
+	if k.PendingUserID != nil {
+		pendingUserID = *k.PendingUserID
+	}
 	return AuthKey{
-		ID:         k.ID,
-		Value:      value,
-		UserID:     userID,
-		CreatedAt:  k.CreatedAt.Time,
-		LastSeenAt: k.LastSeenAt.Time,
+		ID:            k.ID,
+		Value:         value,
+		UserID:        userID,
+		PendingUserID: pendingUserID,
+		CreatedAt:     k.CreatedAt.Time,
+		LastSeenAt:    k.LastSeenAt.Time,
 	}, nil
 }
