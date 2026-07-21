@@ -70,12 +70,16 @@ func codeActive(row db.PhoneCode) bool {
 }
 
 // VerifyCode checks the code+hash for phone. It is single-use and fail-closed:
-// an already-consumed, expired, or exhausted code never verifies. Checks run in
-// order — consumed → expired → exhausted → credential match — so the strictest
-// terminal state wins. A wrong hash or code increments the attempt counter and
-// returns ErrCodeInvalid without revealing which field was wrong; on the attempt
-// that reaches maxAttempts the code becomes exhausted. A correct match consumes
-// the code and returns nil.
+// an already-consumed, expired, or exhausted code never verifies. The Go-side
+// checks (consumed → expired → exhausted) map the right sentinel in the common
+// sequential case. Success is decided by a compare-and-swap scoped to the exact
+// issued code (phone+hash+code) with the terminal-state guards in the WHERE, so
+// a concurrent resend/consume/expiry that slips between the read and the write
+// makes the swap affect zero rows → ErrCodeInvalid. Both mutations are scoped by
+// code_hash so they can never corrupt a code that a resend replaced. A wrong
+// hash or code increments the attempt counter and returns ErrCodeInvalid without
+// revealing which field was wrong; the attempt that reaches maxAttempts exhausts
+// the code.
 func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error {
 	row, err := s.q.GetCode(ctx, phone)
 	switch {
@@ -94,13 +98,27 @@ func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error 
 		return ErrCodeExhausted
 	}
 	if hash != row.CodeHash || code != row.Code {
-		if err := s.q.IncrementCodeAttempts(ctx, phone); err != nil {
+		if err := s.q.IncrementCodeAttempts(ctx, db.IncrementCodeAttemptsParams{
+			Phone:    phone,
+			CodeHash: hash,
+		}); err != nil {
 			return fmt.Errorf("verify code: %w", err)
 		}
 		return ErrCodeInvalid
 	}
-	if err := s.q.ConsumeCode(ctx, phone); err != nil {
+	rows, err := s.q.ConsumeCode(ctx, db.ConsumeCodeParams{
+		Phone:    phone,
+		CodeHash: hash,
+		Code:     code,
+		Attempts: maxAttempts,
+	})
+	if err != nil {
 		return fmt.Errorf("verify code: %w", err)
+	}
+	if rows == 0 {
+		// The code was consumed/expired/exhausted/replaced concurrently between
+		// the read above and this swap. Fail closed.
+		return ErrCodeInvalid
 	}
 	return nil
 }
