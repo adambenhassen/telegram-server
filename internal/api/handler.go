@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"errors"
 	"log/slog"
 
@@ -20,7 +19,7 @@ type handlers struct {
 	log   *slog.Logger
 }
 
-type methodFunc func(ctx context.Context, in *bin.Buffer) (bin.Encoder, error)
+type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
 
 // New builds the RPC handler: dispatcher wrapped with UnpackInvoke so
 // invokeWithLayer/initConnection wrappers are peeled before dispatch.
@@ -45,7 +44,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger) mtproto.Han
 
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
 	d.HandleFunc(id, func(c *mtproto.Conn, req *mtproto.Request) error {
-		res, err := fn(req.Ctx, req.Buf)
+		res, err := fn(req)
 		if err != nil {
 			var rpc *tgerr.Error
 			if !errors.As(err, &rpc) {

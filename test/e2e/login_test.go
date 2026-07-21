@@ -49,7 +49,7 @@ func TestClientLogin(t *testing.T) {
 	const dcID = 2
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	handler := api.New(st, dcID, tgcfg, codes.Logger())
-	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewMemoryAuthKeyStore(), handler, codes.Logger())
+	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"errors"
 	"regexp"
 
@@ -9,6 +8,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -41,15 +41,15 @@ func verifyToRPC(err error) *tgerr.Error {
 	}
 }
 
-func (h *handlers) handleSendCode(ctx context.Context, in *bin.Buffer) (bin.Encoder, error) {
+func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthSendCodeRequest
-	if err := req.Decode(in); err != nil {
+	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
 	if err := validatePhone(req.PhoneNumber); err != nil {
 		return nil, err
 	}
-	hash, code, err := h.store.IssueCode(ctx, req.PhoneNumber)
+	hash, code, err := h.store.IssueCode(r.Ctx, req.PhoneNumber)
 	if err != nil {
 		h.log.Error("issue code", "phone", req.PhoneNumber, "err", err)
 		return nil, errInternal
@@ -58,22 +58,28 @@ func (h *handlers) handleSendCode(ctx context.Context, in *bin.Buffer) (bin.Enco
 	return newSentCode(hash), nil
 }
 
-func (h *handlers) handleSignIn(ctx context.Context, in *bin.Buffer) (bin.Encoder, error) {
+func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthSignInRequest
-	if err := req.Decode(in); err != nil {
+	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
 	code, _ := req.GetPhoneCode()
-	if err := h.store.VerifyCode(ctx, req.PhoneNumber, req.PhoneCodeHash, code); err != nil {
+	if err := h.store.VerifyCode(r.Ctx, req.PhoneNumber, req.PhoneCodeHash, code); err != nil {
 		if rpc := verifyToRPC(err); rpc != errInternal {
 			return nil, rpc
 		}
 		h.log.Error("verify code", "phone", req.PhoneNumber, "err", err)
 		return nil, errInternal
 	}
-	user, err := h.store.CreateUser(ctx, req.PhoneNumber)
+	user, err := h.store.CreateUser(r.Ctx, req.PhoneNumber)
 	if err != nil {
 		h.log.Error("create user", "phone", req.PhoneNumber, "err", err)
+		return nil, errInternal
+	}
+	// Bind the current connection's auth key to the signed-in user so it stays
+	// authorized across reconnects and server restarts.
+	if err := h.store.BindAuthKeyUser(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), user.ID); err != nil {
+		h.log.Error("bind auth key", "user_id", user.ID, "err", err)
 		return nil, errInternal
 	}
 	return &tg.AuthAuthorization{

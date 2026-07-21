@@ -58,7 +58,7 @@ func run(log *slog.Logger) error {
 	tgcfg := api.DefaultConfig(cfg.DCID, host, port)
 	handler := api.New(st, cfg.DCID, tgcfg, log)
 
-	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewMemoryAuthKeyStore(), handler, log)
+	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)

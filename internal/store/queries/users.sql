@@ -5,3 +5,6 @@ RETURNING *;
 
 -- name: UserByPhone :one
 SELECT * FROM users WHERE phone = $1;
+
+-- name: UserByID :one
+SELECT * FROM users WHERE id = $1;

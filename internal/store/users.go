@@ -25,6 +25,18 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 	return User{ID: u.ID, Phone: u.Phone, FirstName: u.FirstName, LastName: u.LastName}, nil
 }
 
+// UserByID returns the user for id, ok=false when absent.
+func (s *Store) UserByID(ctx context.Context, id int64) (User, bool, error) {
+	u, err := s.q.UserByID(ctx, id)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return User{}, false, nil
+	case err != nil:
+		return User{}, false, fmt.Errorf("user by id: %w", err)
+	}
+	return User{ID: u.ID, Phone: u.Phone, FirstName: u.FirstName, LastName: u.LastName}, true, nil
+}
+
 // UserByPhone returns the user for phone, ok=false when absent.
 func (s *Store) UserByPhone(ctx context.Context, phone string) (User, bool, error) {
 	u, err := s.q.UserByPhone(ctx, phone)
