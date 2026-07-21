@@ -21,5 +21,14 @@ SELECT * FROM message_events
 WHERE owner_id = $1 AND pts > $2
 ORDER BY pts;
 
+-- EventsWindow returns events in (from_pts, to_pts] ordered, capped by lim. The
+-- upper bound pins the read to a pts snapshot so the difference never advertises
+-- a pts past an event it omitted.
+-- name: EventsWindow :many
+SELECT * FROM message_events
+WHERE owner_id = sqlc.arg(owner_id) AND pts > sqlc.arg(from_pts) AND pts <= sqlc.arg(to_pts)
+ORDER BY pts
+LIMIT sqlc.arg(lim)::int;
+
 -- name: InsertEvent :exec
 INSERT INTO message_events (owner_id, pts, type, local_id) VALUES ($1, $2, $3, $4);

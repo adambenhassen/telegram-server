@@ -56,3 +56,9 @@ CREATE TABLE message_events (
     local_id BIGINT NOT NULL,     -- affected message (or read max_id)
     PRIMARY KEY (owner_id, pts)
 );
+
+-- Backfill update_state for accounts created before this migration, so the
+-- update APIs work immediately without waiting for the account's first send.
+INSERT INTO update_state (user_id)
+SELECT id FROM users
+ON CONFLICT (user_id) DO NOTHING;
