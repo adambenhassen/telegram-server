@@ -10,12 +10,14 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
-	"github.com/gotd/td/tgtest"
+	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -27,6 +29,9 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// sweepInterval is how often the background sweep deletes expired login codes.
+const sweepInterval = 5 * time.Minute
 
 func run(log *slog.Logger) error {
 	cfg, err := config.Load()
@@ -53,11 +58,13 @@ func run(log *slog.Logger) error {
 		}
 	}()
 
+	go sweepExpiredCodes(ctx, st, log)
+
 	host, port := splitHostPort(cfg.ListenAddr)
 	tgcfg := api.DefaultConfig(cfg.DCID, host, port)
 	handler := api.New(st, cfg.DCID, tgcfg, log)
 
-	server := tgtest.NewServer(tgtest.NewPrivateKey(key), handler, tgtest.ServerOptions{DC: cfg.DCID})
+	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)
@@ -67,6 +74,30 @@ func run(log *slog.Logger) error {
 	log.Info("listening", "addr", cfg.ListenAddr, "dc", cfg.DCID)
 
 	return server.Serve(ctx, transport.Listen(ln))
+}
+
+// sweepExpiredCodes periodically deletes expired login codes until ctx is
+// canceled.
+//
+// ponytail: naive full-table DELETE on a plain ticker. Fine at login-code
+// volumes; if phone_codes gets hot, add an index on expires_at, partition by
+// time, or move the sweep to an external cron/job scheduler.
+func sweepExpiredCodes(ctx context.Context, st *store.Store, log *slog.Logger) {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := st.DeleteExpiredCodes(ctx)
+			if err != nil {
+				log.Error("sweep expired codes", "err", err)
+				continue
+			}
+			log.Info("swept expired codes", "deleted", n)
+		}
+	}
 }
 
 func splitHostPort(addr string) (string, int) {
