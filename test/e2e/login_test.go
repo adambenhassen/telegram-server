@@ -9,14 +9,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
-	"github.com/gotd/td/tgtest"
 	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -48,7 +49,7 @@ func TestClientLogin(t *testing.T) {
 	const dcID = 2
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	handler := api.New(st, dcID, tgcfg, codes.Logger())
-	server := tgtest.NewServer(tgtest.NewPrivateKey(key), handler, tgtest.ServerOptions{DC: dcID})
+	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewMemoryAuthKeyStore(), handler, codes.Logger())
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
