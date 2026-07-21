@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -38,6 +39,21 @@ type Conn struct {
 
 	// created is touched only by the connection's single serve goroutine.
 	created map[int64]struct{}
+
+	// lastPushedPts is the highest pts already pushed to this conn, so a
+	// notification never re-delivers events. Read/written only by the delivery
+	// goroutine, but atomic for safety across the registry hand-off.
+	lastPushedPts atomic.Int64
+}
+
+// LastPushedPts returns the highest pts already pushed to this connection.
+func (c *Conn) LastPushedPts() int {
+	return int(c.lastPushedPts.Load())
+}
+
+// SetLastPushedPts records the highest pts pushed to this connection.
+func (c *Conn) SetLastPushedPts(pts int) {
+	c.lastPushedPts.Store(int64(pts))
 }
 
 func newConn(
