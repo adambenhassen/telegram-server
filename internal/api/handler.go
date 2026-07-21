@@ -39,6 +39,8 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger) mtproto.Han
 	register(d, tg.AuthCheckPasswordRequestTypeID, h.handleCheckPassword)
 	register(d, tg.AccountUpdatePasswordSettingsRequestTypeID, h.handleUpdatePasswordSettings)
 	register(d, tg.AccountGetPasswordSettingsRequestTypeID, h.handleGetPasswordSettings)
+	register(d, tg.UpdatesGetStateRequestTypeID, h.handleGetState)
+	register(d, tg.UpdatesGetDifferenceRequestTypeID, h.handleGetDifference)
 	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		id, err := req.Buf.PeekID()
 		if err != nil {
