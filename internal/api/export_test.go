@@ -31,3 +31,15 @@ func BuildUpdatesForTest(s *store.Store, userID int64, fromPts int) ([]tg.Update
 func GetStateForTest(s *store.Store, userID int64) (bin.Encoder, error) {
 	return testHandlers(s).handleGetState(&mtproto.Request{Ctx: context.Background(), UserID: userID})
 }
+
+// PeerUserID exposes the peer-resolution guard for the external api_test package.
+var PeerUserID = peerUserID
+
+// SendMessageForTest encodes req and invokes handleSendMessage for the caller.
+func SendMessageForTest(s *store.Store, userID int64, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
