@@ -19,3 +19,6 @@ UPDATE phone_codes SET attempts = attempts + 1 WHERE phone = $1;
 
 -- name: ConsumeCode :exec
 UPDATE phone_codes SET consumed_at = now() WHERE phone = $1;
+
+-- name: DeleteExpiredCodes :execrows
+DELETE FROM phone_codes WHERE expires_at < now();
