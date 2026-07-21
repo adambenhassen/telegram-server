@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -28,10 +29,15 @@ type Conn struct {
 	writeTimeout time.Duration
 	log          *slog.Logger
 
-	// Per-session state, mutated only by the connection's single serve goroutine.
+	// writeMu serializes socket writes and guards the mutable session state
+	// (authKey, sessionID) it reads, so a server-initiated Push from the delivery
+	// goroutine cannot interleave with a reply write on the serve goroutine.
+	writeMu   sync.Mutex
 	authKey   crypto.AuthKey
 	sessionID int64
-	created   map[int64]struct{}
+
+	// created is touched only by the connection's single serve goroutine.
+	created map[int64]struct{}
 }
 
 func newConn(
@@ -55,7 +61,16 @@ func newConn(
 
 // setKey binds the connection to the auth key for the frame being handled.
 func (c *Conn) setKey(key crypto.AuthKey) {
+	c.writeMu.Lock()
 	c.authKey = key
+	c.writeMu.Unlock()
+}
+
+// setSession records the client session id for subsequent server writes.
+func (c *Conn) setSession(id int64) {
+	c.writeMu.Lock()
+	c.sessionID = id
+	c.writeMu.Unlock()
 }
 
 // markCreated reports whether new_session_created was already sent for session,
@@ -69,6 +84,8 @@ func (c *Conn) markCreated(session int64) bool {
 }
 
 // send encrypts message under the session key and writes it to the transport.
+// The encrypt+write and the session-state reads it depends on are serialized by
+// writeMu so reply and Push writes never interleave on one socket.
 func (c *Conn) send(ctx context.Context, t proto.MessageType, message bin.Encoder) error {
 	var b bin.Buffer
 	if err := message.Encode(&b); err != nil {
@@ -77,6 +94,9 @@ func (c *Conn) send(ctx context.Context, t proto.MessageType, message bin.Encode
 	if b.Len() > math.MaxInt32 {
 		return fmt.Errorf("message too large: %d bytes", b.Len())
 	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
 	data := crypto.EncryptedMessageData{
 		SessionID:              c.sessionID,
@@ -92,6 +112,16 @@ func (c *Conn) send(ctx context.Context, t proto.MessageType, message bin.Encode
 	defer cancel()
 	if err := c.transport.Send(ctx, &b); err != nil {
 		return fmt.Errorf("send: %w", err)
+	}
+	return nil
+}
+
+// Push encrypts enc under the conn's auth key and writes it as an unsolicited
+// server message (fresh msg_id + server seqno). Safe to call from another
+// goroutine; serialized against reply writes by the conn write mutex.
+func (c *Conn) Push(ctx context.Context, enc bin.Encoder) error {
+	if err := c.send(ctx, proto.MessageFromServer, enc); err != nil {
+		return fmt.Errorf("push [%T]: %w", enc, err)
 	}
 	return nil
 }
