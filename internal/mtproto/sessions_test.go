@@ -1,14 +1,16 @@
-package mtproto
+package mtproto_test
 
 import (
 	"sync"
 	"testing"
+
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
 
 func TestSessionRegistryAddRemove(t *testing.T) {
 	t.Parallel()
-	r := NewSessionRegistry()
-	c1, c2 := &Conn{}, &Conn{}
+	r := mtproto.NewSessionRegistry()
+	c1, c2 := &mtproto.Conn{}, &mtproto.Conn{}
 
 	r.Add(7, c1)
 	r.Add(7, c2)
@@ -33,17 +35,15 @@ func TestSessionRegistryAddRemove(t *testing.T) {
 
 func TestSessionRegistryConcurrent(t *testing.T) {
 	t.Parallel()
-	r := NewSessionRegistry()
+	r := mtproto.NewSessionRegistry()
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
-		c := &Conn{}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 50 {
+		c := &mtproto.Conn{}
+		wg.Go(func() {
 			r.Add(1, c)
 			_ = r.Conns(1)
 			r.Remove(1, c)
-		}()
+		})
 	}
 	wg.Wait()
 	if got := r.Conns(1); len(got) != 0 {
