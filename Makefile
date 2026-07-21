@@ -11,7 +11,7 @@ bin/sqlc:
 	go -C tools build -o "$(CURDIR)/bin/sqlc" github.com/sqlc-dev/sqlc/cmd/sqlc
 
 sqlc: bin/sqlc
-	"$(CURDIR)/bin/sqlc" version
+	"$(CURDIR)/bin/sqlc" generate
 
 generate: sqlc
 

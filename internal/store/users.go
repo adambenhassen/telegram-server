@@ -18,31 +18,21 @@ type User struct {
 
 // CreateUser inserts a user for phone, or returns the existing row.
 func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
-	u := User{Phone: phone}
-	err := s.pool.QueryRow(ctx,
-		`INSERT INTO users (phone) VALUES ($1)
-		 ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
-		 RETURNING id, phone, first_name, last_name`,
-		phone,
-	).Scan(&u.ID, &u.Phone, &u.FirstName, &u.LastName)
+	u, err := s.q.CreateUser(ctx, phone)
 	if err != nil {
 		return User{}, fmt.Errorf("create user: %w", err)
 	}
-	return u, nil
+	return User{ID: u.ID, Phone: u.Phone, FirstName: u.FirstName, LastName: u.LastName}, nil
 }
 
 // UserByPhone returns the user for phone, ok=false when absent.
 func (s *Store) UserByPhone(ctx context.Context, phone string) (User, bool, error) {
-	u := User{}
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, phone, first_name, last_name FROM users WHERE phone = $1`,
-		phone,
-	).Scan(&u.ID, &u.Phone, &u.FirstName, &u.LastName)
+	u, err := s.q.UserByPhone(ctx, phone)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return User{}, false, nil
 	case err != nil:
 		return User{}, false, fmt.Errorf("user by phone: %w", err)
 	}
-	return u, true, nil
+	return User{ID: u.ID, Phone: u.Phone, FirstName: u.FirstName, LastName: u.LastName}, true, nil
 }

@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
 const codeTTL = 5 * time.Minute
@@ -24,15 +27,12 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	if err != nil {
 		return "", "", err
 	}
-	_, err = s.pool.Exec(ctx,
-		`INSERT INTO phone_codes (phone, code_hash, code, expires_at)
-		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT (phone) DO UPDATE
-		   SET code_hash = EXCLUDED.code_hash,
-		       code = EXCLUDED.code,
-		       expires_at = EXCLUDED.expires_at`,
-		phone, hash, code, time.Now().Add(codeTTL),
-	)
+	err = s.q.UpsertCode(ctx, db.UpsertCodeParams{
+		Phone:     phone,
+		CodeHash:  hash,
+		Code:      code,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(codeTTL), Valid: true},
+	})
 	if err != nil {
 		return "", "", fmt.Errorf("issue code: %w", err)
 	}
@@ -42,22 +42,17 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 // VerifyCode checks the code+hash for phone. Returns ErrCodeInvalid or
 // ErrCodeExpired on failure.
 func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error {
-	var storedCode, storedHash string
-	var expires time.Time
-	err := s.pool.QueryRow(ctx,
-		`SELECT code, code_hash, expires_at FROM phone_codes WHERE phone = $1`,
-		phone,
-	).Scan(&storedCode, &storedHash, &expires)
+	row, err := s.q.GetCode(ctx, phone)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return ErrCodeInvalid
 	case err != nil:
 		return fmt.Errorf("verify code: %w", err)
 	}
-	if time.Now().After(expires) {
+	if time.Now().After(row.ExpiresAt.Time) {
 		return ErrCodeExpired
 	}
-	if hash != storedHash || code != storedCode {
+	if hash != row.CodeHash || code != row.Code {
 		return ErrCodeInvalid
 	}
 	return nil
