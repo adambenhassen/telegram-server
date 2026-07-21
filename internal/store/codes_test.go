@@ -84,6 +84,30 @@ func TestIssueCodeResendCooldown(t *testing.T) {
 	}
 }
 
+func TestIssueCodeCooldownSurvivesExhaustion(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const phone = "+15551250005"
+
+	hash, code, err := s.IssueCode(ctx, phone)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	// Exhaust the code with maxAttempts wrong guesses (client holds the real hash).
+	bad := wrongCode(code)
+	for i := range 3 {
+		if err := s.VerifyCode(ctx, phone, hash, bad); !errors.Is(err, store.ErrCodeInvalid) {
+			t.Fatalf("wrong attempt %d: got %v, want ErrCodeInvalid", i+1, err)
+		}
+	}
+	// Exhausting the code must NOT reset the cooldown — otherwise an attacker
+	// mints unlimited fresh codes at 3 guesses each.
+	if _, _, err := s.IssueCode(ctx, phone); !errors.Is(err, store.ErrResendTooSoon) {
+		t.Fatalf("reissue after exhaustion: got %v, want ErrResendTooSoon", err)
+	}
+}
+
 func TestVerifyCodeExpired(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
