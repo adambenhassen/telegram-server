@@ -11,13 +11,37 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const consumeCode = `-- name: ConsumeCode :exec
-UPDATE phone_codes SET consumed_at = now() WHERE phone = $1
+const consumeCode = `-- name: ConsumeCode :execrows
+UPDATE phone_codes SET consumed_at = now()
+WHERE phone = $1
+  AND code_hash = $2
+  AND code = $3
+  AND consumed_at IS NULL
+  AND expires_at >= now()
+  AND attempts < $4
 `
 
-func (q *Queries) ConsumeCode(ctx context.Context, phone string) error {
-	_, err := q.db.Exec(ctx, consumeCode, phone)
-	return err
+type ConsumeCodeParams struct {
+	Phone    string
+	CodeHash string
+	Code     string
+	Attempts int32
+}
+
+// Compare-and-swap: consume only the exact issued code, and only while it is
+// still verifiable. The terminal-state guards live in the WHERE so a code that
+// lost a race to a concurrent resend/consume/expiry affects zero rows.
+func (q *Queries) ConsumeCode(ctx context.Context, arg ConsumeCodeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, consumeCode,
+		arg.Phone,
+		arg.CodeHash,
+		arg.Code,
+		arg.Attempts,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteExpiredCodes = `-- name: DeleteExpiredCodes :execrows
@@ -52,11 +76,19 @@ func (q *Queries) GetCode(ctx context.Context, phone string) (PhoneCode, error) 
 }
 
 const incrementCodeAttempts = `-- name: IncrementCodeAttempts :exec
-UPDATE phone_codes SET attempts = attempts + 1 WHERE phone = $1
+UPDATE phone_codes SET attempts = attempts + 1
+WHERE phone = $1 AND code_hash = $2
 `
 
-func (q *Queries) IncrementCodeAttempts(ctx context.Context, phone string) error {
-	_, err := q.db.Exec(ctx, incrementCodeAttempts, phone)
+type IncrementCodeAttemptsParams struct {
+	Phone    string
+	CodeHash string
+}
+
+// Scoped to the exact issued code by its hash so a concurrent resend (new hash)
+// is never charged for a failed attempt against the old code.
+func (q *Queries) IncrementCodeAttempts(ctx context.Context, arg IncrementCodeAttemptsParams) error {
+	_, err := q.db.Exec(ctx, incrementCodeAttempts, arg.Phone, arg.CodeHash)
 	return err
 }
 

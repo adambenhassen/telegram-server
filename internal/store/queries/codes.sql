@@ -15,10 +15,22 @@ ON CONFLICT (phone) DO UPDATE
 SELECT * FROM phone_codes WHERE phone = $1;
 
 -- name: IncrementCodeAttempts :exec
-UPDATE phone_codes SET attempts = attempts + 1 WHERE phone = $1;
+-- Scoped to the exact issued code by its hash so a concurrent resend (new hash)
+-- is never charged for a failed attempt against the old code.
+UPDATE phone_codes SET attempts = attempts + 1
+WHERE phone = $1 AND code_hash = $2;
 
--- name: ConsumeCode :exec
-UPDATE phone_codes SET consumed_at = now() WHERE phone = $1;
+-- name: ConsumeCode :execrows
+-- Compare-and-swap: consume only the exact issued code, and only while it is
+-- still verifiable. The terminal-state guards live in the WHERE so a code that
+-- lost a race to a concurrent resend/consume/expiry affects zero rows.
+UPDATE phone_codes SET consumed_at = now()
+WHERE phone = $1
+  AND code_hash = $2
+  AND code = $3
+  AND consumed_at IS NULL
+  AND expires_at >= now()
+  AND attempts < $4;
 
 -- name: DeleteExpiredCodes :execrows
 DELETE FROM phone_codes WHERE expires_at < now();
