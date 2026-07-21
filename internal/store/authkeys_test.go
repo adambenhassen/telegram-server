@@ -3,7 +3,10 @@ package store_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
+
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 func TestSaveAndGetAuthKey(t *testing.T) {
@@ -88,6 +91,23 @@ func TestBindAuthKeyUser(t *testing.T) {
 	}
 	if got.UserID != u.ID {
 		t.Errorf("UserID: got %d want %d", got.UserID, u.ID)
+	}
+}
+
+func TestBindAuthKeyUserMissingKeyFailsClosed(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	u, err := s.CreateUser(ctx, "+15551240099")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	// No SaveAuthKey: the key row does not exist, so the bind must not silently
+	// succeed.
+	err = s.BindAuthKeyUser(ctx, 0xdead, u.ID)
+	if !errors.Is(err, store.ErrAuthKeyNotFound) {
+		t.Fatalf("bind missing key: got %v, want ErrAuthKeyNotFound", err)
 	}
 }
 

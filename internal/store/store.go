@@ -21,6 +21,8 @@ type Store struct {
 var (
 	ErrCodeInvalid = errors.New("phone code invalid")
 	ErrCodeExpired = errors.New("phone code expired")
+	// ErrAuthKeyNotFound is returned when an auth-key operation matches no row.
+	ErrAuthKeyNotFound = errors.New("auth key not found")
 )
 
 // Open connects to Postgres. The schema is owned by the Atlas migrations, so
