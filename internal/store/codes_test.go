@@ -119,3 +119,66 @@ func TestVerifyCodeExpired(t *testing.T) {
 		t.Fatalf("verify expired: got %v, want ErrCodeExpired", err)
 	}
 }
+
+func TestDeleteExpiredCodes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	const expiredPhone = "+15551250005"
+	const freshPhone = "+15551250006"
+
+	if _, _, err := s.IssueCode(ctx, expiredPhone); err != nil {
+		t.Fatalf("issue expired: %v", err)
+	}
+	if _, _, err := s.IssueCode(ctx, freshPhone); err != nil {
+		t.Fatalf("issue fresh: %v", err)
+	}
+
+	// Force the first code past its TTL via a direct connection to the same DB.
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("raw connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx,
+		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE phone = $1`,
+		expiredPhone,
+	); err != nil {
+		t.Fatalf("expire code: %v", err)
+	}
+
+	n, err := s.DeleteExpiredCodes(ctx)
+	if err != nil {
+		t.Fatalf("delete expired: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("deleted count: got %d, want 1", n)
+	}
+
+	var count int
+	if err := conn.QueryRow(ctx,
+		`SELECT count(*) FROM phone_codes WHERE phone = $1`, expiredPhone,
+	).Scan(&count); err != nil {
+		t.Fatalf("count expired: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expired row still present: count=%d", count)
+	}
+	if err := conn.QueryRow(ctx,
+		`SELECT count(*) FROM phone_codes WHERE phone = $1`, freshPhone,
+	).Scan(&count); err != nil {
+		t.Fatalf("count fresh: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("fresh row should remain: count=%d", count)
+	}
+}

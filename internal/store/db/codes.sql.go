@@ -20,6 +20,18 @@ func (q *Queries) ConsumeCode(ctx context.Context, phone string) error {
 	return err
 }
 
+const deleteExpiredCodes = `-- name: DeleteExpiredCodes :execrows
+DELETE FROM phone_codes WHERE expires_at < now()
+`
+
+func (q *Queries) DeleteExpiredCodes(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredCodes)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getCode = `-- name: GetCode :one
 SELECT phone, code_hash, code, expires_at, attempts, consumed_at, created_at FROM phone_codes WHERE phone = $1
 `

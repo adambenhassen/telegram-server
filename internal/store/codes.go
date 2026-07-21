@@ -105,6 +105,16 @@ func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error 
 	return nil
 }
 
+// DeleteExpiredCodes removes all login codes past their expiry and returns
+// the number of rows deleted.
+func (s *Store) DeleteExpiredCodes(ctx context.Context) (int64, error) {
+	n, err := s.q.DeleteExpiredCodes(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("delete expired codes: %w", err)
+	}
+	return n, nil
+}
+
 func randDigits5() (string, error) {
 	b := make([]byte, 5)
 	if _, err := rand.Read(b); err != nil {
