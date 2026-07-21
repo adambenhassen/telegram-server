@@ -33,4 +33,8 @@ var (
 	errNewSaltInvalid = rpcErr(400, "NEW_SALT_INVALID")
 	// errNewPasswordBad rejects a missing/malformed new verifier on set/change.
 	errNewPasswordBad = rpcErr(400, "NEW_PASSWORD_BAD")
+	// errMessageIDInvalid rejects edit/delete of an absent or non-owned message.
+	errMessageIDInvalid = rpcErr(400, "MESSAGE_ID_INVALID")
+	// errPeerIDInvalid rejects an unresolvable or unauthorized input peer.
+	errPeerIDInvalid = rpcErr(400, "PEER_ID_INVALID")
 )
