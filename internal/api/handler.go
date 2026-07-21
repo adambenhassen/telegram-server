@@ -30,6 +30,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger) tgtest.Hand
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	register(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
+	register(d, tg.UsersGetUsersRequestTypeID, h.handleGetUsers)
 	d.Fallback(tgtest.HandlerFunc(func(_ *tgtest.Server, req *tgtest.Request) error {
 		id, err := req.Buf.PeekID()
 		if err != nil {
