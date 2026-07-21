@@ -14,8 +14,9 @@ import (
 
 // rpcHandle decrypts an encrypted MTProto frame on an established session and
 // dispatches its contents. The connection's auth key must already be set to the
-// key matching the frame's auth key ID.
-func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer) error {
+// key matching the frame's auth key ID, and userID is the user bound to that key
+// (0 when unbound), resolved by the caller in the same lookup as the key.
+func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID int64) error {
 	m := &crypto.EncryptedMessage{}
 	if err := m.DecodeWithoutCopy(b); err != nil {
 		return fmt.Errorf("decode encrypted message: %w", err)
@@ -35,14 +36,6 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer) error {
 
 	// Buffer now holds the plaintext message body.
 	b.ResetTo(msg.Data())
-
-	// Resolve the user bound to this auth key (0 when unbound). Simple per-request
-	// lookup for M2.
-	// ponytail: per-request DB read; add a cache if request volume warrants it.
-	userID, err := s.keys.UserID(ctx, c.authKey.ID)
-	if err != nil {
-		return fmt.Errorf("resolve user: %w", err)
-	}
 
 	return s.handle(c, &Request{
 		AuthKeyID: c.authKey.ID,

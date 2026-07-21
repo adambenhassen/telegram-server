@@ -11,7 +11,7 @@ import (
 
 func open(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(context.Background(), pgtest.DSN(t))
+	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey())
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

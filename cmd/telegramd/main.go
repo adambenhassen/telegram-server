@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -48,7 +49,7 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("server RSA key", "fingerprint", rsakey.Fingerprint(&key.PublicKey), "path", cfg.RSAKeyPath)
 
-	st, err := store.Open(ctx, cfg.PostgresDSN)
+	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey)
 	if err != nil {
 		return err
 	}
@@ -58,7 +59,19 @@ func run(log *slog.Logger) error {
 		}
 	}()
 
-	go sweepExpiredCodes(ctx, st, log)
+	// Run the sweep under a cancelable child context and wait for it to exit
+	// before the store pool closes, so shutdown never closes the pool out from
+	// under an in-flight sweep. This defer is registered after st.Close so it
+	// runs first (LIFO): cancel the sweep, wait it out, then Close runs.
+	sweepCtx, cancelSweep := context.WithCancel(ctx)
+	var sweepWG sync.WaitGroup
+	sweepWG.Go(func() {
+		sweepExpiredCodes(sweepCtx, st, log)
+	})
+	defer func() {
+		cancelSweep()
+		sweepWG.Wait()
+	}()
 
 	host, port := splitHostPort(cfg.ListenAddr)
 	tgcfg := api.DefaultConfig(cfg.DCID, host, port)

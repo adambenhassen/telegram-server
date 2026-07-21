@@ -34,7 +34,7 @@ func TestClientLogOut(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st, err := store.Open(ctx, pgtest.DSN(t))
+	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey())
 	if err != nil {
 		t.Fatal(err)
 	}

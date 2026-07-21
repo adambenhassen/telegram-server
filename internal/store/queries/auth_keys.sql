@@ -11,6 +11,9 @@ SELECT * FROM auth_keys WHERE id = $1;
 -- name: BindAuthKeyUser :execrows
 UPDATE auth_keys SET user_id = $2 WHERE id = $1;
 
+-- name: TouchAuthKey :exec
+UPDATE auth_keys SET last_seen_at = now() WHERE id = $1;
+
 -- name: DeleteAuthKey :exec
 DELETE FROM auth_keys WHERE id = $1;
 

@@ -14,21 +14,24 @@ steps apply to any gotd-based client or a patched official client.
 ```bash
 go build -o telegramd ./cmd/telegramd
 TG_POSTGRES_DSN="postgres://user:pass@localhost:5432/telegramd?sslmode=disable" \
+  TG_AUTHKEY_ENC_KEY="$(openssl rand -hex 32)" \
   ./telegramd
 ```
 
 Configuration is read from environment variables in `internal/config/config.go`:
 
-| Variable          | Default          | Notes                                      |
-|--------------------|------------------|---------------------------------------------|
-| `TG_LISTEN_ADDR`   | `:2443`          | `host:port` (or `:port`) the server binds   |
-| `TG_POSTGRES_DSN`  | *(required)*     | Postgres connection string; no default, server fails to start without it |
-| `TG_RSA_KEY_PATH`  | `server_key.pem` | Path to the server's RSA private key        |
-| `TG_DC_ID`         | `2`              | DC id this server advertises as `ThisDC`    |
+| Variable            | Default          | Notes                                      |
+|---------------------|------------------|---------------------------------------------|
+| `TG_LISTEN_ADDR`    | `:2443`          | `host:port` (or `:port`) the server binds   |
+| `TG_POSTGRES_DSN`   | *(required)*     | Postgres connection string; no default, server fails to start without it |
+| `TG_AUTHKEY_ENC_KEY`| *(required)*     | 64 hex chars (32 bytes) — master key that encrypts auth keys at rest; must stay stable, or persisted sessions can no longer be decrypted |
+| `TG_RSA_KEY_PATH`   | `server_key.pem` | Path to the server's RSA private key        |
+| `TG_DC_ID`          | `2`              | DC id this server advertises as `ThisDC`    |
 
-Postgres must already be reachable at `TG_POSTGRES_DSN` — the server applies
-its schema (`internal/store/schema.sql`) automatically on startup via
-`store.Open`, there is no separate migration step.
+Postgres must already be reachable at `TG_POSTGRES_DSN`, and its schema must
+already be migrated with Atlas (`atlas migrate apply --env local`; see
+`docs/migrations.md`). The server does not apply migrations — `store.Open`
+verifies the schema is current and fails fast otherwise.
 
 On first run, if the file at `TG_RSA_KEY_PATH` does not exist, the server
 generates a new 2048-bit RSA key and writes it there (PKCS1 PEM, mode
