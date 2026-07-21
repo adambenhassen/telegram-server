@@ -17,10 +17,16 @@ type Store struct {
 	q    *db.Queries
 }
 
-// Sentinel errors returned by VerifyCode.
+// Sentinel errors returned by the login-code methods.
 var (
 	ErrCodeInvalid = errors.New("phone code invalid")
 	ErrCodeExpired = errors.New("phone code expired")
+	// ErrCodeExhausted is returned by VerifyCode when the per-code attempt cap
+	// has been reached; the code can no longer be verified.
+	ErrCodeExhausted = errors.New("phone code exhausted")
+	// ErrResendTooSoon is returned by IssueCode when an active code was issued
+	// within the resend cooldown window.
+	ErrResendTooSoon = errors.New("phone code resend too soon")
 	// ErrAuthKeyNotFound is returned when an auth-key operation matches no row.
 	ErrAuthKeyNotFound = errors.New("auth key not found")
 )

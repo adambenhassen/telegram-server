@@ -11,8 +11,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const consumeCode = `-- name: ConsumeCode :exec
+UPDATE phone_codes SET consumed_at = now() WHERE phone = $1
+`
+
+func (q *Queries) ConsumeCode(ctx context.Context, phone string) error {
+	_, err := q.db.Exec(ctx, consumeCode, phone)
+	return err
+}
+
 const getCode = `-- name: GetCode :one
-SELECT phone, code_hash, code, expires_at FROM phone_codes WHERE phone = $1
+SELECT phone, code_hash, code, expires_at, attempts, consumed_at, created_at FROM phone_codes WHERE phone = $1
 `
 
 func (q *Queries) GetCode(ctx context.Context, phone string) (PhoneCode, error) {
@@ -23,17 +32,32 @@ func (q *Queries) GetCode(ctx context.Context, phone string) (PhoneCode, error) 
 		&i.CodeHash,
 		&i.Code,
 		&i.ExpiresAt,
+		&i.Attempts,
+		&i.ConsumedAt,
+		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const incrementCodeAttempts = `-- name: IncrementCodeAttempts :exec
+UPDATE phone_codes SET attempts = attempts + 1 WHERE phone = $1
+`
+
+func (q *Queries) IncrementCodeAttempts(ctx context.Context, phone string) error {
+	_, err := q.db.Exec(ctx, incrementCodeAttempts, phone)
+	return err
 }
 
 const upsertCode = `-- name: UpsertCode :exec
 INSERT INTO phone_codes (phone, code_hash, code, expires_at)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (phone) DO UPDATE
-  SET code_hash = EXCLUDED.code_hash,
-      code = EXCLUDED.code,
-      expires_at = EXCLUDED.expires_at
+  SET code_hash   = EXCLUDED.code_hash,
+      code        = EXCLUDED.code,
+      expires_at  = EXCLUDED.expires_at,
+      attempts    = 0,
+      consumed_at = NULL,
+      created_at  = now()
 `
 
 type UpsertCodeParams struct {
@@ -43,6 +67,8 @@ type UpsertCodeParams struct {
 	ExpiresAt pgtype.Timestamptz
 }
 
+// Issues a fresh code, resetting the hardening state (attempts, consumed_at,
+// created_at) so a re-issue starts a clean single-use window.
 func (q *Queries) UpsertCode(ctx context.Context, arg UpsertCodeParams) error {
 	_, err := q.db.Exec(ctx, upsertCode,
 		arg.Phone,

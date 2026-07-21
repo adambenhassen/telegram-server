@@ -17,10 +17,13 @@ type AuthKey struct {
 }
 
 type PhoneCode struct {
-	Phone     string
-	CodeHash  string
-	Code      string
-	ExpiresAt pgtype.Timestamptz
+	Phone      string
+	CodeHash   string
+	Code       string
+	ExpiresAt  pgtype.Timestamptz
+	Attempts   int32
+	ConsumedAt pgtype.Timestamptz
+	CreatedAt  pgtype.Timestamptz
 }
 
 type User struct {
