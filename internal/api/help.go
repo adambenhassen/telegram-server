@@ -1,15 +1,15 @@
 package api
 
 import (
-	"context"
-
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
+
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
 
-func (h *handlers) handleGetConfig(_ context.Context, in *bin.Buffer) (bin.Encoder, error) {
+func (h *handlers) handleGetConfig(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.HelpGetConfigRequest
-	if err := req.Decode(in); err != nil {
+	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
 	cfg := *h.cfg

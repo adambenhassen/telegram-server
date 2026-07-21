@@ -28,6 +28,23 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
 	return i, err
 }
 
+const userByID = `-- name: UserByID :one
+SELECT id, phone, first_name, last_name, created_at FROM users WHERE id = $1
+`
+
+func (q *Queries) UserByID(ctx context.Context, id int64) (User, error) {
+	row := q.db.QueryRow(ctx, userByID, id)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const userByPhone = `-- name: UserByPhone :one
 SELECT id, phone, first_name, last_name, created_at FROM users WHERE phone = $1
 `

@@ -36,8 +36,17 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer) error {
 	// Buffer now holds the plaintext message body.
 	b.ResetTo(msg.Data())
 
+	// Resolve the user bound to this auth key (0 when unbound). Simple per-request
+	// lookup for M2.
+	// ponytail: per-request DB read; add a cache if request volume warrants it.
+	userID, err := s.keys.UserID(ctx, c.authKey.ID)
+	if err != nil {
+		return fmt.Errorf("resolve user: %w", err)
+	}
+
 	return s.handle(c, &Request{
 		AuthKeyID: c.authKey.ID,
+		UserID:    userID,
 		SessionID: msg.SessionID,
 		MsgID:     msg.MessageID,
 		Buf:       b,
