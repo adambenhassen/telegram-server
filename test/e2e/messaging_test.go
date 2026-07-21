@@ -130,6 +130,15 @@ func (u *updateCollector) dispatch(x tg.UpdateClass) {
 	}
 }
 
+func tcpPort(t *testing.T, ln net.Listener) int {
+	t.Helper()
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr type = %T", ln.Addr())
+	}
+	return addr.Port
+}
+
 func send[T any](ch chan T, v T) {
 	select {
 	case ch <- v:
@@ -498,5 +507,100 @@ func TestMessagingOfflineBackfill(t *testing.T) {
 	m, ok := full.NewMessages[0].(*tg.Message)
 	if !ok || m.Message != "sent while offline" {
 		t.Fatalf("backfilled message = %+v, want text %q", full.NewMessages[0], "sent while offline")
+	}
+}
+
+// TestMessagingCrossReplica proves the LISTEN/NOTIFY path crosses processes: two
+// servers share one database, A connects to server 1 and B to server 2, and A's
+// send reaches B live only because the NOTIFY emitted by server 1 wakes server
+// 2's listener, which pushes to B's connection in that process.
+func TestMessagingCrossReplica(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := st.Close(); cerr != nil {
+			t.Errorf("store close: %v", cerr)
+		}
+	})
+
+	const dcID = 2
+	codes := newMultiCodeSink()
+	ln1 := mustListen(t, ctx, "127.0.0.1:0")
+	ln2 := mustListen(t, ctx, "127.0.0.1:0")
+	port1 := tcpPort(t, ln1)
+	port2 := tcpPort(t, ln2)
+	t.Cleanup(bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln1))
+	t.Cleanup(bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln2))
+
+	newClient := func(port int, collector *updateCollector) *telegram.Client {
+		return telegram.NewClient(1, "hash", telegram.Options{
+			DC:            dcID,
+			DCList:        dcs.List{Options: []tg.DCOption{{ID: dcID, IPAddress: "127.0.0.1", Port: port}}},
+			PublicKeys:    []telegram.PublicKey{{RSA: &key.PublicKey}},
+			Resolver:      dcs.Plain(dcs.PlainOptions{}),
+			UpdateHandler: collector,
+		})
+	}
+	flowFor := func(phone string) auth.Flow {
+		return auth.NewFlow(
+			auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
+				func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {
+					return codes.wait(ctx, phone)
+				})),
+			auth.SendCodeOptions{},
+		)
+	}
+	const phoneA, phoneB = "+15551283001", "+15551283002"
+
+	// B stays connected to server 2, collecting pushes.
+	collB := newUpdateCollector()
+	bCmds := make(chan command)
+	bID := make(chan int64, 1)
+	errB := make(chan error, 1)
+	go func() {
+		errB <- runInteractive(ctx, newClient(port2, collB), flowFor(phoneB), bID, bCmds)
+	}()
+	var bUserID int64
+	select {
+	case bUserID = <-bID:
+	case <-time.After(30 * time.Second):
+		t.Fatal("client B login timeout")
+	}
+
+	// A connects to server 1 and sends to B.
+	aClient := newClient(port1, newUpdateCollector())
+	if err := aClient.Run(ctx, func(ctx context.Context) error {
+		if err := aClient.Auth().IfNecessary(ctx, flowFor(phoneA)); err != nil {
+			return err
+		}
+		_, err := aClient.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:     &tg.InputPeerUser{UserID: bUserID, AccessHash: bUserID},
+			Message:  "across replicas",
+			RandomID: 77777,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("A login+send: %v", err)
+	}
+
+	got := recvOr(t, collB.newMsg, "B cross-replica updateNewMessage")
+	if got.Message != "across replicas" {
+		t.Fatalf("B received %q, want %q", got.Message, "across replicas")
+	}
+
+	close(bCmds)
+	if err := <-errB; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client B run: %v", err)
 	}
 }
