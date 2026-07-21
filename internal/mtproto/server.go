@@ -34,10 +34,11 @@ const (
 // Server is an MTProto server: it accepts transport connections, performs key
 // exchange for new clients, and dispatches decrypted RPC requests to a Handler.
 type Server struct {
-	dcID    int
-	key     exchange.PrivateKey
-	keys    AuthKeyStore
-	handler Handler
+	dcID     int
+	key      exchange.PrivateKey
+	keys     AuthKeyStore
+	handler  Handler
+	registry *SessionRegistry
 
 	cipher crypto.Cipher
 	clock  clock.Clock
@@ -61,6 +62,7 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 		key:          key,
 		keys:         keys,
 		handler:      handler,
+		registry:     NewSessionRegistry(),
 		cipher:       crypto.NewServerCipher(crypto.DefaultRand()),
 		clock:        c,
 		msgID:        proto.NewMessageIDGen(c.Now),
@@ -68,6 +70,12 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 		writeTimeout: defaultWriteTimeout,
 		log:          log,
 	}
+}
+
+// Registry returns the connected-session registry the server populates as auth
+// keys resolve to users. The update-delivery listener reads it to push updates.
+func (s *Server) Registry() *SessionRegistry {
+	return s.registry
 }
 
 // Key returns the public key clients use to reach this server.
@@ -134,6 +142,14 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 	conn := newConn(tconn, s.cipher, s.msgID, s.clock, s.writeTimeout, s.log)
 	b := new(bin.Buffer)
 	var lastTouch time.Time
+	// registeredUser is the userID this conn was registered under (0 = not yet).
+	// It deregisters on loop exit so the registry only holds live sockets.
+	var registeredUser int64
+	defer func() {
+		if registeredUser != 0 {
+			s.registry.Remove(registeredUser, conn)
+		}
+	}()
 	for {
 		if err := s.read(ctx, tconn, b); err != nil {
 			return err
@@ -156,6 +172,19 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 			return errors.Join(errors.New("get auth key"), err)
 		}
 		if !ok {
+			// A key that previously resolved to a user and is now gone means the
+			// session was revoked (logOut/resetAuthorization). Drop it from the
+			// registry and close the socket so a revoked client can no longer
+			// receive pushes under its cached key.
+			//
+			// ponytail: only closes on the client's next frame; a silent socket
+			// keeps its cached key until it sends again. Full revocation needs a
+			// cross-replica evict signal — deferred to a sessions-hardening pass.
+			if registeredUser != 0 {
+				s.registry.Remove(registeredUser, conn)
+				registeredUser = 0
+				return nil
+			}
 			if err := s.sendProtoError(ctx, tconn, codec.CodeAuthKeyNotFound); err != nil {
 				return err
 			}
@@ -165,6 +194,13 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 		conn.setKey(key)
 		if err := s.rpcHandle(ctx, conn, b, userID); err != nil {
 			return err
+		}
+
+		// Register once the auth key resolves to a bound user (post-login or
+		// reconnect); the conn's session is now established so pushes can write.
+		if userID != 0 && registeredUser == 0 {
+			registeredUser = userID
+			s.registry.Add(userID, conn)
 		}
 
 		// Advance last-seen only after rpcHandle has decrypted and dispatched the

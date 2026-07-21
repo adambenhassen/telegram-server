@@ -26,7 +26,7 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID i
 	if err != nil {
 		return fmt.Errorf("decrypt message: %w", err)
 	}
-	c.sessionID = msg.SessionID
+	c.setSession(msg.SessionID)
 
 	if !c.markCreated(msg.SessionID) {
 		if err := c.sendSessionCreated(ctx, saltFromKeyID(c.authKey.ID)); err != nil {

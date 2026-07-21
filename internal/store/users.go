@@ -16,11 +16,26 @@ type User struct {
 	LastName  string
 }
 
-// CreateUser inserts a user for phone, or returns the existing row.
+// CreateUser inserts a user for phone, or returns the existing row. It also
+// provisions the account's update_state row in the same transaction so the
+// update APIs and the two-sided send lock ordering never race a missing row.
 func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
-	u, err := s.q.CreateUser(ctx, phone)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return User{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	u, err := qtx.CreateUser(ctx, phone)
 	if err != nil {
 		return User{}, fmt.Errorf("create user: %w", err)
+	}
+	if err := qtx.EnsureUpdateState(ctx, u.ID); err != nil {
+		return User{}, fmt.Errorf("ensure update state: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return User{}, fmt.Errorf("commit: %w", err)
 	}
 	return User{ID: u.ID, Phone: u.Phone, FirstName: u.FirstName, LastName: u.LastName}, nil
 }

@@ -17,6 +17,36 @@ type AuthKey struct {
 	PendingUserID *int64
 }
 
+type Dialog struct {
+	OwnerID         int64
+	PeerID          int64
+	TopMessage      int64
+	UnreadCount     int32
+	ReadInboxMaxID  int64
+	ReadOutboxMaxID int64
+}
+
+type Message struct {
+	OwnerID     int64
+	LocalID     int64
+	PeerID      int64
+	FromID      int64
+	Date        pgtype.Timestamptz
+	Message     string
+	Out         bool
+	EditDate    pgtype.Timestamptz
+	Deleted     bool
+	RandomID    int64
+	PeerLocalID int64
+}
+
+type MessageEvent struct {
+	OwnerID int64
+	Pts     int64
+	Type    int16
+	LocalID int64
+}
+
 type PhoneCode struct {
 	Phone      string
 	CodeHash   string
@@ -25,6 +55,14 @@ type PhoneCode struct {
 	Attempts   int32
 	ConsumedAt pgtype.Timestamptz
 	CreatedAt  pgtype.Timestamptz
+}
+
+type UpdateState struct {
+	UserID      int64
+	Pts         int64
+	Seq         int64
+	Date        pgtype.Timestamptz
+	NextLocalID int64
 }
 
 type User struct {
