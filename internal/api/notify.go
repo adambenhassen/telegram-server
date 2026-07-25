@@ -58,6 +58,14 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	})
 }
 
+// maxDeliveryRounds caps the store round trips one notification may cost. Two
+// windows cover the case that matters — a socket that just registered sits at
+// watermark 0 while the account's other sockets sit at the head, and a backlog
+// past maxDiffEvents puts them a batch apart — without letting watermarks
+// spread across many batches turn into one window per socket, which is the
+// amplification this path exists to avoid.
+const maxDeliveryRounds = 2
+
 // deliver builds one batch from the lowest watermark among conns and gives each
 // conn the suffix above its own, so the store work one notification costs does
 // not multiply with the number of sockets a user holds. The window is
@@ -65,17 +73,27 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 //
 // Each conn is told the batch's own pts, and receives every update the batch
 // holds above its watermark, so the advertised pts still never runs past an
-// update the conn was not given — the invariant a push shares with a poll.
+// update the conn was not given — the invariant a push shares with a poll. A
+// conn whose watermark sits below the window start is left alone rather than
+// pushed a batch with a hole in front of it.
 //
-// A batch truncated at maxDiffEvents can end below the watermark of a conn that
-// was already further ahead. Those conns take another round, whose window
-// starts at or past this batch's end: the window advances strictly, so the loop
-// runs once in the common case and terminates in all of them.
+// A batch truncated at maxDiffEvents ends below the watermark of any conn that
+// was already further ahead, so those take a second window, started at the
+// highest watermark left: the sockets closest to the head are the ones a live
+// push is for. Past maxDeliveryRounds the fan-out stops, and a conn still more
+// than a batch away from both ends is picked up by a later notification, whose
+// window has advanced, or by its own getDifference — push is the optimisation,
+// not the guarantee.
 func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error)) {
-	for len(conns) > 0 {
-		from := conns[0].LastPushedPts()
+	for round := 0; round < maxDeliveryRounds && len(conns) > 0; round++ {
+		lo, hi := conns[0].LastPushedPts(), conns[0].LastPushedPts()
 		for _, c := range conns[1:] {
-			from = min(from, c.LastPushedPts())
+			w := c.LastPushedPts()
+			lo, hi = min(lo, w), max(hi, w)
+		}
+		from := lo
+		if round > 0 {
+			from = hi
 		}
 		b, err := build(from)
 		if err != nil {
@@ -91,6 +109,11 @@ func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, b
 		var ahead []pushConn
 		for _, c := range conns {
 			watermark := c.LastPushedPts()
+			if watermark < from {
+				// This window starts past the conn: the batch is missing the
+				// events between the two, so it is not this round's to serve.
+				continue
+			}
 			if watermark >= b.state.Pts {
 				if b.more {
 					ahead = append(ahead, c)

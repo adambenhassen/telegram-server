@@ -125,6 +125,38 @@ func TestDeliverAddingConnsKeepsOneBuild(t *testing.T) {
 	}
 }
 
+// TestDeliverStaggeredWatermarksBoundsBuilds is the same guarantee under
+// truncation: watermarks spread a whole batch apart would otherwise open one
+// window per band, so the round count is capped and the conns nearest the head
+// — the ones a live push exists for — are the ones the second round serves.
+func TestDeliverStaggeredWatermarksBoundsBuilds(t *testing.T) {
+	t.Parallel()
+	const head = 20000
+	for _, n := range []int{2, 4, 16, 32} {
+		conns := make([]pushConn, n)
+		for i := range conns {
+			// A batch apart plus one, so no window can cover two of them.
+			conns[i] = &fakePushConn{pts: i * (maxDiffEvents + 1)}
+		}
+		builds := 0
+		testUpdater().deliver(context.Background(), 7, conns, func(fromPts int) (updateBatch, error) {
+			builds++
+			to := min(fromPts+maxDiffEvents, head)
+			return batch(fromPts, to, to, to < head), nil
+		})
+		if builds > maxDeliveryRounds {
+			t.Fatalf("%d conns cost %d builds, want at most %d", n, builds, maxDeliveryRounds)
+		}
+		top, ok := conns[n-1].(*fakePushConn)
+		if !ok {
+			t.Fatal("conn type")
+		}
+		if len(top.got) != 1 {
+			t.Fatalf("%d conns: the conn nearest the head got %d pushes, want 1", n, len(top.got))
+		}
+	}
+}
+
 // TestDeliverTruncatedBatchServesConnsAhead covers the interaction with the
 // maxDiffEvents cap: a batch clamped below an already-advanced conn's watermark
 // does not strand it, and the extra round is per distinct window, not per conn.
