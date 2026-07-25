@@ -167,11 +167,12 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 		t.Fatalf("second session reset: %v", err)
 	}
 
-	// Straight into the send, with no wait for the eviction to land. The reset
-	// revoked a session other than the revoker's own, so its NOTIFY was published
-	// before the reply the revoker just read: B's send cannot produce an update
-	// that reaches replica 1's listener first, and this asserts real sequencing
-	// rather than a pause long enough to hide it.
+	// Straight into the send, with no wait for the eviction to land. What this
+	// establishes is that the evict really crosses replicas and closes A's socket
+	// unprompted, within the one RPC round trip B's send costs — not that the
+	// NOTIFY was published before the revoker's reply. That ordering is a local
+	// socket write against a round trip, so this passes either way; it is pinned
+	// by TestRevocationPublishesEvictAroundTheReply in internal/api.
 	done := make(chan error, 1)
 	select {
 	case bCmds <- command{fn: func(ctx context.Context, c *tg.Client) error {
