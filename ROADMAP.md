@@ -106,7 +106,9 @@ Updates
 - Bounded difference: capped per batch, returns `differenceSlice` with an
   intermediate state when truncated; state read before events so the advertised
   `pts` never runs past an omitted event.
-- Revoked session dropped and closed on its next frame.
+- Revoked session dropped and closed on its next frame, and closed on every
+  replica without waiting for one via a `tg_evict` NOTIFY; a revocation aimed at
+  the caller's own session publishes only once its reply is on the wire.
 - E2E gates prove live send/read/edit/delete/typing between two gotd clients,
   offline `getDifference` backfill, and cross-process delivery over `LISTEN`/`NOTIFY`.
 
@@ -162,9 +164,6 @@ Runs in parallel with features; currently the weakest area for production.
 
 Tracked so shortcuts don't rot into "later means never".
 
-- **Cross-replica logout revocation.** A revoked session is dropped and closed on
-  its next frame, but a silent socket keeps its cached key until it sends again.
-  Full revocation needs a cross-replica evict signal (a NOTIFY channel). — M4.
 - **`message_events` GC + `updates.differenceTooLong`.** All events retained;
   `getDifference` is capped and returns `differenceSlice` when truncated, but
   there is no event-log trimming or too-long path yet. — M4.
