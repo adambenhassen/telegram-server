@@ -58,7 +58,7 @@ func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
 		if errors.Is(err, store.ErrResendTooSoon) {
 			return nil, errFloodWait
 		}
-		h.log.Error("issue code", "phone", req.PhoneNumber, "err", err)
+		h.log.Error("issue code", "err", err)
 		return nil, errInternal
 	}
 	h.logIssuedCode(req.PhoneNumber, code)
@@ -84,12 +84,12 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 		if rpc := verifyToRPC(err); rpc != errInternal {
 			return nil, rpc
 		}
-		h.log.Error("verify code", "phone", req.PhoneNumber, "err", err)
+		h.log.Error("verify code", "err", err)
 		return nil, errInternal
 	}
 	user, err := h.store.CreateUser(r.Ctx, req.PhoneNumber)
 	if err != nil {
-		h.log.Error("create user", "phone", req.PhoneNumber, "err", err)
+		h.log.Error("create user", "err", err)
 		return nil, errInternal
 	}
 	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
