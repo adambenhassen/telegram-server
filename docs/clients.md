@@ -2,8 +2,9 @@
 
 `telegramd` speaks real MTProto (transport, handshake, encryption via
 `gotd/tgtest`), but it is a milestone-1 (M1) server: one DC, one RPC method
-set, login codes delivered to the server log instead of SMS, and sessions
-held in memory. A stock Telegram Desktop/mobile client cannot reach it —
+set, login codes delivered to the server log instead of SMS (and only when
+`TG_LOG_LOGIN_CODES=true` — off by default, and then not delivered at all),
+and sessions held in memory. A stock Telegram Desktop/mobile client cannot reach it —
 those clients hardcode Telegram's production DCs and RSA keys. You need a
 client built (or patched) to dial our address and trust our key. This is how
 the in-repo e2e test (a real `gotd/td` client) talks to the server; the same
@@ -27,6 +28,7 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_AUTHKEY_ENC_KEY`| *(required)*     | 64 hex chars (32 bytes) — master key that encrypts auth keys at rest; must stay stable, or persisted sessions can no longer be decrypted |
 | `TG_RSA_KEY_PATH`   | `server_key.pem` | Path to the server's RSA private key        |
 | `TG_DC_ID`          | `2`              | DC id this server advertises as `ThisDC`    |
+| `TG_LOG_LOGIN_CODES`| `false`          | Write issued login codes to the log in cleartext. Off by default; with it off no code is delivered anywhere and sign-in cannot complete. A non-boolean value fails startup |
 
 Postgres must already be reachable at `TG_POSTGRES_DSN`, and its schema must
 already be migrated with Atlas (`atlas migrate apply --env local`; see
@@ -79,6 +81,15 @@ this server as `ThisDC`.
 
 ## 4. Logging in — the code goes to the server log, not SMS
 
+Start the server with `TG_LOG_LOGIN_CODES=true` first. It is off by default,
+and while it is off the code is not written to the log — and since the log is
+the only delivery channel there is, the code reaches nobody and sign-in cannot
+complete. The server says so once at startup when the flag is on:
+
+```
+level=WARN msg="TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext"
+```
+
 Call `auth.sendCode` with a phone number, then watch the server log for:
 
 ```
@@ -90,6 +101,10 @@ to find it. There is no SMS/push delivery in M1 — this log line *is* the
 delivery channel. Feed that code back into `auth.signIn` with the
 `phone_code_hash` returned by `sendCode`.
 
+Anyone who can read the server's output can therefore sign in as any account
+that has no 2FA cloud password. Turn the flag on for development against fake
+numbers only.
+
 On a successful `auth.signIn`, the phone number is auto-registered as a new
 user if it hasn't been seen before (`store.CreateUser`) — there is no
 separate registration step or admin approval.
@@ -98,8 +113,10 @@ separate registration step or admin approval.
 
 - **Single DC.** The server only ever advertises itself (`api.DefaultConfig`
   builds one `tg.DCOption`). No multi-DC routing, no migration between DCs.
-- **Log-only code delivery.** `auth.sendCode` logs the code via `slog`
-  instead of sending SMS. Fine for development/testing, not for real users.
+- **Log-only code delivery.** With `TG_LOG_LOGIN_CODES=true`, `auth.sendCode`
+  logs the code via `slog` instead of sending SMS. Fine for
+  development/testing, not for real users — and with the flag at its default
+  there is no delivery channel at all.
 - **In-memory sessions.** Auth state lives in the running process. Restart
   `telegramd` and every connected client must redo the auth-key handshake
   and re-authenticate — nothing survives a restart except the Postgres-backed
