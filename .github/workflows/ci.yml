@@ -234,6 +234,18 @@ jobs:
           wait_listening
           docker compose logs telegramd
 
+          # msg=listening is printed whether or not TG_LOG_LOGIN_CODES reaches
+          # the server, so deleting or misspelling that line in
+          # docker-compose.yml would leave this job green while the stack boots
+          # a server nobody can sign in to. Kept out of wait_listening on
+          # purpose: a flag regression must not look like a 60s boot timeout.
+          # The .env written above never sets the variable, so this covers the
+          # :-true default too.
+          if ! docker compose logs telegramd 2>&1 | grep -q 'TG_LOG_LOGIN_CODES is on'; then
+            echo "telegramd never warned that TG_LOG_LOGIN_CODES is on: the compose default no longer reaches the server"
+            exit 1
+          fi
+
           before=$(fingerprint)
           [ -n "$before" ] || { echo "no fingerprint in the first boot logs"; exit 1; }
           echo "first boot fingerprint=$before"
