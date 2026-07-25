@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -27,19 +28,53 @@ func (s *Store) Notify(ctx context.Context, channel, payload string) error {
 	return nil
 }
 
-// Listener owns a dedicated pgx connection running LISTEN and dispatches each
-// notification to the delivery callbacks.
+// Reconnect pacing for the listener loop. A database that stays down, or one
+// that flaps, is retried on a growing delay and never in a tight loop.
+const (
+	listenerBackoffMin = 100 * time.Millisecond
+	listenerBackoffMax = 30 * time.Second
+	// listenerStableFor is how long a connection must survive for its failure
+	// to count as a fresh one. Below it the database is still unhealthy, so the
+	// delay keeps growing; above it the loop starts over at the floor, whether
+	// or not that connection ever carried a notification.
+	listenerStableFor = 30 * time.Second
+)
+
+// nextBackoff returns the delay before the next reconnect attempt: the floor
+// when the connection that just failed had been up long enough to count as
+// healthy, otherwise the previous delay doubled up to the cap. uptime is zero
+// for an attempt that never connected.
+func nextBackoff(prev, uptime time.Duration) time.Duration {
+	if uptime >= listenerStableFor {
+		return listenerBackoffMin
+	}
+	return min(2*prev, listenerBackoffMax)
+}
+
+// Listener runs LISTEN on a dedicated pgx connection and dispatches each
+// notification to the delivery callbacks, reconnecting when that connection
+// breaks.
 type Listener struct {
-	conn *pgx.Conn
-	log  *slog.Logger
+	log *slog.Logger
+
+	// closeErr is the loop's final connection close error. The loop goroutine
+	// writes it before returning and stop reads it after wg.Wait, so the
+	// WaitGroup orders the two accesses: the connection needs no lock because
+	// only the loop goroutine ever touches it.
+	closeErr error
 }
 
 // StartListener opens a dedicated connection, subscribes to the update, typing
 // and evict channels, and runs the notification loop until the returned stop
-// function is called (which cancels the loop, drains it, and closes the
-// connection). deliver receives a userID whose events changed; typing receives
-// (peerUserID, fromUserID) for a transient typing notification; evict receives
-// (userID, authKeyID) for a session revoked on any replica.
+// function is called (which cancels the loop, drains it, and returns the error
+// from closing the connection). deliver receives a userID whose events changed;
+// typing receives (peerUserID, fromUserID) for a transient typing notification;
+// evict receives (userID, authKeyID) for a session revoked on any replica.
+//
+// A broken connection is reconnected with bounded backoff rather than ending
+// delivery for the life of the process. Notifications emitted while the
+// listener is reconnecting are lost, which push already tolerates: the client's
+// next getDifference backfills them.
 //
 // The callbacks run on this one goroutine, so none of them may block: a stalled
 // callback holds up every other user's delivery.
@@ -54,45 +89,99 @@ func StartListener(
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	conn, err := connectAndListen(ctx, dsn)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	l := &Listener{log: log}
+	loopCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Go(func() { l.run(loopCtx, conn, dsn, deliver, typing, evict) })
+
+	stop := func() error {
+		cancel()
+		wg.Wait()
+		return l.closeErr
+	}
+	return l, stop, nil
+}
+
+// connectAndListen opens a connection subscribed to every channel. The three
+// are always subscribed together: a connection carrying only some of them
+// silently drops a whole class of delivery.
+func connectAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("listener connect: %w", err)
+		return nil, fmt.Errorf("listener connect: %w", err)
 	}
 	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict} {
 		// ch is a constant channel identifier, never user input (no injection).
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			_ = conn.Close(ctx) //nolint:errcheck // best-effort close on setup failure
-			return nil, nil, fmt.Errorf("listen %s: %w", ch, err)
+			return nil, fmt.Errorf("listen %s: %w", ch, err)
 		}
 	}
-
-	l := &Listener{conn: conn, log: log}
-	loopCtx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	wg.Go(func() { l.loop(loopCtx, deliver, typing, evict) })
-
-	stop := func() error {
-		cancel()
-		wg.Wait()
-		return conn.Close(context.Background())
-	}
-	return l, stop, nil
+	return conn, nil
 }
 
-func (l *Listener) loop(
+// run dispatches notifications until ctx is canceled, reconnecting whenever the
+// connection breaks. The loop goroutine owns conn exclusively — it is the only
+// thing that replaces or closes it — so a reconnect needs no lock and no lock
+// ordering against writeMu or the session registry.
+func (l *Listener) run(
 	ctx context.Context,
+	conn *pgx.Conn,
+	dsn string,
 	deliver func(ctx context.Context, userID int64),
 	typing func(ctx context.Context, peerID, fromID int64),
 	evict func(ctx context.Context, userID, authKeyID int64),
 ) {
+	backoff := listenerBackoffMin
 	for {
-		n, err := l.conn.WaitForNotification(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return // canceled: clean shutdown
+		if conn == nil {
+			if !sleepCtx(ctx, backoff) {
+				return // canceled mid-backoff: nothing open to close
 			}
-			l.log.Error("listener wait notification", "err", err)
-			return // connection broken; best-effort delivery ends (getDifference backstops)
+			c, err := connectAndListen(ctx, dsn)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				backoff = nextBackoff(backoff, 0)
+				l.log.Error("listener reconnect", "err", err, "retry_in", backoff)
+				continue
+			}
+			l.log.Info("listener reconnected")
+			conn = c
+		}
+
+		up := time.Now()
+		err := l.dispatch(ctx, conn, deliver, typing, evict)
+		closeErr := conn.Close(context.Background())
+		conn = nil
+		if ctx.Err() != nil {
+			l.closeErr = closeErr
+			return // canceled: clean shutdown
+		}
+		backoff = nextBackoff(backoff, time.Since(up))
+		l.log.Error("listener connection lost", "err", err, "retry_in", backoff)
+	}
+}
+
+// dispatch consumes notifications on conn until ctx is canceled or the
+// connection fails, returning the error that ended it.
+func (l *Listener) dispatch(
+	ctx context.Context,
+	conn *pgx.Conn,
+	deliver func(ctx context.Context, userID int64),
+	typing func(ctx context.Context, peerID, fromID int64),
+	evict func(ctx context.Context, userID, authKeyID int64),
+) error {
+	for {
+		n, err := conn.WaitForNotification(ctx)
+		if err != nil {
+			return err
 		}
 		switch n.Channel {
 		case ChannelUpdates:
@@ -119,6 +208,19 @@ func (l *Listener) loop(
 			}
 			evict(ctx, userID, authKeyID)
 		}
+	}
+}
+
+// sleepCtx waits d, reporting false if ctx ended first. Shutdown must not have
+// to wait out a backoff.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
