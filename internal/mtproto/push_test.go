@@ -200,6 +200,14 @@ func TestOwnerHandoffWaitsForInFlightPush(t *testing.T) {
 		t.Fatal("hand-off did not complete after the push was released")
 	}
 
+	// The in-flight push advanced the watermark to 5 while it held the lock, so
+	// that advance lands after the hand-off was already waiting. The moved conn
+	// must still not carry the previous owner's watermark: keeping it would
+	// silently drop every push to the new owner until their pts passed it.
+	if got := c.LastPushedPts(); got != 0 {
+		t.Fatalf("watermark = %d, want 0: an advance from the previous owner survived the hand-off", got)
+	}
+
 	pushed, err := c.PushTo(ctx, 7, &mt.Pong{PingID: 2}, 9)
 	if err != nil {
 		t.Fatalf("PushTo after rebind: %v", err)

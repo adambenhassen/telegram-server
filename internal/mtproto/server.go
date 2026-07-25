@@ -142,17 +142,39 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 	conn := newConn(tconn, s.cipher, s.msgID, s.clock, s.writeTimeout, s.log)
 	b := new(bin.Buffer)
 	var lastTouch time.Time
-	// registeredUser is the userID this conn was registered under (0 = not yet).
-	// It deregisters on loop exit so the registry only holds live sockets, and
-	// disowns the conn so a delivery already holding it in a snapshot writes
-	// nothing to a socket on its way out.
+	// registeredUser is the userID this conn is currently registered under
+	// (0 = none). bind moves the conn to userID and is the only thing that
+	// writes it, so every path that changes or drops the binding — rebind,
+	// unbind, renegotiation, loop exit — goes through one definition.
+	//
+	// Ownership is handed over before the registry buckets change: Conns gives
+	// delivery a snapshot and the update batch is built from the database before
+	// anything is written, so a delivery for the previous user can already be in
+	// flight. setOwner waits for that write to finish and makes every later one
+	// fail its ownership check; moving the conn between buckets alone would not
+	// stop it. setOwner also clears the push watermark, since the previous
+	// owner's pts means nothing in the new owner's space.
 	var registeredUser int64
-	defer func() {
-		conn.setOwner(0)
+	bind := func(userID int64) {
+		if userID == registeredUser {
+			return
+		}
+		conn.setOwner(userID)
 		if registeredUser != 0 {
 			s.registry.Remove(registeredUser, conn)
+			registeredUser = 0
 		}
-	}()
+		// Register once the auth key resolves to a bound user (post-login,
+		// reconnect or rebind); the conn's session is established so pushes can
+		// write.
+		if userID != 0 {
+			registeredUser = userID
+			s.registry.Add(userID, conn)
+		}
+	}
+	// The registry only holds live sockets, and a delivery already holding this
+	// conn in a snapshot writes nothing to it on the way out.
+	defer bind(0)
 	for {
 		if err := s.read(ctx, tconn, b); err != nil {
 			return err
@@ -164,6 +186,17 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 		}
 
 		if authKeyID == ([8]byte{}) {
+			// Key exchange never reaches s.keys.Get, so neither the resync below
+			// nor the revoked-key check can run on a socket that sends only
+			// handshakes. Left registered, such a socket would keep receiving the
+			// user's updates for as long as it kept renegotiating, outliving both
+			// a rebind and a logOut that deletes the key, and bounded by nothing.
+			// A renegotiating conn holds no established session anyway; it
+			// re-registers on its first encrypted frame under the new key.
+			//
+			// Before runExchange, not after: gotd applies its own 60s
+			// DefaultTimeout per handshake read, wider than the frame deadline.
+			bind(0)
 			if err := s.runExchange(ctx, tconn, b); err != nil {
 				return err
 			}
@@ -205,30 +238,10 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 		// receiving that user's updates under a key someone else now holds, with
 		// no revocation path to close it.
 		//
-		// Hand the conn its new owner before touching the registry. Conns hands
-		// delivery a snapshot and the update batch is built from the database
-		// before anything is written, so a delivery for the previous user can
-		// already be in flight; setOwner waits for that write to finish and
-		// makes every later one fail its ownership check. Moving the conn
-		// between buckets alone would not stop it.
-		//
 		// ponytail: resyncs on the conn's next frame, since the rebind lands
-		// inside the rpcHandle above. Exposure is bounded by the read timeout,
-		// as it is for a revoked key, rather than lasting for the connection.
-		if userID != registeredUser {
-			conn.setOwner(userID)
-			if registeredUser != 0 {
-				s.registry.Remove(registeredUser, conn)
-				registeredUser = 0
-			}
-			// Register once the auth key resolves to a bound user (post-login,
-			// reconnect or rebind); the conn's session is established so pushes
-			// can write.
-			if userID != 0 {
-				registeredUser = userID
-				s.registry.Add(userID, conn)
-			}
-		}
+		// inside the rpcHandle above, so a socket keeps the previous user until
+		// its next frame of any kind or the read timeout, whichever comes first.
+		bind(userID)
 
 		// Advance last-seen only after rpcHandle has decrypted and dispatched the
 		// frame, so activity reflects MAC-authenticated traffic. A garbage frame
