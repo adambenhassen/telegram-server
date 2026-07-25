@@ -25,6 +25,41 @@ type handlers struct {
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
 
+// revokeFunc is a methodFunc that also returns work to run once the reply is on
+// the wire. Exactly one revocation needs it: the one whose eviction closes the
+// socket the reply goes out on. Nothing orders a Postgres round trip against a
+// local socket write, so emitting first would let a successful logOut or
+// self-reset surface to the client as a transport error.
+//
+// Every other revocation emits inside the handler instead, keeping the
+// notification published before the client can observe success — see
+// selfRevocation.
+type revokeFunc func(req *mtproto.Request) (res bin.Encoder, afterReply func(), err error)
+
+// selfRevocation reports whether keyID is the key the request arrived on, which
+// is what decides when the eviction may be published.
+//
+// Deferring it is a cost, not a preference: while the notification waits for the
+// reply, a client that has already seen success can trigger an update whose own
+// NOTIFY commits first, and a replica then delivers that update to the socket
+// being revoked before the evict reaches it. Every live socket still holding the
+// revoked key is exposed for that window, on this replica and on every other —
+// including one held by whoever the revocation is aimed at, which is the whole
+// point of revoking. What makes the delay acceptable is not who is exposed but
+// that the ceiling does not move: the delete has already committed, so each of
+// those sockets still dies at its next frame or at the read timeout. Evict only
+// accelerates that, so a delayed one forfeits the acceleration, never the
+// guarantee. Only the request that revokes its own socket pays it.
+//
+// Publishing first and deferring only this connection's close would need the
+// close and the reply write to agree on which of them is in flight. Nothing but
+// writeMu can decide that, and the evict path may not take writeMu: it runs on
+// the single listener goroutine, where waiting on a write would stall every
+// user's delivery.
+func selfRevocation(r *mtproto.Request, keyID int64) bool {
+	return keyID == mtproto.AuthKeyIDInt64(r.AuthKeyID)
+}
+
 // New builds the RPC handler: dispatcher wrapped with UnpackInvoke so
 // invokeWithLayer/initConnection wrappers are peeled before dispatch.
 func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool) mtproto.Handler {
@@ -40,10 +75,10 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	register(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
-	register(d, tg.AuthLogOutRequestTypeID, h.handleLogOut)
+	registerRevoke(d, tg.AuthLogOutRequestTypeID, h.handleLogOut)
 	register(d, tg.UsersGetUsersRequestTypeID, h.handleGetUsers)
 	register(d, tg.AccountGetAuthorizationsRequestTypeID, h.handleGetAuthorizations)
-	register(d, tg.AccountResetAuthorizationRequestTypeID, h.handleResetAuthorization)
+	registerRevoke(d, tg.AccountResetAuthorizationRequestTypeID, h.handleResetAuthorization)
 	register(d, tg.AccountGetPasswordRequestTypeID, h.handleGetPassword)
 	register(d, tg.AuthCheckPasswordRequestTypeID, h.handleCheckPassword)
 	register(d, tg.AccountUpdatePasswordSettingsRequestTypeID, h.handleUpdatePasswordSettings)
@@ -70,8 +105,18 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 }
 
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
-	d.HandleFunc(id, func(c *mtproto.Conn, req *mtproto.Request) error {
+	registerRevoke(d, id, func(req *mtproto.Request) (bin.Encoder, func(), error) {
 		res, err := fn(req)
+		return res, nil, err
+	})
+}
+
+// registerRevoke registers fn and runs its afterReply hook once the reply write
+// has been attempted, whether or not that write succeeded: the revocation it
+// announces has already committed, so it must propagate either way.
+func registerRevoke(d *mtproto.Dispatcher, id uint32, fn revokeFunc) {
+	d.HandleFunc(id, func(c *mtproto.Conn, req *mtproto.Request) error {
+		res, afterReply, err := fn(req)
 		if err != nil {
 			var rpc *tgerr.Error
 			if !errors.As(err, &rpc) {
@@ -79,6 +124,10 @@ func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
 			}
 			return c.SendErr(req, rpc)
 		}
-		return c.SendResult(req, res)
+		sendErr := c.SendResult(req, res)
+		if afterReply != nil {
+			afterReply()
+		}
+		return sendErr
 	})
 }

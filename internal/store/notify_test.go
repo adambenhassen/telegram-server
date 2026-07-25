@@ -63,9 +63,11 @@ func TestStartListenerDispatches(t *testing.T) {
 
 	delivered := make(chan int64, 1)
 	typed := make(chan [2]int64, 1)
+	evicted := make(chan [2]int64, 1)
 	_, stop, err := store.StartListener(ctx, dsn,
 		func(_ context.Context, userID int64) { delivered <- userID },
 		func(_ context.Context, peerID, fromID int64) { typed <- [2]int64{peerID, fromID} },
+		func(_ context.Context, userID, authKeyID int64) { evicted <- [2]int64{userID, authKeyID} },
 		nil,
 	)
 	if err != nil {
@@ -99,5 +101,22 @@ func TestStartListenerDispatches(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("typing callback not invoked")
+	}
+
+	// A malformed evict payload must be dropped, not widened into a callback with
+	// a partially parsed id: the callback closes live sockets.
+	if err := s.Notify(ctx, store.ChannelEvict, "not-a-pair"); err != nil {
+		t.Fatalf("notify malformed evict: %v", err)
+	}
+	if err := s.Notify(ctx, store.ChannelEvict, store.EvictPayload(11, -4242)); err != nil {
+		t.Fatalf("notify evict: %v", err)
+	}
+	select {
+	case got := <-evicted:
+		if got != [2]int64{11, -4242} {
+			t.Fatalf("evict = %v, want [11 -4242]", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("evict callback not invoked")
 	}
 }

@@ -51,11 +51,32 @@ type Conn struct {
 	// notification never re-delivers events. Read/written only by the delivery
 	// goroutine, but atomic for safety across the registry hand-off.
 	lastPushedPts atomic.Int64
+
+	// authKeyID mirrors authKey.IntID() for readers that must not take writeMu.
+	// Eviction runs on the single LISTEN goroutine and matches conns by key id,
+	// so reading it under writeMu would let one blackholed socket — a push
+	// parked in the write timeout — stall every user's delivery.
+	authKeyID atomic.Int64
 }
 
 // LastPushedPts returns the highest pts already pushed to this connection.
 func (c *Conn) LastPushedPts() int {
 	return int(c.lastPushedPts.Load())
+}
+
+// AuthKeyID returns the id of the auth key this connection last set, 0 before
+// the first encrypted frame. Safe to call from another goroutine, and lock-free
+// on purpose: it is read while matching an eviction against live conns.
+func (c *Conn) AuthKeyID() int64 {
+	return c.authKeyID.Load()
+}
+
+// Close shuts the underlying transport down, unblocking the serve goroutine's
+// pending Recv so it deregisters the conn and exits. It deliberately does not
+// take writeMu: a revoked session must not wait on a write already in flight.
+// A second close from the serve loop's own defer is a no-op the caller ignores.
+func (c *Conn) Close() error {
+	return c.transport.Close()
 }
 
 // setOwner records the user this conn's auth key is now bound to. Changing
@@ -97,6 +118,7 @@ func (c *Conn) setKey(key crypto.AuthKey) {
 	c.writeMu.Lock()
 	c.authKey = key
 	c.writeMu.Unlock()
+	c.authKeyID.Store(key.IntID())
 }
 
 // setSession records the client session id for subsequent server writes.
