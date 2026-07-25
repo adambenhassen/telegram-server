@@ -74,6 +74,48 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 	if len(users) == 0 {
 		t.Fatal("no users hydrated")
 	}
+	// The recipient's copy has from == peer == a, so only the sender is hydrated
+	// here: a stranger's phone number must not come with them.
+	for _, uc := range users {
+		u, ok := uc.(*tg.User)
+		if !ok {
+			t.Fatalf("user type = %T, want *tg.User", uc)
+		}
+		if u.Self || u.ID != a.ID {
+			t.Fatalf("hydrated user = id %d self=%v, want id %d self=false", u.ID, u.Self, a.ID)
+		}
+		if u.Phone != "" {
+			t.Fatalf("peer phone = %q, want empty", u.Phone)
+		}
+	}
+
+	// The sender's own copy hydrates both sides: a keeps its own phone as self,
+	// b is a peer there and must not disclose one.
+	_, senderUsers, _, err := api.BuildUpdatesForTest(s, a.ID, 0)
+	if err != nil {
+		t.Fatalf("build updates sender: %v", err)
+	}
+	var sawSelf, sawPeer bool
+	for _, uc := range senderUsers {
+		u, ok := uc.(*tg.User)
+		if !ok {
+			t.Fatalf("sender user type = %T, want *tg.User", uc)
+		}
+		if u.Self {
+			sawSelf = true
+			if u.ID != a.ID || u.Phone != a.Phone {
+				t.Fatalf("self user = id %d phone %q, want id %d phone %q", u.ID, u.Phone, a.ID, a.Phone)
+			}
+			continue
+		}
+		sawPeer = true
+		if u.ID != b.ID || u.Phone != "" {
+			t.Fatalf("peer user = id %d phone %q, want id %d phone \"\"", u.ID, u.Phone, b.ID)
+		}
+	}
+	if !sawSelf || !sawPeer {
+		t.Fatalf("sender side hydrated self=%v peer=%v, want both", sawSelf, sawPeer)
+	}
 
 	enc, err := api.GetStateForTest(s, b.ID)
 	if err != nil {

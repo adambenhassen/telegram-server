@@ -29,16 +29,21 @@ func messageToTL(m store.Message) *tg.Message {
 }
 
 // userToTL maps a stored user to the wire tg.User. AccessHash is the M1 self-id
-// placeholder; self marks the update recipient's own account.
+// placeholder; self marks the update recipient's own account. The phone number
+// is private to its owner, so it is emitted only on the self entry — names stay
+// for every peer, since a client needs them to render a conversation.
 func userToTL(u store.User, self bool) *tg.User {
-	return &tg.User{
+	tlUser := &tg.User{
 		ID:         u.ID,
 		Self:       self,
-		Phone:      u.Phone,
 		FirstName:  u.FirstName,
 		LastName:   u.LastName,
 		AccessHash: u.ID,
 	}
+	if self {
+		tlUser.Phone = u.Phone
+	}
+	return tlUser
 }
 
 func stateToTL(s store.State) *tg.UpdatesState {
