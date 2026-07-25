@@ -25,6 +25,13 @@ type handlers struct {
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
 
+// revokeFunc is a methodFunc that also returns work to run once the reply is on
+// the wire. Revocation needs it: the evict notification it emits can close this
+// very socket from another goroutine, and nothing orders a Postgres round trip
+// against a local socket write, so emitting before the reply would let a
+// successful logOut or self-reset surface to the client as a transport error.
+type revokeFunc func(req *mtproto.Request) (res bin.Encoder, afterReply func(), err error)
+
 // New builds the RPC handler: dispatcher wrapped with UnpackInvoke so
 // invokeWithLayer/initConnection wrappers are peeled before dispatch.
 func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool) mtproto.Handler {
@@ -40,10 +47,10 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	register(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
-	register(d, tg.AuthLogOutRequestTypeID, h.handleLogOut)
+	registerRevoke(d, tg.AuthLogOutRequestTypeID, h.handleLogOut)
 	register(d, tg.UsersGetUsersRequestTypeID, h.handleGetUsers)
 	register(d, tg.AccountGetAuthorizationsRequestTypeID, h.handleGetAuthorizations)
-	register(d, tg.AccountResetAuthorizationRequestTypeID, h.handleResetAuthorization)
+	registerRevoke(d, tg.AccountResetAuthorizationRequestTypeID, h.handleResetAuthorization)
 	register(d, tg.AccountGetPasswordRequestTypeID, h.handleGetPassword)
 	register(d, tg.AuthCheckPasswordRequestTypeID, h.handleCheckPassword)
 	register(d, tg.AccountUpdatePasswordSettingsRequestTypeID, h.handleUpdatePasswordSettings)
@@ -70,8 +77,18 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 }
 
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
-	d.HandleFunc(id, func(c *mtproto.Conn, req *mtproto.Request) error {
+	registerRevoke(d, id, func(req *mtproto.Request) (bin.Encoder, func(), error) {
 		res, err := fn(req)
+		return res, nil, err
+	})
+}
+
+// registerRevoke registers fn and runs its afterReply hook once the reply write
+// has been attempted, whether or not that write succeeded: the revocation it
+// announces has already committed, so it must propagate either way.
+func registerRevoke(d *mtproto.Dispatcher, id uint32, fn revokeFunc) {
+	d.HandleFunc(id, func(c *mtproto.Conn, req *mtproto.Request) error {
+		res, afterReply, err := fn(req)
 		if err != nil {
 			var rpc *tgerr.Error
 			if !errors.As(err, &rpc) {
@@ -79,6 +96,10 @@ func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
 			}
 			return c.SendErr(req, rpc)
 		}
-		return c.SendResult(req, res)
+		sendErr := c.SendResult(req, res)
+		if afterReply != nil {
+			afterReply()
+		}
+		return sendErr
 	})
 }

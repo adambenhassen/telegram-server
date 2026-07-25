@@ -134,6 +134,21 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 	}
 	aKeyID := keys[0].ID
 
+	// B is logged in and ready to send before anything is revoked, so its message
+	// follows the reset by as little as one RPC round trip: the send must not be
+	// what gives the evict time to land.
+	bCmds := make(chan command)
+	bID := make(chan int64, 1)
+	errB := make(chan error, 1)
+	go func() {
+		errB <- runInteractive(ctx, newClient(port2, newUpdateCollector()), flowFor(phoneB), bID, bCmds)
+	}()
+	select {
+	case <-bID:
+	case <-time.After(30 * time.Second):
+		t.Fatal("client B login timeout")
+	}
+
 	// A second session of the same user, on replica 2, revokes A's key.
 	revoker := newClient(port2, newUpdateCollector())
 	if err := revoker.Run(ctx, func(ctx context.Context) error {
@@ -152,25 +167,29 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 		t.Fatalf("second session reset: %v", err)
 	}
 
-	// The evict crosses to replica 1 on the NOTIFY alone: A sent nothing.
-	waitNoConn(t, reg1, aUserID, 3*time.Second, "after the cross-replica reset")
-
-	// B's message must not reach the revoked socket.
-	bClient := newClient(port2, newUpdateCollector())
-	if err := bClient.Run(ctx, func(ctx context.Context) error {
-		if err := bClient.Auth().IfNecessary(ctx, flowFor(phoneB)); err != nil {
-			return err
-		}
-		_, err := bClient.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+	// Straight into the send, with no wait for the eviction to land. Both
+	// notifications reach replica 1's single listener goroutine in commit order,
+	// evict first, so the ordering this asserts is the real one and not a pause.
+	done := make(chan error, 1)
+	select {
+	case bCmds <- command{fn: func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     &tg.InputPeerUser{UserID: aUserID, AccessHash: aUserID},
 			Message:  "after revocation",
 			RandomID: 30001,
 		})
 		return err
-	}); err != nil {
-		t.Fatalf("B login+send: %v", err)
+	}, done: done}:
+	case <-time.After(10 * time.Second):
+		t.Fatal("B send enqueue timeout")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("B send: %v", err)
 	}
 
+	// Within ~3s of the revocation: no message text on A's socket, and replica 1
+	// holds no conn for A. Without the evict, A's socket is still registered and
+	// still readable, so the push lands and the first assertion fires.
 	select {
 	case got := <-collA.newMsg:
 		t.Fatalf("revoked session received %q", got.Message)
@@ -183,11 +202,124 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 	}
 
 	close(aCmds)
+	close(bCmds)
 	// A's transport was closed under it on purpose, so its run may end in any
 	// transport error; the assertions above are what this test proves.
 	if err := <-errA; err != nil {
 		t.Logf("client A run ended with: %v", err)
 	}
+	if err := <-errB; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client B run: %v", err)
+	}
+}
+
+// TestSelfRevocationRepliesBeforeEviction covers revocation of the caller's own
+// session on a replica that runs the delivery listener, which is the one case
+// where the evict can close the socket the reply is going out on. Both RPCs must
+// answer the client and only then lose the socket: the notification is emitted
+// after the reply write, since nothing orders a Postgres round trip against a
+// local socket write. Emitting first makes a successful logOut or self-reset
+// surface to the client as a transport error instead.
+func TestSelfRevocationRepliesBeforeEviction(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := st.Close(); cerr != nil {
+			t.Errorf("store close: %v", cerr)
+		}
+	})
+
+	const dcID = 2
+	codes := newMultiCodeSink()
+	ln := mustListen(t, ctx, "127.0.0.1:0")
+	port := tcpPort(t, ln)
+	reg, stop := bootServerWithRegistry(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	t.Cleanup(stop)
+
+	newClient := func() *telegram.Client {
+		return telegram.NewClient(1, "hash", telegram.Options{
+			DC:            dcID,
+			DCList:        dcs.List{Options: []tg.DCOption{{ID: dcID, IPAddress: "127.0.0.1", Port: port}}},
+			PublicKeys:    []telegram.PublicKey{{RSA: &key.PublicKey}},
+			Resolver:      dcs.Plain(dcs.PlainOptions{}),
+			UpdateHandler: newUpdateCollector(),
+		})
+	}
+	login := func(ctx context.Context, c *telegram.Client, phone string) error {
+		return c.Auth().IfNecessary(ctx, auth.NewFlow(
+			auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
+				func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {
+					return codes.wait(ctx, phone)
+				})),
+			auth.SendCodeOptions{},
+		))
+	}
+
+	// account.resetAuthorization aimed at the caller's own current session.
+	const phoneReset = "+15551295011"
+	resetter := newClient()
+	var resetUserID int64
+	if err := resetter.Run(ctx, func(ctx context.Context) error {
+		if err := login(ctx, resetter, phoneReset); err != nil {
+			return err
+		}
+		self, err := resetter.Self(ctx)
+		if err != nil {
+			return err
+		}
+		resetUserID = self.ID
+		keys, err := st.AuthKeysByUser(ctx, resetUserID)
+		if err != nil {
+			return err
+		}
+		if len(keys) != 1 {
+			t.Errorf("want 1 auth key before the self-reset, got %d", len(keys))
+		}
+		// The reply for this must arrive even though it revokes the very session
+		// carrying it.
+		ok, err := resetter.API().AccountResetAuthorization(ctx, keys[0].ID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			t.Error("self resetAuthorization returned false")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("self reset: %v", err)
+	}
+	waitNoConn(t, reg, resetUserID, 3*time.Second, "after a self reset")
+
+	// auth.logOut, which always targets the caller's own key.
+	const phoneLogOut = "+15551295012"
+	loggerOut := newClient()
+	var logOutUserID int64
+	if err := loggerOut.Run(ctx, func(ctx context.Context) error {
+		if err := login(ctx, loggerOut, phoneLogOut); err != nil {
+			return err
+		}
+		self, err := loggerOut.Self(ctx)
+		if err != nil {
+			return err
+		}
+		logOutUserID = self.ID
+		_, err = loggerOut.API().AuthLogOut(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("logout on a listener-backed replica: %v", err)
+	}
+	waitNoConn(t, reg, logOutUserID, 3*time.Second, "after a logout")
 }
 
 // TestLogOutEvictsOnlyBoundKeys covers both halves of the auth.logOut emitter
