@@ -101,8 +101,15 @@ Updates
   typing; plus `updates.getState` / `updates.getDifference`.
 - Two-sided storage + per-owner `pts`/event log; `random_id` send dedup
   (idempotent resend); edit/delete mirror both sides via a stored linkage.
-- Real-time delivery: in-process session registry + `Conn.Push` (server-initiated
-  writes serialized against replies) + `LISTEN`/`NOTIFY` fan-out.
+- Real-time delivery: in-process session registry + `Conn.PushTo` (server-initiated
+  writes serialized against replies, and skipped if the conn no longer belongs to
+  the user the batch was built for) + `LISTEN`/`NOTIFY` fan-out.
+- The `LISTEN` listener reconnects with bounded backoff and re-issues `LISTEN` on
+  all three channels, so a broken Postgres connection interrupts delivery on that
+  replica instead of ending it until restart.
+- One update batch is built per user per notification and reused across that
+  user's connections; the live connections one user may hold in a process are
+  capped, so an account opening sockets in a loop cannot multiply delivery cost.
 - Bounded difference: capped per batch, returns `differenceSlice` with an
   intermediate state when truncated; state read before events so the advertised
   `pts` never runs past an omitted event.
@@ -168,7 +175,9 @@ Tracked so shortcuts don't rot into "later means never".
   `getDifference` is capped and returns `differenceSlice` when truncated, but
   there is no event-log trimming or too-long path yet. — M4.
 - **Peer `access_hash`.** Placeholder scheme: `access_hash == user_id`, validated
-  but not cryptographically derived. Real hashing deferred. — M1/M4.
+  but not cryptographically derived. Real hashing deferred; it ships with a
+  peer-lookup RPC or not at all, since the self-satisfying check is currently the
+  only way to name a peer you have never talked to. — M8.
 - **`qts`.** Column kept at 0; no secret-chat / bot update stream. — M4.
 - **Client-pts-ahead resync.** A client `pts` past the server is clamped to empty
   (single-writer invariant), not an explicit resync response. — M4.
