@@ -24,6 +24,7 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | Variable            | Default          | Notes                                      |
 |---------------------|------------------|---------------------------------------------|
 | `TG_LISTEN_ADDR`    | `:2443`          | `host:port` (or `:port`) the server binds   |
+| `TG_ADVERTISE_ADDR` | *(derived from `TG_LISTEN_ADDR`)* | `host:port` clients are told to dial, used verbatim. Derived when unset: the listen address with an empty or wildcard host (`:2443`, `0.0.0.0`, `::`) replaced by `127.0.0.1`. A value that is not `host:port`, has no host, or has a port that is not an integer in 1–65535 fails startup |
 | `TG_POSTGRES_DSN`   | *(required)*     | Postgres connection string; no default, server fails to start without it |
 | `TG_AUTHKEY_ENC_KEY`| *(required)*     | 64 hex chars (32 bytes) — master key that encrypts auth keys at rest; must stay stable, or persisted sessions can no longer be decrypted |
 | `TG_RSA_KEY_PATH`   | `server_key.pem` | Path to the server's RSA private key        |
@@ -54,18 +55,20 @@ level=INFO msg="server RSA key" fingerprint=<int64> path=server_key.pem
 must be built with this exact public key (read `path`, e.g.
 `server_key.pem`, and derive/embed the PEM) and its fingerprint, since
 gotd-style clients select the RSA key to use for the auth-key handshake by
-fingerprint. Also note the `listening addr=... dc=...` log line that follows
-— it confirms the actual bind address and DC id the process is using,
-which may differ from what you passed if `TG_LISTEN_ADDR` was left at
-default.
+fingerprint. Also note the `listening addr=... advertise=... dc=...` log line
+that follows — it confirms the actual bind address, the address clients are
+told to dial, and the DC id the process is using, which may differ from what
+you passed if `TG_LISTEN_ADDR` was left at default.
 
 ## 3. Point a client at this server
 
 To connect, a client needs to be built or patched so that:
 
-- Its DC address/config table points at `host:port` from `TG_LISTEN_ADDR`
-  (e.g. via a custom `tg.DCOption`/test-DC override), matching the `dc`
-  logged above (`TG_DC_ID`, default `2`).
+- Its DC address/config table points at the advertised `host:port` — the
+  `advertise` field in the log line above, i.e. `TG_ADVERTISE_ADDR` or, unset,
+  the address derived from `TG_LISTEN_ADDR` (e.g. via a custom
+  `tg.DCOption`/test-DC override), matching the `dc` logged above (`TG_DC_ID`,
+  default `2`).
 - It trusts the server's RSA public key (fingerprint from step 2) instead of
   Telegram's production keys.
 
