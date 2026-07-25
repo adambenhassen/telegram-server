@@ -23,8 +23,11 @@ migrate-new:
 migrate:
 	atlas migrate apply --env local
 
+# -race is not optional here: the hard parts of this server are ordering
+# (Conn.Push/writeMu, per-owner pts, store lock ordering), and a plain run
+# passes a build that corrupts state under concurrent load.
 test:
-	go test ./...
+	go test -race ./...
 
 lint:
 	golangci-lint run

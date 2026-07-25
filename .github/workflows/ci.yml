@@ -46,5 +46,8 @@ jobs:
       # Postgres comes from testcontainers inside internal/pgtest, which starts
       # postgres:16-alpine with its own config. Nothing to wire up on the runner
       # beyond the Docker daemon ubuntu-latest already provides.
+      #
+      # Via make so the flags (-race) live only in the Makefile and CI cannot
+      # drift from what a local `make test` runs.
       - name: Test
-        run: go test ./...
+        run: make test
