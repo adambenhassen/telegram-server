@@ -95,7 +95,7 @@ jobs:
           docker build -t telegramd:ci .
           docker images telegramd:ci
 
-      - name: Assert non-root and no secrets in the image
+      - name: Assert non-root, key directory mode, and no secrets in the image
         run: |
           user=$(docker inspect -f '{{.Config.User}}' telegramd:ci)
           [ "$user" = "65532:65532" ] || { echo "image runs as '$user'"; exit 1; }
@@ -105,6 +105,18 @@ jobs:
             echo "secret env baked into the image"
             exit 1
           fi
+          # The mode is read off the built image rather than assumed: the COPY
+          # that creates this directory silently shipped 0755 once, and a named
+          # volume mounted here inherits whatever it finds.
+          cid=$(docker create telegramd:ci)
+          entry=$(docker export "$cid" | tar -tvf - | grep -E 'var/lib/telegramd/$' || true)
+          docker rm "$cid" >/dev/null
+          echo "$entry"
+          read -r mode owner _ <<<"$entry"
+          [ "$mode" = "drwx------" ] && [ "$owner" = "65532/65532" ] || {
+            echo "expected 'drwx------ 65532/65532' for var/lib/telegramd/"
+            exit 1
+          }
 
       # Pinned for the same reason as the ci job: the action's default resolves
       # to the canary channel.

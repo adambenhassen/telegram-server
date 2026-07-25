@@ -20,8 +20,9 @@ RUN CGO_ENABLED=0 go build -o /telegramd ./cmd/telegramd
 
 # The server writes exactly one file, its RSA identity key, and the final image
 # has no shell to mkdir with — so the directory is created here and copied in.
-# 0700 and owned by the runtime uid: nothing else in the image is writable.
-RUN install -d -m 0700 -o 65532 -g 65532 /var/lib/telegramd
+# Mode and owner are set on the COPY below, not here: BuildKit creates a COPY
+# destination directory itself and never carries the source directory's mode.
+RUN install -d /var/lib/telegramd
 
 # distroless/static: no shell and no package manager, ships CA certificates for
 # a TLS Postgres DSN, and already defines the non-root uid 65532.
@@ -30,7 +31,10 @@ FROM gcr.io/distroless/static-debian12:nonroot
 # root-owned 0755 on purpose: the process must not be able to rewrite the binary
 # it is executing.
 COPY --from=build /telegramd /usr/local/bin/telegramd
-COPY --from=build --chown=65532:65532 /var/lib/telegramd /var/lib/telegramd
+# 0700 and owned by the runtime uid: nothing else in the image is writable, and
+# a named volume mounted here inherits both. --chmod is load-bearing — without
+# it the destination is created 0755 and the volume carries that outwards.
+COPY --from=build --chown=65532:65532 --chmod=700 /var/lib/telegramd /var/lib/telegramd
 
 # A path, not a secret. Without it the key would default to the working
 # directory and land in the container's writable layer, giving a fresh server
