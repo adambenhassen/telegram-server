@@ -71,5 +71,8 @@ func (h *handlers) handleResetAuthorization(r *mtproto.Request) (bin.Encoder, er
 		h.log.Error("reset authorization: delete key", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	// After the delete commits, so the evicted client cannot reconnect on the
+	// same key and find the row still present.
+	h.notifyEvict(r.Ctx, key.UserID, req.Hash)
 	return &tg.BoolTrue{}, nil
 }

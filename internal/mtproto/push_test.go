@@ -20,6 +20,7 @@ import (
 type fakeConn struct {
 	mu      sync.Mutex
 	count   int
+	closes  int
 	sendErr error
 
 	entered chan struct{}
@@ -38,12 +39,24 @@ func (f *fakeConn) Send(_ context.Context, _ *bin.Buffer) error {
 }
 
 func (f *fakeConn) Recv(_ context.Context, _ *bin.Buffer) error { return errors.New("unused") }
-func (f *fakeConn) Close() error                                { return nil }
+
+func (f *fakeConn) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closes++
+	return nil
+}
 
 func (f *fakeConn) writes() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.count
+}
+
+func (f *fakeConn) closed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closes > 0
 }
 
 func testKey(t *testing.T) crypto.AuthKey {

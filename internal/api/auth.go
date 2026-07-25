@@ -128,9 +128,22 @@ func (h *handlers) handleLogOut(r *mtproto.Request) (bin.Encoder, error) {
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
-	if err := h.store.DeleteAuthKey(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID)); err != nil {
+	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
+	// The evict notification is addressed to the user the key was bound to, and
+	// only the row carries that: an unauthorized logOut has no r.UserID. Read it
+	// before the delete removes it.
+	key, ok, err := h.store.AuthKeyByID(r.Ctx, keyID)
+	if err != nil {
+		h.log.Error("logout: lookup auth key", "err", err)
+		return nil, errInternal
+	}
+	if err := h.store.DeleteAuthKey(r.Ctx, keyID); err != nil {
 		h.log.Error("logout: delete auth key", "err", err)
 		return nil, errInternal
+	}
+	// An unbound key is registered under nobody, so there is nothing to evict.
+	if ok && key.UserID != 0 {
+		h.notifyEvict(r.Ctx, key.UserID, keyID)
 	}
 	return &tg.AuthLoggedOut{}, nil
 }
