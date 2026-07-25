@@ -21,7 +21,15 @@ RUN CGO_ENABLED=0 go build -o /telegramd ./cmd/telegramd
 # The server writes exactly one file, its RSA identity key, and the final image
 # has no shell to mkdir with — so the directory is created here and copied in.
 # 0700 and owned by the runtime uid: nothing else in the image is writable.
-RUN install -d -m 0700 -o 65532 -g 65532 /var/lib/telegramd
+#
+# Staged under /rootfs because `COPY <dir> <dir>` copies a directory's contents
+# rather than the directory itself, and this one is empty — so it has no content
+# to carry the mode across, and the destination would be created at 0755.
+# Copying the staging root instead makes the directory itself content. The
+# parents are created in a separate call at 0755 so 0700 cannot leak onto /var
+# and /var/lib, which the final image already has.
+RUN install -d -m 0755 /rootfs/var /rootfs/var/lib \
+    && install -d -m 0700 -o 65532 -g 65532 /rootfs/var/lib/telegramd
 
 # distroless/static: no shell and no package manager, ships CA certificates for
 # a TLS Postgres DSN, and already defines the non-root uid 65532.
@@ -30,7 +38,10 @@ FROM gcr.io/distroless/static-debian12:nonroot
 # root-owned 0755 on purpose: the process must not be able to rewrite the binary
 # it is executing.
 COPY --from=build /telegramd /usr/local/bin/telegramd
-COPY --from=build --chown=65532:65532 /var/lib/telegramd /var/lib/telegramd
+
+# No --chown: a stage-to-stage copy preserves the ownership set above, and
+# forcing one here would hand /var and /var/lib to the runtime user too.
+COPY --from=build /rootfs/ /
 
 # A path, not a secret. Without it the key would default to the working
 # directory and land in the container's writable layer, giving a fresh server
