@@ -181,19 +181,41 @@ jobs:
           # .gitignore ignores .env.*, so the template only survives because of
           # the negation below it. Dropping or misordering that line loses the
           # file silently, and the stack has no usable template left.
-          if git check-ignore -q .env.example; then
+          #
+          # --no-index is what makes this an assertion about .gitignore: without
+          # it check-ignore consults the index first and reports the tracked
+          # .env.example as not-ignored whatever the rules say, so the guard
+          # would pass with the negation deleted.
+          if git check-ignore -q --no-index .env.example; then
             echo ".env.example is git-ignored: the !.env.example negation is missing or misordered"
             exit 1
           fi
 
       - name: Boot, restart, and check both volumes survived
         run: |
+          # `docker compose logs` returns the logs of exited containers too, so a
+          # server that printed msg=listening and then died still matches. Every
+          # later assertion reads that same history or talks to postgres, so the
+          # whole job would go green with a dead server. Liveness is a separate
+          # question from the log line and has to be asked separately.
+          assert_running() {
+            if [ -z "$(docker compose ps --status running -q telegramd)" ]; then
+              docker compose ps -a
+              docker compose logs telegramd
+              echo "telegramd is not running ($1)"
+              return 1
+            fi
+          }
+
           # The image is distroless with no shell, so telegramd cannot carry a
           # healthcheck and `up --wait` would have nothing to wait on. Poll the
           # log line the server prints once it is actually serving.
           wait_listening() {
             for _ in $(seq 60); do
               if docker compose logs telegramd 2>&1 | grep -q 'msg=listening'; then
+                # A match from a container that is already gone is a failure, not
+                # a reason to keep polling for a line that will never change.
+                assert_running "logged msg=listening then stopped" || return 1
                 return 0
               fi
               sleep 1
@@ -247,6 +269,11 @@ jobs:
           fi
           code=$(docker inspect -f '{{.State.ExitCode}}' "$(docker compose ps -aq migrate)")
           [ "$code" = 0 ] || { echo "migrate exited $code"; exit 1; }
+
+          # wait_listening only proves the server was alive the moment it first
+          # logged. What the scenario claims is that it survived the restart and
+          # the assertions above it, so ask again at the end.
+          assert_running "after the migrate assertions"
 
       - name: Tear down
         if: always()
