@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -73,8 +72,7 @@ func run(log *slog.Logger) error {
 		sweepWG.Wait()
 	}()
 
-	host, port := splitHostPort(cfg.ListenAddr)
-	tgcfg := api.DefaultConfig(cfg.DCID, host, port)
+	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
 	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes)
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
@@ -101,7 +99,8 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	log.Info("listening", "addr", cfg.ListenAddr, "dc", cfg.DCID)
+	advertise := net.JoinHostPort(cfg.AdvertiseHost, strconv.Itoa(cfg.AdvertisePort))
+	log.Info("listening", "addr", cfg.ListenAddr, "advertise", advertise, "dc", cfg.DCID)
 
 	return server.Serve(ctx, transport.Listen(ln))
 }
@@ -128,19 +127,4 @@ func sweepExpiredCodes(ctx context.Context, st *store.Store, log *slog.Logger) {
 			log.Info("swept expired codes", "deleted", n)
 		}
 	}
-}
-
-func splitHostPort(addr string) (string, int) {
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "127.0.0.1", 2443
-	}
-	if host == "" || strings.HasPrefix(addr, ":") {
-		host = "127.0.0.1"
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		port = 2443
-	}
-	return host, port
 }
