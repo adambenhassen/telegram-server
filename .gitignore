@@ -5,3 +5,6 @@ bin/
 *.key
 .env
 .env.*
+# Must stay below .env.*, which would otherwise swallow it; the template carries
+# no secret values.
+!.env.example

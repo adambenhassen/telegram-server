@@ -1,0 +1,102 @@
+# Local development stack: Postgres, migrations, and the server, in that order.
+#
+#   cp .env.example .env && chmod 600 .env
+#   $EDITOR .env            # TG_AUTHKEY_ENC_KEY — openssl rand -hex 32
+#   docker compose up
+#
+# `docker compose down` keeps both volumes, which is what makes a restart
+# uneventful: the same rows, and the same RSA identity. `down -v` destroys them,
+# and the next boot hands every client a new server fingerprint.
+
+# The password has exactly one source, .env, and the DSN exactly one definition
+# here — migrate and telegramd must never be able to reach different databases.
+# The :? form aborts the whole run before a container starts and names the cause;
+# without it an unset variable interpolates to empty and the first symptom is a
+# confusing Postgres error.
+x-dsn: &dsn "postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/telegram?sslmode=disable"
+
+services:
+  # The same image internal/pgtest and the docker CI job start, and the version
+  # atlas.hcl names as its dev database.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: telegram
+    # An open port is not readiness: Postgres accepts connections during its own
+    # init and then drops them. migrate waits on this instead of racing it.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d telegram"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+    # No ports: on purpose. The server reaches Postgres by service name on the
+    # compose network, and psql is `docker compose exec postgres psql -U postgres
+    # telegram` — so publishing 5432 would buy nothing and put the database on
+    # every interface of the host.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Applies the migrations and exits 0. No restart policy: a re-run against an
+  # already migrated database is a no-op, so a restart loop could only hide a
+  # real failure.
+  migrate:
+    # Pinned to the version the ariga/setup-atlas steps in ci.yml use, so the
+    # stack and CI cannot apply migrations with different atlas versions.
+    image: arigaio/atlas:1.2.0-alpine
+    # The image entrypoint is already atlas, so the command starts at `migrate`.
+    # Not `--env local`: that env's dev database is docker://postgres/16, which
+    # would need a Docker daemon inside this container. Three slashes in
+    # file:///migrations — an absolute path, because the working directory here
+    # is not the repo root.
+    command:
+      - migrate
+      - apply
+      - --dir
+      - file:///migrations
+      - --url
+      - *dsn
+    volumes:
+      - ./migrations:/migrations:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  telegramd:
+    # Built from the repo-root Dockerfile: nothing is published to a registry, so
+    # there is no image to pull.
+    build: .
+    environment:
+      TG_POSTGRES_DSN: *dsn
+      TG_AUTHKEY_ENC_KEY: ${TG_AUTHKEY_ENC_KEY:?set TG_AUTHKEY_ENC_KEY in .env - generate one with openssl rand -hex 32}
+    ports:
+      # Loopback only. 2443 is unauthenticated at the transport layer, so whoever
+      # reaches it feeds chosen bytes into the MTProto decode path before any
+      # identity check exists. Docker publishes on 0.0.0.0 by default through a
+      # DNAT rule the host firewall never sees, so "2443:2443" would hand this
+      # server to the whole network the laptop is on.
+      - "127.0.0.1:2443:2443"
+    # TG_LISTEN_ADDR is deliberately unset. Its default :2443 makes the server
+    # advertise 127.0.0.1 as the DC address (cmd/telegramd/main.go:130), which is
+    # right for this stack: the only client is on the host and arrives through the
+    # published port above. Setting 0.0.0.0:2443 would advertise 0.0.0.0, which is
+    # worse. The general fix is tracked separately.
+    #
+    # Proven by the docker job in ci.yml, which already boots this image
+    # --read-only: the static binary writes nothing but its key file.
+    read_only: true
+    volumes:
+      # The one writable path. A named volume takes the mountpoint's 0700 and uid
+      # 65532 from the image; a bind mount would take the host directory's mode
+      # instead — root-owned means the server cannot write its key and crash
+      # loops, 0755 means a live RSA private key readable by every local user.
+      - tgkey:/var/lib/telegramd
+    # store.Open refuses to start against an unmigrated schema
+    # (internal/store/store.go:69), so the ordering is load-bearing, not cosmetic.
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
+  tgkey:
