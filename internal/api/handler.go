@@ -42,17 +42,20 @@ type revokeFunc func(req *mtproto.Request) (res bin.Encoder, afterReply func(), 
 // Deferring it is a cost, not a preference: while the notification waits for the
 // reply, a client that has already seen success can trigger an update whose own
 // NOTIFY commits first, and a replica then delivers that update to the socket
-// being revoked before the evict reaches it. So only the case that has to wait
-// waits. When the revoked key is the caller's own, the sole socket exposed by
-// that window is the caller's own — it asked for this — and every other holder
-// of the key is still evicted as soon as the notification lands.
+// being revoked before the evict reaches it. Every live socket still holding the
+// revoked key is exposed for that window, on this replica and on every other —
+// including one held by whoever the revocation is aimed at, which is the whole
+// point of revoking. What makes the delay acceptable is not who is exposed but
+// that the ceiling does not move: the delete has already committed, so each of
+// those sockets still dies at its next frame or at the read timeout. Evict only
+// accelerates that, so a delayed one forfeits the acceleration, never the
+// guarantee. Only the request that revokes its own socket pays it.
 //
-// The alternative Codex asked for, publishing first and deferring only this
-// connection's close, needs the close and the reply write to agree on which of
-// them is in flight. Nothing but writeMu can decide that, and the evict path may
-// not take writeMu: it runs on the single listener goroutine, where waiting on a
-// write would stall every user's delivery. So the choice is where to pay, and it
-// is paid on the request that revokes itself.
+// Publishing first and deferring only this connection's close would need the
+// close and the reply write to agree on which of them is in flight. Nothing but
+// writeMu can decide that, and the evict path may not take writeMu: it runs on
+// the single listener goroutine, where waiting on a write would stall every
+// user's delivery.
 func selfRevocation(r *mtproto.Request, keyID int64) bool {
 	return keyID == mtproto.AuthKeyIDInt64(r.AuthKeyID)
 }
