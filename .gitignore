@@ -1,2 +1,7 @@
 plans/
 bin/
+# TG_RSA_KEY_PATH defaults to ./server_key.pem, so a local run writes a live private key here
+*.pem
+*.key
+.env
+.env.*
