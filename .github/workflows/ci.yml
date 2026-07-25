@@ -51,3 +51,94 @@ jobs:
       # drift from what a local `make test` runs.
       - name: Test
         run: make test
+
+  # Builds the image and boots it against a migrated database. Docker is not
+  # available in the environments the Dockerfile is edited from, so this job is
+  # the only place it is ever built — it is the gate that stops it rotting.
+  docker:
+    runs-on: ubuntu-latest
+    # The build is the slow part at roughly a minute; this only catches a hang
+    # (a stalled pull, a container that never logs) before it burns six hours.
+    timeout-minutes: 15
+
+    services:
+      # The server needs a *migrated* database, not merely a reachable one:
+      # store.Open refuses to start against an empty schema, so it would never
+      # reach the listening log. Published on localhost for both atlas on the
+      # runner and the container below; the job waits for the healthcheck.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: smoketest
+          POSTGRES_DB: telegram
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # Throwaway and valid only inside this job: the database dies with the
+      # runner, and nothing is ever sealed under this master key. Neither value
+      # may come from a repository secret — that would put real key material in
+      # reach of a workflow that prints container logs.
+      TG_POSTGRES_DSN: postgres://postgres:smoketest@localhost:5432/telegram?sslmode=disable
+      TG_AUTHKEY_ENC_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      - name: Build image
+        run: |
+          docker build -t telegramd:ci .
+          docker images telegramd:ci
+
+      - name: Assert non-root and no secrets in the image
+        run: |
+          user=$(docker inspect -f '{{.Config.User}}' telegramd:ci)
+          [ "$user" = "65532:65532" ] || { echo "image runs as '$user'"; exit 1; }
+          # Both are secrets, so they are injected at run time and must never
+          # appear in the image config, which anyone who can pull it may read.
+          if docker inspect -f '{{json .Config.Env}}' telegramd:ci | grep -Eq 'TG_(AUTHKEY_ENC_KEY|POSTGRES_DSN)'; then
+            echo "secret env baked into the image"
+            exit 1
+          fi
+
+      # Pinned for the same reason as the ci job: the action's default resolves
+      # to the canary channel.
+      - uses: ariga/setup-atlas@v0.3
+        with:
+          version: v1.2.0
+
+      - name: Apply migrations
+        run: atlas migrate apply --dir file://migrations --url "$TG_POSTGRES_DSN"
+
+      - name: Smoke run
+        run: |
+          # --network host reaches the service container on localhost.
+          # --read-only proves the claim the compose ticket depends on: the only
+          # writable path is the volume holding the RSA identity key, which
+          # inherits 0700 and uid 65532 from the image directory. Without that
+          # mount the server would generate a fresh identity into its writable
+          # layer on every start, so the test exercises the intended shape.
+          docker run -d --name telegramd \
+            --network host \
+            --read-only -v tg-key:/var/lib/telegramd \
+            -e TG_POSTGRES_DSN -e TG_AUTHKEY_ENC_KEY \
+            telegramd:ci
+          for _ in $(seq 30); do
+            if docker logs telegramd 2>&1 | grep -q 'msg=listening'; then
+              docker logs telegramd
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs telegramd
+          echo "server never reached msg=listening"
+          exit 1
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f telegramd

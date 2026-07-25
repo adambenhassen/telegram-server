@@ -1,0 +1,19 @@
+# The build stage copies only go.mod, go.sum, cmd/ and internal/, so nothing
+# listed here could reach a layer anyway. This is the second lock: it keeps the
+# files out of the context uploaded to the daemon.
+
+# Key material and configuration. *.pem covers server_key.pem, which
+# rsakey.LoadOrGenerate writes into the working directory of a local run.
+*.pem
+*.key
+.env
+.env.*
+
+# Full history — anything ever committed and later removed comes back with it.
+.git
+
+# Local-only and agent-runtime directories; the latter can hold credentials.
+bin/
+plans/
+.claude/
+.multica/
