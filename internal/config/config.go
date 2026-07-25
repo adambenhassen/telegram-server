@@ -20,7 +20,8 @@ type Config struct {
 	DCID          int
 	// LogLoginCodes opts into writing issued login codes to the log in
 	// cleartext. Off by default: the log is readable by anyone with the
-	// process output, and the code alone signs an account in.
+	// process output, and the code alone signs in any account that has no
+	// 2FA cloud password — one with a password still needs the SRP step.
 	LogLoginCodes bool
 }
 
