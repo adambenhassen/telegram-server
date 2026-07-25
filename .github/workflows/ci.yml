@@ -155,3 +155,99 @@ jobs:
       - name: Stop container
         if: always()
         run: docker rm -f telegramd
+
+  # Brings the compose stack up the way a developer does, then restarts it to
+  # prove the two named volumes carry the state that matters: the database rows
+  # and the RSA identity. Docker is not available in the environments
+  # docker-compose.yml is edited from, so this job is the only place it ever
+  # runs — the gate that stops it rotting.
+  compose:
+    runs-on: ubuntu-latest
+    # Two boots on top of the image build, which is the slow part at roughly a
+    # minute; this only catches a hang before it burns six hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      - name: Write a throwaway .env
+        run: |
+          # Inline literals, never repository secrets: `on: pull_request` means a
+          # fork PR runs this job, and a job that prints container logs must not
+          # hold real key material. Nothing is ever sealed under this key.
+          cat > .env <<'EOF'
+          POSTGRES_PASSWORD=localdev
+          TG_AUTHKEY_ENC_KEY=0000000000000000000000000000000000000000000000000000000000000000
+          EOF
+          # .gitignore ignores .env.*, so the template only survives because of
+          # the negation below it. Dropping or misordering that line loses the
+          # file silently, and the stack has no usable template left.
+          if git check-ignore -q .env.example; then
+            echo ".env.example is git-ignored: the !.env.example negation is missing or misordered"
+            exit 1
+          fi
+
+      - name: Boot, restart, and check both volumes survived
+        run: |
+          # The image is distroless with no shell, so telegramd cannot carry a
+          # healthcheck and `up --wait` would have nothing to wait on. Poll the
+          # log line the server prints once it is actually serving.
+          wait_listening() {
+            for _ in $(seq 60); do
+              if docker compose logs telegramd 2>&1 | grep -q 'msg=listening'; then
+                return 0
+              fi
+              sleep 1
+            done
+            docker compose logs
+            echo "server never reached msg=listening"
+            return 1
+          }
+
+          # The fingerprint is an int64 and may be negative.
+          fingerprint() {
+            docker compose logs telegramd | sed -n 's/.*fingerprint=\(-\?[0-9]\+\).*/\1/p' | head -1
+          }
+
+          docker compose up -d --build
+          wait_listening
+          docker compose logs telegramd
+
+          before=$(fingerprint)
+          [ -n "$before" ] || { echo "no fingerprint in the first boot logs"; exit 1; }
+          echo "first boot fingerprint=$before"
+
+          # A surviving schema proves nothing, because migrate would recreate it.
+          # A hand-written row only comes back if pgdata itself came back.
+          docker compose exec -T postgres psql -U postgres -d telegram \
+            -c 'CREATE TABLE ci_marker (id int primary key); INSERT INTO ci_marker VALUES (1);'
+
+          # Without -v, which is the entire point of the test.
+          docker compose down
+          docker compose up -d
+          wait_listening
+          docker compose logs telegramd
+
+          docker compose exec -T postgres psql -U postgres -d telegram -tAc 'SELECT id FROM ci_marker' \
+            | grep -qx 1 || { echo "pgdata did not survive docker compose down"; exit 1; }
+
+          after=$(fingerprint)
+          echo "second boot fingerprint=$after"
+          # A mismatch means the tgkey volume is not doing its job and every
+          # client would be handed a new server identity on each restart.
+          [ "$before" = "$after" ] || { echo "RSA fingerprint changed: $before -> $after"; exit 1; }
+
+          # `down` removed the first migrate container, so these logs are only the
+          # second run. Atlas records applied versions in atlas_schema_revisions,
+          # so finding nothing to apply is its normal path, not something a flag
+          # has to suppress.
+          docker compose logs migrate
+          if docker compose logs migrate | grep -q 'Migrating to version'; then
+            echo "the second migrate run applied migrations"
+            exit 1
+          fi
+          code=$(docker inspect -f '{{.State.ExitCode}}' "$(docker compose ps -aq migrate)")
+          [ "$code" = 0 ] || { echo "migrate exited $code"; exit 1; }
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
