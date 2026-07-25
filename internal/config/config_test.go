@@ -39,6 +39,44 @@ func TestLoadRequiresDSN(t *testing.T) {
 	}
 }
 
+func TestLoadLogLoginCodes(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	tests := map[string]struct {
+		raw     string
+		want    bool
+		wantErr bool
+	}{
+		"unset":       {raw: "", want: false},
+		"true":        {raw: "true", want: true},
+		"false":       {raw: "false", want: false},
+		"not boolean": {raw: "maybe", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TG_LOG_LOGIN_CODES", tc.raw)
+			cfg, err := config.Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %s, got LogLoginCodes = %v", name, cfg.LogLoginCodes)
+				}
+				// The error must name the variable, so a typo is diagnosable
+				// from the startup log alone.
+				if !strings.Contains(err.Error(), "TG_LOG_LOGIN_CODES") {
+					t.Errorf("error %q does not name TG_LOG_LOGIN_CODES", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.LogLoginCodes != tc.want {
+				t.Errorf("LogLoginCodes = %v, want %v", cfg.LogLoginCodes, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadEncKey(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	tests := map[string]string{

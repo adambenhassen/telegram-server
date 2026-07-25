@@ -1,7 +1,10 @@
 package api_test
 
 import (
+	"context"
 	"errors"
+	"log/slog"
+	"slices"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -34,6 +37,64 @@ func TestSignInWrongCodeMapsToRPCError(t *testing.T) {
 	}
 	if api.VerifyToRPC(nil) != nil {
 		t.Error("nil should map to nil")
+	}
+}
+
+// captureHandler records every log record it is handed. Enabled always reports
+// true so a record suppressed by the gate cannot be confused with one dropped
+// by a level filter — absence is what the flag-off case asserts.
+type captureHandler struct{ records []slog.Record }
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.records = append(h.records, r)
+	return nil
+}
+
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *captureHandler) WithGroup(string) slog.Handler { return h }
+
+func TestLogIssuedCodeGate(t *testing.T) {
+	const (
+		phone = "+15550001111"
+		code  = "12345"
+	)
+	tests := map[string]struct {
+		logLoginCodes bool
+		wantRecords   int
+	}{
+		"flag off": {logLoginCodes: false, wantRecords: 0},
+		"flag on":  {logLoginCodes: true, wantRecords: 1},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			h := &captureHandler{}
+			api.LogIssuedCodeForTest(slog.New(h), tc.logLoginCodes, phone, code)
+			if len(h.records) != tc.wantRecords {
+				t.Fatalf("captured %d records, want %d", len(h.records), tc.wantRecords)
+			}
+			if tc.wantRecords == 0 {
+				return
+			}
+			r := h.records[0]
+			if r.Level != slog.LevelInfo {
+				t.Errorf("level = %v, want %v", r.Level, slog.LevelInfo)
+			}
+			if r.Message != "login code issued" {
+				t.Errorf("message = %q, want %q", r.Message, "login code issued")
+			}
+			var got []string
+			r.Attrs(func(a slog.Attr) bool {
+				got = append(got, a.Key+"="+a.Value.String())
+				return true
+			})
+			want := []string{"phone=" + phone, "code=" + code}
+			if !slices.Equal(got, want) {
+				t.Errorf("attrs = %v, want %v", got, want)
+			}
+		})
 	}
 }
 

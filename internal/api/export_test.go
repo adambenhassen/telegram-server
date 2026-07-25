@@ -18,6 +18,13 @@ var (
 	NewSentCode   = newSentCode
 )
 
+// LogIssuedCodeForTest drives the gated login-code log line for the external
+// api_test package, without needing a store or a database.
+func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code string) {
+	h := &handlers{log: log, logLoginCodes: logLoginCodes}
+	h.logIssuedCode(phone, code)
+}
+
 func testHandlers(s *store.Store) *handlers {
 	return &handlers{store: s, log: slog.New(slog.DiscardHandler)}
 }
