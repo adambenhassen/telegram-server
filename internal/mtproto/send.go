@@ -31,11 +31,18 @@ type Conn struct {
 	log          *slog.Logger
 
 	// writeMu serializes socket writes and guards the mutable session state
-	// (authKey, sessionID) it reads, so a server-initiated Push from the delivery
-	// goroutine cannot interleave with a reply write on the serve goroutine.
+	// (authKey, sessionID, owner) it reads, so a server-initiated push from the
+	// delivery goroutine cannot interleave with a reply write on the serve
+	// goroutine, nor write an update for a user this conn has stopped belonging
+	// to. It is the only lock taken here and is never held across the registry
+	// lock, in either direction.
 	writeMu   sync.Mutex
 	authKey   crypto.AuthKey
 	sessionID int64
+	// owner is the user this conn's auth key is currently bound to, 0 for none.
+	// Delivery addresses every push to an owner, so a push built for the user
+	// who held the key a moment ago is dropped instead of written.
+	owner int64
 
 	// created is touched only by the connection's single serve goroutine.
 	created map[int64]struct{}
@@ -51,9 +58,19 @@ func (c *Conn) LastPushedPts() int {
 	return int(c.lastPushedPts.Load())
 }
 
-// SetLastPushedPts records the highest pts pushed to this connection.
-func (c *Conn) SetLastPushedPts(pts int) {
-	c.lastPushedPts.Store(int64(pts))
+// setOwner records the user this conn's auth key is now bound to. Changing
+// owner clears the push watermark, since the previous owner's pts means nothing
+// in the new owner's space and delivery must treat the conn as freshly
+// registered. It blocks until any push already on the wire finishes, which is
+// what makes the hand-off atomic against delivery.
+func (c *Conn) setOwner(userID int64) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.owner == userID {
+		return
+	}
+	c.owner = userID
+	c.lastPushedPts.Store(0)
 }
 
 func newConn(
@@ -107,12 +124,19 @@ func (c *Conn) send(ctx context.Context, t proto.MessageType, message bin.Encode
 	if err := message.Encode(&b); err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
-	if b.Len() > math.MaxInt32 {
-		return fmt.Errorf("message too large: %d bytes", b.Len())
-	}
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.sendLocked(ctx, t, &b)
+}
+
+// sendLocked encrypts an already-encoded body under the session key and writes
+// it to the transport. writeMu must be held: it guards both the session state
+// read here and the write itself.
+func (c *Conn) sendLocked(ctx context.Context, t proto.MessageType, b *bin.Buffer) error {
+	if b.Len() > math.MaxInt32 {
+		return fmt.Errorf("message too large: %d bytes", b.Len())
+	}
 
 	data := crypto.EncryptedMessageData{
 		SessionID:              c.sessionID,
@@ -120,26 +144,46 @@ func (c *Conn) send(ctx context.Context, t proto.MessageType, message bin.Encode
 		MessageDataLen:         int32(b.Len()), //nolint:gosec // bounded above by MaxInt32
 		MessageDataWithPadding: b.Copy(),
 	}
-	if err := c.cipher.Encrypt(c.authKey, data, &b); err != nil {
+	if err := c.cipher.Encrypt(c.authKey, data, b); err != nil {
 		return fmt.Errorf("encrypt: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, c.writeTimeout)
 	defer cancel()
-	if err := c.transport.Send(ctx, &b); err != nil {
+	if err := c.transport.Send(ctx, b); err != nil {
 		return fmt.Errorf("send: %w", err)
 	}
 	return nil
 }
 
-// Push encrypts enc under the conn's auth key and writes it as an unsolicited
-// server message (fresh msg_id + server seqno). Safe to call from another
-// goroutine; serialized against reply writes by the conn write mutex.
-func (c *Conn) Push(ctx context.Context, enc bin.Encoder) error {
-	if err := c.send(ctx, proto.MessageFromServer, enc); err != nil {
-		return fmt.Errorf("push [%T]: %w", enc, err)
+// PushTo encrypts enc under the conn's auth key and writes it as an unsolicited
+// server message (fresh msg_id + server seqno), but only while the conn still
+// belongs to owner; it reports whether the write happened. The ownership check,
+// the write and the watermark advance share one critical section, so a rebind
+// cannot land between them and let an update built from an already-stale
+// registry snapshot reach the user who has taken the key over.
+//
+// pts is the pts the batch advertises and is recorded only on a successful
+// write; pass 0 for a transient update that carries none, since a persisted
+// batch always advertises at least 1. Safe to call from another goroutine.
+func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int) (bool, error) {
+	var b bin.Buffer
+	if err := enc.Encode(&b); err != nil {
+		return false, fmt.Errorf("push encode [%T]: %w", enc, err)
 	}
-	return nil
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.owner != owner {
+		return false, nil
+	}
+	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
+		return false, fmt.Errorf("push [%T]: %w", enc, err)
+	}
+	if pts > 0 {
+		c.lastPushedPts.Store(int64(pts))
+	}
+	return true, nil
 }
 
 // SendResult sends msg as the RPC result for req.
