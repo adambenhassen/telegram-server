@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes the run already in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    # The suite finishes in ~2m30s; this only catches a hang (a stalled image
+    # pull, a container that never reports ready) before it burns six hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
+
+      # The action's version input defaults to latest, which resolves to the
+      # canary channel; pin the binary so the checksum gate cannot move on its own.
+      - uses: ariga/setup-atlas@v0.3
+        with:
+          version: v1.2.0
+
+      - name: Validate migrations
+        run: atlas migrate validate --dir file://migrations
+
+      # Postgres comes from testcontainers inside internal/pgtest, which starts
+      # postgres:16-alpine with its own config. Nothing to wire up on the runner
+      # beyond the Docker daemon ubuntu-latest already provides.
+      - name: Test
+        run: go test ./...
