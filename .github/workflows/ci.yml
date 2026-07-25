@@ -105,6 +105,19 @@ jobs:
             echo "secret env baked into the image"
             exit 1
           fi
+          # The smoke run below proves the key directory is writable by uid
+          # 65532, not that it is only writable by uid 65532. Assert the mode
+          # from the layer itself: a named volume inherits the mountpoint's mode
+          # from the image, so 0755 here would follow every deployment that
+          # mounts one, and the directory holds the server identity key.
+          cid=$(docker create telegramd:ci)
+          keydir=$(docker export "$cid" | tar -tvf - --numeric-owner var/lib/telegramd/ | head -1)
+          docker rm "$cid" > /dev/null
+          echo "$keydir"
+          case "$keydir" in
+            drwx------*65532/65532*) ;;
+            *) echo "key directory is not 0700 65532:65532"; exit 1 ;;
+          esac
 
       # Pinned for the same reason as the ci job: the action's default resolves
       # to the canary channel.
