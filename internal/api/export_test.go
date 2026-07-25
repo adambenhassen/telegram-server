@@ -44,6 +44,31 @@ func GetStateForTest(s *store.Store, userID int64) (bin.Encoder, error) {
 // PeerUserID exposes the peer-resolution guard for the external api_test package.
 var PeerUserID = peerUserID
 
+// LogOutForTest invokes handleLogOut for a request arriving on authKeyID,
+// handing back the evict announcement unrun so a test can assert whether it was
+// already published by the time the handler returned.
+func LogOutForTest(s *store.Store, authKeyID [8]byte) (bin.Encoder, func(), error) {
+	var buf bin.Buffer
+	if err := (&tg.AuthLogOutRequest{}).Encode(&buf); err != nil {
+		return nil, nil, err
+	}
+	return testHandlers(s).handleLogOut(&mtproto.Request{
+		Ctx: context.Background(), AuthKeyID: authKeyID, Buf: &buf,
+	})
+}
+
+// ResetAuthorizationForTest invokes handleResetAuthorization for userID against
+// hash, on a request arriving on authKeyID, with the same unrun announcement.
+func ResetAuthorizationForTest(s *store.Store, userID int64, authKeyID [8]byte, hash int64) (bin.Encoder, func(), error) {
+	var buf bin.Buffer
+	if err := (&tg.AccountResetAuthorizationRequest{Hash: hash}).Encode(&buf); err != nil {
+		return nil, nil, err
+	}
+	return testHandlers(s).handleResetAuthorization(&mtproto.Request{
+		Ctx: context.Background(), UserID: userID, AuthKeyID: authKeyID, Buf: &buf,
+	})
+}
+
 // SendMessageForTest encodes req and invokes handleSendMessage for the caller.
 func SendMessageForTest(s *store.Store, userID int64, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
 	var buf bin.Buffer
