@@ -72,7 +72,6 @@ services:
       # Not :? like the two above: there is a safe default for this stack, and a
       # .env copied before this line existed must still boot into a server you
       # can sign in to. A bare `true` here would take the knob away instead.
-      TG_LOG_LOGIN_CODES: ${TG_LOG_LOGIN_CODES:-true}
     ports:
       # Loopback only. 2443 is unauthenticated at the transport layer, so whoever
       # reaches it feeds chosen bytes into the MTProto decode path before any
