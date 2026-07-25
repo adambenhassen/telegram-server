@@ -24,7 +24,7 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | Variable            | Default          | Notes                                      |
 |---------------------|------------------|---------------------------------------------|
 | `TG_LISTEN_ADDR`    | `:2443`          | `host:port` (or `:port`) the server binds   |
-| `TG_ADVERTISE_ADDR` | *(derived from `TG_LISTEN_ADDR`)* | `host:port` clients are told to dial, used verbatim. Derived when unset: the listen address with an empty or wildcard host (`:2443`, `0.0.0.0`, `::`) replaced by `127.0.0.1`. A value that is not `host:port`, has no host, or has a non-integer port fails startup |
+| `TG_ADVERTISE_ADDR` | *(derived from `TG_LISTEN_ADDR`)* | `host:port` clients are told to dial, used verbatim. Derived when unset: the listen address with an empty or wildcard host (`:2443`, `0.0.0.0`, `::`) replaced by `127.0.0.1`. A value that is not `host:port`, has no host, or has a port that is not an integer in 1–65535 fails startup |
 | `TG_POSTGRES_DSN`   | *(required)*     | Postgres connection string; no default, server fails to start without it |
 | `TG_AUTHKEY_ENC_KEY`| *(required)*     | 64 hex chars (32 bytes) — master key that encrypts auth keys at rest; must stay stable, or persisted sessions can no longer be decrypted |
 | `TG_RSA_KEY_PATH`   | `server_key.pem` | Path to the server's RSA private key        |

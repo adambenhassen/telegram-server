@@ -90,6 +90,9 @@ func advertiseAddr(advertise, listen string) (string, int, error) {
 	if err != nil {
 		return "", 0, errors.New("TG_ADVERTISE_ADDR port must be an integer")
 	}
+	if port < 1 || port > 65535 {
+		return "", 0, errors.New("TG_ADVERTISE_ADDR port must be between 1 and 65535")
+	}
 	return host, port, nil
 }
 

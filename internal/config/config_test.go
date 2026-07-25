@@ -98,6 +98,10 @@ func TestLoadAdvertiseAddr(t *testing.T) {
 		"not host port":               {advertise: "nope", wantErr: true},
 		"port not an integer":         {advertise: "host:abc", wantErr: true},
 		"empty host":                  {advertise: ":2443", wantErr: true},
+		"port zero":                   {advertise: "host:0", wantErr: true},
+		"port negative":               {advertise: "host:-1", wantErr: true},
+		"port above range":            {advertise: "host:99999", wantErr: true},
+		"highest valid port":          {advertise: "host:65535", wantHost: "host", wantPort: 65535},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
