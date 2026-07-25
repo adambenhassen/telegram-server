@@ -28,12 +28,28 @@ func (s *Store) Notify(ctx context.Context, channel, payload string) error {
 	return nil
 }
 
-// Reconnect backoff bounds for the listener loop. A database that stays down is
-// retried on a growing delay, never in a tight loop.
+// Reconnect pacing for the listener loop. A database that stays down, or one
+// that flaps, is retried on a growing delay and never in a tight loop.
 const (
 	listenerBackoffMin = 100 * time.Millisecond
 	listenerBackoffMax = 30 * time.Second
+	// listenerStableFor is how long a connection must survive for its failure
+	// to count as a fresh one. Below it the database is still unhealthy, so the
+	// delay keeps growing; above it the loop starts over at the floor, whether
+	// or not that connection ever carried a notification.
+	listenerStableFor = 30 * time.Second
 )
+
+// nextBackoff returns the delay before the next reconnect attempt: the floor
+// when the connection that just failed had been up long enough to count as
+// healthy, otherwise the previous delay doubled up to the cap. uptime is zero
+// for an attempt that never connected.
+func nextBackoff(prev, uptime time.Duration) time.Duration {
+	if uptime >= listenerStableFor {
+		return listenerBackoffMin
+	}
+	return min(2*prev, listenerBackoffMax)
+}
 
 // Listener runs LISTEN on a dedicated pgx connection and dispatches each
 // notification to the delivery callbacks, reconnecting when that connection
@@ -127,12 +143,12 @@ func (l *Listener) run(
 			if !sleepCtx(ctx, backoff) {
 				return // canceled mid-backoff: nothing open to close
 			}
-			backoff = min(2*backoff, listenerBackoffMax)
 			c, err := connectAndListen(ctx, dsn)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
+				backoff = nextBackoff(backoff, 0)
 				l.log.Error("listener reconnect", "err", err, "retry_in", backoff)
 				continue
 			}
@@ -140,37 +156,33 @@ func (l *Listener) run(
 			conn = c
 		}
 
-		dispatched, err := l.dispatch(ctx, conn, deliver, typing, evict)
+		up := time.Now()
+		err := l.dispatch(ctx, conn, deliver, typing, evict)
 		closeErr := conn.Close(context.Background())
 		conn = nil
 		if ctx.Err() != nil {
 			l.closeErr = closeErr
 			return // canceled: clean shutdown
 		}
-		l.log.Error("listener connection lost", "err", err)
-		if dispatched {
-			// The connection carried traffic before breaking, so this is a
-			// fresh failure rather than a database that never came back.
-			backoff = listenerBackoffMin
-		}
+		backoff = nextBackoff(backoff, time.Since(up))
+		l.log.Error("listener connection lost", "err", err, "retry_in", backoff)
 	}
 }
 
 // dispatch consumes notifications on conn until ctx is canceled or the
-// connection fails, reporting whether any notification arrived on it.
+// connection fails, returning the error that ended it.
 func (l *Listener) dispatch(
 	ctx context.Context,
 	conn *pgx.Conn,
 	deliver func(ctx context.Context, userID int64),
 	typing func(ctx context.Context, peerID, fromID int64),
 	evict func(ctx context.Context, userID, authKeyID int64),
-) (dispatched bool, err error) {
+) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
-			return dispatched, err
+			return err
 		}
-		dispatched = true
 		switch n.Channel {
 		case ChannelUpdates:
 			userID, perr := strconv.ParseInt(n.Payload, 10, 64)

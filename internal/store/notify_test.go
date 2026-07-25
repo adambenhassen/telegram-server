@@ -125,6 +125,41 @@ func TestStartListenerDispatches(t *testing.T) {
 	}
 }
 
+// TestNextBackoff pins the reconnect pacing rule on the two cases a
+// notification-counting rule got wrong: a database that flaps must keep backing
+// off even while it delivers, and a connection that stayed up while idle must
+// not carry a stale penalty into its next failure.
+func TestNextBackoff(t *testing.T) {
+	t.Parallel()
+
+	// Flapping: every connection dies well before it counts as stable, so the
+	// delay grows to the cap however much traffic each one carried.
+	got := store.ListenerBackoffMin
+	for range 20 {
+		got = store.NextBackoff(got, 500*time.Millisecond)
+		if got > store.ListenerBackoffMax {
+			t.Fatalf("backoff = %v, want at most %v", got, store.ListenerBackoffMax)
+		}
+	}
+	if got != store.ListenerBackoffMax {
+		t.Fatalf("backoff after flapping = %v, want the %v cap", got, store.ListenerBackoffMax)
+	}
+
+	// Idle recovery: a silent connection that stayed up long enough is healthy,
+	// so its failure starts over at the floor rather than at the cap.
+	if got := store.NextBackoff(store.ListenerBackoffMax, 2*time.Hour); got != store.ListenerBackoffMin {
+		t.Fatalf("backoff after a long idle connection = %v, want %v", got, store.ListenerBackoffMin)
+	}
+	if got := store.NextBackoff(store.ListenerBackoffMax, store.ListenerStableFor); got != store.ListenerBackoffMin {
+		t.Fatalf("backoff at the stability threshold = %v, want %v", got, store.ListenerBackoffMin)
+	}
+
+	// A connect attempt that never came up has no uptime to credit.
+	if got := store.NextBackoff(store.ListenerBackoffMin, 0); got != 2*store.ListenerBackoffMin {
+		t.Fatalf("backoff after a failed dial = %v, want %v", got, 2*store.ListenerBackoffMin)
+	}
+}
+
 // TestStartListenerReconnectsAfterBackendTermination kills the listener's
 // Postgres backend server-side and proves delivery resumes on the same process:
 // a dropped connection must not end real-time push until a restart.
