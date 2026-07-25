@@ -26,11 +26,36 @@ type handlers struct {
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
 
 // revokeFunc is a methodFunc that also returns work to run once the reply is on
-// the wire. Revocation needs it: the evict notification it emits can close this
-// very socket from another goroutine, and nothing orders a Postgres round trip
-// against a local socket write, so emitting before the reply would let a
-// successful logOut or self-reset surface to the client as a transport error.
+// the wire. Exactly one revocation needs it: the one whose eviction closes the
+// socket the reply goes out on. Nothing orders a Postgres round trip against a
+// local socket write, so emitting first would let a successful logOut or
+// self-reset surface to the client as a transport error.
+//
+// Every other revocation emits inside the handler instead, keeping the
+// notification published before the client can observe success — see
+// selfRevocation.
 type revokeFunc func(req *mtproto.Request) (res bin.Encoder, afterReply func(), err error)
+
+// selfRevocation reports whether keyID is the key the request arrived on, which
+// is what decides when the eviction may be published.
+//
+// Deferring it is a cost, not a preference: while the notification waits for the
+// reply, a client that has already seen success can trigger an update whose own
+// NOTIFY commits first, and a replica then delivers that update to the socket
+// being revoked before the evict reaches it. So only the case that has to wait
+// waits. When the revoked key is the caller's own, the sole socket exposed by
+// that window is the caller's own — it asked for this — and every other holder
+// of the key is still evicted as soon as the notification lands.
+//
+// The alternative Codex asked for, publishing first and deferring only this
+// connection's close, needs the close and the reply write to agree on which of
+// them is in flight. Nothing but writeMu can decide that, and the evict path may
+// not take writeMu: it runs on the single listener goroutine, where waiting on a
+// write would stall every user's delivery. So the choice is where to pay, and it
+// is paid on the request that revokes itself.
+func selfRevocation(r *mtproto.Request, keyID int64) bool {
+	return keyID == mtproto.AuthKeyIDInt64(r.AuthKeyID)
+}
 
 // New builds the RPC handler: dispatcher wrapped with UnpackInvoke so
 // invokeWithLayer/initConnection wrappers are peeled before dispatch.

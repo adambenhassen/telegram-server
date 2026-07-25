@@ -50,8 +50,10 @@ func (h *handlers) handleGetAuthorizations(r *mtproto.Request) (bin.Encoder, err
 // caller's session identified by Hash (an auth key id) by deleting that auth
 // key. The key is deleted only when it belongs to the caller, so a user cannot
 // reset another user's session; a foreign or unknown hash returns HASH_INVALID.
-// The evict announcement is returned rather than emitted, because a caller
-// resetting its own current session would otherwise race its own reply.
+// Resetting another session publishes the eviction before the reply, so a client
+// that has seen success cannot trigger an update that overtakes it. Only a caller
+// resetting its own current session defers, since there the eviction closes the
+// socket the reply goes out on.
 func (h *handlers) handleResetAuthorization(r *mtproto.Request) (bin.Encoder, func(), error) {
 	var req tg.AccountResetAuthorizationRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -75,7 +77,10 @@ func (h *handlers) handleResetAuthorization(r *mtproto.Request) (bin.Encoder, fu
 	}
 	// Emitted after the delete has committed, so the evicted client cannot
 	// reconnect on the same key and find the row still present.
-	return &tg.BoolTrue{}, func() {
-		h.notifyEvict(r.Ctx, key.UserID, req.Hash)
-	}, nil
+	evict := func() { h.notifyEvict(r.Ctx, key.UserID, req.Hash) }
+	if selfRevocation(r, req.Hash) {
+		return &tg.BoolTrue{}, evict, nil
+	}
+	evict()
+	return &tg.BoolTrue{}, nil, nil
 }

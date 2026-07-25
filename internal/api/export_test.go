@@ -13,9 +13,10 @@ import (
 
 // Test-only aliases exposing unexported helpers to the external api_test package.
 var (
-	ValidatePhone = validatePhone
-	VerifyToRPC   = verifyToRPC
-	NewSentCode   = newSentCode
+	ValidatePhone  = validatePhone
+	VerifyToRPC    = verifyToRPC
+	NewSentCode    = newSentCode
+	SelfRevocation = selfRevocation
 )
 
 // LogIssuedCodeForTest drives the gated login-code log line for the external

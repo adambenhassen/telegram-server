@@ -123,8 +123,9 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 // on, so the client must re-handshake and is no longer authorized. Telegram
 // allows logOut regardless of authorization state; deleting an unbound key is a
 // no-op, so no UserID check is needed. Returns auth.loggedOut on success, and
-// the evict announcement to emit once that reply is on the wire — this key is
-// the caller's own, so the eviction closes the socket the reply goes out on.
+// the evict announcement to emit once that reply is on the wire: logOut always
+// revokes the key the request arrived on, so it is a self-revocation by
+// definition and its eviction closes the socket the reply goes out on.
 func (h *handlers) handleLogOut(r *mtproto.Request) (bin.Encoder, func(), error) {
 	var req tg.AuthLogOutRequest
 	if err := req.Decode(r.Buf); err != nil {
