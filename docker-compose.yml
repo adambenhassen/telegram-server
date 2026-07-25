@@ -80,11 +80,12 @@ services:
       # DNAT rule the host firewall never sees, so "2443:2443" would hand this
       # server to the whole network the laptop is on.
       - "127.0.0.1:2443:2443"
-    # TG_LISTEN_ADDR is deliberately unset. Its default :2443 makes the server
-    # advertise 127.0.0.1 as the DC address (cmd/telegramd/main.go:130), which is
-    # right for this stack: the only client is on the host and arrives through the
-    # published port above. Setting 0.0.0.0:2443 would advertise 0.0.0.0, which is
-    # worse. The general fix is tracked separately.
+    # TG_LISTEN_ADDR and TG_ADVERTISE_ADDR are both deliberately unset. The
+    # listen default :2443 binds every interface in the container, and with no
+    # advertise address set the DC address derives from it as 127.0.0.1:2443,
+    # which is right for this stack: the only client is on the host and arrives
+    # through the published port above. A client reached from anywhere else sets
+    # TG_ADVERTISE_ADDR to the name it dials.
     #
     # Proven by the docker job in ci.yml, which already boots this image
     # --read-only: the static binary writes nothing but its key file.

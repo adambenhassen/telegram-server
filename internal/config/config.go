@@ -4,6 +4,7 @@ package config
 import (
 	"encoding/hex"
 	"errors"
+	"net"
 	"os"
 	"strconv"
 
@@ -17,6 +18,11 @@ type Config struct {
 	RSAKeyPath  string
 	// AuthKeyEncKey is the 32-byte master key that encrypts auth keys at rest.
 	AuthKeyEncKey []byte
+	// AdvertiseHost and AdvertisePort are the address clients are told to
+	// dial, which is not always the one the server binds: a listener on every
+	// interface still has to name one address a client can reach it by.
+	AdvertiseHost string
+	AdvertisePort int
 	DCID          int
 	// LogLoginCodes opts into writing issued login codes to the log in
 	// cleartext. Off by default: the log is readable by anyone with the
@@ -47,6 +53,11 @@ func Load() (Config, error) {
 		}
 		cfg.LogLoginCodes = on
 	}
+	advertiseHost, advertisePort, err := advertiseAddr(os.Getenv("TG_ADVERTISE_ADDR"), cfg.ListenAddr)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AdvertiseHost, cfg.AdvertisePort = advertiseHost, advertisePort
 	if cfg.PostgresDSN == "" {
 		return Config{}, errors.New("TG_POSTGRES_DSN is required")
 	}
@@ -56,6 +67,49 @@ func Load() (Config, error) {
 	}
 	cfg.AuthKeyEncKey = encKey
 	return cfg, nil
+}
+
+// advertiseAddr resolves the address clients are told to dial. An explicit
+// TG_ADVERTISE_ADDR is used verbatim and must parse, since a wrong one is only
+// visible as clients failing to reconnect; an empty one is derived from the
+// listen address, which stays as loosely validated as it was — a bad one fails
+// loudly at net.Listen.
+func advertiseAddr(advertise, listen string) (string, int, error) {
+	if advertise == "" {
+		host, port := splitHostPort(listen)
+		return host, port, nil
+	}
+	host, portStr, err := net.SplitHostPort(advertise)
+	if err != nil {
+		return "", 0, errors.New("TG_ADVERTISE_ADDR must be host:port")
+	}
+	if host == "" {
+		return "", 0, errors.New("TG_ADVERTISE_ADDR must name a host clients can reach")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, errors.New("TG_ADVERTISE_ADDR port must be an integer")
+	}
+	return host, port, nil
+}
+
+// splitHostPort derives an advertisable address from a listen address. A host
+// that is empty or a wildcard binds every interface but names none, so it
+// becomes loopback — the one address that is always reachable.
+func splitHostPort(addr string) (string, int) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "127.0.0.1", 2443
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		port = 2443
+	}
+	return host, port
 }
 
 // decodeEncKey parses the hex-encoded auth-key encryption master key. It is

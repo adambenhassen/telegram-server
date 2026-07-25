@@ -77,6 +77,54 @@ func TestLoadLogLoginCodes(t *testing.T) {
 	}
 }
 
+func TestLoadAdvertiseAddr(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	tests := map[string]struct {
+		listen    string
+		advertise string
+		wantHost  string
+		wantPort  int
+		wantErr   bool
+	}{
+		"derived from default listen addr": {wantHost: "127.0.0.1", wantPort: 2443},
+		"derived from wildcard":            {listen: "0.0.0.0:2443", wantHost: "127.0.0.1", wantPort: 2443},
+		"derived from ipv6 wildcard":       {listen: "[::]:2443", wantHost: "127.0.0.1", wantPort: 2443},
+		"derived from explicit host":       {listen: "192.168.1.5:2443", wantHost: "192.168.1.5", wantPort: 2443},
+		"set with derivable listen addr":   {listen: ":2443", advertise: "tg.example.com:2443", wantHost: "tg.example.com", wantPort: 2443},
+		"set overrides listen addr":        {listen: "0.0.0.0:2443", advertise: "10.0.0.7:9999", wantHost: "10.0.0.7", wantPort: 9999},
+		// Rule 3: an explicit value is used verbatim, wildcard included.
+		"set to wildcard is verbatim": {listen: ":2443", advertise: "0.0.0.0:2443", wantHost: "0.0.0.0", wantPort: 2443},
+		"not host port":               {advertise: "nope", wantErr: true},
+		"port not an integer":         {advertise: "host:abc", wantErr: true},
+		"empty host":                  {advertise: ":2443", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TG_LISTEN_ADDR", tc.listen)
+			t.Setenv("TG_ADVERTISE_ADDR", tc.advertise)
+			cfg, err := config.Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %s, got %s:%d", name, cfg.AdvertiseHost, cfg.AdvertisePort)
+				}
+				// The error must name the variable, so a typo is diagnosable
+				// from the startup log alone.
+				if !strings.Contains(err.Error(), "TG_ADVERTISE_ADDR") {
+					t.Errorf("error %q does not name TG_ADVERTISE_ADDR", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.AdvertiseHost != tc.wantHost || cfg.AdvertisePort != tc.wantPort {
+				t.Errorf("advertise = %s:%d, want %s:%d", cfg.AdvertiseHost, cfg.AdvertisePort, tc.wantHost, tc.wantPort)
+			}
+		})
+	}
+}
+
 func TestLoadEncKey(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	tests := map[string]string{
