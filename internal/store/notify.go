@@ -15,6 +15,7 @@ import (
 const (
 	ChannelUpdates = "tg_updates" // payload: "<userID>"
 	ChannelTyping  = "tg_typing"  // payload: "<peerUserID>|<fromUserID>"
+	ChannelEvict   = "tg_evict"   // payload: "<userID>|<authKeyID>"
 )
 
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
@@ -33,16 +34,21 @@ type Listener struct {
 	log  *slog.Logger
 }
 
-// StartListener opens a dedicated connection, subscribes to the update and
-// typing channels, and runs the notification loop until the returned stop
+// StartListener opens a dedicated connection, subscribes to the update, typing
+// and evict channels, and runs the notification loop until the returned stop
 // function is called (which cancels the loop, drains it, and closes the
 // connection). deliver receives a userID whose events changed; typing receives
-// (peerUserID, fromUserID) for a transient typing notification.
+// (peerUserID, fromUserID) for a transient typing notification; evict receives
+// (userID, authKeyID) for a session revoked on any replica.
+//
+// The callbacks run on this one goroutine, so none of them may block: a stalled
+// callback holds up every other user's delivery.
 func StartListener(
 	ctx context.Context,
 	dsn string,
 	deliver func(ctx context.Context, userID int64),
 	typing func(ctx context.Context, peerID, fromID int64),
+	evict func(ctx context.Context, userID, authKeyID int64),
 	log *slog.Logger,
 ) (*Listener, func() error, error) {
 	if log == nil {
@@ -52,7 +58,7 @@ func StartListener(
 	if err != nil {
 		return nil, nil, fmt.Errorf("listener connect: %w", err)
 	}
-	for _, ch := range []string{ChannelUpdates, ChannelTyping} {
+	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict} {
 		// ch is a constant channel identifier, never user input (no injection).
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			_ = conn.Close(ctx) //nolint:errcheck // best-effort close on setup failure
@@ -63,7 +69,7 @@ func StartListener(
 	l := &Listener{conn: conn, log: log}
 	loopCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	wg.Go(func() { l.loop(loopCtx, deliver, typing) })
+	wg.Go(func() { l.loop(loopCtx, deliver, typing, evict) })
 
 	stop := func() error {
 		cancel()
@@ -77,6 +83,7 @@ func (l *Listener) loop(
 	ctx context.Context,
 	deliver func(ctx context.Context, userID int64),
 	typing func(ctx context.Context, peerID, fromID int64),
+	evict func(ctx context.Context, userID, authKeyID int64),
 ) {
 	for {
 		n, err := l.conn.WaitForNotification(ctx)
@@ -96,33 +103,53 @@ func (l *Listener) loop(
 			}
 			deliver(ctx, userID)
 		case ChannelTyping:
-			peerID, fromID, perr := parseTypingPayload(n.Payload)
+			peerID, fromID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
 				l.log.Warn("bad tg_typing payload", "payload", n.Payload)
 				continue
 			}
 			typing(ctx, peerID, fromID)
+		case ChannelEvict:
+			userID, authKeyID, perr := parsePairPayload(n.Payload)
+			if perr != nil {
+				// Dropped, never widened: an evict that cannot be read must not
+				// escalate into closing every connection of some user.
+				l.log.Warn("bad tg_evict payload", "payload", n.Payload)
+				continue
+			}
+			evict(ctx, userID, authKeyID)
 		}
 	}
 }
 
 // TypingPayload formats a tg_typing NOTIFY payload from the peer and sender ids.
 func TypingPayload(peerID, fromID int64) string {
-	return strconv.FormatInt(peerID, 10) + "|" + strconv.FormatInt(fromID, 10)
+	return pairPayload(peerID, fromID)
 }
 
-func parseTypingPayload(payload string) (peerID, fromID int64, err error) {
-	peerStr, fromStr, ok := strings.Cut(payload, "|")
+// EvictPayload formats a tg_evict NOTIFY payload naming the revoked session: the
+// user the deleted auth key was bound to, and the auth key id itself.
+func EvictPayload(userID, authKeyID int64) string {
+	return pairPayload(userID, authKeyID)
+}
+
+// pairPayload encodes the two-id payload shape shared by the pair channels.
+func pairPayload(first, second int64) string {
+	return strconv.FormatInt(first, 10) + "|" + strconv.FormatInt(second, 10)
+}
+
+func parsePairPayload(payload string) (first, second int64, err error) {
+	firstStr, secondStr, ok := strings.Cut(payload, "|")
 	if !ok {
-		return 0, 0, fmt.Errorf("malformed typing payload %q", payload)
+		return 0, 0, fmt.Errorf("malformed pair payload %q", payload)
 	}
-	peerID, err = strconv.ParseInt(peerStr, 10, 64)
+	first, err = strconv.ParseInt(firstStr, 10, 64)
 	if err != nil {
 		return 0, 0, err
 	}
-	fromID, err = strconv.ParseInt(fromStr, 10, 64)
+	second, err = strconv.ParseInt(secondStr, 10, 64)
 	if err != nil {
 		return 0, 0, err
 	}
-	return peerID, fromID, nil
+	return first, second, nil
 }

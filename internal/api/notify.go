@@ -79,6 +79,29 @@ func (u *Updater) DeliverTyping(ctx context.Context, peerID, fromID int64) {
 	}
 }
 
+// Evict closes the connections of userID that still hold authKeyID, which the
+// revoking replica has just deleted from auth_keys. It is the cross-replica half
+// of revocation: without it a socket that sends no further frame keeps its
+// cached key, and keeps receiving message bodies, until the read timeout.
+//
+// It is deliberately narrow. Nothing stored is touched, the registry is left to
+// the serve goroutine's own cleanup, and a key id matching no live conn is
+// ignored: closing every conn of the user instead would turn one forged NOTIFY
+// line into a whole-account disconnect.
+func (u *Updater) Evict(_ context.Context, userID, authKeyID int64) {
+	for _, c := range u.registry.Conns(userID) {
+		if c.AuthKeyID() != authKeyID {
+			continue
+		}
+		// Closing the transport unblocks that conn's Recv; the serve goroutine
+		// deregisters and disowns it on the way out. Errors are informational:
+		// the socket is going away either way.
+		if err := c.Close(); err != nil {
+			u.log.Info("evict close", "user_id", userID, "err", err)
+		}
+	}
+}
+
 // wrapUpdates envelopes hydrated updates into a tg.Updates for a live push.
 func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, state store.State) *tg.Updates {
 	return &tg.Updates{

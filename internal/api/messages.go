@@ -46,6 +46,17 @@ func (h *handlers) notifyTyping(ctx context.Context, peerID, fromID int64) {
 	}
 }
 
+// notifyEvict announces that authKeyID, bound to userID, has been revoked, so
+// every replica closes the sockets still holding it. Emitted only after the
+// delete has committed: a client whose socket is closed first reconnects with
+// the same cached key, finds the row still there, re-registers, and the evict is
+// spent.
+func (h *handlers) notifyEvict(ctx context.Context, userID, authKeyID int64) {
+	if err := h.store.Notify(ctx, store.ChannelEvict, store.EvictPayload(userID, authKeyID)); err != nil {
+		h.log.Error("notify evict", "user_id", userID, "err", err)
+	}
+}
+
 // twoUsers hydrates the caller and the peer into the update user list.
 func (h *handlers) twoUsers(ctx context.Context, selfID, peerID int64) ([]tg.UserClass, error) {
 	return h.loadUsers(ctx, map[int64]bool{selfID: true, peerID: true}, selfID)

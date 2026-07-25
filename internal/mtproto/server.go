@@ -213,9 +213,11 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 			// registry and close the socket so a revoked client can no longer
 			// receive pushes under its cached key.
 			//
-			// ponytail: only closes on the client's next frame; a silent socket
-			// keeps its cached key until it sends again. Full revocation needs a
-			// cross-replica evict signal — deferred to a sessions-hardening pass.
+			// This stays the guarantee. The tg_evict NOTIFY closes a revoked
+			// socket that sends nothing, but it is best-effort — not persisted,
+			// and lost while a replica's listener is down — so a socket that
+			// missed the signal is still caught here on its next frame, and
+			// failing that by the read timeout.
 			if registeredUser != 0 {
 				// The deferred cleanup deregisters and disowns the conn.
 				return nil

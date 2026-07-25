@@ -122,15 +122,33 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 // handleLogOut serves auth.logOut. It deletes the auth key the request arrived
 // on, so the client must re-handshake and is no longer authorized. Telegram
 // allows logOut regardless of authorization state; deleting an unbound key is a
-// no-op, so no UserID check is needed. Returns auth.loggedOut on success.
-func (h *handlers) handleLogOut(r *mtproto.Request) (bin.Encoder, error) {
+// no-op, so no UserID check is needed. Returns auth.loggedOut on success, and
+// the evict announcement to emit once that reply is on the wire: logOut always
+// revokes the key the request arrived on, so it is a self-revocation by
+// definition and its eviction closes the socket the reply goes out on.
+func (h *handlers) handleLogOut(r *mtproto.Request) (bin.Encoder, func(), error) {
 	var req tg.AuthLogOutRequest
 	if err := req.Decode(r.Buf); err != nil {
-		return nil, errMethodNotImpl
+		return nil, nil, errMethodNotImpl
 	}
-	if err := h.store.DeleteAuthKey(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID)); err != nil {
+	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
+	// The evict notification is addressed to the user the key was bound to, and
+	// only the row carries that: an unauthorized logOut has no r.UserID. Read it
+	// before the delete removes it.
+	key, ok, err := h.store.AuthKeyByID(r.Ctx, keyID)
+	if err != nil {
+		h.log.Error("logout: lookup auth key", "err", err)
+		return nil, nil, errInternal
+	}
+	if err := h.store.DeleteAuthKey(r.Ctx, keyID); err != nil {
 		h.log.Error("logout: delete auth key", "err", err)
-		return nil, errInternal
+		return nil, nil, errInternal
 	}
-	return &tg.AuthLoggedOut{}, nil
+	// An unbound key is registered under nobody, so there is nothing to evict.
+	if !ok || key.UserID == 0 {
+		return &tg.AuthLoggedOut{}, nil, nil
+	}
+	return &tg.AuthLoggedOut{}, func() {
+		h.notifyEvict(r.Ctx, key.UserID, keyID)
+	}, nil
 }

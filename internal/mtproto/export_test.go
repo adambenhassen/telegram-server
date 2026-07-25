@@ -34,6 +34,12 @@ func (c *Conn) SetOwner(userID int64) {
 	c.setOwner(userID)
 }
 
+// SetKey exposes the per-frame auth key binding, which only the serve loop
+// performs in production, so a test can rebind a live conn's key.
+func (c *Conn) SetKey(key crypto.AuthKey) {
+	c.setKey(key)
+}
+
 // Users returns every user id holding at least one registered connection, so a
 // test can assert a connection sits in no bucket at all.
 func (r *SessionRegistry) Users() []int64 {

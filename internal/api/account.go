@@ -50,26 +50,37 @@ func (h *handlers) handleGetAuthorizations(r *mtproto.Request) (bin.Encoder, err
 // caller's session identified by Hash (an auth key id) by deleting that auth
 // key. The key is deleted only when it belongs to the caller, so a user cannot
 // reset another user's session; a foreign or unknown hash returns HASH_INVALID.
-func (h *handlers) handleResetAuthorization(r *mtproto.Request) (bin.Encoder, error) {
+// Resetting another session publishes the eviction before the reply, so a client
+// that has seen success cannot trigger an update that overtakes it. Only a caller
+// resetting its own current session defers, since there the eviction closes the
+// socket the reply goes out on.
+func (h *handlers) handleResetAuthorization(r *mtproto.Request) (bin.Encoder, func(), error) {
 	var req tg.AccountResetAuthorizationRequest
 	if err := req.Decode(r.Buf); err != nil {
-		return nil, errMethodNotImpl
+		return nil, nil, errMethodNotImpl
 	}
 	if r.UserID == 0 {
-		return nil, errAuthKeyUnreg
+		return nil, nil, errAuthKeyUnreg
 	}
 	key, ok, err := h.store.AuthKeyByID(r.Ctx, req.Hash)
 	if err != nil {
 		h.log.Error("reset authorization: lookup key", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, nil, errInternal
 	}
 	// Scope check: reject unless the target key is one of the caller's own.
 	if !ok || key.UserID != r.UserID {
-		return nil, errHashInvalid
+		return nil, nil, errHashInvalid
 	}
 	if err := h.store.DeleteAuthKey(r.Ctx, req.Hash); err != nil {
 		h.log.Error("reset authorization: delete key", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, nil, errInternal
 	}
-	return &tg.BoolTrue{}, nil
+	// Emitted after the delete has committed, so the evicted client cannot
+	// reconnect on the same key and find the row still present.
+	evict := func() { h.notifyEvict(r.Ctx, key.UserID, req.Hash) }
+	if selfRevocation(r, req.Hash) {
+		return &tg.BoolTrue{}, evict, nil
+	}
+	evict()
+	return &tg.BoolTrue{}, nil, nil
 }

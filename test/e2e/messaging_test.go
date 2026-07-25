@@ -162,13 +162,21 @@ func recvOr[T any](t *testing.T, ch chan T, what string) T {
 // wired to the server's session registry, and returns a stop function.
 func bootServerWithDelivery(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, dsn string, log *slog.Logger, ln net.Listener) func() {
 	t.Helper()
+	_, stop := bootServerWithRegistry(t, ctx, key, dcID, st, dsn, log, ln)
+	return stop
+}
+
+// bootServerWithRegistry is bootServerWithDelivery plus the booted server's
+// session registry, for tests that assert which sockets a replica still holds.
+func bootServerWithRegistry(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, dsn string, log *slog.Logger, ln net.Listener) (*mtproto.SessionRegistry, func()) {
+	t.Helper()
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	// Sign-in here reads the code off the log, so the gated line must be on.
 	handler := api.New(st, dcID, tgcfg, log, true)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdater(st, server.Registry(), log)
-	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, log)
+	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, log)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}
@@ -178,7 +186,7 @@ func bootServerWithDelivery(t *testing.T, ctx context.Context, key *rsa.PrivateK
 	go func() { serveErr <- server.Serve(srvCtx, transport.Listen(ln)) }()
 
 	var once bool
-	return func() {
+	return server.Registry(), func() {
 		if once {
 			return
 		}
