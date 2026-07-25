@@ -78,13 +78,16 @@ const maxDeliveryRounds = 2
 // pushed a batch with a hole in front of it.
 //
 // A batch truncated at maxDiffEvents ends below the watermark of any conn that
-// was already further ahead, so those take a second window, started at the
-// highest watermark left: the sockets closest to the head are the ones a live
-// push is for. Past maxDeliveryRounds the fan-out stops, and a conn still more
-// than a batch away from both ends is picked up by a later notification, whose
-// window has advanced, or by its own getDifference — push is the optimisation,
-// not the guarantee.
+// was already further ahead, so those take a second window. That one is
+// anchored at the head, not at a conn: a window reaches the head only if it
+// starts within maxDiffEvents of it and may not start past a conn it serves, so
+// starting at head-maxDiffEvents brings every conn within one batch of the head
+// — every socket a live push is for — up to date in one go. Past
+// maxDeliveryRounds the fan-out stops, and a conn deeper than that is picked up
+// by a later notification, whose window has advanced, or by its own
+// getDifference — push is the optimisation, not the guarantee.
 func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error)) {
+	var head int
 	for round := 0; round < maxDeliveryRounds && len(conns) > 0; round++ {
 		lo, hi := conns[0].LastPushedPts(), conns[0].LastPushedPts()
 		for _, c := range conns[1:] {
@@ -93,13 +96,23 @@ func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, b
 		}
 		from := lo
 		if round > 0 {
-			from = hi
+			tail := head - maxDiffEvents
+			from = max(lo, tail)
+			if hi < tail {
+				// Not even the furthest-along conn is within a batch of the
+				// head, so no window can both reach the head and start below
+				// one of these conns: they are all still catching up. Spend the
+				// round on the one nearest the head rather than on a window
+				// that would serve nobody.
+				from = hi
+			}
 		}
 		b, err := build(from)
 		if err != nil {
 			u.log.Error("deliver build updates", "user_id", userID, "err", err)
 			return
 		}
+		head = b.head
 		// Nothing pending for the furthest-behind conn means nothing pending
 		// for any of them.
 		if len(b.ups) == 0 && !b.more {

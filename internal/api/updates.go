@@ -73,7 +73,11 @@ type updateBatch struct {
 	pts   []int
 	users []tg.UserClass
 	state store.State
-	more  bool
+	// head is the user's pts as read for this batch, before any truncation
+	// clamp on state. It is what a reader within maxDiffEvents of it can be
+	// brought up to by a single further window.
+	head int
+	more bool
 }
 
 // above returns the updates whose pts exceeds fromPts. Events are ordered, so
@@ -100,7 +104,7 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 	if err != nil {
 		return updateBatch{}, err
 	}
-	b := updateBatch{state: state}
+	b := updateBatch{state: state, head: state.Pts}
 	if len(events) > maxDiffEvents {
 		events = events[:maxDiffEvents]
 		b.more = true

@@ -36,9 +36,11 @@ func (f *fakePushConn) PushTo(_ context.Context, _ int64, enc bin.Encoder, pts i
 	return true, nil
 }
 
-// batch builds a batch of one update per pts in (from, to], advertising adv.
-func batch(from, to, adv int, more bool) updateBatch {
-	b := updateBatch{state: store.State{Pts: adv}, more: more}
+// batch builds a batch of one update per pts in (from, to], with head the
+// user's pts before truncation: a batch stopping short of it is a truncated one
+// advertising only the last event it carries, as buildUpdates does.
+func batch(from, to, head int) updateBatch {
+	b := updateBatch{state: store.State{Pts: to}, head: head, more: to < head}
 	for p := from + 1; p <= to; p++ {
 		b.ups = append(b.ups, &tg.UpdateNewMessage{Message: &tg.Message{ID: p}, Pts: p, PtsCount: 1})
 		b.pts = append(b.pts, p)
@@ -79,7 +81,7 @@ func TestDeliverBuildsOnceForEveryConn(t *testing.T) {
 		if fromPts != 0 {
 			t.Errorf("built from pts %d, want the minimum watermark 0", fromPts)
 		}
-		return batch(0, 5, 5, false), nil
+		return batch(0, 5, 5), nil
 	})
 
 	if builds != 1 {
@@ -117,7 +119,7 @@ func TestDeliverAddingConnsKeepsOneBuild(t *testing.T) {
 		builds := 0
 		testUpdater().deliver(context.Background(), 7, conns, func(int) (updateBatch, error) {
 			builds++
-			return batch(0, 9, 9, false), nil
+			return batch(0, 9, 9), nil
 		})
 		if builds != 1 {
 			t.Fatalf("%d conns cost %d builds, want 1", n, builds)
@@ -142,7 +144,7 @@ func TestDeliverStaggeredWatermarksBoundsBuilds(t *testing.T) {
 		testUpdater().deliver(context.Background(), 7, conns, func(fromPts int) (updateBatch, error) {
 			builds++
 			to := min(fromPts+maxDiffEvents, head)
-			return batch(fromPts, to, to, to < head), nil
+			return batch(fromPts, to, head), nil
 		})
 		if builds > maxDeliveryRounds {
 			t.Fatalf("%d conns cost %d builds, want at most %d", n, builds, maxDeliveryRounds)
@@ -170,9 +172,9 @@ func TestDeliverTruncatedBatchServesConnsAhead(t *testing.T) {
 		from = append(from, fromPts)
 		if fromPts == 0 {
 			// Truncated at the cap: advertises only through the last event.
-			return batch(0, 500, 500, true), nil
+			return batch(0, 500, 605), nil
 		}
-		return batch(fromPts, 605, 605, false), nil
+		return batch(fromPts, 605, 605), nil
 	})
 
 	if !slices.Equal(from, []int{0, 600}) {
@@ -191,6 +193,39 @@ func TestDeliverTruncatedBatchServesConnsAhead(t *testing.T) {
 	}
 }
 
+// TestDeliverSecondWindowCoversEveryConnNearTheHead pins the second window to
+// the head rather than to one connection: every conn within a batch of the head
+// shares it and reaches the head, so a middle conn gets the same updates the
+// per-connection path used to give it.
+func TestDeliverSecondWindowCoversEveryConnNearTheHead(t *testing.T) {
+	t.Parallel()
+	const head = 1001
+	behind, mid, live := &fakePushConn{}, &fakePushConn{pts: 600}, &fakePushConn{pts: 1000}
+
+	var from []int
+	testUpdater().deliver(context.Background(), 7, []pushConn{behind, mid, live}, func(fromPts int) (updateBatch, error) {
+		from = append(from, fromPts)
+		return batch(fromPts, min(fromPts+maxDiffEvents, head), head), nil
+	})
+
+	if !slices.Equal(from, []int{0, 600}) {
+		t.Fatalf("built from %v, want [0 600]: the tail window must start low enough to take the pts-600 conn", from)
+	}
+	if got := ptsOf(t, behind.got[0]); !slices.Equal(got[:1], []int{1}) || behind.pts != 500 {
+		t.Fatalf("conn at pts 0 got %d updates from pts %v, watermark %d, want 1..500", len(got), got[:1], behind.pts)
+	}
+	if len(mid.got) != 1 {
+		t.Fatalf("conn at pts 600 got %d pushes, want 1", len(mid.got))
+	}
+	got := ptsOf(t, mid.got[0])
+	if got[0] != 601 || got[len(got)-1] != head || len(got) != head-600 {
+		t.Fatalf("conn at pts 600 got %d updates %d..%d, want 601..%d", len(got), got[0], got[len(got)-1], head)
+	}
+	if len(live.got) != 1 || !slices.Equal(ptsOf(t, live.got[0]), []int{head}) {
+		t.Fatalf("conn at pts 1000 got %d pushes, want the single update %d", len(live.got), head)
+	}
+}
+
 // TestDeliverNothingPending pins the caught-up case: the most-behind conn has
 // nothing, so no conn does, and no second window is opened.
 func TestDeliverNothingPending(t *testing.T) {
@@ -199,7 +234,7 @@ func TestDeliverNothingPending(t *testing.T) {
 	builds := 0
 	testUpdater().deliver(context.Background(), 7, []pushConn{c}, func(int) (updateBatch, error) {
 		builds++
-		return batch(9, 9, 9, false), nil
+		return batch(9, 9, 9), nil
 	})
 	if builds != 1 || len(c.got) != 0 {
 		t.Fatalf("builds = %d, pushes = %d, want 1 and 0", builds, len(c.got))
@@ -227,7 +262,7 @@ func TestDeliverPushFailureDoesNotBlockOthers(t *testing.T) {
 	t.Parallel()
 	broken, ok := &fakePushConn{fail: errors.New("write")}, &fakePushConn{}
 	testUpdater().deliver(context.Background(), 7, []pushConn{broken, ok}, func(int) (updateBatch, error) {
-		return batch(0, 2, 2, false), nil
+		return batch(0, 2, 2), nil
 	})
 	if len(ok.got) != 1 {
 		t.Fatalf("healthy conn got %d pushes, want 1", len(ok.got))
@@ -241,7 +276,7 @@ func TestDeliverPushFailureDoesNotBlockOthers(t *testing.T) {
 // watermark, no duplicates, empty once caught up.
 func TestBatchAbove(t *testing.T) {
 	t.Parallel()
-	b := batch(0, 4, 4, false)
+	b := batch(0, 4, 4)
 	for _, tc := range []struct {
 		from int
 		want []int
