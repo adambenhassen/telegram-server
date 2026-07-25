@@ -196,8 +196,27 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 			return err
 		}
 
-		// Register once the auth key resolves to a bound user (post-login or
-		// reconnect); the conn's session is now established so pushes can write.
+		// Keep the registry in step with the key's current binding, which
+		// s.keys.Get re-reads every frame: an auth.signIn on this key rebinds it
+		// to whoever signed in, and the 2FA path unbinds it back to pending.
+		// Registering once would leave the socket in the first user's bucket,
+		// still receiving that user's updates under a key someone else now
+		// holds, with no revocation path to close it.
+		//
+		// ponytail: resyncs on the conn's next frame, since the rebind happens
+		// inside the rpcHandle above. Exposure is bounded by the read timeout,
+		// as it is for a revoked key, rather than lasting for the connection.
+		if registeredUser != 0 && userID != registeredUser {
+			s.registry.Remove(registeredUser, conn)
+			registeredUser = 0
+			// The conn now belongs to a different user, so the old user's push
+			// watermark is meaningless in the new user's pts space: reset it and
+			// let delivery treat the conn as freshly registered.
+			conn.SetLastPushedPts(0)
+		}
+		// Register once the auth key resolves to a bound user (post-login,
+		// reconnect or rebind); the conn's session is established so pushes can
+		// write.
 		if userID != 0 && registeredUser == 0 {
 			registeredUser = userID
 			s.registry.Add(userID, conn)
