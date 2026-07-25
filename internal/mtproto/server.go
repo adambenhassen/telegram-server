@@ -143,9 +143,12 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 	b := new(bin.Buffer)
 	var lastTouch time.Time
 	// registeredUser is the userID this conn was registered under (0 = not yet).
-	// It deregisters on loop exit so the registry only holds live sockets.
+	// It deregisters on loop exit so the registry only holds live sockets, and
+	// disowns the conn so a delivery already holding it in a snapshot writes
+	// nothing to a socket on its way out.
 	var registeredUser int64
 	defer func() {
+		conn.setOwner(0)
 		if registeredUser != 0 {
 			s.registry.Remove(registeredUser, conn)
 		}
@@ -181,8 +184,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 			// keeps its cached key until it sends again. Full revocation needs a
 			// cross-replica evict signal — deferred to a sessions-hardening pass.
 			if registeredUser != 0 {
-				s.registry.Remove(registeredUser, conn)
-				registeredUser = 0
+				// The deferred cleanup deregisters and disowns the conn.
 				return nil
 			}
 			if err := s.sendProtoError(ctx, tconn, codec.CodeAuthKeyNotFound); err != nil {
@@ -196,30 +198,36 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 			return err
 		}
 
-		// Keep the registry in step with the key's current binding, which
-		// s.keys.Get re-reads every frame: an auth.signIn on this key rebinds it
-		// to whoever signed in, and the 2FA path unbinds it back to pending.
-		// Registering once would leave the socket in the first user's bucket,
-		// still receiving that user's updates under a key someone else now
-		// holds, with no revocation path to close it.
+		// Keep the conn in step with the key's current binding, which s.keys.Get
+		// re-reads every frame: an auth.signIn on this key rebinds it to whoever
+		// signed in, and the 2FA path unbinds it back to pending. Registering
+		// once would leave the socket in the first user's bucket, still
+		// receiving that user's updates under a key someone else now holds, with
+		// no revocation path to close it.
 		//
-		// ponytail: resyncs on the conn's next frame, since the rebind happens
+		// Hand the conn its new owner before touching the registry. Conns hands
+		// delivery a snapshot and the update batch is built from the database
+		// before anything is written, so a delivery for the previous user can
+		// already be in flight; setOwner waits for that write to finish and
+		// makes every later one fail its ownership check. Moving the conn
+		// between buckets alone would not stop it.
+		//
+		// ponytail: resyncs on the conn's next frame, since the rebind lands
 		// inside the rpcHandle above. Exposure is bounded by the read timeout,
 		// as it is for a revoked key, rather than lasting for the connection.
-		if registeredUser != 0 && userID != registeredUser {
-			s.registry.Remove(registeredUser, conn)
-			registeredUser = 0
-			// The conn now belongs to a different user, so the old user's push
-			// watermark is meaningless in the new user's pts space: reset it and
-			// let delivery treat the conn as freshly registered.
-			conn.SetLastPushedPts(0)
-		}
-		// Register once the auth key resolves to a bound user (post-login,
-		// reconnect or rebind); the conn's session is established so pushes can
-		// write.
-		if userID != 0 && registeredUser == 0 {
-			registeredUser = userID
-			s.registry.Add(userID, conn)
+		if userID != registeredUser {
+			conn.setOwner(userID)
+			if registeredUser != 0 {
+				s.registry.Remove(registeredUser, conn)
+				registeredUser = 0
+			}
+			// Register once the auth key resolves to a bound user (post-login,
+			// reconnect or rebind); the conn's session is established so pushes
+			// can write.
+			if userID != 0 {
+				registeredUser = userID
+				s.registry.Add(userID, conn)
+			}
 		}
 
 		// Advance last-seen only after rpcHandle has decrypted and dispatched the

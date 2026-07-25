@@ -160,6 +160,23 @@ func TestServeConnResyncsRegistryWithKeyBinding(t *testing.T) {
 					if conns[0] != seen {
 						t.Fatalf("after %d frames: user %d holds a different conn", served, u)
 					}
+					// The bucket alone does not gate delivery: the conn must also
+					// answer to that user and refuse anyone else, which is what
+					// stops a delivery holding a stale snapshot from writing.
+					pushed, err := conns[0].PushTo(context.Background(), u, &mt.Pong{PingID: 1}, 0)
+					if err != nil {
+						t.Fatalf("after %d frames: push to user %d: %v", served, u, err)
+					}
+					if !pushed {
+						t.Fatalf("after %d frames: conn in user %d's bucket refuses that user's push", served, u)
+					}
+					stranger, err := conns[0].PushTo(context.Background(), u+1000, &mt.Pong{PingID: 1}, 0)
+					if err != nil {
+						t.Fatalf("after %d frames: push to a stranger: %v", served, err)
+					}
+					if stranger {
+						t.Fatalf("after %d frames: conn accepted a push for a user it does not belong to", served)
+					}
 				}
 			}
 

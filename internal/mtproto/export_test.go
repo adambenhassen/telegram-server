@@ -28,6 +28,12 @@ func (s *Server) ServeConn(ctx context.Context, tconn transport.Conn) error {
 	return s.serveConn(ctx, tconn)
 }
 
+// SetOwner exposes the conn's ownership hand-off, which only the serve loop
+// performs in production.
+func (c *Conn) SetOwner(userID int64) {
+	c.setOwner(userID)
+}
+
 // Users returns every user id holding at least one registered connection, so a
 // test can assert a connection sits in no bucket at all.
 func (r *SessionRegistry) Users() []int64 {
