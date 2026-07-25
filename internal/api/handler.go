@@ -19,14 +19,23 @@ type handlers struct {
 	dcID  int
 	log   *slog.Logger
 	srp   *srp.ChallengeStore
+	// logLoginCodes gates the one log call that carries credential material.
+	logLoginCodes bool
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
 
 // New builds the RPC handler: dispatcher wrapped with UnpackInvoke so
 // invokeWithLayer/initConnection wrappers are peeled before dispatch.
-func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger) mtproto.Handler {
-	h := &handlers{store: s, cfg: cfg, dcID: dcID, log: log, srp: srp.NewChallengeStore(srp.DefaultTTL)}
+func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool) mtproto.Handler {
+	h := &handlers{
+		store:         s,
+		cfg:           cfg,
+		dcID:          dcID,
+		log:           log,
+		srp:           srp.NewChallengeStore(srp.DefaultTTL),
+		logLoginCodes: logLoginCodes,
+	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)

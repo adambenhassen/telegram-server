@@ -61,8 +61,17 @@ func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("issue code", "phone", req.PhoneNumber, "err", err)
 		return nil, errInternal
 	}
-	h.log.Info("login code issued", "phone", req.PhoneNumber, "code", code)
+	h.logIssuedCode(req.PhoneNumber, code)
 	return newSentCode(hash), nil
+}
+
+// logIssuedCode writes the code to the log only when the operator opted in
+// via TG_LOG_LOGIN_CODES; the log is the only delivery channel this server has.
+func (h *handlers) logIssuedCode(phone, code string) {
+	if !h.logLoginCodes {
+		return
+	}
+	h.log.Info("login code issued", "phone", phone, "code", code)
 }
 
 func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {

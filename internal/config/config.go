@@ -18,6 +18,10 @@ type Config struct {
 	// AuthKeyEncKey is the 32-byte master key that encrypts auth keys at rest.
 	AuthKeyEncKey []byte
 	DCID          int
+	// LogLoginCodes opts into writing issued login codes to the log in
+	// cleartext. Off by default: the log is readable by anyone with the
+	// process output, and the code alone signs an account in.
+	LogLoginCodes bool
 }
 
 // Load reads configuration from environment variables, applying defaults.
@@ -34,6 +38,13 @@ func Load() (Config, error) {
 			return Config{}, errors.New("TG_DC_ID must be an integer")
 		}
 		cfg.DCID = id
+	}
+	if v := os.Getenv("TG_LOG_LOGIN_CODES"); v != "" {
+		on, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, errors.New("TG_LOG_LOGIN_CODES must be a boolean")
+		}
+		cfg.LogLoginCodes = on
 	}
 	if cfg.PostgresDSN == "" {
 		return Config{}, errors.New("TG_POSTGRES_DSN is required")

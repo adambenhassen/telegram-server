@@ -163,7 +163,8 @@ func recvOr[T any](t *testing.T, ch chan T, what string) T {
 func bootServerWithDelivery(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, dsn string, log *slog.Logger, ln net.Listener) func() {
 	t.Helper()
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
-	handler := api.New(st, dcID, tgcfg, log)
+	// Sign-in here reads the code off the log, so the gated line must be on.
+	handler := api.New(st, dcID, tgcfg, log, true)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdater(st, server.Registry(), log)

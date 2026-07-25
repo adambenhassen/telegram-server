@@ -75,7 +75,10 @@ func run(log *slog.Logger) error {
 
 	host, port := splitHostPort(cfg.ListenAddr)
 	tgcfg := api.DefaultConfig(cfg.DCID, host, port)
-	handler := api.New(st, cfg.DCID, tgcfg, log)
+	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes)
+	if cfg.LogLoginCodes {
+		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
+	}
 
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
