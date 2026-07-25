@@ -1,7 +1,10 @@
 package mtproto
 
 import (
+	"context"
 	"log/slog"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/gotd/td/clock"
@@ -17,4 +20,24 @@ func NewTestConn(tconn transport.Conn, key crypto.AuthKey) *Conn {
 	c.setKey(key)
 	c.setSession(123)
 	return c
+}
+
+// ServeConn exposes the per-connection serve loop so tests can drive it with a
+// scripted transport instead of a real client handshake.
+func (s *Server) ServeConn(ctx context.Context, tconn transport.Conn) error {
+	return s.serveConn(ctx, tconn)
+}
+
+// SetOwner exposes the conn's ownership hand-off, which only the serve loop
+// performs in production.
+func (c *Conn) SetOwner(userID int64) {
+	c.setOwner(userID)
+}
+
+// Users returns every user id holding at least one registered connection, so a
+// test can assert a connection sits in no bucket at all.
+func (r *SessionRegistry) Users() []int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Collect(maps.Keys(r.m))
 }

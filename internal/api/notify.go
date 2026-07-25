@@ -50,11 +50,13 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 		if len(ups) == 0 {
 			continue
 		}
-		if err := c.Push(ctx, wrapUpdates(ups, users, state)); err != nil {
+		// Addressed to userID: this snapshot was taken before the batch was
+		// built, and the conn's auth key can rebind to another user in between.
+		// A push dropped for that reason costs nothing — the user's next poll
+		// backfills it.
+		if _, err := c.PushTo(ctx, userID, wrapUpdates(ups, users, state), state.Pts); err != nil {
 			u.log.Info("deliver push", "user_id", userID, "err", err)
-			continue
 		}
-		c.SetLastPushedPts(state.Pts)
 	}
 }
 
@@ -70,7 +72,8 @@ func (u *Updater) DeliverTyping(ctx context.Context, peerID, fromID int64) {
 		Date:   int(time.Now().Unix()),
 	}
 	for _, c := range conns {
-		if err := c.Push(ctx, short); err != nil {
+		// Carries no pts, so a conn that changed hands simply drops it.
+		if _, err := c.PushTo(ctx, peerID, short, 0); err != nil {
 			u.log.Info("deliver typing", "peer_id", peerID, "err", err)
 		}
 	}
