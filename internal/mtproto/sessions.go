@@ -15,11 +15,25 @@ func NewSessionRegistry() *SessionRegistry {
 	return &SessionRegistry{m: map[int64][]*Conn{}}
 }
 
-// Add registers c as a live connection for userID.
-func (r *SessionRegistry) Add(userID int64, c *Conn) {
+// maxUserConns caps the live connections one user may hold in this process.
+// Delivery walks every one of them per notification, so an account holding
+// sockets without bound multiplies the cost of each of its own updates. A real
+// client holds one socket per session and a handful of sessions, so the cap is
+// far above legitimate use and only bites a client opening sockets in a loop.
+const maxUserConns = 20
+
+// Add registers c as a live connection for userID, reporting whether it fit
+// under the per-user cap. At the cap the new connection is refused and the live
+// ones are left alone: dropping the oldest would take a working session away
+// from a user for opening one more, which is the worse failure of the two.
+func (r *SessionRegistry) Add(userID int64, c *Conn) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.m[userID]) >= maxUserConns {
+		return false
+	}
 	r.m[userID] = append(r.m[userID], c)
-	r.mu.Unlock()
+	return true
 }
 
 // Remove deregisters c from userID; the last connection prunes the user entry.

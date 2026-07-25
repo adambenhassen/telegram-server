@@ -154,10 +154,12 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 	// fail its ownership check; moving the conn between buckets alone would not
 	// stop it. setOwner also clears the push watermark, since the previous
 	// owner's pts means nothing in the new owner's space.
+	// It reports whether the conn is bound: only a registration refused by the
+	// per-user connection cap fails, and unbinding always succeeds.
 	var registeredUser int64
-	bind := func(userID int64) {
+	bind := func(userID int64) bool {
 		if userID == registeredUser {
-			return
+			return true
 		}
 		conn.setOwner(userID)
 		if registeredUser != 0 {
@@ -168,9 +170,17 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 		// reconnect or rebind); the conn's session is established so pushes can
 		// write.
 		if userID != 0 {
+			if !s.registry.Add(userID, conn) {
+				// The user already holds the maximum number of sockets here.
+				// Disowned so nothing is written to it, and reported so the
+				// caller closes it rather than serving a socket the user's
+				// updates will never reach.
+				conn.setOwner(0)
+				return false
+			}
 			registeredUser = userID
-			s.registry.Add(userID, conn)
 		}
+		return true
 	}
 	// The registry only holds live sockets, and a delivery already holding this
 	// conn in a snapshot writes nothing to it on the way out.
@@ -243,7 +253,14 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 		// ponytail: resyncs on the conn's next frame, since the rebind lands
 		// inside the rpcHandle above, so a socket keeps the previous user until
 		// its next frame of any kind or the read timeout, whichever comes first.
-		bind(userID)
+		if !bind(userID) {
+			// Past the per-user connection cap. The frame just handled was
+			// answered normally; the socket then closes on the way out, so a
+			// client that keeps opening sockets is refused the new one instead
+			// of costing the user a working one.
+			s.log.Info("connection refused at user cap", "user_id", userID)
+			return nil
+		}
 
 		// Advance last-seen only after rpcHandle has decrypted and dispatched the
 		// frame, so activity reflects MAC-authenticated traffic. A garbage frame
