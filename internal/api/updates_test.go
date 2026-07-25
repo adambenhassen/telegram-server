@@ -74,6 +74,29 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 	if len(users) == 0 {
 		t.Fatal("no users hydrated")
 	}
+	// A peer's phone number is never disclosed to another account; the recipient
+	// still sees their own.
+	var sawSelf, sawPeer bool
+	for _, uc := range users {
+		u, ok := uc.(*tg.User)
+		if !ok {
+			t.Fatalf("user type = %T, want *tg.User", uc)
+		}
+		if u.Self {
+			sawSelf = true
+			if u.ID != b.ID || u.Phone != b.Phone {
+				t.Fatalf("self user = id %d phone %q, want id %d phone %q", u.ID, u.Phone, b.ID, b.Phone)
+			}
+			continue
+		}
+		sawPeer = true
+		if u.ID != a.ID || u.Phone != "" {
+			t.Fatalf("peer user = id %d phone %q, want id %d phone \"\"", u.ID, u.Phone, a.ID)
+		}
+	}
+	if !sawSelf || !sawPeer {
+		t.Fatalf("hydrated self=%v peer=%v, want both", sawSelf, sawPeer)
+	}
 
 	enc, err := api.GetStateForTest(s, b.ID)
 	if err != nil {
