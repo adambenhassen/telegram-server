@@ -165,10 +165,10 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 
 // History returns owner's messages with peer, newest-first, excluding deleted.
 // offsetID > 0 pages strictly older than that local_id (0 = from newest).
-func (s *Store) History(ctx context.Context, ownerID, peerID int64, offsetID, limit int) ([]Message, error) {
+func (s *Store) History(ctx context.Context, ownerID int64, peerType PeerType, peerID int64, offsetID, limit int) ([]Message, error) {
 	rows, err := s.q.HistoryPage(ctx, db.HistoryPageParams{
 		OwnerID:  ownerID,
-		PeerType: int16(PeerTypeUser),
+		PeerType: int16(peerType),
 		PeerID:   peerID,
 		OffsetID: int64(offsetID),
 		Lim:      int32(limit), //nolint:gosec // limit is a small validated page size

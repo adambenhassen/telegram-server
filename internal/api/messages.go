@@ -125,7 +125,7 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 		limit = maxHistoryLimit
 	}
 
-	msgs, err := h.store.History(r.Ctx, r.UserID, toID, req.OffsetID, limit)
+	msgs, err := h.store.History(r.Ctx, r.UserID, store.PeerTypeUser, toID, req.OffsetID, limit)
 	if err != nil {
 		h.log.Error("get history", "user_id", r.UserID, "err", err)
 		return nil, errInternal
