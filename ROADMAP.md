@@ -122,7 +122,7 @@ Updates
 
 ### M6 — basic group chats
 - `chat` as a peer type; a `peer_type` discriminator column separates 1:1 and
-  group rows throughout `messages` and `dialogs`.
+  group rows in `messages` and `dialogs`.
 - Membership tables track current members; the member set is the authorization
   boundary — an unknown chat and a non-member chat return the same
   `PEER_ID_INVALID`.
