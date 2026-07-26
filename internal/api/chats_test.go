@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
@@ -22,6 +23,18 @@ func rpcMessage(t *testing.T, err error) string {
 		t.Fatalf("expected rpc error, got %v", err)
 	}
 	return rpc.Message
+}
+
+// assertEncodes pins that a reply can actually reach the wire. Reading fields
+// off a response proves nothing about that: gotd's generated encoders reject a
+// nil mandatory field, so a reply can carry every value this file asserts and
+// still fail in Conn.SendResult, after the mutation has already committed.
+func assertEncodes(t *testing.T, enc bin.Encoder) {
+	t.Helper()
+	var buf bin.Buffer
+	if err := enc.Encode(&buf); err != nil {
+		t.Fatalf("reply does not encode: %v", err)
+	}
 }
 
 func inputUsers(ids ...int64) []tg.InputUserClass {
@@ -126,6 +139,7 @@ func TestHandleCreateChatFansOutToEveryMember(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create chat: %v", err)
 	}
+	assertEncodes(t, enc)
 	res, ok := enc.(*tg.MessagesInvitedUsers)
 	if !ok {
 		t.Fatalf("result type = %T, want *tg.MessagesInvitedUsers", enc)
@@ -236,6 +250,7 @@ func TestHandleCreateChatReportsMissingInvitee(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create chat: %v", err)
 	}
+	assertEncodes(t, enc)
 	res, ok := enc.(*tg.MessagesInvitedUsers)
 	if !ok {
 		t.Fatalf("result type = %T, want *tg.MessagesInvitedUsers", enc)
@@ -353,6 +368,7 @@ func createChatForTest(t *testing.T, s *store.Store, creator int64, title string
 	if err != nil {
 		t.Fatalf("create chat: %v", err)
 	}
+	assertEncodes(t, enc)
 	res, ok := enc.(*tg.MessagesInvitedUsers)
 	if !ok {
 		t.Fatalf("result type = %T, want *tg.MessagesInvitedUsers", enc)
@@ -404,6 +420,7 @@ func TestHandleEditChatTitleRenamesAndAnnounces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("edit title: %v", err)
 	}
+	assertEncodes(t, enc)
 	ups, ok := enc.(*tg.Updates)
 	if !ok {
 		t.Fatalf("result type = %T, want *tg.Updates", enc)
