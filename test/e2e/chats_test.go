@@ -257,6 +257,8 @@ func TestChatsRealtime(t *testing.T) {
 	}
 	recvMsg(collA, "A", "hello from B")
 	recvMsg(collC, "C", "hello from B")
+	// Drain B's own copy of the sent message.
+	recvMsg(collB, "B", "hello from B")
 
 	// 4. A edits title to "Team 2"; B and C receive editTitle.
 	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -741,6 +743,7 @@ func TestChatsOfflineBackfill(t *testing.T) {
 
 	// B reconnects and calls getDifference from pts 0.
 	var diff tg.UpdatesDifferenceClass
+	var state *tg.UpdatesState
 	bClient2 := createClient(addr.Port, key, dcID, newUpdateCollector(), sessB)
 	if err := bClient2.Run(ctx, func(ctx context.Context) error {
 		d, err := bClient2.API().UpdatesGetDifference(ctx, &tg.UpdatesGetDifferenceRequest{Pts: 0, Date: 0, Qts: 0})
@@ -748,6 +751,11 @@ func TestChatsOfflineBackfill(t *testing.T) {
 			return err
 		}
 		diff = d
+		st, err := bClient2.API().UpdatesGetState(ctx)
+		if err != nil {
+			return err
+		}
+		state = st
 		return nil
 	}); err != nil {
 		t.Fatalf("B getDifference: %v", err)
@@ -782,10 +790,6 @@ func TestChatsOfflineBackfill(t *testing.T) {
 	}
 
 	// B's pts matches getState.
-	state, err := bClient2.API().UpdatesGetState(ctx)
-	if err != nil {
-		t.Fatalf("B getState: %v", err)
-	}
 	if full.State.Pts != state.Pts {
 		t.Fatalf("diff pts %d != getState pts %d", full.State.Pts, state.Pts)
 	}
