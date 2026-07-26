@@ -37,7 +37,9 @@ var (
 	errMessageIDInvalid = rpcErr(400, "MESSAGE_ID_INVALID")
 	// errPeerIDInvalid rejects an unresolvable or unauthorized input peer.
 	errPeerIDInvalid = rpcErr(400, "PEER_ID_INVALID")
-	// errUsersTooMuch rejects an add that would push a chat past the participant
-	// cap.
+// errChatTitleInvalid rejects an empty, whitespace-only or over-length chat
+	// title on createChat and editChatTitle.
+	errChatTitleInvalid = rpcErr(400, "CHAT_TITLE_EMPTY")
+	// errUsersTooMuch rejects a chat that would exceed the participant limit.
 	errUsersTooMuch = rpcErr(400, "USERS_TOO_MUCH")
 )
