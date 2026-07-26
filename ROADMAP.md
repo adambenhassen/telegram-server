@@ -136,17 +136,13 @@ Updates
   written in the same mutation transaction.
 - 200-member cap enforced at create and add time; bounds the advisory-lock set
   and the write volume per transaction.
-- **Design bet confirmed.** The per-owner `pts`/event-log model and
+- Design bet confirmed: the per-owner `pts`/event-log model and
   `LISTEN`/`NOTIFY` delivery carried the first real fan-out unchanged — no
   per-chat `pts` stream, no broker, no change to the `buildUpdates` path.
   Offline `updates.getDifference` and real-time push use the same event log for
   chat messages as for 1:1.
 - A removed member's dialog returns `ChatForbidden`; their message rows and `pts`
   are retained but `getHistory` is gated on current membership.
-- Known gaps carried forward: no admin model (`ChatAdminRights` not stored or
-  enforced — any member may add or remove anyone including the creator;
-  `revoke_history`, `fwd_limit`, chat photos, and invite links unimplemented);
-  MAIN-52 and MAIN-53 still in flight.
 
 ## Planned — feature track
 
@@ -213,10 +209,42 @@ Tracked so shortcuts don't rot into "later means never".
   is not yet a meaningful per-user counter. — M4.
 - **Chat admin rights.** Any member may add or remove any member, including the
   chat's creator. `ChatAdminRights` is not stored or enforced; `revoke_history`,
-  `fwd_limit`, chat photos, and invite links are not implemented. — M6
+  `fwd_limit`, chat photos, and invite links are not implemented. `revoke_history`
+  and `fwd_limit` are accepted and ignored, so a removed member keeps their own
+  copies of past messages and a new member sees no history before they joined. — M6
 - **Removed-member history access.** A removed member's dialog returns
   `ChatForbidden`; their retained message rows and `pts` are reachable only
   through `updates.getDifference` replay, not through `messages.getHistory`. — M6
+- **Chat read state and chat typing.** `messages.readHistory` and
+  `messages.setTyping` reject an `InputPeerChat` with `PEER_ID_INVALID`. No
+  unread count advances for a chat and no `updateReadHistoryOutbox` is emitted,
+  so a group sender sees no read ticks. Typing additionally needs `peer_type` in
+  the `LISTEN`/`NOTIFY` payload, which today carries a bare user id. — M6
+- **`messages.getChats`, `messages.getFullChat`, `messages.migrateChat`.** Not
+  implemented. A client learns a chat's title and version from the `Chats` list
+  on updates and dialogs, and cannot fetch the participant list. — M6
+- **No control over who may add you to a group.** Any account can create a chat
+  and add any user id it can name, giving it a push channel into that user's
+  update stream until they leave, and nothing stops it re-adding them. The check
+  needs contacts or a block list, neither of which exists yet. — M6
+- **Chat message deletion has three gaps and they are one decision.** Chat
+  deletion is closed to the author, service messages cannot be deleted at all,
+  and an author who has left the chat can no longer delete their own messages.
+  Fail-closed, and three things follow. `messages.deleteMessages` has no `revoke`
+  flag, so every delete that is allowed is a delete-for-everyone. A member cannot
+  clear anyone else's message from their own view. And a message left behind by a
+  departed member is permanent: there is no moderation path, so the creator
+  cannot remove abusive content. 1:1 keeps its existing posture, where either
+  side deletes both copies. Whoever picks this up decides author-delete,
+  self-only delete and creator moderation together across both peer types —
+  deciding them one at a time is how the two peer types diverge. — M6
+- **A difference batch fetches the participant list once per create event.**
+  `maxDiffEvents` caps a batch at 500 events, not at payload size, so 500
+  `ChatActionCreate` rows in one `updates.getDifference` mean 500 `IsMember`
+  plus 500 `Participants` round trips, and at the 200-member cap up to 100k user
+  ids in a single response. Reaching it needs an account that created 500 chats
+  naming the victim, which is the primitive already accepted as residual for M6.
+  Raised as low, not a gate. — M6
 
 ## Engineering invariants
 
