@@ -248,9 +248,10 @@ func TestChatToTLCreator(t *testing.T) {
 	}
 }
 
-// chatFixture creates a chat owned by the first of three fresh users and returns
-// the store, the users and the chat.
-func chatFixture(t *testing.T, phonePrefix string) (*store.Store, []store.User, store.Chat) {
+// chatFixture creates a chat with members participants, owned by the first of
+// members+1 fresh users: the trailing user is a non-participant. It returns the
+// store, the users and the chat.
+func chatFixture(t *testing.T, phonePrefix string, members int) (*store.Store, []store.User, store.Chat) {
 	t.Helper()
 	ctx := context.Background()
 	s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey())
@@ -262,7 +263,7 @@ func chatFixture(t *testing.T, phonePrefix string) (*store.Store, []store.User, 
 			t.Errorf("close: %v", err)
 		}
 	})
-	users := make([]store.User, 3)
+	users := make([]store.User, members+1)
 	for i := range users {
 		u, err := s.CreateUser(ctx, fmt.Sprintf("%s%03d", phonePrefix, i))
 		if err != nil {
@@ -270,7 +271,11 @@ func chatFixture(t *testing.T, phonePrefix string) (*store.Store, []store.User, 
 		}
 		users[i] = u
 	}
-	chat, err := s.CreateChat(ctx, users[0].ID, "team", []int64{users[1].ID})
+	invited := make([]int64, members-1)
+	for i := range invited {
+		invited[i] = users[i+1].ID
+	}
+	chat, err := s.CreateChat(ctx, users[0].ID, "team", invited)
 	if err != nil {
 		t.Fatalf("create chat: %v", err)
 	}
@@ -280,7 +285,7 @@ func chatFixture(t *testing.T, phonePrefix string) (*store.Store, []store.User, 
 func TestBuildUpdatesChatMessage(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s, users, chat := chatFixture(t, "+1555131")
+	s, users, chat := chatFixture(t, "+1555131", 2)
 
 	if _, _, _, err := s.SendChatMessage(ctx, store.FanOut{
 		ChatID: chat.ID, FromID: users[0].ID, Text: "hi", RandomID: 11,
@@ -354,7 +359,7 @@ func TestBuildUpdatesChatMessage(t *testing.T) {
 // stops title/version/participant count leaking after removal.
 func TestLoadChatsNonMemberForbidden(t *testing.T) {
 	t.Parallel()
-	s, users, chat := chatFixture(t, "+1555132")
+	s, users, chat := chatFixture(t, "+1555132", 2)
 
 	member, err := api.LoadChatsForTest(s, []int64{chat.ID}, users[1].ID)
 	if err != nil {
@@ -389,13 +394,13 @@ func TestLoadChatsNonMemberForbidden(t *testing.T) {
 func TestBuildUpdatesCreateActionHidesMembersFromNonMember(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s, users, chat := chatFixture(t, "+1555133")
+	s, users, chat := chatFixture(t, "+1555133", 3)
 
 	// Extra delivers a copy to a user who is not a participant, which is how a
 	// removed member keeps their retained copy of an event.
 	if _, _, _, err := s.SendChatMessage(ctx, store.FanOut{
 		ChatID: chat.ID, FromID: users[0].ID, Text: "team",
-		Action: store.ChatActionCreate, Extra: []int64{users[2].ID},
+		Action: store.ChatActionCreate, Extra: []int64{users[3].ID},
 	}); err != nil {
 		t.Fatalf("send create service message: %v", err)
 	}
@@ -425,23 +430,27 @@ func TestBuildUpdatesCreateActionHidesMembersFromNonMember(t *testing.T) {
 	}
 
 	got, batch := createUsers(users[1].ID)
-	if len(got) != 2 {
-		t.Fatalf("member sees users %v, want both participants", got)
+	if len(got) != 3 {
+		t.Fatalf("member sees users %v, want all three participants", got)
 	}
-	// The action names them, so the batch must resolve them.
+	// The action names them, so the batch must resolve them. users[2] is neither
+	// the sender nor the viewer, so it reaches the batch only through the action's
+	// user list: it is what makes this assertion discriminate.
 	for _, id := range got {
 		if !slices.Contains(batch, id) {
 			t.Fatalf("batch users %v miss participant %d named by the action", batch, id)
 		}
 	}
-	got, batch = createUsers(users[2].ID)
+	got, batch = createUsers(users[3].ID)
 	if len(got) != 0 {
 		t.Fatalf("non-member sees users %v, want none", got)
 	}
 	// Nor may a participant reach them through the batch's user list. The sender
-	// is named by from_id and is not what the gate withholds; the other member is.
-	if slices.Contains(batch, users[1].ID) {
-		t.Fatalf("non-member batch users %v disclose participant %d", batch, users[1].ID)
+	// is named by from_id and is not what the gate withholds; the others are.
+	for _, id := range []int64{users[1].ID, users[2].ID} {
+		if slices.Contains(batch, id) {
+			t.Fatalf("non-member batch users %v disclose participant %d", batch, id)
+		}
 	}
 }
 
