@@ -242,8 +242,6 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 			switch m.Action {
 			case store.ChatActionAddUser, store.ChatActionDeleteUser:
 				refs = append(refs, m.ActionUserID)
-			case store.ChatActionCreate:
-				refs = append(refs, createUsers...)
 			}
 		} else {
 			refs = append(refs, m.PeerID)
