@@ -158,8 +158,10 @@ type chatMutation struct {
 // under the chats row lock. The handler's check ran in a different transaction
 // and is an early error only — a caller removed in the window between the two
 // would otherwise get one action through. It is also the only membership check
-// these mutations get: fanOut deliberately skips the sender check for a non-zero
-// Action, so that a self-removal can announce itself.
+// these mutations get downstream: fanOut deliberately skips the sender check for
+// a non-zero Action, so that a self-removal can announce itself. An outsider is
+// filtered out before the row lock is taken, but that filter decides nothing —
+// see both comments in the body.
 //
 // Liveness: extra names every user the transaction will touch beyond the current
 // member set — the user being added, or the user being removed and therefore
@@ -187,6 +189,23 @@ func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64, e
 		}
 	}()
 
+	// Early reject, ahead of the chats row lock. A caller who takes that lock
+	// holds it for the rest of the transaction, so letting a non-member reach it
+	// hands an outsider two things: the members' own renames, adds and removals
+	// serialised behind them, and a wait whose length answers whether the chat
+	// exists — the timing half of the oracle the uniform ErrNotMember closes.
+	// This is a filter and not the authorization decision: it reads outside the
+	// row lock, so a caller removed after it passes still gets through, and the
+	// re-check below decides. Same error either way, so an absent chat stays
+	// indistinguishable from one the caller is not in.
+	member, err := qtx.IsChatMember(ctx, db.IsChatMemberParams{ChatID: chatID, UserID: callerID})
+	if err != nil {
+		return nil, fmt.Errorf("is chat member: %w", err)
+	}
+	if !member {
+		return nil, ErrNotMember
+	}
+
 	// An absent chat and a chat the caller is not in report the same error, as
 	// fanOut does: the pair is what keeps chat ids unprobeable over a dense id
 	// space, and a distinct "no such chat" here would reopen that oracle from the
@@ -197,9 +216,12 @@ func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64, e
 		return nil, fmt.Errorf("lock chat: %w", err)
 	}
 
-	// Read under the lock: Store.Participants and Store.IsMember run on the pool,
-	// outside this transaction's snapshot and outside the row lock, so a re-check
-	// through either would be decoration.
+	// Read under the lock, and this is the authorization decision. Store.Participants
+	// and Store.IsMember run on the pool, outside this transaction's snapshot and
+	// outside the row lock, so a re-check through either would be decoration — and
+	// so would the early reject above if it were read as replacing this one. It
+	// runs on qtx and still ahead of the lock, which is what makes it a filter:
+	// it can turn away a caller who was never a member, and nothing else.
 	parts, err := qtx.ChatParticipants(ctx, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("chat participants: %w", err)
