@@ -187,8 +187,12 @@ func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64, e
 		}
 	}()
 
+	// An absent chat and a chat the caller is not in report the same error, as
+	// fanOut does: the pair is what keeps chat ids unprobeable over a dense id
+	// space, and a distinct "no such chat" here would reopen that oracle from the
+	// mutation side.
 	if _, err = qtx.ChatByIDForUpdate(ctx, chatID); errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrChatNotFound
+		return nil, ErrNotMember
 	} else if err != nil {
 		return nil, fmt.Errorf("lock chat: %w", err)
 	}

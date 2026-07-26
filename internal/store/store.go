@@ -34,9 +34,6 @@ var (
 	// ErrChatFull is returned when a membership change would take a chat past
 	// maxChatParticipants.
 	ErrChatFull = errors.New("chat participants limit reached")
-	// ErrChatNotFound is returned by the membership mutations when the chat id
-	// resolves to no row. Handlers map it to the same wire error as ErrNotMember.
-	ErrChatNotFound = errors.New("chat not found")
 	// ErrNotMember is returned when a chat write is attempted by a user who is
 	// not a participant of the chat, and by an absent chat id — the two are
 	// deliberately indistinguishable.

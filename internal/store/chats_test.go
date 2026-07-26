@@ -301,10 +301,10 @@ func TestChatMutationsRejectNonMemberCaller(t *testing.T) {
 		t.Errorf("rename by non-member: want ErrNotMember, got %v", err)
 	}
 
-	// An unknown chat id is ErrChatNotFound, which handlers map to the same wire
-	// error, so the pair stays indistinguishable to a prober.
-	if _, _, _, err := s.SetChatTitle(ctx, chat.ID+10_000, a.ID, "Ghost"); !errors.Is(err, store.ErrChatNotFound) {
-		t.Errorf("unknown chat: want ErrChatNotFound, got %v", err)
+	// An unknown chat id reports the same error as a chat the caller is not in,
+	// so the pair stays indistinguishable to a prober walking the id space.
+	if _, _, _, err := s.SetChatTitle(ctx, chat.ID+10_000, a.ID, "Ghost"); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("unknown chat: want ErrNotMember, got %v", err)
 	}
 
 	if got := participantIDs(t, s, chat.ID); len(got) != 2 {
