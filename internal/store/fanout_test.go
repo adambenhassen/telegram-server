@@ -264,6 +264,59 @@ func TestDeleteChatMessageEveryCopy(t *testing.T) {
 	}
 }
 
+// TestDeleteChatMessageIsAuthorOnly matches the delete path to the edit path. A
+// chat delete walks the same copy set an edit does, so a member deleting someone
+// else's message would destroy it for every member, and the edit path's
+// service-message guard would buy nothing if the announcement stayed deletable.
+func TestDeleteChatMessageIsAuthorOnly(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551290121")
+	b := mustUser(t, s, "+15551290122")
+	c := mustUser(t, s, "+15551290123")
+	chat := chatWith(t, s, a, b, c)
+
+	text, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: a.ID, Text: "keep", RandomID: 1})
+	service, _ := sendChat(t, s, store.FanOut{
+		ChatID: chat.ID, FromID: a.ID, Text: "New title", Action: store.ChatActionEditTitle,
+	})
+
+	// b holds an inbound copy of a's message: same fan-out, not b's to destroy.
+	if _, err := s.DeleteMessages(ctx, b.ID, []int64{1}); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("member deleting another member's chat message: want ErrMessageInvalid, got %v", err)
+	}
+	// a triggered the title change, so its copy is outgoing — still undeletable.
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{service.LocalID}); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("deleting a service message: want ErrMessageInvalid, got %v", err)
+	}
+
+	for _, u := range []store.User{a, b, c} {
+		for _, local := range []int64{1, 2} {
+			if m, ok := msgOpt(t, s, u.ID, local); !ok || m.Deleted {
+				t.Errorf("owner %d local %d moved: ok=%v %+v", u.ID, local, ok, m)
+			}
+		}
+		if got := ptsOf(t, s, u.ID); got != 2 {
+			t.Errorf("owner %d pts = %d, want unchanged 2", u.ID, got)
+		}
+	}
+
+	// The author still deletes their own text message for everyone.
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{text.LocalID})
+	if err != nil {
+		t.Fatalf("author delete: %v", err)
+	}
+	if len(perOwner) != 3 {
+		t.Fatalf("perOwner = %+v, want 3 entries", perOwner)
+	}
+	for _, u := range []store.User{a, b, c} {
+		if m, ok := msgOpt(t, s, u.ID, 1); !ok || !m.Deleted {
+			t.Errorf("owner %d copy not deleted: ok=%v %+v", u.ID, ok, m)
+		}
+	}
+}
+
 // TestRemovedMemberCannotEditOrDeleteChatMessage is the F1 control: editMessage
 // and deleteMessages take no peer, so a user removed from a chat still holds a
 // lever on every current member's rows through their own retained copy.

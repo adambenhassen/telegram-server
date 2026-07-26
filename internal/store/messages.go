@@ -402,7 +402,8 @@ func editChatMessage(ctx context.Context, tx pgx.Tx, qtx *db.Queries, pre db.Mes
 // pts per affected user (owner and peers) for the caller to notify.
 //
 // A chat message deletes every per-member copy of its fan-out instead of one
-// mirror row, and the caller must still be a member of every chat the batch
+// mirror row, so only its author may delete it and a service message may not be
+// deleted at all; the caller must also still be a member of every chat the batch
 // touches. A batch may span several chats and both peer types.
 func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []int64) (map[int64]int, error) {
 	if len(localIDs) == 0 {
@@ -432,6 +433,14 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 		}
 		msgs = append(msgs, m)
 		if PeerType(m.PeerType) == PeerTypeChat {
+			// Author only, service messages never, exactly as an edit. A chat
+			// delete walks the same copy set an edit does, so without this a
+			// member deletes any message she holds a copy of out of every other
+			// member's history, and the edit path's service-message guard buys
+			// nothing — the announcement she cannot rewrite she can destroy.
+			if !m.Out || m.ActionType != 0 {
+				return nil, ErrMessageInvalid
+			}
 			copies, e2 := chatCopies(ctx, qtx, m)
 			if e2 != nil {
 				return nil, e2
