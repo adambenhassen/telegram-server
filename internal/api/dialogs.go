@@ -1,12 +1,36 @@
 package api
 
 import (
+	"context"
+
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
+
+// createUsersForDialog fetches the participant list for a ChatActionCreate row
+// when the viewer is still a member. A removed viewer gets nil, matching the
+// empty user list getDifference serves for the same event.
+func (h *handlers) createUsersForDialog(ctx context.Context, chatID, viewerID int64) ([]int64, error) {
+	member, err := h.store.IsMember(ctx, chatID, viewerID)
+	if err != nil {
+		return nil, err
+	}
+	if !member {
+		return nil, nil
+	}
+	parts, err := h.store.Participants(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int64, len(parts))
+	for i, p := range parts {
+		ids[i] = p.UserID
+	}
+	return ids, nil
+}
 
 // handleGetDialogs serves messages.getDialogs: the caller's conversation list
 // with each dialog's top message and the referenced peer users.
@@ -49,10 +73,27 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 			return nil, errInternal
 		}
 		if ok {
-			tlMsgs = append(tlMsgs, messageToTL(m, nil))
 			// The author is the peer in a 1:1 but any member in a group, so it is
 			// taken off the message rather than off the dialog's peer id.
 			peerIDs[m.FromID] = true
+			var createUsers []int64
+			switch m.Action {
+			case store.ChatActionAddUser, store.ChatActionDeleteUser:
+				// ActionUserID is stored on the viewer's own row, so no membership
+				// gate is needed — the row exists because fan-out wrote it here.
+				peerIDs[m.ActionUserID] = true
+			case store.ChatActionCreate:
+				cu, cerr := h.createUsersForDialog(r.Ctx, m.PeerID, r.UserID)
+				if cerr != nil {
+					h.log.Error("get dialogs create users", "user_id", r.UserID, "err", cerr)
+					return nil, errInternal
+				}
+				createUsers = cu
+				for _, id := range cu {
+					peerIDs[id] = true
+				}
+			}
+			tlMsgs = append(tlMsgs, messageToTL(m, createUsers))
 		}
 	}
 
@@ -64,8 +105,9 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	// No membership check on the list itself: a dialog row exists only because a
 	// fan-out wrote it for this owner, so an attacker-chosen id never reaches here.
 	// A removed member keeps their dialog row by design, which is why the viewer is
-	// passed down — loadChats degrades those to tg.ChatForbidden rather than
-	// serving live title, version and participant count forever.
+	// passed down — loadChats degrades those to tg.ChatForbidden (which still
+	// carries the chat's current title, pending MAIN-48) rather than serving
+	// live version and participant count.
 	chats, err := h.loadChats(r.Ctx, chatIDs, r.UserID)
 	if err != nil {
 		h.log.Error("get dialogs chats", "err", err)
