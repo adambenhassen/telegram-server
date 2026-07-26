@@ -17,8 +17,8 @@ import (
 // transaction locks at most one chats row. lockOwners' argument space is user
 // ids only — never pass a chat id, or chat 7 and user 7 falsely serialise.
 //
-// Nothing in this file takes that lock: the rule is written down here for the
-// membership mutations and the fan-out that do.
+// Nothing in this file takes that lock. The fan-out in fanout.go does, and the
+// membership mutations built on it must.
 
 // maxChatParticipants caps a basic chat at Telegram's own limit. It is what
 // bounds the fan-out transaction: one send to a full chat writes 200 message

@@ -26,6 +26,27 @@ func (q *Queries) ChatByID(ctx context.Context, id int64) (Chat, error) {
 	return i, err
 }
 
+const chatByIDForUpdate = `-- name: ChatByIDForUpdate :one
+SELECT id, title, creator_id, version, date FROM chats WHERE id = $1 FOR UPDATE
+`
+
+// ChatByIDForUpdate takes the chats row lock that serialises everything touching
+// one chat's member set: the fan-out reads the member set under it, and the
+// membership mutations take it before changing that set. See the lock-order
+// comment at the top of chats.go.
+func (q *Queries) ChatByIDForUpdate(ctx context.Context, id int64) (Chat, error) {
+	row := q.db.QueryRow(ctx, chatByIDForUpdate, id)
+	var i Chat
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.CreatorID,
+		&i.Version,
+		&i.Date,
+	)
+	return i, err
+}
+
 const chatParticipants = `-- name: ChatParticipants :many
 SELECT chat_id, user_id, inviter_id, date FROM chat_participants WHERE chat_id = $1 ORDER BY user_id
 `

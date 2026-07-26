@@ -34,6 +34,10 @@ var (
 	// ErrChatFull is returned when a membership change would take a chat past
 	// maxChatParticipants.
 	ErrChatFull = errors.New("chat participants limit reached")
+	// ErrNotMember is returned when a chat write is attempted by a user who is
+	// not a participant of the chat, and by an absent chat id — the two are
+	// deliberately indistinguishable.
+	ErrNotMember = errors.New("not a chat member")
 )
 
 // Open connects to Postgres and verifies the schema is migrated. encKey is the
