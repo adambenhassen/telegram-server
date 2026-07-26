@@ -10,15 +10,17 @@ import (
 )
 
 const historyPage = `-- name: HistoryPage :many
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id FROM messages
-WHERE owner_id = $1 AND peer_id = $2 AND deleted = false
-  AND ($3::bigint = 0 OR local_id < $3::bigint)
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id FROM messages
+WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3
+  AND deleted = false
+  AND ($4::bigint = 0 OR local_id < $4::bigint)
 ORDER BY local_id DESC
-LIMIT $4::int
+LIMIT $5::int
 `
 
 type HistoryPageParams struct {
 	OwnerID  int64
+	PeerType int16
 	PeerID   int64
 	OffsetID int64
 	Lim      int32
@@ -27,6 +29,7 @@ type HistoryPageParams struct {
 func (q *Queries) HistoryPage(ctx context.Context, arg HistoryPageParams) ([]Message, error) {
 	rows, err := q.db.Query(ctx, historyPage,
 		arg.OwnerID,
+		arg.PeerType,
 		arg.PeerID,
 		arg.OffsetID,
 		arg.Lim,
@@ -50,6 +53,10 @@ func (q *Queries) HistoryPage(ctx context.Context, arg HistoryPageParams) ([]Mes
 			&i.Deleted,
 			&i.RandomID,
 			&i.PeerLocalID,
+			&i.PeerType,
+			&i.FanoutID,
+			&i.ActionType,
+			&i.ActionUserID,
 		); err != nil {
 			return nil, err
 		}
@@ -62,37 +69,46 @@ func (q *Queries) HistoryPage(ctx context.Context, arg HistoryPageParams) ([]Mes
 }
 
 const insertMessage = `-- name: InsertMessage :exec
-INSERT INTO messages (owner_id, local_id, peer_id, from_id, message, out, random_id, peer_local_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO messages (owner_id, local_id, peer_type, peer_id, from_id, message, out, random_id, peer_local_id,
+                      fanout_id, action_type, action_user_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 `
 
 type InsertMessageParams struct {
-	OwnerID     int64
-	LocalID     int64
-	PeerID      int64
-	FromID      int64
-	Message     string
-	Out         bool
-	RandomID    int64
-	PeerLocalID int64
+	OwnerID      int64
+	LocalID      int64
+	PeerType     int16
+	PeerID       int64
+	FromID       int64
+	Message      string
+	Out          bool
+	RandomID     int64
+	PeerLocalID  int64
+	FanoutID     int64
+	ActionType   int16
+	ActionUserID int64
 }
 
 func (q *Queries) InsertMessage(ctx context.Context, arg InsertMessageParams) error {
 	_, err := q.db.Exec(ctx, insertMessage,
 		arg.OwnerID,
 		arg.LocalID,
+		arg.PeerType,
 		arg.PeerID,
 		arg.FromID,
 		arg.Message,
 		arg.Out,
 		arg.RandomID,
 		arg.PeerLocalID,
+		arg.FanoutID,
+		arg.ActionType,
+		arg.ActionUserID,
 	)
 	return err
 }
 
 const messageByOwnerLocal = `-- name: MessageByOwnerLocal :one
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id FROM messages WHERE owner_id = $1 AND local_id = $2
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id FROM messages WHERE owner_id = $1 AND local_id = $2
 `
 
 type MessageByOwnerLocalParams struct {
@@ -115,12 +131,16 @@ func (q *Queries) MessageByOwnerLocal(ctx context.Context, arg MessageByOwnerLoc
 		&i.Deleted,
 		&i.RandomID,
 		&i.PeerLocalID,
+		&i.PeerType,
+		&i.FanoutID,
+		&i.ActionType,
+		&i.ActionUserID,
 	)
 	return i, err
 }
 
 const messageByRandomID = `-- name: MessageByRandomID :one
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id FROM messages WHERE owner_id = $1 AND random_id = $2 AND random_id <> 0
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id FROM messages WHERE owner_id = $1 AND random_id = $2 AND random_id <> 0
 `
 
 type MessageByRandomIDParams struct {
@@ -143,6 +163,10 @@ func (q *Queries) MessageByRandomID(ctx context.Context, arg MessageByRandomIDPa
 		&i.Deleted,
 		&i.RandomID,
 		&i.PeerLocalID,
+		&i.PeerType,
+		&i.FanoutID,
+		&i.ActionType,
+		&i.ActionUserID,
 	)
 	return i, err
 }
