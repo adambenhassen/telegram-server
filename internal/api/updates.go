@@ -68,6 +68,9 @@ func actionToTL(m store.Message, createUsers []int64) tg.MessageActionClass {
 //
 // Deactivated is left false: chats has no such column and store.Chat no longer
 // carries the field, so false is the only honest answer until one has a reader.
+//
+// Photo is mandatory on the wire, not optional: (*tg.Chat).EncodeBare fails the
+// whole reply when it is nil, so a chat with no photo must say so explicitly.
 func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
 	return &tg.Chat{
 		ID:                c.ID,
@@ -76,6 +79,7 @@ func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
 		ParticipantsCount: participantsCount,
 		Date:              int(c.Date.Unix()),
 		Version:           c.Version,
+		Photo:             &tg.ChatPhotoEmpty{},
 	}
 }
 
