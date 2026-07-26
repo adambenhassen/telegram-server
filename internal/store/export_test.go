@@ -39,6 +39,23 @@ func RemoveChatParticipant(ctx context.Context, s *Store, chatID, userID int64) 
 	return tx.Commit(ctx)
 }
 
+// HoldChatRowLock takes chatID's chats row lock in a transaction of its own and
+// holds it until release is called. It is how a test asserts that a path does
+// NOT take that lock: with the lock held, a caller that reaches for it blocks
+// until its context expires, and one that rejects earlier returns immediately.
+// A wall-clock measurement of two concurrent calls cannot tell those apart.
+func HoldChatRowLock(ctx context.Context, s *Store, chatID int64) (release func(), err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.q.WithTx(tx).ChatByIDForUpdate(ctx, chatID); err != nil {
+		_ = tx.Rollback(ctx) //nolint:errcheck // best effort on the error path
+		return nil, err
+	}
+	return func() { _ = tx.Rollback(ctx) }, nil //nolint:errcheck // nothing to commit
+}
+
 // InsertChatMessageNoFanout writes a chat-peer message row carrying fanout_id = 0
 // — the "not a chat message" sentinel a well-formed fan-out never produces. No
 // shipped path can create one, and the guards that reject it still have to be

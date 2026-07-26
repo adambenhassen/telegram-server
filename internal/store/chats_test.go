@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -324,6 +326,53 @@ func TestChatMutationsRejectNonMemberCaller(t *testing.T) {
 		if ev := eventsOf(t, s, u.ID, 0); len(ev) != 0 {
 			t.Errorf("owner %d events = %+v, want none", u.ID, ev)
 		}
+	}
+}
+
+// TestChatMutationsRejectNonMemberBeforeTheRowLock pins the other half of the
+// non-member invariant: same error, and no side effect — including not taking
+// the chats row lock. A non-member that takes it holds it for the rest of its
+// transaction, which serialises the real members' renames, adds and removals
+// behind an outsider, and turns the wait into a timing oracle for exactly the
+// chat existence the uniform ErrNotMember exists to hide.
+//
+// The lock is held by a third transaction throughout, so the assertion is on the
+// rejection itself rather than on a wall clock: a call that reaches for the lock
+// blocks until its context expires and fails with something other than
+// ErrNotMember. The three run concurrently because they must not serialise on
+// one another either.
+func TestChatMutationsRejectNonMemberBeforeTheRowLock(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551276001")
+	b := mustUser(t, s, "+15551276002")
+	outsider := mustUser(t, s, "+15551276003")
+	target := mustUser(t, s, "+15551276004")
+	chat := chatWith(t, s, a, b)
+
+	release, err := store.HoldChatRowLock(ctx, s, chat.ID)
+	if err != nil {
+		t.Fatalf("hold chat row lock: %v", err)
+	}
+	defer release()
+
+	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	errs := make([]error, 3)
+	var wg sync.WaitGroup
+	wg.Go(func() { _, _, _, errs[0] = s.SetChatTitle(callCtx, chat.ID, outsider.ID, "Hijacked") })
+	wg.Go(func() { _, _, _, errs[1] = s.AddChatUser(callCtx, chat.ID, target.ID, outsider.ID) })
+	wg.Go(func() { _, _, _, errs[2] = s.RemoveChatUser(callCtx, chat.ID, b.ID, outsider.ID) })
+	wg.Wait()
+
+	for i, err := range errs {
+		if !errors.Is(err, store.ErrNotMember) {
+			t.Errorf("call %d under a held chats row lock: want ErrNotMember, got %v", i, err)
+		}
+	}
+	if got := participantIDs(t, s, chat.ID); len(got) != 2 {
+		t.Errorf("participants = %v, want unchanged 2", got)
 	}
 }
 

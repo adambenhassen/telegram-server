@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -602,6 +603,36 @@ func TestSendChatMessageRejectsNonMemberSender(t *testing.T) {
 		if _, ok := msgOpt(t, s, u.ID, 1); ok {
 			t.Errorf("owner %d gained a row from a rejected send", u.ID)
 		}
+	}
+}
+
+// TestSendChatMessageRejectsNonMemberBeforeTheRowLock is the send half of the
+// same invariant the chat mutations carry: a non-member is turned away without
+// taking the chats row lock, so it cannot serialise the members' writes behind
+// itself or time the wait to learn whether the chat exists. The lock is held by
+// another transaction for the length of the call, so a path that reaches for it
+// fails on the context instead of returning ErrNotMember.
+func TestSendChatMessageRejectsNonMemberBeforeTheRowLock(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551290091")
+	b := mustUser(t, s, "+15551290092")
+	outsider := mustUser(t, s, "+15551290093")
+	chat := chatWith(t, s, a, b)
+
+	release, err := store.HoldChatRowLock(ctx, s, chat.ID)
+	if err != nil {
+		t.Fatalf("hold chat row lock: %v", err)
+	}
+	defer release()
+
+	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if _, _, _, err := s.SendChatMessage(callCtx, store.FanOut{
+		ChatID: chat.ID, FromID: outsider.ID, Text: "let me in", RandomID: 1,
+	}); !errors.Is(err, store.ErrNotMember) {
+		t.Fatalf("outsider send under a held chats row lock: want ErrNotMember, got %v", err)
 	}
 }
 
