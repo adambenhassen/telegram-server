@@ -20,6 +20,23 @@ SELECT * FROM chats WHERE id = $1 FOR UPDATE;
 -- name: ChatParticipants :many
 SELECT * FROM chat_participants WHERE chat_id = $1 ORDER BY user_id;
 
+-- InsertChatParticipantIfAbsent reports 0 rows when the user is already a member,
+-- which is what makes a repeated add a no-op instead of an error.
+-- name: InsertChatParticipantIfAbsent :execrows
+INSERT INTO chat_participants (chat_id, user_id, inviter_id) VALUES ($1, $2, $3)
+ON CONFLICT (chat_id, user_id) DO NOTHING;
+
+-- DeleteChatParticipant is called from exactly one place: removeParticipant in
+-- chats.go, which also takes the removed user's advisory lock. See its comment.
+-- name: DeleteChatParticipant :execrows
+DELETE FROM chat_participants WHERE chat_id = $1 AND user_id = $2;
+
+-- name: BumpChatVersion :one
+UPDATE chats SET version = version + 1 WHERE id = $1 RETURNING *;
+
+-- name: SetChatTitle :one
+UPDATE chats SET title = $2, version = version + 1 WHERE id = $1 RETURNING *;
+
 -- name: IsChatMember :one
 SELECT EXISTS(SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2);
 

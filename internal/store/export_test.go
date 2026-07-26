@@ -17,36 +17,23 @@ const (
 	ListenerStableFor  = listenerStableFor
 )
 
-// RemoveChatParticipant drops a participant under the chats row lock, standing in
-// for the membership mutation that owns that operation for real so the fan-out's
-// snapshot ordering can be tested against a concurrent removal. Raw SQL rather
-// than a generated query on purpose: the shipped delete belongs to the mutation
-// ticket, and this must not become the thing it is built on.
-//
-// It takes lockOwners on the removed user because that is the invariant the real
-// mutation owes, not a detail of this helper: any transaction deleting a
-// chat_participants row for U must hold U's per-owner advisory lock in that same
-// transaction. Without it an edit or delete already holding U's lock can read a
-// member set that still contains U, have the removal commit underneath it, and
-// then write message content into a row that no longer belongs to a member. The
-// obligation is on the participant delete, not on any announcement it may or may
-// not send — a removal path that announces to remaining members only, or does not
-// announce at all, breaks the property just as completely.
+// RemoveChatParticipant drops a participant with no announcement, so the fan-out
+// tests can exercise a bare removal racing a chat write. It carries no removal
+// logic of its own: the delete and its advisory lock are removeParticipant's, the
+// one shipped path that deletes a chat_participants row, which is exactly what
+// makes those tests a regression guard for the real invariant rather than for a
+// second removal shape that only tests use.
 func RemoveChatParticipant(ctx context.Context, s *Store, chatID, userID int64) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
-	if _, err := s.q.WithTx(tx).ChatByIDForUpdate(ctx, chatID); err != nil {
+	qtx := s.q.WithTx(tx)
+	if _, err := qtx.ChatByIDForUpdate(ctx, chatID); err != nil {
 		return err
 	}
-	if err := lockOwners(ctx, tx, userID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM chat_participants WHERE chat_id = $1 AND user_id = $2`, chatID, userID,
-	); err != nil {
+	if _, err := removeParticipant(ctx, tx, qtx, chatID, userID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
