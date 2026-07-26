@@ -166,7 +166,7 @@ func TestChatsRealtime(t *testing.T) {
 			return 0
 		}
 	}
-	_, bUserID, cUserID, dUserID := logins(aID, "A"), logins(bID, "B"), logins(cID, "C"), logins(dID, "D")
+	aUserID, bUserID, cUserID, dUserID := logins(aID, "A"), logins(bID, "B"), logins(cID, "C"), logins(dID, "D")
 
 	// 1. A creates chat with B and C, title "Team".
 	var chatID int64
@@ -228,7 +228,7 @@ func TestChatsRealtime(t *testing.T) {
 		})
 		return err
 	})
-	recvMsg := func(coll *updateCollector, who string, wantText string) *tg.Message {
+	recvMsg := func(coll *updateCollector, who string, wantText string, wantFrom int64) *tg.Message {
 		t.Helper()
 		select {
 		case m := <-coll.newMsg:
@@ -246,8 +246,8 @@ func TestChatsRealtime(t *testing.T) {
 			if !ok {
 				t.Fatalf("%s from = %T", who, m.FromID)
 			}
-			if from.UserID != bUserID {
-				t.Fatalf("%s fromID = %d, want %d", who, from.UserID, bUserID)
+			if from.UserID != wantFrom {
+				t.Fatalf("%s fromID = %d, want %d", who, from.UserID, wantFrom)
 			}
 			return m
 		case <-time.After(10 * time.Second):
@@ -255,10 +255,10 @@ func TestChatsRealtime(t *testing.T) {
 			return nil
 		}
 	}
-	recvMsg(collA, "A", "hello from B")
-	recvMsg(collC, "C", "hello from B")
+	recvMsg(collA, "A", "hello from B", bUserID)
+	recvMsg(collC, "C", "hello from B", bUserID)
 	// Drain B's own copy of the sent message.
-	recvMsg(collB, "B", "hello from B")
+	recvMsg(collB, "B", "hello from B", bUserID)
 
 	// 4. A edits title to "Team 2"; B and C receive editTitle.
 	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -374,8 +374,8 @@ func TestChatsRealtime(t *testing.T) {
 		})
 		return err
 	})
-	recvMsg(collB, "B", "after C left")
-	recvMsg(collD, "D", "after C left")
+	recvMsg(collB, "B", "after C left", aUserID)
+	recvMsg(collD, "D", "after C left", aUserID)
 	noCtx, noCancel := context.WithTimeout(ctx, 3*time.Second)
 	if err := collC.waitNoNewMsg(noCtx); err != nil {
 		t.Errorf("C should not receive message after removal: %v", err)
