@@ -3,11 +3,14 @@ package api_test
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
@@ -36,7 +39,17 @@ func TestPeerUserIDValidatesAccessHash(t *testing.T) {
 
 func openStore(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey())
+	s, _ := openStoreDSN(t)
+	return s
+}
+
+// openStoreDSN opens a store and hands back the DSN it runs on, for a test that
+// also needs a raw connection to the same database. Each pgtest.DSN call clones
+// a fresh database, so the DSN has to come from the same call as the store.
+func openStoreDSN(t *testing.T) (*store.Store, string) {
+	t.Helper()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -45,7 +58,7 @@ func openStore(t *testing.T) *store.Store {
 			t.Errorf("close: %v", err)
 		}
 	})
-	return s
+	return s, dsn
 }
 
 func TestHandleSendMessagePersistsAndReturnsUpdates(t *testing.T) {
@@ -152,6 +165,15 @@ func TestHandleSendMessageToChatFansOut(t *testing.T) {
 	s := openStore(t)
 	users, chat := chatWith(t, s, "+15551292001", "+15551292002", "+15551292003")
 
+	// Pull one member's pts off the sender's before the fan-out, so an envelope
+	// that echoed another owner's entry from perOwner cannot coincide with the
+	// sender's own.
+	if _, err := api.SendMessageForTest(s, users[1].ID, &tg.MessagesSendMessageRequest{
+		Peer: &tg.InputPeerUser{UserID: users[2].ID, AccessHash: users[2].ID}, Message: "dm", RandomID: 1,
+	}); err != nil {
+		t.Fatalf("pre-advance: %v", err)
+	}
+
 	enc, err := api.SendMessageForTest(s, users[0].ID, &tg.MessagesSendMessageRequest{
 		Peer:     &tg.InputPeerChat{ChatID: chat.ID},
 		Message:  "hi",
@@ -164,11 +186,27 @@ func TestHandleSendMessageToChatFansOut(t *testing.T) {
 	if !ok {
 		t.Fatalf("result type = %T, want *tg.Updates", enc)
 	}
+	// The envelope must name the sender's own copy and the sender's own new pts.
+	sent, herr := s.History(ctx, users[0].ID, store.PeerTypeChat, chat.ID, 0, 1)
+	if herr != nil || len(sent) != 1 {
+		t.Fatalf("sender copy: %+v err=%v", sent, herr)
+	}
+	senderState, serr := s.State(ctx, users[0].ID)
+	if serr != nil {
+		t.Fatalf("sender state: %v", serr)
+	}
+
 	var sawMsgID, sawNewMsg bool
 	for _, u := range ups.Updates {
 		switch up := u.(type) {
 		case *tg.UpdateMessageID:
-			sawMsgID = up.RandomID == 42
+			if up.RandomID != 42 {
+				t.Errorf("updateMessageID random_id = %d, want 42", up.RandomID)
+			}
+			if int64(up.ID) != sent[0].LocalID {
+				t.Errorf("updateMessageID id = %d, want %d", up.ID, sent[0].LocalID)
+			}
+			sawMsgID = true
 		case *tg.UpdateNewMessage:
 			m, isMsg := up.Message.(*tg.Message)
 			if !isMsg {
@@ -178,6 +216,15 @@ func TestHandleSendMessageToChatFansOut(t *testing.T) {
 			from, isUser := m.FromID.(*tg.PeerUser)
 			sawNewMsg = isChat && peer.ChatID == chat.ID &&
 				isUser && from.UserID == users[0].ID && m.Out && m.Message == "hi"
+			if int64(m.ID) != sent[0].LocalID {
+				t.Errorf("updateNewMessage id = %d, want %d", m.ID, sent[0].LocalID)
+			}
+			if up.Pts != senderState.Pts {
+				t.Errorf("updateNewMessage pts = %d, want the sender's %d", up.Pts, senderState.Pts)
+			}
+			if up.PtsCount != 1 {
+				t.Errorf("updateNewMessage pts_count = %d, want 1", up.PtsCount)
+			}
 		}
 	}
 	if !sawMsgID || !sawNewMsg {
@@ -208,8 +255,19 @@ func TestHandleSendMessageToChatFansOut(t *testing.T) {
 func TestHandleSendMessageToChatIsIdempotent(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 	users, chat := chatWith(t, s, "+15551292011", "+15551292012", "+15551292013")
+
+	// A resend must cost nothing a client can observe, and a lost !dup guard shows
+	// up as a second round of update nudges long before it shows up in the rows.
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err = conn.Exec(ctx, "LISTEN "+store.ChannelUpdates); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
 
 	peer := &tg.InputPeerChat{ChatID: chat.ID}
 	first, err := api.SendMessageForTest(s, users[0].ID, &tg.MessagesSendMessageRequest{
@@ -217,6 +275,23 @@ func TestHandleSendMessageToChatIsIdempotent(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("send: %v", err)
+	}
+
+	// One nudge per member for the send that did write.
+	notified := make(map[string]bool, len(users))
+	for range users {
+		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		n, werr := conn.WaitForNotification(waitCtx)
+		cancel()
+		if werr != nil {
+			t.Fatalf("wait notification: %v", werr)
+		}
+		notified[n.Payload] = true
+	}
+	for _, u := range users {
+		if !notified[strconv.FormatInt(u.ID, 10)] {
+			t.Errorf("no update nudge for member %d", u.ID)
+		}
 	}
 	before := make(map[int64]int, len(users))
 	for _, u := range users {
@@ -235,6 +310,13 @@ func TestHandleSendMessageToChatIsIdempotent(t *testing.T) {
 	}
 	if msgID(t, first) != msgID(t, second) {
 		t.Errorf("resend id = %d, want %d", msgID(t, second), msgID(t, first))
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if n, werr := conn.WaitForNotification(waitCtx); werr == nil {
+		t.Errorf("resend emitted a nudge for %q", n.Payload)
+	} else if !errors.Is(werr, context.DeadlineExceeded) {
+		t.Fatalf("wait after resend: %v", werr)
 	}
 	for _, u := range users {
 		st, serr := s.State(ctx, u.ID)
