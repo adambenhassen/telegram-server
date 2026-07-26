@@ -27,12 +27,3 @@ func DeleteChatUserForTest(s *store.Store, userID int64, req *tg.MessagesDeleteC
 	}
 	return testHandlers(s).handleDeleteChatUser(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
-
-// GetDialogsForTest invokes handleGetDialogs for userID.
-func GetDialogsForTest(s *store.Store, userID int64) (bin.Encoder, error) {
-	var buf bin.Buffer
-	if err := (&tg.MessagesGetDialogsRequest{Limit: 100}).Encode(&buf); err != nil {
-		return nil, err
-	}
-	return testHandlers(s).handleGetDialogs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
-}
