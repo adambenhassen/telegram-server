@@ -376,3 +376,52 @@ func TestLoadChatsNonMemberForbidden(t *testing.T) {
 		t.Fatalf("forbidden chat = %+v, want id %d title team", f, chat.ID)
 	}
 }
+
+// A create service message replayed by someone who is not in the chat must not
+// name the chat's current members: MessageActionChatCreate.Users is the same
+// disclosure loadChats gates, reached through the message instead of the chat.
+func TestBuildUpdatesCreateActionHidesMembersFromNonMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, users, chat := chatFixture(t, "+1555133")
+
+	// Extra delivers a copy to a user who is not a participant, which is how a
+	// removed member keeps their retained copy of an event.
+	if _, _, _, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: chat.ID, FromID: users[0].ID, Text: "team",
+		Action: store.ChatActionCreate, Extra: []int64{users[2].ID},
+	}); err != nil {
+		t.Fatalf("send create service message: %v", err)
+	}
+
+	createUsers := func(viewerID int64) []int64 {
+		t.Helper()
+		ups, _, err := api.BuildUpdatesChatsForTest(s, viewerID, 0)
+		if err != nil {
+			t.Fatalf("build updates for %d: %v", viewerID, err)
+		}
+		if len(ups) != 1 {
+			t.Fatalf("updates for %d = %d, want 1", viewerID, len(ups))
+		}
+		nm, ok := ups[0].(*tg.UpdateNewMessage)
+		if !ok {
+			t.Fatalf("update type = %T, want *tg.UpdateNewMessage", ups[0])
+		}
+		ms, ok := nm.Message.(*tg.MessageService)
+		if !ok {
+			t.Fatalf("message type = %T, want *tg.MessageService", nm.Message)
+		}
+		cr, ok := ms.Action.(*tg.MessageActionChatCreate)
+		if !ok {
+			t.Fatalf("action = %T, want *tg.MessageActionChatCreate", ms.Action)
+		}
+		return cr.Users
+	}
+
+	if got := createUsers(users[1].ID); len(got) != 2 {
+		t.Fatalf("member sees users %v, want both participants", got)
+	}
+	if got := createUsers(users[2].ID); len(got) != 0 {
+		t.Fatalf("non-member sees users %v, want none", got)
+	}
+}

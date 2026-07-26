@@ -206,15 +206,25 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 		if err != nil || !ok {
 			return nil, nil, nil, err
 		}
+		// The create action's user list is current member ids, so it is the same
+		// disclosure loadChats gates: a viewer removed from the chat still replays
+		// their retained copy of the event, and must not learn who is in it now.
+		// An empty list is what a non-member gets.
 		var createUsers []int64
 		if m.Action == store.ChatActionCreate {
-			parts, perr := h.store.Participants(ctx, m.PeerID)
-			if perr != nil {
-				return nil, nil, nil, perr
+			member, merr := h.store.IsMember(ctx, m.PeerID, userID)
+			if merr != nil {
+				return nil, nil, nil, merr
 			}
-			createUsers = make([]int64, len(parts))
-			for i, p := range parts {
-				createUsers[i] = p.UserID
+			if member {
+				parts, perr := h.store.Participants(ctx, m.PeerID)
+				if perr != nil {
+					return nil, nil, nil, perr
+				}
+				createUsers = make([]int64, len(parts))
+				for i, p := range parts {
+					createUsers[i] = p.UserID
+				}
 			}
 		}
 		tlMsg := messageToTL(m, createUsers)
