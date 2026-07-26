@@ -70,6 +70,43 @@ func LoadChatsForTest(s *store.Store, ids []int64, viewerID int64) ([]tg.ChatCla
 	return testHandlers(s).loadChats(context.Background(), set, viewerID)
 }
 
+// GetHistoryForTest encodes req and invokes handleGetHistory for the caller.
+func GetHistoryForTest(s *store.Store, userID int64, req *tg.MessagesGetHistoryRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetHistory(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// GetDialogsForTest invokes handleGetDialogs for the caller.
+func GetDialogsForTest(s *store.Store, userID int64) (bin.Encoder, error) {
+	var buf bin.Buffer
+	req := &tg.MessagesGetDialogsRequest{OffsetPeer: &tg.InputPeerEmpty{}}
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetDialogs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// ReadHistoryForTest encodes req and invokes handleReadHistory for the caller.
+func ReadHistoryForTest(s *store.Store, userID int64, req *tg.MessagesReadHistoryRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleReadHistory(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SetTypingForTest encodes req and invokes handleSetTyping for the caller.
+func SetTypingForTest(s *store.Store, userID int64, req *tg.MessagesSetTypingRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleSetTyping(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // LogOutForTest invokes handleLogOut for a request arriving on authKeyID,
 // handing back the evict announcement unrun so a test can assert whether it was
 // already published by the time the handler returned.

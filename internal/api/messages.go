@@ -59,9 +59,12 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	toID, err := peerUserID(req.Peer)
+	peerType, toID, err := inputPeer(req.Peer)
 	if err != nil {
 		return nil, err
+	}
+	if peerType == store.PeerTypeChat {
+		return h.sendChatMessage(r, toID, &req)
 	}
 
 	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID)
@@ -89,6 +92,74 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	}, nil
 }
 
+// requireMember is the authorization boundary for a client-supplied chat id.
+// An unknown chat and a chat the caller is not in report the identical error, so
+// a caller cannot probe which ids exist over a dense BIGSERIAL id space. It takes
+// no lock and writes nothing on the rejecting path.
+//
+// It is an early error, not the boundary that holds: it runs in a different
+// transaction from the write that follows, so the store re-checks membership
+// under the chats row lock.
+func (h *handlers) requireMember(ctx context.Context, chatID, userID int64) error {
+	member, err := h.store.IsMember(ctx, chatID, userID)
+	if err != nil {
+		h.log.Error("chat membership", "chat_id", chatID, "user_id", userID, "err", err)
+		return errInternal
+	}
+	if !member {
+		return errPeerIDInvalid
+	}
+	return nil
+}
+
+// sendChatMessage fans one message out to every member of chatID and returns the
+// sender-side Updates. The reply is the 1:1 shape plus the chat itself.
+func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+	if err := h.requireMember(r.Ctx, chatID, r.UserID); err != nil {
+		return nil, err
+	}
+
+	sender, perOwner, dup, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
+		ChatID: chatID, FromID: r.UserID, Text: req.Message, RandomID: req.RandomID,
+	})
+	if errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	}
+	if err != nil {
+		h.log.Error("send chat message", "user_id", r.UserID, "chat_id", chatID, "err", err)
+		return nil, errInternal
+	}
+	if !dup {
+		for uid := range perOwner {
+			h.notify(r.Ctx, uid)
+		}
+	}
+
+	recipients := make(map[int64]bool, len(perOwner))
+	for uid := range perOwner {
+		recipients[uid] = true
+	}
+	users, err := h.loadUsers(r.Ctx, recipients, r.UserID)
+	if err != nil {
+		h.log.Error("send chat message users", "err", err)
+		return nil, errInternal
+	}
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("send chat message chats", "err", err)
+		return nil, errInternal
+	}
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{
+			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
+			&tg.UpdateNewMessage{Message: messageToTL(sender, nil), Pts: perOwner[r.UserID], PtsCount: 1},
+		},
+		Users: users,
+		Chats: chats,
+		Date:  int(sender.Date.Unix()),
+	}, nil
+}
+
 // handleGetHistory serves messages.getHistory, paged newest-first by offset_id.
 func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesGetHistoryRequest
@@ -98,9 +169,14 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	toID, err := peerUserID(req.Peer)
+	peerType, toID, err := inputPeer(req.Peer)
 	if err != nil {
 		return nil, err
+	}
+	if peerType == store.PeerTypeChat {
+		if err = h.requireMember(r.Ctx, toID, r.UserID); err != nil {
+			return nil, err
+		}
 	}
 
 	limit := req.Limit
@@ -111,11 +187,15 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 		limit = maxHistoryLimit
 	}
 
-	msgs, err := h.store.History(r.Ctx, r.UserID, store.PeerTypeUser, toID, req.OffsetID, limit)
+	msgs, err := h.store.History(r.Ctx, r.UserID, peerType, toID, req.OffsetID, limit)
 	if err != nil {
 		h.log.Error("get history", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	if peerType == store.PeerTypeChat {
+		return h.chatHistory(r, toID, msgs)
+	}
+
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	for i, m := range msgs {
 		tlMsgs[i] = messageToTL(m, nil)
@@ -126,6 +206,58 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 	return &tg.MessagesMessages{Messages: tlMsgs, Users: users}, nil
+}
+
+// chatHistory renders one page of a chat's history for the caller, who
+// requireMember has already established is a member.
+func (h *handlers) chatHistory(r *mtproto.Request, chatID int64, msgs []store.Message) (bin.Encoder, error) {
+	// A page has as many authors as the chat has members, and a service row names
+	// further users in its action, so the user list is collected from the page
+	// itself; twoUsers is a 1:1 helper and would omit every author but the caller.
+	// createUsers is the chat's current member set, which the caller is entitled
+	// to see here — unlike getDifference, no removed viewer reaches this path.
+	var createUsers []int64
+	for _, m := range msgs {
+		if m.Action == store.ChatActionCreate {
+			parts, perr := h.store.Participants(r.Ctx, chatID)
+			if perr != nil {
+				h.log.Error("get history participants", "chat_id", chatID, "err", perr)
+				return nil, errInternal
+			}
+			createUsers = make([]int64, len(parts))
+			for i, p := range parts {
+				createUsers[i] = p.UserID
+			}
+			break
+		}
+	}
+
+	tlMsgs := make([]tg.MessageClass, len(msgs))
+	authors := map[int64]bool{r.UserID: true}
+	for i, m := range msgs {
+		tlMsgs[i] = messageToTL(m, createUsers)
+		authors[m.FromID] = true
+		switch m.Action {
+		case store.ChatActionAddUser, store.ChatActionDeleteUser:
+			authors[m.ActionUserID] = true
+		case store.ChatActionCreate:
+			for _, id := range createUsers {
+				authors[id] = true
+			}
+		}
+	}
+
+	users, err := h.loadUsers(r.Ctx, authors, r.UserID)
+	if err != nil {
+		h.log.Error("get history users", "err", err)
+		return nil, errInternal
+	}
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("get history chats", "err", err)
+		return nil, errInternal
+	}
+	return &tg.MessagesMessages{Messages: tlMsgs, Users: users, Chats: chats}, nil
 }
 
 // handleReadHistory serves messages.readHistory: advances read state on both
