@@ -11,14 +11,30 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
-// messageToTL maps a stored message to the wire tg.Message. Peer/from are
-// PeerUser; ids are cast to the wire int space. EditDate populates its flag via
-// tg.Message.SetFlags at encode time.
-func messageToTL(m store.Message) *tg.Message {
+// messageToTL maps a stored message to the wire message. The peer follows
+// peer_type; from is always PeerUser, since the author of a chat message is a
+// user either way. ids are cast to the wire int space. EditDate populates its
+// flag via tg.Message.SetFlags at encode time.
+//
+// A row carrying an action renders as tg.MessageService instead. createUsers is
+// the participant list for a ChatActionCreate row and nil for everything else:
+// the mapper stays pure, so the one action that needs a member set is handed it
+// rather than fetching it.
+func messageToTL(m store.Message, createUsers []int64) tg.MessageClass {
+	if m.Action != store.ChatActionNone {
+		return &tg.MessageService{
+			ID:     int(m.LocalID),
+			Out:    m.Out,
+			PeerID: peerToTL(m.PeerType, m.PeerID),
+			FromID: &tg.PeerUser{UserID: m.FromID},
+			Date:   int(m.Date.Unix()),
+			Action: actionToTL(m, createUsers),
+		}
+	}
 	msg := &tg.Message{
 		ID:      int(m.LocalID),
 		Out:     m.Out,
-		PeerID:  &tg.PeerUser{UserID: m.PeerID},
+		PeerID:  peerToTL(m.PeerType, m.PeerID),
 		FromID:  &tg.PeerUser{UserID: m.FromID},
 		Message: m.Text,
 		Date:    int(m.Date.Unix()),
@@ -27,6 +43,40 @@ func messageToTL(m store.Message) *tg.Message {
 		msg.EditDate = int(m.EditDate.Unix())
 	}
 	return msg
+}
+
+// actionToTL maps a service message's action. Create and EditTitle carry the
+// title in the message text; Add/DeleteUser carry their subject in action_user_id.
+func actionToTL(m store.Message, createUsers []int64) tg.MessageActionClass {
+	switch m.Action {
+	case store.ChatActionCreate:
+		return &tg.MessageActionChatCreate{Title: m.Text, Users: createUsers}
+	case store.ChatActionAddUser:
+		return &tg.MessageActionChatAddUser{Users: []int64{m.ActionUserID}}
+	case store.ChatActionDeleteUser:
+		return &tg.MessageActionChatDeleteUser{UserID: m.ActionUserID}
+	case store.ChatActionEditTitle:
+		return &tg.MessageActionChatEditTitle{Title: m.Text}
+	default:
+		return &tg.MessageActionEmpty{}
+	}
+}
+
+// chatToTL maps a stored chat to the wire tg.Chat. selfID marks the creator flag
+// for the recipient of this batch. ParticipantsCount comes from the caller
+// because the mapper stays pure.
+//
+// Deactivated is left false: chats has no such column and store.Chat no longer
+// carries the field, so false is the only honest answer until one has a reader.
+func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
+	return &tg.Chat{
+		ID:                c.ID,
+		Title:             c.Title,
+		Creator:           c.CreatorID == selfID,
+		ParticipantsCount: participantsCount,
+		Date:              int(c.Date.Unix()),
+		Version:           c.Version,
+	}
 }
 
 // userToTL maps a stored user to the wire tg.User. AccessHash is the M1 self-id
@@ -72,6 +122,7 @@ type updateBatch struct {
 	ups   []tg.UpdateClass
 	pts   []int
 	users []tg.UserClass
+	chats []tg.ChatClass
 	state store.State
 	// head is the user's pts as read for this batch, before any truncation
 	// clamp on state. It is what a reader within maxDiffEvents of it can be
@@ -111,8 +162,9 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 	}
 
 	peers := map[int64]bool{}
+	chats := map[int64]bool{}
 	for _, ev := range events {
-		up, refs, uerr := h.eventToUpdate(ctx, userID, ev)
+		up, refs, chatRefs, uerr := h.eventToUpdate(ctx, userID, ev)
 		if uerr != nil {
 			return updateBatch{}, uerr
 		}
@@ -124,6 +176,9 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 		for _, id := range refs {
 			peers[id] = true
 		}
+		for _, id := range chatRefs {
+			chats[id] = true
+		}
 	}
 	// When truncated, advertise only through the last included event's pts.
 	if b.more && len(events) > 0 {
@@ -134,45 +189,95 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 	if err != nil {
 		return updateBatch{}, err
 	}
+	b.chats, err = h.loadChats(ctx, chats, userID)
+	if err != nil {
+		return updateBatch{}, err
+	}
 	return b, nil
 }
 
 // eventToUpdate builds the wire update for one event owned by userID, returning
-// the update and the user ids it references. A nil update (message vanished, or
-// an empty read marker) is skipped by the caller.
-func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Event) (tg.UpdateClass, []int64, error) {
+// the update, the user ids it references and the chat ids it references. A nil
+// update (message vanished, or an empty read marker) is skipped by the caller.
+func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Event) (tg.UpdateClass, []int64, []int64, error) {
 	switch ev.Type {
 	case store.EventNewMessage, store.EventEdit:
 		m, ok, err := h.store.MessageByOwnerLocal(ctx, userID, ev.LocalID)
 		if err != nil || !ok {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		tlMsg := messageToTL(m)
-		refs := []int64{m.FromID, m.PeerID}
+		// The create action's user list is current member ids, so it is the same
+		// disclosure loadChats gates: a viewer removed from the chat still replays
+		// their retained copy of the event, and must not learn who is in it now.
+		// An empty list is what a non-member gets.
+		var createUsers []int64
+		if m.Action == store.ChatActionCreate {
+			member, merr := h.store.IsMember(ctx, m.PeerID, userID)
+			if merr != nil {
+				return nil, nil, nil, merr
+			}
+			if member {
+				parts, perr := h.store.Participants(ctx, m.PeerID)
+				if perr != nil {
+					return nil, nil, nil, perr
+				}
+				createUsers = make([]int64, len(parts))
+				for i, p := range parts {
+					createUsers[i] = p.UserID
+				}
+			}
+		}
+		tlMsg := messageToTL(m, createUsers)
+		refs := []int64{m.FromID}
+		var chatRefs []int64
+		if m.PeerType == store.PeerTypeChat {
+			// The peer is the chat, not a user, so the owner is named explicitly:
+			// a client rendering a group needs itself in the user list.
+			chatRefs = []int64{m.PeerID}
+			refs = append(refs, userID)
+			// A service message names user ids in its action; without them in the
+			// enclosing Users a client renders the add, the removal or the create
+			// as unknown users. createUsers is already F6-gated and stays nil for
+			// a non-member, so appending it discloses nothing new.
+			switch m.Action {
+			case store.ChatActionAddUser, store.ChatActionDeleteUser:
+				refs = append(refs, m.ActionUserID)
+			case store.ChatActionCreate:
+				refs = append(refs, createUsers...)
+			}
+		} else {
+			refs = append(refs, m.PeerID)
+		}
 		if ev.Type == store.EventEdit {
-			return &tg.UpdateEditMessage{Message: tlMsg, Pts: ev.Pts, PtsCount: 1}, refs, nil
+			return &tg.UpdateEditMessage{Message: tlMsg, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil
 		}
-		return &tg.UpdateNewMessage{Message: tlMsg, Pts: ev.Pts, PtsCount: 1}, refs, nil
+		return &tg.UpdateNewMessage{Message: tlMsg, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil
 
 	case store.EventDelete:
-		return &tg.UpdateDeleteMessages{Messages: []int{int(ev.LocalID)}, Pts: ev.Pts, PtsCount: 1}, nil, nil
+		return &tg.UpdateDeleteMessages{Messages: []int{int(ev.LocalID)}, Pts: ev.Pts, PtsCount: 1}, nil, nil, nil
 
 	case store.EventReadIn, store.EventReadOut:
 		if ev.LocalID == 0 {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 		m, ok, err := h.store.MessageByOwnerLocal(ctx, userID, ev.LocalID)
 		if err != nil || !ok {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		peer := &tg.PeerUser{UserID: m.PeerID}
+		peer := peerToTL(m.PeerType, m.PeerID)
+		var refs, chatRefs []int64
+		if m.PeerType == store.PeerTypeChat {
+			chatRefs = []int64{m.PeerID}
+		} else {
+			refs = []int64{m.PeerID}
+		}
 		if ev.Type == store.EventReadOut {
-			return &tg.UpdateReadHistoryOutbox{Peer: peer, MaxID: int(ev.LocalID), Pts: ev.Pts, PtsCount: 1}, []int64{m.PeerID}, nil
+			return &tg.UpdateReadHistoryOutbox{Peer: peer, MaxID: int(ev.LocalID), Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil
 		}
-		return &tg.UpdateReadHistoryInbox{Peer: peer, MaxID: int(ev.LocalID), StillUnreadCount: 0, Pts: ev.Pts, PtsCount: 1}, []int64{m.PeerID}, nil
+		return &tg.UpdateReadHistoryInbox{Peer: peer, MaxID: int(ev.LocalID), StillUnreadCount: 0, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil
 
 	default:
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 }
 
@@ -190,6 +295,41 @@ func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, selfID int
 		users = append(users, userToTL(u, id == selfID))
 	}
 	return users, nil
+}
+
+// loadChats hydrates chat ids for viewerID. A chat the viewer is no longer a
+// member of still reaches here — their dialog row and their retained message
+// copies survive removal by design — so it must not keep serving live metadata.
+// tg.ChatForbidden carries the id and a title and nothing else, which is what
+// tells a client to stop rendering the chat as active.
+//
+// The membership check is one query per chat per batch. A batch references very
+// few distinct chats, so it stays a straight loop with no cache.
+func (h *handlers) loadChats(ctx context.Context, ids map[int64]bool, viewerID int64) ([]tg.ChatClass, error) {
+	chats := make([]tg.ChatClass, 0, len(ids))
+	for id := range ids {
+		c, ok, err := h.store.ChatByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		member, err := h.store.IsMember(ctx, id, viewerID)
+		if err != nil {
+			return nil, err
+		}
+		if !member {
+			chats = append(chats, &tg.ChatForbidden{ID: c.ID, Title: c.Title})
+			continue
+		}
+		parts, err := h.store.Participants(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		chats = append(chats, chatToTL(c, len(parts), viewerID))
+	}
+	return chats, nil
 }
 
 // handleGetState serves updates.getState.
@@ -244,6 +384,7 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 			NewMessages:       newMessages,
 			OtherUpdates:      other,
 			Users:             b.users,
+			Chats:             b.chats,
 			IntermediateState: *stateToTL(b.state),
 		}, nil
 	}
@@ -251,6 +392,7 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 		NewMessages:  newMessages,
 		OtherUpdates: other,
 		Users:        b.users,
+		Chats:        b.chats,
 		State:        *stateToTL(b.state),
 	}, nil
 }
