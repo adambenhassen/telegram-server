@@ -289,22 +289,30 @@ func chatCopies(ctx context.Context, qtx *db.Queries, pre db.Message) ([]db.Mess
 	return copies, nil
 }
 
-// requireChatMember rejects a write into a chat the user has left. editMessage
-// and deleteMessages take no peer — they are keyed on (owner_id, local_id) alone
-// — and a removed member keeps their old copies, so without this they reach every
-// current member's rows through one of them. It runs inside the transaction with
-// the locks already held, which is what makes a removal committed in the meantime
-// visible. ErrMessageInvalid rather than a distinct error keeps the RPC surface
-// unchanged.
-func requireChatMember(ctx context.Context, qtx *db.Queries, chatID, userID int64) error {
-	member, err := qtx.IsChatMember(ctx, db.IsChatMemberParams{ChatID: chatID, UserID: userID})
+// chatMembers returns the chat's current member set.
+//
+// Both of the things it feeds depend on it being read inside the transaction with
+// the per-owner advisory locks already held, never before them. One is the
+// authorization check: editMessage and deleteMessages take no peer — they are
+// keyed on (owner_id, local_id) alone — and a removed member keeps their old
+// copies, so without it they reach every current member's rows through one of
+// them. The other is the filter that keeps the write out of a removed member's
+// own rows, whose copies are theirs and frozen from the moment they left.
+//
+// A membership mutation announces itself with a fan-out that writes a row for the
+// affected user, so once every copy owner's lock is held a removal has either
+// committed and is visible here, or is blocked behind this transaction. Reading
+// the set any earlier reopens exactly the window both uses exist to close.
+func chatMembers(ctx context.Context, qtx *db.Queries, chatID int64) (map[int64]bool, error) {
+	parts, err := qtx.ChatParticipants(ctx, chatID)
 	if err != nil {
-		return fmt.Errorf("chat membership: %w", err)
+		return nil, fmt.Errorf("chat participants: %w", err)
 	}
-	if !member {
-		return ErrMessageInvalid
+	members := make(map[int64]bool, len(parts))
+	for _, p := range parts {
+		members[p.UserID] = true
 	}
-	return nil
+	return members, nil
 }
 
 func copyOwners(copies []db.Message) []int64 {
@@ -319,12 +327,13 @@ func copyOwners(copies []db.Message) []int64 {
 // with one edit event and one pts bump per affected owner. Returns the author's
 // new pts.
 //
-// No chats row lock is taken here, deliberately: the copy set comes from
-// fanout_id, not from the live member set, so there is no member set read for
-// that lock to protect. The membership re-check is serialized by the author's own
-// advisory lock instead — a membership mutation announces itself with a fan-out
-// that writes a row for the affected user, so a removal cannot commit without
-// taking that same lock. Leaving the chats row out is also what lets
+// The copy set comes from fanout_id and the member set from chatMembers, and the
+// write is their intersection: everyone who holds a copy and is still in the chat.
+//
+// No chats row lock is taken here, deliberately. The member set is read after the
+// per-owner advisory locks, and every copy owner's lock is held by then, which is
+// what makes the read authoritative — see chatMembers for why that is as strong
+// as the chats row lock here. Leaving the chats row out is what lets
 // DeleteMessages accept a batch spanning several chats without breaking the
 // one-chats-row-per-transaction rule.
 func editChatMessage(ctx context.Context, tx pgx.Tx, qtx *db.Queries, pre db.Message, text string) (int, error) {
@@ -352,12 +361,24 @@ func editChatMessage(ctx context.Context, tx pgx.Tx, qtx *db.Queries, pre db.Mes
 	if !msg.Out || msg.Deleted {
 		return 0, ErrMessageInvalid
 	}
-	if err = requireChatMember(ctx, qtx, pre.PeerID, pre.OwnerID); err != nil {
+	members, err := chatMembers(ctx, qtx, pre.PeerID)
+	if err != nil {
 		return 0, err
+	}
+	// The author must still be in the chat. ErrMessageInvalid rather than a
+	// distinct error keeps the RPC surface unchanged.
+	if !members[pre.OwnerID] {
+		return 0, ErrMessageInvalid
 	}
 
 	var authorPts int64
 	for _, c := range copies {
+		// A member removed after the send keeps the copy they had. A later edit
+		// must not push new text, an event or a pts bump into it: that is content
+		// delivered to a non-member, and their row stays as it was when they left.
+		if !members[c.OwnerID] {
+			continue
+		}
 		if err = qtx.SetEditedText(ctx, db.SetEditedTextParams{OwnerID: c.OwnerID, LocalID: c.LocalID, Message: text}); err != nil {
 			return 0, fmt.Errorf("edit copy %d: %w", c.OwnerID, err)
 		}
@@ -432,16 +453,28 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 	if err = lockOwners(ctx, tx, lockIDs...); err != nil {
 		return nil, err
 	}
+	members := make(map[int64]map[int64]bool, len(chats))
 	for chatID := range chats {
-		if err = requireChatMember(ctx, qtx, chatID, ownerID); err != nil {
-			return nil, err
+		set, e := chatMembers(ctx, qtx, chatID)
+		if e != nil {
+			return nil, e
 		}
+		if !set[ownerID] {
+			return nil, ErrMessageInvalid
+		}
+		members[chatID] = set
 	}
 
 	perOwner := map[int64]int{}
 	for _, m := range msgs {
 		if PeerType(m.PeerType) == PeerTypeChat {
 			for _, c := range fanouts[m.FanoutID] {
+				// Same rule as an edit: a member removed after the send keeps
+				// their copy, so the delete and its event stop at the current
+				// member set rather than reaching into rows that are theirs.
+				if !members[m.PeerID][c.OwnerID] {
+					continue
+				}
 				if err = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: c.OwnerID, LocalID: c.LocalID}); err != nil {
 					return nil, fmt.Errorf("delete copy %d: %w", c.OwnerID, err)
 				}

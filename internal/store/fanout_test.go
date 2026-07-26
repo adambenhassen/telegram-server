@@ -305,6 +305,75 @@ func TestRemovedMemberCannotEditOrDeleteChatMessage(t *testing.T) {
 	}
 }
 
+// TestChatWriteSkipsMemberRemovedAfterSend is the other direction of F3: the
+// removed member keeps the copy they already had, so a later edit or delete must
+// stop at the current member set. New text reaching their row would be content
+// delivered to a non-member, and the delete would push an event at an account the
+// server has stopped talking to.
+func TestChatWriteSkipsMemberRemovedAfterSend(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551290111")
+	b := mustUser(t, s, "+15551290112")
+	c := mustUser(t, s, "+15551290113")
+	chat := chatWith(t, s, a, b, c)
+
+	sender, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: a.ID, Text: "orig", RandomID: 1})
+	if err := store.RemoveChatParticipant(ctx, s, chat.ID, c.ID); err != nil {
+		t.Fatalf("remove participant: %v", err)
+	}
+
+	assertFrozen := func(when string) {
+		t.Helper()
+		m, ok := msgOpt(t, s, c.ID, 1)
+		if !ok {
+			t.Fatalf("%s: removed member lost its copy", when)
+		}
+		if m.Text != "orig" || m.Deleted || m.EditDate != nil {
+			t.Fatalf("%s: removed member's copy moved: %+v", when, m)
+		}
+		if got := ptsOf(t, s, c.ID); got != 1 {
+			t.Fatalf("%s: removed member pts = %d, want unchanged 1", when, got)
+		}
+		if ev := eventsOf(t, s, c.ID, 0); len(ev) != 1 || ev[0].Type != store.EventNewMessage {
+			t.Fatalf("%s: removed member events = %+v, want only the original send", when, ev)
+		}
+	}
+
+	_, newPts, err := s.EditMessage(ctx, a.ID, sender.LocalID, "edited")
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if newPts != 2 {
+		t.Fatalf("editor pts = %d, want 2", newPts)
+	}
+	assertFrozen("after the edit")
+	for _, u := range []store.User{a, b} {
+		m, ok := msgOpt(t, s, u.ID, 1)
+		if !ok || m.Text != "edited" {
+			t.Errorf("remaining member %d not edited: ok=%v %+v", u.ID, ok, m)
+		}
+		if got := ptsOf(t, s, u.ID); got != 2 {
+			t.Errorf("remaining member %d pts = %d, want 2", u.ID, got)
+		}
+	}
+
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID})
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if len(perOwner) != 2 || perOwner[a.ID] != 3 || perOwner[b.ID] != 3 {
+		t.Fatalf("perOwner = %+v, want only a and b at pts 3", perOwner)
+	}
+	assertFrozen("after the delete")
+	for _, u := range []store.User{a, b} {
+		if m, ok := msgOpt(t, s, u.ID, 1); !ok || !m.Deleted {
+			t.Errorf("remaining member %d copy not deleted: ok=%v %+v", u.ID, ok, m)
+		}
+	}
+}
+
 // TestChatWriteNeverTouchesOneToOneRows is the F2 control: fanout_id = 0 is the
 // sentinel every 1:1 row carries, so a chat-peer row holding it must be rejected
 // rather than walked as a fan-out — walking it would reach the whole 1:1 table.
