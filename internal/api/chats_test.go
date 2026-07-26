@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -106,6 +107,18 @@ func TestHandleCreateChatFansOutToEveryMember(t *testing.T) {
 	}
 	creator, invited := users[0], users[1:]
 
+	// One 1:1 send to a bystander before the create, so the creator sits one pts
+	// ahead of every invitee. Without it every member shares one pts and the
+	// assertion on the reply's Pts below cannot distinguish the caller's own pts
+	// from anybody else's.
+	bystander, err := s.CreateUser(ctx, "+15551292105")
+	if err != nil {
+		t.Fatalf("bystander: %v", err)
+	}
+	if _, _, _, _, err = s.SendMessage(ctx, creator.ID, bystander.ID, "warmup", 991); err != nil {
+		t.Fatalf("warmup send: %v", err)
+	}
+
 	enc, err := api.CreateChatForTest(s, creator.ID, &tg.MessagesCreateChatRequest{
 		Users: inputUsers(invited[0].ID, invited[1].ID, invited[2].ID),
 		Title: "Team",
@@ -144,6 +157,11 @@ func TestHandleCreateChatFansOutToEveryMember(t *testing.T) {
 	if newMsg.PtsCount != 1 {
 		t.Fatalf("pts count = %d, want 1", newMsg.PtsCount)
 	}
+	// The caller's own pts, not any other member's: the creator is at 2 after the
+	// warmup send, every invitee at 1.
+	if newMsg.Pts != 2 {
+		t.Fatalf("pts = %d, want the caller's own 2", newMsg.Pts)
+	}
 	svc, ok := newMsg.Message.(*tg.MessageService)
 	if !ok {
 		t.Fatalf("message type = %T, want *tg.MessageService", newMsg.Message)
@@ -168,7 +186,13 @@ func TestHandleCreateChatFansOutToEveryMember(t *testing.T) {
 	// its owner's pts advanced by the create.
 	var fanoutID int64
 	for _, u := range users {
-		m, ok, err := s.MessageByOwnerLocal(ctx, u.ID, 1)
+		// The creator's warmup send took local id 1 and pts 1; everyone else
+		// starts at the create.
+		wantLocal, wantPts := int64(1), 1
+		if u.ID == creator.ID {
+			wantLocal, wantPts = 2, 2
+		}
+		m, ok, err := s.MessageByOwnerLocal(ctx, u.ID, wantLocal)
 		if err != nil || !ok {
 			t.Fatalf("user %d copy: ok=%v err=%v", u.ID, ok, err)
 		}
@@ -185,8 +209,8 @@ func TestHandleCreateChatFansOutToEveryMember(t *testing.T) {
 		if err != nil {
 			t.Fatalf("state %d: %v", u.ID, err)
 		}
-		if st.Pts != 1 {
-			t.Fatalf("user %d pts = %d, want 1", u.ID, st.Pts)
+		if st.Pts != wantPts {
+			t.Fatalf("user %d pts = %d, want %d", u.ID, st.Pts, wantPts)
 		}
 	}
 }
@@ -232,6 +256,65 @@ func TestHandleCreateChatReportsMissingInvitee(t *testing.T) {
 	}
 	if len(parts) != 2 {
 		t.Fatalf("participants = %d, want 2 (absent user excluded)", len(parts))
+	}
+}
+
+// TestHandleCreateChatRejectsOversize pins both halves of the participant cap at
+// this layer: the boundary rejection of an oversize invite vector, which fires
+// before any id is resolved, and the store's ErrChatFull surfacing as
+// USERS_TOO_MUCH when a vector at the boundary still overflows once the creator
+// is counted. Neither path may write a chat row.
+func TestHandleCreateChatRejectsOversize(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292801")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+
+	// 201 ids, rejected on length alone: none of them needs to exist, because the
+	// boundary check runs before the users are resolved.
+	oversize := make([]int64, 0, 201)
+	for i := range 201 {
+		oversize = append(oversize, int64(i+1))
+	}
+	_, err = api.CreateChatForTest(s, creator.ID, &tg.MessagesCreateChatRequest{
+		Users: inputUsers(oversize...), Title: "Too big",
+	})
+	if msg := rpcMessage(t, err); msg != "USERS_TOO_MUCH" {
+		t.Fatalf("oversize vector: got %s, want USERS_TOO_MUCH", msg)
+	}
+	assertNoChats(t, s, creator.ID)
+
+	// Exactly 200 real invitees passes the boundary and overflows in the store,
+	// since the creator is the 201st participant.
+	full := make([]int64, 0, 200)
+	for i := range 200 {
+		u, err := s.CreateUser(ctx, fmt.Sprintf("+1555129%05d", i))
+		if err != nil {
+			t.Fatalf("member %d: %v", i, err)
+		}
+		full = append(full, u.ID)
+	}
+	_, err = api.CreateChatForTest(s, creator.ID, &tg.MessagesCreateChatRequest{
+		Users: inputUsers(full...), Title: "One too many",
+	})
+	if msg := rpcMessage(t, err); msg != "USERS_TOO_MUCH" {
+		t.Fatalf("store overflow: got %s, want USERS_TOO_MUCH", msg)
+	}
+	assertNoChats(t, s, creator.ID)
+	assertNoChats(t, s, full[0])
+}
+
+func assertNoChats(t *testing.T, s *store.Store, userID int64) {
+	t.Helper()
+	chats, err := s.ChatsForUser(context.Background(), userID)
+	if err != nil {
+		t.Fatalf("chats for user %d: %v", userID, err)
+	}
+	if len(chats) != 0 {
+		t.Fatalf("user %d gained chats %+v after a rejected create", userID, chats)
 	}
 }
 
@@ -299,6 +382,17 @@ func TestHandleEditChatTitleRenamesAndAnnounces(t *testing.T) {
 	}
 	chatID := createChatForTest(t, s, creator.ID, "Team", member.ID)
 
+	// The rename's caller is put one pts ahead of the other member first: with
+	// both sitting at the same pts, an assertion on the reply's Pts would pass
+	// even if it carried the wrong member's.
+	bystander, err := s.CreateUser(ctx, "+15551292403")
+	if err != nil {
+		t.Fatalf("bystander: %v", err)
+	}
+	if _, _, _, _, err = s.SendMessage(ctx, member.ID, bystander.ID, "warmup", 992); err != nil {
+		t.Fatalf("warmup send: %v", err)
+	}
+
 	before, _, err := s.ChatByID(ctx, chatID)
 	if err != nil {
 		t.Fatalf("chat before: %v", err)
@@ -333,16 +427,36 @@ func TestHandleEditChatTitleRenamesAndAnnounces(t *testing.T) {
 		t.Fatalf("stored title = %q, want Team 2", after.Title)
 	}
 
-	// Both members hold an edit-title service message, and neither reply leaks
-	// the other member's pts.
-	for _, uid := range []int64{creator.ID, member.ID} {
-		m, ok, err := s.MessageByOwnerLocal(ctx, uid, 2)
+	// The reply carries the caller's own pts and nobody else's: the caller is at
+	// 3 after the create, the warmup send and the rename; the other member at 2.
+	if len(ups.Updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(ups.Updates))
+	}
+	newMsg, ok := ups.Updates[0].(*tg.UpdateNewMessage)
+	if !ok {
+		t.Fatalf("update type = %T, want *tg.UpdateNewMessage", ups.Updates[0])
+	}
+	if newMsg.Pts != 3 || newMsg.PtsCount != 1 {
+		t.Fatalf("pts = %d count = %d, want the caller's own 3 and 1", newMsg.Pts, newMsg.PtsCount)
+	}
+
+	// Both members hold an edit-title service message: the creator's is their
+	// second local id, the caller's their third.
+	for uid, localID := range map[int64]int64{creator.ID: 2, member.ID: 3} {
+		m, ok, err := s.MessageByOwnerLocal(ctx, uid, localID)
 		if err != nil || !ok {
 			t.Fatalf("user %d rename copy: ok=%v err=%v", uid, ok, err)
 		}
 		if m.Action != store.ChatActionEditTitle || m.Text != "Team 2" {
 			t.Fatalf("user %d rename copy = %+v", uid, m)
 		}
+	}
+	st, err := s.State(ctx, creator.ID)
+	if err != nil {
+		t.Fatalf("creator state: %v", err)
+	}
+	if st.Pts != 2 {
+		t.Fatalf("creator pts = %d, want 2", st.Pts)
 	}
 }
 
