@@ -43,7 +43,7 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 			return nil, errInternal
 		}
 		if ok {
-			tlMsgs = append(tlMsgs, messageToTL(m))
+			tlMsgs = append(tlMsgs, messageToTL(m, nil))
 		}
 	}
 
