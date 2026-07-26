@@ -18,20 +18,6 @@ const (
 	maxHistoryLimit     = 100
 )
 
-// peerUserID resolves an input peer to a 1:1 user id, validating the M1
-// placeholder access hash (access_hash == user_id). Only user peers are in M4
-// scope; anything else is PEER_ID_INVALID.
-func peerUserID(peer tg.InputPeerClass) (int64, error) {
-	p, ok := peer.(*tg.InputPeerUser)
-	if !ok {
-		return 0, errPeerIDInvalid
-	}
-	if p.AccessHash != p.UserID || p.UserID == 0 {
-		return 0, errPeerIDInvalid
-	}
-	return p.UserID, nil
-}
-
 // notify emits the cross-replica update nudge for userID (best-effort).
 func (h *handlers) notify(ctx context.Context, userID int64) {
 	if err := h.store.Notify(ctx, store.ChannelUpdates, strconv.FormatInt(userID, 10)); err != nil {
@@ -96,7 +82,7 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
-			&tg.UpdateNewMessage{Message: messageToTL(sender), Pts: senderPts, PtsCount: 1},
+			&tg.UpdateNewMessage{Message: messageToTL(sender, nil), Pts: senderPts, PtsCount: 1},
 		},
 		Users: users,
 		Date:  int(sender.Date.Unix()),
@@ -132,7 +118,7 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	for i, m := range msgs {
-		tlMsgs[i] = messageToTL(m)
+		tlMsgs[i] = messageToTL(m, nil)
 	}
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
@@ -201,7 +187,7 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
-			&tg.UpdateEditMessage{Message: messageToTL(edited), Pts: newPts, PtsCount: 1},
+			&tg.UpdateEditMessage{Message: messageToTL(edited, nil), Pts: newPts, PtsCount: 1},
 		},
 		Users: users,
 		Date:  int(time.Now().Unix()),

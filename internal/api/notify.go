@@ -144,7 +144,7 @@ func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, b
 			//
 			// users covers the whole batch, so a conn taking a suffix gets a
 			// superset of the users it needs, which a client ignores.
-			if _, err := c.PushTo(ctx, userID, wrapUpdates(ups, b.users, b.state), b.state.Pts); err != nil {
+			if _, err := c.PushTo(ctx, userID, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts); err != nil {
 				u.log.Info("deliver push", "user_id", userID, "err", err)
 			}
 		}
@@ -195,10 +195,11 @@ func (u *Updater) Evict(_ context.Context, userID, authKeyID int64) {
 }
 
 // wrapUpdates envelopes hydrated updates into a tg.Updates for a live push.
-func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, state store.State) *tg.Updates {
+func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, chats []tg.ChatClass, state store.State) *tg.Updates {
 	return &tg.Updates{
 		Updates: ups,
 		Users:   users,
+		Chats:   chats,
 		Date:    state.Date,
 		Seq:     state.Seq,
 	}

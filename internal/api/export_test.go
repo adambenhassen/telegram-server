@@ -44,6 +44,32 @@ func GetStateForTest(s *store.Store, userID int64) (bin.Encoder, error) {
 // PeerUserID exposes the peer-resolution guard for the external api_test package.
 var PeerUserID = peerUserID
 
+// Peer-resolution and wire-mapping helpers, exposed for the external api_test
+// package. All four are pure and need no store.
+var (
+	InputPeer   = inputPeer
+	InputUserID = inputUserID
+	PeerToTL    = peerToTL
+	MessageToTL = messageToTL
+	ChatToTL    = chatToTL
+)
+
+// BuildUpdatesChatsForTest exposes the chat list a batch carries alongside its
+// updates, which BuildUpdatesForTest omits.
+func BuildUpdatesChatsForTest(s *store.Store, userID int64, fromPts int) ([]tg.UpdateClass, []tg.ChatClass, error) {
+	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts)
+	return b.ups, b.chats, err
+}
+
+// LoadChatsForTest exposes loadChats for the external api_test package.
+func LoadChatsForTest(s *store.Store, ids []int64, viewerID int64) ([]tg.ChatClass, error) {
+	set := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return testHandlers(s).loadChats(context.Background(), set, viewerID)
+}
+
 // LogOutForTest invokes handleLogOut for a request arriving on authKeyID,
 // handing back the evict announcement unrun so a test can assert whether it was
 // already published by the time the handler returned.
