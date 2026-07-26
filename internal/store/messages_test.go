@@ -161,7 +161,7 @@ func TestHistoryPaging(t *testing.T) {
 		send(t, s, a, b, txt, int64(1000+i))
 	}
 
-	all, err := s.History(ctx, a.ID, b.ID, 0, 10)
+	all, err := s.History(ctx, a.ID, store.PeerTypeUser, b.ID, 0, 10)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestHistoryPaging(t *testing.T) {
 		t.Fatalf("history not newest-first: %d..%d", all[0].LocalID, all[2].LocalID)
 	}
 
-	older, err := s.History(ctx, a.ID, b.ID, 2, 10) // strictly older than local_id 2
+	older, err := s.History(ctx, a.ID, store.PeerTypeUser, b.ID, 2, 10) // strictly older than local_id 2
 	if err != nil {
 		t.Fatalf("history page: %v", err)
 	}

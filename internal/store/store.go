@@ -31,6 +31,9 @@ var (
 	ErrResendTooSoon = errors.New("phone code resend too soon")
 	// ErrAuthKeyNotFound is returned when an auth-key operation matches no row.
 	ErrAuthKeyNotFound = errors.New("auth key not found")
+	// ErrChatFull is returned when a membership change would take a chat past
+	// maxChatParticipants.
+	ErrChatFull = errors.New("chat participants limit reached")
 )
 
 // Open connects to Postgres and verifies the schema is migrated. encKey is the
