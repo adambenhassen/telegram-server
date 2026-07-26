@@ -90,8 +90,8 @@ func (s *Store) SendChatMessage(ctx context.Context, f FanOut) (sender Message, 
 // Sender membership (the F4 exception), and why it is derived rather than a flag:
 // a plain text message is the only fan-out a client causes directly, and the
 // handler's membership check ran in a different transaction, so a removal can
-// commit between it and this write — the re-check under the locks is the actual
-// authorization boundary. A service message carries a non-zero Action, is
+// commit between it and this write — the re-check under the chats row lock is the
+// actual authorization boundary. A service message carries a non-zero Action, is
 // constructed by the server, and its caller has already taken this chat's row
 // lock and made its own authorization decision under it; checking those here as
 // well would reject the announcement of a self-removal, whose sender is
@@ -122,6 +122,16 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 		seen[p.UserID] = true
 		owners = append(owners, p.UserID)
 	}
+	// Sender membership, before Extra is merged in and before any advisory lock.
+	// Reading it off the member set rather than a second IsChatMember query keeps
+	// one read as the source of truth, and placing it here has two consequences
+	// that are the point rather than a side effect: Extra can never vouch for its
+	// own sender, and a non-member neither pays for nor serialises anyone behind
+	// up to 200 advisory locks before being turned away. The chats row lock, not
+	// the advisory locks, is what makes this read authoritative.
+	if f.Action == ChatActionNone && !seen[f.FromID] {
+		return Message{}, nil, false, ErrNotMember
+	}
 	for _, id := range f.Extra {
 		if id == 0 || seen[id] {
 			continue
@@ -141,15 +151,6 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 
 	if err = lockOwners(ctx, tx, owners...); err != nil {
 		return Message{}, nil, false, err
-	}
-	if f.Action == ChatActionNone {
-		var member bool
-		if member, err = qtx.IsChatMember(ctx, db.IsChatMemberParams{ChatID: f.ChatID, UserID: f.FromID}); err != nil {
-			return Message{}, nil, false, fmt.Errorf("sender membership: %w", err)
-		}
-		if !member {
-			return Message{}, nil, false, ErrNotMember
-		}
 	}
 
 	// Idempotency: a resend with the same random_id returns the original. The
