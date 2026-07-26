@@ -9,6 +9,21 @@ SELECT * FROM messages WHERE owner_id = $1 AND local_id = $2;
 -- name: MessageByRandomID :one
 SELECT * FROM messages WHERE owner_id = $1 AND random_id = $2 AND random_id <> 0;
 
+-- NextFanoutID allocates the id shared by every per-member copy of one chat
+-- message. One value per fan-out, never 0.
+-- name: NextFanoutID :one
+SELECT nextval('message_fanout_seq')::bigint AS fanout_id;
+
+-- MessagesByFanout returns every per-member copy of one chat message, ascending
+-- by owner_id so a caller can take its advisory locks in that order. The
+-- `fanout_id <> 0` predicate is not redundant with the equality: 0 is the "not a
+-- chat message" sentinel every 1:1 row carries, so a zero argument would select
+-- the entire table instead of nothing.
+-- name: MessagesByFanout :many
+SELECT * FROM messages
+WHERE fanout_id = $1 AND fanout_id <> 0
+ORDER BY owner_id;
+
 -- name: HistoryPage :many
 SELECT * FROM messages
 WHERE owner_id = sqlc.arg(owner_id) AND peer_type = sqlc.arg(peer_type) AND peer_id = sqlc.arg(peer_id)
