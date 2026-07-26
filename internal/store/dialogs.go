@@ -13,6 +13,7 @@ import (
 // Dialog is a per-owner conversation summary.
 type Dialog struct {
 	OwnerID         int64
+	PeerType        PeerType
 	PeerID          int64
 	TopMessage      int64
 	UnreadCount     int
@@ -30,6 +31,7 @@ func (s *Store) Dialogs(ctx context.Context, ownerID int64) ([]Dialog, error) {
 	for i, r := range rows {
 		out[i] = Dialog{
 			OwnerID:         r.OwnerID,
+			PeerType:        PeerType(r.PeerType),
 			PeerID:          r.PeerID,
 			TopMessage:      r.TopMessage,
 			UnreadCount:     int(r.UnreadCount),
@@ -58,7 +60,7 @@ func (s *Store) ReadHistory(ctx context.Context, ownerID, peerID, maxID int64) (
 		return 0, 0, err
 	}
 
-	inbox, err := qtx.AdvanceReadInbox(ctx, db.AdvanceReadInboxParams{MaxID: maxID, OwnerID: ownerID, PeerID: peerID})
+	inbox, err := qtx.AdvanceReadInbox(ctx, db.AdvanceReadInboxParams{MaxID: maxID, OwnerID: ownerID, PeerType: int16(PeerTypeUser), PeerID: peerID})
 	if errors.Is(err, pgx.ErrNoRows) {
 		// No dialog to read; leave state untouched.
 		rp, pp, e := currentPts(ctx, qtx, ownerID, peerID)
@@ -72,16 +74,18 @@ func (s *Store) ReadHistory(ctx context.Context, ownerID, peerID, maxID int64) (
 	}
 
 	// Translate the reader's maxID into the peer's outbox local-id space via the
-	// newest mirror at or below maxID, then advance the peer's outbox marker.
+	// newest mirror at or below maxID, then advance the peer's outbox marker. The
+	// peer_type predicate is what keeps the mirror lookup 1:1-only: chat rows share
+	// the peer_id namespace and only carry a meaningful peer_local_id in a 1:1 pair.
 	var peerMax int64
 	if err = tx.QueryRow(ctx,
 		`SELECT COALESCE(MAX(peer_local_id), 0) FROM messages
-		 WHERE owner_id = $1 AND peer_id = $2 AND local_id <= $3`,
-		ownerID, peerID, maxID,
+		 WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3 AND local_id <= $4`,
+		ownerID, int16(PeerTypeUser), peerID, maxID,
 	).Scan(&peerMax); err != nil {
 		return 0, 0, fmt.Errorf("peer max local: %w", err)
 	}
-	if _, err = qtx.AdvanceReadOutbox(ctx, db.AdvanceReadOutboxParams{OwnerID: peerID, PeerID: ownerID, ReadOutboxMaxID: peerMax}); err != nil {
+	if _, err = qtx.AdvanceReadOutbox(ctx, db.AdvanceReadOutboxParams{OwnerID: peerID, PeerType: int16(PeerTypeUser), PeerID: ownerID, ReadOutboxMaxID: peerMax}); err != nil {
 		return 0, 0, fmt.Errorf("advance read outbox: %w", err)
 	}
 

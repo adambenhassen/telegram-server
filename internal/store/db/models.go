@@ -17,6 +17,21 @@ type AuthKey struct {
 	PendingUserID *int64
 }
 
+type Chat struct {
+	ID        int64
+	Title     string
+	CreatorID int64
+	Version   int32
+	Date      pgtype.Timestamptz
+}
+
+type ChatParticipant struct {
+	ChatID    int64
+	UserID    int64
+	InviterID int64
+	Date      pgtype.Timestamptz
+}
+
 type Dialog struct {
 	OwnerID         int64
 	PeerID          int64
@@ -24,20 +39,25 @@ type Dialog struct {
 	UnreadCount     int32
 	ReadInboxMaxID  int64
 	ReadOutboxMaxID int64
+	PeerType        int16
 }
 
 type Message struct {
-	OwnerID     int64
-	LocalID     int64
-	PeerID      int64
-	FromID      int64
-	Date        pgtype.Timestamptz
-	Message     string
-	Out         bool
-	EditDate    pgtype.Timestamptz
-	Deleted     bool
-	RandomID    int64
-	PeerLocalID int64
+	OwnerID      int64
+	LocalID      int64
+	PeerID       int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	Out          bool
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	PeerLocalID  int64
+	PeerType     int16
+	FanoutID     int64
+	ActionType   int16
+	ActionUserID int64
 }
 
 type MessageEvent struct {
