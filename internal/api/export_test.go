@@ -82,7 +82,8 @@ func GetHistoryForTest(s *store.Store, userID int64, req *tg.MessagesGetHistoryR
 // GetDialogsForTest invokes handleGetDialogs for the caller.
 func GetDialogsForTest(s *store.Store, userID int64) (bin.Encoder, error) {
 	var buf bin.Buffer
-	if err := (&tg.MessagesGetDialogsRequest{}).Encode(&buf); err != nil {
+	req := &tg.MessagesGetDialogsRequest{OffsetPeer: &tg.InputPeerEmpty{}}
+	if err := req.Encode(&buf); err != nil {
 		return nil, err
 	}
 	return testHandlers(s).handleGetDialogs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
