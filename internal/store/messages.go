@@ -15,10 +15,20 @@ import (
 // does not own or that does not exist.
 var ErrMessageInvalid = errors.New("message id invalid")
 
+// PeerType discriminates the peer_id namespace. Chat ids and user ids come from
+// different sequences and can collide, so peer_id is meaningless without it.
+type PeerType int16
+
+const (
+	PeerTypeUser PeerType = 1
+	PeerTypeChat PeerType = 2
+)
+
 // Message is a persisted message row (one side of a two-sided pair).
 type Message struct {
 	OwnerID     int64
 	LocalID     int64
+	PeerType    PeerType
 	PeerID      int64
 	FromID      int64
 	Date        time.Time
@@ -34,6 +44,7 @@ func messageFromRow(r db.Message) Message {
 	m := Message{
 		OwnerID:     r.OwnerID,
 		LocalID:     r.LocalID,
+		PeerType:    PeerType(r.PeerType),
 		PeerID:      r.PeerID,
 		FromID:      r.FromID,
 		Date:        r.Date.Time,
@@ -113,14 +124,16 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 
 	// Sender outbox copy (dedup token lives here) + recipient inbox copy.
 	if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
-		OwnerID: fromID, LocalID: sb.LocalID, PeerID: toID, FromID: fromID,
+		OwnerID: fromID, LocalID: sb.LocalID, PeerType: int16(PeerTypeUser), PeerID: toID, FromID: fromID,
 		Message: text, Out: true, RandomID: randomID, PeerLocalID: rb.LocalID,
+		FanoutID: 0, ActionType: 0, ActionUserID: 0,
 	}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("insert sender message: %w", err)
 	}
 	if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
-		OwnerID: toID, LocalID: rb.LocalID, PeerID: fromID, FromID: fromID,
+		OwnerID: toID, LocalID: rb.LocalID, PeerType: int16(PeerTypeUser), PeerID: fromID, FromID: fromID,
 		Message: text, Out: false, RandomID: 0, PeerLocalID: sb.LocalID,
+		FanoutID: 0, ActionType: 0, ActionUserID: 0,
 	}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("insert recipient message: %w", err)
 	}
@@ -133,10 +146,10 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 	}
 
 	// Sender read their own message (unread +0); recipient gains one unread.
-	if err = qtx.UpsertDialog(ctx, db.UpsertDialogParams{OwnerID: fromID, PeerID: toID, TopMessage: sb.LocalID, UnreadCount: 0}); err != nil {
+	if err = qtx.UpsertDialog(ctx, db.UpsertDialogParams{OwnerID: fromID, PeerType: int16(PeerTypeUser), PeerID: toID, TopMessage: sb.LocalID, UnreadCount: 0}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("sender dialog: %w", err)
 	}
-	if err = qtx.UpsertDialog(ctx, db.UpsertDialogParams{OwnerID: toID, PeerID: fromID, TopMessage: rb.LocalID, UnreadCount: 1}); err != nil {
+	if err = qtx.UpsertDialog(ctx, db.UpsertDialogParams{OwnerID: toID, PeerType: int16(PeerTypeUser), PeerID: fromID, TopMessage: rb.LocalID, UnreadCount: 1}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("recipient dialog: %w", err)
 	}
 
@@ -155,6 +168,7 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 func (s *Store) History(ctx context.Context, ownerID, peerID int64, offsetID, limit int) ([]Message, error) {
 	rows, err := s.q.HistoryPage(ctx, db.HistoryPageParams{
 		OwnerID:  ownerID,
+		PeerType: int16(PeerTypeUser),
 		PeerID:   peerID,
 		OffsetID: int64(offsetID),
 		Lim:      int32(limit), //nolint:gosec // limit is a small validated page size

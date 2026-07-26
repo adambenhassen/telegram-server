@@ -14,18 +14,20 @@ UPDATE dialogs SET
   read_inbox_max_id = GREATEST(read_inbox_max_id, $1::bigint),
   unread_count = (
     SELECT count(*) FROM messages m
-    WHERE m.owner_id = dialogs.owner_id AND m.peer_id = dialogs.peer_id
+    WHERE m.owner_id = dialogs.owner_id AND m.peer_type = dialogs.peer_type AND m.peer_id = dialogs.peer_id
       AND m.out = false AND m.deleted = false
       AND m.local_id > GREATEST(dialogs.read_inbox_max_id, $1::bigint)
   )::int
-WHERE owner_id = $2::bigint AND peer_id = $3::bigint
+WHERE owner_id = $2::bigint AND peer_type = $3::smallint
+  AND peer_id = $4::bigint
 RETURNING read_inbox_max_id, unread_count
 `
 
 type AdvanceReadInboxParams struct {
-	MaxID   int64
-	OwnerID int64
-	PeerID  int64
+	MaxID    int64
+	OwnerID  int64
+	PeerType int16
+	PeerID   int64
 }
 
 type AdvanceReadInboxRow struct {
@@ -36,26 +38,37 @@ type AdvanceReadInboxRow struct {
 // AdvanceReadInbox raises the reader's read_inbox_max_id monotonically and
 // recomputes unread as the count of still-unread inbound messages above it.
 func (q *Queries) AdvanceReadInbox(ctx context.Context, arg AdvanceReadInboxParams) (AdvanceReadInboxRow, error) {
-	row := q.db.QueryRow(ctx, advanceReadInbox, arg.MaxID, arg.OwnerID, arg.PeerID)
+	row := q.db.QueryRow(ctx, advanceReadInbox,
+		arg.MaxID,
+		arg.OwnerID,
+		arg.PeerType,
+		arg.PeerID,
+	)
 	var i AdvanceReadInboxRow
 	err := row.Scan(&i.ReadInboxMaxID, &i.UnreadCount)
 	return i, err
 }
 
 const advanceReadOutbox = `-- name: AdvanceReadOutbox :execrows
-UPDATE dialogs SET read_outbox_max_id = GREATEST(read_outbox_max_id, $3)
-WHERE owner_id = $1 AND peer_id = $2
+UPDATE dialogs SET read_outbox_max_id = GREATEST(read_outbox_max_id, $4)
+WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3
 `
 
 type AdvanceReadOutboxParams struct {
 	OwnerID         int64
+	PeerType        int16
 	PeerID          int64
 	ReadOutboxMaxID int64
 }
 
 // AdvanceReadOutbox raises the peer's read_outbox_max_id monotonically.
 func (q *Queries) AdvanceReadOutbox(ctx context.Context, arg AdvanceReadOutboxParams) (int64, error) {
-	result, err := q.db.Exec(ctx, advanceReadOutbox, arg.OwnerID, arg.PeerID, arg.ReadOutboxMaxID)
+	result, err := q.db.Exec(ctx, advanceReadOutbox,
+		arg.OwnerID,
+		arg.PeerType,
+		arg.PeerID,
+		arg.ReadOutboxMaxID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -63,7 +76,7 @@ func (q *Queries) AdvanceReadOutbox(ctx context.Context, arg AdvanceReadOutboxPa
 }
 
 const dialogsForOwner = `-- name: DialogsForOwner :many
-SELECT owner_id, peer_id, top_message, unread_count, read_inbox_max_id, read_outbox_max_id FROM dialogs WHERE owner_id = $1 ORDER BY top_message DESC
+SELECT owner_id, peer_id, top_message, unread_count, read_inbox_max_id, read_outbox_max_id, peer_type FROM dialogs WHERE owner_id = $1 ORDER BY top_message DESC
 `
 
 func (q *Queries) DialogsForOwner(ctx context.Context, ownerID int64) ([]Dialog, error) {
@@ -82,6 +95,7 @@ func (q *Queries) DialogsForOwner(ctx context.Context, ownerID int64) ([]Dialog,
 			&i.UnreadCount,
 			&i.ReadInboxMaxID,
 			&i.ReadOutboxMaxID,
+			&i.PeerType,
 		); err != nil {
 			return nil, err
 		}
@@ -94,15 +108,16 @@ func (q *Queries) DialogsForOwner(ctx context.Context, ownerID int64) ([]Dialog,
 }
 
 const upsertDialog = `-- name: UpsertDialog :exec
-INSERT INTO dialogs (owner_id, peer_id, top_message, unread_count)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (owner_id, peer_id) DO UPDATE
+INSERT INTO dialogs (owner_id, peer_type, peer_id, top_message, unread_count)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (owner_id, peer_type, peer_id) DO UPDATE
   SET top_message  = EXCLUDED.top_message,
       unread_count = dialogs.unread_count + EXCLUDED.unread_count
 `
 
 type UpsertDialogParams struct {
 	OwnerID     int64
+	PeerType    int16
 	PeerID      int64
 	TopMessage  int64
 	UnreadCount int32
@@ -113,6 +128,7 @@ type UpsertDialogParams struct {
 func (q *Queries) UpsertDialog(ctx context.Context, arg UpsertDialogParams) error {
 	_, err := q.db.Exec(ctx, upsertDialog,
 		arg.OwnerID,
+		arg.PeerType,
 		arg.PeerID,
 		arg.TopMessage,
 		arg.UnreadCount,
