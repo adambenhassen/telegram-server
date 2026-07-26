@@ -32,9 +32,6 @@ type Chat struct {
 	CreatorID int64
 	Version   int
 	Date      time.Time
-	// Deactivated has no column yet; chats are never deactivated in M6, so it is
-	// always false. It exists for the tg.Chat mapping a later ticket adds.
-	Deactivated bool
 }
 
 // Participant is one member of a chat.
@@ -59,16 +56,24 @@ func chatFromRow(r db.Chat) Chat {
 // appearing in memberIDs are deduped rather than rejected. ErrChatFull if the
 // deduped member count exceeds maxChatParticipants; no rows are written then.
 func (s *Store) CreateChat(ctx context.Context, creatorID int64, title string, memberIDs []int64) (Chat, error) {
-	members := make([]int64, 0, len(memberIDs)+1)
-	seen := make(map[int64]bool, len(memberIDs)+1)
-	for _, id := range append([]int64{creatorID}, memberIDs...) {
-		if !seen[id] {
-			seen[id] = true
-			members = append(members, id)
+	// The cap bounds the allocation, not just the transaction: memberIDs arrives
+	// from a client vector and is only capped at the transport frame size, so
+	// neither the deduped set nor its index may be sized from it. The set only
+	// grows, so stopping at the first id past the cap decides ErrChatFull on the
+	// same condition the full scan would.
+	members := make([]int64, 0, maxChatParticipants+1)
+	seen := make(map[int64]bool, maxChatParticipants+1)
+	members = append(members, creatorID)
+	seen[creatorID] = true
+	for _, id := range memberIDs {
+		if seen[id] {
+			continue
 		}
-	}
-	if len(members) > maxChatParticipants {
-		return Chat{}, ErrChatFull
+		seen[id] = true
+		members = append(members, id)
+		if len(members) > maxChatParticipants {
+			return Chat{}, ErrChatFull
+		}
 	}
 
 	tx, err := s.pool.Begin(ctx)
