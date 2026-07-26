@@ -81,12 +81,21 @@ func (m *multiCodeSink) Handle(_ context.Context, r slog.Record) error {
 
 // --- client-side update collector ---
 
+// serviceMsgEnvelope carries a service message received via updateNewMessage.
+type serviceMsgEnvelope struct {
+	svc *tg.MessageService
+}
+
 type updateCollector struct {
 	newMsg     chan *tg.Message
 	editMsg    chan *tg.Message
 	delMsg     chan []int
 	readOutbox chan int
 	typing     chan int64
+	// serviceMsg collects *tg.MessageService from updateNewMessage.
+	serviceMsg chan serviceMsgEnvelope
+	// chatChats collects the Chats slice from *tg.Updates envelopes.
+	chatChats chan []tg.ChatClass
 }
 
 func newUpdateCollector() *updateCollector {
@@ -96,6 +105,8 @@ func newUpdateCollector() *updateCollector {
 		delMsg:     make(chan []int, 4),
 		readOutbox: make(chan int, 4),
 		typing:     make(chan int64, 4),
+		serviceMsg: make(chan serviceMsgEnvelope, 4),
+		chatChats:  make(chan []tg.ChatClass, 4),
 	}
 }
 
@@ -104,6 +115,9 @@ func (u *updateCollector) Handle(_ context.Context, upd tg.UpdatesClass) error {
 	case *tg.Updates:
 		for _, x := range t.Updates {
 			u.dispatch(x)
+		}
+		if len(t.Chats) > 0 {
+			send(u.chatChats, t.Chats)
 		}
 	case *tg.UpdateShort:
 		u.dispatch(t.Update)
@@ -114,8 +128,11 @@ func (u *updateCollector) Handle(_ context.Context, upd tg.UpdatesClass) error {
 func (u *updateCollector) dispatch(x tg.UpdateClass) {
 	switch up := x.(type) {
 	case *tg.UpdateNewMessage:
-		if m, ok := up.Message.(*tg.Message); ok {
+		switch m := up.Message.(type) {
+		case *tg.Message:
 			send(u.newMsg, m)
+		case *tg.MessageService:
+			send(u.serviceMsg, serviceMsgEnvelope{svc: m})
 		}
 	case *tg.UpdateEditMessage:
 		if m, ok := up.Message.(*tg.Message); ok {
