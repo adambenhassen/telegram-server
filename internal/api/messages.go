@@ -192,38 +192,72 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("get history", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	if peerType == store.PeerTypeChat {
+		return h.chatHistory(r, toID, msgs)
+	}
+
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	for i, m := range msgs {
 		tlMsgs[i] = messageToTL(m, nil)
 	}
-
-	if peerType == store.PeerTypeChat {
-		// A chat page has as many authors as it has members, so the user list is
-		// collected from the page itself; twoUsers is a 1:1 helper and would omit
-		// every author but the caller.
-		authors := map[int64]bool{r.UserID: true}
-		for _, m := range msgs {
-			authors[m.FromID] = true
-		}
-		users, uerr := h.loadUsers(r.Ctx, authors, r.UserID)
-		if uerr != nil {
-			h.log.Error("get history users", "err", uerr)
-			return nil, errInternal
-		}
-		chats, cerr := h.loadChats(r.Ctx, map[int64]bool{toID: true}, r.UserID)
-		if cerr != nil {
-			h.log.Error("get history chats", "err", cerr)
-			return nil, errInternal
-		}
-		return &tg.MessagesMessages{Messages: tlMsgs, Users: users, Chats: chats}, nil
-	}
-
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("get history users", "err", err)
 		return nil, errInternal
 	}
 	return &tg.MessagesMessages{Messages: tlMsgs, Users: users}, nil
+}
+
+// chatHistory renders one page of a chat's history for the caller, who
+// requireMember has already established is a member.
+func (h *handlers) chatHistory(r *mtproto.Request, chatID int64, msgs []store.Message) (bin.Encoder, error) {
+	// A page has as many authors as the chat has members, and a service row names
+	// further users in its action, so the user list is collected from the page
+	// itself; twoUsers is a 1:1 helper and would omit every author but the caller.
+	// createUsers is the chat's current member set, which the caller is entitled
+	// to see here — unlike getDifference, no removed viewer reaches this path.
+	var createUsers []int64
+	for _, m := range msgs {
+		if m.Action == store.ChatActionCreate {
+			parts, perr := h.store.Participants(r.Ctx, chatID)
+			if perr != nil {
+				h.log.Error("get history participants", "chat_id", chatID, "err", perr)
+				return nil, errInternal
+			}
+			createUsers = make([]int64, len(parts))
+			for i, p := range parts {
+				createUsers[i] = p.UserID
+			}
+			break
+		}
+	}
+
+	tlMsgs := make([]tg.MessageClass, len(msgs))
+	authors := map[int64]bool{r.UserID: true}
+	for i, m := range msgs {
+		tlMsgs[i] = messageToTL(m, createUsers)
+		authors[m.FromID] = true
+		switch m.Action {
+		case store.ChatActionAddUser, store.ChatActionDeleteUser:
+			authors[m.ActionUserID] = true
+		case store.ChatActionCreate:
+			for _, id := range createUsers {
+				authors[id] = true
+			}
+		}
+	}
+
+	users, err := h.loadUsers(r.Ctx, authors, r.UserID)
+	if err != nil {
+		h.log.Error("get history users", "err", err)
+		return nil, errInternal
+	}
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("get history chats", "err", err)
+		return nil, errInternal
+	}
+	return &tg.MessagesMessages{Messages: tlMsgs, Users: users, Chats: chats}, nil
 }
 
 // handleReadHistory serves messages.readHistory: advances read state on both

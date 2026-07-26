@@ -370,7 +370,9 @@ func TestHandleGetDialogsMixesUsersAndChats(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("dm: %v", err)
 	}
-	if _, err = api.SendMessageForTest(s, users[1].ID, &tg.MessagesSendMessageRequest{
+	// The group's last message is from the other member, so the caller can only
+	// render it if Users carries the top message's author.
+	if _, err = api.SendMessageForTest(s, users[0].ID, &tg.MessagesSendMessageRequest{
 		Peer: &tg.InputPeerChat{ChatID: chat.ID}, Message: "group", RandomID: 2,
 	}); err != nil {
 		t.Fatalf("chat send: %v", err)
@@ -405,6 +407,68 @@ func TestHandleGetDialogsMixesUsersAndChats(t *testing.T) {
 	c, isChat := res.Chats[0].(*tg.Chat)
 	if !isChat || c.Title != "Crew" {
 		t.Fatalf("chat entry = %#v, want live chat titled Crew", res.Chats[0])
+	}
+	got := make(map[int64]bool, len(res.Users))
+	for _, u := range res.Users {
+		got[u.GetID()] = true
+	}
+	for _, id := range []int64{users[0].ID, users[1].ID, other.ID} {
+		if !got[id] {
+			t.Errorf("user list missing %d", id)
+		}
+	}
+}
+
+// A service row names user ids in its action, and a client renders them as
+// unknown users unless the enclosing Users covers them.
+func TestHandleGetHistoryOnChatListsServiceActionUsers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	users, chat := chatWith(t, s, "+15551292071", "+15551292072")
+	joiner, err := s.CreateUser(ctx, "+15551292073")
+	if err != nil {
+		t.Fatalf("joiner: %v", err)
+	}
+	if _, _, _, err = s.AddChatUser(ctx, chat.ID, joiner.ID, users[0].ID); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, _, _, err = s.RemoveChatUser(ctx, chat.ID, joiner.ID, users[0].ID); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	enc, err := api.GetHistoryForTest(s, users[1].ID, &tg.MessagesGetHistoryRequest{
+		Peer: &tg.InputPeerChat{ChatID: chat.ID},
+	})
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesMessages", enc)
+	}
+	var sawAdd, sawDelete bool
+	for _, m := range res.Messages {
+		svc, isSvc := m.(*tg.MessageService)
+		if !isSvc {
+			continue
+		}
+		switch a := svc.Action.(type) {
+		case *tg.MessageActionChatAddUser:
+			sawAdd = len(a.Users) == 1 && a.Users[0] == joiner.ID
+		case *tg.MessageActionChatDeleteUser:
+			sawDelete = a.UserID == joiner.ID
+		}
+	}
+	if !sawAdd || !sawDelete {
+		t.Fatalf("service rows: add=%v delete=%v", sawAdd, sawDelete)
+	}
+	got := make(map[int64]bool, len(res.Users))
+	for _, u := range res.Users {
+		got[u.GetID()] = true
+	}
+	if !got[joiner.ID] {
+		t.Errorf("user list missing action subject %d", joiner.ID)
 	}
 }
 

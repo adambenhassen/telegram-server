@@ -50,6 +50,9 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 		}
 		if ok {
 			tlMsgs = append(tlMsgs, messageToTL(m, nil))
+			// The author is the peer in a 1:1 but any member in a group, so it is
+			// taken off the message rather than off the dialog's peer id.
+			peerIDs[m.FromID] = true
 		}
 	}
 
