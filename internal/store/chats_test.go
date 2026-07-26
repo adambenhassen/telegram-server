@@ -22,6 +22,363 @@ func participantIDs(t *testing.T, s *store.Store, chatID int64) []int64 {
 	return ids
 }
 
+func chatVersion(t *testing.T, s *store.Store, chatID int64) int {
+	t.Helper()
+	c, ok, err := s.ChatByID(context.Background(), chatID)
+	if err != nil || !ok {
+		t.Fatalf("chat %d: ok=%v err=%v", chatID, ok, err)
+	}
+	return c.Version
+}
+
+// assertService checks one owner's copy of a service message: same fan-out, the
+// expected action, and the subject it names.
+func assertService(t *testing.T, s *store.Store, ownerID, localID int64, fanoutID int64, action store.ChatAction, subject int64) {
+	t.Helper()
+	m, ok := msgOpt(t, s, ownerID, localID)
+	if !ok {
+		t.Fatalf("owner %d got no service message copy", ownerID)
+	}
+	if m.Action != action || m.ActionUserID != subject {
+		t.Errorf("owner %d copy = action %d subject %d, want %d/%d", ownerID, m.Action, m.ActionUserID, action, subject)
+	}
+	if m.FanoutID != fanoutID {
+		t.Errorf("owner %d fanout_id = %d, want shared %d", ownerID, m.FanoutID, fanoutID)
+	}
+}
+
+func TestAddChatUserAnnouncesToEveryMemberIncludingTheNewOne(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551271001")
+	b := mustUser(t, s, "+15551271002")
+	c := mustUser(t, s, "+15551271003")
+	chat := chatWith(t, s, a, b)
+
+	added, sender, perOwner, err := s.AddChatUser(ctx, chat.ID, c.ID, a.ID)
+	if err != nil || !added {
+		t.Fatalf("add: added=%v err=%v", added, err)
+	}
+	if len(perOwner) != 3 {
+		t.Fatalf("perOwner = %+v, want 3 entries", perOwner)
+	}
+	if got := participantIDs(t, s, chat.ID); len(got) != 3 {
+		t.Fatalf("participants = %v, want 3", got)
+	}
+	if v := chatVersion(t, s, chat.ID); v != chat.Version+1 {
+		t.Errorf("version = %d, want %d", v, chat.Version+1)
+	}
+	if sender.Action != store.ChatActionAddUser || sender.ActionUserID != c.ID {
+		t.Fatalf("sender copy = %+v, want AddUser on %d", sender, c.ID)
+	}
+	for _, u := range []store.User{a, b, c} {
+		if perOwner[u.ID] != 1 {
+			t.Errorf("owner %d pts = %d, want 1", u.ID, perOwner[u.ID])
+		}
+		if got := ptsOf(t, s, u.ID); got != 1 {
+			t.Errorf("owner %d stored pts = %d, want 1", u.ID, got)
+		}
+		assertService(t, s, u.ID, 1, sender.FanoutID, store.ChatActionAddUser, c.ID)
+	}
+	// The new member's own copy is what puts the chat in their dialog list.
+	if d := dialogOf(t, s, c.ID, chat.ID); d.TopMessage != 1 {
+		t.Errorf("new member dialog top = %d, want 1", d.TopMessage)
+	}
+}
+
+func TestAddChatUserAlreadyMemberChangesNothing(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551271011")
+	b := mustUser(t, s, "+15551271012")
+	chat := chatWith(t, s, a, b)
+
+	added, _, perOwner, err := s.AddChatUser(ctx, chat.ID, b.ID, a.ID)
+	if err != nil {
+		t.Fatalf("re-add: %v", err)
+	}
+	if added || perOwner != nil {
+		t.Fatalf("re-add: added=%v perOwner=%+v, want false/nil", added, perOwner)
+	}
+	if got := participantIDs(t, s, chat.ID); len(got) != 2 {
+		t.Errorf("participants = %v, want 2", got)
+	}
+	if v := chatVersion(t, s, chat.ID); v != chat.Version {
+		t.Errorf("version = %d, want unchanged %d", v, chat.Version)
+	}
+	for _, u := range []store.User{a, b} {
+		if got := ptsOf(t, s, u.ID); got != 0 {
+			t.Errorf("owner %d pts = %d, want 0", u.ID, got)
+		}
+		if ev := eventsOf(t, s, u.ID, 0); len(ev) != 0 {
+			t.Errorf("owner %d events = %+v, want none", u.ID, ev)
+		}
+	}
+}
+
+func TestAddChatUserAtCapRejectsAndWritesNothing(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551272000")
+	members := make([]int64, 0, 199)
+	for i := range 199 {
+		members = append(members, mustUser(t, s, fmt.Sprintf("+1555129%05d", i)).ID)
+	}
+	chat, err := s.CreateChat(ctx, a.ID, "Full", members)
+	if err != nil {
+		t.Fatalf("create full chat: %v", err)
+	}
+	outsider := mustUser(t, s, "+15551272999")
+
+	if _, _, _, err := s.AddChatUser(ctx, chat.ID, outsider.ID, a.ID); !errors.Is(err, store.ErrChatFull) {
+		t.Fatalf("add at cap: want ErrChatFull, got %v", err)
+	}
+	if got := participantIDs(t, s, chat.ID); len(got) != 200 {
+		t.Fatalf("participants = %d, want unchanged 200", len(got))
+	}
+	if v := chatVersion(t, s, chat.ID); v != chat.Version {
+		t.Errorf("version = %d, want unchanged %d", v, chat.Version)
+	}
+	if got := ptsOf(t, s, a.ID); got != 0 {
+		t.Errorf("caller pts = %d, want 0", got)
+	}
+}
+
+func TestRemoveChatUserAnnouncesToTheRemovedUser(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551273001")
+	b := mustUser(t, s, "+15551273002")
+	c := mustUser(t, s, "+15551273003")
+	chat := chatWith(t, s, a, b, c)
+
+	// c speaks before being removed: their existing copies must survive intact.
+	sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: c.ID, Text: "bye", RandomID: 5})
+
+	removed, sender, perOwner, err := s.RemoveChatUser(ctx, chat.ID, c.ID, a.ID)
+	if err != nil || !removed {
+		t.Fatalf("remove: removed=%v err=%v", removed, err)
+	}
+	if len(perOwner) != 3 {
+		t.Fatalf("perOwner = %+v, want the two remaining members and the removed user", perOwner)
+	}
+	got := participantIDs(t, s, chat.ID)
+	if len(got) != 2 {
+		t.Fatalf("participants = %v, want 2", got)
+	}
+	for _, id := range got {
+		if id == c.ID {
+			t.Fatalf("removed user still a participant: %v", got)
+		}
+	}
+	if v := chatVersion(t, s, chat.ID); v != chat.Version+1 {
+		t.Errorf("version = %d, want %d", v, chat.Version+1)
+	}
+	for _, u := range []store.User{a, b, c} {
+		if perOwner[u.ID] != 2 {
+			t.Errorf("owner %d pts = %d, want 2", u.ID, perOwner[u.ID])
+		}
+		assertService(t, s, u.ID, 2, sender.FanoutID, store.ChatActionDeleteUser, c.ID)
+	}
+	// The removed user's earlier message is untouched, not deleted.
+	m, ok := msgOpt(t, s, c.ID, 1)
+	if !ok || m.Deleted || m.Text != "bye" {
+		t.Fatalf("removed user's earlier row = ok:%v %+v", ok, m)
+	}
+}
+
+func TestRemoveChatUserNotAMemberChangesNothing(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551273011")
+	b := mustUser(t, s, "+15551273012")
+	outsider := mustUser(t, s, "+15551273013")
+	chat := chatWith(t, s, a, b)
+
+	removed, _, perOwner, err := s.RemoveChatUser(ctx, chat.ID, outsider.ID, a.ID)
+	if err != nil {
+		t.Fatalf("remove non-member: %v", err)
+	}
+	if removed || perOwner != nil {
+		t.Fatalf("remove non-member: removed=%v perOwner=%+v, want false/nil", removed, perOwner)
+	}
+	if got := participantIDs(t, s, chat.ID); len(got) != 2 {
+		t.Errorf("participants = %v, want 2", got)
+	}
+	if v := chatVersion(t, s, chat.ID); v != chat.Version {
+		t.Errorf("version = %d, want unchanged %d", v, chat.Version)
+	}
+	for _, u := range []store.User{a, b, outsider} {
+		if got := ptsOf(t, s, u.ID); got != 0 {
+			t.Errorf("owner %d pts = %d, want 0", u.ID, got)
+		}
+	}
+}
+
+// TestRemoveChatUserSelfLeave is the F4 exception: the announcement's sender is
+// no longer a member by the time the fan-out runs, and it must still be written.
+func TestRemoveChatUserSelfLeave(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551273021")
+	b := mustUser(t, s, "+15551273022")
+	chat := chatWith(t, s, a, b)
+
+	removed, sender, perOwner, err := s.RemoveChatUser(ctx, chat.ID, a.ID, a.ID)
+	if err != nil || !removed {
+		t.Fatalf("self-removal: removed=%v err=%v", removed, err)
+	}
+	if got := participantIDs(t, s, chat.ID); len(got) != 1 || got[0] != b.ID {
+		t.Fatalf("participants = %v, want only %d", got, b.ID)
+	}
+	if len(perOwner) != 2 {
+		t.Fatalf("perOwner = %+v, want the remaining member and the leaver", perOwner)
+	}
+	if sender.OwnerID != a.ID || !sender.Out {
+		t.Fatalf("leaver got no own copy: %+v", sender)
+	}
+	for _, u := range []store.User{a, b} {
+		assertService(t, s, u.ID, 1, sender.FanoutID, store.ChatActionDeleteUser, a.ID)
+	}
+}
+
+func TestSetChatTitleAnnouncesToEveryMember(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551274001")
+	b := mustUser(t, s, "+15551274002")
+	chat := chatWith(t, s, a, b)
+
+	got, sender, perOwner, err := s.SetChatTitle(ctx, chat.ID, a.ID, "Renamed")
+	if err != nil {
+		t.Fatalf("set title: %v", err)
+	}
+	if got.Title != "Renamed" || got.Version != chat.Version+1 {
+		t.Fatalf("chat = %+v, want title Renamed at version %d", got, chat.Version+1)
+	}
+	if sender.Text != "Renamed" || sender.Action != store.ChatActionEditTitle {
+		t.Fatalf("sender copy = %+v, want an EditTitle carrying the new title", sender)
+	}
+	for _, u := range []store.User{a, b} {
+		if perOwner[u.ID] != 1 {
+			t.Errorf("owner %d pts = %d, want 1", u.ID, perOwner[u.ID])
+		}
+		assertService(t, s, u.ID, 1, sender.FanoutID, store.ChatActionEditTitle, 0)
+	}
+	stored, ok, err := s.ChatByID(ctx, chat.ID)
+	if err != nil || !ok || stored.Title != "Renamed" {
+		t.Fatalf("stored chat = %+v ok=%v err=%v", stored, ok, err)
+	}
+}
+
+// TestChatMutationsRejectNonMemberCaller is F4: the in-transaction caller check
+// under the chats row lock. It is the only membership check these three get,
+// because fanOut skips the sender check for a non-zero Action.
+func TestChatMutationsRejectNonMemberCaller(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551275001")
+	b := mustUser(t, s, "+15551275002")
+	outsider := mustUser(t, s, "+15551275003")
+	target := mustUser(t, s, "+15551275004")
+	chat := chatWith(t, s, a, b)
+
+	if _, _, _, err := s.AddChatUser(ctx, chat.ID, target.ID, outsider.ID); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("add by non-member: want ErrNotMember, got %v", err)
+	}
+	if _, _, _, err := s.RemoveChatUser(ctx, chat.ID, b.ID, outsider.ID); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("remove by non-member: want ErrNotMember, got %v", err)
+	}
+	if _, _, _, err := s.SetChatTitle(ctx, chat.ID, outsider.ID, "Hijacked"); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("rename by non-member: want ErrNotMember, got %v", err)
+	}
+
+	// An unknown chat id reports the same error as a chat the caller is not in,
+	// so the pair stays indistinguishable to a prober walking the id space.
+	if _, _, _, err := s.SetChatTitle(ctx, chat.ID+10_000, a.ID, "Ghost"); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("unknown chat: want ErrNotMember, got %v", err)
+	}
+
+	if got := participantIDs(t, s, chat.ID); len(got) != 2 {
+		t.Errorf("participants = %v, want unchanged 2", got)
+	}
+	c, _, err := s.ChatByID(ctx, chat.ID)
+	if err != nil {
+		t.Fatalf("chat by id: %v", err)
+	}
+	if c.Version != chat.Version || c.Title != chat.Title {
+		t.Errorf("chat = %+v, want unchanged %+v", c, chat)
+	}
+	for _, u := range []store.User{a, b, outsider, target} {
+		if got := ptsOf(t, s, u.ID); got != 0 {
+			t.Errorf("owner %d pts = %d, want 0", u.ID, got)
+		}
+		if ev := eventsOf(t, s, u.ID, 0); len(ev) != 0 {
+			t.Errorf("owner %d events = %+v, want none", u.ID, ev)
+		}
+	}
+}
+
+// TestChatMutationsCommitMembershipWithTheirAnnouncement is F5. The failure it
+// guards against is a membership change committing without its service message:
+// an add whose fan-out is lost leaves a member no client ever saw join, and a
+// remove whose fan-out is lost leaves the removed client showing the chat
+// forever.
+//
+// The fan-out failure cannot be injected from a test without adding a seam to
+// production code: every error fanOut can raise on this path is either
+// unreachable (the participant cap is rejected earlier, under the same lock) or
+// blocked by a foreign key that the participant write hits first. So atomicity is
+// asserted the other way — after a successful call both halves are present, and
+// after a rejected one neither is — and structurally, by there being no commit
+// between the mutation and the fan-out in either method.
+func TestChatMutationsCommitMembershipWithTheirAnnouncement(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551276001")
+	b := mustUser(t, s, "+15551276002")
+	chat := chatWith(t, s, a, b)
+
+	// Add: membership and the announcement land together.
+	_, addSender, _, err := s.AddChatUser(ctx, chat.ID, mustUser(t, s, "+15551276003").ID, a.ID)
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	added := participantIDs(t, s, chat.ID)
+	if len(added) != 3 {
+		t.Fatalf("participants = %v, want 3", added)
+	}
+	for _, id := range added {
+		assertService(t, s, id, 1, addSender.FanoutID, store.ChatActionAddUser, addSender.ActionUserID)
+	}
+
+	// Remove: the same, plus the removed user's own copy.
+	_, rmSender, rmPerOwner, err := s.RemoveChatUser(ctx, chat.ID, b.ID, a.ID)
+	if err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, ok := rmPerOwner[b.ID]; !ok {
+		t.Fatalf("removed user missing from perOwner %+v", rmPerOwner)
+	}
+	for id := range rmPerOwner {
+		assertService(t, s, id, 2, rmSender.FanoutID, store.ChatActionDeleteUser, b.ID)
+	}
+	for _, id := range participantIDs(t, s, chat.ID) {
+		if id == b.ID {
+			t.Fatal("removal committed its announcement but not its membership change")
+		}
+	}
+}
+
 func TestCreateChatDedupesMembers(t *testing.T) {
 	t.Parallel()
 	s := open(t)

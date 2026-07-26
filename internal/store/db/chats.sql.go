@@ -9,6 +9,23 @@ import (
 	"context"
 )
 
+const bumpChatVersion = `-- name: BumpChatVersion :one
+UPDATE chats SET version = version + 1 WHERE id = $1 RETURNING id, title, creator_id, version, date
+`
+
+func (q *Queries) BumpChatVersion(ctx context.Context, id int64) (Chat, error) {
+	row := q.db.QueryRow(ctx, bumpChatVersion, id)
+	var i Chat
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.CreatorID,
+		&i.Version,
+		&i.Date,
+	)
+	return i, err
+}
+
 const chatByID = `-- name: ChatByID :one
 SELECT id, title, creator_id, version, date FROM chats WHERE id = $1
 `
@@ -111,6 +128,25 @@ func (q *Queries) ChatsForUser(ctx context.Context, userID int64) ([]Chat, error
 	return items, nil
 }
 
+const deleteChatParticipant = `-- name: DeleteChatParticipant :execrows
+DELETE FROM chat_participants WHERE chat_id = $1 AND user_id = $2
+`
+
+type DeleteChatParticipantParams struct {
+	ChatID int64
+	UserID int64
+}
+
+// DeleteChatParticipant is called from exactly one place: removeParticipant in
+// chats.go, which also takes the removed user's advisory lock. See its comment.
+func (q *Queries) DeleteChatParticipant(ctx context.Context, arg DeleteChatParticipantParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteChatParticipant, arg.ChatID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const insertChat = `-- name: InsertChat :one
 INSERT INTO chats (title, creator_id) VALUES ($1, $2)
 RETURNING id, title, creator_id, version, date
@@ -149,6 +185,27 @@ func (q *Queries) InsertChatParticipant(ctx context.Context, arg InsertChatParti
 	return err
 }
 
+const insertChatParticipantIfAbsent = `-- name: InsertChatParticipantIfAbsent :execrows
+INSERT INTO chat_participants (chat_id, user_id, inviter_id) VALUES ($1, $2, $3)
+ON CONFLICT (chat_id, user_id) DO NOTHING
+`
+
+type InsertChatParticipantIfAbsentParams struct {
+	ChatID    int64
+	UserID    int64
+	InviterID int64
+}
+
+// InsertChatParticipantIfAbsent reports 0 rows when the user is already a member,
+// which is what makes a repeated add a no-op instead of an error.
+func (q *Queries) InsertChatParticipantIfAbsent(ctx context.Context, arg InsertChatParticipantIfAbsentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertChatParticipantIfAbsent, arg.ChatID, arg.UserID, arg.InviterID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const isChatMember = `-- name: IsChatMember :one
 SELECT EXISTS(SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2)
 `
@@ -163,4 +220,26 @@ func (q *Queries) IsChatMember(ctx context.Context, arg IsChatMemberParams) (boo
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const setChatTitle = `-- name: SetChatTitle :one
+UPDATE chats SET title = $2, version = version + 1 WHERE id = $1 RETURNING id, title, creator_id, version, date
+`
+
+type SetChatTitleParams struct {
+	ID    int64
+	Title string
+}
+
+func (q *Queries) SetChatTitle(ctx context.Context, arg SetChatTitleParams) (Chat, error) {
+	row := q.db.QueryRow(ctx, setChatTitle, arg.ID, arg.Title)
+	var i Chat
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.CreatorID,
+		&i.Version,
+		&i.Date,
+	)
+	return i, err
 }
