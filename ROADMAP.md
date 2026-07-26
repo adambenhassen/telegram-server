@@ -60,7 +60,8 @@ Users & help
 Messaging
 - `messages.sendMessage`, `messages.getDialogs`, `messages.getHistory`,
   `messages.readHistory`, `messages.editMessage`, `messages.deleteMessages`,
-  `messages.setTyping`
+  `messages.setTyping`, `messages.createChat`, `messages.addChatUser`,
+  `messages.deleteChatUser`, `messages.editChatTitle`
 
 Updates
 - `updates.getState`, `updates.getDifference`
@@ -119,6 +120,34 @@ Updates
 - E2E gates prove live send/read/edit/delete/typing between two gotd clients,
   offline `getDifference` backfill, and cross-process delivery over `LISTEN`/`NOTIFY`.
 
+### M6 — basic group chats
+- `chat` as a peer type; a `peer_type` discriminator column separates 1:1 and
+  group rows throughout `messages`, `dialogs`, and `message_events`.
+- Membership tables track current members; the member set is the authorization
+  boundary — an unknown chat and a non-member chat return the same
+  `PEER_ID_INVALID`.
+- Four RPCs: `messages.createChat`, `messages.addChatUser`,
+  `messages.deleteChatUser`, `messages.editChatTitle`.
+- Fan-out: a send to a chat writes one message row, one event, and one `pts`
+  bump per member in a single transaction under sorted advisory locks, all
+  sharing one `fanout_id`. Edit and delete walk the `fanout_id` copy set; only
+  the author may delete, and service messages cannot be deleted.
+- Service messages for chat create, member add, member remove, and title change;
+  written in the same mutation transaction.
+- 200-member cap enforced at create and add time; bounds the advisory-lock set
+  and the write volume per transaction.
+- **Design bet confirmed.** The per-owner `pts`/event-log model and
+  `LISTEN`/`NOTIFY` delivery carried the first real fan-out unchanged — no
+  per-chat `pts` stream, no broker, no change to the `buildUpdates` path.
+  Offline `updates.getDifference` and real-time push use the same event log for
+  chat messages as for 1:1.
+- A removed member's dialog returns `ChatForbidden`; their message rows and `pts`
+  are retained but `getHistory` is gated on current membership.
+- Known gaps carried forward: no admin model (`ChatAdminRights` not stored or
+  enforced — any member may add or remove anyone including the creator;
+  `revoke_history`, `fwd_limit`, chat photos, and invite links unimplemented);
+  MAIN-52 and MAIN-53 still in flight.
+
 ## Planned — feature track
 
 ### M5 — Media & files
@@ -126,13 +155,6 @@ Updates
 - Photo/document messages, thumbnails, `messages.sendMedia`.
 - Blob store abstraction: local filesystem first, RustFS (S3-compatible) later.
 - Reference-counted storage; file `access_hash` and expiry.
-
-### M6 — Group chats (basic)
-- `chat` as a peer type; membership tables.
-- `messages.createChat`, `addChatUser`, `deleteChatUser`, `editChatTitle`.
-- Fan-out: a send writes N per-member rows reusing the two-sided/event-log model;
-  member set drives the recipient list.
-- Service messages (member added/removed, title changed).
 
 ### M7 — Channels & supergroups
 - Broadcast channels and megagroups; the channel `pts` stream.
@@ -164,7 +186,13 @@ Runs in parallel with features; currently the weakest area for production.
 - **Observability.** Structured logs exist; add metrics (connections, pts lag,
   push latency, NOTIFY throughput) and tracing.
 - **Rate limiting & abuse.** Per-account/per-IP limits beyond the login-code
-  cooldown; flood-wait on messaging RPCs.
+  cooldown; flood-wait on messaging RPCs, `messages.createChat`, and
+  `messages.addChatUser`. The 200-member cap bounds one transaction but is not a
+  rate control: one account can create a 200-member chat and send in a loop,
+  each send holding up to 200 advisory locks and serialising against 200
+  uninvolved accounts' 1:1 sends. Additionally, `messages.getDialogs` does not
+  paginate the chat list, so an account in many chats makes each dialog call
+  expensive independently — a cost input for sizing the flood-wait limit.
 - **Backups & retention.** Postgres backup story; `message_events` retention.
 
 ## Known deferrals & tech debt
@@ -183,6 +211,12 @@ Tracked so shortcuts don't rot into "later means never".
   (single-writer invariant), not an explicit resync response. — M4.
 - **`seq` on update envelopes.** Minimal; gotd relies on `pts` for dedup, so `seq`
   is not yet a meaningful per-user counter. — M4.
+- **Chat admin rights.** Any member may add or remove any member, including the
+  chat's creator. `ChatAdminRights` is not stored or enforced; `revoke_history`,
+  `fwd_limit`, chat photos, and invite links are not implemented. — M6
+- **Removed-member history access.** A removed member's dialog returns
+  `ChatForbidden`; their retained message rows and `pts` are reachable only
+  through `updates.getDifference` replay, not through `messages.getHistory`. — M6
 
 ## Engineering invariants
 
