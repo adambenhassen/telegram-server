@@ -219,4 +219,25 @@ func TestCreateChatRejectsOversizeAndWritesNothing(t *testing.T) {
 			t.Fatalf("user %d gained chats %+v after a rejected create", id, cs)
 		}
 	}
+	// ChatsForUser joins chat_participants, so it cannot see an orphan chats row.
+	// This database is cloned per test and starts empty, so no id may resolve.
+	for id := int64(1); id <= 10; id++ {
+		c, ok, err := s.ChatByID(ctx, id)
+		if err != nil {
+			t.Fatalf("chat by id %d: %v", id, err)
+		}
+		if ok {
+			t.Fatalf("rejected create left chat row %+v", c)
+		}
+	}
+
+	// The cap itself is inclusive: creator + 199 members is exactly 200 and must
+	// succeed. Runs after the emptiness assertions so it cannot mask them.
+	c, err := s.CreateChat(ctx, a.ID, "Exactly full", members[:199])
+	if err != nil {
+		t.Fatalf("create chat at the 200 limit: %v", err)
+	}
+	if got := participantIDs(t, s, c.ID); len(got) != 200 {
+		t.Fatalf("participants at the limit = %d, want 200", len(got))
+	}
 }
