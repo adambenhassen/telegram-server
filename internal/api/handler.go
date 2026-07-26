@@ -92,7 +92,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesEditMessageRequestTypeID, h.handleEditMessage)
 	register(d, tg.MessagesDeleteMessagesRequestTypeID, h.handleDeleteMessages)
 	register(d, tg.MessagesSetTypingRequestTypeID, h.handleSetTyping)
-register(d, tg.MessagesCreateChatRequestTypeID, h.handleCreateChat)
+	register(d, tg.MessagesCreateChatRequestTypeID, h.handleCreateChat)
 	register(d, tg.MessagesEditChatTitleRequestTypeID, h.handleEditChatTitle)
 	register(d, tg.MessagesAddChatUserRequestTypeID, h.handleAddChatUser)
 	register(d, tg.MessagesDeleteChatUserRequestTypeID, h.handleDeleteChatUser)
