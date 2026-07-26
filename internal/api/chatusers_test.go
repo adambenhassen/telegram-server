@@ -118,6 +118,72 @@ func TestChatUserUnknownChatIsPeerIDInvalid(t *testing.T) {
 	wantRPC(t, err, "PEER_ID_INVALID")
 }
 
+// A target id no users row backs must be rejected before the store sees it:
+// without the check the add fails the chat_participants FK as an INTERNAL and the
+// removal quietly reports success.
+func TestChatUserUnknownTargetIsPeerIDInvalid(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a := chatUser(t, s, 81)
+	b := chatUser(t, s, 82)
+	chat, err := s.CreateChat(ctx, a.ID, "Ghost target", []int64{b.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	const unused = 8_888_888
+
+	_, err = api.AddChatUserForTest(s, a.ID, &tg.MessagesAddChatUserRequest{
+		ChatID: chat.ID,
+		UserID: &tg.InputUser{UserID: unused, AccessHash: unused},
+	})
+	wantRPC(t, err, "PEER_ID_INVALID")
+
+	_, err = api.DeleteChatUserForTest(s, a.ID, &tg.MessagesDeleteChatUserRequest{
+		ChatID: chat.ID,
+		UserID: &tg.InputUser{UserID: unused, AccessHash: unused},
+	})
+	wantRPC(t, err, "PEER_ID_INVALID")
+
+	if got := apiParticipants(t, s, chat.ID); len(got) != 2 {
+		t.Errorf("participants = %v, want unchanged 2", got)
+	}
+	if got := apiPts(t, s, a.ID); got != 0 {
+		t.Errorf("caller pts = %d, want 0", got)
+	}
+}
+
+// A full chat reports USERS_TOO_MUCH, not the generic INTERNAL a dropped
+// ErrChatFull mapping would produce.
+func TestAddChatUserAtCapIsUsersTooMuch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a := chatUser(t, s, 91)
+	members := make([]int64, 0, 199)
+	for i := range 199 {
+		u, err := s.CreateUser(ctx, fmt.Sprintf("+1555133%04d", i))
+		if err != nil {
+			t.Fatalf("member %d: %v", i, err)
+		}
+		members = append(members, u.ID)
+	}
+	chat, err := s.CreateChat(ctx, a.ID, "Full", members)
+	if err != nil {
+		t.Fatalf("create full chat: %v", err)
+	}
+	outsider := chatUser(t, s, 92)
+
+	_, err = api.AddChatUserForTest(s, a.ID, &tg.MessagesAddChatUserRequest{
+		ChatID: chat.ID,
+		UserID: &tg.InputUser{UserID: outsider.ID, AccessHash: outsider.ID},
+	})
+	wantRPC(t, err, "USERS_TOO_MUCH")
+	if got := apiParticipants(t, s, chat.ID); len(got) != 200 {
+		t.Errorf("participants = %d, want unchanged 200", len(got))
+	}
+}
+
 func TestAddChatUserAlreadyMemberReturnsEmptyUpdates(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -368,7 +434,7 @@ func TestDeleteChatUserSelfLeaves(t *testing.T) {
 // metadata (F6).
 func TestRemovedUserGetDialogsSeesChatForbidden(t *testing.T) {
 	t.Parallel()
-	t.Skip("handleGetDialogs hydrates Chats only once MAIN-45 wires loadChats into dialogs.go")
+	t.Skip("MAIN-51: unskip once MAIN-45 wires loadChats into dialogs.go, which today hydrates no Chats")
 
 	ctx := context.Background()
 	s := openStore(t)
