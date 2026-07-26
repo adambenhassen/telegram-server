@@ -104,6 +104,25 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 		return Message{}, nil, false, ErrMessageInvalid
 	}
 
+	// Early reject, ahead of the chats row lock, for the one fan-out a client
+	// causes directly. A non-member that takes that lock holds it to commit, which
+	// serialises the members' own writes behind an outsider and makes the wait a
+	// timing oracle for the chat existence the uniform error hides. Gated on
+	// Action exactly as the authoritative check below is, so a service message —
+	// whose sender may deliberately no longer be a member — never reaches it. It
+	// reads outside the row lock and therefore decides nothing: it turns away a
+	// caller who was never a member, and the member-set read under the lock
+	// remains the authorization boundary.
+	if f.Action == ChatActionNone {
+		member, e := qtx.IsChatMember(ctx, db.IsChatMemberParams{ChatID: f.ChatID, UserID: f.FromID})
+		if e != nil {
+			return Message{}, nil, false, fmt.Errorf("is chat member: %w", e)
+		}
+		if !member {
+			return Message{}, nil, false, ErrNotMember
+		}
+	}
+
 	// An absent chat and a chat the sender is not in report the same error: the
 	// pair is what keeps chat ids unprobeable over a dense id space.
 	if _, err = qtx.ChatByIDForUpdate(ctx, f.ChatID); errors.Is(err, pgx.ErrNoRows) {
@@ -128,7 +147,9 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 	// that are the point rather than a side effect: Extra can never vouch for its
 	// own sender, and a non-member neither pays for nor serialises anyone behind
 	// up to 200 advisory locks before being turned away. The chats row lock, not
-	// the advisory locks, is what makes this read authoritative.
+	// the advisory locks, is what makes this read authoritative — which is why the
+	// early reject above is a filter ahead of that lock and not a move of this
+	// check out from under it.
 	if f.Action == ChatActionNone && !seen[f.FromID] {
 		return Message{}, nil, false, ErrNotMember
 	}
