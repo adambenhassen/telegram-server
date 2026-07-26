@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -287,7 +288,7 @@ func TestBuildUpdatesChatMessage(t *testing.T) {
 		t.Fatalf("send chat message: %v", err)
 	}
 
-	ups, chats, err := api.BuildUpdatesChatsForTest(s, users[1].ID, 0)
+	ups, _, chats, err := api.BuildUpdatesChatsForTest(s, users[1].ID, 0)
 	if err != nil {
 		t.Fatalf("build updates: %v", err)
 	}
@@ -314,7 +315,7 @@ func TestBuildUpdatesChatMessage(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("send add-user service message: %v", err)
 	}
-	svcUps, _, err := api.BuildUpdatesChatsForTest(s, users[1].ID, 1)
+	svcUps, svcUsers, _, err := api.BuildUpdatesChatsForTest(s, users[1].ID, 1)
 	if err != nil {
 		t.Fatalf("build updates service: %v", err)
 	}
@@ -332,6 +333,11 @@ func TestBuildUpdatesChatMessage(t *testing.T) {
 	au, ok := ms.Action.(*tg.MessageActionChatAddUser)
 	if !ok || len(au.Users) != 1 || au.Users[0] != users[2].ID {
 		t.Fatalf("action = %+v, want MessageActionChatAddUser [%d]", ms.Action, users[2].ID)
+	}
+	// The added user is named by the action, so the batch must carry them: a
+	// client with only the sender renders the add as an unknown user.
+	if !hasUser(svcUsers, users[2].ID) {
+		t.Fatalf("batch users = %v, want the added user %d", userIDs(svcUsers), users[2].ID)
 	}
 
 	if len(chats) != 1 {
@@ -394,9 +400,9 @@ func TestBuildUpdatesCreateActionHidesMembersFromNonMember(t *testing.T) {
 		t.Fatalf("send create service message: %v", err)
 	}
 
-	createUsers := func(viewerID int64) []int64 {
+	createUsers := func(viewerID int64) (action []int64, batch []int64) {
 		t.Helper()
-		ups, _, err := api.BuildUpdatesChatsForTest(s, viewerID, 0)
+		ups, batchUsers, _, err := api.BuildUpdatesChatsForTest(s, viewerID, 0)
 		if err != nil {
 			t.Fatalf("build updates for %d: %v", viewerID, err)
 		}
@@ -415,13 +421,41 @@ func TestBuildUpdatesCreateActionHidesMembersFromNonMember(t *testing.T) {
 		if !ok {
 			t.Fatalf("action = %T, want *tg.MessageActionChatCreate", ms.Action)
 		}
-		return cr.Users
+		return cr.Users, userIDs(batchUsers)
 	}
 
-	if got := createUsers(users[1].ID); len(got) != 2 {
+	got, batch := createUsers(users[1].ID)
+	if len(got) != 2 {
 		t.Fatalf("member sees users %v, want both participants", got)
 	}
-	if got := createUsers(users[2].ID); len(got) != 0 {
+	// The action names them, so the batch must resolve them.
+	for _, id := range got {
+		if !slices.Contains(batch, id) {
+			t.Fatalf("batch users %v miss participant %d named by the action", batch, id)
+		}
+	}
+	got, batch = createUsers(users[2].ID)
+	if len(got) != 0 {
 		t.Fatalf("non-member sees users %v, want none", got)
 	}
+	// Nor may a participant reach them through the batch's user list. The sender
+	// is named by from_id and is not what the gate withholds; the other member is.
+	if slices.Contains(batch, users[1].ID) {
+		t.Fatalf("non-member batch users %v disclose participant %d", batch, users[1].ID)
+	}
+}
+
+// userIDs lists the ids of a batch's hydrated users.
+func userIDs(us []tg.UserClass) []int64 {
+	out := make([]int64, 0, len(us))
+	for _, uc := range us {
+		if u, ok := uc.(*tg.User); ok {
+			out = append(out, u.ID)
+		}
+	}
+	return out
+}
+
+func hasUser(us []tg.UserClass, id int64) bool {
+	return slices.Contains(userIDs(us), id)
 }

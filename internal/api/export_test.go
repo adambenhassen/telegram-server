@@ -54,11 +54,11 @@ var (
 	ChatToTL    = chatToTL
 )
 
-// BuildUpdatesChatsForTest exposes the chat list a batch carries alongside its
-// updates, which BuildUpdatesForTest omits.
-func BuildUpdatesChatsForTest(s *store.Store, userID int64, fromPts int) ([]tg.UpdateClass, []tg.ChatClass, error) {
+// BuildUpdatesChatsForTest exposes the user and chat lists a batch carries
+// alongside its updates, which BuildUpdatesForTest partly omits.
+func BuildUpdatesChatsForTest(s *store.Store, userID int64, fromPts int) ([]tg.UpdateClass, []tg.UserClass, []tg.ChatClass, error) {
 	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts)
-	return b.ups, b.chats, err
+	return b.ups, b.users, b.chats, err
 }
 
 // LoadChatsForTest exposes loadChats for the external api_test package.

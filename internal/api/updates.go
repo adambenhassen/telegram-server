@@ -235,6 +235,16 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 			// a client rendering a group needs itself in the user list.
 			chatRefs = []int64{m.PeerID}
 			refs = append(refs, userID)
+			// A service message names user ids in its action; without them in the
+			// enclosing Users a client renders the add, the removal or the create
+			// as unknown users. createUsers is already F6-gated and stays nil for
+			// a non-member, so appending it discloses nothing new.
+			switch m.Action {
+			case store.ChatActionAddUser, store.ChatActionDeleteUser:
+				refs = append(refs, m.ActionUserID)
+			case store.ChatActionCreate:
+				refs = append(refs, createUsers...)
+			}
 		} else {
 			refs = append(refs, m.PeerID)
 		}
