@@ -413,12 +413,24 @@ func TestDeleteChatUserSelfLeaves(t *testing.T) {
 		t.Fatalf("create chat: %v", err)
 	}
 
-	if _, err = api.DeleteChatUserForTest(s, b.ID, &tg.MessagesDeleteChatUserRequest{
+	enc, err := api.DeleteChatUserForTest(s, b.ID, &tg.MessagesDeleteChatUserRequest{
 		ChatID: chat.ID,
 		UserID: &tg.InputUserSelf{},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("self leave: %v", err)
 	}
+	ups, ok := enc.(*tg.Updates)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.Updates", enc)
+	}
+	if len(ups.Chats) != 1 {
+		t.Fatalf("chats = %+v, want one", ups.Chats)
+	}
+	if _, ok := ups.Chats[0].(*tg.ChatForbidden); !ok {
+		t.Fatalf("chats[0] = %T, want *tg.ChatForbidden", ups.Chats[0])
+	}
+
 	if got := apiParticipants(t, s, chat.ID); len(got) != 1 || got[0] != a.ID {
 		t.Fatalf("participants = %v, want just %d", got, a.ID)
 	}
@@ -429,12 +441,31 @@ func TestDeleteChatUserSelfLeaves(t *testing.T) {
 	}
 }
 
+func TestAddChatUserUnauthorized(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	_, err := api.AddChatUserForTest(s, 0, &tg.MessagesAddChatUserRequest{
+		ChatID: 1,
+		UserID: &tg.InputUser{UserID: 1, AccessHash: 1},
+	})
+	wantRPC(t, err, "AUTH_KEY_UNREGISTERED")
+}
+
+func TestDeleteChatUserUnauthorized(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	_, err := api.DeleteChatUserForTest(s, 0, &tg.MessagesDeleteChatUserRequest{
+		ChatID: 1,
+		UserID: &tg.InputUser{UserID: 1, AccessHash: 1},
+	})
+	wantRPC(t, err, "AUTH_KEY_UNREGISTERED")
+}
+
 // A removed member still holds their dialog row, so getDialogs keeps listing the
 // chat — and must describe it as tg.ChatForbidden rather than serving live
 // metadata (F6).
 func TestRemovedUserGetDialogsSeesChatForbidden(t *testing.T) {
 	t.Parallel()
-	t.Skip("MAIN-51: unskip once MAIN-45 wires loadChats into dialogs.go, which today hydrates no Chats")
 
 	ctx := context.Background()
 	s := openStore(t)
