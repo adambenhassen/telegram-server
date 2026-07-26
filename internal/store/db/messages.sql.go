@@ -171,6 +171,66 @@ func (q *Queries) MessageByRandomID(ctx context.Context, arg MessageByRandomIDPa
 	return i, err
 }
 
+const messagesByFanout = `-- name: MessagesByFanout :many
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id FROM messages
+WHERE fanout_id = $1 AND fanout_id <> 0
+ORDER BY owner_id
+`
+
+// MessagesByFanout returns every per-member copy of one chat message, ascending
+// by owner_id so a caller can take its advisory locks in that order. The
+// `fanout_id <> 0` predicate is not redundant with the equality: 0 is the "not a
+// chat message" sentinel every 1:1 row carries, so a zero argument would select
+// the entire table instead of nothing.
+func (q *Queries) MessagesByFanout(ctx context.Context, fanoutID int64) ([]Message, error) {
+	rows, err := q.db.Query(ctx, messagesByFanout, fanoutID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Message
+	for rows.Next() {
+		var i Message
+		if err := rows.Scan(
+			&i.OwnerID,
+			&i.LocalID,
+			&i.PeerID,
+			&i.FromID,
+			&i.Date,
+			&i.Message,
+			&i.Out,
+			&i.EditDate,
+			&i.Deleted,
+			&i.RandomID,
+			&i.PeerLocalID,
+			&i.PeerType,
+			&i.FanoutID,
+			&i.ActionType,
+			&i.ActionUserID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const nextFanoutID = `-- name: NextFanoutID :one
+SELECT nextval('message_fanout_seq')::bigint AS fanout_id
+`
+
+// NextFanoutID allocates the id shared by every per-member copy of one chat
+// message. One value per fan-out, never 0.
+func (q *Queries) NextFanoutID(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, nextFanoutID)
+	var fanout_id int64
+	err := row.Scan(&fanout_id)
+	return fanout_id, err
+}
+
 const setDeleted = `-- name: SetDeleted :exec
 UPDATE messages SET deleted = true WHERE owner_id = $1 AND local_id = $2
 `
