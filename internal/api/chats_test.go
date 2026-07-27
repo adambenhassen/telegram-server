@@ -49,9 +49,11 @@ func TestChatTitleValidation(t *testing.T) {
 	t.Parallel()
 
 	for name, in := range map[string]string{
-		"empty":      "",
-		"whitespace": "   \t\n ",
-		"too long":   strings.Repeat("a", 256),
+		"empty":        "",
+		"whitespace":   "   \t\n ",
+		"too long":     strings.Repeat("a", 256),
+		"nul byte":     "a\x00b",
+		"invalid utf8": "a\xffb",
 	} {
 		if _, err := api.ChatTitle(in); err == nil {
 			t.Errorf("%s: expected CHAT_TITLE_EMPTY, got nil", name)
@@ -67,6 +69,9 @@ func TestChatTitleValidation(t *testing.T) {
 	if _, err := api.ChatTitle(strings.Repeat("a", 255)); err != nil {
 		t.Fatalf("255 chars rejected: %v", err)
 	}
+	if got, err := api.ChatTitle(" Привет 👋 "); err != nil || got != "Привет 👋" {
+		t.Fatalf("multi-byte title: got %q err=%v", got, err)
+	}
 }
 
 func TestHandleCreateChatRejectsBadTitle(t *testing.T) {
@@ -79,9 +84,11 @@ func TestHandleCreateChatRejectsBadTitle(t *testing.T) {
 	}
 
 	for name, title := range map[string]string{
-		"empty":      "",
-		"whitespace": "   ",
-		"too long":   strings.Repeat("a", 256),
+		"empty":        "",
+		"whitespace":   "   ",
+		"too long":     strings.Repeat("a", 256),
+		"nul byte":     "a\x00b",
+		"invalid utf8": "\xff",
 	} {
 		_, err := api.CreateChatForTest(s, a.ID, &tg.MessagesCreateChatRequest{Title: title})
 		if msg := rpcMessage(t, err); msg != "CHAT_TITLE_EMPTY" {
@@ -486,11 +493,21 @@ func TestHandleEditChatTitleRejectsBadTitle(t *testing.T) {
 		t.Fatalf("creator: %v", err)
 	}
 	chatID := createChatForTest(t, s, creator.ID, "Team")
+	before, _, err := s.ChatByID(ctx, chatID)
+	if err != nil {
+		t.Fatalf("chat before: %v", err)
+	}
+	beforeMsgs, err := s.History(ctx, creator.ID, store.PeerTypeChat, chatID, 0, 100)
+	if err != nil {
+		t.Fatalf("history before: %v", err)
+	}
 
 	for name, title := range map[string]string{
-		"empty":      "",
-		"whitespace": "  ",
-		"too long":   strings.Repeat("a", 256),
+		"empty":        "",
+		"whitespace":   "  ",
+		"too long":     strings.Repeat("a", 256),
+		"nul byte":     "a\x00b",
+		"invalid utf8": "\xff",
 	} {
 		_, err := api.EditChatTitleForTest(s, creator.ID, &tg.MessagesEditChatTitleRequest{
 			ChatID: chatID, Title: title,
@@ -505,6 +522,16 @@ func TestHandleEditChatTitleRejectsBadTitle(t *testing.T) {
 	}
 	if c.Title != "Team" {
 		t.Fatalf("title = %q, want Team", c.Title)
+	}
+	if c.Version != before.Version {
+		t.Fatalf("version = %d, want unchanged %d", c.Version, before.Version)
+	}
+	afterMsgs, err := s.History(ctx, creator.ID, store.PeerTypeChat, chatID, 0, 100)
+	if err != nil {
+		t.Fatalf("history after: %v", err)
+	}
+	if len(afterMsgs) != len(beforeMsgs) {
+		t.Fatalf("messages = %d, want unchanged %d", len(afterMsgs), len(beforeMsgs))
 	}
 }
 

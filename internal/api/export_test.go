@@ -140,3 +140,12 @@ func SendMessageForTest(s *store.Store, userID int64, req *tg.MessagesSendMessag
 	}
 	return testHandlers(s).handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
+
+// EditMessageForTest encodes req and invokes handleEditMessage for the caller.
+func EditMessageForTest(s *store.Store, userID int64, req *tg.MessagesEditMessageRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleEditMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
