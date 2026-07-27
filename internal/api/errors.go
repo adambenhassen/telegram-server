@@ -40,6 +40,9 @@ var (
 	// errChatTitleInvalid rejects an empty, whitespace-only or over-length chat
 	// title on createChat and editChatTitle.
 	errChatTitleInvalid = rpcErr(400, "CHAT_TITLE_EMPTY")
+	// errMessageEmpty rejects message text the server cannot store — a NUL byte or
+	// an invalid UTF-8 sequence.
+	errMessageEmpty = rpcErr(400, "MESSAGE_EMPTY")
 	// errUsersTooMuch rejects a chat that would exceed the participant limit.
 	errUsersTooMuch = rpcErr(400, "USERS_TOO_MUCH")
 )

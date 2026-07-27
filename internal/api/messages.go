@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -48,6 +50,13 @@ func (h *handlers) twoUsers(ctx context.Context, selfID, peerID int64) ([]tg.Use
 	return h.loadUsers(ctx, map[int64]bool{selfID: true, peerID: true}, selfID)
 }
 
+// validText rejects client text Postgres cannot store: a NUL byte or an invalid
+// UTF-8 sequence. Both reach the driver intact and fail the INSERT, turning a
+// client bug into a 500 and a log line.
+func validText(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
+}
+
 // handleSendMessage serves messages.sendMessage: it persists both sides, nudges
 // both users' sessions, and returns the sender-side Updates (updateMessageID +
 // updateNewMessage).
@@ -58,6 +67,10 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
+	}
+	// Before the peer split, so the chat fan-out is guarded by the same check.
+	if !validText(req.Message) {
+		return nil, errMessageEmpty
 	}
 	peerType, toID, err := inputPeer(req.Peer)
 	if err != nil {
@@ -294,6 +307,9 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
+	}
+	if !validText(req.Message) {
+		return nil, errMessageEmpty
 	}
 
 	peerID, newPts, err := h.store.EditMessage(r.Ctx, r.UserID, int64(req.ID), req.Message)
