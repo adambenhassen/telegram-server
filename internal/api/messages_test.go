@@ -702,12 +702,11 @@ func TestHandleGetDialogsOnCreateRowListsParticipants(t *testing.T) {
 	}
 }
 
-// A viewer removed from a chat still gets their dialog row, but the create-row
-// action should render with an empty user list (F6 gate). Without the fix,
-// either the Participants query never runs and Users is empty (correct), or the
-// Participants query runs and leaks members (incorrect). This test verifies the
-// correct path: ChatForbidden chat, empty action users, and no Participants call.
-func TestHandleGetDialogsRemovedViewerOnCreateRow(t *testing.T) {
+// A viewer removed from a chat still gets their dialog row, and RemoveChatUser
+// fans the announcement to the removed user, so their top message is the
+// delete-user row naming them. Without the fix ActionUserID never enters the
+// user list. The chat itself stays degraded to tg.ChatForbidden.
+func TestHandleGetDialogsRemovedViewerSeesDeleteRow(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openStore(t)
@@ -739,8 +738,7 @@ func TestHandleGetDialogsRemovedViewerOnCreateRow(t *testing.T) {
 	if len(res.Dialogs) != 1 {
 		t.Errorf("dialogs = %d, want 1", len(res.Dialogs))
 	}
-	// Top message is the create action, but action users should be empty
-	// for a non-member.
+	// Top message is the delete-user announcement naming the removed viewer.
 	if len(res.Messages) != 1 {
 		t.Fatalf("messages = %d, want 1", len(res.Messages))
 	}
@@ -748,12 +746,19 @@ func TestHandleGetDialogsRemovedViewerOnCreateRow(t *testing.T) {
 	if !ok {
 		t.Fatalf("top message type = %T, want *tg.MessageService", res.Messages[0])
 	}
-	createAction, ok := svc.Action.(*tg.MessageActionChatCreate)
+	del, ok := svc.Action.(*tg.MessageActionChatDeleteUser)
 	if !ok {
-		t.Fatalf("action type = %T, want *tg.MessageActionChatCreate", svc.Action)
+		t.Fatalf("action type = %T, want *tg.MessageActionChatDeleteUser", svc.Action)
 	}
-	if len(createAction.Users) != 0 {
-		t.Errorf("create action users = %d, want 0 for removed viewer", len(createAction.Users))
+	if del.UserID != users[1].ID {
+		t.Errorf("action user = %d, want %d", del.UserID, users[1].ID)
+	}
+	got := make(map[int64]bool, len(res.Users))
+	for _, u := range res.Users {
+		got[u.GetID()] = true
+	}
+	if !got[users[1].ID] {
+		t.Errorf("user list missing removed viewer %d", users[1].ID)
 	}
 }
 
