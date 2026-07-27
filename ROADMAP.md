@@ -143,6 +143,10 @@ Updates
   chat messages as for 1:1.
 - A removed member's dialog returns `ChatForbidden`; their message rows and `pts`
   are retained but `getHistory` is gated on current membership.
+- E2E gates prove the chat lifecycle live between real gotd clients — create,
+  send, title change, member add and remove, and a removed member going inert —
+  plus offline `getDifference` backfill of chat messages and service messages,
+  and cross-replica delivery over `LISTEN`/`NOTIFY`.
 
 ## Planned — feature track
 
