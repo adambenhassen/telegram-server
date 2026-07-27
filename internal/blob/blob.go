@@ -22,6 +22,8 @@ type Store interface {
 	Put(ctx context.Context, key string, r io.Reader) (int64, error)
 	// ReadAt returns at most limit bytes of key starting at offset. A window
 	// running past the end of the blob yields a short slice and a nil error.
+	// A negative offset or limit is an error: the window comes from the
+	// client and is not trusted.
 	ReadAt(ctx context.Context, key string, offset, limit int64) ([]byte, error)
 }
 
@@ -87,7 +89,16 @@ func (l *Local) Put(_ context.Context, key string, r io.Reader) (int64, error) {
 // download asks for a fixed-size window and the last window of a blob is
 // short, so io.EOF alongside a partial read returns those bytes with a nil
 // error. Any other error is wrapped and returned.
+//
+// The window is client-supplied, so it is validated here rather than trusted:
+// a negative offset or limit is rejected, and the buffer is sized against the
+// blob rather than against limit, so a huge limit over a small blob cannot
+// turn into a huge allocation.
 func (l *Local) ReadAt(_ context.Context, key string, offset, limit int64) ([]byte, error) {
+	if offset < 0 || limit < 0 {
+		return nil, fmt.Errorf("blob read: negative window offset=%d limit=%d", offset, limit)
+	}
+
 	f, err := l.root.Open(key)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
@@ -96,6 +107,14 @@ func (l *Local) ReadAt(_ context.Context, key string, offset, limit int64) ([]by
 		return nil, fmt.Errorf("blob open: %w", err)
 	}
 	defer func() { _ = f.Close() }() //nolint:errcheck // read-only close
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("blob stat: %w", err)
+	}
+	if rest := max(fi.Size()-offset, 0); rest < limit {
+		limit = rest
+	}
 
 	buf := make([]byte, limit)
 	n, err := f.ReadAt(buf, offset)

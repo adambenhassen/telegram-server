@@ -107,6 +107,42 @@ func TestPutReadAt(t *testing.T) {
 	})
 }
 
+func TestReadAtHostileWindow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	l, _ := newLocal(t)
+	key := blob.Key(4242)
+	if _, err := l.Put(ctx, key, strings.NewReader(payload)); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	for name, w := range map[string]struct{ offset, limit int64 }{
+		"negative limit":  {0, -1},
+		"negative offset": {-1, 5},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := l.ReadAt(ctx, key, w.offset, w.limit); err == nil {
+				t.Fatal("accepted an out-of-range window")
+			}
+		})
+	}
+
+	t.Run("limit past end of blob", func(t *testing.T) {
+		t.Parallel()
+		got, err := l.ReadAt(ctx, key, 0, 1<<31)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if string(got) != payload {
+			t.Fatalf("read %q, want %q", got, payload)
+		}
+		if cap(got) > len(payload) {
+			t.Fatalf("allocated %d bytes for a %d-byte blob", cap(got), len(payload))
+		}
+	})
+}
+
 func TestReadAtMissingKey(t *testing.T) {
 	t.Parallel()
 	l, _ := newLocal(t)
