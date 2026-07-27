@@ -593,6 +593,257 @@ func TestHandleGetDialogsHidesChatAfterRemoval(t *testing.T) {
 	}
 }
 
+// When the top message of a chat dialog is an add-user service row, the user
+// named by action_user_id must appear in the Users list so the client can
+// render the participant instead of an unknown placeholder. Without the fix,
+// Users only contains the author and the viewer.
+func TestHandleGetDialogsListsAddUserActionSubject(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	users, chat := chatWith(t, s, "+15551292081", "+15551292082")
+	joiner, err := s.CreateUser(ctx, "+15551292083")
+	if err != nil {
+		t.Fatalf("joiner: %v", err)
+	}
+	if _, _, _, err = s.AddChatUser(ctx, chat.ID, joiner.ID, users[0].ID); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	enc, err := api.GetDialogsForTest(s, users[1].ID)
+	if err != nil {
+		t.Fatalf("dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesDialogs", enc)
+	}
+	got := make(map[int64]bool, len(res.Users))
+	for _, u := range res.Users {
+		got[u.GetID()] = true
+	}
+	for _, id := range []int64{users[0].ID, users[1].ID, joiner.ID} {
+		if !got[id] {
+			t.Errorf("user list missing %d", id)
+		}
+	}
+}
+
+// When the top message of a chat dialog is a delete-user service row, the
+// removed user must appear in the Users list. Without the fix, the removed
+// user is absent and the client renders an unknown placeholder.
+func TestHandleGetDialogsListsDeleteUserActionSubject(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	users, chat := chatWith(t, s, "+15551292091", "+15551292092", "+15551292093")
+	if _, _, _, err := s.RemoveChatUser(ctx, chat.ID, users[2].ID, users[0].ID); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	enc, err := api.GetDialogsForTest(s, users[1].ID)
+	if err != nil {
+		t.Fatalf("dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesDialogs", enc)
+	}
+	got := make(map[int64]bool, len(res.Users))
+	for _, u := range res.Users {
+		got[u.GetID()] = true
+	}
+	for _, id := range []int64{users[0].ID, users[1].ID, users[2].ID} {
+		if !got[id] {
+			t.Errorf("user list missing %d", id)
+		}
+	}
+}
+
+// When the only message in a chat is the create row, the top message on the
+// dialog must carry the participant ids, and every participant must appear in
+// Users. Without the fix, the action renders with an empty user list.
+func TestHandleGetDialogsOnCreateRowListsParticipants(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	users, chat := chatWith(t, s, "+15551292101", "+15551292102", "+15551292103")
+	// CreateChat writes no message; handleCreateChat announces the create row,
+	// and that fan-out is what gives each member a dialog.
+	if _, _, _, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: chat.ID, FromID: users[0].ID, Text: "Crew", Action: store.ChatActionCreate,
+	}); err != nil {
+		t.Fatalf("create row: %v", err)
+	}
+
+	enc, err := api.GetDialogsForTest(s, users[1].ID)
+	if err != nil {
+		t.Fatalf("dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesDialogs", enc)
+	}
+	got := make(map[int64]bool, len(res.Users))
+	for _, u := range res.Users {
+		got[u.GetID()] = true
+	}
+	for _, u := range users {
+		if !got[u.ID] {
+			t.Errorf("user list missing participant %d", u.ID)
+		}
+	}
+	// Top message should be the create action with users populated.
+	if len(res.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(res.Messages))
+	}
+	svc, ok := res.Messages[0].(*tg.MessageService)
+	if !ok {
+		t.Fatalf("top message type = %T, want *tg.MessageService", res.Messages[0])
+	}
+	createAction, ok := svc.Action.(*tg.MessageActionChatCreate)
+	if !ok {
+		t.Fatalf("action type = %T, want *tg.MessageActionChatCreate", svc.Action)
+	}
+	if len(createAction.Users) != 3 {
+		t.Errorf("create action users = %d, want 3", len(createAction.Users))
+	}
+}
+
+// A viewer removed from a chat still gets their dialog row, and RemoveChatUser
+// fans the announcement to the removed user, so their top message is the
+// delete-user row naming them. Without the fix ActionUserID never enters the
+// user list. The chat itself stays degraded to tg.ChatForbidden.
+func TestHandleGetDialogsRemovedViewerSeesDeleteRow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	users, chat := chatWith(t, s, "+15551292111", "+15551292112")
+	if _, _, _, err := s.RemoveChatUser(ctx, chat.ID, users[1].ID, users[0].ID); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	enc, err := api.GetDialogsForTest(s, users[1].ID)
+	if err != nil {
+		t.Fatalf("dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesDialogs", enc)
+	}
+	// Chat should be forbidden.
+	if len(res.Chats) != 1 {
+		t.Fatalf("chats = %d, want 1", len(res.Chats))
+	}
+	forbidden, ok := res.Chats[0].(*tg.ChatForbidden)
+	if !ok {
+		t.Fatalf("chat entry = %#v, want *tg.ChatForbidden", res.Chats[0])
+	}
+	if forbidden.ID != chat.ID {
+		t.Errorf("forbidden id = %d, want %d", forbidden.ID, chat.ID)
+	}
+	// The dialog row survives removal.
+	if len(res.Dialogs) != 1 {
+		t.Errorf("dialogs = %d, want 1", len(res.Dialogs))
+	}
+	// Top message is the delete-user announcement naming the removed viewer.
+	if len(res.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(res.Messages))
+	}
+	svc, ok := res.Messages[0].(*tg.MessageService)
+	if !ok {
+		t.Fatalf("top message type = %T, want *tg.MessageService", res.Messages[0])
+	}
+	del, ok := svc.Action.(*tg.MessageActionChatDeleteUser)
+	if !ok {
+		t.Fatalf("action type = %T, want *tg.MessageActionChatDeleteUser", svc.Action)
+	}
+	if del.UserID != users[1].ID {
+		t.Errorf("action user = %d, want %d", del.UserID, users[1].ID)
+	}
+	got := make(map[int64]bool, len(res.Users))
+	for _, u := range res.Users {
+		got[u.GetID()] = true
+	}
+	if !got[users[1].ID] {
+		t.Errorf("user list missing removed viewer %d", users[1].ID)
+	}
+}
+
+// Criterion 4, the authorization gate itself: a non-member whose dialog top
+// message is still the create row must not get the chat's live member list.
+// No RPC produces that state — RemoveChatUser fans a delete row that becomes
+// the removed account's top message — so the membership row is dropped
+// directly, leaving the retained dialog pointing at the create row.
+func TestHandleGetDialogsNonMemberOnCreateRowGetsNoParticipants(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	users, chat := chatWith(t, s, "+15551292121", "+15551292122", "+15551292123")
+	// Fan the create row while the viewer is still a member: SendChatMessage
+	// writes dialog rows only for current members and rejects a non-member
+	// sender, so this cannot move below the DELETE.
+	if _, _, _, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: chat.ID, FromID: users[0].ID, Text: "Crew", Action: store.ChatActionCreate,
+	}); err != nil {
+		t.Fatalf("create row: %v", err)
+	}
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err = conn.Exec(ctx,
+		"DELETE FROM chat_participants WHERE chat_id = $1 AND user_id = $2", chat.ID, users[1].ID,
+	); err != nil {
+		t.Fatalf("drop membership: %v", err)
+	}
+
+	enc, err := api.GetDialogsForTest(s, users[1].ID)
+	if err != nil {
+		t.Fatalf("dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesDialogs", enc)
+	}
+	// The dialog row survives, degraded to a forbidden chat.
+	if len(res.Dialogs) != 1 {
+		t.Errorf("dialogs = %d, want 1", len(res.Dialogs))
+	}
+	if len(res.Chats) != 1 {
+		t.Fatalf("chats = %d, want 1", len(res.Chats))
+	}
+	forbidden, ok := res.Chats[0].(*tg.ChatForbidden)
+	if !ok {
+		t.Fatalf("chat entry = %#v, want *tg.ChatForbidden", res.Chats[0])
+	}
+	if forbidden.ID != chat.ID {
+		t.Errorf("forbidden id = %d, want %d", forbidden.ID, chat.ID)
+	}
+	if len(res.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(res.Messages))
+	}
+	svc, ok := res.Messages[0].(*tg.MessageService)
+	if !ok {
+		t.Fatalf("top message type = %T, want *tg.MessageService", res.Messages[0])
+	}
+	createAction, ok := svc.Action.(*tg.MessageActionChatCreate)
+	if !ok {
+		t.Fatalf("action type = %T, want *tg.MessageActionChatCreate", svc.Action)
+	}
+	// The gate: no Participants call, so no member ids reach a non-member.
+	if len(createAction.Users) != 0 {
+		t.Errorf("create action users = %d, want 0 for a non-member", len(createAction.Users))
+	}
+	for _, u := range res.Users {
+		if u.GetID() == users[2].ID {
+			t.Errorf("user list leaks member %d to a non-member", users[2].ID)
+		}
+	}
+}
+
 // F7: readHistory and setTyping stay 1:1-only. Typing in particular resolves its
 // peer id as a user id on delivery, so accepting a chat peer would push
 // updateUserTyping to whichever account shares the chat's id.
