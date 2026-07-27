@@ -105,9 +105,9 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	// No membership check on the list itself: a dialog row exists only because a
 	// fan-out wrote it for this owner, so an attacker-chosen id never reaches here.
 	// A removed member keeps their dialog row by design, which is why the viewer is
-	// passed down — loadChats degrades those to tg.ChatForbidden (which still
-	// carries the chat's current title, pending MAIN-48) rather than serving
-	// live version and participant count.
+	// passed down — loadChats degrades those to tg.ChatForbidden, which carries
+	// the id and an empty title and nothing else — no live title, version or
+	// participant count reaches a removed member.
 	chats, err := h.loadChats(r.Ctx, chatIDs, r.UserID)
 	if err != nil {
 		h.log.Error("get dialogs chats", "err", err)
