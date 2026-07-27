@@ -383,8 +383,28 @@ func TestLoadChatsNonMemberForbidden(t *testing.T) {
 	if !ok {
 		t.Fatalf("outsider chat type = %T, want *tg.ChatForbidden", outsider[0])
 	}
-	if f.ID != chat.ID || f.Title != "team" {
-		t.Fatalf("forbidden chat = %+v, want id %d title team", f, chat.ID)
+	if f.ID != chat.ID || f.Title != "" {
+		t.Fatalf("forbidden chat = %+v, want id %d empty title", f, chat.ID)
+	}
+
+	// A rename by a remaining member must not reach the outsider: the live title
+	// is a writable channel into an account that is no longer in the chat.
+	if _, _, _, err := s.SetChatTitle(context.Background(), chat.ID, users[1].ID, "renamed"); err != nil {
+		t.Fatalf("set chat title: %v", err)
+	}
+	after, err := api.LoadChatsForTest(s, []int64{chat.ID}, users[2].ID)
+	if err != nil {
+		t.Fatalf("load chats outsider after rename: %v", err)
+	}
+	if len(after) != 1 {
+		t.Fatalf("outsider chats after rename = %d, want 1", len(after))
+	}
+	f2, ok := after[0].(*tg.ChatForbidden)
+	if !ok {
+		t.Fatalf("outsider chat type after rename = %T, want *tg.ChatForbidden", after[0])
+	}
+	if f2.ID != chat.ID || f2.Title != "" {
+		t.Fatalf("forbidden chat after rename = %+v, want id %d empty title", f2, chat.ID)
 	}
 }
 
