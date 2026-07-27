@@ -304,8 +304,11 @@ func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, selfID int
 // loadChats hydrates chat ids for viewerID. A chat the viewer is no longer a
 // member of still reaches here — their dialog row and their retained message
 // copies survive removal by design — so it must not keep serving live metadata.
-// tg.ChatForbidden carries the id and a title and nothing else, which is what
-// tells a client to stop rendering the chat as active.
+// tg.ChatForbidden carries the id and an empty title and nothing else, which is
+// what tells a client to stop rendering the chat as active. The title is blanked
+// deliberately: the live row keeps changing after removal, and any remaining
+// member may rename the chat freely, so serving it would leave a writable
+// channel into an account that was ejected.
 //
 // The membership check is one query per chat per batch. A batch references very
 // few distinct chats, so it stays a straight loop with no cache.
@@ -324,7 +327,7 @@ func (h *handlers) loadChats(ctx context.Context, ids map[int64]bool, viewerID i
 			return nil, err
 		}
 		if !member {
-			chats = append(chats, &tg.ChatForbidden{ID: c.ID, Title: c.Title})
+			chats = append(chats, &tg.ChatForbidden{ID: c.ID, Title: ""})
 			continue
 		}
 		parts, err := h.store.Participants(ctx, id)

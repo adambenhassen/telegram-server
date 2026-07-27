@@ -597,6 +597,9 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 				if pc, ok := dial.Peer.(*tg.PeerChat); ok && pc.ChatID == chatID {
 					for _, ch := range diags.Chats {
 						if cf, ok := ch.(*tg.ChatForbidden); ok && cf.ID == chatID {
+							if cf.Title != "" {
+								return errors.New("chatForbidden carries a title")
+							}
 							return nil
 						}
 					}
