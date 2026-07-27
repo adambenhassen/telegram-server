@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"errors"
-	"log/slog"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -57,39 +57,46 @@ func execChat(t *testing.T, cmds chan command, fn func(ctx context.Context, c *t
 	}
 }
 
-func bootServerWithDelivery2(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, dsn string, log *slog.Logger, ln net.Listener) func() {
-	t.Helper()
-	_, stop := bootServerWithRegistry(t, ctx, key, dcID, st, dsn, log, ln)
-	return stop
-}
-
-// waitService waits for a service message with the given action type.
-func (u *updateCollector) waitService(ctx context.Context, wantAction tg.MessageActionClass) (*tg.MessageService, error) {
+// waitService waits for a service message with the given action type and
+// returns the envelope it arrived in.
+func (u *updateCollector) waitService(ctx context.Context, wantAction tg.MessageActionClass) (serviceMsgEnvelope, error) {
 	for {
 		select {
 		case env := <-u.serviceMsg:
-			if reflectType(env.svc.Action) == reflectType(wantAction) {
-				return env.svc, nil
+			if actionType(env.svc.Action) == actionType(wantAction) {
+				return env, nil
 			}
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return serviceMsgEnvelope{}, ctx.Err()
 		}
 	}
 }
 
-func reflectType(v any) string {
-	switch v.(type) {
-	case *tg.MessageActionChatCreate:
-		return "create"
-	case *tg.MessageActionChatEditTitle:
-		return "editTitle"
-	case *tg.MessageActionChatAddUser:
-		return "addUser"
-	case *tg.MessageActionChatDeleteUser:
-		return "deleteUser"
-	default:
-		return "other"
+// waitNoService asserts that no service message with the given action type
+// arrives within the context deadline.
+func (u *updateCollector) waitNoService(ctx context.Context, wantAction tg.MessageActionClass) error {
+	for {
+		select {
+		case env := <-u.serviceMsg:
+			if actionType(env.svc.Action) == actionType(wantAction) {
+				return fmt.Errorf("unexpected service message %s", actionType(env.svc.Action))
+			}
+		case <-ctx.Done():
+			return nil
+		}
 	}
+}
+
+func actionType(v tg.MessageActionClass) string { return fmt.Sprintf("%T", v) }
+
+// hasChat reports whether chats carries a *tg.Chat with the given id.
+func hasChat(chats []tg.ChatClass, id int64) bool {
+	for _, c := range chats {
+		if ch, ok := c.(*tg.Chat); ok && ch.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // waitNoNewMsg asserts that no regular message arrives within the context
@@ -137,7 +144,7 @@ func TestChatsRealtime(t *testing.T) {
 	if !ok {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
-	stop := bootServerWithDelivery2(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
 	t.Cleanup(stop)
 
 	const phoneA, phoneB, phoneC, phoneD = "+15551290001", "+15551290002", "+15551290003", "+15551290004"
@@ -204,16 +211,20 @@ func TestChatsRealtime(t *testing.T) {
 		t.Helper()
 		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer sCancel()
-		svc, err := coll.waitService(sCtx, &tg.MessageActionChatCreate{})
+		env, err := coll.waitService(sCtx, &tg.MessageActionChatCreate{})
 		if err != nil {
 			t.Fatalf("%s wait create service: %v", who, err)
 		}
-		cr, ok := svc.Action.(*tg.MessageActionChatCreate)
+		cr, ok := env.svc.Action.(*tg.MessageActionChatCreate)
 		if !ok {
-			t.Fatalf("%s action = %T", who, svc.Action)
+			t.Fatalf("%s action = %T", who, env.svc.Action)
 		}
 		if cr.Title != "Team" {
 			t.Fatalf("%s create title = %q", who, cr.Title)
+		}
+		// The enclosing envelope carries the chat the service message is about.
+		if !hasChat(env.chats, chatID) {
+			t.Fatalf("%s create envelope chats = %v, want chat %d", who, env.chats, chatID)
 		}
 	}
 	waitSvc(collB, "B")
@@ -271,13 +282,13 @@ func TestChatsRealtime(t *testing.T) {
 		t.Helper()
 		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer sCancel()
-		svc, err := coll.waitService(sCtx, &tg.MessageActionChatEditTitle{})
+		env, err := coll.waitService(sCtx, &tg.MessageActionChatEditTitle{})
 		if err != nil {
 			t.Fatalf("%s wait edit title service: %v", who, err)
 		}
-		et, ok := svc.Action.(*tg.MessageActionChatEditTitle)
+		et, ok := env.svc.Action.(*tg.MessageActionChatEditTitle)
 		if !ok {
-			t.Fatalf("%s action = %T", who, svc.Action)
+			t.Fatalf("%s action = %T", who, env.svc.Action)
 		}
 		if et.Title != "Team 2" {
 			t.Fatalf("%s edit title = %q", who, et.Title)
@@ -299,13 +310,13 @@ func TestChatsRealtime(t *testing.T) {
 		t.Helper()
 		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer sCancel()
-		svc, err := coll.waitService(sCtx, &tg.MessageActionChatAddUser{})
+		env, err := coll.waitService(sCtx, &tg.MessageActionChatAddUser{})
 		if err != nil {
 			t.Fatalf("%s wait add user service: %v", who, err)
 		}
-		au, ok := svc.Action.(*tg.MessageActionChatAddUser)
+		au, ok := env.svc.Action.(*tg.MessageActionChatAddUser)
 		if !ok {
-			t.Fatalf("%s action = %T", who, svc.Action)
+			t.Fatalf("%s action = %T", who, env.svc.Action)
 		}
 		if len(au.Users) != 1 || au.Users[0] != dUserID {
 			t.Fatalf("%s addUser users = %v", who, au.Users)
@@ -351,13 +362,13 @@ func TestChatsRealtime(t *testing.T) {
 		t.Helper()
 		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer sCancel()
-		svc, err := coll.waitService(sCtx, &tg.MessageActionChatDeleteUser{})
+		env, err := coll.waitService(sCtx, &tg.MessageActionChatDeleteUser{})
 		if err != nil {
 			t.Fatalf("%s wait delete user service: %v", who, err)
 		}
-		dl, ok := svc.Action.(*tg.MessageActionChatDeleteUser)
+		dl, ok := env.svc.Action.(*tg.MessageActionChatDeleteUser)
 		if !ok {
-			t.Fatalf("%s action = %T", who, svc.Action)
+			t.Fatalf("%s action = %T", who, env.svc.Action)
 		}
 		if dl.UserID != cUserID {
 			t.Fatalf("%s deleteUser userID = %d", who, dl.UserID)
@@ -423,7 +434,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	if !ok {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
-	stop := bootServerWithDelivery2(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
 	t.Cleanup(stop)
 
 	const phoneA, phoneC = "+15551291001", "+15551291002"
@@ -560,9 +571,17 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	} else {
 		t.Fatalf("delete error type = %T, want *tgerr.Error", delErr)
 	}
+	// A should not receive a delete update either.
+	noDelCtx, noDelCancel := context.WithTimeout(ctx, 2*time.Second)
+	select {
+	case <-collA.delMsg:
+		t.Error("A should not receive delete from removed member")
+	case <-noDelCtx.Done():
+	}
+	noDelCancel()
 
 	// F6: C's getDialogs lists chat as chatForbidden.
-	execChat(t, cCmds, func(ctx context.Context, c *tg.Client) error {
+	checkForbidden := func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
 			OffsetDate: 0, OffsetID: 0, OffsetPeer: &tg.InputPeerEmpty{}, Limit: 100,
 		})
@@ -586,7 +605,23 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 			}
 		}
 		return errors.New("chat not in dialogs")
+	}
+	execChat(t, cCmds, checkForbidden)
+
+	// F6: A renames the chat after the removal. C must not track it — no
+	// chatEditTitle service message reaches C, and the dialog stays forbidden.
+	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesEditChatTitle(ctx, &tg.MessagesEditChatTitleRequest{
+			ChatID: chatID, Title: "Two renamed",
+		})
+		return err
 	})
+	noTitleCtx, noTitleCancel := context.WithTimeout(ctx, 3*time.Second)
+	if err := collC.waitNoService(noTitleCtx, &tg.MessageActionChatEditTitle{}); err != nil {
+		t.Errorf("C should not receive title change after removal: %v", err)
+	}
+	noTitleCancel()
+	execChat(t, cCmds, checkForbidden)
 
 	// F3: C's sendMessage → PEER_ID_INVALID.
 	var sendErr error
@@ -670,7 +705,7 @@ func TestChatsOfflineBackfill(t *testing.T) {
 	if !ok {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
-	stop := bootServerWithDelivery2(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551292001", "+15551292002"
@@ -766,27 +801,41 @@ func TestChatsOfflineBackfill(t *testing.T) {
 		t.Fatalf("difference type = %T, want *tg.UpdatesDifference", diff)
 	}
 
-	// Count messages and service messages. Expect: create + 3 messages + editTitle = 5 new messages.
-	msgCount := 0
-	svcCount := 0
-	for _, m := range full.NewMessages {
-		switch m.(type) {
+	// Expect exactly: chatCreate, "msg 1".."msg 3", chatEditTitle — in that
+	// order. Ids are allocated per owner in pts order, so ascending ids are the
+	// client-visible proof the batch is replayed in pts order.
+	wantOrder := []string{
+		actionType(&tg.MessageActionChatCreate{}),
+		"msg 1", "msg 2", "msg 3",
+		actionType(&tg.MessageActionChatEditTitle{}),
+	}
+	if len(full.NewMessages) != len(wantOrder) {
+		t.Fatalf("backfill messages = %d, want %d", len(full.NewMessages), len(wantOrder))
+	}
+	prevID := 0
+	for i, m := range full.NewMessages {
+		var got string
+		var id int
+		switch msg := m.(type) {
 		case *tg.Message:
-			msgCount++
+			got, id = msg.Message, msg.ID
 		case *tg.MessageService:
-			svcCount++
+			got, id = actionType(msg.Action), msg.ID
+		default:
+			t.Fatalf("backfill message %d type = %T", i, m)
 		}
-	}
-	if msgCount != 3 {
-		t.Fatalf("backfill messages = %d, want 3", msgCount)
-	}
-	if svcCount != 2 {
-		t.Fatalf("backfill service messages = %d, want 2 (create + editTitle)", svcCount)
+		if got != wantOrder[i] {
+			t.Fatalf("backfill message %d = %q, want %q", i, got, wantOrder[i])
+		}
+		if id <= prevID {
+			t.Fatalf("backfill message %d id %d not ascending (previous %d)", i, id, prevID)
+		}
+		prevID = id
 	}
 
-	// Chats populated in difference.
-	if len(full.Chats) == 0 {
-		t.Fatal("backfill Chats empty")
+	// The chat itself is in the difference.
+	if !hasChat(full.Chats, chatID) {
+		t.Fatalf("backfill Chats = %v, want chat %d", full.Chats, chatID)
 	}
 
 	// B's pts matches getState.
@@ -824,8 +873,8 @@ func TestChatsCrossReplica(t *testing.T) {
 	ln2 := mustListen(t, ctx, "127.0.0.1:0")
 	port1 := tcpPort(t, ln1)
 	port2 := tcpPort(t, ln2)
-	t.Cleanup(bootServerWithDelivery2(t, ctx, key, dcID, st, dsn, codes.Logger(), ln1))
-	t.Cleanup(bootServerWithDelivery2(t, ctx, key, dcID, st, dsn, codes.Logger(), ln2))
+	t.Cleanup(bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln1))
+	t.Cleanup(bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln2))
 
 	const phoneA, phoneB = "+15551293001", "+15551293002"
 
