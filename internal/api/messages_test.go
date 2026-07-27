@@ -661,7 +661,7 @@ func TestSendAndEditMessageRejectUnstorableText(t *testing.T) {
 	}
 
 	_, err = api.EditMessageForTest(s, a.ID, &tg.MessagesEditMessageRequest{
-		ID: int(sent.LocalID), Message: "\xff",
+		Peer: peer, ID: int(sent.LocalID), Message: "\xff",
 	})
 	rpcError(t, err, "MESSAGE_EMPTY")
 	after, ok, err := s.MessageByOwnerLocal(ctx, a.ID, sent.LocalID)
@@ -688,9 +688,11 @@ func TestSendAndEditMessageKeepMultiByteText(t *testing.T) {
 		t.Fatalf("user b: %v", err)
 	}
 
+	peer := &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID}
+
 	const text = "Привет 👋"
 	enc, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     peer,
 		Message:  text,
 		RandomID: 7,
 	})
@@ -708,7 +710,7 @@ func TestSendAndEditMessageKeepMultiByteText(t *testing.T) {
 
 	const edited = "Пока 👋"
 	if _, err := api.EditMessageForTest(s, a.ID, &tg.MessagesEditMessageRequest{
-		ID: int(sent.LocalID), Message: edited,
+		Peer: peer, ID: int(sent.LocalID), Message: edited,
 	}); err != nil {
 		t.Fatalf("edit: %v", err)
 	}
