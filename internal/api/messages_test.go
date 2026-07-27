@@ -611,3 +611,114 @@ func TestReadHistoryAndSetTypingRejectChatPeers(t *testing.T) {
 	})
 	rpcError(t, err, "PEER_ID_INVALID")
 }
+
+// TestSendAndEditMessageRejectUnstorableText pins the API boundary against text
+// Postgres cannot store. A NUL byte or an invalid UTF-8 sequence reaches the
+// driver intact and fails the INSERT, so without this guard a client bug is a
+// 500 and an error log line an unprivileged caller can repeat at will.
+func TestSendAndEditMessageRejectUnstorableText(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a, err := s.CreateUser(ctx, "+15551293001")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551293002")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+	peer := &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID}
+
+	for name, text := range map[string]string{
+		"nul byte":     "a\x00b",
+		"invalid utf8": "\xff",
+	} {
+		_, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
+			Peer: peer, Message: text, RandomID: 1,
+		})
+		rpcError(t, err, "MESSAGE_EMPTY")
+		msgs, err := s.History(ctx, a.ID, store.PeerTypeUser, b.ID, 0, 100)
+		if err != nil {
+			t.Fatalf("%s: history: %v", name, err)
+		}
+		if len(msgs) != 0 {
+			t.Fatalf("%s: stored %d messages, want 0", name, len(msgs))
+		}
+	}
+
+	// A stored message must survive an edit carrying the same text.
+	enc, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
+		Peer: peer, Message: "hello", RandomID: 2,
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	assertEncodes(t, enc)
+	sent, ok, err := s.MessageByOwnerLocal(ctx, a.ID, 1)
+	if err != nil || !ok {
+		t.Fatalf("sent message: ok=%v err=%v", ok, err)
+	}
+
+	_, err = api.EditMessageForTest(s, a.ID, &tg.MessagesEditMessageRequest{
+		Peer: peer, ID: int(sent.LocalID), Message: "\xff",
+	})
+	rpcError(t, err, "MESSAGE_EMPTY")
+	after, ok, err := s.MessageByOwnerLocal(ctx, a.ID, sent.LocalID)
+	if err != nil || !ok {
+		t.Fatalf("message after edit: ok=%v err=%v", ok, err)
+	}
+	if after.Text != "hello" {
+		t.Fatalf("text = %q, want hello", after.Text)
+	}
+}
+
+// TestSendAndEditMessageKeepMultiByteText pins that the guard rejects only what
+// the database cannot store: valid multi-byte UTF-8 round-trips unchanged.
+func TestSendAndEditMessageKeepMultiByteText(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a, err := s.CreateUser(ctx, "+15551293011")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551293012")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+
+	peer := &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID}
+
+	const text = "Привет 👋"
+	enc, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
+		Peer:     peer,
+		Message:  text,
+		RandomID: 7,
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	assertEncodes(t, enc)
+	sent, ok, err := s.MessageByOwnerLocal(ctx, a.ID, 1)
+	if err != nil || !ok {
+		t.Fatalf("sent message: ok=%v err=%v", ok, err)
+	}
+	if sent.Text != text {
+		t.Fatalf("stored text = %q, want %q", sent.Text, text)
+	}
+
+	const edited = "Пока 👋"
+	if _, err := api.EditMessageForTest(s, a.ID, &tg.MessagesEditMessageRequest{
+		Peer: peer, ID: int(sent.LocalID), Message: edited,
+	}); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	after, ok, err := s.MessageByOwnerLocal(ctx, a.ID, sent.LocalID)
+	if err != nil || !ok {
+		t.Fatalf("message after edit: ok=%v err=%v", ok, err)
+	}
+	if after.Text != edited {
+		t.Fatalf("edited text = %q, want %q", after.Text, edited)
+	}
+}
