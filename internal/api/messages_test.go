@@ -665,8 +665,16 @@ func TestHandleGetDialogsListsDeleteUserActionSubject(t *testing.T) {
 // Users. Without the fix, the action renders with an empty user list.
 func TestHandleGetDialogsOnCreateRowListsParticipants(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 	s := openStore(t)
-	users, _ := chatWith(t, s, "+15551292101", "+15551292102", "+15551292103")
+	users, chat := chatWith(t, s, "+15551292101", "+15551292102", "+15551292103")
+	// CreateChat writes no message; handleCreateChat announces the create row,
+	// and that fan-out is what gives each member a dialog.
+	if _, _, _, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: chat.ID, FromID: users[0].ID, Text: "Crew", Action: store.ChatActionCreate,
+	}); err != nil {
+		t.Fatalf("create row: %v", err)
+	}
 
 	enc, err := api.GetDialogsForTest(s, users[1].ID)
 	if err != nil {
@@ -772,6 +780,14 @@ func TestHandleGetDialogsNonMemberOnCreateRowGetsNoParticipants(t *testing.T) {
 	ctx := context.Background()
 	s, dsn := openStoreDSN(t)
 	users, chat := chatWith(t, s, "+15551292121", "+15551292122", "+15551292123")
+	// Fan the create row while the viewer is still a member: SendChatMessage
+	// writes dialog rows only for current members and rejects a non-member
+	// sender, so this cannot move below the DELETE.
+	if _, _, _, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: chat.ID, FromID: users[0].ID, Text: "Crew", Action: store.ChatActionCreate,
+	}); err != nil {
+		t.Fatalf("create row: %v", err)
+	}
 
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
