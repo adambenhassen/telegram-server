@@ -28,11 +28,12 @@ const (
 )
 
 // chatTitle validates a client-supplied chat title and returns the trimmed form
-// that gets stored. Empty, whitespace-only and over-length are one error: the
-// client is not owed a distinction it cannot act on differently.
+// that gets stored. Empty, whitespace-only, over-length and text the server
+// cannot store are one error: the client is not owed a distinction it cannot act
+// on differently.
 func chatTitle(raw string) (string, error) {
 	title := strings.TrimSpace(raw)
-	if title == "" || utf8.RuneCountInString(title) > maxChatTitle {
+	if title == "" || !validText(title) || utf8.RuneCountInString(title) > maxChatTitle {
 		return "", errChatTitleInvalid
 	}
 	return title, nil
