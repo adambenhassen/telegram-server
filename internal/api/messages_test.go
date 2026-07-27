@@ -762,6 +762,72 @@ func TestHandleGetDialogsRemovedViewerSeesDeleteRow(t *testing.T) {
 	}
 }
 
+// Criterion 4, the authorization gate itself: a non-member whose dialog top
+// message is still the create row must not get the chat's live member list.
+// No RPC produces that state — RemoveChatUser fans a delete row that becomes
+// the removed account's top message — so the membership row is dropped
+// directly, leaving the retained dialog pointing at the create row.
+func TestHandleGetDialogsNonMemberOnCreateRowGetsNoParticipants(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	users, chat := chatWith(t, s, "+15551292121", "+15551292122", "+15551292123")
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err = conn.Exec(ctx,
+		"DELETE FROM chat_participants WHERE chat_id = $1 AND user_id = $2", chat.ID, users[1].ID,
+	); err != nil {
+		t.Fatalf("drop membership: %v", err)
+	}
+
+	enc, err := api.GetDialogsForTest(s, users[1].ID)
+	if err != nil {
+		t.Fatalf("dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesDialogs", enc)
+	}
+	// The dialog row survives, degraded to a forbidden chat.
+	if len(res.Dialogs) != 1 {
+		t.Errorf("dialogs = %d, want 1", len(res.Dialogs))
+	}
+	if len(res.Chats) != 1 {
+		t.Fatalf("chats = %d, want 1", len(res.Chats))
+	}
+	forbidden, ok := res.Chats[0].(*tg.ChatForbidden)
+	if !ok {
+		t.Fatalf("chat entry = %#v, want *tg.ChatForbidden", res.Chats[0])
+	}
+	if forbidden.ID != chat.ID {
+		t.Errorf("forbidden id = %d, want %d", forbidden.ID, chat.ID)
+	}
+	if len(res.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(res.Messages))
+	}
+	svc, ok := res.Messages[0].(*tg.MessageService)
+	if !ok {
+		t.Fatalf("top message type = %T, want *tg.MessageService", res.Messages[0])
+	}
+	createAction, ok := svc.Action.(*tg.MessageActionChatCreate)
+	if !ok {
+		t.Fatalf("action type = %T, want *tg.MessageActionChatCreate", svc.Action)
+	}
+	// The gate: no Participants call, so no member ids reach a non-member.
+	if len(createAction.Users) != 0 {
+		t.Errorf("create action users = %d, want 0 for a non-member", len(createAction.Users))
+	}
+	for _, u := range res.Users {
+		if u.GetID() == users[2].ID {
+			t.Errorf("user list leaks member %d to a non-member", users[2].ID)
+		}
+	}
+}
+
 // F7: readHistory and setTyping stay 1:1-only. Typing in particular resolves its
 // peer id as a user id on delivery, so accepting a chat peer would push
 // updateUserTyping to whichever account shares the chat's id.
