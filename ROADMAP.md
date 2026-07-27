@@ -218,7 +218,12 @@ Tracked so shortcuts don't rot into "later means never".
   copies of past messages and a new member sees no history before they joined. — M6
 - **Removed-member history access.** A removed member's dialog returns
   `ChatForbidden`; their retained message rows and `pts` are reachable only
-  through `updates.getDifference` replay, not through `messages.getHistory`. — M6
+  through `updates.getDifference` replay, not through `messages.getHistory`. The
+  `ChatForbidden` title is served empty rather than live, a deliberate divergence
+  from upstream — which is assumed to serve the chat's current title — because any
+  remaining member may rename the chat and that would keep writing into a removed
+  account. The cost is that a removed member's client renders the chat nameless on
+  a fresh sync. — M6
 - **Chat read state and chat typing.** `messages.readHistory` and
   `messages.setTyping` reject an `InputPeerChat` with `PEER_ID_INVALID`. No
   unread count advances for a chat and no `updateReadHistoryOutbox` is emitted,
