@@ -18,6 +18,13 @@ SELECT * FROM channels WHERE id = $1;
 -- name: ChannelStateForUpdate :one
 SELECT * FROM channel_state WHERE channel_id = $1 FOR UPDATE;
 
+-- LockChannel takes the channels row lock that serialises the rights mutations:
+-- the caller's and the target's participant rows are read under it and the write
+-- lands under it, so a demotion cannot interleave with the promotion it revokes.
+-- See the lock-order comment at the top of channels.go.
+-- name: LockChannel :one
+SELECT * FROM channels WHERE id = $1 FOR UPDATE;
+
 -- name: ChannelParticipants :many
 SELECT * FROM channel_participants WHERE channel_id = $1 ORDER BY user_id;
 
@@ -38,6 +45,17 @@ SELECT count(*) FROM channel_participants WHERE user_id = $1;
 -- name: InsertChannelParticipantIfAbsent :execrows
 INSERT INTO channel_participants (channel_id, user_id, role, join_pts) VALUES ($1, $2, $3, $4)
 ON CONFLICT (channel_id, user_id) DO NOTHING;
+
+-- UpdateChannelParticipantRole and UpdateChannelParticipantBan only ever update:
+-- neither may create a participant row, so 0 rows affected means the target is
+-- not a member and the caller rejects.
+-- name: UpdateChannelParticipantRole :execrows
+UPDATE channel_participants SET role = $3 WHERE channel_id = $1 AND user_id = $2;
+
+-- banned_until takes SQL NULL to unban and 'infinity' for a permanent ban, so
+-- the parameter is a pgtype.Timestamptz — the same type the column decodes into.
+-- name: UpdateChannelParticipantBan :execrows
+UPDATE channel_participants SET banned_until = $3 WHERE channel_id = $1 AND user_id = $2;
 
 -- name: DeleteChannelParticipant :execrows
 DELETE FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
