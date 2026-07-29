@@ -1036,6 +1036,7 @@ func TestGetDialogsListsTheCallersChannels(t *testing.T) {
 		t.Errorf("chat = %T, want *tg.Channel", got.Chats[0])
 	}
 }
+
 // unknownHash is a well-formed hash of the right shape that was never issued —
 // 22 base64url characters, the width store.CreateChannelInvite emits.
 const unknownHash = "0000000000000000000000"
