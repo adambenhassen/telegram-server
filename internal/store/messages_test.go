@@ -20,7 +20,7 @@ func mustUser(t *testing.T, s *store.Store, phone string) store.User {
 
 func send(t *testing.T, s *store.Store, from, to store.User, text string, rid int64) store.Message {
 	t.Helper()
-	m, _, _, _, err := s.SendMessage(context.Background(), from.ID, to.ID, text, rid) //nolint:dogsled // only the stored message is needed here
+	m, _, _, _, err := s.SendMessage(context.Background(), from.ID, to.ID, text, rid, 0) //nolint:dogsled // only the stored message is needed here
 	if err != nil {
 		t.Fatalf("send %q: %v", text, err)
 	}
@@ -43,7 +43,7 @@ func TestSendMessageTwoSided(t *testing.T) {
 	a := mustUser(t, s, "+15551240001")
 	b := mustUser(t, s, "+15551240002")
 
-	sender, senderPts, recipientPts, dup, err := s.SendMessage(ctx, a.ID, b.ID, "hi", 111)
+	sender, senderPts, recipientPts, dup, err := s.SendMessage(ctx, a.ID, b.ID, "hi", 111, 0)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -87,6 +87,34 @@ func TestSendMessageTwoSided(t *testing.T) {
 	}
 }
 
+// Both sides of a 1:1 pair carry the same file id — that is what makes the
+// download gate pass for the recipient.
+func TestSendMessageCarriesFileIDOnBothSides(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551240021")
+	b := mustUser(t, s, "+15551240022")
+
+	f, err := s.AllocateFile(ctx, a.ID, 11, "text/plain", "hello.txt", bigQuota)
+	if err != nil {
+		t.Fatalf("allocate file: %v", err)
+	}
+	sender, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "here", 5, f.ID) //nolint:dogsled // only the stored message is needed here
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if sender.FileID != f.ID {
+		t.Fatalf("sender row file_id = %d, want %d", sender.FileID, f.ID)
+	}
+	if own := msgAt(t, s, a.ID, sender.LocalID); own.FileID != f.ID {
+		t.Fatalf("stored sender row file_id = %d, want %d", own.FileID, f.ID)
+	}
+	if recv := msgAt(t, s, b.ID, sender.PeerLocalID); recv.FileID != f.ID {
+		t.Fatalf("recipient row file_id = %d, want %d", recv.FileID, f.ID)
+	}
+}
+
 func TestSendMessageRandomIDDedup(t *testing.T) {
 	t.Parallel()
 	s := open(t)
@@ -94,11 +122,11 @@ func TestSendMessageRandomIDDedup(t *testing.T) {
 	a := mustUser(t, s, "+15551240011")
 	b := mustUser(t, s, "+15551240012")
 
-	first, _, _, dup, err := s.SendMessage(ctx, a.ID, b.ID, "once", 999)
+	first, _, _, dup, err := s.SendMessage(ctx, a.ID, b.ID, "once", 999, 0)
 	if err != nil || dup {
 		t.Fatalf("first send: dup=%v err=%v", dup, err)
 	}
-	again, sPts, rPts, dup, err := s.SendMessage(ctx, a.ID, b.ID, "once", 999)
+	again, sPts, rPts, dup, err := s.SendMessage(ctx, a.ID, b.ID, "once", 999, 0)
 	if err != nil {
 		t.Fatalf("resend: %v", err)
 	}
@@ -130,7 +158,7 @@ func TestConcurrentOppositeFirstSends(t *testing.T) {
 	ctx := context.Background()
 
 	sendErr := func(from, to store.User, rid int64) error {
-		_, _, _, _, e := s.SendMessage(ctx, from.ID, to.ID, "x", rid)
+		_, _, _, _, e := s.SendMessage(ctx, from.ID, to.ID, "x", rid, 0)
 		return e
 	}
 

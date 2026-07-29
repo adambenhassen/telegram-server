@@ -30,6 +30,8 @@ type FanOut struct {
 	Action       ChatAction
 	ActionUserID int64 // subject of AddUser/DeleteUser; 0 otherwise
 	RandomID     int64 // sender dedup token; 0 for service messages
+	// FileID attaches an uploaded file to every per-member copy. 0 = no media.
+	FileID int64
 
 	// Extra is a member id to include in this fan-out even though the chat's
 	// current member set may not contain them — needed so a removed user
@@ -221,7 +223,7 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 		if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
 			OwnerID: owner, LocalID: b.LocalID, PeerType: int16(PeerTypeChat), PeerID: f.ChatID, FromID: f.FromID,
 			Message: f.Text, Out: out, RandomID: randomID, PeerLocalID: 0,
-			FanoutID: fanoutID, ActionType: int16(f.Action), ActionUserID: f.ActionUserID,
+			FanoutID: fanoutID, ActionType: int16(f.Action), ActionUserID: f.ActionUserID, FileID: f.FileID,
 		}); err != nil {
 			return Message{}, nil, false, fmt.Errorf("insert message %d: %w", owner, err)
 		}
