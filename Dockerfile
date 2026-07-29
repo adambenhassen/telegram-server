@@ -28,8 +28,15 @@ RUN CGO_ENABLED=0 go build -o /telegramd ./cmd/telegramd
 # Copying the staging root instead makes the directory itself content. The
 # parents are created in a separate call at 0755 so 0700 cannot leak onto /var
 # and /var/lib, which the final image already has.
+#
+# Uploaded file bodies get their own directory, and a deployment gives it its
+# own volume: they are unbounded attacker-supplied bytes, while the key
+# directory is the one thing here that has to be backed up and has to stay
+# small. Separate mounts keep a disk-full on media from becoming a failure to
+# write the identity key.
 RUN install -d -m 0755 /rootfs/var /rootfs/var/lib \
-    && install -d -m 0700 -o 65532 -g 65532 /rootfs/var/lib/telegramd
+    && install -d -m 0700 -o 65532 -g 65532 /rootfs/var/lib/telegramd \
+    && install -d -m 0700 -o 65532 -g 65532 /rootfs/var/lib/telegramd-blobs
 
 # distroless/static: no shell and no package manager, ships CA certificates for
 # a TLS Postgres DSN, and already defines the non-root uid 65532.
@@ -48,6 +55,12 @@ COPY --from=build /rootfs/ /
 # identity on every run and putting a live private key into anything that
 # snapshots the container. Mount a volume here so the identity survives restarts.
 ENV TG_RSA_KEY_PATH=/var/lib/telegramd/server_key.pem
+
+# Also a path, not a secret. The config default is relative, which is right for
+# a run from a source checkout and wrong here: this image runs read-only, so a
+# relative directory cannot be created and the server refuses to start. Mount a
+# volume here — a separate one from the key volume.
+ENV TG_BLOB_DIR=/var/lib/telegramd-blobs
 
 # TG_POSTGRES_DSN and TG_AUTHKEY_ENC_KEY are deliberately absent: both are
 # secrets, both are injected at run time, and startup fails loudly without them.
