@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"log/slog"
+	"sync"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -29,6 +30,17 @@ type handlers struct {
 	// maxUserStorageBytes is the account-lifetime stored-bytes cap assembly
 	// checks before it allocates a file row.
 	maxUserStorageBytes int64
+	// downloads holds the user ids with a getFile in flight, capped at one each.
+	// Bounding concurrency is what makes the download path safe without a tuned
+	// rate limit: it composes with maxUserConns (internal/mtproto/sessions.go:18)
+	// into a ceiling on how much disk read and egress one account can demand at
+	// once, and unlike a rate it needs no load data nobody has measured yet.
+	//
+	// Lock order: downloadsMu is a leaf. It is taken and released around a map
+	// operation and is never held across a store call, a blob read, or a socket
+	// write, so it cannot participate in a cycle with any existing lock.
+	downloadsMu sync.Mutex
+	downloads   map[int64]bool
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -82,6 +94,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 
 		blobs:               blobs,
 		maxUserStorageBytes: maxUserStorageBytes,
+		downloads:           map[int64]bool{},
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
@@ -111,6 +124,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesSendMediaRequestTypeID, h.handleSendMedia)
 	register(d, tg.UploadSaveFilePartRequestTypeID, h.handleSaveFilePart)
 	register(d, tg.UploadSaveBigFilePartRequestTypeID, h.handleSaveBigFilePart)
+	register(d, tg.UploadGetFileRequestTypeID, h.handleGetFile)
 	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		id, err := req.Buf.PeekID()
 		if err != nil {

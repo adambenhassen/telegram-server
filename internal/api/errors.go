@@ -61,4 +61,16 @@ var (
 	// errFileQuota rejects an upload that would take the account past its total
 	// stored-bytes cap.
 	errFileQuota = rpcErr(400, "STORAGE_CHECK_FAILED")
+	// errLocationInvalid rejects every upload.getFile the server will not serve:
+	// an unknown file id, a wrong access hash, a file whose bytes were never
+	// stored, a caller who owns no live message referencing it, a location type
+	// M5 does not serve, and a range outside the file. They are ONE error on
+	// purpose. files.id is dense BIGSERIAL, so two distinguishable errors would
+	// turn the download path into an existence-and-enumeration oracle over every
+	// file on the server.
+	errLocationInvalid = rpcErr(400, "LOCATION_INVALID")
+	// errDownloadBusy rejects a second concurrent download from one account.
+	// FLOOD_WAIT is the right signal: the condition clears on its own as soon as
+	// the in-flight request finishes.
+	errDownloadBusy = rpcErr(420, "FLOOD_WAIT_1")
 )
