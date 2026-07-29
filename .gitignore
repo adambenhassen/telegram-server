@@ -3,6 +3,8 @@ bin/
 # TG_RSA_KEY_PATH defaults to ./server_key.pem, so a local run writes a live private key here
 *.pem
 *.key
+# TG_BLOB_DIR defaults to ./blobs, so a local run writes uploaded file bodies here
+blobs/
 .env
 .env.*
 # Must stay below .env.*, which would otherwise swallow it; the template carries
