@@ -89,6 +89,16 @@ func GetDialogsForTest(s *store.Store, userID int64) (bin.Encoder, error) {
 	return testHandlers(s).handleGetDialogs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// GetDialogsPageForTest encodes req and invokes handleGetDialogs for the caller,
+// so a test can drive Limit and OffsetID.
+func GetDialogsPageForTest(s *store.Store, userID int64, req *tg.MessagesGetDialogsRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetDialogs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // ReadHistoryForTest encodes req and invokes handleReadHistory for the caller.
 func ReadHistoryForTest(s *store.Store, userID int64, req *tg.MessagesReadHistoryRequest) (bin.Encoder, error) {
 	var buf bin.Buffer
