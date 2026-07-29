@@ -53,6 +53,37 @@ func (h *handlers) twoUsers(ctx context.Context, selfID, peerID int64) ([]tg.Use
 	return h.loadUsers(ctx, map[int64]bool{selfID: true, peerID: true}, selfID)
 }
 
+// loadFiles hydrates the files referenced by a batch of message rows into wire
+// documents. Rows with no media, and files whose bytes were never stored, are
+// simply absent from the map — messageToTL renders those as plain messages.
+//
+// The id list is derived from the caller's own rows and never from anything
+// client-supplied: store.FilesByIDs checks no entitlement (the download gate
+// lives in FileForDownload alone), so this list is the boundary on this path.
+//
+// A batch with no media skips the query and returns an empty map, so no call
+// site needs a nil check or a branch of its own.
+func (h *handlers) loadFiles(ctx context.Context, msgs []store.Message) (map[int64]*tg.Document, error) {
+	var ids []int64
+	for _, m := range msgs {
+		if m.FileID != 0 {
+			ids = append(ids, m.FileID)
+		}
+	}
+	if len(ids) == 0 {
+		return map[int64]*tg.Document{}, nil
+	}
+	files, err := h.store.FilesByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	docs := make(map[int64]*tg.Document, len(files))
+	for id, f := range files {
+		docs[id] = h.documentToTL(f)
+	}
+	return docs, nil
+}
+
 // validText rejects client text Postgres cannot store: a NUL byte or an invalid
 // UTF-8 sequence. Both reach the driver intact and fail the INSERT, turning a
 // client bug into a 500 and a log line.
@@ -101,7 +132,8 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
-			&tg.UpdateNewMessage{Message: messageToTL(sender, nil), Pts: senderPts, PtsCount: 1},
+			// sendMessage never carries media; the media send path builds its own reply.
+			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil), Pts: senderPts, PtsCount: 1},
 		},
 		Users: users,
 		Date:  int(sender.Date.Unix()),
@@ -168,7 +200,8 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
-			&tg.UpdateNewMessage{Message: messageToTL(sender, nil), Pts: perOwner[r.UserID], PtsCount: 1},
+			// sendMessage never carries media; the media send path builds its own reply.
+			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil), Pts: perOwner[r.UserID], PtsCount: 1},
 		},
 		Users: users,
 		Chats: chats,
@@ -212,9 +245,14 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 		return h.chatHistory(r, toID, msgs)
 	}
 
+	files, err := h.loadFiles(r.Ctx, msgs)
+	if err != nil {
+		h.log.Error("get history files", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	for i, m := range msgs {
-		tlMsgs[i] = messageToTL(m, nil)
+		tlMsgs[i] = messageToTL(m, nil, files)
 	}
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
@@ -248,10 +286,15 @@ func (h *handlers) chatHistory(r *mtproto.Request, chatID int64, msgs []store.Me
 		}
 	}
 
+	files, err := h.loadFiles(r.Ctx, msgs)
+	if err != nil {
+		h.log.Error("get history files", "user_id", r.UserID, "chat_id", chatID, "err", err)
+		return nil, errInternal
+	}
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	authors := map[int64]bool{r.UserID: true}
 	for i, m := range msgs {
-		tlMsgs[i] = messageToTL(m, createUsers)
+		tlMsgs[i] = messageToTL(m, createUsers, files)
 		authors[m.FromID] = true
 		switch m.Action {
 		case store.ChatActionAddUser, store.ChatActionDeleteUser:
@@ -331,6 +374,11 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("reload edited message", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	files, err := h.loadFiles(r.Ctx, []store.Message{edited})
+	if err != nil {
+		h.log.Error("edit message files", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
 	users, err := h.twoUsers(r.Ctx, r.UserID, peerID)
 	if err != nil {
 		h.log.Error("edit message users", "err", err)
@@ -338,7 +386,7 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
-			&tg.UpdateEditMessage{Message: messageToTL(edited, nil), Pts: newPts, PtsCount: 1},
+			&tg.UpdateEditMessage{Message: messageToTL(edited, nil, files), Pts: newPts, PtsCount: 1},
 		},
 		Users: users,
 		Date:  int(time.Now().Unix()),

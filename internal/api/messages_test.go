@@ -1091,3 +1091,124 @@ func TestHandleGetDialogsClampsLimit(t *testing.T) {
 		t.Fatalf("exact page = %d dialogs, count %d, want 3 and 3", len(slice.Dialogs), slice.Count)
 	}
 }
+
+// mediaMessage sends a message from one user to another carrying a stored file,
+// and returns the sender's row and the file it attached.
+func mediaMessage(t *testing.T, s *store.Store, from, to store.User, text string, stored bool) (store.Message, store.File) {
+	t.Helper()
+	ctx := context.Background()
+	f, err := s.AllocateFile(ctx, from.ID, 11, "text/plain", "hello.txt", 1<<31)
+	if err != nil {
+		t.Fatalf("allocate file: %v", err)
+	}
+	if stored {
+		if err := s.MarkFileStored(ctx, f.ID); err != nil {
+			t.Fatalf("mark stored: %v", err)
+		}
+	}
+	sender, _, _, _, err := s.SendMessage(ctx, from.ID, to.ID, text, 909, f.ID) //nolint:dogsled // only the sender row is needed here
+	if err != nil {
+		t.Fatalf("send media message: %v", err)
+	}
+	return sender, f
+}
+
+// mediaUsers creates a pair of accounts for a media test.
+func mediaUsers(t *testing.T, s *store.Store, a, b string) (store.User, store.User) {
+	t.Helper()
+	ctx := context.Background()
+	u1, err := s.CreateUser(ctx, a)
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	u2, err := s.CreateUser(ctx, b)
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+	return u1, u2
+}
+
+// historyMessages runs getHistory for caller against peer and returns the page.
+func historyMessages(t *testing.T, s *store.Store, caller, peer store.User) []tg.MessageClass {
+	t.Helper()
+	enc, err := api.GetHistoryForTest(s, caller.ID, &tg.MessagesGetHistoryRequest{
+		Peer: &tg.InputPeerUser{UserID: peer.ID, AccessHash: peer.ID},
+	})
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("history type = %T, want *tg.MessagesMessages", enc)
+	}
+	return res.Messages
+}
+
+func TestHandleGetHistoryRendersDocumentMedia(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	u1, u2 := mediaUsers(t, s, "+15551294001", "+15551294002")
+	_, f := mediaMessage(t, s, u1, u2, "here", true)
+
+	msgs := historyMessages(t, s, u2, u1)
+	if len(msgs) != 1 {
+		t.Fatalf("history = %d messages, want 1", len(msgs))
+	}
+	m, ok := msgs[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("message type = %T, want *tg.Message", msgs[0])
+	}
+	if m.Message != "here" {
+		t.Fatalf("text = %q, want %q", m.Message, "here")
+	}
+	doc := mediaDocument(t, m)
+	if doc.ID != f.ID || doc.AccessHash != f.AccessHash {
+		t.Fatalf("document id/hash = %d/%d, want %d/%d", doc.ID, doc.AccessHash, f.ID, f.AccessHash)
+	}
+	if doc.MimeType != "text/plain" || doc.Size != 11 {
+		t.Fatalf("document mime/size = %q/%d, want text/plain/11", doc.MimeType, doc.Size)
+	}
+	if len(doc.Attributes) != 1 {
+		t.Fatalf("attributes = %d, want 1", len(doc.Attributes))
+	}
+	name, ok := doc.Attributes[0].(*tg.DocumentAttributeFilename)
+	if !ok || name.FileName != "hello.txt" {
+		t.Fatalf("attribute = %+v, want DocumentAttributeFilename hello.txt", doc.Attributes[0])
+	}
+}
+
+func TestHandleGetHistoryUnstoredFileRendersPlainMessage(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	u1, u2 := mediaUsers(t, s, "+15551294003", "+15551294004")
+	mediaMessage(t, s, u1, u2, "here", false)
+
+	msgs := historyMessages(t, s, u2, u1)
+	if len(msgs) != 1 {
+		t.Fatalf("history = %d messages, want 1", len(msgs))
+	}
+	m, ok := msgs[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("message type = %T, want *tg.Message", msgs[0])
+	}
+	if m.Media != nil {
+		t.Fatalf("media = %+v, want none for an unstored file", m.Media)
+	}
+	if m.Message != "here" {
+		t.Fatalf("text = %q, want %q", m.Message, "here")
+	}
+}
+
+// mediaDocument asserts a wire message carries document media and returns it.
+func mediaDocument(t *testing.T, m *tg.Message) *tg.Document {
+	t.Helper()
+	media, ok := m.Media.(*tg.MessageMediaDocument)
+	if !ok {
+		t.Fatalf("media type = %T, want *tg.MessageMediaDocument", m.Media)
+	}
+	doc, ok := media.Document.(*tg.Document)
+	if !ok {
+		t.Fatalf("document type = %T, want *tg.Document", media.Document)
+	}
+	return doc
+}

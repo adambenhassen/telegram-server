@@ -82,7 +82,8 @@ func (h *handlers) chatUpdate(ctx context.Context, callerID int64, chat store.Ch
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateNewMessage{
-				Message:  messageToTL(sender, createUsers),
+				// A service message never carries media.
+				Message:  messageToTL(sender, createUsers, nil),
 				Pts:      perOwner[callerID],
 				PtsCount: 1,
 			},

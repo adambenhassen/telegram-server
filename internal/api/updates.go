@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/binary"
 	"sort"
 
 	"github.com/gotd/td/bin"
@@ -19,8 +20,9 @@ import (
 // A row carrying an action renders as tg.MessageService instead. createUsers is
 // the participant list for a ChatActionCreate row and nil for everything else:
 // the mapper stays pure, so the one action that needs a member set is handed it
-// rather than fetching it.
-func messageToTL(m store.Message, createUsers []int64) tg.MessageClass {
+// rather than fetching it. files is the same pattern for media, keyed by file
+// id; a row whose file id is absent from it renders as a plain message.
+func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Document) tg.MessageClass {
 	if m.Action != store.ChatActionNone {
 		return &tg.MessageService{
 			ID:     int(m.LocalID),
@@ -42,7 +44,37 @@ func messageToTL(m store.Message, createUsers []int64) tg.MessageClass {
 	if m.EditDate != nil {
 		msg.EditDate = int(m.EditDate.Unix())
 	}
+	// SetMedia rather than a plain assignment: Media is a conditional field and
+	// encodes only when its flag is set with it.
+	if d, ok := files[m.FileID]; ok && m.FileID != 0 {
+		msg.SetMedia(&tg.MessageMediaDocument{Document: d})
+	}
 	return msg
+}
+
+// documentToTL names a stored file on the wire. Attributes carry only the file
+// name: M5 stores no other document attribute, and it never decodes an uploaded
+// file, so it cannot honestly claim an image size or a duration it did not
+// measure.
+//
+// FileReference is the 8-byte big-endian file id — a placeholder, the same
+// posture as the peer access_hash. It is echoed deterministically and ignored
+// entirely on input. Half-validating it would make it an oracle; ignoring it
+// does not.
+func (h *handlers) documentToTL(f store.File) *tg.Document {
+	d := &tg.Document{
+		ID:            f.ID,
+		AccessHash:    f.AccessHash,
+		FileReference: binary.BigEndian.AppendUint64(nil, uint64(f.ID)), //nolint:gosec // G115: opaque 64-bit id, sign irrelevant
+		Date:          int(f.Date.Unix()),
+		MimeType:      f.MimeType,
+		Size:          f.Size,
+		DCID:          h.dcID,
+	}
+	if f.FileName != "" {
+		d.Attributes = []tg.DocumentAttributeClass{&tg.DocumentAttributeFilename{FileName: f.FileName}}
+	}
+	return d
 }
 
 // actionToTL maps a service message's action. Create and EditTitle carry the
@@ -165,10 +197,23 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 		b.more = true
 	}
 
+	msgs, err := h.batchMessages(ctx, userID, events)
+	if err != nil {
+		return updateBatch{}, err
+	}
+	rows := make([]store.Message, 0, len(msgs))
+	for _, m := range msgs {
+		rows = append(rows, m)
+	}
+	files, err := h.loadFiles(ctx, rows)
+	if err != nil {
+		return updateBatch{}, err
+	}
+
 	peers := map[int64]bool{}
 	chats := map[int64]bool{}
 	for _, ev := range events {
-		up, refs, chatRefs, uerr := h.eventToUpdate(ctx, userID, ev)
+		up, refs, chatRefs, uerr := h.eventToUpdate(ctx, userID, ev, msgs, files)
 		if uerr != nil {
 			return updateBatch{}, uerr
 		}
@@ -200,15 +245,46 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 	return b, nil
 }
 
+// batchMessages loads, once per distinct local id, the message rows the batch's
+// events name, keyed by local id. A row that has since vanished is absent, which
+// is the same skip its per-event lookup used to produce. Loading them up front is
+// what lets the batch's media be hydrated in a single query.
+func (h *handlers) batchMessages(ctx context.Context, userID int64, events []store.Event) (map[int64]store.Message, error) {
+	msgs := make(map[int64]store.Message, len(events))
+	for _, ev := range events {
+		switch ev.Type {
+		case store.EventNewMessage, store.EventEdit, store.EventReadIn, store.EventReadOut:
+		default:
+			continue
+		}
+		if ev.LocalID == 0 {
+			continue
+		}
+		if _, done := msgs[ev.LocalID]; done {
+			continue
+		}
+		m, ok, err := h.store.MessageByOwnerLocal(ctx, userID, ev.LocalID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		msgs[ev.LocalID] = m
+	}
+	return msgs, nil
+}
+
 // eventToUpdate builds the wire update for one event owned by userID, returning
 // the update, the user ids it references and the chat ids it references. A nil
 // update (message vanished, or an empty read marker) is skipped by the caller.
-func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Event) (tg.UpdateClass, []int64, []int64, error) {
+// msgs and files are the batch's pre-loaded rows and their media.
+func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Event, msgs map[int64]store.Message, files map[int64]*tg.Document) (tg.UpdateClass, []int64, []int64, error) {
 	switch ev.Type {
 	case store.EventNewMessage, store.EventEdit:
-		m, ok, err := h.store.MessageByOwnerLocal(ctx, userID, ev.LocalID)
-		if err != nil || !ok {
-			return nil, nil, nil, err
+		m, ok := msgs[ev.LocalID]
+		if !ok {
+			return nil, nil, nil, nil
 		}
 		// The create action's user list is current member ids, so it is the same
 		// disclosure loadChats gates: a viewer removed from the chat still replays
@@ -231,7 +307,7 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 				}
 			}
 		}
-		tlMsg := messageToTL(m, createUsers)
+		tlMsg := messageToTL(m, createUsers, files)
 		refs := []int64{m.FromID}
 		var chatRefs []int64
 		if m.PeerType == store.PeerTypeChat {
@@ -264,9 +340,9 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 		if ev.LocalID == 0 {
 			return nil, nil, nil, nil
 		}
-		m, ok, err := h.store.MessageByOwnerLocal(ctx, userID, ev.LocalID)
-		if err != nil || !ok {
-			return nil, nil, nil, err
+		m, ok := msgs[ev.LocalID]
+		if !ok {
+			return nil, nil, nil, nil
 		}
 		peer := peerToTL(m.PeerType, m.PeerID)
 		var refs, chatRefs []int64

@@ -61,7 +61,8 @@ func (h *handlers) chatMembershipUpdates(ctx context.Context, selfID, target int
 	}
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
-			&tg.UpdateNewMessage{Message: messageToTL(sender, nil), Pts: perOwner[selfID], PtsCount: 1},
+			// A service message never carries media.
+			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil), Pts: perOwner[selfID], PtsCount: 1},
 		},
 		Users: users,
 		Chats: chats,
