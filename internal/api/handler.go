@@ -121,6 +121,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesEditChatTitleRequestTypeID, h.handleEditChatTitle)
 	register(d, tg.MessagesAddChatUserRequestTypeID, h.handleAddChatUser)
 	register(d, tg.MessagesDeleteChatUserRequestTypeID, h.handleDeleteChatUser)
+	register(d, tg.ChannelsGetMessagesRequestTypeID, h.handleGetChannelMessages)
 	register(d, tg.MessagesSendMediaRequestTypeID, h.handleSendMedia)
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
 	register(d, tg.ChannelsGetChannelsRequestTypeID, h.handleGetChannels)

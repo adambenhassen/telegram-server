@@ -179,6 +179,16 @@ func LoadChannelsForTest(s *store.Store, ids []int64, viewerID int64) ([]tg.Chat
 	return testHandlers(s).loadChannels(context.Background(), set, viewerID)
 }
 
+// GetChannelMessagesForTest encodes req and invokes handleGetChannelMessages
+// for the caller.
+func GetChannelMessagesForTest(s *store.Store, userID int64, req *tg.ChannelsGetMessagesRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetChannelMessages(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // GetDifferenceForTest encodes req and invokes handleGetDifference for the caller.
 func GetDifferenceForTest(s *store.Store, userID int64, req *tg.UpdatesGetDifferenceRequest) (bin.Encoder, error) {
 	var buf bin.Buffer
