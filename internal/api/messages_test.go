@@ -1093,8 +1093,8 @@ func TestHandleGetDialogsClampsLimit(t *testing.T) {
 }
 
 // mediaMessage sends a message from one user to another carrying a stored file,
-// and returns the file it attached.
-func mediaMessage(t *testing.T, s *store.Store, from, to store.User, text string, stored bool) store.File {
+// and returns the sender's row and the file it attached.
+func mediaMessage(t *testing.T, s *store.Store, from, to store.User, text string, stored bool) (store.Message, store.File) {
 	t.Helper()
 	ctx := context.Background()
 	f, err := s.AllocateFile(ctx, from.ID, 11, "text/plain", "hello.txt", 1<<31)
@@ -1106,10 +1106,11 @@ func mediaMessage(t *testing.T, s *store.Store, from, to store.User, text string
 			t.Fatalf("mark stored: %v", err)
 		}
 	}
-	if _, _, _, _, err := s.SendMessage(ctx, from.ID, to.ID, text, 909, f.ID); err != nil {
+	sender, _, _, _, err := s.SendMessage(ctx, from.ID, to.ID, text, 909, f.ID) //nolint:dogsled // only the sender row is needed here
+	if err != nil {
 		t.Fatalf("send media message: %v", err)
 	}
-	return f
+	return sender, f
 }
 
 // mediaUsers creates a pair of accounts for a media test.
@@ -1147,7 +1148,7 @@ func TestHandleGetHistoryRendersDocumentMedia(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
 	u1, u2 := mediaUsers(t, s, "+15551294001", "+15551294002")
-	f := mediaMessage(t, s, u1, u2, "here", true)
+	_, f := mediaMessage(t, s, u1, u2, "here", true)
 
 	msgs := historyMessages(t, s, u2, u1)
 	if len(msgs) != 1 {

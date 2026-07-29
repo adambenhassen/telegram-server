@@ -546,3 +546,59 @@ func TestDocumentToTLFileReferenceIsTheFileID(t *testing.T) {
 		t.Fatalf("attributes = %d, want 0 for an unnamed file", len(d.Attributes))
 	}
 }
+
+// A send and an edit of the same row put two events in one batch naming one
+// local id. batchMessages loads that row once and both updates must still carry
+// the media, so the dedup cannot drop the second event's row.
+func TestGetDifferenceRendersMediaOnEditOfTheSameRow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	u1, u2 := mediaUsers(t, s, "+15551295003", "+15551295004")
+	sent, f := mediaMessage(t, s, u1, u2, "here", true)
+
+	if _, _, err := s.EditMessage(ctx, u1.ID, sent.LocalID, "there"); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+
+	enc, err := api.GetDifferenceForTest(s, u1.ID, &tg.UpdatesGetDifferenceRequest{Pts: 0})
+	if err != nil {
+		t.Fatalf("get difference: %v", err)
+	}
+	diff, ok := enc.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("difference type = %T, want *tg.UpdatesDifference", enc)
+	}
+	if len(diff.NewMessages) != 1 {
+		t.Fatalf("new messages = %d, want 1", len(diff.NewMessages))
+	}
+	newMsg, ok := diff.NewMessages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("new message type = %T, want *tg.Message", diff.NewMessages[0])
+	}
+	if doc := mediaDocument(t, newMsg); doc.ID != f.ID {
+		t.Fatalf("new message document = %d, want %d", doc.ID, f.ID)
+	}
+
+	var edits int
+	for _, u := range diff.OtherUpdates {
+		up, ok := u.(*tg.UpdateEditMessage)
+		if !ok {
+			continue
+		}
+		edits++
+		edited, ok := up.Message.(*tg.Message)
+		if !ok {
+			t.Fatalf("edited message type = %T, want *tg.Message", up.Message)
+		}
+		if edited.Message != "there" {
+			t.Fatalf("edited text = %q, want %q", edited.Message, "there")
+		}
+		if doc := mediaDocument(t, edited); doc.ID != f.ID {
+			t.Fatalf("edited message document = %d, want %d", doc.ID, f.ID)
+		}
+	}
+	if edits != 1 {
+		t.Fatalf("edit updates = %d, want 1", edits)
+	}
+}
