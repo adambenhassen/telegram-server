@@ -430,6 +430,45 @@ func TestSetChannelBanAdminMayBanAMemberOnly(t *testing.T) {
 	}
 }
 
+// A banned caller has no rights on either method: the ban would otherwise be
+// toothless against an admin, whose row also survives leaving.
+func TestChannelRightsRejectABannedCaller(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551291046")
+	admin := mustUser(t, s, "+15551291047")
+	member := mustUser(t, s, "+15551291048")
+	ch, hash, err := store.SeedChannelWithMember(ctx, s, owner.ID, admin.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, hash, member.ID); err != nil {
+		t.Fatalf("join member: %v", err)
+	}
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	until := time.Now().Add(time.Hour)
+	if err := s.SetChannelBan(ctx, ch.ID, owner.ID, admin.ID, &until, false); err != nil {
+		t.Fatalf("creator bans admin: %v", err)
+	}
+
+	if err := s.SetChannelBan(ctx, ch.ID, admin.ID, member.ID, &until, false); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("banned admin bans: err = %v, want ErrNotMember", err)
+	}
+	if err := s.SetChannelRole(ctx, ch.ID, admin.ID, member.ID, 1); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("banned admin promotes: err = %v, want ErrNotMember", err)
+	}
+	got, ok, err := s.ChannelMemberOf(ctx, ch.ID, member.ID)
+	if err != nil || !ok {
+		t.Fatalf("member of: ok=%v err=%v", ok, err)
+	}
+	if got.Role != 0 || got.BannedUntil != nil {
+		t.Errorf("a banned caller wrote to the target: %+v", got)
+	}
+}
+
 func TestChannelRightsRejectSelfAndAbsentTargets(t *testing.T) {
 	t.Parallel()
 	s := open(t)

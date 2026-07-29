@@ -399,6 +399,15 @@ func (s *Store) beginChannelMutation(
 		return fail(fmt.Errorf("caller participant: %w", err))
 	}
 
+	// A banned caller has no rights at all, whatever their role. G3 does not list
+	// the case, so it fails closed: an admin banned by the creator would otherwise
+	// keep banning members, and their row survives LeaveChannel. The creator cannot
+	// be banned by anyone, so this cannot leave a channel with nobody able to grant
+	// rights.
+	if channelMemberFromRow(caller).Banned(time.Now()) {
+		return fail(ErrNotMember)
+	}
+
 	// The target must already hold a row. Neither method may create one — that is
 	// the push primitive re-entering through the side door.
 	target, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
@@ -430,6 +439,8 @@ func (s *Store) beginChannelMutation(
 //   - The target must already have a channel_participants row. Neither method may
 //     create one.
 //   - role accepts only 0 and 1. Role 2 is never assignable.
+//   - A currently-banned caller has no rights on either method, whatever their
+//     role.
 //
 // Every rejection — no such channel, caller not a member, target not a member,
 // insufficient rights — is the SAME error, ErrNotMember. Channel ids are dense
