@@ -43,7 +43,19 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errAuthKeyUnreg
 	}
 
-	dialogs, err := h.store.Dialogs(r.Ctx, r.UserID)
+	limit := req.Limit
+	if limit <= 0 {
+		limit = defaultDialogsLimit
+	}
+	if limit > maxDialogsLimit {
+		limit = maxDialogsLimit
+	}
+
+	// req.OffsetDate and req.OffsetPeer are ignored deliberately. The list is
+	// ordered by top_message, the owner's own monotonic local_id, so offset_id
+	// alone is a total order over the page key; the other two would only mean
+	// something under a different sort.
+	dialogs, err := h.store.Dialogs(r.Ctx, r.UserID, int64(req.OffsetID), limit)
 	if err != nil {
 		h.log.Error("get dialogs", "user_id", r.UserID, "err", err)
 		return nil, errInternal
@@ -113,5 +125,17 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("get dialogs chats", "err", err)
 		return nil, errInternal
 	}
-	return &tg.MessagesDialogs{Dialogs: tlDialogs, Messages: tlMsgs, Users: users, Chats: chats}, nil
+	// A short page reached the end of the list, so the plain reply is accurate. A
+	// full page may have more behind it and must say so, the way getDifference
+	// returns differenceSlice when it truncates. The count is only paid for on
+	// that branch.
+	if len(dialogs) < limit {
+		return &tg.MessagesDialogs{Dialogs: tlDialogs, Messages: tlMsgs, Users: users, Chats: chats}, nil
+	}
+	total, err := h.store.CountDialogs(r.Ctx, r.UserID)
+	if err != nil {
+		h.log.Error("get dialogs count", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return &tg.MessagesDialogsSlice{Count: total, Dialogs: tlDialogs, Messages: tlMsgs, Users: users, Chats: chats}, nil
 }

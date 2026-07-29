@@ -75,12 +75,36 @@ func (q *Queries) AdvanceReadOutbox(ctx context.Context, arg AdvanceReadOutboxPa
 	return result.RowsAffected(), nil
 }
 
-const dialogsForOwner = `-- name: DialogsForOwner :many
-SELECT owner_id, peer_id, top_message, unread_count, read_inbox_max_id, read_outbox_max_id, peer_type FROM dialogs WHERE owner_id = $1 ORDER BY top_message DESC
+const countDialogsForOwner = `-- name: CountDialogsForOwner :one
+SELECT count(*)::int FROM dialogs WHERE owner_id = $1
 `
 
-func (q *Queries) DialogsForOwner(ctx context.Context, ownerID int64) ([]Dialog, error) {
-	rows, err := q.db.Query(ctx, dialogsForOwner, ownerID)
+// CountDialogsForOwner is the total the truncated reply advertises, so a client
+// knows more pages exist. Unfiltered by offset on purpose: it is the size of the
+// whole list, not of the remainder.
+func (q *Queries) CountDialogsForOwner(ctx context.Context, ownerID int64) (int32, error) {
+	row := q.db.QueryRow(ctx, countDialogsForOwner, ownerID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const dialogsForOwner = `-- name: DialogsForOwner :many
+SELECT owner_id, peer_id, top_message, unread_count, read_inbox_max_id, read_outbox_max_id, peer_type FROM dialogs
+WHERE owner_id = $1
+  AND ($2::bigint = 0 OR top_message < $2::bigint)
+ORDER BY top_message DESC
+LIMIT $3::int
+`
+
+type DialogsForOwnerParams struct {
+	OwnerID  int64
+	OffsetID int64
+	Lim      int32
+}
+
+func (q *Queries) DialogsForOwner(ctx context.Context, arg DialogsForOwnerParams) ([]Dialog, error) {
+	rows, err := q.db.Query(ctx, dialogsForOwner, arg.OwnerID, arg.OffsetID, arg.Lim)
 	if err != nil {
 		return nil, err
 	}

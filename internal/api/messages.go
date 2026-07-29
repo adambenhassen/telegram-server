@@ -18,6 +18,9 @@ import (
 const (
 	defaultHistoryLimit = 20
 	maxHistoryLimit     = 100
+
+	defaultDialogsLimit = 20
+	maxDialogsLimit     = 100
 )
 
 // notify emits the cross-replica update nudge for userID (best-effort).
@@ -80,7 +83,7 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 		return h.sendChatMessage(r, toID, &req)
 	}
 
-	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID)
+	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0)
 	if err != nil {
 		h.log.Error("send message", "user_id", r.UserID, "err", err)
 		return nil, errInternal

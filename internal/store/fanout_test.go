@@ -65,7 +65,7 @@ func eventsOf(t *testing.T, s *store.Store, userID int64, fromPts int) []store.E
 
 func dialogOf(t *testing.T, s *store.Store, ownerID, chatID int64) store.Dialog {
 	t.Helper()
-	ds, err := s.Dialogs(context.Background(), ownerID)
+	ds, err := s.Dialogs(context.Background(), ownerID, 0, 100)
 	if err != nil {
 		t.Fatalf("dialogs %d: %v", ownerID, err)
 	}
@@ -147,6 +147,36 @@ func TestSendChatMessageFansOutToEveryMember(t *testing.T) {
 		}
 		if d.UnreadCount != wantUnread || d.TopMessage != m.LocalID {
 			t.Errorf("owner %d dialog = %+v, want unread %d top %d", u.ID, d, wantUnread, m.LocalID)
+		}
+	}
+}
+
+// A chat send puts the file id on every per-member copy, so the gate passes for
+// each member and for nobody else.
+func TestSendChatMessageCarriesFileIDToEveryCopy(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551290011")
+	b := mustUser(t, s, "+15551290012")
+	c := mustUser(t, s, "+15551290013")
+	chat := chatWith(t, s, a, b, c)
+
+	f, err := s.AllocateFile(ctx, a.ID, 11, "text/plain", "hello.txt", bigQuota)
+	if err != nil {
+		t.Fatalf("allocate file: %v", err)
+	}
+	sender, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: a.ID, Text: "here", RandomID: 78, FileID: f.ID})
+	if sender.FileID != f.ID {
+		t.Fatalf("sender copy file_id = %d, want %d", sender.FileID, f.ID)
+	}
+	for _, u := range []store.User{a, b, c} {
+		m, ok := msgOpt(t, s, u.ID, 1)
+		if !ok {
+			t.Fatalf("owner %d got no message row", u.ID)
+		}
+		if m.FileID != f.ID {
+			t.Errorf("owner %d file_id = %d, want %d", u.ID, m.FileID, f.ID)
 		}
 	}
 }

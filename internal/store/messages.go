@@ -40,7 +40,9 @@ type Message struct {
 	PeerLocalID int64
 	// FanoutID links every per-member copy of one chat message; 0 on 1:1 rows,
 	// where the linkage is PeerLocalID instead.
-	FanoutID     int64
+	FanoutID int64
+	// FileID is the uploaded file attached to this message; 0 = no media.
+	FileID       int64
 	Action       ChatAction
 	ActionUserID int64
 }
@@ -60,6 +62,7 @@ func messageFromRow(r db.Message) Message {
 		PeerLocalID: r.PeerLocalID,
 
 		FanoutID:     r.FanoutID,
+		FileID:       r.FileID,
 		Action:       ChatAction(r.ActionType),
 		ActionUserID: r.ActionUserID,
 	}
@@ -86,7 +89,7 @@ func (s *Store) MessageByOwnerLocal(ctx context.Context, ownerID, localID int64)
 // gets its own local_id and its own pts++. A repeated randomID (per sender) is
 // deduped: the original sender message is returned with dup=true and no new rows
 // or events. Returns the sender's stored copy plus both owners' resulting pts.
-func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string, randomID int64) (sender Message, senderPts, recipientPts int, dup bool, err error) {
+func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string, randomID, fileID int64) (sender Message, senderPts, recipientPts int, dup bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("begin: %w", err)
@@ -135,14 +138,14 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 	if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
 		OwnerID: fromID, LocalID: sb.LocalID, PeerType: int16(PeerTypeUser), PeerID: toID, FromID: fromID,
 		Message: text, Out: true, RandomID: randomID, PeerLocalID: rb.LocalID,
-		FanoutID: 0, ActionType: 0, ActionUserID: 0,
+		FanoutID: 0, ActionType: 0, ActionUserID: 0, FileID: fileID,
 	}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("insert sender message: %w", err)
 	}
 	if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
 		OwnerID: toID, LocalID: rb.LocalID, PeerType: int16(PeerTypeUser), PeerID: fromID, FromID: fromID,
 		Message: text, Out: false, RandomID: 0, PeerLocalID: sb.LocalID,
-		FanoutID: 0, ActionType: 0, ActionUserID: 0,
+		FanoutID: 0, ActionType: 0, ActionUserID: 0, FileID: fileID,
 	}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("insert recipient message: %w", err)
 	}
