@@ -316,6 +316,21 @@ func TestSetChannelRolePromotesAndDemotesForTheCreatorOnly(t *testing.T) {
 	if got := roleOf(t, s, ch.ID, member.ID); got != 0 {
 		t.Errorf("role after demote = %d, want 0", got)
 	}
+
+	// G3 lists promotion and demotion and nothing else, so a role the target
+	// already holds is unlisted and fails closed.
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, member.ID, 0); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("member to member: err = %v, want ErrNotMember", err)
+	}
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, member.ID, 1); err != nil {
+		t.Fatalf("re-promote: %v", err)
+	}
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, member.ID, 1); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("admin to admin: err = %v, want ErrNotMember", err)
+	}
+	if got := roleOf(t, s, ch.ID, member.ID); got != 1 {
+		t.Errorf("role after rejected no-ops = %d, want 1", got)
+	}
 }
 
 // G3: an admin holds no promotion right at all, and the rejection is the same

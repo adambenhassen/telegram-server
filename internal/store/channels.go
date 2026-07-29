@@ -438,7 +438,8 @@ func (s *Store) beginChannelMutation(
 //     the only self-directed membership change.
 //   - The target must already have a channel_participants row. Neither method may
 //     create one.
-//   - role accepts only 0 and 1. Role 2 is never assignable.
+//   - role accepts only 0 and 1. Role 2 is never assignable, and a role the
+//     target already holds is not a listed transition either.
 //   - A currently-banned caller has no rights on either method, whatever their
 //     role.
 //
@@ -460,7 +461,9 @@ func (s *Store) SetChannelRole(ctx context.Context, channelID, callerID, targetI
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 
 	// Only the creator grants or revokes rights, and the creator is never a target.
-	if caller.Role != channelRoleCreator || target.Role == channelRoleCreator {
+	// G3 lists two transitions and no more, so a no-op — member to member, admin to
+	// admin — is unlisted and fails closed like anything else.
+	if caller.Role != channelRoleCreator || target.Role == channelRoleCreator || int(target.Role) == role {
 		return ErrNotMember
 	}
 
