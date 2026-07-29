@@ -23,8 +23,11 @@ func peerUserID(peer tg.InputPeerClass) (int64, error) {
 // peerToTL names a stored peer on the wire. peer_id alone is ambiguous — chat
 // ids and user ids come from different sequences — so peer_type decides.
 func peerToTL(peerType store.PeerType, peerID int64) tg.PeerClass {
-	if peerType == store.PeerTypeChat {
+	switch peerType {
+	case store.PeerTypeChat:
 		return &tg.PeerChat{ChatID: peerID}
+	case store.PeerTypeChannel:
+		return &tg.PeerChannel{ChannelID: peerID}
 	}
 	return &tg.PeerUser{UserID: peerID}
 }
@@ -32,13 +35,25 @@ func peerToTL(peerType store.PeerType, peerID int64) tg.PeerClass {
 // inputPeer classifies a client-supplied input peer. InputPeerChat carries no
 // access hash at all, so this only decodes the id: membership in the chat is the
 // entire authorization boundary and every caller MUST check it separately.
-// Anything that is neither InputPeerUser nor InputPeerChat is PEER_ID_INVALID.
+// Anything that is none of InputPeerUser, InputPeerChat or InputPeerChannel is
+// PEER_ID_INVALID.
 func inputPeer(peer tg.InputPeerClass) (store.PeerType, int64, error) {
 	if c, ok := peer.(*tg.InputPeerChat); ok {
 		if c.ChatID == 0 {
 			return 0, 0, errPeerIDInvalid
 		}
 		return store.PeerTypeChat, c.ChatID, nil
+	}
+	if c, ok := peer.(*tg.InputPeerChannel); ok {
+		// The M1 placeholder scheme, the same shape peerUserID validates for
+		// users: access_hash == id. It is NOT an authorization boundary — channel
+		// ids are dense and the hash is derivable from the id, so anyone can name
+		// any channel here. Admission is the invite hash and the membership row,
+		// never this check.
+		if c.ChannelID == 0 || c.AccessHash != c.ChannelID {
+			return 0, 0, errPeerIDInvalid
+		}
+		return store.PeerTypeChannel, c.ChannelID, nil
 	}
 	id, err := peerUserID(peer)
 	if err != nil {

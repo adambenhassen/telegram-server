@@ -22,6 +22,8 @@ type PeerType int16
 const (
 	PeerTypeUser PeerType = 1
 	PeerTypeChat PeerType = 2
+	// PeerTypeChannel is a channel peer; its ids come from the channels sequence.
+	PeerTypeChannel PeerType = 3
 )
 
 // Message is a persisted message row (one side of a two-sided pair).
