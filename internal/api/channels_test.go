@@ -1765,3 +1765,67 @@ func TestChannelEditsRejectBadInput(t *testing.T) {
 		t.Errorf("editBanned on a chat peer: got %s, want PEER_ID_INVALID", msg)
 	}
 }
+
+// A rights struct that revokes something other than view_messages has nothing
+// M7 can store, and it must not fall through to the unban path: a caller
+// tightening a restriction on a banned member would otherwise clear the ban and
+// be told it worked.
+func TestEditBannedRejectsAPartialRestriction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551298081")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551298082")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "Team", "", true)
+	if err != nil {
+		t.Fatalf("create megagroup: %v", err)
+	}
+	joinChannelByInvite(t, s, ch, member.ID)
+	if _, err = banForever(t, s, creator.ID, ch, member.ID); err != nil {
+		t.Fatalf("seed ban: %v", err)
+	}
+
+	_, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
+		Channel:      &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Participant:  &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID},
+		BannedRights: tg.ChatBannedRights{SendMessages: true},
+	})
+	if err == nil {
+		t.Fatal("partial restriction: expected BANNED_RIGHTS_INVALID, got nil")
+	}
+	if msg := rpcMessage(t, err); msg != "BANNED_RIGHTS_INVALID" {
+		t.Errorf("partial restriction: got %s, want BANNED_RIGHTS_INVALID", msg)
+	}
+
+	m, found, err := s.ChannelMemberOf(ctx, ch.ID, member.ID)
+	if err != nil || !found {
+		t.Fatalf("member of: found=%v err=%v", found, err)
+	}
+	if !m.Banned(time.Now()) || !m.Forever() {
+		t.Fatalf("ban was cleared by a rejected edit: banned=%v forever=%v", m.Banned(time.Now()), m.Forever())
+	}
+	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)}); err == nil {
+		t.Fatal("history after a rejected edit: the ban no longer revokes reads")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Errorf("history after a rejected edit: got %s, want PEER_ID_INVALID", msg)
+	}
+
+	// The rejection is decided on the rights struct alone, so it does not need a
+	// channel to exist — which is what keeps it off the post-read error collapse.
+	_, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
+		Channel:      &tg.InputChannel{ChannelID: ch.ID + 1_000_000, AccessHash: ch.ID + 1_000_000},
+		Participant:  &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID},
+		BannedRights: tg.ChatBannedRights{SendMessages: true},
+	})
+	if err == nil {
+		t.Fatal("partial restriction on an absent channel: got nil")
+	} else if msg := rpcMessage(t, err); msg != "BANNED_RIGHTS_INVALID" {
+		t.Errorf("partial restriction on an absent channel: got %s, want BANNED_RIGHTS_INVALID", msg)
+	}
+}

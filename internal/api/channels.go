@@ -601,10 +601,14 @@ func (h *handlers) handleEditAdmin(r *mtproto.Request) (bin.Encoder, error) {
 // handleEditAdmin and for the same reason: the store owns the rule set.
 //
 // ViewMessages is the only flag M7 reads. Set, it is a ban; an until_date of 0
-// means forever and anything else is that instant. Every other restriction flag
-// — SendMessages, SendMedia and the rest — is accepted and IGNORED, because M7
-// has no partial restriction to store: a rights struct that restricts sending
-// but not viewing therefore UNBANS the member rather than half-banning them.
+// means forever and anything else is that instant. The ZERO value — and only
+// the zero value — is the unban.
+//
+// A rights struct that revokes something other than ViewMessages is rejected
+// rather than ignored. M7 has no partial restriction to store, so ignoring the
+// flags would land such a request on the unban path: a caller tightening a
+// restriction on a currently-banned member would clear that member's ban and be
+// told the edit applied, which is the write moving opposite to the request.
 //
 // An until_date already in the past is rejected instead of written. It would
 // otherwise commit a ban that ChannelMember.Banned reports as already lapsed,
@@ -626,6 +630,15 @@ func (h *handlers) handleEditBanned(r *mtproto.Request) (bin.Encoder, error) {
 	targetID, err := peerUserID(req.Participant)
 	if err != nil {
 		return nil, err
+	}
+
+	// Decided on the client's own rights struct, before any channel or
+	// participant row is read — the same ordering errUntilDateInvalid keeps
+	// below. It is reachable without any channel existing, so it is not a
+	// distinguishable outcome an attacker can play off errPeerIDInvalid, and the
+	// post-read collapse to that one error is untouched.
+	if !req.BannedRights.ViewMessages && !req.BannedRights.Zero() {
+		return nil, errBannedRightsInvalid
 	}
 
 	var (
