@@ -70,6 +70,25 @@ func (h *handlers) loadFiles(ctx context.Context, msgs []store.Message) (map[int
 			ids = append(ids, m.FileID)
 		}
 	}
+	return h.fileDocs(ctx, ids)
+}
+
+// loadChannelFiles is loadFiles for channel posts. It is a separate collector
+// for the sentinel alone: channel_messages.file_id is a nullable column, where
+// messages.file_id uses 0 for "no media".
+func (h *handlers) loadChannelFiles(ctx context.Context, msgs []store.ChannelMessage) (map[int64]*tg.Document, error) {
+	var ids []int64
+	for _, m := range msgs {
+		if m.FileID != nil {
+			ids = append(ids, *m.FileID)
+		}
+	}
+	return h.fileDocs(ctx, ids)
+}
+
+// fileDocs hydrates file ids into wire documents. See loadFiles for why the id
+// list may only ever be derived from the caller's own rows.
+func (h *handlers) fileDocs(ctx context.Context, ids []int64) (map[int64]*tg.Document, error) {
 	if len(ids) == 0 {
 		return map[int64]*tg.Document{}, nil
 	}
@@ -110,10 +129,8 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	// No channel send path exists yet, and the 1:1 fallthrough below would treat
-	// the channel id as a user id and write into that account's message rows.
 	if peerType == store.PeerTypeChannel {
-		return nil, errPeerIDInvalid
+		return h.sendChannelMessage(r, toID, &req)
 	}
 	if peerType == store.PeerTypeChat {
 		return h.sendChatMessage(r, toID, &req)
@@ -227,11 +244,6 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	// No channel history path exists yet, and the 1:1 fallthrough below would read
-	// the channel id as a user id out of the caller's own message rows.
-	if peerType == store.PeerTypeChannel {
-		return nil, errPeerIDInvalid
-	}
 	if peerType == store.PeerTypeChat {
 		if err = h.requireMember(r.Ctx, toID, r.UserID); err != nil {
 			return nil, err
@@ -244,6 +256,16 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	if limit > maxHistoryLimit {
 		limit = maxHistoryLimit
+	}
+
+	// A channel keeps one row per post rather than one per member, so it has its
+	// own read path and its own reply type; store.History reads the caller's own
+	// message rows and has nothing to return for a channel peer.
+	if peerType == store.PeerTypeChannel {
+		if err = h.requireChannelMember(r.Ctx, toID, r.UserID); err != nil {
+			return nil, err
+		}
+		return h.channelHistory(r, toID, &req, limit)
 	}
 
 	msgs, err := h.store.History(r.Ctx, r.UserID, peerType, toID, req.OffsetID, limit)

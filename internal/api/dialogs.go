@@ -32,6 +32,62 @@ func (h *handlers) createUsersForDialog(ctx context.Context, chatID, viewerID in
 	return ids, nil
 }
 
+// maxChannelDialogs caps the channels one getDialogs reply carries.
+//
+// Channel dialogs are deliberately NOT paged: channels write no dialogs row, so
+// there is no page key to offset them by, and every page of the dialog list
+// carries the caller's channels again. The account cap is 500 channels, so this
+// is bounded but not free — several queries per channel per call — and the
+// shape is the M6 chat-list deferral again (ROADMAP.md:242). Paging them needs
+// a sort key channels do not yet have. Batching the reads and paging the block
+// is MAIN-109.
+const maxChannelDialogs = 100
+
+// channelDialogs builds the dialog entries for the channels userID belongs to,
+// returning the channel ids referenced, the entries, and the top post of each so
+// the caller can hydrate media for the whole reply in one query. A channel with
+// no posts is skipped: a dialog must name a top message and there is none.
+func (h *handlers) channelDialogs(ctx context.Context, userID int64) (map[int64]bool, []tg.DialogClass, []store.ChannelMessage, error) {
+	chans, err := h.store.ChannelsForUser(ctx, userID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(chans) > maxChannelDialogs {
+		chans = chans[:maxChannelDialogs]
+	}
+
+	ids := make(map[int64]bool, len(chans))
+	dialogs := make([]tg.DialogClass, 0, len(chans))
+	tops := make([]store.ChannelMessage, 0, len(chans))
+	for _, ch := range chans {
+		// The newest post is the top message. A membership row is what put this
+		// channel in the list, so the read is already gated.
+		newest, herr := h.store.ChannelHistory(ctx, ch.ID, 0, 1)
+		if herr != nil {
+			return nil, nil, nil, herr
+		}
+		if len(newest) == 0 {
+			continue
+		}
+		pts, perr := h.store.ChannelState(ctx, ch.ID)
+		if perr != nil {
+			return nil, nil, nil, perr
+		}
+		d := &tg.Dialog{
+			Peer:       &tg.PeerChannel{ChannelID: ch.ID},
+			TopMessage: int(newest[0].LocalID),
+			// Channels keep no per-member read state in M7, so there is no read
+			// marker and no honest unread count to report.
+			UnreadCount: 0,
+		}
+		d.SetPts(pts)
+		ids[ch.ID] = true
+		dialogs = append(dialogs, d)
+		tops = append(tops, newest[0])
+	}
+	return ids, dialogs, tops, nil
+}
+
 // handleGetDialogs serves messages.getDialogs: the caller's conversation list
 // with each dialog's top message and the referenced peer users.
 func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
@@ -118,9 +174,42 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("get dialogs files", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	tlMsgs := make([]tg.MessageClass, len(tops))
+	tlMsgs := make([]tg.MessageClass, 0, len(tops))
 	for i, m := range tops {
-		tlMsgs[i] = messageToTL(m, topCreateUsers[i], files)
+		tlMsgs = append(tlMsgs, messageToTL(m, topCreateUsers[i], files))
+	}
+
+	// Channels write no dialogs row — they keep one message row per channel, not
+	// one per member — so the caller's channels are appended after the paged
+	// rows rather than read out of the page.
+	//
+	// First page only, and that is what keeps the reply honest rather than a
+	// saving: the block is not part of the paged sequence, so appending it to
+	// every page would repeat the same channels on each one and leave a client
+	// that pages to the end holding as many copies as it fetched pages.
+	// offset_id is the whole page key here (see above — offset_date and
+	// offset_peer are ignored), so offset_id == 0 is the only honest test for
+	// "first page"; adding offset_date to it would hide the channels entirely
+	// from a client that sets a field this handler does not page on.
+	var channelIDs map[int64]bool
+	var channelDialogs []tg.DialogClass
+	if req.OffsetID == 0 {
+		ids, ds, channelTops, cerr := h.channelDialogs(r.Ctx, r.UserID)
+		if cerr != nil {
+			h.log.Error("get dialogs channels", "user_id", r.UserID, "err", cerr)
+			return nil, errInternal
+		}
+		channelFiles, ferr := h.loadChannelFiles(r.Ctx, channelTops)
+		if ferr != nil {
+			h.log.Error("get dialogs channel files", "user_id", r.UserID, "err", ferr)
+			return nil, errInternal
+		}
+		channelIDs, channelDialogs = ids, ds
+		tlDialogs = append(tlDialogs, channelDialogs...)
+		for _, m := range channelTops {
+			tlMsgs = append(tlMsgs, channelMessageToTL(m, r.UserID, channelFiles))
+			peerIDs[m.FromID] = true
+		}
 	}
 
 	users, err := h.loadUsers(r.Ctx, peerIDs, r.UserID)
@@ -139,6 +228,12 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("get dialogs chats", "err", err)
 		return nil, errInternal
 	}
+	channels, err := h.loadChannels(r.Ctx, channelIDs, r.UserID)
+	if err != nil {
+		h.log.Error("get dialogs channel peers", "err", err)
+		return nil, errInternal
+	}
+	chats = append(chats, channels...)
 	// A short page reached the end of the list, so the plain reply is accurate. A
 	// full page may have more behind it and must say so, the way getDifference
 	// returns differenceSlice when it truncates. The count is only paid for on
@@ -151,5 +246,14 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("get dialogs count", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	// CountDialogs counts dialogs rows, and channels have none, so the appended
+	// block has to be added or this page would advertise a total smaller than the
+	// list it is shipping. channelDialogs is empty on every page but the first,
+	// where the block is not shipped either, so no page ever ships more rows than
+	// it counts. The count does still shrink by the channel count after the first
+	// page, which is the honest reading of a block that is served once and not
+	// paged; making it constant would mean paying the per-channel reads on every
+	// page purely to count them.
+	total += len(channelDialogs)
 	return &tg.MessagesDialogsSlice{Count: total, Dialogs: tlDialogs, Messages: tlMsgs, Users: users, Chats: chats}, nil
 }

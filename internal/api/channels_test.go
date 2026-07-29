@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
@@ -527,5 +528,511 @@ func TestHandleLeaveChannelRejectsBannedMember(t *testing.T) {
 	}
 	if _, found, err := s.ChannelMemberOf(ctx, ch.ID, member.ID); err != nil || found {
 		t.Fatalf("participant row after leave: found=%v err=%v", found, err)
+	}
+}
+
+// joinChannelByInvite adds userID to ch through the invite path, the only admission
+// route a channel has, and returns the participant row it created.
+func joinChannelByInvite(t *testing.T, s *store.Store, ch store.Channel, userID int64) store.ChannelMember {
+	t.Helper()
+	ctx := context.Background()
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, ch.CreatorID)
+	if err != nil {
+		t.Fatalf("export invite: %v", err)
+	}
+	_, m, err := s.JoinChannelByInvite(ctx, hash, userID)
+	if err != nil {
+		t.Fatalf("join channel: %v", err)
+	}
+	return m
+}
+
+func channelPeer(id int64) tg.InputPeerClass {
+	return &tg.InputPeerChannel{ChannelID: id, AccessHash: id}
+}
+
+func sendToChannel(t *testing.T, s *store.Store, userID, channelID int64, text string, randomID int64) (bin.Encoder, error) {
+	t.Helper()
+	return api.SendMessageForTest(s, userID, &tg.MessagesSendMessageRequest{
+		Peer: channelPeer(channelID), Message: text, RandomID: randomID,
+	})
+}
+
+func updatesOf(t *testing.T, enc bin.Encoder) *tg.Updates {
+	t.Helper()
+	ups, ok := enc.(*tg.Updates)
+	if !ok {
+		t.Fatalf("reply = %T, want *tg.Updates", enc)
+	}
+	return ups
+}
+
+// newChannelMessage pulls the post announcement out of a send reply.
+func newChannelMessage(t *testing.T, enc bin.Encoder) *tg.UpdateNewChannelMessage {
+	t.Helper()
+	ups := updatesOf(t, enc)
+	for _, u := range ups.Updates {
+		if nm, isNew := u.(*tg.UpdateNewChannelMessage); isNew {
+			return nm
+		}
+	}
+	t.Fatalf("no updateNewChannelMessage in %+v", ups.Updates)
+	return nil
+}
+
+func TestSendMessageToChannelAnnouncesTheChannelPost(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292001")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	res, err := sendToChannel(t, s, creator.ID, ch.ID, "first", 111)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	assertEncodes(t, res)
+
+	nm := newChannelMessage(t, res)
+	if nm.Pts != 1 || nm.PtsCount != 1 {
+		t.Errorf("pts = %d/%d, want 1/1", nm.Pts, nm.PtsCount)
+	}
+	msg, ok := nm.Message.(*tg.Message)
+	if !ok {
+		t.Fatalf("message = %T, want *tg.Message", nm.Message)
+	}
+	if msg.Message != "first" || msg.ID != 1 || !msg.Out {
+		t.Errorf("message = %+v, want out post 1 %q", msg, "first")
+	}
+	if peer, isChan := msg.PeerID.(*tg.PeerChannel); !isChan || peer.ChannelID != ch.ID {
+		t.Errorf("peer = %+v, want channel %d", msg.PeerID, ch.ID)
+	}
+	if from, isUser := msg.FromID.(*tg.PeerUser); !isUser || from.UserID != creator.ID {
+		t.Errorf("from = %+v, want user %d", msg.FromID, creator.ID)
+	}
+
+	ups := updatesOf(t, res)
+	if len(ups.Chats) != 1 {
+		t.Fatalf("chats = %d, want 1", len(ups.Chats))
+	}
+	if _, isChan := ups.Chats[0].(*tg.Channel); !isChan {
+		t.Errorf("chat = %T, want *tg.Channel", ups.Chats[0])
+	}
+}
+
+func TestSendMessageToBroadcastRejectsAPlainMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292011")
+	if err != nil {
+		t.Fatalf("create creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551292012")
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if m := joinChannelByInvite(t, s, ch, member.ID); m.Role != 0 {
+		t.Fatalf("joined at role %d, want 0", m.Role)
+	}
+
+	if _, err = sendToChannel(t, s, member.ID, ch.ID, "hi", 222); err == nil {
+		t.Fatal("expected PEER_ID_INVALID, got nil")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("got %s, want PEER_ID_INVALID", msg)
+	}
+
+	// Rejected posts write nothing, so the channel is still at pts 0.
+	pts, err := s.ChannelState(ctx, ch.ID)
+	if err != nil || pts != 0 {
+		t.Fatalf("pts = %d err=%v, want 0", pts, err)
+	}
+}
+
+func TestSendMessageToMegagroupAcceptsAPlainMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292021")
+	if err != nil {
+		t.Fatalf("create creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551292022")
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "Team", "", true)
+	if err != nil {
+		t.Fatalf("create megagroup: %v", err)
+	}
+	joinChannelByInvite(t, s, ch, member.ID)
+
+	res, err := sendToChannel(t, s, member.ID, ch.ID, "hello", 333)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	assertEncodes(t, res)
+	if nm := newChannelMessage(t, res); nm.Pts != 1 {
+		t.Errorf("pts = %d, want 1", nm.Pts)
+	}
+}
+
+func TestSendMessageToChannelResendIsIdempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292031")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	first, err := sendToChannel(t, s, creator.ID, ch.ID, "once", 444)
+	if err != nil {
+		t.Fatalf("first send: %v", err)
+	}
+	again, err := sendToChannel(t, s, creator.ID, ch.ID, "once", 444)
+	if err != nil {
+		t.Fatalf("resend: %v", err)
+	}
+	assertEncodes(t, again)
+
+	a, b := newChannelMessage(t, first), newChannelMessage(t, again)
+	if a.Message.GetID() != b.Message.GetID() {
+		t.Errorf("resend id = %d, want %d", b.Message.GetID(), a.Message.GetID())
+	}
+	pts, err := s.ChannelState(ctx, ch.ID)
+	if err != nil || pts != 1 {
+		t.Fatalf("pts = %d err=%v, want 1 (resend must not advance it)", pts, err)
+	}
+}
+
+func TestChannelReadsRejectANonMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292041")
+	if err != nil {
+		t.Fatalf("create creator: %v", err)
+	}
+	outsider, err := s.CreateUser(ctx, "+15551292042")
+	if err != nil {
+		t.Fatalf("create outsider: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err = sendToChannel(t, s, creator.ID, ch.ID, "secret", 555); err != nil {
+		t.Fatalf("seed post: %v", err)
+	}
+
+	_, err = api.GetChannelMessagesForTest(s, outsider.ID, &tg.ChannelsGetMessagesRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: 1}},
+	})
+	if err == nil {
+		t.Fatal("getMessages: expected PEER_ID_INVALID, got nil")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Errorf("getMessages: got %s, want PEER_ID_INVALID", msg)
+	}
+
+	_, err = api.GetHistoryForTest(s, outsider.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)})
+	if err == nil {
+		t.Fatal("getHistory: expected PEER_ID_INVALID, got nil")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Errorf("getHistory: got %s, want PEER_ID_INVALID", msg)
+	}
+}
+
+// A ban revokes reads, not just writes. M7 has no ban-writing store method yet
+// — that lands in MAIN-93 — so the row is set directly here rather than leaving
+// requireChannelMember's Banned(now) branch with no test at all: a regression
+// that dropped the ban check would otherwise pass green.
+func TestChannelReadsRejectABannedMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, err := s.CreateUser(ctx, "+15551292081")
+	if err != nil {
+		t.Fatalf("create creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551292082")
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "Team", "", true)
+	if err != nil {
+		t.Fatalf("create megagroup: %v", err)
+	}
+	joinChannelByInvite(t, s, ch, member.ID)
+	if _, err = sendToChannel(t, s, creator.ID, ch.ID, "before the ban", 900); err != nil {
+		t.Fatalf("seed post: %v", err)
+	}
+
+	// The member reads fine right up to the ban, so the rejection below is the
+	// ban and not a membership problem.
+	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)}); err != nil {
+		t.Fatalf("history before ban: %v", err)
+	}
+
+	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(time.Hour))
+
+	_, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)})
+	if err == nil {
+		t.Fatal("getHistory: expected PEER_ID_INVALID for a banned member, got nil")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Errorf("getHistory: got %s, want PEER_ID_INVALID", msg)
+	}
+
+	_, err = api.GetChannelMessagesForTest(s, member.ID, &tg.ChannelsGetMessagesRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: 1}},
+	})
+	if err == nil {
+		t.Fatal("getMessages: expected PEER_ID_INVALID for a banned member, got nil")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Errorf("getMessages: got %s, want PEER_ID_INVALID", msg)
+	}
+}
+
+// A member reads the channel's whole history, including the posts made before
+// they joined. join_pts bounds the difference path's replay only; it is a cost
+// control and never a confidentiality one, so this is asserted rather than
+// assumed.
+func TestChannelHistoryServesPostsFromBeforeTheMemberJoined(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292051")
+	if err != nil {
+		t.Fatalf("create creator: %v", err)
+	}
+	latecomer, err := s.CreateUser(ctx, "+15551292052")
+	if err != nil {
+		t.Fatalf("create latecomer: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err = sendToChannel(t, s, creator.ID, ch.ID, "one", 661); err != nil {
+		t.Fatalf("post one: %v", err)
+	}
+	if _, err = sendToChannel(t, s, creator.ID, ch.ID, "two", 662); err != nil {
+		t.Fatalf("post two: %v", err)
+	}
+
+	m := joinChannelByInvite(t, s, ch, latecomer.ID)
+	if m.JoinPts != 2 {
+		t.Fatalf("join_pts = %d, want 2 (the latecomer joined after both posts)", m.JoinPts)
+	}
+
+	res, err := api.GetHistoryForTest(s, latecomer.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)})
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	assertEncodes(t, res)
+	got, ok := res.(*tg.MessagesChannelMessages)
+	if !ok {
+		t.Fatalf("reply = %T, want *tg.MessagesChannelMessages", res)
+	}
+	if got.Pts != 2 || got.Count != 2 || len(got.Messages) != 2 {
+		t.Fatalf("pts=%d count=%d messages=%d, want 2/2/2", got.Pts, got.Count, len(got.Messages))
+	}
+	// Newest first.
+	if got.Messages[0].GetID() != 2 || got.Messages[1].GetID() != 1 {
+		t.Errorf("ids = %d,%d, want 2,1", got.Messages[0].GetID(), got.Messages[1].GetID())
+	}
+	first, isMsg := got.Messages[1].(*tg.Message)
+	if !isMsg || first.Message != "one" || first.Out {
+		t.Errorf("oldest = %+v, want inbound %q", got.Messages[1], "one")
+	}
+}
+
+func TestGetChannelMessagesReturnsTheNamedPosts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292061")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	for i, text := range []string{"one", "two", "three"} {
+		if _, err = sendToChannel(t, s, creator.ID, ch.ID, text, int64(700+i)); err != nil {
+			t.Fatalf("post %s: %v", text, err)
+		}
+	}
+
+	res, err := api.GetChannelMessagesForTest(s, creator.ID, &tg.ChannelsGetMessagesRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		// The third id has no row and must simply be absent from the reply.
+		ID: []tg.InputMessageClass{&tg.InputMessageID{ID: 3}, &tg.InputMessageID{ID: 1}, &tg.InputMessageID{ID: 99}},
+	})
+	if err != nil {
+		t.Fatalf("get channel messages: %v", err)
+	}
+	assertEncodes(t, res)
+	got, ok := res.(*tg.MessagesChannelMessages)
+	if !ok {
+		t.Fatalf("reply = %T, want *tg.MessagesChannelMessages", res)
+	}
+	if got.Pts != 3 || got.Count != 2 || len(got.Messages) != 2 {
+		t.Fatalf("pts=%d count=%d messages=%d, want 3/2/2", got.Pts, got.Count, len(got.Messages))
+	}
+	if got.Messages[0].GetID() != 3 || got.Messages[1].GetID() != 1 {
+		t.Errorf("ids = %d,%d, want the requested order 3,1", got.Messages[0].GetID(), got.Messages[1].GetID())
+	}
+}
+
+// Channels are not part of the paged dialogs sequence, so they ship once, on
+// the first page. A later page repeating them would hand a client that pages to
+// the end one copy per page, and a page whose Count omitted them would advertise
+// a total smaller than the list it ships.
+func TestGetDialogsShipsChannelsOnTheFirstPageOnly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	me, err := s.CreateUser(ctx, "+15551292091")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	other, err := s.CreateUser(ctx, "+15551292092")
+	if err != nil {
+		t.Fatalf("create peer: %v", err)
+	}
+	if _, err = api.SendMessageForTest(s, me.ID, &tg.MessagesSendMessageRequest{
+		Peer: &tg.InputPeerUser{UserID: other.ID, AccessHash: other.ID}, Message: "hi", RandomID: 910,
+	}); err != nil {
+		t.Fatalf("seed 1:1 dialog: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, me.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err = sendToChannel(t, s, me.ID, ch.ID, "post", 911); err != nil {
+		t.Fatalf("seed post: %v", err)
+	}
+
+	// Limit 1 with one dialog row is a full page, so the reply is the slice form
+	// that carries a count.
+	first, err := api.GetDialogsPageForTest(s, me.ID, &tg.MessagesGetDialogsRequest{
+		Limit: 1, OffsetPeer: &tg.InputPeerEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	assertEncodes(t, first)
+	slice, ok := first.(*tg.MessagesDialogsSlice)
+	if !ok {
+		t.Fatalf("first page = %T, want *tg.MessagesDialogsSlice", first)
+	}
+	if len(slice.Dialogs) != 2 {
+		t.Fatalf("first page dialogs = %d, want the 1:1 row plus the channel", len(slice.Dialogs))
+	}
+	if slice.Count != len(slice.Dialogs) {
+		t.Errorf("count = %d, want %d — a page may not advertise fewer than it ships", slice.Count, len(slice.Dialogs))
+	}
+
+	// Second page: the paged sequence is exhausted and the channel block must not
+	// come back with it.
+	second, err := api.GetDialogsPageForTest(s, me.ID, &tg.MessagesGetDialogsRequest{
+		Limit: 1, OffsetID: 1, OffsetPeer: &tg.InputPeerEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	assertEncodes(t, second)
+	page2, ok := second.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("second page = %T, want *tg.MessagesDialogs", second)
+	}
+	for _, d := range page2.Dialogs {
+		if dlg, isDialog := d.(*tg.Dialog); isDialog {
+			if _, isChan := dlg.Peer.(*tg.PeerChannel); isChan {
+				t.Errorf("channel repeated on page 2: %+v", dlg.Peer)
+			}
+		}
+	}
+}
+
+func TestGetDialogsListsTheCallersChannels(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292071")
+	if err != nil {
+		t.Fatalf("create creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551292072")
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	joinChannelByInvite(t, s, ch, member.ID)
+	// An empty channel has no top message and must not appear in the list.
+	if _, err = s.CreateChannel(ctx, creator.ID, "Empty", "", false); err != nil {
+		t.Fatalf("create empty channel: %v", err)
+	}
+	for i, text := range []string{"one", "two"} {
+		if _, err = sendToChannel(t, s, creator.ID, ch.ID, text, int64(800+i)); err != nil {
+			t.Fatalf("post %s: %v", text, err)
+		}
+	}
+
+	res, err := api.GetDialogsForTest(s, member.ID)
+	if err != nil {
+		t.Fatalf("get dialogs: %v", err)
+	}
+	assertEncodes(t, res)
+	got, ok := res.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("reply = %T, want *tg.MessagesDialogs", res)
+	}
+	if len(got.Dialogs) != 1 {
+		t.Fatalf("dialogs = %d, want 1", len(got.Dialogs))
+	}
+	d, isDialog := got.Dialogs[0].(*tg.Dialog)
+	if !isDialog {
+		t.Fatalf("dialog = %T, want *tg.Dialog", got.Dialogs[0])
+	}
+	peer, isChan := d.Peer.(*tg.PeerChannel)
+	if !isChan || peer.ChannelID != ch.ID {
+		t.Fatalf("peer = %+v, want channel %d", d.Peer, ch.ID)
+	}
+	if d.TopMessage != 2 {
+		t.Errorf("top message = %d, want 2", d.TopMessage)
+	}
+	if pts, hasPts := d.GetPts(); !hasPts || pts != 2 {
+		t.Errorf("pts = %d present=%v, want 2", pts, hasPts)
+	}
+	if len(got.Messages) != 1 || got.Messages[0].GetID() != 2 {
+		t.Errorf("messages = %+v, want the channel's post 2", got.Messages)
+	}
+	if len(got.Chats) != 1 {
+		t.Fatalf("chats = %d, want the channel", len(got.Chats))
+	}
+	if _, isChannel := got.Chats[0].(*tg.Channel); !isChannel {
+		t.Errorf("chat = %T, want *tg.Channel", got.Chats[0])
 	}
 }

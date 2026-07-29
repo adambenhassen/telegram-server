@@ -34,22 +34,28 @@ func TestPeerToTLChannel(t *testing.T) {
 	}
 }
 
-// A channel input peer now resolves instead of failing in inputPeer, so every
-// handler that has no channel path of its own has to reject it explicitly. The
-// 1:1 fallthrough would otherwise read the channel id as a user id and write
-// into that account's message rows.
-func TestSendMessageRejectsChannelPeer(t *testing.T) {
+// A channel input peer resolves in inputPeer, and the placeholder access hash it
+// validates is derivable from the id, so nothing about naming a channel here is
+// an authorization step. sendMessage now has a channel path, and what still has
+// to hold is that the path rejects a caller with no participant row: the 1:1
+// fallthrough would otherwise read the channel id as a user id and write into
+// that account's message rows.
+func TestSendMessageRejectsChannelPeerFromNonMember(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
 	u, err := s.CreateUser(context.Background(), "+15551940001")
 	if err != nil {
 		t.Fatalf("user: %v", err)
 	}
+	outsider, err := s.CreateUser(context.Background(), "+15551940002")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
 	ch, err := s.CreateChannel(context.Background(), u.ID, "news", "", false)
 	if err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	_, err = api.SendMessageForTest(s, u.ID, &tg.MessagesSendMessageRequest{
+	_, err = api.SendMessageForTest(s, outsider.ID, &tg.MessagesSendMessageRequest{
 		Peer:     &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID},
 		Message:  "hi",
 		RandomID: 11,
