@@ -36,6 +36,62 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.UploadPartTTL != 6*time.Hour {
 		t.Errorf("UploadPartTTL = %v, want 6h", cfg.UploadPartTTL)
 	}
+	if cfg.BlobDir != "blobs" {
+		t.Errorf("BlobDir = %q, want blobs", cfg.BlobDir)
+	}
+	if cfg.MaxUserStorageBytes != 2<<30 {
+		t.Errorf("MaxUserStorageBytes = %d, want %d", cfg.MaxUserStorageBytes, int64(2<<30))
+	}
+}
+
+func TestLoadBlobDir(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_BLOB_DIR", "/var/lib/telegramd/blobs")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BlobDir != "/var/lib/telegramd/blobs" {
+		t.Errorf("BlobDir = %q", cfg.BlobDir)
+	}
+}
+
+func TestLoadMaxUserStorageBytes(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	tests := map[string]struct {
+		raw     string
+		want    int64
+		wantErr bool
+	}{
+		"unset":       {raw: "", want: 2 << 30},
+		"override":    {raw: "1048576", want: 1048576},
+		"not integer": {raw: "2GB", wantErr: true},
+		"zero":        {raw: "0", wantErr: true},
+		"negative":    {raw: "-1", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TG_MAX_USER_STORAGE_BYTES", tc.raw)
+			cfg, err := config.Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load: expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), "TG_MAX_USER_STORAGE_BYTES") {
+					t.Fatalf("Load: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.MaxUserStorageBytes != tc.want {
+				t.Errorf("MaxUserStorageBytes = %d, want %d", cfg.MaxUserStorageBytes, tc.want)
+			}
+		})
+	}
 }
 
 func TestLoadMaxFileBytes(t *testing.T) {
