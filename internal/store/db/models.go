@@ -42,6 +42,17 @@ type Dialog struct {
 	PeerType        int16
 }
 
+type File struct {
+	ID         int64
+	UploaderID int64
+	AccessHash int64
+	Size       int64
+	MimeType   string
+	FileName   string
+	Stored     bool
+	Date       pgtype.Timestamptz
+}
+
 type Message struct {
 	OwnerID      int64
 	LocalID      int64
@@ -58,6 +69,7 @@ type Message struct {
 	FanoutID     int64
 	ActionType   int16
 	ActionUserID int64
+	FileID       int64
 }
 
 type MessageEvent struct {
@@ -83,6 +95,14 @@ type UpdateState struct {
 	Seq         int64
 	Date        pgtype.Timestamptz
 	NextLocalID int64
+}
+
+type UploadPart struct {
+	UserID    int64
+	FileID    int64
+	PartIndex int32
+	Payload   []byte
+	Date      pgtype.Timestamptz
 }
 
 type User struct {
