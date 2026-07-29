@@ -238,6 +238,17 @@ func TestFileForDownloadChannelMember(t *testing.T) {
 		t.Fatalf("member of another channel: want ErrFileNotFound, got %v", err)
 	}
 
+	// Membership entitles to the files a post in that channel carries, not to
+	// every stored file: without cm.file_id = f.id, orphan — stored and posted
+	// nowhere — is readable by any member of any channel.
+	orphan := allocate(t, s, creator.ID, 11)
+	if err := s.MarkFileStored(ctx, orphan.ID); err != nil {
+		t.Fatalf("mark orphan stored: %v", err)
+	}
+	if _, err := s.FileForDownload(ctx, orphan.ID, orphan.AccessHash, member.ID); !errors.Is(err, store.ErrFileNotFound) {
+		t.Fatalf("file with no channel post: want ErrFileNotFound, got %v", err)
+	}
+
 	// A live ban revokes, and lifting it restores.
 	future := time.Now().Add(time.Hour)
 	if err := store.SetChannelBan(ctx, s, channelID, member.ID, &future); err != nil {
