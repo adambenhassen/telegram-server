@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -199,5 +200,101 @@ func TestChannelHistoryNewestFirstSkipsDeleted(t *testing.T) {
 	}
 	if len(history) != 1 || history[0].LocalID != 1 {
 		t.Fatalf("offset page = %+v, want local_id 1 only", history)
+	}
+}
+
+// The channel_state row lock ahead of the dedup read is the one thing here that
+// the per-account original does not have, so it gets its own test: two posts of
+// the same random_id landing at once must serialise on that row, and exactly one
+// of them must come back a duplicate. Without the lock both can miss the lookup
+// and the second dies on channel_messages_random_uniq instead.
+func TestPostChannelMessageDedupsUnderConcurrency(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	author := mustUser(t, s, "+15551260005")
+	ch := mustChannel(t, s, author.ID, "news")
+
+	const posters = 4
+	var wg sync.WaitGroup
+	results := make([]struct {
+		msg store.ChannelMessage
+		pts int
+		dup bool
+		err error
+	}, posters)
+	start := make(chan struct{})
+	for i := range posters {
+		wg.Go(func() {
+			<-start
+			r := &results[i]
+			r.msg, r.pts, r.dup, r.err = s.PostChannelMessage(ctx, ch, author.ID, "hi", 42, nil)
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	dups := 0
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("post %d: %v", i, r.err)
+		}
+		if r.msg.LocalID != 1 || r.pts != 1 {
+			t.Fatalf("post %d: local_id %d pts %d, want 1,1", i, r.msg.LocalID, r.pts)
+		}
+		if r.dup {
+			dups++
+		}
+	}
+	if dups != posters-1 {
+		t.Fatalf("%d posts flagged dup, want %d", dups, posters-1)
+	}
+
+	pts, err := s.ChannelState(ctx, ch)
+	if err != nil || pts != 1 {
+		t.Fatalf("channel state = %d, err %v; want 1", pts, err)
+	}
+	history, err := s.ChannelHistory(ctx, ch, 0, 10)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("history = %d rows, want 1", len(history))
+	}
+}
+
+// ChannelMessages keeps deleted rows and ChannelHistory drops them. The split is
+// intentional — event hydration has to be able to name a post a delete event
+// removed — so it is asserted rather than left to read as an oversight.
+func TestChannelMessagesKeepsDeletedRows(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	author := mustUser(t, s, "+15551260006")
+	ch := mustChannel(t, s, author.ID, "news")
+
+	post(t, s, ch, author.ID, "one", 1)
+	if err := store.MarkChannelMessageDeleted(ctx, s, ch, 1); err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
+
+	msgs, err := s.ChannelMessages(ctx, ch, []int64{1})
+	if err != nil {
+		t.Fatalf("channel messages: %v", err)
+	}
+	got, ok := msgs[1]
+	if !ok {
+		t.Fatal("deleted post missing from ChannelMessages")
+	}
+	if !got.Deleted || got.Message != "one" {
+		t.Fatalf("deleted post = %+v", got)
+	}
+
+	history, err := s.ChannelHistory(ctx, ch, 0, 10)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("history = %+v, want empty", history)
 	}
 }

@@ -57,6 +57,11 @@ func channelMessageFromRow(r db.ChannelMessage) ChannelMessage {
 // ChannelState returns the channel's current pts. A channel that has never been
 // posted to has no channel_state row yet and reports 0, so a difference against
 // it works from the moment the channel exists.
+//
+// A channel id that does not exist reports 0 as well: this is not an existence
+// check and cannot be used as one. Callers gate on the channel and on the
+// caller's membership of it before they get here, as everywhere else in this
+// package.
 func (s *Store) ChannelState(ctx context.Context, channelID int64) (int, error) {
 	row, err := s.q.GetChannelState(ctx, channelID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -169,7 +174,10 @@ func (s *Store) ChannelEventsWindow(ctx context.Context, channelID int64, fromPt
 	return events, nil
 }
 
-// ChannelMessages returns the requested posts keyed by local_id. Ids with no row
+// ChannelMessages returns the requested posts keyed by local_id, deleted rows
+// included — deliberately, and unlike ChannelHistory, which excludes them. This
+// is the hydration read behind an event log, and a delete event has to be able
+// to name the post it removed. Ids with no row
 // are simply absent from the map, which is what hydrating an event log against a
 // channel someone has pruned looks like.
 func (s *Store) ChannelMessages(ctx context.Context, channelID int64, localIDs []int64) (map[int64]ChannelMessage, error) {
