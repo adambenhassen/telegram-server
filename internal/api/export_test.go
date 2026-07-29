@@ -39,7 +39,53 @@ func MaxFileParts() int {
 }
 
 func testHandlers(s *store.Store) *handlers {
-	return &handlers{store: s, log: slog.New(slog.DiscardHandler), maxFileBytes: TestMaxFileBytes}
+	return &handlers{
+		store:        s,
+		log:          slog.New(slog.DiscardHandler),
+		maxFileBytes: TestMaxFileBytes,
+		downloads:    map[int64]bool{},
+	}
+}
+
+// MaxDownloadChunk exposes the per-reply download cap to the api_test package.
+const MaxDownloadChunk = maxDownloadChunk
+
+// GetFileSeqForTest returns a getFile bound to ONE handlers value, so
+// successive calls share the in-flight download slot. GetFileForTest builds a
+// fresh handler per call and therefore cannot observe a leaked slot.
+func GetFileSeqForTest(
+	s *store.Store, blobs blob.Store,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	h := testHandlers(s)
+	h.blobs = blobs
+	return func(userID int64, req *tg.UploadGetFileRequest) (bin.Encoder, error) {
+		var buf bin.Buffer
+		if err := req.Encode(&buf); err != nil {
+			return nil, err
+		}
+		return h.handleGetFile(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+	}
+}
+
+// DownloadSlotForTest exposes the per-account in-flight download slot, which
+// needs no store.
+func DownloadSlotForTest() (begin func(int64) bool, end func(int64)) {
+	h := testHandlers(nil)
+	return h.beginDownload, h.endDownload
+}
+
+// GetFileForTest encodes req and invokes handleGetFile for the caller against
+// blobs.
+func GetFileForTest(
+	s *store.Store, userID int64, blobs blob.Store, req *tg.UploadGetFileRequest,
+) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.blobs = blobs
+	return h.handleGetFile(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // SaveFilePartForTest encodes req and invokes handleSaveFilePart for the caller.
