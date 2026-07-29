@@ -93,8 +93,9 @@ type UploadPartsSummaryRow struct {
 }
 
 // UploadPartsSummary is what assembly checks contiguity with: part indexes are
-// distinct and non-negative by the primary key, so n = total and max = total-1
-// together prove the set is exactly {0 .. total-1} with no gaps.
+// distinct by the primary key and non-negative because partIndexOf rejects a
+// negative index, so n = total and max = total-1 together prove the set is
+// exactly {0 .. total-1} with no gaps.
 func (q *Queries) UploadPartsSummary(ctx context.Context, arg UploadPartsSummaryParams) (UploadPartsSummaryRow, error) {
 	row := q.db.QueryRow(ctx, uploadPartsSummary, arg.UserID, arg.FileID)
 	var i UploadPartsSummaryRow
@@ -129,14 +130,20 @@ func (q *Queries) UpsertUploadPart(ctx context.Context, arg UpsertUploadPartPara
 	return err
 }
 
-const userOutstandingBytes = `-- name: UserOutstandingBytes :one
-SELECT coalesce(sum(length(payload)), 0)::bigint FROM upload_parts
-WHERE user_id = $1
+const userOutstanding = `-- name: UserOutstanding :one
+SELECT count(*)::bigint AS parts,
+       coalesce(sum(length(payload)), 0)::bigint AS total_bytes
+FROM upload_parts WHERE user_id = $1
 `
 
-func (q *Queries) UserOutstandingBytes(ctx context.Context, userID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, userOutstandingBytes, userID)
-	var column_1 int64
-	err := row.Scan(&column_1)
-	return column_1, err
+type UserOutstandingRow struct {
+	Parts      int64
+	TotalBytes int64
+}
+
+func (q *Queries) UserOutstanding(ctx context.Context, userID int64) (UserOutstandingRow, error) {
+	row := q.db.QueryRow(ctx, userOutstanding, userID)
+	var i UserOutstandingRow
+	err := row.Scan(&i.Parts, &i.TotalBytes)
+	return i, err
 }

@@ -154,6 +154,109 @@ func TestSaveUploadPartUserQuota(t *testing.T) {
 	}
 }
 
+// A row costs far more than a 1-byte payload, so the byte cap alone lets a
+// client hold ~2*maxFileBytes rows. rowCapFile is small enough that the row cap
+// binds first: at 1 byte a part, 2*maxFileBytes+1 parts would be needed to trip
+// the byte cap and only rowCapParts+1 to trip the row cap.
+const (
+	rowCapFile  = 3 * store.MinPartBytesForRowCap
+	rowCapParts = 2 * (rowCapFile / store.MinPartBytesForRowCap)
+)
+
+func TestSaveUploadPartRowCap(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000011")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	for i := range rowCapParts {
+		if err := s.SaveUploadPart(ctx, u.ID, 1, i, part('a', 1), rowCapFile); err != nil {
+			t.Fatalf("save part %d: %v", i, err)
+		}
+	}
+	err = s.SaveUploadPart(ctx, u.ID, 1, rowCapParts, part('a', 1), rowCapFile)
+	if !errors.Is(err, store.ErrTooManyParts) {
+		t.Fatalf("over row cap: %v", err)
+	}
+
+	parts, _, _, err := s.UploadPartsSummary(ctx, u.ID, 1)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if parts != rowCapParts {
+		t.Fatalf("row cap rollback failed: parts=%d, want %d", parts, rowCapParts)
+	}
+}
+
+// The point of MinPartBytesForRowCap: a client using ordinary part sizes must
+// hit the byte cap, never the row cap.
+//
+// The margin has to be built deliberately. When maxFileBytes is a multiple of
+// MinPartBytesForRowCap, exact 32 KiB parts trip both caps on the same call and
+// the byte error only wins because its check is written first — that asserts
+// statement order, not a margin. marginFile is 2.5 parts, so the row cap rounds
+// up to 6 while the byte cap allows only 5: part 6 is over bytes with the row
+// count still strictly under its cap, whichever order the two checks run in.
+const (
+	marginFile    = 5 * store.MinPartBytesForRowCap / 2
+	marginByteCap = 2 * marginFile / store.MinPartBytesForRowCap // 5 parts
+	marginPerFile = 2                                            // 2*32 KiB <= marginFile, so the per-file cap never fires
+	marginRowCap  = 6                                            // 2*ceil(marginFile/32 KiB)
+)
+
+func TestSaveUploadPartRowCapNoFalsePositive(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000012")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	for i := range marginByteCap {
+		if err := s.SaveUploadPart(ctx, u.ID, int64(i/marginPerFile), i%marginPerFile, part('a', store.MinPartBytesForRowCap), marginFile); err != nil {
+			t.Fatalf("save part %d: %v", i, err)
+		}
+	}
+	// marginByteCap+1 parts is over the byte cap and still under the row cap.
+	if marginByteCap+1 > marginRowCap {
+		t.Fatalf("test setup has no margin: byte cap trips at %d parts, row cap at %d", marginByteCap+1, marginRowCap+1)
+	}
+	err = s.SaveUploadPart(ctx, u.ID, marginByteCap/marginPerFile, marginByteCap%marginPerFile, part('a', store.MinPartBytesForRowCap), marginFile)
+	if !errors.Is(err, store.ErrUploadQuota) {
+		t.Fatalf("32 KiB parts over the byte cap: got %v, want ErrUploadQuota", err)
+	}
+}
+
+func TestUploadRowCapIsPerUser(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a, err := s.CreateUser(ctx, "+15559000013")
+	if err != nil {
+		t.Fatalf("create user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15559000014")
+	if err != nil {
+		t.Fatalf("create user b: %v", err)
+	}
+
+	for i := range rowCapParts {
+		if err := s.SaveUploadPart(ctx, a.ID, 1, i, part('a', 1), rowCapFile); err != nil {
+			t.Fatalf("save a part %d: %v", i, err)
+		}
+	}
+	if err := s.SaveUploadPart(ctx, a.ID, 1, rowCapParts, part('a', 1), rowCapFile); !errors.Is(err, store.ErrTooManyParts) {
+		t.Fatalf("a over row cap: %v", err)
+	}
+	if err := s.SaveUploadPart(ctx, b.ID, 1, 0, part('b', 1), rowCapFile); err != nil {
+		t.Fatalf("b blocked by a: %v", err)
+	}
+}
+
 // Two accounts naming the same client-chosen file_id must not see each other's
 // bytes: user_id is part of the primary key and of every lookup.
 func TestUploadPartsIsolatedPerUser(t *testing.T) {
