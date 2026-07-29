@@ -8,15 +8,6 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
-func mustChannel(t *testing.T, s *store.Store, creatorID int64, title string) int64 {
-	t.Helper()
-	id, err := store.InsertTestChannel(context.Background(), s, creatorID, title)
-	if err != nil {
-		t.Fatalf("create channel %q: %v", title, err)
-	}
-	return id
-}
-
 func post(t *testing.T, s *store.Store, channelID, fromID int64, text string, rid int64) (store.ChannelMessage, int) {
 	t.Helper()
 	m, pts, dup, err := s.PostChannelMessage(context.Background(), channelID, fromID, text, rid, nil)
@@ -34,7 +25,7 @@ func TestPostChannelMessageAdvancesStream(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	author := mustUser(t, s, "+15551260001")
-	ch := mustChannel(t, s, author.ID, "news")
+	ch := mustChannel(t, s, author.ID, "news").ID
 
 	if pts, err := s.ChannelState(ctx, ch); err != nil || pts != 0 {
 		t.Fatalf("fresh channel state = %d, err %v; want 0", pts, err)
@@ -95,7 +86,7 @@ func TestPostChannelMessageDedupsRandomID(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	author := mustUser(t, s, "+15551260002")
-	ch := mustChannel(t, s, author.ID, "news")
+	ch := mustChannel(t, s, author.ID, "news").ID
 
 	first, pts1 := post(t, s, ch, author.ID, "hi", 42)
 
@@ -138,7 +129,7 @@ func TestChannelEventsWindowIsBounded(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	author := mustUser(t, s, "+15551260003")
-	ch := mustChannel(t, s, author.ID, "news")
+	ch := mustChannel(t, s, author.ID, "news").ID
 
 	post(t, s, ch, author.ID, "one", 1)
 	post(t, s, ch, author.ID, "two", 2)
@@ -168,7 +159,7 @@ func TestChannelHistoryNewestFirstSkipsDeleted(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	author := mustUser(t, s, "+15551260004")
-	ch := mustChannel(t, s, author.ID, "news")
+	ch := mustChannel(t, s, author.ID, "news").ID
 
 	post(t, s, ch, author.ID, "one", 1)
 	post(t, s, ch, author.ID, "two", 2)
@@ -213,7 +204,7 @@ func TestPostChannelMessageDedupsUnderConcurrency(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	author := mustUser(t, s, "+15551260005")
-	ch := mustChannel(t, s, author.ID, "news")
+	ch := mustChannel(t, s, author.ID, "news").ID
 
 	const posters = 4
 	var wg sync.WaitGroup
@@ -271,7 +262,7 @@ func TestChannelMessagesKeepsDeletedRows(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	author := mustUser(t, s, "+15551260006")
-	ch := mustChannel(t, s, author.ID, "news")
+	ch := mustChannel(t, s, author.ID, "news").ID
 
 	post(t, s, ch, author.ID, "one", 1)
 	if err := store.MarkChannelMessageDeleted(ctx, s, ch, 1); err != nil {

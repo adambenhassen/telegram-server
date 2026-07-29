@@ -142,19 +142,6 @@ func InsertTestEvent(ctx context.Context, s *Store, ownerID int64, typ EventType
 	})
 }
 
-// InsertTestChannel creates a channel row. The shipped channel-creation path is
-// MAIN-84's; the post/pts tests need a channel id before it lands and must not
-// grow a second creation path of their own, so this writes the one row the FK
-// needs and nothing else.
-func InsertTestChannel(ctx context.Context, s *Store, creatorID int64, title string) (int64, error) {
-	var id int64
-	err := s.pool.QueryRow(ctx,
-		`INSERT INTO channels (title, creator_id) VALUES ($1, $2) RETURNING id`,
-		title, creatorID,
-	).Scan(&id)
-	return id, err
-}
-
 // MarkChannelMessageDeleted flips a post's deleted flag with no event and no pts
 // bump. Channel edit/delete is a later ticket; this exists so ChannelHistory's
 // exclusion of deleted rows is provable now.
