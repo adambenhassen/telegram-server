@@ -110,6 +110,11 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	if err != nil {
 		return nil, err
 	}
+	// No channel send path exists yet, and the 1:1 fallthrough below would treat
+	// the channel id as a user id and write into that account's message rows.
+	if peerType == store.PeerTypeChannel {
+		return nil, errPeerIDInvalid
+	}
 	if peerType == store.PeerTypeChat {
 		return h.sendChatMessage(r, toID, &req)
 	}
@@ -221,6 +226,11 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	peerType, toID, err := inputPeer(req.Peer)
 	if err != nil {
 		return nil, err
+	}
+	// No channel history path exists yet, and the 1:1 fallthrough below would read
+	// the channel id as a user id out of the caller's own message rows.
+	if peerType == store.PeerTypeChannel {
+		return nil, errPeerIDInvalid
 	}
 	if peerType == store.PeerTypeChat {
 		if err = h.requireMember(r.Ctx, toID, r.UserID); err != nil {

@@ -133,12 +133,13 @@ func GetStateForTest(s *store.Store, userID int64) (bin.Encoder, error) {
 var PeerUserID = peerUserID
 
 // Peer-resolution and wire-mapping helpers, exposed for the external api_test
-// package. All four are pure and need no store.
+// package. All of them are pure and need no store.
 var (
 	InputPeer   = inputPeer
 	InputUserID = inputUserID
 	PeerToTL    = peerToTL
 	ChatToTL    = chatToTL
+	ChannelToTL = channelToTL
 )
 
 // MessageToTL maps a media-free row, which is every row a pure mapper test
@@ -167,6 +168,15 @@ func LoadChatsForTest(s *store.Store, ids []int64, viewerID int64) ([]tg.ChatCla
 		set[id] = true
 	}
 	return testHandlers(s).loadChats(context.Background(), set, viewerID)
+}
+
+// LoadChannelsForTest exposes loadChannels for the external api_test package.
+func LoadChannelsForTest(s *store.Store, ids []int64, viewerID int64) ([]tg.ChatClass, error) {
+	set := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return testHandlers(s).loadChannels(context.Background(), set, viewerID)
 }
 
 // GetDifferenceForTest encodes req and invokes handleGetDifference for the caller.

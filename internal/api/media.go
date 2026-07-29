@@ -136,6 +136,11 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	if err != nil {
 		return nil, err
 	}
+	// No channel send path exists yet, and the 1:1 fallthrough below would treat
+	// the channel id as a user id and write into that account's message rows.
+	if peerType == store.PeerTypeChannel {
+		return nil, errPeerIDInvalid
+	}
 	if peerType == store.PeerTypeChat {
 		if err = h.requireMember(r.Ctx, toID, r.UserID); err != nil {
 			return nil, err

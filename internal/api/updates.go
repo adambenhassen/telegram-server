@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"sort"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -112,6 +113,36 @@ func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
 		Date:              int(c.Date.Unix()),
 		Version:           c.Version,
 		Photo:             &tg.ChatPhotoEmpty{},
+	}
+}
+
+// channelToTL maps a stored channel to the wire. member says whether the viewer
+// is currently entitled to the channel's metadata; a non-member and a banned
+// member are the same answer, since a ban that still served the live title would
+// be cosmetic.
+//
+// AccessHash is the M1 placeholder (access_hash == id). The forbidden form
+// carries an empty title on purpose, the rule M6 settled for ChatForbidden: the
+// row keeps changing after someone leaves, and any remaining member may rename
+// it, so serving the live title would leave a writable channel into a client
+// that is no longer entitled to it.
+//
+// M7 stores no username, photo, participants count or admin rights, so none is
+// ever set here. store.Channel.Version has no wire counterpart either: unlike
+// tg.Chat, the current tg.Channel schema carries no version field.
+func channelToTL(c store.Channel, m store.ChannelMember, member bool) tg.ChatClass {
+	if !member {
+		return &tg.ChannelForbidden{ID: c.ID, AccessHash: c.ID, Title: ""}
+	}
+	return &tg.Channel{
+		ID:         c.ID,
+		Title:      c.Title,
+		AccessHash: c.ID,
+		Date:       int(c.Date.Unix()),
+		Megagroup:  c.Megagroup,
+		Broadcast:  !c.Megagroup,
+		Creator:    m.Role == 2,
+		Left:       false,
 	}
 }
 
@@ -413,6 +444,32 @@ func (h *handlers) loadChats(ctx context.Context, ids map[int64]bool, viewerID i
 		chats = append(chats, chatToTL(c, len(parts), viewerID))
 	}
 	return chats, nil
+}
+
+// loadChannels hydrates channel ids for viewerID, the channel counterpart of
+// loadChats. An id with no channel row is skipped. A viewer who is not a member,
+// or whose membership is banned as of now, gets tg.ChannelForbidden — a ban is
+// not cosmetic, so it must revoke metadata the same way leaving does.
+//
+// Two queries per channel per batch, no cache, for the reason loadChats states:
+// a batch names very few distinct channels.
+func (h *handlers) loadChannels(ctx context.Context, ids map[int64]bool, viewerID int64) ([]tg.ChatClass, error) {
+	channels := make([]tg.ChatClass, 0, len(ids))
+	for id := range ids {
+		ch, ok, err := h.store.ChannelByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		member, found, err := h.store.ChannelMemberOf(ctx, id, viewerID)
+		if err != nil {
+			return nil, err
+		}
+		channels = append(channels, channelToTL(ch, member, found && !member.Banned(time.Now())))
+	}
+	return channels, nil
 }
 
 // handleGetState serves updates.getState.
