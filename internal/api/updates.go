@@ -127,9 +127,15 @@ func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
 // it, so serving the live title would leave a writable channel into a client
 // that is no longer entitled to it.
 //
-// M7 stores no username, photo, participants count or admin rights, so none is
-// ever set here. store.Channel.Version has no wire counterpart either: unlike
-// tg.Chat, the current tg.Channel schema carries no version field.
+// M7 stores no username, participants count or admin rights, so none is ever set
+// here. store.Channel.Version has no wire counterpart either: unlike tg.Chat, the
+// current tg.Channel schema carries no version field.
+//
+// Photo is chatPhotoEmpty rather than left nil, the same as chatToTL: the field
+// is mandatory in the channel constructor, so a nil one encodes to an error in
+// Conn.SendResult and takes down every reply carrying a channel — after the
+// mutation has committed. "M7 stores no photo" is said with the empty
+// constructor, not by omitting the field.
 func channelToTL(c store.Channel, m store.ChannelMember, member bool) tg.ChatClass {
 	if !member {
 		return &tg.ChannelForbidden{ID: c.ID, AccessHash: c.ID, Title: ""}
@@ -143,6 +149,7 @@ func channelToTL(c store.Channel, m store.ChannelMember, member bool) tg.ChatCla
 		Broadcast:  !c.Megagroup,
 		Creator:    m.Role == 2,
 		Left:       false,
+		Photo:      &tg.ChatPhotoEmpty{},
 	}
 }
 

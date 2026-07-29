@@ -422,6 +422,7 @@ func TestHandleGetChannelsHidesMetadataFromBannedMember(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get channels while banned: %v", err)
 	}
+	assertEncodes(t, res)
 	chats, ok := res.(*tg.MessagesChats)
 	if !ok {
 		t.Fatalf("got %T, want *tg.MessagesChats", res)
@@ -440,6 +441,7 @@ func TestHandleGetChannelsHidesMetadataFromBannedMember(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get channels after ban expiry: %v", err)
 	}
+	assertEncodes(t, res)
 	chats, ok = res.(*tg.MessagesChats)
 	if !ok {
 		t.Fatalf("got %T, want *tg.MessagesChats", res)
@@ -471,6 +473,7 @@ func TestHandleGetChannelsDropsUnknownIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get channels: %v", err)
 	}
+	assertEncodes(t, res)
 	chats, ok := res.(*tg.MessagesChats)
 	if !ok {
 		t.Fatalf("got %T, want *tg.MessagesChats", res)
