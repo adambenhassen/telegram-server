@@ -27,6 +27,15 @@ const (
 	maxGetChannels = 100
 )
 
+// The coarse participant roles M7 stores, mirroring internal/store's own
+// unexported constants. There is no bitfield: a member either holds admin
+// rights or does not.
+const (
+	channelRoleMember  = 0
+	channelRoleAdmin   = 1
+	channelRoleCreator = 2
+)
+
 // channelAbout validates a client-supplied channel description and returns the
 // trimmed form that gets stored. An empty about is legal — unlike a title, a
 // channel without a description is a normal channel.
@@ -475,6 +484,190 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 		Date:      int(time.Now().Unix()),
 		Permanent: true,
 	}, nil
+}
+
+// channelMemberUpdate is the reply both membership-editing RPCs return: the
+// channel as the CALLER may now see it, plus the two accounts involved. No
+// service message and no pts move — M7 writes no channel service messages, and
+// a role or ban change is not a post.
+func (h *handlers) channelMemberUpdate(r *mtproto.Request, channelID, targetID int64) (bin.Encoder, error) {
+	chats, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("channel member update channels", "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	users, err := h.loadUsers(r.Ctx, map[int64]bool{r.UserID: true, targetID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("channel member update users", "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: channelID}},
+		Chats:   chats,
+		Users:   users,
+		Date:    int(time.Now().Unix()),
+	}, nil
+}
+
+// channelRoleUnchanged reports whether the store.ErrNotMember SetChannelRole
+// just returned was only "the target already holds this role".
+//
+// SetChannelRole is deliberately not idempotent: G3 lists two transitions and a
+// no-op is not one of them, so it fails closed with the same error a rights
+// rejection returns. MTProto clients retry, and a retried promotion that has
+// already committed must not come back as PEER_ID_INVALID. This re-read is the
+// ONE thing the handler is allowed to decide about the rule set, and it decides
+// nothing the caller could not already see: it converts a failure into a
+// success only when the caller is an unbanned creator — the one role the store
+// would have let through — and the target already sits at the requested role.
+// A caller who is not that gets the identical error either way.
+func (h *handlers) channelRoleUnchanged(ctx context.Context, channelID, callerID, targetID int64, role int) (bool, error) {
+	caller, found, err := h.store.ChannelMemberOf(ctx, channelID, callerID)
+	if err != nil {
+		return false, err
+	}
+	if !found || caller.Role != channelRoleCreator || caller.Banned(time.Now()) {
+		return false, nil
+	}
+	target, found, err := h.store.ChannelMemberOf(ctx, channelID, targetID)
+	if err != nil {
+		return false, err
+	}
+	return found && target.Role == role, nil
+}
+
+// handleEditAdmin serves channels.editAdmin.
+//
+// There is no rights check here on purpose, the same reasoning
+// handleEditChatTitle records for chats: the store re-checks caller and target
+// inside its own transaction under the channels row lock, and that is the
+// authorization boundary. A copy of the rule set here would run in a different
+// transaction, and the gap between the two is exactly what a concurrent
+// demotion would ride.
+//
+// req.AdminRights is a bitfield and M7 stores no bitfield, so it collapses to
+// the coarse role: any right set at all promotes to role 1, the zero value
+// demotes to role 0. The individual flags are accepted and IGNORED — the M6
+// posture for fwd_limit and for ChatAdminRights (ROADMAP.md:271). A client that
+// sets only BanUsers gets a FULL admin, which is the consequence of a coarse
+// role and is stated here rather than left as a silent surprise. req.Rank is
+// accepted and ignored too: M7 stores no custom rank.
+//
+// store.ErrNotMember is the only mapping, and every rejection it covers — not a
+// member, not the creator, target is the creator, target has no row, self as
+// target, no such channel — returns the identical errPeerIDInvalid. A
+// distinguishable "you may not do that" would confirm both that the channel
+// exists and what the target's role is.
+func (h *handlers) handleEditAdmin(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsEditAdminRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := inputChannelID(req.Channel)
+	if err != nil {
+		return nil, err
+	}
+	targetID, err := inputUserID(req.UserID, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+
+	role := channelRoleMember
+	if !req.AdminRights.Zero() {
+		role = channelRoleAdmin
+	}
+
+	err = h.store.SetChannelRole(r.Ctx, channelID, r.UserID, targetID, role)
+	if errors.Is(err, store.ErrNotMember) {
+		unchanged, rerr := h.channelRoleUnchanged(r.Ctx, channelID, r.UserID, targetID, role)
+		if rerr != nil {
+			h.log.Error("edit admin recheck", "channel_id", channelID, "user_id", r.UserID, "err", rerr)
+			return nil, errInternal
+		}
+		if !unchanged {
+			return nil, errPeerIDInvalid
+		}
+	} else if err != nil {
+		h.log.Error("edit admin", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return h.channelMemberUpdate(r, channelID, targetID)
+}
+
+// handleEditBanned serves channels.editBanned. It is the same thin shape as
+// handleEditAdmin and for the same reason: the store owns the rule set.
+//
+// ViewMessages is the only flag M7 reads. Set, it is a ban; an until_date of 0
+// means forever and anything else is that instant. The ZERO value — and only
+// the zero value — is the unban.
+//
+// A rights struct that revokes something other than ViewMessages is rejected
+// rather than ignored. M7 has no partial restriction to store, so ignoring the
+// flags would land such a request on the unban path: a caller tightening a
+// restriction on a currently-banned member would clear that member's ban and be
+// told the edit applied, which is the write moving opposite to the request.
+//
+// An until_date already in the past is rejected instead of written. It would
+// otherwise commit a ban that ChannelMember.Banned reports as already lapsed,
+// so the caller would be told a member was banned who is not.
+func (h *handlers) handleEditBanned(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsEditBannedRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := inputChannelID(req.Channel)
+	if err != nil {
+		return nil, err
+	}
+	// Only a user may be banned. A chat or channel peer here names no
+	// participant row.
+	targetID, err := peerUserID(req.Participant)
+	if err != nil {
+		return nil, err
+	}
+
+	// Decided on the client's own rights struct, before any channel or
+	// participant row is read — the same ordering errUntilDateInvalid keeps
+	// below. It is reachable without any channel existing, so it is not a
+	// distinguishable outcome an attacker can play off errPeerIDInvalid, and the
+	// post-read collapse to that one error is untouched.
+	if !req.BannedRights.ViewMessages && !req.BannedRights.Zero() {
+		return nil, errBannedRightsInvalid
+	}
+
+	var (
+		until   *time.Time
+		forever bool
+	)
+	if req.BannedRights.ViewMessages {
+		if req.BannedRights.UntilDate == 0 {
+			forever = true
+		} else {
+			ts := time.Unix(int64(req.BannedRights.UntilDate), 0)
+			if !ts.After(time.Now()) {
+				return nil, errUntilDateInvalid
+			}
+			until = &ts
+		}
+	}
+
+	// A repeated ban and an unban of an unbanned member both succeed here, so
+	// unlike editAdmin this needs no retry re-read.
+	err = h.store.SetChannelBan(r.Ctx, channelID, r.UserID, targetID, until, forever)
+	if errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	}
+	if err != nil {
+		h.log.Error("edit banned", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return h.channelMemberUpdate(r, channelID, targetID)
 }
 
 // handleCheckChatInvite serves messages.checkChatInvite. It writes nothing: the

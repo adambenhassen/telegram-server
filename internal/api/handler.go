@@ -129,6 +129,8 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
 	register(d, tg.ChannelsGetChannelsRequestTypeID, h.handleGetChannels)
 	register(d, tg.ChannelsLeaveChannelRequestTypeID, h.handleLeaveChannel)
+	register(d, tg.ChannelsEditAdminRequestTypeID, h.handleEditAdmin)
+	register(d, tg.ChannelsEditBannedRequestTypeID, h.handleEditBanned)
 	register(d, tg.UploadSaveFilePartRequestTypeID, h.handleSaveFilePart)
 	register(d, tg.UploadSaveBigFilePartRequestTypeID, h.handleSaveBigFilePart)
 	register(d, tg.UploadGetFileRequestTypeID, h.handleGetFile)
