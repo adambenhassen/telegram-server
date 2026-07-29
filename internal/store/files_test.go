@@ -226,6 +226,18 @@ func TestFileForDownloadChannelMember(t *testing.T) {
 		t.Fatalf("non-member: want ErrFileNotFound, got %v", err)
 	}
 
+	// Membership of SOME channel is not membership of the posting one. Without
+	// cp.channel_id = cm.channel_id in the join, outsider — a member of a
+	// different channel and of nothing else — reads this channel's file.
+	outsider := mustUser(t, s, "+15559100064")
+	other := allocate(t, s, creator.ID, 11)
+	if _, _, err := store.SeedChannelPost(ctx, s, creator.ID, outsider.ID, other.ID); err != nil {
+		t.Fatalf("seed second channel: %v", err)
+	}
+	if _, err := s.FileForDownload(ctx, f.ID, f.AccessHash, outsider.ID); !errors.Is(err, store.ErrFileNotFound) {
+		t.Fatalf("member of another channel: want ErrFileNotFound, got %v", err)
+	}
+
 	// A live ban revokes, and lifting it restores.
 	future := time.Now().Add(time.Hour)
 	if err := store.SetChannelBan(ctx, s, channelID, member.ID, &future); err != nil {
