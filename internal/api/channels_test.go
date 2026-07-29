@@ -4,12 +4,52 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
+
+// channelExec runs one statement against the test database. The store's own
+// SetChannelBan / SetChannelCaps helpers live in internal/store/export_test.go,
+// which compiles only into that package's test binary, so they are unreachable
+// from api_test; raw SQL on the same DSN is the way this package reaches state
+// no M7 RPC can produce yet — the pattern media_test.go already uses.
+func channelExec(t *testing.T, ctx context.Context, dsn, sql string, args ...any) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		if cerr := conn.Close(ctx); cerr != nil {
+			t.Errorf("close conn: %v", cerr)
+		}
+	}()
+	if _, err := conn.Exec(ctx, sql, args...); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+}
+
+// joinChannel writes a plain participant row. Joining is MAIN-91's RPC; this is
+// how a second member exists today.
+func joinChannel(t *testing.T, ctx context.Context, dsn string, channelID, userID int64) {
+	t.Helper()
+	channelExec(t, ctx, dsn,
+		`INSERT INTO channel_participants (channel_id, user_id, role, join_pts) VALUES ($1, $2, 0, 0)`,
+		channelID, userID)
+}
+
+// banChannelMember sets banned_until. Ban mutation is a later ticket's RPC.
+func banChannelMember(t *testing.T, ctx context.Context, dsn string, channelID, userID int64, until time.Time) {
+	t.Helper()
+	channelExec(t, ctx, dsn,
+		`UPDATE channel_participants SET banned_until = $3 WHERE channel_id = $1 AND user_id = $2`,
+		channelID, userID, until)
+}
 
 func inputChannels(ids ...int64) []tg.InputChannelClass {
 	out := make([]tg.InputChannelClass, len(ids))
@@ -323,5 +363,166 @@ func TestChannelHandlersRejectUnauthenticated(t *testing.T) {
 		if msg := rpcMessage(t, call()); msg != "AUTH_KEY_UNREGISTERED" {
 			t.Errorf("%s: got %s, want AUTH_KEY_UNREGISTERED", name, msg)
 		}
+	}
+}
+
+func TestHandleCreateChannelAtPerAccountCap(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	u, err := s.CreateUser(ctx, "+15551294010")
+	if err != nil {
+		t.Fatalf("user: %v", err)
+	}
+
+	// 500 is the store's default per-account cap (defaultMaxChannelsPerUser,
+	// internal/store/channels.go:41). Filling it with one statement instead of 500
+	// handler calls keeps the test cheap; the store's own lowered-cap helper is not
+	// reachable from this package.
+	channelExec(t, ctx, dsn, `
+		WITH created AS (
+			INSERT INTO channels (title, creator_id)
+			SELECT 'filler ' || g, $1 FROM generate_series(1, 500) g
+			RETURNING id
+		)
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
+		SELECT id, $1, 2, 0 FROM created`, u.ID)
+
+	_, err = api.CreateChannelForTest(s, u.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "One more"})
+	if msg := rpcMessage(t, err); msg != "USERS_TOO_MUCH" {
+		t.Fatalf("at cap: got %s, want USERS_TOO_MUCH", msg)
+	}
+	channels, err := s.ChannelsForUser(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("channels for user: %v", err)
+	}
+	if len(channels) != 500 {
+		t.Fatalf("holds %d channels, want 500 — the rejected create wrote a row", len(channels))
+	}
+}
+
+func TestHandleGetChannelsHidesMetadataFromBannedMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	owner, err := s.CreateUser(ctx, "+15551294011")
+	if err != nil {
+		t.Fatalf("owner: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551294012")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	ch := createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "Secret"})
+	joinChannel(t, ctx, dsn, ch.ID, member.ID)
+
+	// While the ban is live the member is a stranger to the metadata.
+	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(time.Hour))
+	res, err := api.GetChannelsForTest(s, member.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(ch.ID)})
+	if err != nil {
+		t.Fatalf("get channels while banned: %v", err)
+	}
+	chats, ok := res.(*tg.MessagesChats)
+	if !ok {
+		t.Fatalf("got %T, want *tg.MessagesChats", res)
+	}
+	forbidden, ok := chats.Chats[0].(*tg.ChannelForbidden)
+	if !ok {
+		t.Fatalf("banned member: got %T, want *tg.ChannelForbidden", chats.Chats[0])
+	}
+	if forbidden.Title != "" {
+		t.Errorf("banned member title = %q, want empty", forbidden.Title)
+	}
+
+	// An expired ban is not a ban: the same row gets the title back.
+	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(-time.Hour))
+	res, err = api.GetChannelsForTest(s, member.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(ch.ID)})
+	if err != nil {
+		t.Fatalf("get channels after ban expiry: %v", err)
+	}
+	chats, ok = res.(*tg.MessagesChats)
+	if !ok {
+		t.Fatalf("got %T, want *tg.MessagesChats", res)
+	}
+	live, ok := chats.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("expired ban: got %T, want *tg.Channel", chats.Chats[0])
+	}
+	if live.Title != "Secret" {
+		t.Errorf("title = %q, want %q", live.Title, "Secret")
+	}
+}
+
+func TestHandleGetChannelsDropsUnknownIDs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	owner, err := s.CreateUser(ctx, "+15551294013")
+	if err != nil {
+		t.Fatalf("owner: %v", err)
+	}
+	ch := createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "News"})
+
+	// An id with no channel row is dropped, not reported: a distinguishable
+	// not-found would make the dense BIGSERIAL id space enumerable.
+	res, err := api.GetChannelsForTest(s, owner.ID, &tg.ChannelsGetChannelsRequest{
+		ID: inputChannels(ch.ID, ch.ID+100000),
+	})
+	if err != nil {
+		t.Fatalf("get channels: %v", err)
+	}
+	chats, ok := res.(*tg.MessagesChats)
+	if !ok {
+		t.Fatalf("got %T, want *tg.MessagesChats", res)
+	}
+	if len(chats.Chats) != 1 {
+		t.Fatalf("%d chats, want 1", len(chats.Chats))
+	}
+	if got := chats.Chats[0].GetID(); got != ch.ID {
+		t.Errorf("chat id = %d, want %d", got, ch.ID)
+	}
+}
+
+func TestHandleLeaveChannelRejectsBannedMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	owner, err := s.CreateUser(ctx, "+15551294014")
+	if err != nil {
+		t.Fatalf("owner: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551294015")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	ch := createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "News"})
+	joinChannel(t, ctx, dsn, ch.ID, member.ID)
+	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(time.Hour))
+
+	// Leaving under a live ban must not delete the row: the join path admits any
+	// account without one, so a successful leave here is a ban reset.
+	_, err = api.LeaveChannelForTest(s, member.ID, &tg.ChannelsLeaveChannelRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+	})
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("banned leave: got %s, want PEER_ID_INVALID", msg)
+	}
+	m, found, err := s.ChannelMemberOf(ctx, ch.ID, member.ID)
+	if err != nil || !found {
+		t.Fatalf("participant row after rejected leave: found=%v err=%v", found, err)
+	}
+	if !m.Banned(time.Now()) {
+		t.Fatal("ban cleared by the rejected leave")
+	}
+
+	// Once the ban has expired the same member leaves normally.
+	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(-time.Hour))
+	if _, err := api.LeaveChannelForTest(s, member.ID, &tg.ChannelsLeaveChannelRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+	}); err != nil {
+		t.Fatalf("leave after ban expiry: %v", err)
+	}
+	if _, found, err := s.ChannelMemberOf(ctx, ch.ID, member.ID); err != nil || found {
+		t.Fatalf("participant row after leave: found=%v err=%v", found, err)
 	}
 }

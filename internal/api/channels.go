@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gotd/td/bin"
@@ -169,6 +170,27 @@ func (h *handlers) handleLeaveChannel(r *mtproto.Request) (bin.Encoder, error) {
 	id, err := inputChannelID(req.Channel)
 	if err != nil {
 		return nil, err
+	}
+
+	// A banned member may not leave. LeaveChannel deletes the participant row and
+	// JoinChannelByInvite (internal/store/channels.go:281) admits any account that
+	// has none, so without this check leave-then-rejoin is a ban reset for anyone
+	// still holding the invite hash. It is the same errPeerIDInvalid a non-member
+	// gets, so it tells a banned caller nothing new: loadChannels already renders
+	// them channelForbidden, which is what a stranger sees too.
+	//
+	// The check and the delete are two statements, so a ban landing between them
+	// still slips through. Closing that means the store's delete carrying the ban
+	// predicate in its WHERE clause, which is a store change and belongs with the
+	// editBanned ticket that introduces the only writer of banned_until — M7 has
+	// no RPC that sets a ban, so today nothing races this.
+	member, found, err := h.store.ChannelMemberOf(r.Ctx, id, r.UserID)
+	if err != nil {
+		h.log.Error("leave channel membership", "channel_id", id, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !found || member.Banned(time.Now()) {
+		return nil, errPeerIDInvalid
 	}
 
 	left, err := h.store.LeaveChannel(r.Ctx, id, r.UserID)
