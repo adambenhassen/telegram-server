@@ -510,6 +510,113 @@ func (h *handlers) loadChannels(ctx context.Context, ids map[int64]bool, viewerI
 	return channels, nil
 }
 
+// channelBatch is one channel's hydrated updates plus everything a client must
+// be told alongside them. pts[i] is the pts of ups[i], ascending.
+type channelBatch struct {
+	ups        []tg.UpdateClass
+	pts        []int
+	users      []tg.UserClass
+	chats      []tg.ChatClass
+	currentPts int
+	more       bool
+}
+
+// buildChannelUpdates hydrates channelID's events after fromPts into wire
+// updates plus the referenced users and channels. It is the single delivery
+// path for updates.getChannelDifference; the live push (MAIN-96) must call
+// this same function, never a second serialisation path. Limit is clamped into
+// [1, maxDiffEvents] before this is called.
+//
+// State is read first, then events are bounded to (fromPts, currentPts], so the
+// advertised pts never runs past an event omitted from the response. This is
+// the same ordering buildUpdates uses for the per-account stream.
+func (h *handlers) buildChannelUpdates(ctx context.Context, channelID, viewerID int64, fromPts, limit, currentPts int) (channelBatch, error) {
+	// Fetch one past the cap to detect truncation.
+	events, err := h.store.ChannelEventsWindow(ctx, channelID, fromPts, currentPts, limit+1)
+	if err != nil {
+		return channelBatch{}, err
+	}
+	b := channelBatch{currentPts: currentPts}
+	if len(events) > limit {
+		events = events[:limit]
+		b.more = true
+	}
+
+	// Collect local ids for batched message load.
+	localIDs := make([]int64, 0, len(events))
+	for _, ev := range events {
+		localIDs = append(localIDs, ev.LocalID)
+	}
+	msgs, err := h.store.ChannelMessages(ctx, channelID, localIDs)
+	if err != nil {
+		return channelBatch{}, err
+	}
+
+	// Load files for all messages in the batch.
+	chMsgs := make([]store.ChannelMessage, 0, len(msgs))
+	for _, m := range msgs {
+		chMsgs = append(chMsgs, m)
+	}
+	files, err := h.loadChannelFiles(ctx, chMsgs)
+	if err != nil {
+		return channelBatch{}, err
+	}
+
+	peers := map[int64]bool{}
+	for _, ev := range events {
+		up, refs := h.channelEventToUpdate(ctx, channelID, viewerID, ev, msgs, files)
+		if up == nil {
+			continue
+		}
+		b.ups = append(b.ups, up)
+		b.pts = append(b.pts, ev.Pts)
+		for _, id := range refs {
+			peers[id] = true
+		}
+	}
+	// When truncated, pts advertised is the last included event's pts, not
+	// the channel's current pts — that is the whole point of the bound.
+	if b.more && len(events) > 0 {
+		b.currentPts = events[len(events)-1].Pts
+	}
+
+	b.users, err = h.loadUsers(ctx, peers, viewerID)
+	if err != nil {
+		return channelBatch{}, err
+	}
+	b.chats, err = h.loadChannels(ctx, map[int64]bool{channelID: true}, viewerID)
+	if err != nil {
+		return channelBatch{}, err
+	}
+	return b, nil
+}
+
+// channelEventToUpdate builds the wire update for one channel event, returning
+// the update and the user ids it references. Only event type 1 (new message)
+// is rendered in M7; types 2 and 3 are skipped with a debug log. A nil update
+// is returned when the message row is not found.
+func (h *handlers) channelEventToUpdate(_ context.Context, channelID, viewerID int64, ev store.ChannelEvent, msgs map[int64]store.ChannelMessage, files map[int64]*tg.Document) (tg.UpdateClass, []int64) {
+	switch ev.Type {
+	case store.EventNewMessage:
+		m, ok := msgs[ev.LocalID]
+		if !ok {
+			h.log.Debug("channel message row not found", "local_id", ev.LocalID, "channel_id", channelID, "pts", ev.Pts)
+			return nil, nil
+		}
+		return &tg.UpdateNewChannelMessage{
+			Message:  channelMessageToTL(m, viewerID, files),
+			Pts:      ev.Pts,
+			PtsCount: 1,
+		}, []int64{m.FromID}
+	default:
+		// Types 2 (edit) and 3 (delete) are unused in M7. Skip rather than
+		// fail the batch; log at debug so a future implementation can trace
+		// how often this fires.
+		h.log.Debug("unknown channel event type", "type", ev.Type, "channel_id", channelID, "pts", ev.Pts)
+		return nil, nil
+	}
+}
+
 // handleGetState serves updates.getState.
 func (h *handlers) handleGetState(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {

@@ -262,7 +262,7 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	// own read path and its own reply type; store.History reads the caller's own
 	// message rows and has nothing to return for a channel peer.
 	if peerType == store.PeerTypeChannel {
-		if err = h.requireChannelMember(r.Ctx, toID, r.UserID); err != nil {
+		if _, err = h.requireChannelMember(r.Ctx, toID, r.UserID); err != nil {
 			return nil, err
 		}
 		return h.channelHistory(r, toID, &req, limit)
