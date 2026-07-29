@@ -1,0 +1,59 @@
+-- name: InsertChannel :one
+INSERT INTO channels (title, about, creator_id, megagroup) VALUES ($1, $2, $3, $4)
+RETURNING *;
+
+-- name: InsertChannelState :exec
+INSERT INTO channel_state (channel_id) VALUES ($1);
+
+-- name: InsertChannelParticipant :exec
+INSERT INTO channel_participants (channel_id, user_id, role, join_pts) VALUES ($1, $2, $3, $4);
+
+-- name: ChannelByID :one
+SELECT * FROM channels WHERE id = $1;
+
+-- ChannelStateForUpdate takes the channel_state row lock that serialises
+-- admission to one channel: the pts a joiner records and the participant count
+-- the caps are decided on are both read under it. See the lock-order comment at
+-- the top of channels.go.
+-- name: ChannelStateForUpdate :one
+SELECT * FROM channel_state WHERE channel_id = $1 FOR UPDATE;
+
+-- name: ChannelParticipants :many
+SELECT * FROM channel_participants WHERE channel_id = $1 ORDER BY user_id;
+
+-- name: ChannelParticipantByUser :one
+SELECT * FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
+
+-- name: CountChannelParticipants :one
+SELECT count(*) FROM channel_participants WHERE channel_id = $1;
+
+-- CountChannelsForUser backs the per-account cap. It counts memberships, so a
+-- channel the account was removed from stops counting against it.
+-- name: CountChannelsForUser :one
+SELECT count(*) FROM channel_participants WHERE user_id = $1;
+
+-- InsertChannelParticipantIfAbsent reports 0 rows when the user already holds a
+-- row, which is what makes a repeated join a no-op instead of an error — and in
+-- particular never lowers an existing join_pts or clears an existing ban.
+-- name: InsertChannelParticipantIfAbsent :execrows
+INSERT INTO channel_participants (channel_id, user_id, role, join_pts) VALUES ($1, $2, $3, $4)
+ON CONFLICT (channel_id, user_id) DO NOTHING;
+
+-- name: DeleteChannelParticipant :execrows
+DELETE FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
+
+-- name: InsertChannelInvite :exec
+INSERT INTO channel_invites (hash, channel_id, creator_id) VALUES ($1, $2, $3);
+
+-- ChannelInviteByHash is the ONLY way into a channel. It is keyed on the hash
+-- alone and takes no channel id, so the dense channels.id space is not an
+-- admission input and cannot be walked. An unknown hash and an unusable one are
+-- one rejection upstream — see JoinChannelByInvite.
+-- name: ChannelInviteByHash :one
+SELECT * FROM channel_invites WHERE hash = $1;
+
+-- name: ChannelsForUser :many
+SELECT c.* FROM channels c
+JOIN channel_participants p ON p.channel_id = c.id
+WHERE p.user_id = $1
+ORDER BY c.id;
