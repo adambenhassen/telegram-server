@@ -17,6 +17,58 @@ type AuthKey struct {
 	PendingUserID *int64
 }
 
+type Channel struct {
+	ID        int64
+	Title     string
+	About     string
+	CreatorID int64
+	Megagroup bool
+	Version   int32
+	Date      pgtype.Timestamptz
+}
+
+type ChannelEvent struct {
+	ChannelID int64
+	Pts       int64
+	Type      int16
+	LocalID   int64
+}
+
+type ChannelInvite struct {
+	Hash      string
+	ChannelID int64
+	CreatorID int64
+	Date      pgtype.Timestamptz
+}
+
+type ChannelMessage struct {
+	ChannelID int64
+	LocalID   int64
+	FromID    int64
+	Date      pgtype.Timestamptz
+	Message   string
+	EditDate  pgtype.Timestamptz
+	Deleted   bool
+	RandomID  int64
+	FileID    *int64
+}
+
+type ChannelParticipant struct {
+	ChannelID   int64
+	UserID      int64
+	Role        int16
+	BannedUntil pgtype.Timestamptz
+	JoinPts     int64
+	Date        pgtype.Timestamptz
+}
+
+type ChannelState struct {
+	ChannelID   int64
+	Pts         int64
+	NextLocalID int64
+	Date        pgtype.Timestamptz
+}
+
 type Chat struct {
 	ID        int64
 	Title     string
