@@ -71,21 +71,22 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 //
 // ponytail: presence-check of the newest migration's artifacts, not a version
 // table — pgtest applies raw SQL and has no Atlas revisions table to read. The
-// sentinels track the latest migration (chat_participants table +
-// messages.fanout_id column) plus message_events from the one before it; update
+// sentinels track the latest migration (files table) plus chat_participants,
+// messages.fanout_id and message_events from the ones before it; update
 // them when a migration adds new schema.
 func (s *Store) checkSchema(ctx context.Context) error {
-	var hasParticipants, hasFanoutID, hasEvents bool
+	var hasParticipants, hasFanoutID, hasEvents, hasFiles bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
 		              WHERE table_name = 'messages' AND column_name = 'fanout_id'),
-		       to_regclass('public.message_events') IS NOT NULL`,
-	).Scan(&hasParticipants, &hasFanoutID, &hasEvents)
+		       to_regclass('public.message_events') IS NOT NULL,
+		       to_regclass('public.files') IS NOT NULL`,
+	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasFiles)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasParticipants || !hasFanoutID || !hasEvents {
+	if !hasParticipants || !hasFanoutID || !hasEvents || !hasFiles {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil
