@@ -530,11 +530,7 @@ type channelBatch struct {
 // State is read first, then events are bounded to (fromPts, currentPts], so the
 // advertised pts never runs past an event omitted from the response. This is
 // the same ordering buildUpdates uses for the per-account stream.
-func (h *handlers) buildChannelUpdates(ctx context.Context, channelID, viewerID int64, fromPts, limit int) (channelBatch, error) {
-	currentPts, err := h.store.ChannelState(ctx, channelID)
-	if err != nil {
-		return channelBatch{}, err
-	}
+func (h *handlers) buildChannelUpdates(ctx context.Context, channelID, viewerID int64, fromPts, limit, currentPts int) (channelBatch, error) {
 	// Fetch one past the cap to detect truncation.
 	events, err := h.store.ChannelEventsWindow(ctx, channelID, fromPts, currentPts, limit+1)
 	if err != nil {
@@ -604,6 +600,7 @@ func (h *handlers) channelEventToUpdate(_ context.Context, channelID, viewerID i
 	case store.EventNewMessage:
 		m, ok := msgs[ev.LocalID]
 		if !ok {
+			h.log.Debug("channel message row not found", "local_id", ev.LocalID, "channel_id", channelID, "pts", ev.Pts)
 			return nil, nil
 		}
 		return &tg.UpdateNewChannelMessage{

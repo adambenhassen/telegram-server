@@ -242,16 +242,16 @@ const maxChannelMessagesPerCall = 100
 // Unlike the post path, whose authoritative check lives inside the store's
 // write transaction under the channel_state row lock, a read has no write to
 // order against: this check and the read that follows are the whole of it.
-func (h *handlers) requireChannelMember(ctx context.Context, channelID, userID int64) error {
+func (h *handlers) requireChannelMember(ctx context.Context, channelID, userID int64) (store.ChannelMember, error) {
 	member, found, err := h.store.ChannelMemberOf(ctx, channelID, userID)
 	if err != nil {
 		h.log.Error("channel membership", "channel_id", channelID, "user_id", userID, "err", err)
-		return errInternal
+		return store.ChannelMember{}, errInternal
 	}
 	if !found || member.Banned(time.Now()) {
-		return errPeerIDInvalid
+		return store.ChannelMember{}, errPeerIDInvalid
 	}
-	return nil
+	return member, nil
 }
 
 // sendChannelMessage posts to a channel and returns the poster-side Updates.
@@ -329,7 +329,8 @@ func (h *handlers) handleGetChannelDifference(r *mtproto.Request) (bin.Encoder, 
 
 	// Require participant row and not banned; unknown channel and non-member
 	// return the same errPeerIDInvalid.
-	if err = h.requireChannelMember(r.Ctx, channelID, r.UserID); err != nil {
+	member, err := h.requireChannelMember(r.Ctx, channelID, r.UserID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -339,11 +340,6 @@ func (h *handlers) handleGetChannelDifference(r *mtproto.Request) (bin.Encoder, 
 	// getHistory still serves the full history to a current member, deliberately,
 	// and that asymmetry needs this comment or someone will later "fix" one of
 	// the two to match the other.
-	member, _, err := h.store.ChannelMemberOf(r.Ctx, channelID, r.UserID)
-	if err != nil {
-		h.log.Error("channel difference membership", "channel_id", channelID, "user_id", r.UserID, "err", err)
-		return nil, errInternal
-	}
 	fromPts := max(req.Pts, member.JoinPts)
 
 	// Clamp req.Limit into [1, maxDiffEvents].
@@ -362,14 +358,14 @@ func (h *handlers) handleGetChannelDifference(r *mtproto.Request) (bin.Encoder, 
 		return &tg.UpdatesChannelDifferenceEmpty{Pts: currentPts, Final: true}, nil
 	}
 
-	b, err := h.buildChannelUpdates(r.Ctx, channelID, r.UserID, fromPts, limit)
+	b, err := h.buildChannelUpdates(r.Ctx, channelID, r.UserID, fromPts, limit, currentPts)
 	if err != nil {
 		h.log.Error("channel difference build", "channel_id", channelID, "err", err)
 		return nil, errInternal
 	}
 
 	if len(b.ups) == 0 {
-		return &tg.UpdatesChannelDifferenceEmpty{Pts: currentPts, Final: true}, nil
+		return &tg.UpdatesChannelDifferenceEmpty{Pts: b.currentPts, Final: true}, nil
 	}
 
 	// Extract messages from updates for NewMessages.
@@ -392,7 +388,7 @@ func (h *handlers) handleGetChannelDifference(r *mtproto.Request) (bin.Encoder, 
 	}
 	return &tg.UpdatesChannelDifference{
 		Final:        true,
-		Pts:          currentPts,
+		Pts:          b.currentPts,
 		NewMessages:  newMessages,
 		OtherUpdates: nil,
 		Chats:        b.chats,
@@ -414,7 +410,7 @@ func (h *handlers) handleGetChannelMessages(r *mtproto.Request) (bin.Encoder, er
 	if err != nil {
 		return nil, err
 	}
-	if err = h.requireChannelMember(r.Ctx, channelID, r.UserID); err != nil {
+	if _, err = h.requireChannelMember(r.Ctx, channelID, r.UserID); err != nil {
 		return nil, err
 	}
 
