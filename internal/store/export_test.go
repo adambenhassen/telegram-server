@@ -142,31 +142,38 @@ func InsertTestEvent(ctx context.Context, s *Store, ownerID int64, typ EventType
 	})
 }
 
-// SeedChannelPost creates a channel, joins memberID to it through the shipped
-// invite path, and posts one message carrying fileID. Only the post is written
-// directly: the channel write path is a later ticket, so the download gate's
-// channel branch has no shipped way to produce that row yet. Returns the channel
-// id and the post's local_id.
-func SeedChannelPost(ctx context.Context, s *Store, creatorID, memberID, fileID int64) (channelID, localID int64, err error) {
+// SeedChannelWithMember creates a channel owned by creatorID and admits memberID
+// to it through the shipped invite path — the only way a participant row is ever
+// produced. Returns the channel and the invite hash, so a test can re-join on the
+// same hash.
+func SeedChannelWithMember(ctx context.Context, s *Store, creatorID, memberID int64) (Channel, string, error) {
 	ch, err := s.CreateChannel(ctx, creatorID, "test", "", false)
 	if err != nil {
-		return 0, 0, err
+		return Channel{}, "", err
 	}
 	hash, err := s.CreateChannelInvite(ctx, ch.ID, creatorID)
 	if err != nil {
-		return 0, 0, err
+		return Channel{}, "", err
 	}
 	if _, _, err = s.JoinChannelByInvite(ctx, hash, memberID); err != nil {
+		return Channel{}, "", err
+	}
+	return ch, hash, nil
+}
+
+// SeedChannelPost creates a channel, joins memberID to it through the shipped
+// invite path, and posts one message carrying fileID. Returns the channel id and
+// the post's local_id.
+func SeedChannelPost(ctx context.Context, s *Store, creatorID, memberID, fileID int64) (channelID, localID int64, err error) {
+	ch, _, err := SeedChannelWithMember(ctx, s, creatorID, memberID)
+	if err != nil {
 		return 0, 0, err
 	}
-	localID = 1
-	if _, err = s.pool.Exec(ctx,
-		`INSERT INTO channel_messages (channel_id, local_id, from_id, message, file_id)
-		 VALUES ($1, $2, $3, 'post', $4)`,
-		ch.ID, localID, creatorID, fileID); err != nil {
+	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creatorID, "post", 0, &fileID)
+	if err != nil {
 		return 0, 0, err
 	}
-	return ch.ID, localID, nil
+	return ch.ID, post.LocalID, nil
 }
 
 // SetChannelPostDeleted soft-deletes a channel post, the state the channel

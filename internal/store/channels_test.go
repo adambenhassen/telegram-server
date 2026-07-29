@@ -283,6 +283,270 @@ func TestInfiniteBanIsPermanent(t *testing.T) {
 	}
 }
 
+// roleOf reads the target's role, failing the test if it holds no row.
+func roleOf(t *testing.T, s *store.Store, channelID, userID int64) int {
+	t.Helper()
+	m, ok, err := s.ChannelMemberOf(context.Background(), channelID, userID)
+	if err != nil || !ok {
+		t.Fatalf("member of %d: ok=%v err=%v", channelID, ok, err)
+	}
+	return m.Role
+}
+
+func TestSetChannelRolePromotesAndDemotesForTheCreatorOnly(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551291030")
+	member := mustUser(t, s, "+15551291031")
+	ch, _, err := store.SeedChannelWithMember(ctx, s, owner.ID, member.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, member.ID, 1); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if got := roleOf(t, s, ch.ID, member.ID); got != 1 {
+		t.Fatalf("role after promote = %d, want 1", got)
+	}
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, member.ID, 0); err != nil {
+		t.Fatalf("demote: %v", err)
+	}
+	if got := roleOf(t, s, ch.ID, member.ID); got != 0 {
+		t.Errorf("role after demote = %d, want 0", got)
+	}
+}
+
+// G3: an admin holds no promotion right at all, and the rejection is the same
+// error an outsider gets.
+func TestSetChannelRoleRejectsAnAdminCaller(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551291032")
+	admin := mustUser(t, s, "+15551291033")
+	member := mustUser(t, s, "+15551291034")
+	ch, hash, err := store.SeedChannelWithMember(ctx, s, owner.ID, admin.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, hash, member.ID); err != nil {
+		t.Fatalf("join member: %v", err)
+	}
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+
+	if err := s.SetChannelRole(ctx, ch.ID, admin.ID, member.ID, 1); !errors.Is(err, store.ErrNotMember) {
+		t.Fatalf("admin promoting: err = %v, want ErrNotMember", err)
+	}
+	if got := roleOf(t, s, ch.ID, member.ID); got != 0 {
+		t.Errorf("role moved to %d on a rejected promotion", got)
+	}
+	// Nor may an admin demote another admin, and nobody may demote the creator.
+	if err := s.SetChannelRole(ctx, ch.ID, admin.ID, admin.ID, 0); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("admin demoting itself: err = %v, want ErrNotMember", err)
+	}
+	if err := s.SetChannelRole(ctx, ch.ID, admin.ID, owner.ID, 0); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("admin demoting the creator: err = %v, want ErrNotMember", err)
+	}
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, owner.ID, 0); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("creator demoting itself: err = %v, want ErrNotMember", err)
+	}
+	if got := roleOf(t, s, ch.ID, owner.ID); got != 2 {
+		t.Errorf("creator role = %d, want 2", got)
+	}
+	if got := roleOf(t, s, ch.ID, admin.ID); got != 1 {
+		t.Errorf("admin role = %d, want 1", got)
+	}
+	// Role 2 is never assignable.
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, member.ID, 2); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("assigning role 2: err = %v, want ErrNotMember", err)
+	}
+	if got := roleOf(t, s, ch.ID, member.ID); got != 0 {
+		t.Errorf("role moved to %d on a rejected role value", got)
+	}
+}
+
+func TestSetChannelBanAdminMayBanAMemberOnly(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551291035")
+	admin := mustUser(t, s, "+15551291036")
+	other := mustUser(t, s, "+15551291037")
+	member := mustUser(t, s, "+15551291038")
+	ch, hash, err := store.SeedChannelWithMember(ctx, s, owner.ID, admin.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	for _, u := range []int64{other.ID, member.ID} {
+		if _, _, err := s.JoinChannelByInvite(ctx, hash, u); err != nil {
+			t.Fatalf("join %d: %v", u, err)
+		}
+	}
+	for _, u := range []int64{admin.ID, other.ID} {
+		if err := s.SetChannelRole(ctx, ch.ID, owner.ID, u, 1); err != nil {
+			t.Fatalf("promote %d: %v", u, err)
+		}
+	}
+
+	until := time.Now().Add(time.Hour)
+	if err := s.SetChannelBan(ctx, ch.ID, admin.ID, member.ID, &until, false); err != nil {
+		t.Fatalf("admin bans member: %v", err)
+	}
+	m, _, err := s.ChannelMemberOf(ctx, ch.ID, member.ID)
+	if err != nil {
+		t.Fatalf("member of: %v", err)
+	}
+	if !m.Banned(time.Now()) {
+		t.Fatalf("member not banned: %+v", m)
+	}
+
+	// An admin over another admin, and anyone over the creator, are rejected and
+	// write nothing.
+	if err := s.SetChannelBan(ctx, ch.ID, admin.ID, other.ID, &until, false); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("admin bans admin: err = %v, want ErrNotMember", err)
+	}
+	for _, caller := range []int64{admin.ID, member.ID, owner.ID} {
+		if err := s.SetChannelBan(ctx, ch.ID, caller, owner.ID, &until, false); !errors.Is(err, store.ErrNotMember) {
+			t.Errorf("caller %d bans the creator: err = %v, want ErrNotMember", caller, err)
+		}
+	}
+	for _, u := range []int64{other.ID, owner.ID} {
+		got, _, err := s.ChannelMemberOf(ctx, ch.ID, u)
+		if err != nil {
+			t.Fatalf("member of: %v", err)
+		}
+		if got.BannedUntil != nil {
+			t.Errorf("rejected ban wrote banned_until on %d: %+v", u, got)
+		}
+	}
+
+	// A plain member holds no rights on either method.
+	if err := s.SetChannelBan(ctx, ch.ID, member.ID, other.ID, &until, false); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("member bans: err = %v, want ErrNotMember", err)
+	}
+}
+
+func TestChannelRightsRejectSelfAndAbsentTargets(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551291039")
+	member := mustUser(t, s, "+15551291040")
+	outsider := mustUser(t, s, "+15551291041")
+	ch, _, err := store.SeedChannelWithMember(ctx, s, owner.ID, member.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	until := time.Now().Add(time.Hour)
+
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, owner.ID, 1); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("self role: err = %v, want ErrNotMember", err)
+	}
+	if err := s.SetChannelBan(ctx, ch.ID, owner.ID, owner.ID, &until, false); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("self ban: err = %v, want ErrNotMember", err)
+	}
+
+	// A target with no participant row is rejected, and no row is created — the
+	// push primitive must not re-enter through these methods.
+	if err := s.SetChannelRole(ctx, ch.ID, owner.ID, outsider.ID, 1); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("absent target role: err = %v, want ErrNotMember", err)
+	}
+	if err := s.SetChannelBan(ctx, ch.ID, owner.ID, outsider.ID, &until, false); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("absent target ban: err = %v, want ErrNotMember", err)
+	}
+	if _, ok, err := s.ChannelMemberOf(ctx, ch.ID, outsider.ID); err != nil || ok {
+		t.Errorf("a rejected mutation created a row: ok=%v err=%v", ok, err)
+	}
+
+	// A caller with no row of its own, and a channel that does not exist, are the
+	// same rejection.
+	if err := s.SetChannelRole(ctx, ch.ID, outsider.ID, member.ID, 1); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("outsider caller: err = %v, want ErrNotMember", err)
+	}
+	if err := s.SetChannelBan(ctx, ch.ID+(1<<40), owner.ID, member.ID, &until, false); !errors.Is(err, store.ErrNotMember) {
+		t.Errorf("unknown channel: err = %v, want ErrNotMember", err)
+	}
+}
+
+func TestSetChannelBanForeverThenUnban(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551291042")
+	member := mustUser(t, s, "+15551291043")
+	ch, _, err := store.SeedChannelWithMember(ctx, s, owner.ID, member.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := s.SetChannelBan(ctx, ch.ID, owner.ID, member.ID, nil, true); err != nil {
+		t.Fatalf("ban forever: %v", err)
+	}
+	m, _, err := s.ChannelMemberOf(ctx, ch.ID, member.ID)
+	if err != nil {
+		t.Fatalf("member of: %v", err)
+	}
+	if !m.Banned(time.Now()) || !m.Forever() {
+		t.Fatalf("forever ban read back as %+v, want banned and permanent", m)
+	}
+
+	if err := s.SetChannelBan(ctx, ch.ID, owner.ID, member.ID, nil, false); err != nil {
+		t.Fatalf("unban: %v", err)
+	}
+	m, _, err = s.ChannelMemberOf(ctx, ch.ID, member.ID)
+	if err != nil {
+		t.Fatalf("member of: %v", err)
+	}
+	if m.BannedUntil != nil || m.Banned(time.Now()) {
+		t.Errorf("unban left %+v, want banned_until NULL", m)
+	}
+}
+
+// A ban outlives membership: leaving does not delete a banned row, so a re-join
+// on the same hash comes back banned and at the original join_pts.
+func TestBannedMemberCannotLeaveAwayTheBan(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551291044")
+	member := mustUser(t, s, "+15551291045")
+	ch, hash, err := store.SeedChannelWithMember(ctx, s, owner.ID, member.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	before, _, err := s.ChannelMemberOf(ctx, ch.ID, member.ID)
+	if err != nil {
+		t.Fatalf("member of: %v", err)
+	}
+	if err := s.SetChannelBan(ctx, ch.ID, owner.ID, member.ID, nil, true); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+
+	// The caller sees a normal leave.
+	left, err := s.LeaveChannel(ctx, ch.ID, member.ID)
+	if err != nil || !left {
+		t.Fatalf("leave: left=%v err=%v, want true/nil", left, err)
+	}
+	if _, ok, err := s.ChannelMemberOf(ctx, ch.ID, member.ID); err != nil || !ok {
+		t.Fatalf("banned row deleted by leave: ok=%v err=%v", ok, err)
+	}
+
+	_, m, err := s.JoinChannelByInvite(ctx, hash, member.ID)
+	if err != nil {
+		t.Fatalf("re-join: %v", err)
+	}
+	if !m.Banned(time.Now()) || !m.Forever() {
+		t.Errorf("re-join cleared the ban: %+v", m)
+	}
+	if m.JoinPts != before.JoinPts {
+		t.Errorf("join_pts moved to %d, want %d", m.JoinPts, before.JoinPts)
+	}
+}
+
 func TestCreateChannelRejectsPastThePerAccountCap(t *testing.T) {
 	t.Parallel()
 	s := open(t)
