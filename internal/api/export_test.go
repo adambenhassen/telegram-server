@@ -90,9 +90,20 @@ var (
 	InputPeer   = inputPeer
 	InputUserID = inputUserID
 	PeerToTL    = peerToTL
-	MessageToTL = messageToTL
 	ChatToTL    = chatToTL
 )
+
+// MessageToTL maps a media-free row, which is every row a pure mapper test
+// builds by hand. Media is hydrated from the store, so it is asserted through
+// the read paths instead.
+func MessageToTL(m store.Message, createUsers []int64) tg.MessageClass {
+	return messageToTL(m, createUsers, nil)
+}
+
+// DocumentToTL exposes the file-to-wire mapper for the external api_test package.
+func DocumentToTL(dcID int, f store.File) *tg.Document {
+	return (&handlers{dcID: dcID}).documentToTL(f)
+}
 
 // BuildUpdatesChatsForTest exposes the user and chat lists a batch carries
 // alongside its updates, which BuildUpdatesForTest partly omits.
@@ -108,6 +119,15 @@ func LoadChatsForTest(s *store.Store, ids []int64, viewerID int64) ([]tg.ChatCla
 		set[id] = true
 	}
 	return testHandlers(s).loadChats(context.Background(), set, viewerID)
+}
+
+// GetDifferenceForTest encodes req and invokes handleGetDifference for the caller.
+func GetDifferenceForTest(s *store.Store, userID int64, req *tg.UpdatesGetDifferenceRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetDifference(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // GetHistoryForTest encodes req and invokes handleGetHistory for the caller.

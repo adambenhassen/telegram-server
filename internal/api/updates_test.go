@@ -2,8 +2,10 @@ package api_test
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -487,4 +489,60 @@ func userIDs(us []tg.UserClass) []int64 {
 
 func hasUser(us []tg.UserClass, id int64) bool {
 	return slices.Contains(userIDs(us), id)
+}
+
+func TestGetDifferenceRendersSameMediaAsHistory(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	u1, u2 := mediaUsers(t, s, "+15551295001", "+15551295002")
+	mediaMessage(t, s, u1, u2, "here", true)
+
+	enc, err := api.GetDifferenceForTest(s, u2.ID, &tg.UpdatesGetDifferenceRequest{Pts: 0})
+	if err != nil {
+		t.Fatalf("get difference: %v", err)
+	}
+	diff, ok := enc.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("difference type = %T, want *tg.UpdatesDifference", enc)
+	}
+	if len(diff.NewMessages) != 1 {
+		t.Fatalf("new messages = %d, want 1", len(diff.NewMessages))
+	}
+	pulled, ok := diff.NewMessages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("message type = %T, want *tg.Message", diff.NewMessages[0])
+	}
+
+	msgs := historyMessages(t, s, u2, u1)
+	if len(msgs) != 1 {
+		t.Fatalf("history = %d messages, want 1", len(msgs))
+	}
+	read, ok := msgs[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("history message type = %T, want *tg.Message", msgs[0])
+	}
+
+	// The pull path and the read path must agree on the media they serve.
+	if diffDoc, readDoc := mediaDocument(t, pulled), mediaDocument(t, read); !reflect.DeepEqual(diffDoc, readDoc) {
+		t.Fatalf("getDifference document = %+v, getHistory document = %+v", diffDoc, readDoc)
+	}
+}
+
+func TestDocumentToTLFileReferenceIsTheFileID(t *testing.T) {
+	t.Parallel()
+
+	d := api.DocumentToTL(2, store.File{ID: 0x0102030405060708, AccessHash: 7, MimeType: "text/plain", Size: 11})
+	if len(d.FileReference) != 8 {
+		t.Fatalf("file reference = %d bytes, want 8", len(d.FileReference))
+	}
+	if got := int64(binary.BigEndian.Uint64(d.FileReference)); got != d.ID { //nolint:gosec // G115: opaque 64-bit id, sign irrelevant
+		t.Fatalf("file reference decodes to %d, want %d", got, d.ID)
+	}
+	if d.DCID != 2 {
+		t.Fatalf("dc id = %d, want 2", d.DCID)
+	}
+	// A file with no name carries no attribute rather than an empty one.
+	if len(d.Attributes) != 0 {
+		t.Fatalf("attributes = %d, want 0 for an unnamed file", len(d.Attributes))
+	}
 }
