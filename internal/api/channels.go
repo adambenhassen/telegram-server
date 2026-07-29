@@ -308,6 +308,98 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 	}, nil
 }
 
+// handleGetChannelDifference serves updates.getChannelDifference.
+//
+// ponytail: channelDifferenceTooLong is not implemented. Nothing trims
+// channel_events, so no pts can fall off the log yet and the too-long path
+// would be unreachable code. It rides with the event-log GC decision
+// (ROADMAP.md:258).
+func (h *handlers) handleGetChannelDifference(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.UpdatesGetChannelDifferenceRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := inputChannelID(req.Channel)
+	if err != nil {
+		return nil, err
+	}
+
+	// Require participant row and not banned; unknown channel and non-member
+	// return the same errPeerIDInvalid.
+	if err = h.requireChannelMember(r.Ctx, channelID, r.UserID); err != nil {
+		return nil, err
+	}
+
+	// Clamp pts to join_pts (G5 cost control). A client-supplied pts below the
+	// floor is clamped rather than trusted, so a fresh joiner cannot make the
+	// server replay a decade of events. This is NOT a confidentiality control:
+	// getHistory still serves the full history to a current member, deliberately,
+	// and that asymmetry needs this comment or someone will later "fix" one of
+	// the two to match the other.
+	member, _, err := h.store.ChannelMemberOf(r.Ctx, channelID, r.UserID)
+	if err != nil {
+		h.log.Error("channel difference membership", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	fromPts := max(req.Pts, member.JoinPts)
+
+	// Clamp req.Limit into [1, maxDiffEvents].
+	limit := max(1, min(req.Limit, maxDiffEvents))
+
+	// Read state first to clamp ahead-of-server.
+	currentPts, err := h.store.ChannelState(r.Ctx, channelID)
+	if err != nil {
+		h.log.Error("channel difference state", "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+
+	// Client pts above server's current pts: clamp to empty (same as
+	// handleGetDifference for the per-account stream).
+	if fromPts >= currentPts {
+		return &tg.UpdatesChannelDifferenceEmpty{Pts: currentPts, Final: true}, nil
+	}
+
+	b, err := h.buildChannelUpdates(r.Ctx, channelID, r.UserID, fromPts, limit)
+	if err != nil {
+		h.log.Error("channel difference build", "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+
+	if len(b.ups) == 0 {
+		return &tg.UpdatesChannelDifferenceEmpty{Pts: currentPts, Final: true}, nil
+	}
+
+	// Extract messages from updates for NewMessages.
+	var newMessages []tg.MessageClass
+	for _, u := range b.ups {
+		if nuc, ok := u.(*tg.UpdateNewChannelMessage); ok {
+			newMessages = append(newMessages, nuc.Message)
+		}
+	}
+
+	if b.more {
+		return &tg.UpdatesChannelDifference{
+			Final:        false,
+			Pts:          b.currentPts,
+			NewMessages:  newMessages,
+			OtherUpdates: nil,
+			Chats:        b.chats,
+			Users:        b.users,
+		}, nil
+	}
+	return &tg.UpdatesChannelDifference{
+		Final:        true,
+		Pts:          currentPts,
+		NewMessages:  newMessages,
+		OtherUpdates: nil,
+		Chats:        b.chats,
+		Users:        b.users,
+	}, nil
+}
+
 // handleGetChannelMessages serves channels.getMessages: the named posts of one
 // channel, for a caller who is currently an unbanned member of it.
 func (h *handlers) handleGetChannelMessages(r *mtproto.Request) (bin.Encoder, error) {

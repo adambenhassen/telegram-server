@@ -82,5 +82,15 @@ func EditBannedForTest(s *store.Store, userID int64, req *tg.ChannelsEditBannedR
 	return testHandlers(s).handleEditBanned(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// GetChannelDifferenceForTest encodes req and invokes handleGetChannelDifference
+// for the caller.
+func GetChannelDifferenceForTest(s *store.Store, userID int64, req *tg.UpdatesGetChannelDifferenceRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetChannelDifference(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // MaxGetChannels exposes the getChannels input cap to the api_test package.
 const MaxGetChannels = maxGetChannels
