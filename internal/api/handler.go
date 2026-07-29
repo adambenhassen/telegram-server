@@ -8,6 +8,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/srp"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -23,6 +24,11 @@ type handlers struct {
 	logLoginCodes bool
 	// maxFileBytes is the per-file upload cap the save handlers enforce.
 	maxFileBytes int64
+	// blobs holds assembled file bodies; the files table holds their metadata.
+	blobs blob.Store
+	// maxUserStorageBytes is the account-lifetime stored-bytes cap assembly
+	// checks before it allocates a file row.
+	maxUserStorageBytes int64
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -64,7 +70,7 @@ func selfRevocation(r *mtproto.Request, keyID int64) bool {
 
 // New builds the RPC handler: dispatcher wrapped with UnpackInvoke so
 // invokeWithLayer/initConnection wrappers are peeled before dispatch.
-func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64) mtproto.Handler {
+func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64) mtproto.Handler {
 	h := &handlers{
 		store:         s,
 		cfg:           cfg,
@@ -73,6 +79,9 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		srp:           srp.NewChallengeStore(srp.DefaultTTL),
 		logLoginCodes: logLoginCodes,
 		maxFileBytes:  maxFileBytes,
+
+		blobs:               blobs,
+		maxUserStorageBytes: maxUserStorageBytes,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
@@ -99,6 +108,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesEditChatTitleRequestTypeID, h.handleEditChatTitle)
 	register(d, tg.MessagesAddChatUserRequestTypeID, h.handleAddChatUser)
 	register(d, tg.MessagesDeleteChatUserRequestTypeID, h.handleDeleteChatUser)
+	register(d, tg.MessagesSendMediaRequestTypeID, h.handleSendMedia)
 	register(d, tg.UploadSaveFilePartRequestTypeID, h.handleSaveFilePart)
 	register(d, tg.UploadSaveBigFilePartRequestTypeID, h.handleSaveBigFilePart)
 	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {

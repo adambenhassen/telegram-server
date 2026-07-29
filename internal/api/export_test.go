@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"io"
 	"log/slog"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -209,6 +211,38 @@ func SendMessageForTest(s *store.Store, userID int64, req *tg.MessagesSendMessag
 		return nil, err
 	}
 	return testHandlers(s).handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SendMediaForTest encodes req and invokes handleSendMedia for the caller,
+// against blobs and the account-lifetime storage cap maxUserStorageBytes.
+func SendMediaForTest(
+	s *store.Store, userID int64, blobs blob.Store, maxUserStorageBytes int64,
+	req *tg.MessagesSendMediaRequest,
+) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.blobs, h.maxUserStorageBytes = blobs, maxUserStorageBytes
+	return h.handleSendMedia(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// TestMaxUserStorageBytes is the account-lifetime stored-bytes cap media tests
+// run with unless they are reaching for the quota rejection.
+const TestMaxUserStorageBytes int64 = 2 << 30
+
+// SanitizeMIME and SanitizeFileName expose the two boundary sanitizers. Both
+// are pure and need no store.
+var (
+	SanitizeMIME     = sanitizeMIME
+	SanitizeFileName = sanitizeFileName
+)
+
+// NewPartsReaderForTest builds the streaming reader over an in-flight upload's
+// parts, for the external api_test package.
+func NewPartsReaderForTest(s *store.Store, userID, fileID int64, total int) io.Reader {
+	return &partsReader{ctx: context.Background(), store: s, userID: userID, fileID: fileID, total: total}
 }
 
 // EditMessageForTest encodes req and invokes handleEditMessage for the caller.

@@ -33,6 +33,14 @@ type Config struct {
 	// MaxFileBytes caps one uploaded file. A user's outstanding unassembled
 	// bytes are capped at twice this, which is two concurrent max-size uploads.
 	MaxFileBytes int64
+	// BlobDir is where uploaded file bodies are stored. It must be outside the
+	// repository and outside anything a future HTTP surface serves statically.
+	BlobDir string
+	// MaxUserStorageBytes caps the total size of one account's uploaded files.
+	// M5 ships no blob deleter, so nothing decrements this: it is a lifetime
+	// quota per account, not a live one, and it is the number that decides
+	// whether one account can fill the disk.
+	MaxUserStorageBytes int64
 	// UploadPartTTL is how long an unassembled upload part is kept before the
 	// sweeper deletes it. Short on purpose: a real client uploads and sends
 	// within minutes, and the TTL is the term that makes worst-case retained
@@ -54,9 +62,11 @@ func Load() (Config, error) {
 		PostgresDSN: os.Getenv("TG_POSTGRES_DSN"),
 		RSAKeyPath:  envOr("TG_RSA_KEY_PATH", "server_key.pem"),
 		DCID:        2,
+		BlobDir:     envOr("TG_BLOB_DIR", "blobs"),
 
-		MaxFileBytes:  100 << 20,
-		UploadPartTTL: 6 * time.Hour,
+		MaxFileBytes:        100 << 20,
+		MaxUserStorageBytes: 2 << 30,
+		UploadPartTTL:       6 * time.Hour,
 	}
 	if v := os.Getenv("TG_DC_ID"); v != "" {
 		id, err := strconv.Atoi(v)
@@ -77,6 +87,16 @@ func Load() (Config, error) {
 			return Config{}, errors.New("TG_MAX_FILE_BYTES must be at most 1099511627776")
 		}
 		cfg.MaxFileBytes = n
+	}
+	if v := os.Getenv("TG_MAX_USER_STORAGE_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return Config{}, errors.New("TG_MAX_USER_STORAGE_BYTES must be an integer")
+		}
+		if n <= 0 {
+			return Config{}, errors.New("TG_MAX_USER_STORAGE_BYTES must be positive")
+		}
+		cfg.MaxUserStorageBytes = n
 	}
 	if v := os.Getenv("TG_UPLOAD_PART_TTL"); v != "" {
 		d, err := time.ParseDuration(v)

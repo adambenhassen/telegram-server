@@ -85,6 +85,24 @@ func (s *Store) MessageByOwnerLocal(ctx context.Context, ownerID, localID int64)
 	return messageFromRow(r), true, nil
 }
 
+// MessageByRandomID returns the sender's own copy of the message carrying
+// randomID; ok=false when absent. It is the read half of the dedup token both
+// send paths write, for a caller that has to know whether a send is a resend
+// before it does work the send itself cannot undo.
+func (s *Store) MessageByRandomID(ctx context.Context, ownerID, randomID int64) (Message, bool, error) {
+	if randomID == 0 {
+		return Message{}, false, nil
+	}
+	r, err := s.q.MessageByRandomID(ctx, db.MessageByRandomIDParams{OwnerID: ownerID, RandomID: randomID})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Message{}, false, nil
+	case err != nil:
+		return Message{}, false, fmt.Errorf("message by random id: %w", err)
+	}
+	return messageFromRow(r), true, nil
+}
+
 // SendMessage persists both sides of a 1:1 message in one transaction. Each side
 // gets its own local_id and its own pts++. A repeated randomID (per sender) is
 // deduped: the original sender message is returned with dup=true and no new rows

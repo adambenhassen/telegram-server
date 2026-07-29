@@ -132,13 +132,16 @@ jobs:
         run: |
           # --network host reaches the service container on localhost.
           # --read-only proves the claim the compose ticket depends on: the only
-          # writable path is the volume holding the RSA identity key, which
-          # inherits 0700 and uid 65532 from the image directory. Without that
-          # mount the server would generate a fresh identity into its writable
-          # layer on every start, so the test exercises the intended shape.
+          # writable paths are the two volumes, one holding the RSA identity key
+          # and one holding uploaded file bodies, each inheriting 0700 and uid
+          # 65532 from its image directory. Without the key mount the server
+          # would generate a fresh identity into its writable layer on every
+          # start; without the blob mount it cannot store media at all. They are
+          # separate volumes so unbounded uploads cannot fill the volume the
+          # identity key is backed up from.
           docker run -d --name telegramd \
             --network host \
-            --read-only -v tg-key:/var/lib/telegramd \
+            --read-only -v tg-key:/var/lib/telegramd -v tg-blobs:/var/lib/telegramd-blobs \
             -e TG_POSTGRES_DSN -e TG_AUTHKEY_ENC_KEY \
             telegramd:ci
           for _ in $(seq 30); do

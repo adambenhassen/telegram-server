@@ -91,11 +91,14 @@ services:
     # --read-only: the static binary writes nothing but its key file.
     read_only: true
     volumes:
-      # The one writable path. A named volume takes the mountpoint's 0700 and uid
+      # The two writable paths, and the only ones. A named volume takes the mountpoint's 0700 and uid
       # 65532 from the image; a bind mount would take the host directory's mode
       # instead — root-owned means the server cannot write its key and crash
       # loops, 0755 means a live RSA private key readable by every local user.
       - tgkey:/var/lib/telegramd
+      # Uploaded file bodies, on their own volume: they grow without bound and
+      # the key volume must not. Same 0700 uid 65532 inheritance as above.
+      - tgblobs:/var/lib/telegramd-blobs
     # store.Open refuses to start against an unmigrated schema
     # (internal/store/store.go:69), so the ordering is load-bearing, not cosmetic.
     depends_on:
@@ -105,3 +108,4 @@ services:
 volumes:
   pgdata:
   tgkey:
+  tgblobs:

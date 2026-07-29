@@ -16,6 +16,7 @@ import (
 	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -75,8 +76,13 @@ func run(log *slog.Logger) error {
 		sweepWG.Wait()
 	}()
 
+	blobs, err := blob.NewLocal(cfg.BlobDir)
+	if err != nil {
+		return err
+	}
+
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
-	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes)
+	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes)
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
 	}
