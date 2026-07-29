@@ -18,6 +18,9 @@ import (
 const (
 	defaultHistoryLimit = 20
 	maxHistoryLimit     = 100
+
+	defaultDialogsLimit = 20
+	maxDialogsLimit     = 100
 )
 
 // notify emits the cross-replica update nudge for userID (best-effort).

@@ -21,9 +21,15 @@ type Dialog struct {
 	ReadOutboxMaxID int64
 }
 
-// Dialogs lists the owner's conversations, newest activity first.
-func (s *Store) Dialogs(ctx context.Context, ownerID int64) ([]Dialog, error) {
-	rows, err := s.q.DialogsForOwner(ctx, ownerID)
+// Dialogs lists the owner's conversations, newest activity first, one page at a
+// time. offsetID > 0 pages strictly older than that top_message (0 = from
+// newest); limit is required and bounds the page.
+func (s *Store) Dialogs(ctx context.Context, ownerID, offsetID int64, limit int) ([]Dialog, error) {
+	rows, err := s.q.DialogsForOwner(ctx, db.DialogsForOwnerParams{
+		OwnerID:  ownerID,
+		OffsetID: offsetID,
+		Lim:      int32(limit), //nolint:gosec // limit is a small validated page size
+	})
 	if err != nil {
 		return nil, fmt.Errorf("dialogs for owner: %w", err)
 	}
@@ -40,6 +46,15 @@ func (s *Store) Dialogs(ctx context.Context, ownerID int64) ([]Dialog, error) {
 		}
 	}
 	return out, nil
+}
+
+// CountDialogs is the owner's total dialog count, for the truncated reply.
+func (s *Store) CountDialogs(ctx context.Context, ownerID int64) (int, error) {
+	n, err := s.q.CountDialogsForOwner(ctx, ownerID)
+	if err != nil {
+		return 0, fmt.Errorf("count dialogs for owner: %w", err)
+	}
+	return int(n), nil
 }
 
 // ReadHistory marks the reader's inbound history with peer read up to maxID

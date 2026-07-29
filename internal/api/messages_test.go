@@ -973,3 +973,121 @@ func TestSendAndEditMessageKeepMultiByteText(t *testing.T) {
 		t.Fatalf("edited text = %q, want %q", after.Text, edited)
 	}
 }
+
+// dialogsFor gives owner n DM dialogs, top messages 1..n, newest last.
+func dialogsFor(t *testing.T, s *store.Store, phonePrefix string, n int) store.User {
+	t.Helper()
+	ctx := context.Background()
+	owner, err := s.CreateUser(ctx, phonePrefix+"000")
+	if err != nil {
+		t.Fatalf("owner: %v", err)
+	}
+	for i := range n {
+		peer, perr := s.CreateUser(ctx, phonePrefix+strconv.Itoa(101+i))
+		if perr != nil {
+			t.Fatalf("peer %d: %v", i, perr)
+		}
+		// The peer sends, so the owner gets an inbox copy and a dialog.
+		if _, perr = api.SendMessageForTest(s, peer.ID, &tg.MessagesSendMessageRequest{
+			Peer: &tg.InputPeerUser{UserID: owner.ID, AccessHash: owner.ID}, Message: "hi", RandomID: int64(i + 1),
+		}); perr != nil {
+			t.Fatalf("dm %d: %v", i, perr)
+		}
+	}
+	return owner
+}
+
+// topMessage reads a reply dialog's top message.
+func topMessage(t *testing.T, d tg.DialogClass) int {
+	t.Helper()
+	dlg, ok := d.(*tg.Dialog)
+	if !ok {
+		t.Fatalf("dialog type = %T, want *tg.Dialog", d)
+	}
+	return dlg.TopMessage
+}
+
+// A list longer than the page must come back as a slice carrying the whole-list
+// total, so the client knows there is more behind the page it got.
+func TestHandleGetDialogsTruncatesToSlice(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	const total = 21 // one over the default limit
+	owner := dialogsFor(t, s, "+1555129321", total)
+
+	// Limit 0 clamps to defaultDialogsLimit.
+	enc, err := api.GetDialogsPageForTest(s, owner.ID, &tg.MessagesGetDialogsRequest{OffsetPeer: &tg.InputPeerEmpty{}})
+	if err != nil {
+		t.Fatalf("dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesDialogsSlice)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesDialogsSlice", enc)
+	}
+	if len(res.Dialogs) != 20 {
+		t.Fatalf("dialogs = %d, want 20", len(res.Dialogs))
+	}
+	if res.Count != total {
+		t.Fatalf("count = %d, want %d", res.Count, total)
+	}
+	// Newest first, so the page starts at the last dialog written.
+	if top := topMessage(t, res.Dialogs[0]); top != total {
+		t.Fatalf("first dialog top_message = %d, want %d", top, total)
+	}
+
+	// Paging past the first page reaches the end and drops back to the plain reply.
+	last := topMessage(t, res.Dialogs[len(res.Dialogs)-1])
+	enc, err = api.GetDialogsPageForTest(s, owner.ID, &tg.MessagesGetDialogsRequest{
+		OffsetPeer: &tg.InputPeerEmpty{}, OffsetID: last, Limit: 20,
+	})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	rest, ok := enc.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("second page type = %T, want *tg.MessagesDialogs", enc)
+	}
+	if len(rest.Dialogs) != total-20 {
+		t.Fatalf("second page = %d dialogs, want %d", len(rest.Dialogs), total-20)
+	}
+	if got := topMessage(t, rest.Dialogs[0]); got != last-1 {
+		t.Fatalf("second page starts at %d, want %d — offset is not strictly older", got, last-1)
+	}
+}
+
+// An over-large limit clamps rather than serving the whole list unbounded.
+func TestHandleGetDialogsClampsLimit(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	owner := dialogsFor(t, s, "+1555129331", 3)
+
+	enc, err := api.GetDialogsPageForTest(s, owner.ID, &tg.MessagesGetDialogsRequest{
+		OffsetPeer: &tg.InputPeerEmpty{}, Limit: 500,
+	})
+	if err != nil {
+		t.Fatalf("dialogs: %v", err)
+	}
+	// Three dialogs is short of the clamped 100, so the reply stays plain.
+	res, ok := enc.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesDialogs", enc)
+	}
+	if len(res.Dialogs) != 3 {
+		t.Fatalf("dialogs = %d, want 3", len(res.Dialogs))
+	}
+
+	// A limit the list exactly fills is a full page, so it must advertise the total.
+	enc, err = api.GetDialogsPageForTest(s, owner.ID, &tg.MessagesGetDialogsRequest{
+		OffsetPeer: &tg.InputPeerEmpty{}, Limit: 3,
+	})
+	if err != nil {
+		t.Fatalf("exact page: %v", err)
+	}
+	slice, ok := enc.(*tg.MessagesDialogsSlice)
+	if !ok {
+		t.Fatalf("exact page type = %T, want *tg.MessagesDialogsSlice", enc)
+	}
+	if slice.Count != 3 || len(slice.Dialogs) != 3 {
+		t.Fatalf("exact page = %d dialogs, count %d, want 3 and 3", len(slice.Dialogs), slice.Count)
+	}
+}

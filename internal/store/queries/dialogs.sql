@@ -8,7 +8,17 @@ ON CONFLICT (owner_id, peer_type, peer_id) DO UPDATE
       unread_count = dialogs.unread_count + EXCLUDED.unread_count;
 
 -- name: DialogsForOwner :many
-SELECT * FROM dialogs WHERE owner_id = $1 ORDER BY top_message DESC;
+SELECT * FROM dialogs
+WHERE owner_id = sqlc.arg(owner_id)
+  AND (sqlc.arg(offset_id)::bigint = 0 OR top_message < sqlc.arg(offset_id)::bigint)
+ORDER BY top_message DESC
+LIMIT sqlc.arg(lim)::int;
+
+-- CountDialogsForOwner is the total the truncated reply advertises, so a client
+-- knows more pages exist. Unfiltered by offset on purpose: it is the size of the
+-- whole list, not of the remainder.
+-- name: CountDialogsForOwner :one
+SELECT count(*)::int FROM dialogs WHERE owner_id = $1;
 
 -- AdvanceReadInbox raises the reader's read_inbox_max_id monotonically and
 -- recomputes unread as the count of still-unread inbound messages above it.
