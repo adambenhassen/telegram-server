@@ -62,7 +62,10 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	tlDialogs := make([]tg.DialogClass, 0, len(dialogs))
-	tlMsgs := make([]tg.MessageClass, 0, len(dialogs))
+	// Top messages are collected first and mapped after the loop, so the whole
+	// page's media is hydrated in one query rather than one per dialog.
+	tops := make([]store.Message, 0, len(dialogs))
+	topCreateUsers := make([][]int64, 0, len(dialogs))
 	peerIDs := map[int64]bool{r.UserID: true}
 	chatIDs := map[int64]bool{}
 	for _, d := range dialogs {
@@ -105,8 +108,19 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 					peerIDs[id] = true
 				}
 			}
-			tlMsgs = append(tlMsgs, messageToTL(m, createUsers))
+			tops = append(tops, m)
+			topCreateUsers = append(topCreateUsers, createUsers)
 		}
+	}
+
+	files, err := h.loadFiles(r.Ctx, tops)
+	if err != nil {
+		h.log.Error("get dialogs files", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	tlMsgs := make([]tg.MessageClass, len(tops))
+	for i, m := range tops {
+		tlMsgs[i] = messageToTL(m, topCreateUsers[i], files)
 	}
 
 	users, err := h.loadUsers(r.Ctx, peerIDs, r.UserID)
