@@ -17,6 +17,7 @@ import (
 	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -50,7 +51,11 @@ func TestClientLogin(t *testing.T) {
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	// The code sink scrapes the issued code out of the log, so the e2e suite
 	// needs the gated line on.
-	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20, blobs, 2<<30)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
 
 	var lc net.ListenConfig
