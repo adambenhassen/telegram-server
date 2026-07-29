@@ -43,6 +43,10 @@ func TestSanitizeFileName(t *testing.T) {
 		"réunion notes.pdf":      "réunion notes.pdf",
 		"nul\x00.txt":            "",
 		"two\nlines.txt":         "",
+		"bell\x07.txt":           "",
+		"c1\u009f.txt":           "",
+		"annexe\u202egnp.exe":    "",
+		"isolate\u2066.txt":      "",
 		strings.Repeat("a", 256): "",
 	}
 	for in, want := range tests {
