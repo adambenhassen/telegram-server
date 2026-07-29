@@ -173,7 +173,7 @@ func TestChannelHistoryNewestFirstSkipsDeleted(t *testing.T) {
 		t.Fatalf("history not newest-first: %+v", history)
 	}
 
-	if err := store.MarkChannelMessageDeleted(ctx, s, ch, 2); err != nil {
+	if err := store.SetChannelPostDeleted(ctx, s, ch, 2); err != nil {
 		t.Fatalf("mark deleted: %v", err)
 	}
 	history, err = s.ChannelHistory(ctx, ch, 0, 10)
@@ -265,7 +265,7 @@ func TestChannelMessagesKeepsDeletedRows(t *testing.T) {
 	ch := mustChannel(t, s, author.ID, "news").ID
 
 	post(t, s, ch, author.ID, "one", 1)
-	if err := store.MarkChannelMessageDeleted(ctx, s, ch, 1); err != nil {
+	if err := store.SetChannelPostDeleted(ctx, s, ch, 1); err != nil {
 		t.Fatalf("mark deleted: %v", err)
 	}
 
