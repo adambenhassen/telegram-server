@@ -126,16 +126,28 @@ func TestGetFileGate(t *testing.T) {
 		t.Fatalf("user c: %v", err)
 	}
 
-	rejections := map[string]struct {
+	type rejection struct {
 		userID int64
 		loc    *tg.InputDocumentFileLocation
-	}{
+	}
+	rejections := map[string]rejection{
 		"stranger":    {c.ID, &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash}},
 		"wrong hash":  {a.ID, &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash + 1}},
 		"absent id":   {a.ID, &tg.InputDocumentFileLocation{ID: doc.ID + 1000, AccessHash: doc.AccessHash}},
 		"thumb size":  {a.ID, &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash, ThumbSize: "m"}},
 		"never given": {c.ID, &tg.InputDocumentFileLocation{ID: doc.ID + 1000, AccessHash: doc.AccessHash + 1}},
 	}
+
+	// A file row that exists but whose bytes were never stored: allocated and
+	// never assembled, so it fails the gate's stored predicate.
+	unstored, err := s.AllocateFile(ctx, a.ID, 11, "text/plain", "never.txt", api.TestMaxUserStorageBytes)
+	if err != nil {
+		t.Fatalf("allocate file: %v", err)
+	}
+	rejections["not stored"] = rejection{
+		a.ID, &tg.InputDocumentFileLocation{ID: unstored.ID, AccessHash: unstored.AccessHash},
+	}
+
 	for name, r := range rejections {
 		_, err = api.GetFileForTest(s, r.userID, blobs, &tg.UploadGetFileRequest{
 			Location: r.loc, Offset: 0, Limit: 1024,
@@ -216,6 +228,44 @@ func TestGetFileDeletedMessageRevokes(t *testing.T) {
 		if msg := rpcMessage(t, err); msg != "LOCATION_INVALID" {
 			t.Errorf("post-delete read by %d: got %s, want LOCATION_INVALID", uid, msg)
 		}
+	}
+}
+
+// TestGetFileReleasesSlotOnError drives the release through handleGetFile
+// rather than through the slot methods, which is the only way to catch a
+// dropped `defer h.endDownload`. That failure is permanent: a leaked slot locks
+// the account out of downloading for the life of the process.
+func TestGetFileReleasesSlotOnError(t *testing.T) {
+	t.Parallel()
+	s, blobs, a, _, doc := downloadFixture(t, "+15551297041", "+15551297042")
+	// Both calls go through one handler, so they share the slot map.
+	getFile := api.GetFileSeqForTest(s, blobs)
+
+	// Fails after the claim: the window check that rejects an offset past the
+	// end runs against the loaded file, so the slot has already been taken.
+	_, err := getFile(a.ID, &tg.UploadGetFileRequest{
+		Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+		Offset:   int64(len(downloadPayload)) + 1,
+		Limit:    1024,
+	})
+	if msg := rpcMessage(t, err); msg != "LOCATION_INVALID" {
+		t.Fatalf("got %s, want LOCATION_INVALID", msg)
+	}
+
+	enc, err := getFile(a.ID, &tg.UploadGetFileRequest{
+		Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+		Offset:   0,
+		Limit:    64,
+	})
+	if err != nil {
+		t.Fatalf("read after failed download: %v", err)
+	}
+	f, ok := enc.(*tg.UploadFile)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.UploadFile", enc)
+	}
+	if string(f.Bytes) != downloadPayload {
+		t.Errorf("read after failed download = %q, want %q", f.Bytes, downloadPayload)
 	}
 }
 
