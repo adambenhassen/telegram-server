@@ -71,8 +71,8 @@ func (q *Queries) HistoryPage(ctx context.Context, arg HistoryPageParams) ([]Mes
 
 const insertMessage = `-- name: InsertMessage :exec
 INSERT INTO messages (owner_id, local_id, peer_type, peer_id, from_id, message, out, random_id, peer_local_id,
-                      fanout_id, action_type, action_user_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                      fanout_id, action_type, action_user_id, file_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 `
 
 type InsertMessageParams struct {
@@ -88,6 +88,7 @@ type InsertMessageParams struct {
 	FanoutID     int64
 	ActionType   int16
 	ActionUserID int64
+	FileID       int64
 }
 
 func (q *Queries) InsertMessage(ctx context.Context, arg InsertMessageParams) error {
@@ -104,6 +105,7 @@ func (q *Queries) InsertMessage(ctx context.Context, arg InsertMessageParams) er
 		arg.FanoutID,
 		arg.ActionType,
 		arg.ActionUserID,
+		arg.FileID,
 	)
 	return err
 }
