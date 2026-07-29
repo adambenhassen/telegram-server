@@ -53,6 +53,37 @@ func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Docum
 	return msg
 }
 
+// channelMessageToTL maps a stored channel post to the wire message, the
+// channel counterpart of messageToTL. A channel keeps one row per post rather
+// than one per member, so Out is derived from the viewer here instead of being
+// read off the row, and the peer is always the channel.
+//
+// Channel posts carry no service actions in M7, so this always renders a
+// tg.Message. files is keyed by file id exactly as messageToTL's is, but the
+// "no media" sentinel differs and the trap is worth naming:
+// channel_messages.file_id is NULL for no media, while messages.file_id is 0.
+func channelMessageToTL(m store.ChannelMessage, viewerID int64, files map[int64]*tg.Document) *tg.Message {
+	msg := &tg.Message{
+		ID:      int(m.LocalID),
+		Out:     m.FromID == viewerID,
+		PeerID:  &tg.PeerChannel{ChannelID: m.ChannelID},
+		FromID:  &tg.PeerUser{UserID: m.FromID},
+		Message: m.Message,
+		Date:    int(m.Date.Unix()),
+	}
+	if m.EditDate != nil {
+		msg.EditDate = int(m.EditDate.Unix())
+	}
+	// SetMedia rather than a plain assignment: Media is a conditional field and
+	// encodes only when its flag is set with it.
+	if m.FileID != nil {
+		if d, ok := files[*m.FileID]; ok {
+			msg.SetMedia(&tg.MessageMediaDocument{Document: d})
+		}
+	}
+	return msg
+}
+
 // documentToTL names a stored file on the wire. Attributes carry only the file
 // name: M5 stores no other document attribute, and it never decodes an uploaded
 // file, so it cannot honestly claim an image size or a duration it did not
