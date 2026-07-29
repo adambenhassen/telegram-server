@@ -240,22 +240,25 @@ jobs:
           # hardcoding the path is what makes this catch the silent case: a
           # TG_BLOB_DIR pointing at some path with no volume under it leaves
           # uploads in the writable layer while the stack still boots green.
+          #
+          # Diagnostics go to stderr: the caller captures stdout, so a failure
+          # message written there would be swallowed instead of logged.
           blob_volume() {
             cid=$(docker compose ps -q telegramd)
-            [ -n "$cid" ] || { echo "no telegramd container to inspect ($1)"; return 1; }
+            [ -n "$cid" ] || { echo "no telegramd container to inspect ($1)" >&2; return 1; }
 
             dir=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' \
               | sed -n 's/^TG_BLOB_DIR=//p' | head -1)
             if [ -z "$dir" ]; then
-              echo "telegramd has no TG_BLOB_DIR in its environment ($1)"
+              echo "telegramd has no TG_BLOB_DIR in its environment ($1)" >&2
               return 1
             fi
 
             vol=$(docker inspect "$cid" \
               --format '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "'"$dir"'")}}{{.Name}}{{end}}{{end}}')
             if [ -z "$vol" ]; then
-              docker inspect "$cid" --format '{{json .Mounts}}'
-              echo "TG_BLOB_DIR=$dir is not a named volume: uploaded files would die with the container ($1)"
+              docker inspect "$cid" --format '{{json .Mounts}}' >&2
+              echo "TG_BLOB_DIR=$dir is not a named volume: uploaded files would die with the container ($1)" >&2
               return 1
             fi
             echo "$vol"
