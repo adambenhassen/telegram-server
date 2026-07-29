@@ -217,6 +217,93 @@ func TestSendMediaToUser(t *testing.T) {
 	}
 }
 
+func TestSendMediaSanitizesStoredMIME(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a, err := s.CreateUser(ctx, "+15551296091")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551296092")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+	saveParts(t, s, a.ID, 564, []byte("plain"))
+
+	// The wiring, not the pure function: a mime type with a space is stored as
+	// the generic type, and the reply echoes what was stored.
+	enc, err := api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
+		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Media:    uploadedDocument(564, 1, "two\nlines.txt", "text/plain; charset=utf-8"),
+		RandomID: 50,
+	})
+	if err != nil {
+		t.Fatalf("send media: %v", err)
+	}
+	doc := documentOf(t, enc)
+	if doc.MimeType != "application/octet-stream" {
+		t.Errorf("MimeType = %q, want application/octet-stream", doc.MimeType)
+	}
+	// The file name is unusable, so the document carries no name attribute.
+	if len(doc.Attributes) != 0 {
+		t.Errorf("attributes = %#v, want none", doc.Attributes)
+	}
+}
+
+func TestSendMediaResendIsIdempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	a, err := s.CreateUser(ctx, "+15551296101")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551296102")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+	saveParts(t, s, a.ID, 565, []byte("once"))
+
+	req := &tg.MessagesSendMediaRequest{
+		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Media:    uploadedDocument(565, 1, "once.txt", "text/plain"),
+		Message:  "look",
+		RandomID: 51,
+	}
+	first, err := api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, req)
+	if err != nil {
+		t.Fatalf("send media: %v", err)
+	}
+	firstDoc := documentOf(t, first)
+
+	// A client that lost the reply resends. Assembly already consumed the
+	// parts, so a resend that reached it would report MEDIA_INVALID for a
+	// message that was delivered.
+	second, err := api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, req)
+	if err != nil {
+		t.Fatalf("resend: %v", err)
+	}
+	secondDoc := documentOf(t, second)
+	if secondDoc.ID != firstDoc.ID {
+		t.Errorf("resend document = %d, want %d", secondDoc.ID, firstDoc.ID)
+	}
+	// No second message and no second file: the resend cost nothing.
+	if n := countFiles(t, ctx, dsn); n != 1 {
+		t.Errorf("files rows = %d, want 1", n)
+	}
+	hist, err := api.GetHistoryForTest(s, b.ID, &tg.MessagesGetHistoryRequest{
+		Peer: &tg.InputPeerUser{UserID: a.ID, AccessHash: a.ID},
+	})
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	msgs, ok := hist.(*tg.MessagesMessages)
+	if !ok || len(msgs.Messages) != 1 {
+		t.Fatalf("history = %#v, want one message", hist)
+	}
+}
+
 func TestSendMediaToChat(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)

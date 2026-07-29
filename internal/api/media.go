@@ -147,17 +147,28 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, err
 	}
 
-	file, err := h.assembleFile(r.Ctx, r.UserID, clientFileID, parts, name, media.MimeType)
+	// Assembly is the one step in this handler the send path's dedup cannot
+	// cover: it consumes the upload parts, so a resend that reached assembly
+	// would fail on an upload that is no longer there and report MEDIA_INVALID
+	// for a message that was in fact delivered. Reading the dedup token first
+	// makes a resend re-send the file the original message already names.
+	fileID, err := h.resendFileID(r.Ctx, r.UserID, req.RandomID)
 	if err != nil {
 		return nil, err
 	}
-	files := map[int64]*tg.Document{file.ID: h.documentToTL(file)}
-
-	if peerType == store.PeerTypeChat {
-		return h.sendChatMedia(r, toID, &req, file, files)
+	if fileID == 0 {
+		file, aerr := h.assembleFile(r.Ctx, r.UserID, clientFileID, parts, name, media.MimeType)
+		if aerr != nil {
+			return nil, aerr
+		}
+		fileID = file.ID
 	}
 
-	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, file.ID)
+	if peerType == store.PeerTypeChat {
+		return h.sendChatMedia(r, toID, &req, fileID)
+	}
+
+	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, fileID)
 	if err != nil {
 		h.log.Error("send media", "user_id", r.UserID, "err", err)
 		return nil, errInternal
@@ -170,6 +181,14 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("send media users", "err", err)
+		return nil, errInternal
+	}
+	// Hydrated off the row that was actually stored rather than off the file
+	// this call assembled: on a resend those differ, and keying the map on the
+	// wrong id renders the reply as a plain message.
+	files, err := h.loadFiles(r.Ctx, []store.Message{sender})
+	if err != nil {
+		h.log.Error("send media files", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
 	return &tg.Updates{
@@ -186,11 +205,10 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 // membership requireMember has already established, and returns the sender-side
 // Updates.
 func (h *handlers) sendChatMedia(
-	r *mtproto.Request, chatID int64, req *tg.MessagesSendMediaRequest,
-	file store.File, files map[int64]*tg.Document,
+	r *mtproto.Request, chatID int64, req *tg.MessagesSendMediaRequest, fileID int64,
 ) (bin.Encoder, error) {
 	sender, perOwner, dup, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
-		ChatID: chatID, FromID: r.UserID, Text: req.Message, RandomID: req.RandomID, FileID: file.ID,
+		ChatID: chatID, FromID: r.UserID, Text: req.Message, RandomID: req.RandomID, FileID: fileID,
 	})
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
@@ -219,6 +237,11 @@ func (h *handlers) sendChatMedia(
 		h.log.Error("send chat media chats", "err", err)
 		return nil, errInternal
 	}
+	files, err := h.loadFiles(r.Ctx, []store.Message{sender})
+	if err != nil {
+		h.log.Error("send chat media files", "user_id", r.UserID, "chat_id", chatID, "err", err)
+		return nil, errInternal
+	}
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
@@ -228,6 +251,27 @@ func (h *handlers) sendChatMedia(
 		Chats: chats,
 		Date:  int(sender.Date.Unix()),
 	}, nil
+}
+
+// resendFileID reports the file the caller's existing message with this random
+// id already names. It is 0 both when this send is not a resend and when the
+// original message carried no media, and those two want the same handling: go
+// on to assemble, and let the send path's own dedup decide what the reply is.
+// The send paths dedup
+// on the same token inside their own transaction, so this read is an early exit
+// and not the boundary: a resend that races past it assembles a second file and
+// the send still returns the original row, which costs stored bytes but cannot
+// duplicate a message.
+func (h *handlers) resendFileID(ctx context.Context, userID, randomID int64) (int64, error) {
+	existing, ok, err := h.store.MessageByRandomID(ctx, userID, randomID)
+	if err != nil {
+		h.log.Error("send media random id", "user_id", userID, "err", err)
+		return 0, errInternal
+	}
+	if !ok {
+		return 0, nil
+	}
+	return existing.FileID, nil
 }
 
 // inputFileParts reads the three fields assembly needs off an input file.
