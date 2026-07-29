@@ -21,6 +21,8 @@ type handlers struct {
 	srp   *srp.ChallengeStore
 	// logLoginCodes gates the one log call that carries credential material.
 	logLoginCodes bool
+	// maxFileBytes is the per-file upload cap the save handlers enforce.
+	maxFileBytes int64
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -62,7 +64,7 @@ func selfRevocation(r *mtproto.Request, keyID int64) bool {
 
 // New builds the RPC handler: dispatcher wrapped with UnpackInvoke so
 // invokeWithLayer/initConnection wrappers are peeled before dispatch.
-func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool) mtproto.Handler {
+func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64) mtproto.Handler {
 	h := &handlers{
 		store:         s,
 		cfg:           cfg,
@@ -70,6 +72,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		log:           log,
 		srp:           srp.NewChallengeStore(srp.DefaultTTL),
 		logLoginCodes: logLoginCodes,
+		maxFileBytes:  maxFileBytes,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
@@ -96,6 +99,8 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesEditChatTitleRequestTypeID, h.handleEditChatTitle)
 	register(d, tg.MessagesAddChatUserRequestTypeID, h.handleAddChatUser)
 	register(d, tg.MessagesDeleteChatUserRequestTypeID, h.handleDeleteChatUser)
+	register(d, tg.UploadSaveFilePartRequestTypeID, h.handleSaveFilePart)
+	register(d, tg.UploadSaveBigFilePartRequestTypeID, h.handleSaveBigFilePart)
 	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		id, err := req.Buf.PeekID()
 		if err != nil {
