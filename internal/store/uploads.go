@@ -1,0 +1,158 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/adambenhassen/telegram-server/internal/store/db"
+)
+
+// ErrPartTooLarge is returned when one upload part exceeds MaxPartBytes, is
+// empty, or names a part index outside the int32 column.
+var ErrPartTooLarge = errors.New("upload part too large")
+
+// ErrFileTooLarge is returned when an upload's parts would exceed the per-file
+// byte cap.
+var ErrFileTooLarge = errors.New("upload file too large")
+
+// ErrUploadQuota is returned when a user's outstanding unassembled bytes would
+// exceed their cap.
+var ErrUploadQuota = errors.New("upload quota exceeded")
+
+// MaxPartBytes is the protocol maximum for one upload.saveFilePart part.
+const MaxPartBytes = 512 * 1024
+
+// partIndexOf narrows a part index to the int32 the column stores. Truncating
+// instead would alias a client-chosen index onto a different part's row.
+func partIndexOf(i int) (int32, bool) {
+	if i < 0 || i > math.MaxInt32 {
+		return 0, false
+	}
+	return int32(i), true
+}
+
+// SaveUploadPart writes one part of an in-flight upload, enforcing the per-file
+// and per-user byte caps. maxFileBytes is the per-file cap; the per-user
+// outstanding cap is twice that, which is two concurrent max-size uploads.
+//
+// Ordering, and why the caps are checked AFTER the write: the sums are read
+// back inside the same transaction as the upsert, so what they measure is the
+// state the write produced. That removes the whole class of accounting bug a
+// separate counter has — a client re-saving part 0 in a loop is not billed
+// twice, because there is no counter to increment, only a SUM over rows the
+// upsert has already deduplicated. Over a cap, the transaction rolls back and
+// the part is gone.
+//
+// Lock: one advisory lock on user_id, taken first, so one account's concurrent
+// saves serialise and two of them cannot both read a sum that is under the cap
+// and both commit. It is the same per-owner advisory namespace lockOwners uses
+// in messages.go. This transaction takes that one lock and no other lock of any
+// kind, so it cannot be part of a cycle and cannot deadlock against the
+// send/fan-out paths, which take advisory locks under the chats row lock.
+func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIndex int, payload []byte, maxFileBytes int64) error {
+	if len(payload) == 0 || len(payload) > MaxPartBytes {
+		return ErrPartTooLarge
+	}
+	idx, ok := partIndexOf(partIndex)
+	if !ok {
+		return ErrPartTooLarge
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	if err = lockOwners(ctx, tx, userID); err != nil {
+		return err
+	}
+	qtx := s.q.WithTx(tx)
+
+	if err = qtx.UpsertUploadPart(ctx, db.UpsertUploadPartParams{
+		UserID:    userID,
+		FileID:    fileID,
+		PartIndex: idx,
+		Payload:   payload,
+	}); err != nil {
+		return fmt.Errorf("upsert upload part: %w", err)
+	}
+
+	fileBytes, err := qtx.FileOutstandingBytes(ctx, db.FileOutstandingBytesParams{UserID: userID, FileID: fileID})
+	if err != nil {
+		return fmt.Errorf("file outstanding bytes: %w", err)
+	}
+	if fileBytes > maxFileBytes {
+		return ErrFileTooLarge
+	}
+
+	userBytes, err := qtx.UserOutstandingBytes(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("user outstanding bytes: %w", err)
+	}
+	if userBytes > 2*maxFileBytes {
+		return ErrUploadQuota
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// UploadPartsSummary reports the part count, the highest part index and the
+// total byte size of an in-flight upload. Assembly uses all three.
+func (s *Store) UploadPartsSummary(ctx context.Context, userID, fileID int64) (parts int64, maxIndex int, totalBytes int64, err error) {
+	r, err := s.q.UploadPartsSummary(ctx, db.UploadPartsSummaryParams{UserID: userID, FileID: fileID})
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("upload parts summary: %w", err)
+	}
+	return r.Parts, int(r.MaxIndex), r.TotalBytes, nil
+}
+
+// UploadPart returns one part's payload. ok=false when the part is absent.
+func (s *Store) UploadPart(ctx context.Context, userID, fileID int64, partIndex int) (payload []byte, ok bool, err error) {
+	idx, ok := partIndexOf(partIndex)
+	if !ok {
+		return nil, false, nil
+	}
+	p, err := s.q.UploadPartPayload(ctx, db.UploadPartPayloadParams{
+		UserID:    userID,
+		FileID:    fileID,
+		PartIndex: idx,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("upload part payload: %w", err)
+	}
+	return p, true, nil
+}
+
+// DeleteUploadParts drops every part of one in-flight upload, returning the row
+// count. Called once an upload has been assembled.
+func (s *Store) DeleteUploadParts(ctx context.Context, userID, fileID int64) (int64, error) {
+	n, err := s.q.DeleteUploadParts(ctx, db.DeleteUploadPartsParams{UserID: userID, FileID: fileID})
+	if err != nil {
+		return 0, fmt.Errorf("delete upload parts: %w", err)
+	}
+	return n, nil
+}
+
+// DeleteExpiredUploadParts drops parts older than cutoff, returning the row
+// count. This is the only delete in M5 that removes stored bytes, and it can
+// only ever remove parts no message references: a part row is deleted at
+// assembly, so anything left is an upload that was never sent.
+func (s *Store) DeleteExpiredUploadParts(ctx context.Context, cutoff time.Time) (int64, error) {
+	n, err := s.q.DeleteExpiredUploadParts(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
+	if err != nil {
+		return 0, fmt.Errorf("delete expired upload parts: %w", err)
+	}
+	return n, nil
+}
