@@ -104,3 +104,46 @@ func InsertTestEvent(ctx context.Context, s *Store, ownerID int64, typ EventType
 		LocalID: localID,
 	})
 }
+
+// SeedChannelPost creates a channel with creatorID as its owner, adds memberID
+// as a participant, and posts one message carrying fileID. The M7 channel write
+// path does not exist yet, so the download gate's channel branch has no shipped
+// way to produce its rows; this writes exactly the three the branch reads.
+// Returns the channel id and the post's local_id.
+func SeedChannelPost(ctx context.Context, s *Store, creatorID, memberID, fileID int64) (channelID, localID int64, err error) {
+	if err = s.pool.QueryRow(ctx,
+		`INSERT INTO channels (title, creator_id) VALUES ('test', $1) RETURNING id`,
+		creatorID).Scan(&channelID); err != nil {
+		return 0, 0, err
+	}
+	if _, err = s.pool.Exec(ctx,
+		`INSERT INTO channel_participants (channel_id, user_id) VALUES ($1, $2)`,
+		channelID, memberID); err != nil {
+		return 0, 0, err
+	}
+	localID = 1
+	if _, err = s.pool.Exec(ctx,
+		`INSERT INTO channel_messages (channel_id, local_id, from_id, message, file_id)
+		 VALUES ($1, $2, $3, 'post', $4)`,
+		channelID, localID, creatorID, fileID); err != nil {
+		return 0, 0, err
+	}
+	return channelID, localID, nil
+}
+
+// SetChannelBan sets a participant's banned_until; a nil time clears the ban.
+func SetChannelBan(ctx context.Context, s *Store, channelID, userID int64, until *time.Time) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE channel_participants SET banned_until = $3 WHERE channel_id = $1 AND user_id = $2`,
+		channelID, userID, until)
+	return err
+}
+
+// SetChannelPostDeleted soft-deletes a channel post, the state the channel
+// branch of the download gate has to treat as revocation.
+func SetChannelPostDeleted(ctx context.Context, s *Store, channelID, localID int64) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = $2`,
+		channelID, localID)
+	return err
+}

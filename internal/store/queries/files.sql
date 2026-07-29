@@ -16,7 +16,13 @@ SELECT coalesce(sum(size), 0)::bigint FROM files WHERE uploader_id = $1;
 -- depth; the EXISTS is the boundary. messages is per-owner — one row per
 -- entitled account, and one per member on a chat fan-out — so the set of
 -- accounts allowed to read a file is already enumerated on disk and needs no
--- separate membership model.
+-- separate membership model. Channels are the exception, and the second EXISTS
+-- is why: a channel post writes ONE channel_messages row and no per-member row
+-- at all, so entitlement there has to be computed from membership rather than
+-- read off an enumeration. banned_until is part of that computation — a banned
+-- member keeps their channel_participants row, and without the predicate that
+-- retained row would be an entitlement instead of a record, making a ban
+-- cosmetic for exactly the content worth exfiltrating.
 --
 -- Consequences that follow from putting it here rather than in the handler:
 -- deleteMessages soft-deletes both sides, so deleting a media message actually
@@ -30,9 +36,19 @@ SELECT coalesce(sum(size), 0)::bigint FROM files WHERE uploader_id = $1;
 -- name: FileForDownload :one
 SELECT f.* FROM files f
 WHERE f.id = $1 AND f.access_hash = $2 AND f.stored = true
-  AND EXISTS (
-      SELECT 1 FROM messages m
-      WHERE m.owner_id = $3 AND m.file_id = f.id AND m.deleted = false
+  AND (
+      EXISTS (
+          SELECT 1 FROM messages m
+          WHERE m.owner_id = $3 AND m.file_id = f.id AND m.deleted = false
+      )
+      OR EXISTS (
+          SELECT 1 FROM channel_messages cm
+          JOIN channel_participants cp
+            ON cp.channel_id = cm.channel_id AND cp.user_id = $3
+          WHERE cm.file_id = f.id
+            AND cm.deleted = false
+            AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+      )
   );
 
 -- name: FilesByIDs :many

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -191,5 +192,69 @@ func TestFilesByIDsReturnsOnlyStored(t *testing.T) {
 	}
 	if empty == nil || len(empty) != 0 {
 		t.Fatalf("nil ids = %+v, want an empty non-nil map", empty)
+	}
+}
+
+// The channel branch of the gate: membership entitles, and a ban, a
+// non-membership and a soft-deleted post all revoke — as the same
+// ErrFileNotFound the 1:1 branch returns.
+func TestFileForDownloadChannelMember(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15559100061")
+	member := mustUser(t, s, "+15559100062")
+	stranger := mustUser(t, s, "+15559100063")
+
+	f := allocate(t, s, creator.ID, 11)
+	if err := s.MarkFileStored(ctx, f.ID); err != nil {
+		t.Fatalf("mark stored: %v", err)
+	}
+	channelID, localID, err := store.SeedChannelPost(ctx, s, creator.ID, member.ID, f.ID)
+	if err != nil {
+		t.Fatalf("seed channel post: %v", err)
+	}
+
+	got, err := s.FileForDownload(ctx, f.ID, f.AccessHash, member.ID)
+	if err != nil {
+		t.Fatalf("member download: %v", err)
+	}
+	if got.ID != f.ID || !got.Stored {
+		t.Fatalf("downloaded row wrong: %+v", got)
+	}
+	if _, err := s.FileForDownload(ctx, f.ID, f.AccessHash, stranger.ID); !errors.Is(err, store.ErrFileNotFound) {
+		t.Fatalf("non-member: want ErrFileNotFound, got %v", err)
+	}
+
+	// A live ban revokes, and lifting it restores.
+	future := time.Now().Add(time.Hour)
+	if err := store.SetChannelBan(ctx, s, channelID, member.ID, &future); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+	if _, err := s.FileForDownload(ctx, f.ID, f.AccessHash, member.ID); !errors.Is(err, store.ErrFileNotFound) {
+		t.Fatalf("banned member: want ErrFileNotFound, got %v", err)
+	}
+	if err := store.SetChannelBan(ctx, s, channelID, member.ID, nil); err != nil {
+		t.Fatalf("unban: %v", err)
+	}
+	if _, err := s.FileForDownload(ctx, f.ID, f.AccessHash, member.ID); err != nil {
+		t.Fatalf("after unban: %v", err)
+	}
+
+	// A lapsed ban is not a ban.
+	past := time.Now().Add(-time.Hour)
+	if err := store.SetChannelBan(ctx, s, channelID, member.ID, &past); err != nil {
+		t.Fatalf("lapsed ban: %v", err)
+	}
+	if _, err := s.FileForDownload(ctx, f.ID, f.AccessHash, member.ID); err != nil {
+		t.Fatalf("lapsed ban: %v", err)
+	}
+
+	// Soft-deleting the post revokes retrieval, as it does on the 1:1 branch.
+	if err := store.SetChannelPostDeleted(ctx, s, channelID, localID); err != nil {
+		t.Fatalf("delete post: %v", err)
+	}
+	if _, err := s.FileForDownload(ctx, f.ID, f.AccessHash, member.ID); !errors.Is(err, store.ErrFileNotFound) {
+		t.Fatalf("deleted post: want ErrFileNotFound, got %v", err)
 	}
 }
