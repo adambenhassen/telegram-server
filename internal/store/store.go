@@ -17,6 +17,14 @@ type Store struct {
 	pool   *pgxpool.Pool
 	q      *db.Queries
 	cipher *keycrypt.Cipher
+
+	// Channel bounds, seeded from the defaults in channels.go. They are fields
+	// rather than constants only so a test can exercise the cap branches without
+	// writing 10 000 rows; a test lowering them on its own Store cannot disturb
+	// another test's Store, which package-level vars would not give under
+	// t.Parallel().
+	maxChannelParticipants int
+	maxChannelsPerUser     int
 }
 
 // Sentinel errors returned by the login-code methods.
@@ -38,6 +46,17 @@ var (
 	// not a participant of the chat, and by an absent chat id — the two are
 	// deliberately indistinguishable.
 	ErrNotMember = errors.New("not a chat member")
+	// ErrChannelFull is returned when a join would take a channel past
+	// maxChannelParticipants.
+	ErrChannelFull = errors.New("channel participants limit reached")
+	// ErrTooManyChannels is returned when a join would take an account past
+	// maxChannelsPerUser.
+	ErrTooManyChannels = errors.New("channel limit per account reached")
+	// ErrInviteInvalid is returned by JoinChannelByInvite for every rejection
+	// that depends on the hash: one that does not exist, and one whose channel is
+	// gone. They are one error on purpose — a distinguishable set makes the invite
+	// space probeable, and the hash is the whole admission boundary.
+	ErrInviteInvalid = errors.New("channel invite invalid")
 )
 
 // Open connects to Postgres and verifies the schema is migrated. encKey is the
@@ -57,7 +76,13 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	s := &Store{pool: pool, q: db.New(pool), cipher: cipher}
+	s := &Store{
+		pool:                   pool,
+		q:                      db.New(pool),
+		cipher:                 cipher,
+		maxChannelParticipants: defaultMaxChannelParticipants,
+		maxChannelsPerUser:     defaultMaxChannelsPerUser,
+	}
 	if err := s.checkSchema(ctx); err != nil {
 		pool.Close()
 		return nil, err
