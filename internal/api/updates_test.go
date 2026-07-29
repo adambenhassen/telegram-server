@@ -250,6 +250,77 @@ func TestChatToTLCreator(t *testing.T) {
 	}
 }
 
+func TestChannelToTL(t *testing.T) {
+	t.Parallel()
+	c := store.Channel{ID: 4, Title: "news", CreatorID: 5, Date: time.Unix(1000, 0)}
+
+	forbidden, ok := api.ChannelToTL(c, store.ChannelMember{}, false).(*tg.ChannelForbidden)
+	if !ok {
+		t.Fatalf("channelToTL for non-member = %T, want *tg.ChannelForbidden", forbidden)
+	}
+	if forbidden.Title != "" || forbidden.ID != 4 || forbidden.AccessHash != 4 {
+		t.Fatalf("channelToTL for non-member = %+v, want id 4, hash 4, empty title", forbidden)
+	}
+
+	got, ok := api.ChannelToTL(c, store.ChannelMember{UserID: 5, Role: 2}, true).(*tg.Channel)
+	if !ok {
+		t.Fatalf("channelToTL for member = %T, want *tg.Channel", got)
+	}
+	if !got.Broadcast || got.Megagroup || !got.Creator || got.Left {
+		t.Fatalf("channelToTL for creator of a broadcast = %+v", got)
+	}
+	if got.Title != "news" || got.AccessHash != 4 || got.Date != 1000 {
+		t.Fatalf("channelToTL for member = %+v, want news/hash 4/date 1000", got)
+	}
+
+	c.Megagroup = true
+	got, ok = api.ChannelToTL(c, store.ChannelMember{UserID: 9, Role: 0}, true).(*tg.Channel)
+	if !ok {
+		t.Fatalf("channelToTL for megagroup member = %T, want *tg.Channel", got)
+	}
+	if got.Broadcast || !got.Megagroup || got.Creator {
+		t.Fatalf("channelToTL for plain member of a megagroup = %+v", got)
+	}
+}
+
+func TestLoadChannelsNonMemberForbidden(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551950001")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	outsider, err := s.CreateUser(ctx, "+15551950002")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "news", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	// A missing id is skipped, exactly as loadChats skips a missing chat.
+	got, err := api.LoadChannelsForTest(s, []int64{ch.ID, ch.ID + 100000}, creator.ID)
+	if err != nil {
+		t.Fatalf("load channels: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("load channels for creator = %d entries, want 1", len(got))
+	}
+	if c, ok := got[0].(*tg.Channel); !ok || c.Title != "news" {
+		t.Fatalf("load channels for creator = %#v, want *tg.Channel news", got[0])
+	}
+
+	got, err = api.LoadChannelsForTest(s, []int64{ch.ID}, outsider.ID)
+	if err != nil {
+		t.Fatalf("load channels outsider: %v", err)
+	}
+	if c, ok := got[0].(*tg.ChannelForbidden); !ok || c.Title != "" {
+		t.Fatalf("load channels for outsider = %#v, want *tg.ChannelForbidden with empty title", got[0])
+	}
+}
+
 // chatFixture creates a chat with members participants, owned by the first of
 // members+1 fresh users: the trailing user is a non-participant. It returns the
 // store, the users and the chat.

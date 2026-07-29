@@ -117,6 +117,16 @@ func SetChannelBan(ctx context.Context, s *Store, channelID, userID int64, until
 	return err
 }
 
+// SetChannelRole writes a participant's role directly. Promotion is a later
+// ticket's RPC; this exists so the post-rights check can be tested against an
+// admin row today.
+func SetChannelRole(ctx context.Context, s *Store, channelID, userID int64, role int16) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE channel_participants SET role = $3 WHERE channel_id = $1 AND user_id = $2`,
+		channelID, userID, role)
+	return err
+}
+
 // SetChannelBanInfinite writes banned_until = 'infinity'. It is separate from
 // SetChannelBan because no Go time.Time encodes to infinity, and infinity is the
 // value the ban decode has to survive.

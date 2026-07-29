@@ -91,6 +91,37 @@ func (s *Store) ChannelState(ctx context.Context, channelID int64) (int, error) 
 func (s *Store) PostChannelMessage(
 	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64,
 ) (ChannelMessage, int, bool, error) {
+	return s.postChannelMessage(ctx, channelID, fromID, text, randomID, fileID, false)
+}
+
+// PostChannelMessageAs is PostChannelMessage with the post-rights check
+// performed inside the same transaction, under the channel_state row lock. It is
+// the entry point a handler uses; PostChannelMessage stays the unchecked
+// primitive underneath it.
+//
+// The rule, and it fails closed on anything not listed: a broadcast channel
+// (megagroup = false) admits role >= 1 only, a megagroup admits any participant
+// row, and a member banned at now() is admitted by neither. No participant row
+// is a rejection. Every rejection is ErrNotMember, the same error the chat
+// fan-out uses, because a distinct "you are banned" tells an outsider the
+// channel exists.
+//
+// Locking and ordering, which is the point of this function existing rather than
+// the check living in a handler: the channel row and the caller's participant
+// row are read AFTER LockChannelState and before any write, inside the
+// transaction that does the insert. It takes no new lock — the channel_state row
+// lock is already held and the two reads join under it. A handler-level check
+// runs in its own transaction, so a member banned concurrently would still land
+// a post. That ordering is what every future channel write inherits.
+func (s *Store) PostChannelMessageAs(
+	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64,
+) (ChannelMessage, int, bool, error) {
+	return s.postChannelMessage(ctx, channelID, fromID, text, randomID, fileID, true)
+}
+
+func (s *Store) postChannelMessage(
+	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64, checkRights bool,
+) (ChannelMessage, int, bool, error) {
 	if channelID == 0 || fromID == 0 {
 		return ChannelMessage{}, 0, false, ErrMessageInvalid
 	}
@@ -102,12 +133,35 @@ func (s *Store) PostChannelMessage(
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
+	// Early reject, ahead of EnsureChannelState. It decides nothing — the
+	// authoritative check is the identical call under the row lock below — but
+	// channel_state.channel_id REFERENCES channels (id), so letting a caller with
+	// no rights reach the insert turns a channel that does not exist into an FK
+	// error instead of ErrNotMember, and that distinct error is exactly the
+	// existence oracle the one-error rule closes. Same shape as the fan-out's
+	// pre-lock IsChatMember reject in fanout.go.
+	if checkRights {
+		if err = checkPostRights(ctx, qtx, channelID, fromID); err != nil {
+			return ChannelMessage{}, 0, false, err
+		}
+	}
+
 	if err = qtx.EnsureChannelState(ctx, channelID); err != nil {
 		return ChannelMessage{}, 0, false, fmt.Errorf("ensure channel state: %w", err)
 	}
 	st, err := qtx.LockChannelState(ctx, channelID)
 	if err != nil {
 		return ChannelMessage{}, 0, false, fmt.Errorf("lock channel state: %w", err)
+	}
+
+	// The authoritative check: under the row lock taken above, before the dedup
+	// read and before any write, so a ban committing concurrently is seen. A
+	// caller with no right to post here must not be able to probe random_ids
+	// either.
+	if checkRights {
+		if err = checkPostRights(ctx, qtx, channelID, fromID); err != nil {
+			return ChannelMessage{}, 0, false, err
+		}
 	}
 
 	// Idempotency: a resend with the same random_id returns the original post,
@@ -151,6 +205,40 @@ func (s *Store) PostChannelMessage(
 		return ChannelMessage{}, 0, false, fmt.Errorf("commit: %w", err)
 	}
 	return channelMessageFromRow(stored), int(b.Pts), false, nil
+}
+
+// checkPostRights answers whether fromID may post to channelID, reading both
+// rows on the caller's transaction so they are the state the insert lands in.
+// Every rejection is ErrNotMember; see PostChannelMessageAs for why they are not
+// distinguishable.
+func checkPostRights(ctx context.Context, qtx *db.Queries, channelID, fromID int64) error {
+	ch, err := qtx.ChannelByID(ctx, channelID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrNotMember
+	case err != nil:
+		return fmt.Errorf("channel by id: %w", err)
+	}
+
+	row, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID, UserID: fromID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrNotMember
+	case err != nil:
+		return fmt.Errorf("channel participant: %w", err)
+	}
+
+	member := channelMemberFromRow(row)
+	if member.Banned(time.Now()) {
+		return ErrNotMember
+	}
+	// Broadcast: posting is an admin right. Megagroup: any unbanned participant.
+	if !ch.Megagroup && member.Role < 1 {
+		return ErrNotMember
+	}
+	return nil
 }
 
 // ChannelEventsWindow returns the channel's events in (fromPts, toPts] ordered
