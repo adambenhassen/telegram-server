@@ -1036,3 +1036,339 @@ func TestGetDialogsListsTheCallersChannels(t *testing.T) {
 		t.Errorf("chat = %T, want *tg.Channel", got.Chats[0])
 	}
 }
+
+// unknownHash is a well-formed hash of the right shape that was never issued —
+// 22 base64url characters, the width store.CreateChannelInvite emits.
+const unknownHash = "0000000000000000000000"
+
+// inviteHash pulls the hash back out of the exported link, which is the only
+// form a client ever sees it in.
+func inviteHash(t *testing.T, link string) string {
+	t.Helper()
+	hash, ok := strings.CutPrefix(link, "https://t.me/+")
+	if !ok {
+		t.Fatalf("link %q has no invite prefix", link)
+	}
+	return hash
+}
+
+// channelWith creates one broadcast channel owned by a fresh account, and
+// returns the creator, the channel and a second account that is not in it.
+func channelWith(t *testing.T, s *store.Store, creatorPhone, otherPhone string) (creator, other store.User, ch store.Channel) {
+	t.Helper()
+	ctx := context.Background()
+	creator, err := s.CreateUser(ctx, creatorPhone)
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	other, err = s.CreateUser(ctx, otherPhone)
+	if err != nil {
+		t.Fatalf("other: %v", err)
+	}
+	ch, err = s.CreateChannel(ctx, creator.ID, "Broadcast", "about", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	return creator, other, ch
+}
+
+// exportInvite exports an invite as userID and returns its hash.
+func exportInvite(t *testing.T, s *store.Store, userID int64, ch store.Channel) string {
+	t.Helper()
+	res, err := api.ExportChatInviteForTest(s, userID, &tg.MessagesExportChatInviteRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+	})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	assertEncodes(t, res)
+	exported, ok := res.(*tg.ChatInviteExported)
+	if !ok {
+		t.Fatalf("export: got %T, want *tg.ChatInviteExported", res)
+	}
+	if exported.AdminID != userID {
+		t.Errorf("admin id: got %d, want %d", exported.AdminID, userID)
+	}
+	if !exported.Permanent {
+		t.Error("invite is not marked permanent, but M7 stores no expiry")
+	}
+	return inviteHash(t, exported.Link)
+}
+
+func TestExportAndImportChannelInvite(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, joiner, ch := channelWith(t, s, "+15551293001", "+15551293002")
+
+	hash := exportInvite(t, s, creator.ID, ch)
+
+	res, err := api.ImportChatInviteForTest(s, joiner.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	assertEncodes(t, res)
+	upd, ok := res.(*tg.Updates)
+	if !ok {
+		t.Fatalf("import: got %T, want *tg.Updates", res)
+	}
+	if len(upd.Updates) != 1 {
+		t.Fatalf("updates: got %d, want 1", len(upd.Updates))
+	}
+	if u, ok := upd.Updates[0].(*tg.UpdateChannel); !ok || u.ChannelID != ch.ID {
+		t.Errorf("update: got %#v, want UpdateChannel for %d", upd.Updates[0], ch.ID)
+	}
+	if len(upd.Chats) != 1 {
+		t.Fatalf("chats: got %d, want 1", len(upd.Chats))
+	}
+	if c, ok := upd.Chats[0].(*tg.Channel); !ok || c.ID != ch.ID || c.Title != ch.Title {
+		t.Errorf("chat: got %#v, want live channel %d", upd.Chats[0], ch.ID)
+	}
+
+	member, found, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil {
+		t.Fatalf("member of: %v", err)
+	}
+	if !found || member.Role != 0 {
+		t.Fatalf("joiner membership: found=%v role=%d, want found role 0", found, member.Role)
+	}
+}
+
+func TestExportChatInviteRejectsUnauthorized(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, member, ch := channelWith(t, s, "+15551293011", "+15551293012")
+
+	// A role-0 member: joined through the creator's invite, exactly as a real one
+	// arrives.
+	hash := exportInvite(t, s, creator.ID, ch)
+	if _, err := api.ImportChatInviteForTest(s, member.ID, &tg.MessagesImportChatInviteRequest{Hash: hash}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	peer := &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID}
+	if _, err := api.ExportChatInviteForTest(s, member.ID, &tg.MessagesExportChatInviteRequest{Peer: peer}); err == nil {
+		t.Error("role-0 member exported an invite")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Errorf("role-0 member: got %s, want PEER_ID_INVALID", msg)
+	}
+
+	// A banned admin. The creator is role 2, so banning them covers "banned" while
+	// the role check is satisfied — the ban has to be what rejects it.
+	banChannelMember(t, ctx, dsn, ch.ID, creator.ID, time.Now().Add(time.Hour))
+	if _, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{Peer: peer}); err == nil {
+		t.Error("banned admin exported an invite")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Errorf("banned admin: got %s, want PEER_ID_INVALID", msg)
+	}
+}
+
+// TestExportChatInviteRejectsNonChannelPeer pins that the peer type gate holds:
+// chats have no invites in M7, and a user peer never had any.
+func TestExportChatInviteRejectsNonChannelPeer(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	creator, _, ch := channelWith(t, s, "+15551293051", "+15551293052")
+
+	for name, peer := range map[string]tg.InputPeerClass{
+		"chat": &tg.InputPeerChat{ChatID: ch.ID},
+		"user": &tg.InputPeerUser{UserID: creator.ID, AccessHash: creator.ID},
+		"self": &tg.InputPeerSelf{},
+	} {
+		_, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{Peer: peer})
+		if err == nil {
+			t.Errorf("%s peer: exported an invite", name)
+		} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+			t.Errorf("%s peer: got %s, want PEER_ID_INVALID", name, msg)
+		}
+	}
+}
+
+// TestBannedMemberSeesForbiddenChannel covers the one behaviour chosen against
+// the ticket text: check and import hand a banned member the forbidden channel
+// form, not the live one. A ban revokes metadata the same way leaving does, so a
+// re-join must not restore the title the ban took away — and JoinChannelByInvite
+// returns a banned member's row untouched, so import is reachable while banned.
+func TestBannedMemberSeesForbiddenChannel(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, member, ch := channelWith(t, s, "+15551293061", "+15551293062")
+	hash := exportInvite(t, s, creator.ID, ch)
+
+	if _, err := api.ImportChatInviteForTest(s, member.ID, &tg.MessagesImportChatInviteRequest{Hash: hash}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(time.Hour))
+
+	res, err := api.CheckChatInviteForTest(s, member.ID, &tg.MessagesCheckChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("check as banned: %v", err)
+	}
+	assertEncodes(t, res)
+	already, ok := res.(*tg.ChatInviteAlready)
+	if !ok {
+		t.Fatalf("check as banned: got %T, want *tg.ChatInviteAlready", res)
+	}
+	if f, ok := already.Chat.(*tg.ChannelForbidden); !ok {
+		t.Errorf("check as banned: got %#v, want *tg.ChannelForbidden", already.Chat)
+	} else if f.Title != "" {
+		t.Errorf("check as banned: forbidden channel leaked title %q", f.Title)
+	}
+
+	res, err = api.ImportChatInviteForTest(s, member.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import as banned: %v", err)
+	}
+	assertEncodes(t, res)
+	upd, ok := res.(*tg.Updates)
+	if !ok {
+		t.Fatalf("import as banned: got %T, want *tg.Updates", res)
+	}
+	if len(upd.Chats) != 1 {
+		t.Fatalf("chats: got %d, want 1", len(upd.Chats))
+	}
+	if f, ok := upd.Chats[0].(*tg.ChannelForbidden); !ok {
+		t.Errorf("import as banned: got %#v, want *tg.ChannelForbidden", upd.Chats[0])
+	} else if f.Title != "" {
+		t.Errorf("import as banned: forbidden channel leaked title %q", f.Title)
+	}
+
+	// The ban survives the re-join: it must not be cleared by importing again.
+	after, found, err := s.ChannelMemberOf(ctx, ch.ID, member.ID)
+	if err != nil {
+		t.Fatalf("member of: %v", err)
+	}
+	if !found || !after.Banned(time.Now()) {
+		t.Errorf("re-join cleared the ban: found=%v banned_until=%v", found, after.BannedUntil)
+	}
+}
+
+// TestInviteFailuresAreIndistinguishable pins the whole point of the admission
+// boundary: a wrong hash on check and on import, and an export against a channel
+// that does not exist, must all be the same wire error. Anything finer turns the
+// dense channels.id space or the invite space into an existence oracle.
+func TestInviteFailuresAreIndistinguishable(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	_, stranger, ch := channelWith(t, s, "+15551293021", "+15551293022")
+
+	_, checkErr := api.CheckChatInviteForTest(s, stranger.ID, &tg.MessagesCheckChatInviteRequest{Hash: unknownHash})
+	_, importErr := api.ImportChatInviteForTest(s, stranger.ID, &tg.MessagesImportChatInviteRequest{Hash: unknownHash})
+	// An id past every channel this test created, so the row genuinely is absent.
+	_, exportErr := api.ExportChatInviteForTest(s, stranger.ID, &tg.MessagesExportChatInviteRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: ch.ID + 1_000_000, AccessHash: ch.ID + 1_000_000},
+	})
+	// A channel that DOES exist but the caller is not in, which must not be
+	// distinguishable from one that does not exist.
+	_, strangerErr := api.ExportChatInviteForTest(s, stranger.ID, &tg.MessagesExportChatInviteRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+	})
+
+	for name, err := range map[string]error{
+		"check unknown hash":  checkErr,
+		"import unknown hash": importErr,
+		"export unknown chan": exportErr,
+		"export non-member":   strangerErr,
+	} {
+		if err == nil {
+			t.Fatalf("%s: got nil error", name)
+		}
+		if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+			t.Errorf("%s: got %s, want PEER_ID_INVALID", name, msg)
+		}
+	}
+}
+
+func TestCheckChatInviteWritesNothing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, viewer, ch := channelWith(t, s, "+15551293031", "+15551293032")
+	hash := exportInvite(t, s, creator.ID, ch)
+
+	before, err := s.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		t.Fatalf("members before: %v", err)
+	}
+
+	res, err := api.CheckChatInviteForTest(s, viewer.ID, &tg.MessagesCheckChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	assertEncodes(t, res)
+	invite, ok := res.(*tg.ChatInvite)
+	if !ok {
+		t.Fatalf("check: got %T, want *tg.ChatInvite", res)
+	}
+	if invite.Title != ch.Title {
+		t.Errorf("title: got %q, want %q", invite.Title, ch.Title)
+	}
+	if len(invite.Participants) != 0 {
+		t.Errorf("participants: got %d, want none", len(invite.Participants))
+	}
+
+	after, err := s.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		t.Fatalf("members after: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("check seated someone: %d participants before, %d after", len(before), len(after))
+	}
+
+	// A member gets the already-joined form instead, still without writing.
+	res, err = api.CheckChatInviteForTest(s, creator.ID, &tg.MessagesCheckChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("check as member: %v", err)
+	}
+	assertEncodes(t, res)
+	already, ok := res.(*tg.ChatInviteAlready)
+	if !ok {
+		t.Fatalf("check as member: got %T, want *tg.ChatInviteAlready", res)
+	}
+	if c, ok := already.Chat.(*tg.Channel); !ok || c.ID != ch.ID {
+		t.Errorf("already chat: got %#v, want live channel %d", already.Chat, ch.ID)
+	}
+}
+
+func TestImportChatInviteIsIdempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, joiner, ch := channelWith(t, s, "+15551293041", "+15551293042")
+	hash := exportInvite(t, s, creator.ID, ch)
+
+	if _, err := api.ImportChatInviteForTest(s, joiner.ID, &tg.MessagesImportChatInviteRequest{Hash: hash}); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	first, _, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil {
+		t.Fatalf("member of: %v", err)
+	}
+
+	// A post between the two joins moves the channel's pts, so a second join that
+	// rewrote join_pts would seat the joiner above history they already hold.
+	if _, _, _, err = s.PostChannelMessageAs(ctx, ch.ID, creator.ID, "hello", 7, nil); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	if _, err = api.ImportChatInviteForTest(s, joiner.ID, &tg.MessagesImportChatInviteRequest{Hash: hash}); err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	second, _, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil {
+		t.Fatalf("member of after: %v", err)
+	}
+	if second.JoinPts != first.JoinPts {
+		t.Errorf("join_pts moved on re-join: %d then %d", first.JoinPts, second.JoinPts)
+	}
+
+	members, err := s.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		t.Fatalf("members: %v", err)
+	}
+	if len(members) != 2 {
+		t.Errorf("participants: got %d, want 2", len(members))
+	}
+}

@@ -406,3 +406,170 @@ func (h *handlers) channelMessages(r *mtproto.Request, channelID int64, msgs []s
 		Users:    users,
 	}, nil
 }
+
+// inviteLinkPrefix is what a hash is rendered behind. The link is the whole
+// credential, so nothing but the hash may appear after it — an id in the link
+// would put the dense channels.id space back on the wire.
+const inviteLinkPrefix = "https://t.me/+"
+
+// handleExportChatInvite serves messages.exportChatInvite for a channel.
+//
+// Every rejection returns errPeerIDInvalid: no channel row, no participant row,
+// role 0, or a live ban. They are ONE error deliberately. channels.id is dense
+// BIGSERIAL and the peer access hash is the placeholder access_hash == id, so a
+// distinguishable "not a member" would confirm to any account that a channel
+// with that id exists, and the invite hash is the only thing standing between an
+// account and admission.
+//
+// Role 1 is the floor because an invite is a bearer credential for the whole
+// channel: a role-0 member able to mint one would put every member in charge of
+// the channel's admission boundary.
+//
+// Every call mints a NEW hash and no call retires an old one: M7 has no
+// revocation, so an admin exporting twice has permanently issued two independent
+// bearer credentials to the channel and can withdraw neither. That fan-out is
+// unbounded and is not closed by returning the existing invite instead —
+// revocation is what closes it, and it is out of M7 scope. Until then, every
+// hash an admin has ever exported admits forever.
+//
+// req.ExpireDate, req.UsageLimit, req.RequestNeeded, req.LegacyRevokePermanent
+// and req.Title are accepted and IGNORED. M7 stores none of them, so the invite
+// this returns never expires, has no usage limit and needs no approval — the
+// reply says so with Permanent. Accepting and ignoring is the posture M6 took
+// for fwd_limit; it is stated here because a silently-dropped expiry is the kind
+// of thing a reader assumes works.
+func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, error) {
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	var req tg.MessagesExportChatInviteRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	peerType, channelID, err := inputPeer(req.Peer)
+	if err != nil {
+		return nil, err
+	}
+	// Chats keep having no invites in M7, and a user peer never had any.
+	if peerType != store.PeerTypeChannel {
+		return nil, errPeerIDInvalid
+	}
+
+	member, found, err := h.store.ChannelMemberOf(r.Ctx, channelID, r.UserID)
+	if err != nil {
+		h.log.Error("export chat invite membership", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !found || member.Role < 1 || member.Banned(time.Now()) {
+		return nil, errPeerIDInvalid
+	}
+
+	hash, err := h.store.CreateChannelInvite(r.Ctx, channelID, r.UserID)
+	if err != nil {
+		h.log.Error("export chat invite create", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return &tg.ChatInviteExported{
+		Link:      inviteLinkPrefix + hash,
+		AdminID:   r.UserID,
+		Date:      int(time.Now().Unix()),
+		Permanent: true,
+	}, nil
+}
+
+// handleCheckChatInvite serves messages.checkChatInvite. It writes nothing: the
+// hash is looked up, the caller's membership is read, and that is all.
+//
+// The hash is the only input. Every failure — unknown hash, an invite whose
+// channel is gone, a malformed hash — returns errPeerIDInvalid, the same value
+// export and import return. 128 bits of entropy only buys an unwalkable invite
+// space if failures inside it are indistinguishable from one another.
+func (h *handlers) handleCheckChatInvite(r *mtproto.Request) (bin.Encoder, error) {
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	var req tg.MessagesCheckChatInviteRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+
+	ch, err := h.store.ChannelByInvite(r.Ctx, req.Hash)
+	switch {
+	case errors.Is(err, store.ErrInviteInvalid):
+		return nil, errPeerIDInvalid
+	case err != nil:
+		h.log.Error("check chat invite lookup", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	member, found, err := h.store.ChannelMemberOf(r.Ctx, ch.ID, r.UserID)
+	if err != nil {
+		h.log.Error("check chat invite membership", "channel_id", ch.ID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if found {
+		// A banned member holds a participant row, so it is still "already" — but
+		// the channel it gets back is the forbidden form, the same answer
+		// loadChannels gives. A ban that still served the live title would be
+		// cosmetic.
+		return &tg.ChatInviteAlready{Chat: channelToTL(ch, member, !member.Banned(time.Now()))}, nil
+	}
+	// No participants and no photo: M7 stores neither, and a preview naming who
+	// is inside a private channel would give away more than the title does.
+	return &tg.ChatInvite{
+		Title:     ch.Title,
+		About:     ch.About,
+		Photo:     &tg.PhotoEmpty{},
+		Channel:   true,
+		Broadcast: !ch.Megagroup,
+		Megagroup: ch.Megagroup,
+	}, nil
+}
+
+// handleImportChatInvite serves messages.importChatInvite: the only way an
+// account acquires a channel participant row.
+//
+// store.ErrInviteInvalid maps to errPeerIDInvalid, byte-identical to what export
+// and check return, so the invite space stays unprobeable. The two cap errors
+// may be distinct from it and from each other — reaching either needs a hash the
+// caller already holds, so neither says anything about whether an invite exists.
+//
+// No NOTIFY is emitted and no pts moves: joining is not a channel event, and the
+// joiner's join_pts was set inside the store's transaction under the channel's
+// state row lock.
+func (h *handlers) handleImportChatInvite(r *mtproto.Request) (bin.Encoder, error) {
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	var req tg.MessagesImportChatInviteRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+
+	ch, member, err := h.store.JoinChannelByInvite(r.Ctx, req.Hash, r.UserID)
+	switch {
+	case errors.Is(err, store.ErrInviteInvalid):
+		return nil, errPeerIDInvalid
+	case errors.Is(err, store.ErrChannelFull):
+		return nil, errUsersTooMuch
+	case errors.Is(err, store.ErrTooManyChannels):
+		return nil, errChannelsTooMuch
+	case err != nil:
+		h.log.Error("import chat invite join", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	users, err := h.loadUsers(r.Ctx, map[int64]bool{r.UserID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("import chat invite render users", "channel_id", ch.ID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: ch.ID}},
+		Users:   users,
+		// A re-join by a banned member returns that member's untouched row, and
+		// it must not hand back metadata the ban revoked.
+		Chats: []tg.ChatClass{channelToTL(ch, member, !member.Banned(time.Now()))},
+		Date:  int(time.Now().Unix()),
+	}, nil
+}
