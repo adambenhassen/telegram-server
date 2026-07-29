@@ -141,3 +141,39 @@ func InsertTestEvent(ctx context.Context, s *Store, ownerID int64, typ EventType
 		LocalID: localID,
 	})
 }
+
+// SeedChannelPost creates a channel, joins memberID to it through the shipped
+// invite path, and posts one message carrying fileID. Only the post is written
+// directly: the channel write path is a later ticket, so the download gate's
+// channel branch has no shipped way to produce that row yet. Returns the channel
+// id and the post's local_id.
+func SeedChannelPost(ctx context.Context, s *Store, creatorID, memberID, fileID int64) (channelID, localID int64, err error) {
+	ch, err := s.CreateChannel(ctx, creatorID, "test", "", false)
+	if err != nil {
+		return 0, 0, err
+	}
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, creatorID)
+	if err != nil {
+		return 0, 0, err
+	}
+	if _, _, err = s.JoinChannelByInvite(ctx, hash, memberID); err != nil {
+		return 0, 0, err
+	}
+	localID = 1
+	if _, err = s.pool.Exec(ctx,
+		`INSERT INTO channel_messages (channel_id, local_id, from_id, message, file_id)
+		 VALUES ($1, $2, $3, 'post', $4)`,
+		ch.ID, localID, creatorID, fileID); err != nil {
+		return 0, 0, err
+	}
+	return ch.ID, localID, nil
+}
+
+// SetChannelPostDeleted soft-deletes a channel post, the state the channel
+// branch of the download gate has to treat as revocation.
+func SetChannelPostDeleted(ctx context.Context, s *Store, channelID, localID int64) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = $2`,
+		channelID, localID)
+	return err
+}
