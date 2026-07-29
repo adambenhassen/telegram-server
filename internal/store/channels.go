@@ -218,6 +218,32 @@ func (s *Store) ChannelMemberOf(ctx context.Context, channelID, userID int64) (C
 	return channelMemberFromRow(r), true, nil
 }
 
+// ChannelByInvite resolves an invite hash to the channel it admits to, reading
+// only — it is what a preview of an invite is served from, and previewing an
+// invite must never seat anyone. The hash is the only input, for the reason
+// JoinChannelByInvite states.
+//
+// Every rejection is ErrInviteInvalid: an unknown hash and an invite whose
+// channel is gone are indistinguishable, or the invite space becomes probeable
+// through the preview instead of through the join.
+func (s *Store) ChannelByInvite(ctx context.Context, hash string) (Channel, error) {
+	invite, err := s.q.ChannelInviteByHash(ctx, hash)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Channel{}, ErrInviteInvalid
+	case err != nil:
+		return Channel{}, fmt.Errorf("channel invite: %w", err)
+	}
+	channel, err := s.q.ChannelByID(ctx, invite.ChannelID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Channel{}, ErrInviteInvalid
+	case err != nil:
+		return Channel{}, fmt.Errorf("channel by id: %w", err)
+	}
+	return channelFromRow(channel), nil
+}
+
 // CreateChannelInvite issues a bearer invite for the channel: 128 bits from
 // crypto/rand, base64url without padding, 22 characters. It fails closed — a
 // crypto/rand error is returned, never swallowed and never replaced with a

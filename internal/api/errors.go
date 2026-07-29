@@ -45,6 +45,10 @@ var (
 	errMessageEmpty = rpcErr(400, "MESSAGE_EMPTY")
 	// errUsersTooMuch rejects a chat that would exceed the participant limit.
 	errUsersTooMuch = rpcErr(400, "USERS_TOO_MUCH")
+	// errChannelsTooMuch rejects a join that would exceed the per-account
+	// channel cap. Distinct from USERS_TOO_MUCH because both are only reachable
+	// with a hash the caller already holds.
+	errChannelsTooMuch = rpcErr(400, "CHANNELS_TOO_MUCH")
 	// errFilePartInvalid rejects a part index that is negative or past the
 	// per-file maximum, and a zero file id.
 	errFilePartInvalid = rpcErr(400, "FILE_PART_INVALID")
