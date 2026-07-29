@@ -193,6 +193,20 @@ func TestSaveUploadPartRowCap(t *testing.T) {
 
 // The point of MinPartBytesForRowCap: a client using ordinary part sizes must
 // hit the byte cap, never the row cap.
+//
+// The margin has to be built deliberately. When maxFileBytes is a multiple of
+// MinPartBytesForRowCap, exact 32 KiB parts trip both caps on the same call and
+// the byte error only wins because its check is written first — that asserts
+// statement order, not a margin. marginFile is 2.5 parts, so the row cap rounds
+// up to 6 while the byte cap allows only 5: part 6 is over bytes with the row
+// count still strictly under its cap, whichever order the two checks run in.
+const (
+	marginFile    = 5 * store.MinPartBytesForRowCap / 2
+	marginByteCap = 2 * marginFile / store.MinPartBytesForRowCap // 5 parts
+	marginPerFile = 2                                            // 2*32 KiB <= marginFile, so the per-file cap never fires
+	marginRowCap  = 6                                            // 2*ceil(marginFile/32 KiB)
+)
+
 func TestSaveUploadPartRowCapNoFalsePositive(t *testing.T) {
 	t.Parallel()
 	s := open(t)
@@ -202,18 +216,18 @@ func TestSaveUploadPartRowCapNoFalsePositive(t *testing.T) {
 		t.Fatalf("create user: %v", err)
 	}
 
-	// Three parts a file keeps every file exactly at the per-file cap, so the
-	// only caps left in play are the per-user ones.
-	const perFile = rowCapFile / store.MinPartBytesForRowCap
-	for i := 0; ; i++ {
-		err = s.SaveUploadPart(ctx, u.ID, int64(i/perFile), i%perFile, part('a', store.MinPartBytesForRowCap), rowCapFile)
-		if err == nil {
-			continue
+	for i := range marginByteCap {
+		if err := s.SaveUploadPart(ctx, u.ID, int64(i/marginPerFile), i%marginPerFile, part('a', store.MinPartBytesForRowCap), marginFile); err != nil {
+			t.Fatalf("save part %d: %v", i, err)
 		}
-		if !errors.Is(err, store.ErrUploadQuota) {
-			t.Fatalf("save part %d: got %v, want ErrUploadQuota", i, err)
-		}
-		break
+	}
+	// marginByteCap+1 parts is over the byte cap and still under the row cap.
+	if marginByteCap+1 > marginRowCap {
+		t.Fatalf("test setup has no margin: byte cap trips at %d parts, row cap at %d", marginByteCap+1, marginRowCap+1)
+	}
+	err = s.SaveUploadPart(ctx, u.ID, marginByteCap/marginPerFile, marginByteCap%marginPerFile, part('a', store.MinPartBytesForRowCap), marginFile)
+	if !errors.Is(err, store.ErrUploadQuota) {
+		t.Fatalf("32 KiB parts over the byte cap: got %v, want ErrUploadQuota", err)
 	}
 }
 
