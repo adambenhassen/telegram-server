@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1373,6 +1374,320 @@ func TestImportChatInviteIsIdempotent(t *testing.T) {
 	}
 }
 
+// --- updates.getChannelDifference tests ---
+
+func TestGetChannelDifferenceThreePosts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, _, ch := channelWith(t, s, "+1555140001", "+1555140002")
+
+	hash := exportInvite(t, s, creator.ID, ch)
+	_, err := api.ImportChatInviteForTest(s, creator.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	for i := range 3 {
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+	}
+
+	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     0,
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatalf("getChannelDifference(pts=0): %v", err)
+	}
+	assertEncodes(t, enc)
+	diff, ok := enc.(*tg.UpdatesChannelDifference)
+	if !ok {
+		t.Fatalf("type = %T, want *tg.UpdatesChannelDifference", enc)
+	}
+	if !diff.Final {
+		t.Fatal("Final = false, want true")
+	}
+	if diff.Pts != 3 {
+		t.Fatalf("Pts = %d, want 3", diff.Pts)
+	}
+	if len(diff.NewMessages) != 3 {
+		t.Fatalf("NewMessages = %d, want 3", len(diff.NewMessages))
+	}
+}
+
+func TestGetChannelDifferencePartialPts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, _, ch := channelWith(t, s, "+1555141001", "+1555141002")
+
+	hash := exportInvite(t, s, creator.ID, ch)
+	_, err := api.ImportChatInviteForTest(s, creator.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	for i := range 3 {
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+	}
+
+	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     2,
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatalf("getChannelDifference(pts=2): %v", err)
+	}
+	assertEncodes(t, enc)
+	diff, ok := enc.(*tg.UpdatesChannelDifference)
+	if !ok {
+		t.Fatalf("type = %T, want *tg.UpdatesChannelDifference", enc)
+	}
+	if !diff.Final {
+		t.Fatal("Final = false, want true")
+	}
+	if diff.Pts != 3 {
+		t.Fatalf("Pts = %d, want 3", diff.Pts)
+	}
+	if len(diff.NewMessages) != 1 {
+		t.Fatalf("NewMessages = %d, want 1", len(diff.NewMessages))
+	}
+}
+
+func TestGetChannelDifferenceCaughtUp(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, _, ch := channelWith(t, s, "+1555142001", "+1555142002")
+
+	hash := exportInvite(t, s, creator.ID, ch)
+	_, err := api.ImportChatInviteForTest(s, creator.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	for i := range 3 {
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+	}
+
+	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     3,
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatalf("getChannelDifference(pts=3): %v", err)
+	}
+	assertEncodes(t, enc)
+	empty, ok := enc.(*tg.UpdatesChannelDifferenceEmpty)
+	if !ok {
+		t.Fatalf("type = %T, want *tg.UpdatesChannelDifferenceEmpty", enc)
+	}
+	if !empty.Final {
+		t.Fatal("Final = false, want true")
+	}
+	if empty.Pts != 3 {
+		t.Fatalf("Pts = %d, want 3", empty.Pts)
+	}
+}
+
+func TestGetChannelDifferenceAheadOfServer(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, _, ch := channelWith(t, s, "+1555143001", "+1555143002")
+
+	hash := exportInvite(t, s, creator.ID, ch)
+	_, err := api.ImportChatInviteForTest(s, creator.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	for i := range 3 {
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+	}
+
+	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     99,
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatalf("getChannelDifference(pts=99): %v", err)
+	}
+	assertEncodes(t, enc)
+	empty, ok := enc.(*tg.UpdatesChannelDifferenceEmpty)
+	if !ok {
+		t.Fatalf("type = %T, want *tg.UpdatesChannelDifferenceEmpty", enc)
+	}
+	if empty.Pts != 3 {
+		t.Fatalf("Pts = %d, want 3", empty.Pts)
+	}
+}
+
+func TestGetChannelDifferenceJoinPtsClamp(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, _, ch := channelWith(t, s, "+1555144001", "+1555144002")
+
+	for i := range 2 {
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+	}
+
+	lateUser, err := s.CreateUser(ctx, "+1555144003")
+	if err != nil {
+		t.Fatalf("late user: %v", err)
+	}
+	hash := exportInvite(t, s, creator.ID, ch)
+	_, err = api.ImportChatInviteForTest(s, lateUser.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "after join", 3, nil); err != nil {
+		t.Fatalf("post after join: %v", err)
+	}
+
+	enc, err := api.GetChannelDifferenceForTest(s, lateUser.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     0,
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatalf("getChannelDifference(pts=0): %v", err)
+	}
+	assertEncodes(t, enc)
+	diff, ok := enc.(*tg.UpdatesChannelDifference)
+	if !ok {
+		t.Fatalf("type = %T, want *tg.UpdatesChannelDifference", enc)
+	}
+	if len(diff.NewMessages) != 1 {
+		t.Fatalf("NewMessages = %d, want 1 (clamped to join_pts=2)", len(diff.NewMessages))
+	}
+	if diff.Pts != 3 {
+		t.Fatalf("Pts = %d, want 3", diff.Pts)
+	}
+	_ = dsn
+}
+
+func TestGetChannelDifferenceNonMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, _, ch := channelWith(t, s, "+1555145001", "+1555145002")
+
+	if _, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg", 1, nil); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	outsider, err := s.CreateUser(ctx, "+1555145003")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
+	_, err = api.GetChannelDifferenceForTest(s, outsider.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     0,
+		Limit:   100,
+	})
+	if err == nil {
+		t.Fatal("expected error for non-member, got nil")
+	}
+}
+
+func TestGetChannelDifferenceBanned(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, other, ch := channelWith(t, s, "+1555146001", "+1555146002")
+
+	joinChannel(t, ctx, dsn, ch.ID, other.ID)
+
+	if _, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg", 1, nil); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	banUntil := time.Now().Add(time.Hour)
+	banChannelMember(t, ctx, dsn, ch.ID, other.ID, banUntil)
+
+	_, err := api.GetChannelDifferenceForTest(s, other.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     0,
+		Limit:   100,
+	})
+	if err == nil {
+		t.Fatal("expected error for banned member, got nil")
+	}
+}
+
+func TestGetChannelDifferenceTruncated(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, _, ch := channelWith(t, s, "+1555147001", "+1555147002")
+
+	hash := exportInvite(t, s, creator.ID, ch)
+	_, err := api.ImportChatInviteForTest(s, creator.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	for i := range 5 {
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+	}
+
+	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     0,
+		Limit:   2,
+	})
+	if err != nil {
+		t.Fatalf("getChannelDifference(limit=2): %v", err)
+	}
+	assertEncodes(t, enc)
+	diff, ok := enc.(*tg.UpdatesChannelDifference)
+	if !ok {
+		t.Fatalf("type = %T, want *tg.UpdatesChannelDifference", enc)
+	}
+	if diff.Final {
+		t.Fatal("Final = true, want false (truncated)")
+	}
+	if len(diff.NewMessages) != 2 {
+		t.Fatalf("NewMessages = %d, want 2", len(diff.NewMessages))
+	}
+	if diff.Pts != 2 {
+		t.Fatalf("Pts = %d, want 2 (last included event's pts)", diff.Pts)
+	}
+}
+
 // inputUser names a target for editAdmin under the M1 placeholder access hash.
 func inputUser(id int64) tg.InputUserClass {
 	return &tg.InputUser{UserID: id, AccessHash: id}
@@ -1827,5 +2142,60 @@ func TestEditBannedRejectsAPartialRestriction(t *testing.T) {
 		t.Fatal("partial restriction on an absent channel: got nil")
 	} else if msg := rpcMessage(t, err); msg != "BANNED_RIGHTS_INVALID" {
 		t.Errorf("partial restriction on an absent channel: got %s, want BANNED_RIGHTS_INVALID", msg)
+	}
+}
+
+func TestGetChannelDifferenceSkippedEvent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, _, ch := channelWith(t, s, "+1555148001", "+1555148002")
+
+	hash := exportInvite(t, s, creator.ID, ch)
+	_, err := api.ImportChatInviteForTest(s, creator.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg", 1, nil); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// Insert a channel event with type 2 (edit) that references a non-existent
+	// message row, to exercise the skipped event path in channelEventToUpdate.
+	channelExec(t, ctx, dsn,
+		`INSERT INTO channel_events (channel_id, pts, "type", local_id) VALUES ($1, $2, 2, 99999)`,
+		ch.ID, 2)
+	channelExec(t, ctx, dsn,
+		`UPDATE channel_state SET pts = $2 WHERE channel_id = $1`,
+		ch.ID, 2)
+
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg2", 3, nil); err != nil {
+		t.Fatalf("post2: %v", err)
+	}
+
+	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     0,
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatalf("getChannelDifference: %v", err)
+	}
+	assertEncodes(t, enc)
+	diff, ok := enc.(*tg.UpdatesChannelDifference)
+	if !ok {
+		t.Fatalf("type = %T, want *tg.UpdatesChannelDifference", enc)
+	}
+	if !diff.Final {
+		t.Fatal("Final = false, want true")
+	}
+	if diff.Pts != 3 {
+		t.Fatalf("Pts = %d, want 3", diff.Pts)
+	}
+	// Skipped event (type 2) produces no update; only the two real messages appear.
+	if len(diff.NewMessages) != 2 {
+		t.Fatalf("NewMessages = %d, want 2 (skipped event type 2)", len(diff.NewMessages))
 	}
 }
