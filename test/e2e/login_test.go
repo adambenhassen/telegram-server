@@ -50,7 +50,7 @@ func TestClientLogin(t *testing.T) {
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	// The code sink scrapes the issued code out of the log, so the e2e suite
 	// needs the gated line on.
-	handler := api.New(st, dcID, tgcfg, codes.Logger(), true)
+	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
 
 	var lc net.ListenConfig

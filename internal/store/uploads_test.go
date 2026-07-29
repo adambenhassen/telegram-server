@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -396,5 +397,37 @@ func TestDeleteExpiredUploadParts(t *testing.T) {
 	}
 	if parts, _, _, err := s.UploadPartsSummary(ctx, u.ID, 1); err != nil || parts != 0 {
 		t.Fatalf("after sweep: parts=%d err=%v", parts, err)
+	}
+}
+
+// TestSaveUploadPartRejectsOutOfRangeIndex covers both branches of the index
+// narrowing. An index past MaxInt32 is the one that matters: truncating it
+// instead of rejecting it would alias onto part 0 and silently overwrite it, so
+// the assertion is on part 0's bytes, not only on the error.
+func TestSaveUploadPartRejectsOutOfRangeIndex(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000010")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	want := part('a', 64)
+	if err = s.SaveUploadPart(ctx, u.ID, 42, 0, want, maxFile); err != nil {
+		t.Fatalf("save part 0: %v", err)
+	}
+	for _, idx := range []int{-1, math.MaxInt32 + 1} {
+		if err = s.SaveUploadPart(ctx, u.ID, 42, idx, part('b', 64), maxFile); !errors.Is(err, store.ErrPartTooLarge) {
+			t.Fatalf("index %d: %v, want ErrPartTooLarge", idx, err)
+		}
+	}
+
+	got, ok, err := s.UploadPart(ctx, u.ID, 42, 0)
+	if err != nil || !ok {
+		t.Fatalf("read part 0: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("part 0 was overwritten: got %q", got)
 	}
 }

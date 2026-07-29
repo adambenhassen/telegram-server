@@ -26,8 +26,36 @@ func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code stri
 	h.logIssuedCode(phone, code)
 }
 
+// TestMaxFileBytes is the per-file upload cap test handlers run with. It is the
+// production default, so MaxFileParts is the same 200 a real server enforces.
+const TestMaxFileBytes int64 = 100 << 20
+
+// MaxFileParts exposes the derived part-index bound for the external api_test
+// package, for a handler built with TestMaxFileBytes.
+func MaxFileParts() int {
+	return testHandlers(nil).maxFileParts()
+}
+
 func testHandlers(s *store.Store) *handlers {
-	return &handlers{store: s, log: slog.New(slog.DiscardHandler)}
+	return &handlers{store: s, log: slog.New(slog.DiscardHandler), maxFileBytes: TestMaxFileBytes}
+}
+
+// SaveFilePartForTest encodes req and invokes handleSaveFilePart for the caller.
+func SaveFilePartForTest(s *store.Store, userID int64, req *tg.UploadSaveFilePartRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SaveBigFilePartForTest encodes req and invokes handleSaveBigFilePart.
+func SaveBigFilePartForTest(s *store.Store, userID int64, req *tg.UploadSaveBigFilePartRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleSaveBigFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // BuildUpdatesForTest exposes buildUpdates for the external api_test package.

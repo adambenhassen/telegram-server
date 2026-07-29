@@ -185,7 +185,7 @@ func bootServerWithRegistry(t *testing.T, ctx context.Context, key *rsa.PrivateK
 	t.Helper()
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	// Sign-in here reads the code off the log, so the gated line must be on.
-	handler := api.New(st, dcID, tgcfg, log, true)
+	handler := api.New(st, dcID, tgcfg, log, true, 100<<20)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdater(st, server.Registry(), log)

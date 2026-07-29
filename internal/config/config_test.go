@@ -3,6 +3,7 @@ package config_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/config"
 )
@@ -28,6 +29,86 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if len(cfg.AuthKeyEncKey) != 32 {
 		t.Errorf("AuthKeyEncKey len = %d, want 32", len(cfg.AuthKeyEncKey))
+	}
+	if cfg.MaxFileBytes != 104857600 {
+		t.Errorf("MaxFileBytes = %d, want 104857600", cfg.MaxFileBytes)
+	}
+	if cfg.UploadPartTTL != 6*time.Hour {
+		t.Errorf("UploadPartTTL = %v, want 6h", cfg.UploadPartTTL)
+	}
+}
+
+func TestLoadMaxFileBytes(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	tests := map[string]struct {
+		raw     string
+		want    int64
+		wantErr bool
+	}{
+		"unset":       {raw: "", want: 104857600},
+		"override":    {raw: "2097152", want: 2097152},
+		"not integer": {raw: "10MB", wantErr: true},
+		"zero":        {raw: "0", wantErr: true},
+		"negative":    {raw: "-1", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TG_MAX_FILE_BYTES", tc.raw)
+			cfg, err := config.Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %s, got MaxFileBytes = %d", name, cfg.MaxFileBytes)
+				}
+				if !strings.Contains(err.Error(), "TG_MAX_FILE_BYTES") {
+					t.Errorf("error %q does not name TG_MAX_FILE_BYTES", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.MaxFileBytes != tc.want {
+				t.Errorf("MaxFileBytes = %d, want %d", cfg.MaxFileBytes, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadUploadPartTTL(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	tests := map[string]struct {
+		raw     string
+		want    time.Duration
+		wantErr bool
+	}{
+		"unset":        {raw: "", want: 6 * time.Hour},
+		"override":     {raw: "30m", want: 30 * time.Minute},
+		"not duration": {raw: "soon", wantErr: true},
+		"zero":         {raw: "0s", wantErr: true},
+		"negative":     {raw: "-1h", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TG_UPLOAD_PART_TTL", tc.raw)
+			cfg, err := config.Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %s, got UploadPartTTL = %v", name, cfg.UploadPartTTL)
+				}
+				if !strings.Contains(err.Error(), "TG_UPLOAD_PART_TTL") {
+					t.Errorf("error %q does not name TG_UPLOAD_PART_TTL", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.UploadPartTTL != tc.want {
+				t.Errorf("UploadPartTTL = %v, want %v", cfg.UploadPartTTL, tc.want)
+			}
+		})
 	}
 }
 

@@ -67,13 +67,16 @@ func run(log *slog.Logger) error {
 	sweepWG.Go(func() {
 		sweepExpiredCodes(sweepCtx, st, log)
 	})
+	sweepWG.Go(func() {
+		sweepExpiredUploadParts(sweepCtx, st, cfg.UploadPartTTL, log)
+	})
 	defer func() {
 		cancelSweep()
 		sweepWG.Wait()
 	}()
 
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
-	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes)
+	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes)
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
 	}
@@ -125,6 +128,31 @@ func sweepExpiredCodes(ctx context.Context, st *store.Store, log *slog.Logger) {
 				continue
 			}
 			log.Info("swept expired codes", "deleted", n)
+		}
+	}
+}
+
+// sweepExpiredUploadParts periodically deletes unassembled upload parts older
+// than ttl until ctx is canceled.
+//
+// The interval is derived from the TTL rather than being a constant: this sweep
+// is what bounds worst-case retained bytes, and an interval no greater than a
+// quarter of the TTL keeps the overshoot past expiry small relative to the
+// window itself.
+func sweepExpiredUploadParts(ctx context.Context, st *store.Store, ttl time.Duration, log *slog.Logger) {
+	ticker := time.NewTicker(ttl / 4)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := st.DeleteExpiredUploadParts(ctx, time.Now().Add(-ttl))
+			if err != nil {
+				log.Error("sweep expired upload parts", "err", err)
+				continue
+			}
+			log.Info("swept expired upload parts", "deleted", n)
 		}
 	}
 }
