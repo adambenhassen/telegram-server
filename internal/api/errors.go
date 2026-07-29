@@ -73,6 +73,11 @@ var (
 	// turn the download path into an existence-and-enumeration oracle over every
 	// file on the server.
 	errLocationInvalid = rpcErr(400, "LOCATION_INVALID")
+	// errUntilDateInvalid rejects a channels.editBanned whose until_date has
+	// already passed. It is decided entirely on the client's own input, before
+	// any channel or participant is read, so it tells a caller nothing about the
+	// channel and may be distinct from errPeerIDInvalid.
+	errUntilDateInvalid = rpcErr(400, "UNTIL_DATE_INVALID")
 	// errDownloadBusy rejects a second concurrent download from one account.
 	// FLOOD_WAIT is the right signal: the condition clears on its own as soon as
 	// the in-flight request finishes.

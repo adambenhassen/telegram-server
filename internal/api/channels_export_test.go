@@ -64,5 +64,23 @@ func ImportChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesImpor
 	return testHandlers(s).handleImportChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// EditAdminForTest encodes req and invokes handleEditAdmin for the caller.
+func EditAdminForTest(s *store.Store, userID int64, req *tg.ChannelsEditAdminRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleEditAdmin(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// EditBannedForTest encodes req and invokes handleEditBanned for the caller.
+func EditBannedForTest(s *store.Store, userID int64, req *tg.ChannelsEditBannedRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleEditBanned(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // MaxGetChannels exposes the getChannels input cap to the api_test package.
 const MaxGetChannels = maxGetChannels
