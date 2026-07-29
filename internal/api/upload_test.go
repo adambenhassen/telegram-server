@@ -143,6 +143,85 @@ func TestSaveFilePartRejectedIndexWritesNothing(t *testing.T) {
 	}
 }
 
+// TestSaveFilePartPerFileCap drives the store's per-file byte cap through the
+// handler: the second max-size part takes the file past a 600 KiB cap.
+func TestSaveFilePartPerFileCap(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	u, err := s.CreateUser(ctx, "+15551294006")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	const cap600 = 600 * 1024
+	full := bytes.Repeat([]byte{'a'}, store.MaxPartBytes)
+	if _, err := api.SaveFilePartCappedForTest(s, u.ID, cap600, &tg.UploadSaveFilePartRequest{
+		FileID: 999, FilePart: 0, Bytes: full,
+	}); err != nil {
+		t.Fatalf("save part 0: %v", err)
+	}
+	_, err = api.SaveFilePartCappedForTest(s, u.ID, cap600, &tg.UploadSaveFilePartRequest{
+		FileID: 999, FilePart: 1, Bytes: full,
+	})
+	rpcError(t, err, "FILE_PART_TOO_BIG")
+}
+
+// TestSaveFilePartOutstandingCap drives the per-user outstanding-bytes cap,
+// which is twice the per-file one, across three files that are each legal on
+// their own. The mapping under test is the one the M5 threat model rules on:
+// over the cap the account gets FLOOD_WAIT, not INTERNAL.
+func TestSaveFilePartOutstandingCap(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	u, err := s.CreateUser(ctx, "+15551294007")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	const cap600 = 600 * 1024
+	full := bytes.Repeat([]byte{'a'}, store.MaxPartBytes)
+	for _, fileID := range []int64{1, 2} {
+		if _, err := api.SaveFilePartCappedForTest(s, u.ID, cap600, &tg.UploadSaveFilePartRequest{
+			FileID: fileID, FilePart: 0, Bytes: full,
+		}); err != nil {
+			t.Fatalf("save file %d: %v", fileID, err)
+		}
+	}
+	_, err = api.SaveFilePartCappedForTest(s, u.ID, cap600, &tg.UploadSaveFilePartRequest{
+		FileID: 3, FilePart: 0, Bytes: full,
+	})
+	rpcError(t, err, "FLOOD_WAIT_60")
+}
+
+// TestSaveFilePartRowCap covers the row-count half of the same outstanding cap,
+// which reports the same FLOOD_WAIT: with a 64 KiB per-file cap the row cap is
+// four, so the fifth one-byte part of a fifth file is rejected on rows rather
+// than on bytes.
+func TestSaveFilePartRowCap(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	u, err := s.CreateUser(ctx, "+15551294008")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	const cap64 = 64 * 1024
+	for fileID := int64(1); fileID <= 4; fileID++ {
+		if _, err := api.SaveFilePartCappedForTest(s, u.ID, cap64, &tg.UploadSaveFilePartRequest{
+			FileID: fileID, FilePart: 0, Bytes: []byte("x"),
+		}); err != nil {
+			t.Fatalf("save file %d: %v", fileID, err)
+		}
+	}
+	_, err = api.SaveFilePartCappedForTest(s, u.ID, cap64, &tg.UploadSaveFilePartRequest{
+		FileID: 5, FilePart: 0, Bytes: []byte("x"),
+	})
+	rpcError(t, err, "FLOOD_WAIT_60")
+}
+
 func TestSaveBigFilePartValidatesTotalParts(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

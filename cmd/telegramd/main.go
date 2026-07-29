@@ -140,7 +140,10 @@ func sweepExpiredCodes(ctx context.Context, st *store.Store, log *slog.Logger) {
 // quarter of the TTL keeps the overshoot past expiry small relative to the
 // window itself.
 func sweepExpiredUploadParts(ctx context.Context, st *store.Store, ttl time.Duration, log *slog.Logger) {
-	ticker := time.NewTicker(ttl / 4)
+	// Floored at a second: NewTicker panics on a non-positive interval, and the
+	// config only rejects a non-positive TTL, so a tiny-but-valid TTL would
+	// otherwise crash the server at boot rather than sweep aggressively.
+	ticker := time.NewTicker(max(ttl/4, time.Second))
 	defer ticker.Stop()
 	for {
 		select {

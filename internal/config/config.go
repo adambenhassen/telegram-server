@@ -40,6 +40,13 @@ type Config struct {
 	UploadPartTTL time.Duration
 }
 
+// MaxFileBytesLimit is the ceiling on TG_MAX_FILE_BYTES. It is a bound on the
+// arithmetic, not a product decision: the derived part count rounds up by the
+// part size and the per-user cap doubles the per-file one, so a value near
+// MaxInt64 overflows both and turns every save into a rejection. 1 TiB is far
+// past any file a client can upload and leaves both terms in range.
+const MaxFileBytesLimit int64 = 1 << 40
+
 // Load reads configuration from environment variables, applying defaults.
 func Load() (Config, error) {
 	cfg := Config{
@@ -65,6 +72,9 @@ func Load() (Config, error) {
 		}
 		if n <= 0 {
 			return Config{}, errors.New("TG_MAX_FILE_BYTES must be positive")
+		}
+		if n > MaxFileBytesLimit {
+			return Config{}, errors.New("TG_MAX_FILE_BYTES must be at most 1099511627776")
 		}
 		cfg.MaxFileBytes = n
 	}

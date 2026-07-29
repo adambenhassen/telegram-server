@@ -48,6 +48,9 @@ func TestLoadMaxFileBytes(t *testing.T) {
 	}{
 		"unset":       {raw: "", want: 104857600},
 		"override":    {raw: "2097152", want: 2097152},
+		"at limit":    {raw: "1099511627776", want: 1 << 40},
+		"past limit":  {raw: "1099511627777", wantErr: true},
+		"max int64":   {raw: "9223372036854775807", wantErr: true},
 		"not integer": {raw: "10MB", wantErr: true},
 		"zero":        {raw: "0", wantErr: true},
 		"negative":    {raw: "-1", wantErr: true},

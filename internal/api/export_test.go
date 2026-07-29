@@ -49,6 +49,18 @@ func SaveFilePartForTest(s *store.Store, userID int64, req *tg.UploadSaveFilePar
 	return testHandlers(s).handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SaveFilePartCappedForTest is SaveFilePartForTest against a handler built with
+// maxFileBytes, so a test can reach the per-file and per-user caps without
+// uploading a hundred megabytes.
+func SaveFilePartCappedForTest(s *store.Store, userID int64, maxFileBytes int64, req *tg.UploadSaveFilePartRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := &handlers{store: s, log: slog.New(slog.DiscardHandler), maxFileBytes: maxFileBytes}
+	return h.handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SaveBigFilePartForTest encodes req and invokes handleSaveBigFilePart.
 func SaveBigFilePartForTest(s *store.Store, userID int64, req *tg.UploadSaveBigFilePartRequest) (bin.Encoder, error) {
 	var buf bin.Buffer
