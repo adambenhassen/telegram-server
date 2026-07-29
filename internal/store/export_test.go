@@ -90,6 +90,34 @@ func InsertChatMessageNoFanout(ctx context.Context, s *Store, ownerID, chatID in
 	return b.LocalID, nil
 }
 
+// SetChannelPts forces a channel's pts, so the join path can be asserted
+// against a non-zero sequence without a message-send path that does not exist
+// until the next ticket.
+func SetChannelPts(ctx context.Context, s *Store, channelID, pts int64) error {
+	_, err := s.pool.Exec(ctx, `UPDATE channel_state SET pts = $2 WHERE channel_id = $1`, channelID, pts)
+	return err
+}
+
+// SetChannelBan writes a participant's banned_until directly. Ban mutation is a
+// later ticket's RPC; this exists so the read and re-join paths can be tested
+// against a banned row today.
+func SetChannelBan(ctx context.Context, s *Store, channelID, userID int64, until *time.Time) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE channel_participants SET banned_until = $3 WHERE channel_id = $1 AND user_id = $2`,
+		channelID, userID, until)
+	return err
+}
+
+// SetChannelBanInfinite writes banned_until = 'infinity'. It is separate from
+// SetChannelBan because no Go time.Time encodes to infinity, and infinity is the
+// value the ban decode has to survive.
+func SetChannelBanInfinite(ctx context.Context, s *Store, channelID, userID int64) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE channel_participants SET banned_until = 'infinity' WHERE channel_id = $1 AND user_id = $2`,
+		channelID, userID)
+	return err
+}
+
 // InsertTestEvent bumps the owner's pts and appends one event at the new pts,
 // letting update-state tests exercise EventsSince without a full message send.
 func InsertTestEvent(ctx context.Context, s *Store, ownerID int64, typ EventType, localID int64) error {
