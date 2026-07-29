@@ -251,6 +251,9 @@ func TestRejoinDoesNotClearABan(t *testing.T) {
 	if !m.Banned(time.Now()) {
 		t.Errorf("re-join cleared the ban: %+v", m)
 	}
+	if m.Forever() {
+		t.Errorf("finite ban reported as permanent: %+v", m)
+	}
 }
 
 // 'infinity' is a permanent ban. pgx decodes it as a zero time.Time carrying an
@@ -272,5 +275,96 @@ func TestInfiniteBanIsPermanent(t *testing.T) {
 	}
 	if !m.Banned(time.Now()) {
 		t.Errorf("infinite ban read as not banned: %+v", m)
+	}
+	// Forever is how a handler recognises this without knowing the year-9999
+	// stand-in, which must never reach the wire.
+	if !m.Forever() {
+		t.Errorf("infinite ban not reported as permanent: %+v", m)
+	}
+}
+
+func TestCreateChannelRejectsPastThePerAccountCap(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15551291014")
+	store.SetChannelCaps(s, 10000, 1)
+
+	first := mustChannel(t, s, u.ID, "First")
+	// One row held, cap 1: the >= boundary rejects here rather than at 2.
+	if _, err := s.CreateChannel(ctx, u.ID, "Second", "", false); !errors.Is(err, store.ErrTooManyChannels) {
+		t.Fatalf("second create: err = %v, want ErrTooManyChannels", err)
+	}
+
+	chans, err := s.ChannelsForUser(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("channels for user: %v", err)
+	}
+	if len(chans) != 1 || chans[0].ID != first.ID {
+		t.Errorf("rejected create wrote rows: %+v", chans)
+	}
+}
+
+func TestJoinChannelByInviteRejectsAFullChannel(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551291015")
+	first := mustUser(t, s, "+15551291016")
+	second := mustUser(t, s, "+15551291017")
+	ch := mustChannel(t, s, owner.ID, "News") // the creator takes seat 1
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+	store.SetChannelCaps(s, 2, 500)
+
+	// Seat 2 of 2 is still free, so this one is admitted: the boundary is >=,
+	// not >.
+	if _, _, err := s.JoinChannelByInvite(ctx, hash, first.ID); err != nil {
+		t.Fatalf("join at the last free seat: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, hash, second.ID); !errors.Is(err, store.ErrChannelFull) {
+		t.Fatalf("join past the cap: err = %v, want ErrChannelFull", err)
+	}
+	if _, ok, err := s.ChannelMemberOf(ctx, ch.ID, second.ID); err != nil || ok {
+		t.Errorf("rejected join wrote a row: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestJoinChannelByInviteRejectsPastThePerAccountCap(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551291018")
+	joiner := mustUser(t, s, "+15551291019")
+	// Both channels are created before the cap is lowered, so this exercises the
+	// join path's check and not the create path's.
+	one := mustChannel(t, s, owner.ID, "One")
+	two := mustChannel(t, s, owner.ID, "Two")
+	hashOne, err := s.CreateChannelInvite(ctx, one.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("invite one: %v", err)
+	}
+	hashTwo, err := s.CreateChannelInvite(ctx, two.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("invite two: %v", err)
+	}
+
+	store.SetChannelCaps(s, 10000, 1)
+	if _, _, err := s.JoinChannelByInvite(ctx, hashOne, joiner.ID); err != nil {
+		t.Fatalf("first join: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, hashTwo, joiner.ID); !errors.Is(err, store.ErrTooManyChannels) {
+		t.Fatalf("second join: err = %v, want ErrTooManyChannels", err)
+	}
+	if _, ok, err := s.ChannelMemberOf(ctx, two.ID, joiner.ID); err != nil || ok {
+		t.Errorf("rejected join wrote a row: ok=%v err=%v", ok, err)
+	}
+
+	// An account already holding the row is not the cap's business: a re-join of
+	// a channel it is in still returns, even though it is at the cap.
+	if _, m, err := s.JoinChannelByInvite(ctx, hashOne, joiner.ID); err != nil || m.UserID != joiner.ID {
+		t.Errorf("re-join at the cap: member=%+v err=%v", m, err)
 	}
 }

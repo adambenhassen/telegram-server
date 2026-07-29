@@ -17,6 +17,14 @@ type Store struct {
 	pool   *pgxpool.Pool
 	q      *db.Queries
 	cipher *keycrypt.Cipher
+
+	// Channel bounds, seeded from the defaults in channels.go. They are fields
+	// rather than constants only so a test can exercise the cap branches without
+	// writing 10 000 rows; a test lowering them on its own Store cannot disturb
+	// another test's Store, which package-level vars would not give under
+	// t.Parallel().
+	maxChannelParticipants int
+	maxChannelsPerUser     int
 }
 
 // Sentinel errors returned by the login-code methods.
@@ -68,7 +76,13 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	s := &Store{pool: pool, q: db.New(pool), cipher: cipher}
+	s := &Store{
+		pool:                   pool,
+		q:                      db.New(pool),
+		cipher:                 cipher,
+		maxChannelParticipants: defaultMaxChannelParticipants,
+		maxChannelsPerUser:     defaultMaxChannelsPerUser,
+	}
 	if err := s.checkSchema(ctx); err != nil {
 		pool.Close()
 		return nil, err

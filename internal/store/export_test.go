@@ -90,6 +90,15 @@ func InsertChatMessageNoFanout(ctx context.Context, s *Store, ownerID, chatID in
 	return b.LocalID, nil
 }
 
+// SetChannelCaps lowers one Store's channel bounds so the cap branches can be
+// exercised at their boundary instead of by writing 10 000 participant rows.
+// Scoped to this Store on purpose: a package-level override would leak into
+// every other test in a parallel run.
+func SetChannelCaps(s *Store, participants, perUser int) {
+	s.maxChannelParticipants = participants
+	s.maxChannelsPerUser = perUser
+}
+
 // SetChannelPts forces a channel's pts, so the join path can be asserted
 // against a non-zero sequence without a message-send path that does not exist
 // until the next ticket.

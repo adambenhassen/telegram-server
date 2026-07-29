@@ -24,14 +24,22 @@ import (
 // pts it records and the counts the caps are decided on the same snapshot the
 // insert lands in.
 
-// maxChannelParticipants and maxChannelsPerUser are the bounds recorded in the
-// M7 migration. Both are checked under the channel_state row lock; that lock
-// serialises joins to one channel exactly, so the per-channel cap is exact and
-// the per-account one is exact per channel — two joins to two different channels
-// can both see 499. The overshoot is bounded by concurrency, not unbounded.
+// defaultMaxChannelParticipants and defaultMaxChannelsPerUser are the bounds
+// recorded in the M7 migration. They seed the per-Store fields of the same name
+// in Open; nothing but a test overrides them, and a test overriding one Store
+// leaves every other Store in a parallel run alone.
+//
+// Exactness, both on the join path and on the create path: the join path checks
+// both under the channel_state row lock, which serialises joins to ONE channel,
+// so the per-channel cap is exact and the per-account one is exact per channel —
+// two joins to two different channels can both read 499. CreateChannel's check
+// has the same property for the same reason, since there is no channel_state row
+// to lock before the channel exists. Closing that would take a lock across every
+// channel an account touches, which is a far worse trade than an overshoot
+// bounded by an account's own concurrency.
 const (
-	maxChannelParticipants = 10000 // per channel
-	maxChannelsPerUser     = 500   // per account
+	defaultMaxChannelParticipants = 10000 // per channel
+	defaultMaxChannelsPerUser     = 500   // per account
 )
 
 // inviteHashBytes is the entropy behind one invite. 128 bits is what makes the
@@ -72,6 +80,15 @@ func (m ChannelMember) Banned(now time.Time) bool {
 	return m.BannedUntil != nil && m.BannedUntil.After(now)
 }
 
+// Forever reports whether the member's ban is permanent — banned_until =
+// 'infinity'. It exists so bannedForever never has to be recognised outside this
+// package: a caller serialising BannedUntil directly would put year 9999 on the
+// wire where MTProto wants its own forever ban, and the year is this package's
+// stand-in for a value Go's time has no representation for.
+func (m ChannelMember) Forever() bool {
+	return m.BannedUntil != nil && m.BannedUntil.Equal(bannedForever)
+}
+
 func channelFromRow(r db.Channel) Channel {
 	return Channel{
 		ID:        r.ID,
@@ -103,7 +120,10 @@ func channelMemberFromRow(r db.ChannelParticipant) ChannelMember {
 // CreateChannel creates a channel owned by creatorID, in one transaction: the
 // channels row, its channel_state row, and the creator's participant row at
 // role 2 with join_pts 0 — a creator sees the channel's whole history because
-// there is none before them.
+// there is none before them. ErrTooManyChannels once the creator already holds
+// maxChannelsPerUser participant rows, and then nothing is written: creating is
+// the other way an account acquires a row, so leaving the cap to the join path
+// would let an account past it by creating instead of joining.
 func (s *Store) CreateChannel(ctx context.Context, creatorID int64, title, about string, megagroup bool) (Channel, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -111,6 +131,18 @@ func (s *Store) CreateChannel(ctx context.Context, creatorID int64, title, about
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
+
+	// Same count the join path decides its per-account cap on, and deliberately
+	// the same query: two counts of "channels this account is in" would be two
+	// definitions of the cap, and they would drift the first time one of them
+	// learns to exclude something.
+	joined, err := qtx.CountChannelsForUser(ctx, creatorID)
+	if err != nil {
+		return Channel{}, fmt.Errorf("count channels for user: %w", err)
+	}
+	if joined >= int64(s.maxChannelsPerUser) {
+		return Channel{}, ErrTooManyChannels
+	}
 
 	row, err := qtx.InsertChannel(ctx, db.InsertChannelParams{
 		Title: title, About: about, CreatorID: creatorID, Megagroup: megagroup,
@@ -268,14 +300,14 @@ func (s *Store) JoinChannelByInvite(ctx context.Context, hash string, userID int
 	if err != nil {
 		return Channel{}, ChannelMember{}, fmt.Errorf("count participants: %w", err)
 	}
-	if seats >= maxChannelParticipants {
+	if seats >= int64(s.maxChannelParticipants) {
 		return Channel{}, ChannelMember{}, ErrChannelFull
 	}
 	joined, err := qtx.CountChannelsForUser(ctx, userID)
 	if err != nil {
 		return Channel{}, ChannelMember{}, fmt.Errorf("count channels for user: %w", err)
 	}
-	if joined >= maxChannelsPerUser {
+	if joined >= int64(s.maxChannelsPerUser) {
 		return Channel{}, ChannelMember{}, ErrTooManyChannels
 	}
 
