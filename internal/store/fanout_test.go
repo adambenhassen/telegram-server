@@ -65,7 +65,7 @@ func eventsOf(t *testing.T, s *store.Store, userID int64, fromPts int) []store.E
 
 func dialogOf(t *testing.T, s *store.Store, ownerID, chatID int64) store.Dialog {
 	t.Helper()
-	ds, err := s.Dialogs(context.Background(), ownerID)
+	ds, err := s.Dialogs(context.Background(), ownerID, 0, 100)
 	if err != nil {
 		t.Fatalf("dialogs %d: %v", ownerID, err)
 	}
