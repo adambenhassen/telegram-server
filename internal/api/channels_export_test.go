@@ -37,5 +37,32 @@ func LeaveChannelForTest(s *store.Store, userID int64, req *tg.ChannelsLeaveChan
 	return testHandlers(s).handleLeaveChannel(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// ExportChatInviteForTest encodes req and invokes handleExportChatInvite for the caller.
+func ExportChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesExportChatInviteRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleExportChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// CheckChatInviteForTest encodes req and invokes handleCheckChatInvite for the caller.
+func CheckChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesCheckChatInviteRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleCheckChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// ImportChatInviteForTest encodes req and invokes handleImportChatInvite for the caller.
+func ImportChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesImportChatInviteRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleImportChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // MaxGetChannels exposes the getChannels input cap to the api_test package.
 const MaxGetChannels = maxGetChannels
