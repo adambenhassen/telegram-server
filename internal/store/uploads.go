@@ -25,8 +25,17 @@ var ErrFileTooLarge = errors.New("upload file too large")
 // exceed their cap.
 var ErrUploadQuota = errors.New("upload quota exceeded")
 
+// ErrTooManyParts is returned when a user's outstanding part count would exceed
+// the row cap.
+var ErrTooManyParts = errors.New("too many upload parts")
+
 // MaxPartBytes is the protocol maximum for one upload.saveFilePart part.
 const MaxPartBytes = 512 * 1024
+
+// MinPartBytesForRowCap is the smallest part size real clients choose. The
+// per-user row cap is derived from it so that a client using ordinary part
+// sizes is never rejected by the row cap before the byte cap.
+const MinPartBytesForRowCap = 32 * 1024
 
 // partIndexOf narrows a part index to the int32 the column stores. Truncating
 // instead would alias a client-chosen index onto a different part's row.
@@ -39,7 +48,9 @@ func partIndexOf(i int) (int32, bool) {
 
 // SaveUploadPart writes one part of an in-flight upload, enforcing the per-file
 // and per-user byte caps. maxFileBytes is the per-file cap; the per-user
-// outstanding cap is twice that, which is two concurrent max-size uploads.
+// outstanding cap is twice that, which is two concurrent max-size uploads. The
+// same outstanding set is capped by row count, because a row costs more than
+// its payload in index and WAL and a 1-byte part pays almost nothing for one.
 //
 // Ordering, and why the caps are checked AFTER the write: the sums are read
 // back inside the same transaction as the upsert, so what they measure is the
@@ -91,12 +102,16 @@ func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIn
 		return ErrFileTooLarge
 	}
 
-	userBytes, err := qtx.UserOutstandingBytes(ctx, userID)
+	user, err := qtx.UserOutstanding(ctx, userID)
 	if err != nil {
-		return fmt.Errorf("user outstanding bytes: %w", err)
+		return fmt.Errorf("user outstanding: %w", err)
 	}
-	if userBytes > 2*maxFileBytes {
+	if user.TotalBytes > 2*maxFileBytes {
 		return ErrUploadQuota
+	}
+	maxParts := 2 * ((maxFileBytes + MinPartBytesForRowCap - 1) / MinPartBytesForRowCap)
+	if user.Parts > maxParts {
+		return ErrTooManyParts
 	}
 
 	if err = tx.Commit(ctx); err != nil {

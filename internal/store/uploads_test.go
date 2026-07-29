@@ -154,6 +154,95 @@ func TestSaveUploadPartUserQuota(t *testing.T) {
 	}
 }
 
+// A row costs far more than a 1-byte payload, so the byte cap alone lets a
+// client hold ~2*maxFileBytes rows. rowCapFile is small enough that the row cap
+// binds first: at 1 byte a part, 2*maxFileBytes+1 parts would be needed to trip
+// the byte cap and only rowCapParts+1 to trip the row cap.
+const (
+	rowCapFile  = 3 * store.MinPartBytesForRowCap
+	rowCapParts = 2 * (rowCapFile / store.MinPartBytesForRowCap)
+)
+
+func TestSaveUploadPartRowCap(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000011")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	for i := range rowCapParts {
+		if err := s.SaveUploadPart(ctx, u.ID, 1, i, part('a', 1), rowCapFile); err != nil {
+			t.Fatalf("save part %d: %v", i, err)
+		}
+	}
+	err = s.SaveUploadPart(ctx, u.ID, 1, rowCapParts, part('a', 1), rowCapFile)
+	if !errors.Is(err, store.ErrTooManyParts) {
+		t.Fatalf("over row cap: %v", err)
+	}
+
+	parts, _, _, err := s.UploadPartsSummary(ctx, u.ID, 1)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if parts != rowCapParts {
+		t.Fatalf("row cap rollback failed: parts=%d, want %d", parts, rowCapParts)
+	}
+}
+
+// The point of MinPartBytesForRowCap: a client using ordinary part sizes must
+// hit the byte cap, never the row cap.
+func TestSaveUploadPartRowCapNoFalsePositive(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000012")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	// Three parts a file keeps every file exactly at the per-file cap, so the
+	// only caps left in play are the per-user ones.
+	const perFile = rowCapFile / store.MinPartBytesForRowCap
+	for i := 0; ; i++ {
+		err = s.SaveUploadPart(ctx, u.ID, int64(i/perFile), i%perFile, part('a', store.MinPartBytesForRowCap), rowCapFile)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, store.ErrUploadQuota) {
+			t.Fatalf("save part %d: got %v, want ErrUploadQuota", i, err)
+		}
+		break
+	}
+}
+
+func TestUploadRowCapIsPerUser(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a, err := s.CreateUser(ctx, "+15559000013")
+	if err != nil {
+		t.Fatalf("create user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15559000014")
+	if err != nil {
+		t.Fatalf("create user b: %v", err)
+	}
+
+	for i := range rowCapParts {
+		if err := s.SaveUploadPart(ctx, a.ID, 1, i, part('a', 1), rowCapFile); err != nil {
+			t.Fatalf("save a part %d: %v", i, err)
+		}
+	}
+	if err := s.SaveUploadPart(ctx, a.ID, 1, rowCapParts, part('a', 1), rowCapFile); !errors.Is(err, store.ErrTooManyParts) {
+		t.Fatalf("a over row cap: %v", err)
+	}
+	if err := s.SaveUploadPart(ctx, b.ID, 1, 0, part('b', 1), rowCapFile); err != nil {
+		t.Fatalf("b blocked by a: %v", err)
+	}
+}
+
 // Two accounts naming the same client-chosen file_id must not see each other's
 // bytes: user_id is part of the primary key and of every lookup.
 func TestUploadPartsIsolatedPerUser(t *testing.T) {
