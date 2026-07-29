@@ -23,6 +23,11 @@ import (
 // JoinChannelByInvite takes it and holds it to commit, which is what makes the
 // pts it records and the counts the caps are decided on the same snapshot the
 // insert lands in.
+//
+// The rights mutations — SetChannelRole, SetChannelBan and LeaveChannel — take
+// the channels row lock instead (LockChannel), first and held to commit, and
+// take nothing else. Nothing anywhere takes the channel_state row and then the
+// channels row, or the reverse, so the two cannot form a cycle.
 
 // defaultMaxChannelParticipants and defaultMaxChannelsPerUser are the bounds
 // recorded in the M7 migration. They seed the per-Store fields of the same name
@@ -56,6 +61,13 @@ type Channel struct {
 	Version   int
 	Date      time.Time
 }
+
+// Participant roles, as recorded in the M7 migration.
+const (
+	channelRoleMember  = 0
+	channelRoleAdmin   = 1
+	channelRoleCreator = 2
+)
 
 // ChannelMember is one participant row of a channel.
 type ChannelMember struct {
@@ -338,17 +350,236 @@ func (s *Store) JoinChannelByInvite(ctx context.Context, hash string, userID int
 	return channelFromRow(channel), channelMemberFromRow(member), nil
 }
 
+// beginChannelMutation opens the transaction SetChannelRole and SetChannelBan
+// share: the channels row lock first, then the caller's and the target's
+// participant rows read under it. Every rejection it can reach is ErrNotMember,
+// and it returns the transaction still open, so the caller's rights check and its
+// write land in the same transaction as these reads. The check has to be in that
+// transaction or two concurrent calls interleave and an admin being demoted
+// commits a promotion — the same obligation beginChatMutation discharges for
+// chats and fanout.go:118 for the fan-out.
+//
+// On any error the transaction is already rolled back; on success the caller owns
+// it and must roll back or commit.
+func (s *Store) beginChannelMutation(
+	ctx context.Context, channelID, callerID, targetID int64,
+) (pgx.Tx, *db.Queries, db.ChannelParticipant, db.ChannelParticipant, error) {
+	var none db.ChannelParticipant
+
+	// Self as target is rejected on both methods unconditionally: LeaveChannel is
+	// the only self-directed membership change.
+	if callerID == targetID {
+		return nil, nil, none, none, ErrNotMember
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, none, none, fmt.Errorf("begin: %w", err)
+	}
+	qtx := s.q.WithTx(tx)
+	fail := func(e error) (pgx.Tx, *db.Queries, db.ChannelParticipant, db.ChannelParticipant, error) {
+		_ = tx.Rollback(ctx) //nolint:errcheck // best effort on the error path
+		return nil, nil, none, none, e
+	}
+
+	if _, err = qtx.LockChannel(ctx, channelID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fail(ErrNotMember)
+		}
+		return fail(fmt.Errorf("lock channel: %w", err))
+	}
+
+	caller, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID, UserID: callerID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return fail(ErrNotMember)
+	case err != nil:
+		return fail(fmt.Errorf("caller participant: %w", err))
+	}
+
+	// A banned caller has no rights at all, whatever their role. G3 does not list
+	// the case, so it fails closed: an admin banned by the creator would otherwise
+	// keep banning members, and their row survives LeaveChannel. The creator cannot
+	// be banned by anyone, so this cannot leave a channel with nobody able to grant
+	// rights.
+	if channelMemberFromRow(caller).Banned(time.Now()) {
+		return fail(ErrNotMember)
+	}
+
+	// The target must already hold a row. Neither method may create one — that is
+	// the push primitive re-entering through the side door.
+	target, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID, UserID: targetID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return fail(ErrNotMember)
+	case err != nil:
+		return fail(fmt.Errorf("target participant: %w", err))
+	}
+	return tx, qtx, caller, target, nil
+}
+
+// The G3 rule set, fixed by the M7 threat model (MAIN-82). SetChannelRole and
+// SetChannelBan implement it and nothing else: anything not listed fails closed.
+//
+//   - Creator (role 2): may promote a member to admin; may demote an admin to
+//     member; may ban or unban a member or an admin. Cannot be demoted or banned
+//     by anyone, including themselves. Cannot demote themselves — M7 has no
+//     ownership transfer, so it would leave the channel with nobody able to grant
+//     rights.
+//   - Admin (role 1): may ban and unban role-0 members only. May NOT promote
+//     anyone, may not demote anyone, may not ban or unban another admin, may not
+//     touch the creator.
+//   - Member (role 0): no rights on either method.
+//   - Self as target is rejected on both methods unconditionally. LeaveChannel is
+//     the only self-directed membership change.
+//   - The target must already have a channel_participants row. Neither method may
+//     create one.
+//   - role accepts only 0 and 1. Role 2 is never assignable, and a role the
+//     target already holds is not a listed transition either.
+//   - A currently-banned caller has no rights on either method, whatever their
+//     role.
+//
+// Every rejection — no such channel, caller not a member, target not a member,
+// insufficient rights — is the SAME error, ErrNotMember. Channel ids are dense
+// BIGSERIAL; a distinct not-found makes them enumerable. See
+// internal/api/chatusers.go:35 for the reasoning and the pattern.
+
+// SetChannelRole sets targetID's role in the channel, under the G3 rule set
+// above and in one transaction holding the channels row lock.
+func (s *Store) SetChannelRole(ctx context.Context, channelID, callerID, targetID int64, role int) error {
+	if role != channelRoleMember && role != channelRoleAdmin {
+		return ErrNotMember
+	}
+	tx, qtx, caller, target, err := s.beginChannelMutation(ctx, channelID, callerID, targetID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	// Only the creator grants or revokes rights, and the creator is never a target.
+	// G3 lists two transitions and no more, so a no-op — member to member, admin to
+	// admin — is unlisted and fails closed like anything else.
+	if caller.Role != channelRoleCreator || target.Role == channelRoleCreator || int(target.Role) == role {
+		return ErrNotMember
+	}
+
+	n, err := qtx.UpdateChannelParticipantRole(ctx, db.UpdateChannelParticipantRoleParams{
+		ChannelID: channelID, UserID: targetID, Role: int16(role), //nolint:gosec // role is 0 or 1 here
+	})
+	if err != nil {
+		return fmt.Errorf("update channel participant role: %w", err)
+	}
+	if n == 0 {
+		return ErrNotMember
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// SetChannelBan bans or unbans targetID, under the G3 rule set above and in one
+// transaction holding the channels row lock. forever writes 'infinity'; until ==
+// nil with forever false clears the ban; otherwise the timestamp is written.
+//
+// There is no second ban predicate: reads keep deciding on ChannelMember.Banned.
+func (s *Store) SetChannelBan(
+	ctx context.Context, channelID, callerID, targetID int64, until *time.Time, forever bool,
+) error {
+	tx, qtx, caller, target, err := s.beginChannelMutation(ctx, channelID, callerID, targetID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	switch {
+	case target.Role == channelRoleCreator:
+		// The creator is untouchable, whoever asks.
+		return ErrNotMember
+	case caller.Role == channelRoleCreator:
+		// May ban or unban a member or an admin.
+	case caller.Role == channelRoleAdmin && target.Role == channelRoleMember:
+		// An admin reaches role-0 members and nothing else.
+	default:
+		return ErrNotMember
+	}
+
+	var banned pgtype.Timestamptz
+	switch {
+	case forever:
+		banned = pgtype.Timestamptz{InfinityModifier: pgtype.Infinity, Valid: true}
+	case until != nil:
+		banned = pgtype.Timestamptz{Time: *until, Valid: true}
+	}
+
+	n, err := qtx.UpdateChannelParticipantBan(ctx, db.UpdateChannelParticipantBanParams{
+		ChannelID: channelID, UserID: targetID, BannedUntil: banned,
+	})
+	if err != nil {
+		return fmt.Errorf("update channel participant ban: %w", err)
+	}
+	if n == 0 {
+		return ErrNotMember
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
 // LeaveChannel deletes userID's participant row; left=false means there was
 // none. The creator leaving is allowed here — whether the RPC permits it is the
 // handler's call, not this layer's.
+//
+// A currently-banned row is NOT deleted: banned_until lives on the participant
+// row, so deleting it would let a banned member leave, re-join on the same invite
+// hash and come back unbanned with a fresh join_pts. The caller still sees a
+// normal leave (left = true) and the row stays, so JoinChannelByInvite's
+// "row already present" branch returns the banned row on re-join. A banned row
+// still counts against the participant cap; that is deliberate and conservative.
+//
+// The channels row lock is taken first and held to commit, so the read that
+// decides and the delete are one snapshot.
 func (s *Store) LeaveChannel(ctx context.Context, channelID, userID int64) (bool, error) {
-	n, err := s.q.DeleteChannelParticipant(ctx, db.DeleteChannelParticipantParams{
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	if _, err = qtx.LockChannel(ctx, channelID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lock channel: %w", err)
+	}
+
+	row, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
 		ChannelID: channelID, UserID: userID,
 	})
-	if err != nil {
-		return false, fmt.Errorf("delete channel participant: %w", err)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("channel participant: %w", err)
 	}
-	return n > 0, nil
+
+	if !channelMemberFromRow(row).Banned(time.Now()) {
+		if _, err = qtx.DeleteChannelParticipant(ctx, db.DeleteChannelParticipantParams{
+			ChannelID: channelID, UserID: userID,
+		}); err != nil {
+			return false, fmt.Errorf("delete channel participant: %w", err)
+		}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return true, nil
 }
 
 // ChannelsForUser returns every channel the user holds a participant row in.

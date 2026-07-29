@@ -7,6 +7,8 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const channelByID = `-- name: ChannelByID :one
@@ -301,4 +303,68 @@ INSERT INTO channel_state (channel_id) VALUES ($1)
 func (q *Queries) InsertChannelState(ctx context.Context, channelID int64) error {
 	_, err := q.db.Exec(ctx, insertChannelState, channelID)
 	return err
+}
+
+const lockChannel = `-- name: LockChannel :one
+SELECT id, title, about, creator_id, megagroup, version, date FROM channels WHERE id = $1 FOR UPDATE
+`
+
+// LockChannel takes the channels row lock that serialises the rights mutations:
+// the caller's and the target's participant rows are read under it and the write
+// lands under it, so a demotion cannot interleave with the promotion it revokes.
+// See the lock-order comment at the top of channels.go.
+func (q *Queries) LockChannel(ctx context.Context, id int64) (Channel, error) {
+	row := q.db.QueryRow(ctx, lockChannel, id)
+	var i Channel
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.About,
+		&i.CreatorID,
+		&i.Megagroup,
+		&i.Version,
+		&i.Date,
+	)
+	return i, err
+}
+
+const updateChannelParticipantBan = `-- name: UpdateChannelParticipantBan :execrows
+UPDATE channel_participants SET banned_until = $3 WHERE channel_id = $1 AND user_id = $2
+`
+
+type UpdateChannelParticipantBanParams struct {
+	ChannelID   int64
+	UserID      int64
+	BannedUntil pgtype.Timestamptz
+}
+
+// banned_until takes SQL NULL to unban and 'infinity' for a permanent ban, so
+// the parameter is a pgtype.Timestamptz — the same type the column decodes into.
+func (q *Queries) UpdateChannelParticipantBan(ctx context.Context, arg UpdateChannelParticipantBanParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateChannelParticipantBan, arg.ChannelID, arg.UserID, arg.BannedUntil)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateChannelParticipantRole = `-- name: UpdateChannelParticipantRole :execrows
+UPDATE channel_participants SET role = $3 WHERE channel_id = $1 AND user_id = $2
+`
+
+type UpdateChannelParticipantRoleParams struct {
+	ChannelID int64
+	UserID    int64
+	Role      int16
+}
+
+// UpdateChannelParticipantRole and UpdateChannelParticipantBan only ever update:
+// neither may create a participant row, so 0 rows affected means the target is
+// not a member and the caller rejects.
+func (q *Queries) UpdateChannelParticipantRole(ctx context.Context, arg UpdateChannelParticipantRoleParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateChannelParticipantRole, arg.ChannelID, arg.UserID, arg.Role)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
