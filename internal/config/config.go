@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
 )
@@ -29,7 +30,22 @@ type Config struct {
 	// process output, and the code alone signs in any account that has no
 	// 2FA cloud password — one with a password still needs the SRP step.
 	LogLoginCodes bool
+	// MaxFileBytes caps one uploaded file. A user's outstanding unassembled
+	// bytes are capped at twice this, which is two concurrent max-size uploads.
+	MaxFileBytes int64
+	// UploadPartTTL is how long an unassembled upload part is kept before the
+	// sweeper deletes it. Short on purpose: a real client uploads and sends
+	// within minutes, and the TTL is the term that makes worst-case retained
+	// bytes finite at accounts x cap.
+	UploadPartTTL time.Duration
 }
+
+// MaxFileBytesLimit is the ceiling on TG_MAX_FILE_BYTES. It is a bound on the
+// arithmetic, not a product decision: the derived part count rounds up by the
+// part size and the per-user cap doubles the per-file one, so a value near
+// MaxInt64 overflows both and turns every save into a rejection. 1 TiB is far
+// past any file a client can upload and leaves both terms in range.
+const MaxFileBytesLimit int64 = 1 << 40
 
 // Load reads configuration from environment variables, applying defaults.
 func Load() (Config, error) {
@@ -38,6 +54,9 @@ func Load() (Config, error) {
 		PostgresDSN: os.Getenv("TG_POSTGRES_DSN"),
 		RSAKeyPath:  envOr("TG_RSA_KEY_PATH", "server_key.pem"),
 		DCID:        2,
+
+		MaxFileBytes:  100 << 20,
+		UploadPartTTL: 6 * time.Hour,
 	}
 	if v := os.Getenv("TG_DC_ID"); v != "" {
 		id, err := strconv.Atoi(v)
@@ -45,6 +64,29 @@ func Load() (Config, error) {
 			return Config{}, errors.New("TG_DC_ID must be an integer")
 		}
 		cfg.DCID = id
+	}
+	if v := os.Getenv("TG_MAX_FILE_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return Config{}, errors.New("TG_MAX_FILE_BYTES must be an integer")
+		}
+		if n <= 0 {
+			return Config{}, errors.New("TG_MAX_FILE_BYTES must be positive")
+		}
+		if n > MaxFileBytesLimit {
+			return Config{}, errors.New("TG_MAX_FILE_BYTES must be at most 1099511627776")
+		}
+		cfg.MaxFileBytes = n
+	}
+	if v := os.Getenv("TG_UPLOAD_PART_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_UPLOAD_PART_TTL must be a duration")
+		}
+		if d <= 0 {
+			return Config{}, errors.New("TG_UPLOAD_PART_TTL must be positive")
+		}
+		cfg.UploadPartTTL = d
 	}
 	if v := os.Getenv("TG_LOG_LOGIN_CODES"); v != "" {
 		on, err := strconv.ParseBool(v)

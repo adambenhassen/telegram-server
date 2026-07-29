@@ -45,4 +45,14 @@ var (
 	errMessageEmpty = rpcErr(400, "MESSAGE_EMPTY")
 	// errUsersTooMuch rejects a chat that would exceed the participant limit.
 	errUsersTooMuch = rpcErr(400, "USERS_TOO_MUCH")
+	// errFilePartInvalid rejects a part index that is negative or past the
+	// per-file maximum, and a zero file id.
+	errFilePartInvalid = rpcErr(400, "FILE_PART_INVALID")
+	// errFilePartTooBig rejects a part over the 512 KiB protocol maximum, and a
+	// file whose parts would exceed TG_MAX_FILE_BYTES.
+	errFilePartTooBig = rpcErr(400, "FILE_PART_TOO_BIG")
+	// errStorageQuota rejects an upload that would take the account past its
+	// outstanding-bytes cap. FLOOD_WAIT is the closest Telegram signal: the
+	// condition clears on its own once the account assembles or its parts expire.
+	errStorageQuota = rpcErr(420, "FLOOD_WAIT_60")
 )
