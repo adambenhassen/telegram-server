@@ -97,7 +97,10 @@ func (s *Store) AllocateFile(ctx context.Context, uploaderID, size int64, mimeTy
 	if err != nil {
 		return File{}, fmt.Errorf("user stored bytes: %w", err)
 	}
-	if used+size > maxUserBytes {
+	// Written as a subtraction rather than used+size so a size near MaxInt64
+	// cannot wrap the sum negative and be admitted. size > 0 is rejected above
+	// and maxUserBytes is config-side and non-negative, so this is exact.
+	if size > maxUserBytes || used > maxUserBytes-size {
 		return File{}, ErrStorageQuota
 	}
 

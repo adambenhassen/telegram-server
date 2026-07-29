@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -60,9 +61,18 @@ func TestAllocateFileEnforcesStorageQuota(t *testing.T) {
 	if _, err := s.AllocateFile(ctx, u.ID, 41, "text/plain", "b.txt", quota); !errors.Is(err, store.ErrStorageQuota) {
 		t.Fatalf("over quota: want ErrStorageQuota, got %v", err)
 	}
-	// The rejected allocation inserted nothing.
+	// A size that would wrap the signed sum negative is still over quota, not
+	// under it.
+	if _, err := s.AllocateFile(ctx, u.ID, math.MaxInt64, "text/plain", "huge.txt", quota); !errors.Is(err, store.ErrStorageQuota) {
+		t.Fatalf("overflowing size: want ErrStorageQuota, got %v", err)
+	}
+	// Neither rejection inserted a row: the exact remaining 40 bytes still fit,
+	// which they would not if 41 or MaxInt64 had been recorded.
 	if _, err := s.AllocateFile(ctx, u.ID, 40, "text/plain", "c.txt", quota); err != nil {
 		t.Fatalf("at quota after rejection: %v", err)
+	}
+	if _, err := s.AllocateFile(ctx, u.ID, 1, "text/plain", "d.txt", quota); !errors.Is(err, store.ErrStorageQuota) {
+		t.Fatalf("full quota: want ErrStorageQuota, got %v", err)
 	}
 }
 
