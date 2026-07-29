@@ -160,8 +160,9 @@ jobs:
         run: docker rm -f telegramd
 
   # Brings the compose stack up the way a developer does, then restarts it to
-  # prove the two named volumes carry the state that matters: the database rows
-  # and the RSA identity. Docker is not available in the environments
+  # prove the three named volumes carry the state that matters: the database
+  # rows, the RSA identity, and the uploaded file bodies. Docker is not
+  # available in the environments
   # docker-compose.yml is edited from, so this job is the only place it ever
   # runs — the gate that stops it rotting.
   compose:
@@ -194,7 +195,7 @@ jobs:
             exit 1
           fi
 
-      - name: Boot, restart, and check both volumes survived
+      - name: Boot, restart, and check all three volumes survived
         run: |
           # `docker compose logs` returns the logs of exited containers too, so a
           # server that printed msg=listening and then died still matches. Every
@@ -233,6 +234,47 @@ jobs:
             docker compose logs telegramd | sed -n 's/.*fingerprint=\(-\?[0-9]\+\).*/\1/p' | head -1
           }
 
+          # Prints the name of the named volume mounted at whatever TG_BLOB_DIR
+          # the running container actually resolved to, and fails if there is
+          # none. Reading the variable back out of the container rather than
+          # hardcoding the path is what makes this catch the silent case: a
+          # TG_BLOB_DIR pointing at some path with no volume under it leaves
+          # uploads in the writable layer while the stack still boots green.
+          #
+          # Diagnostics go to stderr: the caller captures stdout, so a failure
+          # message written there would be swallowed instead of logged.
+          blob_volume() {
+            cid=$(docker compose ps -q telegramd)
+            [ -n "$cid" ] || { echo "no telegramd container to inspect ($1)" >&2; return 1; }
+
+            dir=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+              | sed -n 's/^TG_BLOB_DIR=//p' | head -1)
+            if [ -z "$dir" ]; then
+              echo "telegramd has no TG_BLOB_DIR in its environment ($1)" >&2
+              return 1
+            fi
+
+            vol=$(docker inspect "$cid" \
+              --format '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "'"$dir"'")}}{{.Name}}{{end}}{{end}}')
+            if [ -z "$vol" ]; then
+              docker inspect "$cid" --format '{{json .Mounts}}' >&2
+              echo "TG_BLOB_DIR=$dir is not a named volume: uploaded files would die with the container ($1)" >&2
+              return 1
+            fi
+            echo "$vol"
+          }
+
+          # telegramd is distroless and has no shell, so `docker compose exec`
+          # cannot touch the volume. A throwaway busybox mounting the same named
+          # volume can, and it is the volume that is under test either way.
+          blob_write() {
+            docker run --rm -v "$1":/blobs busybox:1.37 sh -c 'echo canary > /blobs/ci_canary'
+          }
+
+          blob_read() {
+            docker run --rm -v "$1":/blobs busybox:1.37 cat /blobs/ci_canary
+          }
+
           docker compose up -d --build
           wait_listening
           docker compose logs telegramd
@@ -258,6 +300,13 @@ jobs:
           docker compose exec -T postgres psql -U postgres -d telegram \
             -c 'CREATE TABLE ci_marker (id int primary key); INSERT INTO ci_marker VALUES (1);'
 
+          # Same reasoning as ci_marker: the directory existing proves nothing,
+          # because the image creates it and telegramd would too. A file written
+          # by hand only comes back if the volume itself came back.
+          blobs=$(blob_volume "first boot") || exit 1
+          echo "blob volume=$blobs"
+          blob_write "$blobs"
+
           # Without -v, which is the entire point of the test.
           docker compose down
           docker compose up -d
@@ -266,6 +315,17 @@ jobs:
 
           docker compose exec -T postgres psql -U postgres -d telegram -tAc 'SELECT id FROM ci_marker' \
             | grep -qx 1 || { echo "pgdata did not survive docker compose down"; exit 1; }
+
+          # A second boot on a fresh anonymous volume would also have a blob
+          # directory, so the name has to match, not just the mount exist.
+          blobs_after=$(blob_volume "second boot") || exit 1
+          [ "$blobs" = "$blobs_after" ] || { echo "blob volume changed: $blobs -> $blobs_after"; exit 1; }
+
+          # Content, not existence: the directory is recreated on every boot.
+          # No pipe here on purpose — a failing `docker run` must fail the step
+          # rather than feed an empty string to a grep that then decides.
+          canary=$(blob_read "$blobs")
+          [ "$canary" = canary ] || { echo "blob volume did not survive docker compose down: read '$canary'"; exit 1; }
 
           after=$(fingerprint)
           echo "second boot fingerprint=$after"
