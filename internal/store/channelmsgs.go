@@ -133,6 +133,19 @@ func (s *Store) postChannelMessage(
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
+	// Early reject, ahead of EnsureChannelState. It decides nothing — the
+	// authoritative check is the identical call under the row lock below — but
+	// channel_state.channel_id REFERENCES channels (id), so letting a caller with
+	// no rights reach the insert turns a channel that does not exist into an FK
+	// error instead of ErrNotMember, and that distinct error is exactly the
+	// existence oracle the one-error rule closes. Same shape as the fan-out's
+	// pre-lock IsChatMember reject in fanout.go.
+	if checkRights {
+		if err = checkPostRights(ctx, qtx, channelID, fromID); err != nil {
+			return ChannelMessage{}, 0, false, err
+		}
+	}
+
 	if err = qtx.EnsureChannelState(ctx, channelID); err != nil {
 		return ChannelMessage{}, 0, false, fmt.Errorf("ensure channel state: %w", err)
 	}
@@ -141,8 +154,9 @@ func (s *Store) postChannelMessage(
 		return ChannelMessage{}, 0, false, fmt.Errorf("lock channel state: %w", err)
 	}
 
-	// Under the row lock taken above, before the dedup read and before any write:
-	// a caller with no right to post here must not be able to probe random_ids
+	// The authoritative check: under the row lock taken above, before the dedup
+	// read and before any write, so a ban committing concurrently is seen. A
+	// caller with no right to post here must not be able to probe random_ids
 	// either.
 	if checkRights {
 		if err = checkPostRights(ctx, qtx, channelID, fromID); err != nil {

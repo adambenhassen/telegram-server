@@ -439,3 +439,40 @@ func TestPostChannelMessageAsAllowsLapsedBan(t *testing.T) {
 
 	postAs(t, s, ch.ID, member.ID, "back", 1)
 }
+
+func TestPostChannelMessageAsRejectsPermanentBan(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551260741")
+	member := mustUser(t, s, "+15551260742")
+	ch := mustMegagroup(t, s, creator.ID, "chat")
+	seat(t, s, ch, creator.ID, member.ID, 0)
+
+	// banned_until = 'infinity' decodes through its own path (bannedForever); a
+	// permanent ban is the one the check must never let through.
+	if err := store.SetChannelBanInfinite(ctx, s, ch.ID, member.ID); err != nil {
+		t.Fatalf("ban forever: %v", err)
+	}
+
+	refusedAs(t, s, ch.ID, member.ID, 1)
+}
+
+func TestPostChannelMessageAsHidesUnknownChannel(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	user := mustUser(t, s, "+15551260751")
+	ch := mustChannel(t, s, user.ID, "news")
+
+	// A channel id with no row must return the same ErrNotMember as a channel the
+	// caller is not in, not the channel_state foreign-key error that would say the
+	// id is free.
+	missing := ch.ID + 1_000_000
+	if _, _, _, err := s.PostChannelMessageAs(ctx, missing, user.ID, "nope", 1, nil); !errors.Is(err, store.ErrNotMember) {
+		t.Fatalf("post to unknown channel = %v, want ErrNotMember", err)
+	}
+	if pts, err := s.ChannelState(ctx, missing); err != nil || pts != 0 {
+		t.Fatalf("unknown channel state = %d, err %v; want 0", pts, err)
+	}
+}
