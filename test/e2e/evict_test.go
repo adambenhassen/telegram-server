@@ -143,8 +143,9 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 	go func() {
 		errB <- runInteractive(ctx, newClient(port2, newUpdateCollector()), flowFor(phoneB), bID, bCmds)
 	}()
+	var bUserID int64
 	select {
-	case <-bID:
+	case bUserID = <-bID:
 	case <-time.After(30 * time.Second):
 		t.Fatal("client B login timeout")
 	}
@@ -177,7 +178,7 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 	select {
 	case bCmds <- command{fn: func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerUser{UserID: aUserID, AccessHash: aUserID},
+			Peer:     peerUser(bUserID, aUserID),
 			Message:  "after revocation",
 			RandomID: 30001,
 		})

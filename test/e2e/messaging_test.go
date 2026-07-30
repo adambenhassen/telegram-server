@@ -203,7 +203,7 @@ func bootServerWithRegistry(t *testing.T, ctx context.Context, key *rsa.PrivateK
 	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver())
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
-	updater := api.NewUpdater(st, server.Registry(), log)
+	updater := api.NewUpdater(st, server.Registry(), log, pgtest.PeerDeriver())
 	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, log)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
@@ -342,8 +342,8 @@ func TestMessagingRealtime(t *testing.T) {
 		return <-d
 	}
 
-	peerB := &tg.InputPeerUser{UserID: bUserID, AccessHash: bUserID}
-	peerA := &tg.InputPeerUser{UserID: aUserID, AccessHash: aUserID}
+	peerB := peerUser(aUserID, bUserID)
+	peerA := peerUser(bUserID, aUserID)
 
 	// 1. Real-time proof: A sends, B receives updateNewMessage live.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -505,13 +505,19 @@ func TestMessagingOfflineBackfill(t *testing.T) {
 	}
 
 	// A logs in and sends to the now-offline B.
+	var aUserID int64
 	aClient := newClient(sessA)
 	if err := aClient.Run(ctx, func(ctx context.Context) error {
 		if err := aClient.Auth().IfNecessary(ctx, flowFor(phoneA)); err != nil {
 			return err
 		}
-		_, err := aClient.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerUser{UserID: bUserID, AccessHash: bUserID},
+		self, err := aClient.Self(ctx)
+		if err != nil {
+			return err
+		}
+		aUserID = self.ID
+		_, err = aClient.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:     peerUser(aUserID, bUserID),
 			Message:  "sent while offline",
 			RandomID: 55555,
 		})
@@ -616,13 +622,19 @@ func TestMessagingCrossReplica(t *testing.T) {
 	}
 
 	// A connects to server 1 and sends to B.
+	var aUserID int64
 	aClient := newClient(port1, newUpdateCollector())
 	if err := aClient.Run(ctx, func(ctx context.Context) error {
 		if err := aClient.Auth().IfNecessary(ctx, flowFor(phoneA)); err != nil {
 			return err
 		}
-		_, err := aClient.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerUser{UserID: bUserID, AccessHash: bUserID},
+		self, err := aClient.Self(ctx)
+		if err != nil {
+			return err
+		}
+		aUserID = self.ID
+		_, err = aClient.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:     peerUser(aUserID, bUserID),
 			Message:  "across replicas",
 			RandomID: 77777,
 		})

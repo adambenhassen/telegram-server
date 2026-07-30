@@ -10,6 +10,8 @@ import (
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -44,6 +46,7 @@ func testHandlers(s *store.Store) *handlers {
 		log:          slog.New(slog.DiscardHandler),
 		maxFileBytes: TestMaxFileBytes,
 		downloads:    map[int64]bool{},
+		peers:        pgtest.PeerDeriver(),
 	}
 }
 
@@ -130,17 +133,43 @@ func GetStateForTest(s *store.Store, userID int64) (bin.Encoder, error) {
 }
 
 // PeerUserID exposes the peer-resolution guard for the external api_test package.
-var PeerUserID = peerUserID
+// Uses the test deriver from pgtest.
+func PeerUserID(peer tg.InputPeerClass, viewerID int64) (int64, error) {
+	return testHandlers(nil).peerUserID(peer, viewerID)
+}
 
 // Peer-resolution and wire-mapping helpers, exposed for the external api_test
-// package. All of them are pure and need no store.
+// package. PeerToTL, ChatToTL and ChannelToTL are pure and need no store.
+// InputPeer and InputUserID use the test deriver from pgtest.
 var (
-	InputPeer   = inputPeer
-	InputUserID = inputUserID
 	PeerToTL    = peerToTL
 	ChatToTL    = chatToTL
 	ChannelToTL = channelToTL
 )
+
+func InputPeer(peer tg.InputPeerClass, viewerID int64) (store.PeerType, int64, error) {
+	return testHandlers(nil).inputPeer(peer, viewerID)
+}
+
+func InputUserID(u tg.InputUserClass, viewerID int64) (int64, error) {
+	return testHandlers(nil).inputUserID(u, viewerID)
+}
+
+// DeriveUserHash returns the access_hash viewerID carries for peerID, using the
+// test deriver. Tests use it to construct valid input peers.
+func DeriveUserHash(viewerID, peerID int64) int64 {
+	return pgtest.PeerDeriver().Derive(viewerID, peerhash.KindUser, peerID)
+}
+
+// InputPeerUser builds a valid InputPeerUser for peerID as seen by viewerID.
+func InputPeerUser(viewerID, peerID int64) *tg.InputPeerUser {
+	return &tg.InputPeerUser{UserID: peerID, AccessHash: DeriveUserHash(viewerID, peerID)}
+}
+
+// InputUser builds a valid InputUser for peerID as seen by viewerID.
+func InputUser(viewerID, peerID int64) *tg.InputUser {
+	return &tg.InputUser{UserID: peerID, AccessHash: DeriveUserHash(viewerID, peerID)}
+}
 
 // MessageToTL maps a media-free row, which is every row a pure mapper test
 // builds by hand. Media is hydrated from the store, so it is asserted through

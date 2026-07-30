@@ -132,7 +132,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	if !validText(req.Message) {
 		return nil, errMessageEmpty
 	}
-	peerType, toID, err := inputPeer(req.Peer)
+	peerType, toID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
 		return nil, err
 	}

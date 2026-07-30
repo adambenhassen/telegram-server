@@ -46,7 +46,7 @@ func chatTitle(raw string) (string, error) {
 // client bug rather than a fact about an account.
 func (h *handlers) resolveInvitees(ctx context.Context, users []tg.InputUserClass, selfID int64) (members []int64, missing []tg.MissingInvitee, err error) {
 	for _, u := range users {
-		id, err := inputUserID(u, selfID)
+		id, err := h.inputUserID(u, selfID)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -363,6 +363,7 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 			return 0
 		}
 	}
+	aUserID := login(aID, "A")
 	bUserID := login(bID, "B")
 
 	// A creates broadcast channel, B joins.
@@ -384,7 +385,7 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsEditAdmin(ctx, &tg.ChannelsEditAdminRequest{
 			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
-			UserID:  &tg.InputUser{UserID: bUserID, AccessHash: bUserID},
+			UserID:  inputUser(aUserID, bUserID),
 			AdminRights: tg.ChatAdminRights{
 				PostMessages: true,
 			},
@@ -889,7 +890,7 @@ func TestChannelsBan(t *testing.T) {
 			return 0
 		}
 	}
-	login(aID, "A")
+	aUserID := login(aID, "A")
 	bUserID := login(bID, "B")
 
 	// A creates broadcast channel. B joins via invite.
@@ -919,7 +920,7 @@ func TestChannelsBan(t *testing.T) {
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
 			Channel:     &tg.InputChannel{ChannelID: chID, AccessHash: chID},
-			Participant: &tg.InputPeerUser{UserID: bUserID, AccessHash: bUserID},
+			Participant: peerUser(aUserID, bUserID),
 			BannedRights: tg.ChatBannedRights{
 				ViewMessages: true,
 				UntilDate:    0,
@@ -969,7 +970,7 @@ func TestChannelsBan(t *testing.T) {
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
 			Channel:      &tg.InputChannel{ChannelID: chID, AccessHash: chID},
-			Participant:  &tg.InputPeerUser{UserID: bUserID, AccessHash: bUserID},
+			Participant:  peerUser(aUserID, bUserID),
 			BannedRights: tg.ChatBannedRights{},
 		})
 		return err

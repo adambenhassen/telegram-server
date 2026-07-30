@@ -20,9 +20,16 @@ import (
 func TestPeerUserIDValidatesAccessHash(t *testing.T) {
 	t.Parallel()
 
-	id, err := api.PeerUserID(&tg.InputPeerUser{UserID: 5, AccessHash: 5})
+	// Derived hash for (viewer=5, peer=5) is the valid hash.
+	peer := api.InputPeerUser(5, 5)
+	id, err := api.PeerUserID(peer, 5)
 	if err != nil || id != 5 {
 		t.Fatalf("valid peer: id=%d err=%v", id, err)
+	}
+
+	// access_hash == user_id (M1 placeholder) must be rejected.
+	if _, err := api.PeerUserID(&tg.InputPeerUser{UserID: 5, AccessHash: 5}, 5); err == nil {
+		t.Error("M1 placeholder: expected PEER_ID_INVALID, got nil")
 	}
 
 	for name, peer := range map[string]tg.InputPeerClass{
@@ -31,7 +38,7 @@ func TestPeerUserIDValidatesAccessHash(t *testing.T) {
 		"self":       &tg.InputPeerSelf{},
 		"chat":       &tg.InputPeerChat{ChatID: 1},
 	} {
-		if _, err := api.PeerUserID(peer); err == nil {
+		if _, err := api.PeerUserID(peer, 5); err == nil {
 			t.Errorf("%s: expected PEER_ID_INVALID, got nil", name)
 		}
 	}
@@ -75,7 +82,7 @@ func TestHandleSendMessagePersistsAndReturnsUpdates(t *testing.T) {
 	}
 
 	enc, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     api.InputPeerUser(a.ID, b.ID),
 		Message:  "hello",
 		RandomID: 4242,
 	})
@@ -169,7 +176,7 @@ func TestHandleSendMessageToChatFansOut(t *testing.T) {
 	// that echoed another owner's entry from perOwner cannot coincide with the
 	// sender's own.
 	if _, err := api.SendMessageForTest(s, users[1].ID, &tg.MessagesSendMessageRequest{
-		Peer: &tg.InputPeerUser{UserID: users[2].ID, AccessHash: users[2].ID}, Message: "dm", RandomID: 1,
+		Peer: api.InputPeerUser(users[1].ID, users[2].ID), Message: "dm", RandomID: 1,
 	}); err != nil {
 		t.Fatalf("pre-advance: %v", err)
 	}
@@ -448,7 +455,7 @@ func TestHandleGetDialogsMixesUsersAndChats(t *testing.T) {
 	}
 
 	if _, err = api.SendMessageForTest(s, users[1].ID, &tg.MessagesSendMessageRequest{
-		Peer: &tg.InputPeerUser{UserID: other.ID, AccessHash: other.ID}, Message: "1:1", RandomID: 1,
+		Peer: api.InputPeerUser(users[1].ID, other.ID), Message: "1:1", RandomID: 1,
 	}); err != nil {
 		t.Fatalf("dm: %v", err)
 	}
@@ -879,7 +886,7 @@ func TestSendAndEditMessageRejectUnstorableText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("user b: %v", err)
 	}
-	peer := &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID}
+	peer := api.InputPeerUser(a.ID, b.ID)
 
 	for name, text := range map[string]string{
 		"nul byte":     "a\x00b",
@@ -939,7 +946,7 @@ func TestSendAndEditMessageKeepMultiByteText(t *testing.T) {
 		t.Fatalf("user b: %v", err)
 	}
 
-	peer := &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID}
+	peer := api.InputPeerUser(a.ID, b.ID)
 
 	const text = "Привет 👋"
 	enc, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
@@ -989,7 +996,7 @@ func dialogsFor(t *testing.T, s *store.Store, phonePrefix string, n int) store.U
 		}
 		// The peer sends, so the owner gets an inbox copy and a dialog.
 		if _, perr = api.SendMessageForTest(s, peer.ID, &tg.MessagesSendMessageRequest{
-			Peer: &tg.InputPeerUser{UserID: owner.ID, AccessHash: owner.ID}, Message: "hi", RandomID: int64(i + 1),
+			Peer: api.InputPeerUser(peer.ID, owner.ID), Message: "hi", RandomID: int64(i + 1),
 		}); perr != nil {
 			t.Fatalf("dm %d: %v", i, perr)
 		}
@@ -1132,7 +1139,7 @@ func mediaUsers(t *testing.T, s *store.Store, a, b string) (store.User, store.Us
 func historyMessages(t *testing.T, s *store.Store, caller, peer store.User) []tg.MessageClass {
 	t.Helper()
 	enc, err := api.GetHistoryForTest(s, caller.ID, &tg.MessagesGetHistoryRequest{
-		Peer: &tg.InputPeerUser{UserID: peer.ID, AccessHash: peer.ID},
+		Peer: api.InputPeerUser(caller.ID, peer.ID),
 	})
 	if err != nil {
 		t.Fatalf("get history: %v", err)

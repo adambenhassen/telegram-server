@@ -12,7 +12,7 @@ import (
 
 func TestInputPeerChannel(t *testing.T) {
 	t.Parallel()
-	pt, id, err := api.InputPeer(&tg.InputPeerChannel{ChannelID: 5, AccessHash: 5})
+	pt, id, err := api.InputPeer(&tg.InputPeerChannel{ChannelID: 5, AccessHash: 5}, 0)
 	if err != nil || pt != store.PeerTypeChannel || id != 5 {
 		t.Fatalf("inputPeer(channel 5) = (%d, %d, %v), want (channel, 5, nil)", pt, id, err)
 	}
@@ -20,7 +20,7 @@ func TestInputPeerChannel(t *testing.T) {
 		&tg.InputPeerChannel{ChannelID: 5, AccessHash: 6},
 		&tg.InputPeerChannel{ChannelID: 0, AccessHash: 0},
 	} {
-		if _, _, err := api.InputPeer(p); err == nil {
+		if _, _, err := api.InputPeer(p, 0); err == nil {
 			t.Fatalf("inputPeer(%T %+v) = nil error, want PEER_ID_INVALID", p, p)
 		}
 	}

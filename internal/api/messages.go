@@ -132,7 +132,7 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	if !validText(req.Message) {
 		return nil, errMessageEmpty
 	}
-	peerType, toID, err := inputPeer(req.Peer)
+	peerType, toID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -247,7 +247,7 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	peerType, toID, err := inputPeer(req.Peer)
+	peerType, toID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +368,7 @@ func (h *handlers) handleReadHistory(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	toID, err := peerUserID(req.Peer)
+	toID, err := h.peerUserID(req.Peer, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -471,7 +471,7 @@ func (h *handlers) handleSetTyping(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	toID, err := peerUserID(req.Peer)
+	toID, err := h.peerUserID(req.Peer, r.UserID)
 	if err != nil {
 		return nil, err
 	}

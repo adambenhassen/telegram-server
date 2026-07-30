@@ -19,9 +19,8 @@ import (
 type handlers struct {
 	store *store.Store
 	// peers derives the per-viewer peer access_hash. Every emission and
-	// verification site in this package must go through it and construct the
-	// value nowhere else. Nothing calls it yet: the emission sites are cut over
-	// in later MAIN-116 tickets, and the wire is unchanged until they land.
+	// verification site in this package goes through it. Nothing constructs
+	// a peer access hash anywhere else.
 	peers *peerhash.Deriver
 	cfg   *tg.Config
 	dcID  int

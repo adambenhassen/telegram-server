@@ -920,7 +920,7 @@ func TestGetDialogsShipsChannelsOnTheFirstPageOnly(t *testing.T) {
 		t.Fatalf("create peer: %v", err)
 	}
 	if _, err = api.SendMessageForTest(s, me.ID, &tg.MessagesSendMessageRequest{
-		Peer: &tg.InputPeerUser{UserID: other.ID, AccessHash: other.ID}, Message: "hi", RandomID: 910,
+		Peer: api.InputPeerUser(me.ID, other.ID), Message: "hi", RandomID: 910,
 	}); err != nil {
 		t.Fatalf("seed 1:1 dialog: %v", err)
 	}
@@ -1178,7 +1178,7 @@ func TestExportChatInviteRejectsNonChannelPeer(t *testing.T) {
 
 	for name, peer := range map[string]tg.InputPeerClass{
 		"chat": &tg.InputPeerChat{ChatID: ch.ID},
-		"user": &tg.InputPeerUser{UserID: creator.ID, AccessHash: creator.ID},
+		"user": api.InputPeerUser(creator.ID, creator.ID),
 		"self": &tg.InputPeerSelf{},
 	} {
 		_, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{Peer: peer})
@@ -1696,9 +1696,10 @@ func TestGetChannelDifferenceTruncated(t *testing.T) {
 	}
 }
 
-// inputUser names a target for editAdmin under the M1 placeholder access hash.
-func inputUser(id int64) tg.InputUserClass {
-	return &tg.InputUser{UserID: id, AccessHash: id}
+// inputUser names a target for editAdmin. Uses the test deriver with callerID
+// as viewer.
+func inputUser(callerID, id int64) tg.InputUserClass {
+	return api.InputUser(callerID, id)
 }
 
 // promote runs channels.editAdmin as callerID with a single admin right set,
@@ -1707,7 +1708,7 @@ func promote(t *testing.T, s *store.Store, callerID int64, ch store.Channel, tar
 	t.Helper()
 	return api.EditAdminForTest(s, callerID, &tg.ChannelsEditAdminRequest{
 		Channel:     &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
-		UserID:      inputUser(targetID),
+		UserID:      inputUser(callerID, targetID),
 		AdminRights: tg.ChatAdminRights{BanUsers: true},
 		Rank:        "boss",
 	})
@@ -1719,7 +1720,7 @@ func banForever(t *testing.T, s *store.Store, callerID int64, ch store.Channel, 
 	t.Helper()
 	return api.EditBannedForTest(s, callerID, &tg.ChannelsEditBannedRequest{
 		Channel:      &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
-		Participant:  &tg.InputPeerUser{UserID: targetID, AccessHash: targetID},
+		Participant:  api.InputPeerUser(callerID, targetID),
 		BannedRights: tg.ChatBannedRights{ViewMessages: true},
 	})
 }
@@ -1873,7 +1874,7 @@ func TestEditAdminRetryIsIdempotent(t *testing.T) {
 	// The demotion back to role 0 is a real transition and still works.
 	if _, err = api.EditAdminForTest(s, creator.ID, &tg.ChannelsEditAdminRequest{
 		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
-		UserID:  inputUser(admin.ID),
+		UserID:  inputUser(creator.ID, admin.ID),
 	}); err != nil {
 		t.Fatalf("demote: %v", err)
 	}
@@ -1928,7 +1929,7 @@ func TestEditBannedBansPermanentlyAndUnbans(t *testing.T) {
 	// The zero rights struct is the unban.
 	if _, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
 		Channel:     &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
-		Participant: &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID},
+		Participant: api.InputPeerUser(creator.ID, member.ID),
 	}); err != nil {
 		t.Fatalf("unban: %v", err)
 	}
@@ -1966,7 +1967,7 @@ func TestEditBannedRejectsAPastUntilDate(t *testing.T) {
 
 	_, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
 		Channel:     &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
-		Participant: &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID},
+		Participant: api.InputPeerUser(creator.ID, member.ID),
 		BannedRights: tg.ChatBannedRights{
 			ViewMessages: true,
 			UntilDate:    int(time.Now().Add(-time.Hour).Unix()),
@@ -2064,7 +2065,7 @@ func TestChannelEditsRejectBadInput(t *testing.T) {
 	creator, _, ch := channelWith(t, s, "+15551298071", "+15551298072")
 
 	if _, err := api.EditAdminForTest(s, 0, &tg.ChannelsEditAdminRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID}, UserID: inputUser(creator.ID),
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID}, UserID: inputUser(0, creator.ID),
 	}); err == nil {
 		t.Fatal("editAdmin unauthenticated: got nil")
 	} else if msg := rpcMessage(t, err); msg != "AUTH_KEY_UNREGISTERED" {
@@ -2072,7 +2073,7 @@ func TestChannelEditsRejectBadInput(t *testing.T) {
 	}
 	if _, err := api.EditBannedForTest(s, 0, &tg.ChannelsEditBannedRequest{
 		Channel:     &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
-		Participant: &tg.InputPeerUser{UserID: creator.ID, AccessHash: creator.ID},
+		Participant: api.InputPeerUser(0, creator.ID),
 	}); err == nil {
 		t.Fatal("editBanned unauthenticated: got nil")
 	} else if msg := rpcMessage(t, err); msg != "AUTH_KEY_UNREGISTERED" {
@@ -2116,7 +2117,7 @@ func TestEditBannedRejectsAPartialRestriction(t *testing.T) {
 
 	_, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
 		Channel:      &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
-		Participant:  &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID},
+		Participant:  api.InputPeerUser(creator.ID, member.ID),
 		BannedRights: tg.ChatBannedRights{SendMessages: true},
 	})
 	if err == nil {
@@ -2143,7 +2144,7 @@ func TestEditBannedRejectsAPartialRestriction(t *testing.T) {
 	// channel to exist — which is what keeps it off the post-read error collapse.
 	_, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
 		Channel:      &tg.InputChannel{ChannelID: ch.ID + 1_000_000, AccessHash: ch.ID + 1_000_000},
-		Participant:  &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID},
+		Participant:  api.InputPeerUser(creator.ID, member.ID),
 		BannedRights: tg.ChatBannedRights{SendMessages: true},
 	})
 	if err == nil {
@@ -2245,7 +2246,7 @@ func TestGetDialogsMultiChannel(t *testing.T) {
 		t.Fatalf("other: %v", err)
 	}
 	if _, err = api.SendMessageForTest(s, other.ID, &tg.MessagesSendMessageRequest{
-		Peer: &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID}, Message: "hi", RandomID: 999,
+		Peer: api.InputPeerUser(other.ID, member.ID), Message: "hi", RandomID: 999,
 	}); err != nil {
 		t.Fatalf("dm: %v", err)
 	}
@@ -2392,7 +2393,7 @@ func TestGetDialogsChannelCursorSafe(t *testing.T) {
 			t.Fatalf("peer %d: %v", i, perr)
 		}
 		if _, perr = api.SendMessageForTest(s, peer.ID, &tg.MessagesSendMessageRequest{
-			Peer: &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID}, Message: "hi", RandomID: int64(i + 1),
+			Peer: api.InputPeerUser(peer.ID, member.ID), Message: "hi", RandomID: int64(i + 1),
 		}); perr != nil {
 			t.Fatalf("dm %d: %v", i, perr)
 		}

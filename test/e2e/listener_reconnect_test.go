@@ -79,9 +79,9 @@ func TestListenerReconnectResumesDelivery(t *testing.T) {
 	go func() { errA <- runInteractive(ctx, clientA, flowFor(phoneA), aID, aCmds) }()
 	go func() { errB <- runInteractive(ctx, clientB, flowFor(phoneB), bID, bCmds) }()
 
-	var bUserID int64
+	var aUserID, bUserID int64
 	select {
-	case <-aID:
+	case aUserID = <-aID:
 	case <-time.After(30 * time.Second):
 		t.Fatal("client A login timeout")
 	}
@@ -100,7 +100,7 @@ func TestListenerReconnectResumesDelivery(t *testing.T) {
 		}
 		return <-d
 	}
-	peerB := &tg.InputPeerUser{UserID: bUserID, AccessHash: bUserID}
+	peerB := peerUser(aUserID, bUserID)
 	sendToB := func(text string, randomID int64) {
 		if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 			_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{

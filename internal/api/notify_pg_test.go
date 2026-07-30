@@ -6,6 +6,7 @@ import (
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
 )
 
 // TestDeliverChannelPostNobodyHomeSkipsStateQuery verifies that DeliverChannelPost
@@ -28,5 +29,5 @@ func TestDeliverChannelPostNobodyHomeSkipsStateQuery(t *testing.T) {
 	// Empty registry: no live conn for any member on this replica.
 	reg := mtproto.NewSessionRegistry()
 	// Must return cleanly; the lazy state fetch means ChannelState is never called.
-	api.NewUpdater(s, reg, nil).DeliverChannelPost(ctx, ch.ID)
+	api.NewUpdater(s, reg, nil, pgtest.PeerDeriver()).DeliverChannelPost(ctx, ch.ID)
 }

@@ -53,20 +53,19 @@ func channelAbout(raw string) (string, error) {
 	return about, nil
 }
 
-// inputChannelID resolves a client-supplied InputChannel to a channel id through
-// the same validation inputPeer applies, so the placeholder access-hash rule is
-// written once. InputChannelEmpty and InputChannelFromMessage are
-// PEER_ID_INVALID: neither names a channel this server can resolve.
+// inputChannelID resolves a client-supplied InputChannel to a channel id.
+// Channels keep the M1 placeholder (access_hash == id); they are out of scope
+// for MAIN-120. InputChannelEmpty and InputChannelFromMessage are
+// PEER_ID_INVALID.
 func inputChannelID(c tg.InputChannelClass) (int64, error) {
 	v, ok := c.(*tg.InputChannel)
 	if !ok {
 		return 0, errPeerIDInvalid
 	}
-	_, id, err := inputPeer(&tg.InputPeerChannel{ChannelID: v.ChannelID, AccessHash: v.AccessHash})
-	if err != nil {
-		return 0, err
+	if v.ChannelID == 0 || v.AccessHash != v.ChannelID {
+		return 0, errPeerIDInvalid
 	}
-	return id, nil
+	return v.ChannelID, nil
 }
 
 // handleCreateChannel serves channels.createChannel.
@@ -570,7 +569,7 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
-	peerType, channelID, err := inputPeer(req.Peer)
+	peerType, channelID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -624,7 +623,7 @@ func (h *handlers) handleRevokeExportedChatInvite(r *mtproto.Request) (bin.Encod
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
-	peerType, channelID, err := inputPeer(req.Peer)
+	peerType, channelID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -736,7 +735,7 @@ func (h *handlers) handleEditAdmin(r *mtproto.Request) (bin.Encoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	targetID, err := inputUserID(req.UserID, r.UserID)
+	targetID, err := h.inputUserID(req.UserID, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -793,7 +792,7 @@ func (h *handlers) handleEditBanned(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	// Only a user may be banned. A chat or channel peer here names no
 	// participant row.
-	targetID, err := peerUserID(req.Participant)
+	targetID, err := h.peerUserID(req.Participant, r.UserID)
 	if err != nil {
 		return nil, err
 	}
