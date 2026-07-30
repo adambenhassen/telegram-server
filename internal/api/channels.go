@@ -842,12 +842,17 @@ func (h *handlers) handleImportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 		h.log.Error("import chat invite render users", "channel_id", ch.ID, "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	return &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: ch.ID}},
-		Users:   users,
-		// A re-join by a banned member returns that member's untouched row, and
-		// it must not hand back metadata the ban revoked.
-		Chats: []tg.ChatClass{channelToTL(ch, member, !member.Banned(time.Now()))},
-		Date:  int(time.Now().Unix()),
+	// gotd v0.161.0 maps messages.importChatInvite to MessagesChatInviteJoinResultClass
+	// (type id 0x445663a7), NOT bare Updates (0x74ae4240). Returning bare Updates would
+	// cause the client to fail decoding with an unexpected type id error.
+	return &tg.MessagesChatInviteJoinResultOk{
+		Updates: &tg.Updates{
+			Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: ch.ID}},
+			Users:   users,
+			// A re-join by a banned member returns that member's untouched row, and
+			// it must not hand back metadata the ban revoked.
+			Chats: []tg.ChatClass{channelToTL(ch, member, !member.Banned(time.Now()))},
+			Date:  int(time.Now().Unix()),
+		},
 	}, nil
 }
