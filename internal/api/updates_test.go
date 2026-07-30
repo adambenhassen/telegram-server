@@ -91,6 +91,9 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 		if u.Phone != "" {
 			t.Fatalf("peer phone = %q, want empty", u.Phone)
 		}
+		if u.AccessHash != api.DeriveUserHash(b.ID, u.ID) {
+			t.Fatalf("access_hash = %d, want derived hash for viewer %d, peer %d", u.AccessHash, b.ID, u.ID)
+		}
 	}
 
 	// The sender's own copy hydrates both sides: a keeps its own phone as self,
@@ -110,11 +113,17 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 			if u.ID != a.ID || u.Phone != a.Phone {
 				t.Fatalf("self user = id %d phone %q, want id %d phone %q", u.ID, u.Phone, a.ID, a.Phone)
 			}
+			if u.AccessHash != api.DeriveUserHash(a.ID, u.ID) {
+				t.Fatalf("self access_hash = %d, want derived hash for viewer %d, peer %d", u.AccessHash, a.ID, u.ID)
+			}
 			continue
 		}
 		sawPeer = true
 		if u.ID != b.ID || u.Phone != "" {
 			t.Fatalf("peer user = id %d phone %q, want id %d phone \"\"", u.ID, u.Phone, b.ID)
+		}
+		if u.AccessHash != api.DeriveUserHash(a.ID, u.ID) {
+			t.Fatalf("peer access_hash = %d, want derived hash for viewer %d, peer %d", u.AccessHash, a.ID, u.ID)
 		}
 	}
 	if !sawSelf || !sawPeer {
@@ -133,11 +142,11 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 
 func TestInputPeer(t *testing.T) {
 	t.Parallel()
-	pt, id, err := api.InputPeer(&tg.InputPeerChat{ChatID: 3})
+	pt, id, err := api.InputPeer(&tg.InputPeerChat{ChatID: 3}, 0)
 	if err != nil || pt != store.PeerTypeChat || id != 3 {
 		t.Fatalf("inputPeer(chat 3) = (%d, %d, %v), want (chat, 3, nil)", pt, id, err)
 	}
-	pt, id, err = api.InputPeer(&tg.InputPeerUser{UserID: 5, AccessHash: 5})
+	pt, id, err = api.InputPeer(&tg.InputPeerUser{UserID: 5, AccessHash: api.DeriveUserHash(5, 5)}, 5)
 	if err != nil || pt != store.PeerTypeUser || id != 5 {
 		t.Fatalf("inputPeer(user 5) = (%d, %d, %v), want (user, 5, nil)", pt, id, err)
 	}
@@ -147,7 +156,7 @@ func TestInputPeer(t *testing.T) {
 		&tg.InputPeerEmpty{},
 		&tg.InputPeerSelf{},
 	} {
-		if _, _, err := api.InputPeer(p); err == nil {
+		if _, _, err := api.InputPeer(p, 0); err == nil {
 			t.Fatalf("inputPeer(%T %+v) = nil error, want PEER_ID_INVALID", p, p)
 		}
 	}
@@ -158,7 +167,7 @@ func TestInputUserID(t *testing.T) {
 	if id, err := api.InputUserID(&tg.InputUserSelf{}, 5); err != nil || id != 5 {
 		t.Fatalf("inputUserID(self, 5) = (%d, %v), want (5, nil)", id, err)
 	}
-	if id, err := api.InputUserID(&tg.InputUser{UserID: 9, AccessHash: 9}, 5); err != nil || id != 9 {
+	if id, err := api.InputUserID(api.InputUser(5, 9), 5); err != nil || id != 9 {
 		t.Fatalf("inputUserID(user 9) = (%d, %v), want (9, nil)", id, err)
 	}
 	for _, u := range []tg.InputUserClass{

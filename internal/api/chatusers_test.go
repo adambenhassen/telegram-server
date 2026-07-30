@@ -79,7 +79,7 @@ func TestAddChatUserByNonMemberIsPeerIDInvalid(t *testing.T) {
 
 	_, err = api.AddChatUserForTest(s, outsider.ID, &tg.MessagesAddChatUserRequest{
 		ChatID: chat.ID,
-		UserID: &tg.InputUser{UserID: target.ID, AccessHash: target.ID},
+		UserID: api.InputUser(outsider.ID, target.ID),
 	})
 	wantRPC(t, err, "PEER_ID_INVALID")
 	if got := apiParticipants(t, s, chat.ID); len(got) != 2 {
@@ -89,7 +89,7 @@ func TestAddChatUserByNonMemberIsPeerIDInvalid(t *testing.T) {
 	// A non-member removal is the same boundary and the same error.
 	_, err = api.DeleteChatUserForTest(s, outsider.ID, &tg.MessagesDeleteChatUserRequest{
 		ChatID: chat.ID,
-		UserID: &tg.InputUser{UserID: b.ID, AccessHash: b.ID},
+		UserID: api.InputUser(outsider.ID, b.ID),
 	})
 	wantRPC(t, err, "PEER_ID_INVALID")
 	if got := apiParticipants(t, s, chat.ID); len(got) != 2 {
@@ -107,13 +107,13 @@ func TestChatUserUnknownChatIsPeerIDInvalid(t *testing.T) {
 
 	_, err := api.AddChatUserForTest(s, a.ID, &tg.MessagesAddChatUserRequest{
 		ChatID: 9_999_999,
-		UserID: &tg.InputUser{UserID: target.ID, AccessHash: target.ID},
+		UserID: api.InputUser(a.ID, target.ID),
 	})
 	wantRPC(t, err, "PEER_ID_INVALID")
 
 	_, err = api.DeleteChatUserForTest(s, a.ID, &tg.MessagesDeleteChatUserRequest{
 		ChatID: 9_999_999,
-		UserID: &tg.InputUser{UserID: target.ID, AccessHash: target.ID},
+		UserID: api.InputUser(a.ID, target.ID),
 	})
 	wantRPC(t, err, "PEER_ID_INVALID")
 }
@@ -176,7 +176,7 @@ func TestAddChatUserAtCapIsUsersTooMuch(t *testing.T) {
 
 	_, err = api.AddChatUserForTest(s, a.ID, &tg.MessagesAddChatUserRequest{
 		ChatID: chat.ID,
-		UserID: &tg.InputUser{UserID: outsider.ID, AccessHash: outsider.ID},
+		UserID: api.InputUser(a.ID, outsider.ID),
 	})
 	wantRPC(t, err, "USERS_TOO_MUCH")
 	if got := apiParticipants(t, s, chat.ID); len(got) != 200 {
@@ -197,7 +197,7 @@ func TestAddChatUserAlreadyMemberReturnsEmptyUpdates(t *testing.T) {
 
 	enc, err := api.AddChatUserForTest(s, a.ID, &tg.MessagesAddChatUserRequest{
 		ChatID: chat.ID,
-		UserID: &tg.InputUser{UserID: b.ID, AccessHash: b.ID},
+		UserID: api.InputUser(a.ID, b.ID),
 	})
 	if err != nil {
 		t.Fatalf("re-add: %v", err)
@@ -240,7 +240,7 @@ func TestAddChatUserAnnouncesToEveryMember(t *testing.T) {
 
 	enc, err := api.AddChatUserForTest(s, a.ID, &tg.MessagesAddChatUserRequest{
 		ChatID:   chat.ID,
-		UserID:   &tg.InputUser{UserID: c.ID, AccessHash: c.ID},
+		UserID:   api.InputUser(a.ID, c.ID),
 		FwdLimit: 100,
 	})
 	if err != nil {
@@ -316,7 +316,7 @@ func TestDeleteChatUserAnnouncesToRemainingAndRemoved(t *testing.T) {
 
 	enc, err := api.DeleteChatUserForTest(s, b.ID, &tg.MessagesDeleteChatUserRequest{
 		ChatID:        chat.ID,
-		UserID:        &tg.InputUser{UserID: c.ID, AccessHash: c.ID},
+		UserID:        api.InputUser(b.ID, c.ID),
 		RevokeHistory: true,
 	})
 	if err != nil {
@@ -377,7 +377,7 @@ func TestDeleteChatUserNonMemberChangesNothing(t *testing.T) {
 
 	enc, err := api.DeleteChatUserForTest(s, a.ID, &tg.MessagesDeleteChatUserRequest{
 		ChatID: chat.ID,
-		UserID: &tg.InputUser{UserID: outsider.ID, AccessHash: outsider.ID},
+		UserID: api.InputUser(a.ID, outsider.ID),
 	})
 	if err != nil {
 		t.Fatalf("remove non-member: %v", err)
@@ -482,7 +482,7 @@ func TestRemovedUserGetDialogsSeesChatForbidden(t *testing.T) {
 	}
 	if _, err = api.DeleteChatUserForTest(s, a.ID, &tg.MessagesDeleteChatUserRequest{
 		ChatID: chat.ID,
-		UserID: &tg.InputUser{UserID: b.ID, AccessHash: b.ID},
+		UserID: api.InputUser(a.ID, b.ID),
 	}); err != nil {
 		t.Fatalf("remove: %v", err)
 	}

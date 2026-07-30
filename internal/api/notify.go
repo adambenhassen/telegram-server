@@ -9,6 +9,7 @@ import (
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -23,12 +24,12 @@ type Updater struct {
 }
 
 // NewUpdater builds an Updater over the store and the server's session registry.
-func NewUpdater(s *store.Store, registry *mtproto.SessionRegistry, log *slog.Logger) *Updater {
+func NewUpdater(s *store.Store, registry *mtproto.SessionRegistry, log *slog.Logger, peers *peerhash.Deriver) *Updater {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Updater{
-		h:        &handlers{store: s, log: log},
+		h:        &handlers{store: s, log: log, peers: peers},
 		registry: registry,
 		log:      log,
 	}

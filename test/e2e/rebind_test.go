@@ -90,8 +90,9 @@ func TestRebindStopsPushToPreviousUser(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("victim login timeout")
 	}
+	var senderUserID int64
 	select {
-	case <-senderID:
+	case senderUserID = <-senderID:
 	case <-time.After(30 * time.Second):
 		t.Fatal("sender login timeout")
 	}
@@ -105,7 +106,7 @@ func TestRebindStopsPushToPreviousUser(t *testing.T) {
 		}
 		return <-d
 	}
-	peerVictim := &tg.InputPeerUser{UserID: victimUserID, AccessHash: victimUserID}
+	peerVictim := peerUser(senderUserID, victimUserID)
 	sendToVictim := func(text string, randomID int64) {
 		t.Helper()
 		if err := exec(senderCmds, func(ctx context.Context, c *tg.Client) error {

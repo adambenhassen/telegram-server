@@ -5,6 +5,9 @@ import (
 	"os"
 	"testing"
 
+	"github.com/gotd/td/tg"
+
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 )
 
@@ -18,4 +21,21 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	os.Exit(m.Run())
+}
+
+// peerUser builds an InputPeerUser with the derived access hash for a user peer.
+// viewerID is the user sending the request; targetID is the peer being addressed.
+func peerUser(viewerID, targetID int64) *tg.InputPeerUser {
+	return &tg.InputPeerUser{
+		UserID:     targetID,
+		AccessHash: pgtest.PeerDeriver().Derive(viewerID, peerhash.KindUser, targetID),
+	}
+}
+
+// inputUser builds an InputUser with the derived access hash.
+func inputUser(viewerID, targetID int64) *tg.InputUser {
+	return &tg.InputUser{
+		UserID:     targetID,
+		AccessHash: pgtest.PeerDeriver().Derive(viewerID, peerhash.KindUser, targetID),
+	}
 }

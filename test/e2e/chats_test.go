@@ -181,8 +181,8 @@ func TestChatsRealtime(t *testing.T) {
 		inv, err := c.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
 			Title: "Team",
 			Users: []tg.InputUserClass{
-				&tg.InputUser{UserID: bUserID, AccessHash: bUserID},
-				&tg.InputUser{UserID: cUserID, AccessHash: cUserID},
+				inputUser(aUserID, bUserID),
+				inputUser(aUserID, cUserID),
 			},
 		})
 		if err != nil {
@@ -301,7 +301,7 @@ func TestChatsRealtime(t *testing.T) {
 	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesAddChatUser(ctx, &tg.MessagesAddChatUserRequest{
 			ChatID:   chatID,
-			UserID:   &tg.InputUser{UserID: dUserID, AccessHash: dUserID},
+			UserID:   inputUser(aUserID, dUserID),
 			FwdLimit: 0,
 		})
 		return err
@@ -354,7 +354,7 @@ func TestChatsRealtime(t *testing.T) {
 	// 6. A removes C; C receives delete service message.
 	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesDeleteChatUser(ctx, &tg.MessagesDeleteChatUserRequest{
-			ChatID: chatID, UserID: &tg.InputUser{UserID: cUserID, AccessHash: cUserID},
+			ChatID: chatID, UserID: inputUser(aUserID, cUserID),
 		})
 		return err
 	})
@@ -459,7 +459,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 			return 0
 		}
 	}
-	_, cUserID := logins(aID, "A"), logins(cID, "C")
+	aUserID, cUserID := logins(aID, "A"), logins(cID, "C")
 
 	// A and C create a chat (A invites C).
 	var chatID int64
@@ -468,7 +468,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 		inv, err := c.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
 			Title: "Two",
 			Users: []tg.InputUserClass{
-				&tg.InputUser{UserID: cUserID, AccessHash: cUserID},
+				inputUser(aUserID, cUserID),
 			},
 		})
 		if err != nil {
@@ -513,7 +513,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	// A removes C.
 	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesDeleteChatUser(ctx, &tg.MessagesDeleteChatUserRequest{
-			ChatID: chatID, UserID: &tg.InputUser{UserID: cUserID, AccessHash: cUserID},
+			ChatID: chatID, UserID: inputUser(aUserID, cUserID),
 		})
 		return err
 	})
@@ -734,17 +734,23 @@ func TestChatsOfflineBackfill(t *testing.T) {
 
 	// A logs in, creates chat with B, sends 3 messages, changes title.
 	var chatID int64
+	var aUserID int64
 	aClient := createClient(addr.Port, key, dcID, newUpdateCollector(), sessA)
 	if err := aClient.Run(ctx, func(ctx context.Context) error {
 		if err := aClient.Auth().IfNecessary(ctx, flowFor(phoneA, codes)); err != nil {
 			return err
 		}
+		self, err := aClient.Self(ctx)
+		if err != nil {
+			return err
+		}
+		aUserID = self.ID
 		api := aClient.API()
 
 		inv, err := api.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
 			Title: "Backfill",
 			Users: []tg.InputUserClass{
-				&tg.InputUser{UserID: bUserID, AccessHash: bUserID},
+				inputUser(aUserID, bUserID),
 			},
 		})
 		if err != nil {
@@ -898,17 +904,23 @@ func TestChatsCrossReplica(t *testing.T) {
 
 	// A connects to server 1, logs in, creates chat with B.
 	var chatID int64
+	var aUserID int64
 	aClient := createClient(port1, key, dcID, newUpdateCollector(), nil)
 	if err := aClient.Run(ctx, func(ctx context.Context) error {
 		if err := aClient.Auth().IfNecessary(ctx, flowFor(phoneA, codes)); err != nil {
 			return err
 		}
+		self, err := aClient.Self(ctx)
+		if err != nil {
+			return err
+		}
+		aUserID = self.ID
 		api := aClient.API()
 
 		inv, err := api.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
 			Title: "Cross",
 			Users: []tg.InputUserClass{
-				&tg.InputUser{UserID: bUserID, AccessHash: bUserID},
+				inputUser(aUserID, bUserID),
 			},
 		})
 		if err != nil {
