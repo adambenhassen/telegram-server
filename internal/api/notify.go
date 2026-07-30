@@ -171,6 +171,107 @@ func (u *Updater) DeliverTyping(ctx context.Context, peerID, fromID int64) {
 	}
 }
 
+// DeliverChannelPost pushes a newly-committed channel post to every non-banned
+// member that holds a live connection on this replica. It is the channelPost
+// callback for StartListener (part 2 of MAIN-96 / MAIN-114).
+//
+// ChannelState is fetched lazily — only on the first member found with a live
+// conn. A replica where nobody is home skips it entirely after one
+// ChannelMembers query and O(members) in-memory registry lookups.
+//
+// The per-connection channel-pts watermark does not exist on Conn. The window
+// is anchored one step below currentPts (or at JoinPts if that is higher),
+// so the triggering event is always included. A duplicate UpdateNewChannelMessage
+// is safe (the client dedups on pts); a missed one is backfilled by the next
+// getChannelDifference.
+func (u *Updater) DeliverChannelPost(ctx context.Context, channelID int64) {
+	members, err := u.h.store.ChannelMembers(ctx, channelID)
+	if err != nil {
+		u.log.Error("deliver channel post members", "channel_id", channelID, "err", err)
+		return
+	}
+	now := time.Now()
+	var (
+		currentPts int
+		ptsFetched bool
+	)
+	u.deliverChannel(ctx, members, now,
+		func(userID int64) []pushConn {
+			raw := u.registry.Conns(userID)
+			if len(raw) == 0 {
+				return nil
+			}
+			cs := make([]pushConn, len(raw))
+			for i, c := range raw {
+				cs[i] = c
+			}
+			return cs
+		},
+		func(memberID int64, fromPts int) (channelBatch, error) {
+			if !ptsFetched {
+				pts, serr := u.h.store.ChannelState(ctx, channelID)
+				if serr != nil {
+					u.log.Error("deliver channel post state", "channel_id", channelID, "err", serr)
+					return channelBatch{}, serr
+				}
+				currentPts = pts
+				ptsFetched = true
+			}
+			return u.h.buildChannelUpdates(ctx, channelID, memberID, max(fromPts, currentPts-1), maxDiffEvents, currentPts)
+		},
+	)
+}
+
+// deliverChannel is the testable core of DeliverChannelPost. For each
+// non-banned member that has live conns it calls build once (with the member's
+// JoinPts as the floor hint) and pushes the resulting updates to each conn.
+//
+// The callback runs on the listener's single goroutine; it must not block. All
+// pushes are inline. The bound that makes this acceptable: the number of members
+// with live conns on this replica is typically small (the replica serves a
+// fraction of all members). If that fraction grows too large for inline work,
+// the callback would need to hand off to a worker pool.
+func (u *Updater) deliverChannel(
+	ctx context.Context,
+	members []store.ChannelMember,
+	now time.Time,
+	connsFor func(userID int64) []pushConn,
+	build func(memberID int64, fromPts int) (channelBatch, error),
+) {
+	for _, m := range members {
+		if m.Banned(now) {
+			continue
+		}
+		conns := connsFor(m.UserID)
+		if len(conns) == 0 {
+			continue
+		}
+		b, err := build(m.UserID, m.JoinPts)
+		if err != nil {
+			u.log.Error("deliver channel build", "user_id", m.UserID, "err", err)
+			continue
+		}
+		if len(b.ups) == 0 {
+			continue
+		}
+		env := &tg.Updates{
+			Updates: b.ups,
+			Users:   b.users,
+			Chats:   b.chats,
+			Date:    int(now.Unix()),
+			Seq:     0,
+		}
+		for _, c := range conns {
+			// Pass pts=0: this is a channel update; the conn's lastPushedPts
+			// tracks the per-account stream and must not be corrupted by a
+			// channel pts value.
+			if _, err := c.PushTo(ctx, m.UserID, env, 0); err != nil {
+				u.log.Info("deliver channel push", "user_id", m.UserID, "err", err)
+			}
+		}
+	}
+}
+
 // Evict closes the connections of userID that still hold authKeyID, which the
 // revoking replica has just deleted from auth_keys. It is the cross-replica half
 // of revocation: without it a socket that sends no further frame keeps its
