@@ -70,6 +70,13 @@ Media
 Updates
 - `updates.getState`, `updates.getDifference`
 
+Channels
+- `channels.createChannel`, `channels.getChannels`, `channels.leaveChannel`,
+  `channels.editAdmin`, `channels.editBanned`, `channels.getMessages`
+- `messages.exportChatInvite`, `messages.checkChatInvite`,
+  `messages.importChatInvite`
+- `updates.getChannelDifference`
+
 ## Shipped
 
 ### M1 — MTProto core + login
@@ -204,13 +211,40 @@ Updates
   plus offline `getDifference` backfill of chat messages and service messages,
   and cross-replica delivery over `LISTEN`/`NOTIFY`.
 
-## Planned — feature track
-
 ### M7 — Channels & supergroups
-- Broadcast channels and megagroups; the channel `pts` stream.
-- `channels.*` surface (create, join/leave, getMessages, editAdmin, editBanned).
-- Larger fan-out likely forces the `message_events` GC + `differenceTooLong`
-  path (see deferrals).
+- Channel as a peer type; megagroup and broadcast share one `channels` table
+  with a `megagroup` flag, differing only in who may post: admins in broadcast,
+  anyone in megagroup.
+- One message row per channel, not per member. A channel post writes a single
+  `channel_messages` row that every entitled member reads. The per-account
+  `pts` stream cannot represent an event whose audience grows after the fact,
+  so channels carry their own: `channel_state` + `channel_events`, keyed by
+  channel the way `update_state` + `message_events` are keyed by user. This is
+  the second update stream the architecture now holds.
+- Admission is by invite hash alone; there is no join-by-channel-id path.
+  `channels.id` is dense BIGSERIAL and the peer `access_hash` placeholder is
+  `access_hash == id`, so a join keyed on the id would let any account
+  enumerate and join every channel on the server. The hash is the secret; the
+  channel id is never an input to the join path.
+- Coarse `role` + `banned_until` rights model: 0 = member, 1 = admin,
+  2 = creator. `ChatAdminRights` and `ChatBannedRights` flag sets are accepted
+  and collapsed to a single bit. An admin may post in a broadcast channel; a
+  member may not.
+- One `NOTIFY` per post, not one per member. Each replica's listener checks
+  whether it holds connections for any of the channel's members and pushes to
+  those; a server with 10 000 members in a channel emits exactly one
+  notification.
+- Design bet extended: `LISTEN`/`NOTIFY` delivery and the `buildUpdates` push
+  path carry channel fan-out without a broker and without per-member event
+  rows. The second `pts` stream was the only structural addition; the delivery
+  and difference machinery reuse the M4 foundation.
+- `join_pts` records the channel's `pts` at the moment each member joined and
+  floors the channel difference for that member, bounding cold-start cost.
+- E2E gates prove the channel lifecycle live between gotd clients — create,
+  join by invite, post, get history, editAdmin, editBanned, leaveChannel, and
+  `getChannelDifference` backfill.
+
+## Planned — feature track
 
 ### M8 and later
 - Secret chats (end-to-end, separate key exchange, `qts` stream).
@@ -356,6 +390,38 @@ Tracked so shortcuts don't rot into "later means never".
   Whether the current two-sided behaviour is a deliberate M5 simplification or a
   defect, and whether M5 wants the `revoke` flag at all, is the open question
   tracked in MAIN-79. — M5
+- **Full history to any current member.** `messages.getHistory` serves a member
+  the channel's whole history, including posts from before they joined.
+  `join_pts` bounds only how far back `getChannelDifference` will replay — a
+  cost control, not a confidentiality boundary. Nothing may later be built on it
+  as one. — M7
+- **Invite hash is bearer-grade.** No expiry, no usage limit, no per-invite
+  revocation. `expire_date` and `usage_limit` are accepted and silently ignored.
+  A leaked hash is a leaked channel until the row is deleted. — M7
+- **No audit trail for membership or role changes.** No service message is written
+  for a join, a promotion, or a ban; the participant row records only the current
+  state. Prior states are not recoverable. — M7
+- **`ChatAdminRights` and `ChatBannedRights` flags collapsed to one bit.** The
+  coarse `role` column maps any right set to admin (role 1) and collapses every
+  partial restriction to the same banned state as a full ban. Individual flags are
+  accepted and discarded. With no fine-grained rights, an admin who bans every
+  other member holds the only mutable position, recoverable only by the creator. — M7
+- **No `channelDifferenceTooLong`.** Nothing trims `channel_events`, so the
+  too-long path is unreachable. Rides with the `message_events` GC deferral
+  already recorded above. — M7
+- **No typing, read state, or unread counts for channels.** Channel dialogs are
+  appended unpaged to `getDialogs`; a client in many channels makes each dialog
+  call expensive. — M7
+- **No channel ownership transfer.** A creator who leaves cannot assign the
+  creator role to another member. Once the creator leaves, no admin can elevate
+  themselves to creator. — M7
+- **No channel media send path.** `messages.sendMedia` rejects channel peers;
+  a channel post cannot carry a document in M7. The download side is already
+  built — the M5 `FileForDownload` gate grew its channel branch in M7 — so the
+  gap is send only. — M7
+- **`store.channels.version` has no wire counterpart.** The column is written
+  and kept in Postgres but never rendered: `tg.Channel` in gotd v0.161.0
+  carries no `Version` field, unlike `tg.Chat`. — M7
 
 ## Engineering invariants
 
