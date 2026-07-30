@@ -11,6 +11,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -422,6 +423,65 @@ func TestDeliverChannelPostTwoMembers(t *testing.T) {
 	}
 	if len(connB.got) != 1 {
 		t.Fatalf("member 2 got %d pushes, want 1", len(connB.got))
+	}
+}
+
+// TestDeliverChannelPostPushesViaRealStore exercises the full fan-out path
+// against a real store: PostChannelMessage writes a channel event, deliverChannel
+// is driven with a buildChannelUpdates call that reads it back, and the push
+// arrives on a fakePushConn. This covers DeliverChannelPost's build closure
+// (including the max(fromPts, currentPts-1) floor) without needing a real network
+// connection.
+func TestDeliverChannelPostPushesViaRealStore(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(ctx, dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("store close: %v", err)
+		}
+	})
+
+	alice, err := s.CreateUser(ctx, "+15550000201")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, alice.ID, "live channel", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, alice.ID, "hello", 1, nil); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	currentPts, err := s.ChannelState(ctx, ch.ID)
+	if err != nil {
+		t.Fatalf("channel state: %v", err)
+	}
+
+	conn := &fakePushConn{}
+	member := store.ChannelMember{UserID: alice.ID, JoinPts: 0}
+	u := &Updater{h: &handlers{store: s, log: slog.New(slog.DiscardHandler)}, log: slog.New(slog.DiscardHandler)}
+	u.deliverChannel(ctx, []store.ChannelMember{member}, time.Now(),
+		func(userID int64) []pushConn { return []pushConn{conn} },
+		func(memberID int64, fromPts int) (channelBatch, error) {
+			return u.h.buildChannelUpdates(ctx, ch.ID, memberID, max(fromPts, currentPts-1), maxDiffEvents, currentPts)
+		},
+	)
+	if len(conn.got) != 1 {
+		t.Fatalf("alice got %d pushes, want 1", len(conn.got))
+	}
+	var gotChannel bool
+	for _, up := range conn.got[0].Updates {
+		if _, ok := up.(*tg.UpdateNewChannelMessage); ok {
+			gotChannel = true
+		}
+	}
+	if !gotChannel {
+		t.Fatal("push contained no UpdateNewChannelMessage")
 	}
 }
 

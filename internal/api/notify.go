@@ -175,42 +175,26 @@ func (u *Updater) DeliverTyping(ctx context.Context, peerID, fromID int64) {
 // member that holds a live connection on this replica. It is the channelPost
 // callback for StartListener (part 2 of MAIN-96 / MAIN-114).
 //
-// Delivery cost is bounded: one ChannelMembers query, then for each non-banned
-// member O(1) in-memory registry lookups, and only then one ChannelState query
-// and one buildChannelUpdates call per member with a live conn. A replica where
-// nobody is home for the channel skips the state query entirely.
+// ChannelState is fetched lazily — only on the first member found with a live
+// conn. A replica where nobody is home skips it entirely after one
+// ChannelMembers query and O(members) in-memory registry lookups.
 //
-// The per-connection channel-pts watermark does not exist on Conn. Push from
-// each member's JoinPts floor instead. A duplicate UpdateNewChannelMessage is
-// safe (the client dedups on pts); a missed one is backfilled by the next
-// getChannelDifference. This is the accepted trade-off until per-channel
-// per-conn watermarks are added to the registry.
+// The per-connection channel-pts watermark does not exist on Conn. The window
+// is anchored one step below currentPts (or at JoinPts if that is higher),
+// so the triggering event is always included. A duplicate UpdateNewChannelMessage
+// is safe (the client dedups on pts); a missed one is backfilled by the next
+// getChannelDifference.
 func (u *Updater) DeliverChannelPost(ctx context.Context, channelID int64) {
 	members, err := u.h.store.ChannelMembers(ctx, channelID)
 	if err != nil {
 		u.log.Error("deliver channel post members", "channel_id", channelID, "err", err)
 		return
 	}
-	// Fast pre-check against the in-memory registry: if no non-banned member
-	// has a live conn here, skip the state query entirely. On a replica serving
-	// 2 of a 10 000-member channel, this is 10 000 in-memory lookups and then
-	// one state query, not 10 000 DB round-trips.
 	now := time.Now()
-	anyActive := false
-	for _, m := range members {
-		if !m.Banned(now) && len(u.registry.Conns(m.UserID)) > 0 {
-			anyActive = true
-			break
-		}
-	}
-	if !anyActive {
-		return
-	}
-	currentPts, err := u.h.store.ChannelState(ctx, channelID)
-	if err != nil {
-		u.log.Error("deliver channel post state", "channel_id", channelID, "err", err)
-		return
-	}
+	var (
+		currentPts int
+		ptsFetched bool
+	)
 	u.deliverChannel(ctx, members, now,
 		func(userID int64) []pushConn {
 			raw := u.registry.Conns(userID)
@@ -224,21 +208,29 @@ func (u *Updater) DeliverChannelPost(ctx context.Context, channelID int64) {
 			return cs
 		},
 		func(memberID int64, fromPts int) (channelBatch, error) {
-			return u.h.buildChannelUpdates(ctx, channelID, memberID, fromPts, maxDiffEvents, currentPts)
+			if !ptsFetched {
+				pts, serr := u.h.store.ChannelState(ctx, channelID)
+				if serr != nil {
+					u.log.Error("deliver channel post state", "channel_id", channelID, "err", serr)
+					return channelBatch{}, serr
+				}
+				currentPts = pts
+				ptsFetched = true
+			}
+			return u.h.buildChannelUpdates(ctx, channelID, memberID, max(fromPts, currentPts-1), maxDiffEvents, currentPts)
 		},
 	)
 }
 
 // deliverChannel is the testable core of DeliverChannelPost. For each
-// non-banned member that has live conns, it calls build once (from the member's
-// JoinPts floor) and pushes the resulting updates to each conn.
+// non-banned member that has live conns it calls build once (with the member's
+// JoinPts as the floor hint) and pushes the resulting updates to each conn.
 //
 // The callback runs on the listener's single goroutine; it must not block. All
 // pushes are inline. The bound that makes this acceptable: the number of members
 // with live conns on this replica is typically small (the replica serves a
-// fraction of all members), so the number of build calls is small. If a channel
-// grows so large that even the active-member fraction exceeds a safe inline
-// limit, the callback would need to hand work to a worker pool instead.
+// fraction of all members). If that fraction grows too large for inline work,
+// the callback would need to hand off to a worker pool.
 func (u *Updater) deliverChannel(
 	ctx context.Context,
 	members []store.ChannelMember,
