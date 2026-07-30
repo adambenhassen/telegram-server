@@ -22,9 +22,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
 
+      # cache: true keys the module and build caches on go.sum, so a run that
+      # changed no dependency skips `go mod download` and reuses compiled
+      # packages across Build, Lint and Test.
       - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: go.mod
+          cache: true
 
       - name: Build
         run: go build ./...
@@ -99,14 +103,14 @@ jobs:
 
       # type=gha needs the docker-container driver; the default builder cannot
       # export to an external cache backend.
-      - uses: docker/setup-buildx-action@v3.11.1
+      - uses: docker/setup-buildx-action@v4.2.0
 
       # mode=max because the compiler and `go mod download` layers live in the
       # discarded build stage: mode=min would only cache the distroless result
       # and a source-only run would still redownload the module cache.
       # load: true puts the image in the daemon, which every step below inspects.
       - name: Build image
-        uses: docker/build-push-action@v6.18.0
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
           tags: telegramd:ci
@@ -206,10 +210,10 @@ jobs:
       # the image is built here instead and loaded into the daemon under the tag
       # the telegramd service names. `up` below finds it present and skips the
       # build — same image, same assertions, just not rebuilt from scratch.
-      - uses: docker/setup-buildx-action@v3.11.1
+      - uses: docker/setup-buildx-action@v4.2.0
 
       - name: Build image
-        uses: docker/build-push-action@v6.18.0
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
           tags: telegramd:local
