@@ -11,12 +11,18 @@ import (
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/srp"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 type handlers struct {
 	store *store.Store
+	// peers derives the per-viewer peer access_hash. Every emission and
+	// verification site in this package must go through it and construct the
+	// value nowhere else. Nothing calls it yet: the emission sites are cut over
+	// in later MAIN-116 tickets, and the wire is unchanged until they land.
+	peers *peerhash.Deriver
 	cfg   *tg.Config
 	dcID  int
 	log   *slog.Logger
@@ -82,8 +88,16 @@ func selfRevocation(r *mtproto.Request, keyID int64) bool {
 
 // New builds the RPC handler: dispatcher wrapped with UnpackInvoke so
 // invokeWithLayer/initConnection wrappers are peeled before dispatch.
-func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64) mtproto.Handler {
+//
+// peers derives the per-viewer peer access hashes. It is required, and a nil one
+// is a programming error rather than a runtime condition, so it stops the server
+// at startup instead of surfacing as a nil dereference on the first peer emitted.
+func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver) mtproto.Handler {
+	if peers == nil {
+		panic("api: nil peer hash deriver")
+	}
 	h := &handlers{
+		peers:         peers,
 		store:         s,
 		cfg:           cfg,
 		dcID:          dcID,

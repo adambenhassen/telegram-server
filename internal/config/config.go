@@ -18,6 +18,13 @@ type Config struct {
 	PostgresDSN string
 	RSAKeyPath  string
 	// AuthKeyEncKey is the 32-byte master key that encrypts auth keys at rest.
+	//
+	// Changing it is a total re-auth event: no stored auth key opens under a new
+	// key, so every client re-handshakes. Peer access hashes are derived from
+	// this material too (internal/peerhash) and carry no key epoch, which is
+	// only safe while that stays true — before adding any dual-key rotation that
+	// lets a session survive a key change, read the key rotation constraint in
+	// the internal/peerhash package doc.
 	AuthKeyEncKey []byte
 	// AdvertiseHost and AdvertisePort are the address clients are told to
 	// dial, which is not always the one the server binds: a listener on every
