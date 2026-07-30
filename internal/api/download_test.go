@@ -33,7 +33,7 @@ func downloadFixture(t *testing.T, phoneA, phoneB string) (
 	}
 	saveParts(t, s, a.ID, 900, []byte(downloadPayload))
 	enc, err := api.SendMediaForTest(s, a.ID, blobs, api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     api.InputPeerUser(a.ID, b.ID),
 		Media:    uploadedDocument(900, 1, "hello.txt", "text/plain"),
 		RandomID: 900,
 	})
@@ -194,7 +194,7 @@ func TestGetFileDeletedMessageRevokes(t *testing.T) {
 
 	// b's own local id for the message, which is what b deletes by.
 	hist, err := api.GetHistoryForTest(s, b.ID, &tg.MessagesGetHistoryRequest{
-		Peer: &tg.InputPeerUser{UserID: a.ID, AccessHash: a.ID},
+		Peer: api.InputPeerUser(b.ID, a.ID),
 	})
 	if err != nil {
 		t.Fatalf("get history: %v", err)

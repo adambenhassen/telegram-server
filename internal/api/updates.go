@@ -10,6 +10,7 @@ import (
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -184,17 +185,18 @@ func channelToTL(c store.Channel, m store.ChannelMember, member bool) tg.ChatCla
 	}
 }
 
-// userToTL maps a stored user to the wire tg.User. AccessHash is the M1 self-id
-// placeholder; self marks the update recipient's own account. The phone number
-// is private to its owner, so it is emitted only on the self entry — names stay
-// for every peer, since a client needs them to render a conversation.
-func userToTL(u store.User, self bool) *tg.User {
+// userToTL maps a stored user to the wire tg.User. AccessHash is derived for
+// (viewerID, u.ID) so only the viewer can use it. self marks the update
+// recipient's own account. The phone number is private to its owner, so it is
+// emitted only on the self entry — names stay for every peer, since a client
+// needs them to render a conversation.
+func (h *handlers) userToTL(u store.User, viewerID int64, self bool) *tg.User {
 	tlUser := &tg.User{
 		ID:         u.ID,
 		Self:       self,
 		FirstName:  u.FirstName,
 		LastName:   u.LastName,
-		AccessHash: u.ID,
+		AccessHash: h.peers.Derive(viewerID, peerhash.KindUser, u.ID),
 	}
 	if self {
 		tlUser.Phone = u.Phone
@@ -430,8 +432,10 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 	}
 }
 
-// loadUsers hydrates the given user ids into wire users, marking selfID as Self.
-func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, selfID int64) ([]tg.UserClass, error) {
+// loadUsers hydrates the given user ids into wire users, marking selfID as
+// Self. viewerID is the account receiving this response; it is used to derive
+// the per-viewer access hash for each user.
+func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, viewerID int64) ([]tg.UserClass, error) {
 	users := make([]tg.UserClass, 0, len(ids))
 	for id := range ids {
 		u, ok, err := h.store.UserByID(ctx, id)
@@ -441,7 +445,7 @@ func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, selfID int
 		if !ok {
 			continue
 		}
-		users = append(users, userToTL(u, id == selfID))
+		users = append(users, h.userToTL(u, viewerID, id == viewerID))
 	}
 	return users, nil
 }

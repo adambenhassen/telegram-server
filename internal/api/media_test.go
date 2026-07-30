@@ -157,7 +157,7 @@ func TestSendMediaToUser(t *testing.T) {
 	saveParts(t, s, a.ID, 555, []byte("hello "), []byte("world"))
 
 	enc, err := api.SendMediaForTest(s, a.ID, blobs, api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     api.InputPeerUser(a.ID, b.ID),
 		Media:    uploadedDocument(555, 2, "hello.txt", "text/plain"),
 		Message:  "look",
 		RandomID: 42,
@@ -180,7 +180,7 @@ func TestSendMediaToUser(t *testing.T) {
 
 	// The recipient reads the same document off their own history.
 	hist, err := api.GetHistoryForTest(s, b.ID, &tg.MessagesGetHistoryRequest{
-		Peer: &tg.InputPeerUser{UserID: a.ID, AccessHash: a.ID},
+		Peer: api.InputPeerUser(b.ID, a.ID),
 	})
 	if err != nil {
 		t.Fatalf("get history: %v", err)
@@ -238,7 +238,7 @@ func TestSendMediaSanitizesStoredMIME(t *testing.T) {
 	// The wiring, not the pure function: a mime type with a space is stored as
 	// the generic type, and the reply echoes what was stored.
 	enc, err := api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     api.InputPeerUser(a.ID, b.ID),
 		Media:    uploadedDocument(564, 1, "two\nlines.txt", "text/plain; charset=utf-8"),
 		RandomID: 50,
 	})
@@ -270,7 +270,7 @@ func TestSendMediaResendIsIdempotent(t *testing.T) {
 	saveParts(t, s, a.ID, 565, []byte("once"))
 
 	req := &tg.MessagesSendMediaRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     api.InputPeerUser(a.ID, b.ID),
 		Media:    uploadedDocument(565, 1, "once.txt", "text/plain"),
 		Message:  "look",
 		RandomID: 51,
@@ -297,7 +297,7 @@ func TestSendMediaResendIsIdempotent(t *testing.T) {
 		t.Errorf("files rows = %d, want 1", n)
 	}
 	hist, err := api.GetHistoryForTest(s, b.ID, &tg.MessagesGetHistoryRequest{
-		Peer: &tg.InputPeerUser{UserID: a.ID, AccessHash: a.ID},
+		Peer: api.InputPeerUser(b.ID, a.ID),
 	})
 	if err != nil {
 		t.Fatalf("get history: %v", err)
@@ -369,7 +369,7 @@ func TestSendMediaRejectsPhoto(t *testing.T) {
 	saveParts(t, s, a.ID, 557, []byte("not really a png"))
 
 	_, err = api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
-		Peer: &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer: api.InputPeerUser(a.ID, b.ID),
 		Media: &tg.InputMediaUploadedPhoto{
 			File: &tg.InputFile{ID: 557, Parts: 1, Name: "photo.png"},
 		},
@@ -395,7 +395,7 @@ func TestSendMediaRejectsThumb(t *testing.T) {
 	media := uploadedDocument(558, 1, "clip.bin", "application/octet-stream")
 	media.SetThumb(&tg.InputFile{ID: 559, Parts: 1, Name: "thumb.jpg"})
 	_, err = api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     api.InputPeerUser(a.ID, b.ID),
 		Media:    media,
 		RandomID: 45,
 	})
@@ -417,7 +417,7 @@ func TestSendMediaRejectsPartCountMismatch(t *testing.T) {
 	saveParts(t, s, a.ID, 560, []byte("one"), []byte("two"))
 
 	_, err = api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     api.InputPeerUser(a.ID, b.ID),
 		Media:    uploadedDocument(560, 3, "short.txt", "text/plain"),
 		RandomID: 46,
 	})
@@ -446,7 +446,7 @@ func TestSendMediaRejectsAnotherAccountsUpload(t *testing.T) {
 	saveParts(t, s, b.ID, 561, []byte("b's bytes"))
 
 	_, err = api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     api.InputPeerUser(a.ID, b.ID),
 		Media:    uploadedDocument(561, 1, "stolen.txt", "text/plain"),
 		RandomID: 47,
 	})
@@ -494,7 +494,7 @@ func TestSendMediaEnforcesStorageQuota(t *testing.T) {
 	saveParts(t, s, a.ID, 563, []byte("eleven byte"))
 
 	_, err = api.SendMediaForTest(s, a.ID, newBlobs(t), 4, &tg.MessagesSendMediaRequest{
-		Peer:     &tg.InputPeerUser{UserID: b.ID, AccessHash: b.ID},
+		Peer:     api.InputPeerUser(a.ID, b.ID),
 		Media:    uploadedDocument(563, 1, "big.txt", "text/plain"),
 		RandomID: 49,
 	})

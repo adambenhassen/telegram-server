@@ -464,7 +464,7 @@ func TestDeliverChannelPostPushesViaRealStore(t *testing.T) {
 
 	conn := &fakePushConn{}
 	member := store.ChannelMember{UserID: alice.ID, JoinPts: 0}
-	u := &Updater{h: &handlers{store: s, log: slog.New(slog.DiscardHandler)}, log: slog.New(slog.DiscardHandler)}
+	u := &Updater{h: &handlers{store: s, log: slog.New(slog.DiscardHandler), peers: pgtest.PeerDeriver()}, log: slog.New(slog.DiscardHandler)}
 	u.deliverChannel(ctx, []store.ChannelMember{member}, time.Now(),
 		func(userID int64) []pushConn { return []pushConn{conn} },
 		func(memberID int64, fromPts int) (channelBatch, error) {

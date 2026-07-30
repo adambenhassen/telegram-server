@@ -286,7 +286,7 @@ func TestMediaRoundTrip(t *testing.T) {
 		t.Fatalf("upload parts = %d, want 2", parts)
 	}
 
-	peerB := &tg.InputPeerUser{UserID: b.id, AccessHash: b.id}
+	peerB := peerUser(a.id, b.id)
 	doc := sendUploadedDocument(t, a, peerB, clientFileID, parts, "gate.bin", "here", 910001)
 	if doc.Size != int64(len(payload)) {
 		t.Fatalf("document size = %d, want %d", doc.Size, len(payload))
@@ -299,7 +299,7 @@ func TestMediaRoundTrip(t *testing.T) {
 	}
 
 	// B sees the same document on its own history.
-	peerA := &tg.InputPeerUser{UserID: a.id, AccessHash: a.id}
+	peerA := peerUser(b.id, a.id)
 	var bDoc *tg.Document
 	execChat(t, b.cmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peerA, Limit: 10})
@@ -362,7 +362,7 @@ func TestMediaDownloadRequiresOwnMessage(t *testing.T) {
 	const clientFileID = int64(0x5ED10002)
 	parts := uploadParts(t, a, clientFileID, payload)
 
-	peerB := &tg.InputPeerUser{UserID: b.id, AccessHash: b.id}
+	peerB := peerUser(a.id, b.id)
 	doc := sendUploadedDocument(t, a, peerB, clientFileID, parts, "gate.bin", "here", 910002)
 
 	// B, the recipient, can read it.
@@ -401,8 +401,8 @@ func TestMediaInChatFanOut(t *testing.T) {
 		inv, err := cl.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
 			Title: "Media",
 			Users: []tg.InputUserClass{
-				&tg.InputUser{UserID: b.id, AccessHash: b.id},
-				&tg.InputUser{UserID: c.id, AccessHash: c.id},
+				inputUser(a.id, b.id),
+				inputUser(a.id, c.id),
 			},
 		})
 		if err != nil {

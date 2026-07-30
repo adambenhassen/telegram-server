@@ -44,7 +44,7 @@ func TestEvictClosesOnlyTheRevokedKey(t *testing.T) {
 	t.Parallel()
 	revoked, kept, other := seededKey(1), seededKey(2), seededKey(3)
 	reg := mtproto.NewSessionRegistry()
-	u := api.NewUpdater(nil, reg, slog.New(slog.DiscardHandler))
+	u := api.NewUpdater(nil, reg, slog.New(slog.DiscardHandler), nil)
 	ctx := context.Background()
 
 	const victim, bystander int64 = 7, 9

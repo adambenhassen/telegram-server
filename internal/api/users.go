@@ -48,7 +48,7 @@ func (h *handlers) handleResolvePhone(r *mtproto.Request) (bin.Encoder, error) {
 
 	return &tg.ContactsResolvedPeer{
 		Peer:  &tg.PeerUser{UserID: user.ID},
-		Users: []tg.UserClass{userToTL(user, false)},
+		Users: []tg.UserClass{h.userToTL(user, r.UserID, false)},
 	}, nil
 }
 
@@ -74,13 +74,6 @@ func (h *handlers) handleGetUsers(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errAuthKeyUnreg
 	}
 	return &tg.UserClassVector{Elems: []tg.UserClass{
-		&tg.User{
-			ID:         user.ID,
-			Self:       true,
-			Phone:      user.Phone,
-			FirstName:  user.FirstName,
-			LastName:   user.LastName,
-			AccessHash: user.ID, // M1: self access hash placeholder
-		},
+		h.userToTL(user, r.UserID, true),
 	}}, nil
 }

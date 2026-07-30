@@ -37,10 +37,10 @@ func assertEncodes(t *testing.T, enc bin.Encoder) {
 	}
 }
 
-func inputUsers(ids ...int64) []tg.InputUserClass {
+func inputUsers(viewerID int64, ids ...int64) []tg.InputUserClass {
 	out := make([]tg.InputUserClass, len(ids))
 	for i, id := range ids {
-		out[i] = &tg.InputUser{UserID: id, AccessHash: id}
+		out[i] = api.InputUser(viewerID, id)
 	}
 	return out
 }
@@ -140,7 +140,7 @@ func TestHandleCreateChatFansOutToEveryMember(t *testing.T) {
 	}
 
 	enc, err := api.CreateChatForTest(s, creator.ID, &tg.MessagesCreateChatRequest{
-		Users: inputUsers(invited[0].ID, invited[1].ID, invited[2].ID),
+		Users: inputUsers(creator.ID, invited[0].ID, invited[1].ID, invited[2].ID),
 		Title: "Team",
 	})
 	if err != nil {
@@ -251,7 +251,7 @@ func TestHandleCreateChatReportsMissingInvitee(t *testing.T) {
 	absent := other.ID + 100000
 
 	enc, err := api.CreateChatForTest(s, creator.ID, &tg.MessagesCreateChatRequest{
-		Users: inputUsers(other.ID, absent),
+		Users: inputUsers(creator.ID, other.ID, absent),
 		Title: "Team",
 	})
 	if err != nil {
@@ -302,7 +302,7 @@ func TestHandleCreateChatRejectsOversize(t *testing.T) {
 		oversize = append(oversize, int64(i+1))
 	}
 	_, err = api.CreateChatForTest(s, creator.ID, &tg.MessagesCreateChatRequest{
-		Users: inputUsers(oversize...), Title: "Too big",
+		Users: inputUsers(creator.ID, oversize...), Title: "Too big",
 	})
 	if msg := rpcMessage(t, err); msg != "USERS_TOO_MUCH" {
 		t.Fatalf("oversize vector: got %s, want USERS_TOO_MUCH", msg)
@@ -320,7 +320,7 @@ func TestHandleCreateChatRejectsOversize(t *testing.T) {
 		full = append(full, u.ID)
 	}
 	_, err = api.CreateChatForTest(s, creator.ID, &tg.MessagesCreateChatRequest{
-		Users: inputUsers(full...), Title: "One too many",
+		Users: inputUsers(creator.ID, full...), Title: "One too many",
 	})
 	if msg := rpcMessage(t, err); msg != "USERS_TOO_MUCH" {
 		t.Fatalf("store overflow: got %s, want USERS_TOO_MUCH", msg)
@@ -370,7 +370,7 @@ func TestHandleCreateChatRejectsMalformedInputUser(t *testing.T) {
 func createChatForTest(t *testing.T, s *store.Store, creator int64, title string, members ...int64) int64 {
 	t.Helper()
 	enc, err := api.CreateChatForTest(s, creator, &tg.MessagesCreateChatRequest{
-		Users: inputUsers(members...), Title: title,
+		Users: inputUsers(creator, members...), Title: title,
 	})
 	if err != nil {
 		t.Fatalf("create chat: %v", err)

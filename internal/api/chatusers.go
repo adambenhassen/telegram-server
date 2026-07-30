@@ -16,7 +16,7 @@ import (
 // wire error ready to hand back. A target that no user row backs is
 // PEER_ID_INVALID, the same error a bad access hash gets.
 func (h *handlers) resolveTarget(ctx context.Context, u tg.InputUserClass, selfID int64, op string) (int64, error) {
-	target, err := inputUserID(u, selfID)
+	target, err := h.inputUserID(u, selfID)
 	if err != nil {
 		return 0, err
 	}
