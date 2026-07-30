@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -250,19 +251,20 @@ func TestChannelsLifecycle(t *testing.T) {
 
 	// B receives UpdateNewChannelMessage with the correct text and Pts=1.
 	select {
-	case m := <-collB.newChannelMsg:
-		if m.Message != "hello channel" {
-			t.Fatalf("B channel msg = %q, want %q", m.Message, "hello channel")
+	case upd := <-collB.newChannelMsg:
+		if upd.Msg.Message != "hello channel" {
+			t.Fatalf("B channel msg = %q, want %q", upd.Msg.Message, "hello channel")
 		}
-		peer, ok := m.PeerID.(*tg.PeerChannel)
+		peer, ok := upd.Msg.PeerID.(*tg.PeerChannel)
 		if !ok {
-			t.Fatalf("B peer = %T, want *tg.PeerChannel", m.PeerID)
+			t.Fatalf("B peer = %T, want *tg.PeerChannel", upd.Msg.PeerID)
 		}
 		if peer.ChannelID != chID {
 			t.Fatalf("B peer channelID = %d, want %d", peer.ChannelID, chID)
 		}
-		// Pts=1 is asserted via the UpdateNewChannelMessage envelope; the message
-		// itself does not carry pts, so read it from the update the sender received.
+		if upd.Pts != 1 {
+			t.Fatalf("B UpdateNewChannelMessage Pts = %d, want 1", upd.Pts)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("B timed out waiting for channel message")
 	}
@@ -361,8 +363,6 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 			return 0
 		}
 	}
-	aUserID := login(aID, "A")
-	_ = aUserID
 	bUserID := login(bID, "B")
 
 	// A creates broadcast channel, B joins.
@@ -907,9 +907,9 @@ func TestChannelsBan(t *testing.T) {
 		return err
 	})
 	select {
-	case m := <-collB.newChannelMsg:
-		if m.Message != "live 1" {
-			t.Fatalf("B pre-ban msg = %q, want %q", m.Message, "live 1")
+	case upd := <-collB.newChannelMsg:
+		if upd.Msg.Message != "live 1" {
+			t.Fatalf("B pre-ban msg = %q, want %q", upd.Msg.Message, "live 1")
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("B timed out waiting for live 1")
@@ -994,16 +994,26 @@ func TestChannelsBan(t *testing.T) {
 		return nil
 	})
 
-	// B: getChannelDifference → succeeds (returns empty because join_pts floor
-	// was set before any posts; currentPts is the floor).
+	// B: getChannelDifference → UpdatesChannelDifference with Final=true
+	// and the messages posted before/during the ban (access restored after unban).
 	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
-		_, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
+		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
 			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
 			Pts:     0,
 			Limit:   10,
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		diff, ok := d.(*tg.UpdatesChannelDifference)
+		if !ok {
+			return fmt.Errorf("getChannelDifference after unban: got %T, want *tg.UpdatesChannelDifference", d)
+		}
+		if !diff.Final {
+			return errors.New("getChannelDifference after unban: Final != true")
+		}
+		return nil
 	})
 
 	// A posts "live 3"; B receives it (unban restored delivery).
@@ -1016,9 +1026,9 @@ func TestChannelsBan(t *testing.T) {
 		return err
 	})
 	select {
-	case m := <-collB.newChannelMsg:
-		if m.Message != "live 3" {
-			t.Fatalf("B post-unban msg = %q, want %q", m.Message, "live 3")
+	case upd := <-collB.newChannelMsg:
+		if upd.Msg.Message != "live 3" {
+			t.Fatalf("B post-unban msg = %q, want %q", upd.Msg.Message, "live 3")
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("B timed out waiting for live 3 after unban")
@@ -1151,9 +1161,9 @@ func TestChannelsCrossReplica(t *testing.T) {
 
 	// B (on server 2) receives the channel message over LISTEN/NOTIFY.
 	select {
-	case m := <-collB.newChannelMsg:
-		if m.Message != "cross replica channel" {
-			t.Fatalf("B received %q, want %q", m.Message, "cross replica channel")
+	case upd := <-collB.newChannelMsg:
+		if upd.Msg.Message != "cross replica channel" {
+			t.Fatalf("B received %q, want %q", upd.Msg.Message, "cross replica channel")
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("B timed out waiting for cross-replica channel message")
