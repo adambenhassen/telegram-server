@@ -108,7 +108,7 @@ func TestClientLogin(t *testing.T) {
 		t.Fatalf("user not persisted: ok=%v err=%v", ok, err)
 	}
 	if u.Phone != phone {
-		t.Errorf("phone = %q", u.Phone)
+		t.Errorf("phone = %q, want %q", u.Phone, phone)
 	}
 }
 
