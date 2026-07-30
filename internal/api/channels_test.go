@@ -2209,11 +2209,11 @@ func TestGetChannelDifferenceSkippedEvent(t *testing.T) {
 }
 
 // TestGetDialogsMultiChannelByteIdentical verifies that the batched channel
-// dialog query produces a response structurally identical to an independent
-// reference built from the store's ChannelDialogsForUser rows. The reference
-// is built by reading the store rows directly and constructing the expected
-// dialog list, then compared field-by-field against the API response. This
-// proves the batched path renders the same data the per-channel path did.
+// dialog query produces wire bytes identical to a reference built through the
+// former per-channel path: ChannelsForUser → ChannelHistory + ChannelState per
+// channel. The reference is rendered into a complete MessagesDialogs (channels
+// prepended, matching the cursor fix), encoded to bytes, and compared against
+// the batched API response.
 func TestGetDialogsMultiChannelByteIdentical(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -2252,72 +2252,84 @@ func TestGetDialogsMultiChannelByteIdentical(t *testing.T) {
 		t.Fatalf("dm: %v", err)
 	}
 
-	// Build reference from store rows.
-	rows, err := s.ChannelDialogsForUser(ctx, member.ID)
+	// Build reference through the former per-channel path:
+	// ChannelsForUser → ChannelHistory + ChannelState for each channel.
+	allChannels, err := s.ChannelsForUser(ctx, member.ID)
 	if err != nil {
-		t.Fatalf("store query: %v", err)
+		t.Fatalf("channels for user: %v", err)
 	}
-	refChannelIDs := make(map[int64]bool)
-	refChannelTopIDs := make([]int64, 0, len(rows))
-	for _, r := range rows {
-		if r.Top == nil {
+	refChannelDialogs := make([]tg.DialogClass, 0, len(allChannels))
+	for _, ch := range allChannels {
+		hist, herr := s.ChannelHistory(ctx, ch.ID, 0, 1)
+		if herr != nil {
+			t.Fatalf("channel history %d: %v", ch.ID, herr)
+		}
+		if len(hist) == 0 {
 			continue
 		}
-		refChannelIDs[r.Channel.ID] = true
-		refChannelTopIDs = append(refChannelTopIDs, r.Top.LocalID)
+		pts, perr := s.ChannelState(ctx, ch.ID)
+		if perr != nil {
+			t.Fatalf("channel state %d: %v", ch.ID, perr)
+		}
+		d := &tg.Dialog{
+			Peer:       &tg.PeerChannel{ChannelID: ch.ID},
+			TopMessage: int(hist[0].LocalID),
+		}
+		d.SetPts(pts)
+		refChannelDialogs = append(refChannelDialogs, d)
 	}
 
-	// Call API and verify it matches the store reference.
+	// Build reference dialogs: dialogs rows first, channels prepended.
+	dialogRows, err := s.Dialogs(ctx, member.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("dialogs: %v", err)
+	}
+	refDialogs := make([]tg.DialogClass, 0, len(dialogRows)+len(refChannelDialogs))
+	// Prepend channels (matching cursor fix).
+	refDialogs = append(refDialogs, refChannelDialogs...)
+	for _, d := range dialogRows {
+		refDialogs = append(refDialogs, &tg.Dialog{
+			Peer:            api.PeerToTL(d.PeerType, d.PeerID),
+			TopMessage:      int(d.TopMessage),
+			ReadInboxMaxID:  int(d.ReadInboxMaxID),
+			ReadOutboxMaxID: int(d.ReadOutboxMaxID),
+			UnreadCount:     d.UnreadCount,
+		})
+	}
+
+	// Encode reference.
+	refRes := &tg.MessagesDialogs{Dialogs: refDialogs}
+	refBuf := bin.Buffer{}
+	if err = refRes.Encode(&refBuf); err != nil {
+		t.Fatalf("encode reference: %v", err)
+	}
+	refBytes, refErr := refBuf.Bytes()
+	if refErr != nil {
+		t.Fatalf("reference bytes: %v", refErr)
+	}
+
+	// Call batched API and encode.
 	enc, err := api.GetDialogsForTest(s, member.ID)
 	if err != nil {
 		t.Fatalf("get dialogs: %v", err)
 	}
-	got, ok := enc.(*tg.MessagesDialogs)
-	if !ok {
-		t.Fatalf("reply = %T, want *tg.MessagesDialogs", enc)
+	gotBuf := bin.Buffer{}
+	if err = enc.Encode(&gotBuf); err != nil {
+		t.Fatalf("encode batched: %v", err)
+	}
+	gotBytes, gotErr := gotBuf.Bytes()
+	if gotErr != nil {
+		t.Fatalf("batched bytes: %v", gotErr)
 	}
 
-	// Verify channel dialogs match store rows.
-	gotChannelIDs := make(map[int64]bool)
-	gotChannelTopIDs := make([]int64, 0, len(got.Dialogs))
-	for _, d := range got.Dialogs {
-		dlg, isDialog := d.(*tg.Dialog)
-		if !isDialog {
-			continue
+	// Compare wire bytes.
+	if len(gotBytes) != len(refBytes) {
+		t.Fatalf("wire bytes differ in length: batched=%d ref=%d", len(gotBytes), len(refBytes))
+	}
+	for i := range gotBytes {
+		if gotBytes[i] != refBytes[i] {
+			t.Fatalf("wire bytes differ at offset %d: batched=0x%02x ref=0x%02x", i, gotBytes[i], refBytes[i])
 		}
-		if peer, isChan := dlg.Peer.(*tg.PeerChannel); isChan {
-			gotChannelIDs[peer.ChannelID] = true
-			gotChannelTopIDs = append(gotChannelTopIDs, int64(dlg.TopMessage))
-		}
-	}
-
-	if len(gotChannelIDs) != len(refChannelIDs) {
-		t.Fatalf("channel count = %d, want %d (from store)", len(gotChannelIDs), len(refChannelIDs))
-	}
-	for id := range refChannelIDs {
-		if !gotChannelIDs[id] {
-			t.Errorf("missing channel %d in API response", id)
-		}
-	}
-
-	// Verify top message ids match.
-	if len(gotChannelTopIDs) != len(refChannelTopIDs) {
-		t.Fatalf("top ids count = %d, want %d", len(gotChannelTopIDs), len(refChannelTopIDs))
-	}
-	for i := range refChannelTopIDs {
-		if gotChannelTopIDs[i] != refChannelTopIDs[i] {
-			t.Errorf("top id[%d] = %d, want %d", i, gotChannelTopIDs[i], refChannelTopIDs[i])
-		}
-	}
-
-	// Verify message count matches total tops (channels + dialogs).
-	dialogRows, err := s.Dialogs(ctx, member.ID, 0, 100)
-	if err != nil {
-		t.Fatalf("dialogs query: %v", err)
-	}
-	expectMsgs := len(gotChannelTopIDs) + len(dialogRows)
-	if len(got.Messages) != expectMsgs {
-		t.Errorf("messages = %d, want %d (%d channel tops + %d dialog tops)", len(got.Messages), expectMsgs, len(gotChannelTopIDs), len(dialogRows))
 	}
 }
 
