@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -474,5 +477,154 @@ func TestPostChannelMessageAsHidesUnknownChannel(t *testing.T) {
 	}
 	if pts, err := s.ChannelState(ctx, missing); err != nil || pts != 0 {
 		t.Fatalf("unknown channel state = %d, err %v; want 0", pts, err)
+	}
+}
+
+// joinChannel writes a plain participant row for userID in channelID.
+func joinChannel(t *testing.T, s *store.Store, channelID, userID int64) {
+	t.Helper()
+	channelExec(t, context.Background(), pgtest.DSN(t),
+		`INSERT INTO channel_participants (channel_id, user_id, role, join_pts) VALUES ($1, $2, 0, 0)`,
+		channelID, userID)
+}
+
+// channelExec runs one statement against the test database.
+func channelExec(t *testing.T, ctx context.Context, dsn, sql string, args ...any) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		if cerr := conn.Close(ctx); cerr != nil {
+			t.Errorf("close conn: %v", cerr)
+		}
+	}()
+	if _, err := conn.Exec(ctx, sql, args...); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+}
+
+func TestChannelDialogsForUserReturnsChannelsWithTopMessageAndPts(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551270001")
+	member := mustUser(t, s, "+15551270002")
+
+	ch1 := mustChannel(t, s, creator.ID, "News")
+	ch2 := mustChannel(t, s, creator.ID, "Updates")
+
+	// Member joins ch1 only.
+	joinChannel(t, s, ch1.ID, member.ID)
+
+	// Post to ch1 (two posts, top should be the second).
+	_, _ = post(t, s, ch1.ID, creator.ID, "first", 100)
+	m2, _ := post(t, s, ch1.ID, creator.ID, "second", 101)
+
+	// Post to ch2 (creator is member, member is not).
+	post(t, s, ch2.ID, creator.ID, "ch2 post", 200)
+
+	// Member should only see ch1.
+	rows, err := s.ChannelDialogsForUser(ctx, member.ID)
+	if err != nil {
+		t.Fatalf("channel dialogs for user: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.Channel.ID != ch1.ID {
+		t.Fatalf("channel id = %d, want %d", row.Channel.ID, ch1.ID)
+	}
+	if row.Pts != 2 {
+		t.Fatalf("pts = %d, want 2", row.Pts)
+	}
+	if row.Top == nil {
+		t.Fatal("top message is nil")
+	}
+	if row.Top.LocalID != m2.LocalID {
+		t.Fatalf("top local_id = %d, want %d", row.Top.LocalID, m2.LocalID)
+	}
+	if row.Top.FromID != creator.ID {
+		t.Fatalf("top from_id = %d, want %d", row.Top.FromID, creator.ID)
+	}
+}
+
+func TestChannelDialogsForUserSkipsEmptyChannel(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551270011")
+	member := mustUser(t, s, "+15551270012")
+
+	ch := mustChannel(t, s, creator.ID, "Empty")
+	joinChannel(t, s, ch.ID, member.ID)
+
+	// No posts.
+	rows, err := s.ChannelDialogsForUser(ctx, member.ID)
+	if err != nil {
+		t.Fatalf("channel dialogs for user: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].Top != nil {
+		t.Fatalf("top = %+v, want nil for empty channel", rows[0].Top)
+	}
+}
+
+func TestChannelDialogsForUserExcludesDeletedTopMessage(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551270021")
+	member := mustUser(t, s, "+15551270022")
+
+	ch := mustChannel(t, s, creator.ID, "News")
+	joinChannel(t, s, ch.ID, member.ID)
+
+	_, _ = post(t, s, ch.ID, creator.ID, "old", 300)
+	_, _ = post(t, s, ch.ID, creator.ID, "deleted", 301)
+	m3, _ := post(t, s, ch.ID, creator.ID, "new", 302)
+
+	// Delete the middle post (local_id 2).
+	channelExec(t, ctx, pgtest.DSN(t),
+		`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = $2`,
+		ch.ID, int64(2))
+
+	rows, err := s.ChannelDialogsForUser(ctx, member.ID)
+	if err != nil {
+		t.Fatalf("channel dialogs for user: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].Top == nil {
+		t.Fatal("top is nil — should fall back to newest non-deleted")
+	}
+	// Top should be the newest non-deleted: m3 (local_id 3).
+	if rows[0].Top.LocalID != m3.LocalID {
+		t.Fatalf("top local_id = %d, want %d (newest non-deleted)", rows[0].Top.LocalID, m3.LocalID)
+	}
+}
+
+func TestChannelDialogsForUserExcludesNonMember(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551270031")
+	outsider := mustUser(t, s, "+15551270032")
+
+	ch := mustChannel(t, s, creator.ID, "Secret")
+	post(t, s, ch.ID, creator.ID, "post", 400)
+
+	// Outsider is not a member.
+	rows, err := s.ChannelDialogsForUser(ctx, outsider.ID)
+	if err != nil {
+		t.Fatalf("channel dialogs for user: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("rows = %d, want 0 (outsider sees nothing)", len(rows))
 	}
 }

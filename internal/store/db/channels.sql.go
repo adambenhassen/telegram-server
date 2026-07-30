@@ -30,6 +30,105 @@ func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
 	return i, err
 }
 
+const channelDialogsForUser = `-- name: ChannelDialogsForUser :many
+SELECT
+    c.id AS channel_id,
+    c.title,
+    c.about,
+    c.creator_id,
+    c.megagroup,
+    c.version,
+    c.date AS channel_date,
+    cs.pts,
+    cs.next_local_id,
+    cs.date AS state_date,
+    top.local_id   AS top_local_id,
+    top.from_id    AS top_from_id,
+    top.date       AS top_date,
+    top.message    AS top_message,
+    top.edit_date  AS top_edit_date,
+    top.deleted    AS top_deleted,
+    top.random_id  AS top_random_id,
+    top.file_id    AS top_file_id
+FROM channels c
+JOIN channel_participants p ON p.channel_id = c.id
+JOIN channel_state cs ON cs.channel_id = c.id
+LEFT JOIN LATERAL (
+    SELECT cm.channel_id, cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date, cm.deleted, cm.random_id, cm.file_id
+    FROM channel_messages cm
+    WHERE cm.channel_id = c.id AND cm.deleted = false
+    ORDER BY cm.local_id DESC
+    LIMIT 1
+) top ON true
+WHERE p.user_id = $1
+ORDER BY c.id
+`
+
+type ChannelDialogsForUserRow struct {
+	ChannelID   int64
+	Title       string
+	About       string
+	CreatorID   int64
+	Megagroup   bool
+	Version     int32
+	ChannelDate pgtype.Timestamptz
+	Pts         int64
+	NextLocalID int64
+	StateDate   pgtype.Timestamptz
+	TopLocalID  int64
+	TopFromID   int64
+	TopDate     pgtype.Timestamptz
+	TopMessage  string
+	TopEditDate pgtype.Timestamptz
+	TopDeleted  bool
+	TopRandomID int64
+	TopFileID   *int64
+}
+
+// ChannelDialogsForUser returns every channel the user belongs to alongside the
+// channel's pts and the newest non-deleted post (the "top message" for the
+// dialog list). A channel with no posts or whose newest post is deleted still
+// comes back so the caller can skip it; the pts is never NULL because
+// channel_state is created with the channel.
+func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]ChannelDialogsForUserRow, error) {
+	rows, err := q.db.Query(ctx, channelDialogsForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChannelDialogsForUserRow
+	for rows.Next() {
+		var i ChannelDialogsForUserRow
+		if err := rows.Scan(
+			&i.ChannelID,
+			&i.Title,
+			&i.About,
+			&i.CreatorID,
+			&i.Megagroup,
+			&i.Version,
+			&i.ChannelDate,
+			&i.Pts,
+			&i.NextLocalID,
+			&i.StateDate,
+			&i.TopLocalID,
+			&i.TopFromID,
+			&i.TopDate,
+			&i.TopMessage,
+			&i.TopEditDate,
+			&i.TopDeleted,
+			&i.TopRandomID,
+			&i.TopFileID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const channelInviteByHash = `-- name: ChannelInviteByHash :one
 SELECT hash, channel_id, creator_id, date FROM channel_invites WHERE hash = $1
 `
