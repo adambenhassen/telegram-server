@@ -2305,6 +2305,23 @@ func TestGetDialogsMultiChannel(t *testing.T) {
 	if len(res.Messages) != 3 {
 		t.Fatalf("messages = %d, want 3", len(res.Messages))
 	}
+	// Identify the two channel top messages and assert each channel id/local id pair.
+	for _, m := range res.Messages {
+		msg, ok := m.(*tg.Message)
+		if !ok {
+			continue
+		}
+		peer, ok := msg.PeerID.(*tg.PeerChannel)
+		if !ok {
+			continue
+		}
+		if !channelIDs[peer.ChannelID] {
+			t.Errorf("message peer channel %d not in channel set", peer.ChannelID)
+		}
+		if msg.ID != 1 {
+			t.Errorf("channel %d message id = %d, want 1", peer.ChannelID, msg.ID)
+		}
+	}
 
 	// Chats: 2 channels, DM peer must NOT appear.
 	if len(res.Chats) != 2 {
