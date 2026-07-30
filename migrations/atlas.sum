@@ -1,4 +1,4 @@
-h1:6gn99cCU22U3ZsC4x0B86Dlqgny6hhKBOkt1Ggirtjg=
+h1:mR2rDb9d8iKhsio3zT3XdBVmggciifHwM9BY7PFL088=
 20260721000001_baseline.sql h1:cnO6K1z0Uv3goEvecgJixKSio6ziaB1rF7cQLoCWOxs=
 20260721000002_auth_keys.sql h1:+vNabm6vdEAgu3H5ZGw2Wr8D/Y6i4ikAAUO3JbfZQeE=
 20260721000003_code_hardening.sql h1:8pbAqUpqcwOONUfac+qC51QjfC1JnObNCcXa1HC/dr0=
@@ -7,4 +7,4 @@ h1:6gn99cCU22U3ZsC4x0B86Dlqgny6hhKBOkt1Ggirtjg=
 20260725000006_group_chats.sql h1:bq+1zLjEnXZXJK/NwFkPTtccKxwbblbIoAnn72W7T1I=
 20260727000007_media.sql h1:4cz0gqfR/h5Q9jR3jwvBEdCd7dvZiqg+4tvdu4jKMpk=
 20260729000008_channels.sql h1:ms/cdyKM8K7EVf4hu3hyl1j1NdYaM1zBRtqrh+TGdVE=
-20260730000009_lookup_quota.sql h1:bD2p1V1pki2sKVz0wJ3sFBU0rnC2DNO4a5E4jB+EK8Y=
+20260730000009_lookup_quota.sql h1:lbrJeFigESzko6fVNsnm23g9R9b5dvX6kItZutblHzc=

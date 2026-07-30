@@ -14,6 +14,7 @@ import (
 )
 
 func TestResolvePhoneUnauthenticated(t *testing.T) {
+	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
 	if err != nil {
@@ -31,6 +32,7 @@ func TestResolvePhoneUnauthenticated(t *testing.T) {
 }
 
 func TestResolvePhoneInvalidPhone(t *testing.T) {
+	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
 	if err != nil {
@@ -48,6 +50,7 @@ func TestResolvePhoneInvalidPhone(t *testing.T) {
 }
 
 func TestResolvePhoneMiss(t *testing.T) {
+	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
 	if err != nil {
@@ -70,6 +73,7 @@ func TestResolvePhoneMiss(t *testing.T) {
 }
 
 func TestResolvePhoneHit(t *testing.T) {
+	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
 	if err != nil {
@@ -123,6 +127,7 @@ func TestResolvePhoneHit(t *testing.T) {
 }
 
 func TestResolvePhoneQuota(t *testing.T) {
+	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
 	if err != nil {
@@ -159,6 +164,7 @@ func TestResolvePhoneQuota(t *testing.T) {
 }
 
 func TestResolvePhoneQuotaRetrySamePhone(t *testing.T) {
+	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
 	if err != nil {
@@ -177,18 +183,20 @@ func TestResolvePhoneQuotaRetrySamePhone(t *testing.T) {
 		_, _ = api.ResolvePhoneForTest(s, caller.ID, &tg.ContactsResolvePhoneRequest{Phone: phone}) //nolint:errcheck // error expected (miss)
 	}
 
-	// Retry the same phone — should NOT charge again (distinct count).
-	// But quota is already exhausted, so it should still fail.
-	_, err = api.ResolvePhoneForTest(s, caller.ID, &tg.ContactsResolvePhoneRequest{Phone: "15551000000"})
+	// Retry the same phone as loop iteration 0 — distinct count stays at 20,
+	// so quota passes and the miss path returns PHONE_NOT_OCCUPIED.
+	retryPhone := fmt.Sprintf("15551%09d", 0)
+	_, err = api.ResolvePhoneForTest(s, caller.ID, &tg.ContactsResolvePhoneRequest{Phone: retryPhone})
 	if err == nil {
-		t.Fatal("retry of same phone after quota exhausted did not fail")
+		t.Fatal("retry of same phone did not fail")
 	}
-	if !tgerr.Is(err, "FLOOD_WAIT") {
-		t.Errorf("got %v, want FLOOD_WAIT", err)
+	if !tgerr.Is(err, "PHONE_NOT_OCCUPIED") {
+		t.Errorf("got %v, want PHONE_NOT_OCCUPIED", err)
 	}
 }
 
 func TestResolvePhoneSelf(t *testing.T) {
+	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
 	if err != nil {
@@ -227,6 +235,7 @@ func TestResolvePhoneSelf(t *testing.T) {
 }
 
 func TestResolvePhoneNormalization(t *testing.T) {
+	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
 	if err != nil {

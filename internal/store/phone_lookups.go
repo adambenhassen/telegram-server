@@ -27,10 +27,9 @@ const LookupLimit = 20
 // lookup is allowed, ErrLookupQuotaExceeded when the caller has exhausted their
 // quota, and a wrapped error on storage failure.
 //
-// The check is atomic: expired rows are pruned, the current count of distinct
-// phones is read, a new row is inserted (idempotent for retries), and the count
-// is verified again. This prevents a race between the count and the insert from
-// allowing one extra lookup past the limit.
+// The check is atomic: expired rows are pruned, a new row is inserted, and the
+// distinct phone count is verified against the limit. COUNT DISTINCT handles
+// dedup so retries of the same phone do not double-charge.
 func (s *Store) CheckAndChargeLookup(ctx context.Context, callerID int64, phone string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -46,7 +45,7 @@ func (s *Store) CheckAndChargeLookup(ctx context.Context, callerID int64, phone 
 		return fmt.Errorf("prune lookups: %w", err)
 	}
 
-	// Insert the attempt (idempotent: ON CONFLICT DO NOTHING).
+	// Insert the attempt. COUNT DISTINCT handles dedup for retries.
 	if err := qtx.InsertPhoneLookup(ctx, db.InsertPhoneLookupParams{
 		CallerID: callerID,
 		Phone:    phone,

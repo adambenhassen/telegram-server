@@ -1,4 +1,4 @@
--- M9: peer lookup — phone number resolution with per-account quota.
+-- M8: peer lookup — phone number resolution with per-account quota.
 
 -- Normalize existing phone numbers: strip leading '+' so that '+1555...' and
 -- '1555...' are the same value. This backfill is required because the write
@@ -16,6 +16,7 @@ UPDATE phone_codes
 
 -- phone_lookups tracks per-caller, per-phone lookup history for quota enforcement.
 -- Rolling window is enforced by deleting expired rows before counting.
+-- COUNT DISTINCT phone enforces the quota; one row per call is expected.
 CREATE TABLE phone_lookups (
     caller_id   BIGINT    NOT NULL REFERENCES users (id),
     phone       TEXT      NOT NULL,

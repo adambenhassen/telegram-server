@@ -45,7 +45,6 @@ func (q *Queries) DeleteExpiredPhoneLookups(ctx context.Context, lookedUpAt pgty
 const insertPhoneLookup = `-- name: InsertPhoneLookup :exec
 INSERT INTO phone_lookups (caller_id, phone, looked_up_at)
 VALUES ($1, $2, now())
-ON CONFLICT DO NOTHING
 `
 
 type InsertPhoneLookupParams struct {
@@ -54,6 +53,7 @@ type InsertPhoneLookupParams struct {
 }
 
 // Record a lookup attempt. caller_id and phone are the normalized values.
+// COUNT DISTINCT phone enforces the quota; one row per call is expected.
 func (q *Queries) InsertPhoneLookup(ctx context.Context, arg InsertPhoneLookupParams) error {
 	_, err := q.db.Exec(ctx, insertPhoneLookup, arg.CallerID, arg.Phone)
 	return err
