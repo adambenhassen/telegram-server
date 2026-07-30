@@ -7,9 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -480,31 +477,6 @@ func TestPostChannelMessageAsHidesUnknownChannel(t *testing.T) {
 	}
 }
 
-// joinChannel writes a plain participant row for userID in channelID.
-func joinChannel(t *testing.T, s *store.Store, channelID, userID int64) {
-	t.Helper()
-	channelExec(t, context.Background(), pgtest.DSN(t),
-		`INSERT INTO channel_participants (channel_id, user_id, role, join_pts) VALUES ($1, $2, 0, 0)`,
-		channelID, userID)
-}
-
-// channelExec runs one statement against the test database.
-func channelExec(t *testing.T, ctx context.Context, dsn, sql string, args ...any) {
-	t.Helper()
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer func() {
-		if cerr := conn.Close(ctx); cerr != nil {
-			t.Errorf("close conn: %v", cerr)
-		}
-	}()
-	if _, err := conn.Exec(ctx, sql, args...); err != nil {
-		t.Fatalf("exec: %v", err)
-	}
-}
-
 func TestChannelDialogsForUserReturnsChannelsWithTopMessageAndPts(t *testing.T) {
 	t.Parallel()
 	s := open(t)
@@ -515,8 +487,10 @@ func TestChannelDialogsForUserReturnsChannelsWithTopMessageAndPts(t *testing.T) 
 	ch1 := mustChannel(t, s, creator.ID, "News")
 	ch2 := mustChannel(t, s, creator.ID, "Updates")
 
-	// Member joins ch1 only.
-	joinChannel(t, s, ch1.ID, member.ID)
+	// Member joins ch1 only via the shipped invite path.
+	if _, err := store.JoinChannelMember(ctx, s, ch1.ID, member.ID); err != nil {
+		t.Fatalf("join ch1: %v", err)
+	}
 
 	// Post to ch1 (two posts, top should be the second).
 	_, _ = post(t, s, ch1.ID, creator.ID, "first", 100)
@@ -559,7 +533,9 @@ func TestChannelDialogsForUserSkipsEmptyChannel(t *testing.T) {
 	member := mustUser(t, s, "+15551270012")
 
 	ch := mustChannel(t, s, creator.ID, "Empty")
-	joinChannel(t, s, ch.ID, member.ID)
+	if _, err := store.JoinChannelMember(ctx, s, ch.ID, member.ID); err != nil {
+		t.Fatalf("join: %v", err)
+	}
 
 	// No posts.
 	rows, err := s.ChannelDialogsForUser(ctx, member.ID)
@@ -582,16 +558,18 @@ func TestChannelDialogsForUserExcludesDeletedTopMessage(t *testing.T) {
 	member := mustUser(t, s, "+15551270022")
 
 	ch := mustChannel(t, s, creator.ID, "News")
-	joinChannel(t, s, ch.ID, member.ID)
+	if _, err := store.JoinChannelMember(ctx, s, ch.ID, member.ID); err != nil {
+		t.Fatalf("join: %v", err)
+	}
 
 	_, _ = post(t, s, ch.ID, creator.ID, "old", 300)
 	_, _ = post(t, s, ch.ID, creator.ID, "deleted", 301)
 	m3, _ := post(t, s, ch.ID, creator.ID, "new", 302)
 
-	// Delete the middle post (local_id 2).
-	channelExec(t, ctx, pgtest.DSN(t),
-		`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = $2`,
-		ch.ID, int64(2))
+	// Delete the middle post (local_id 2) via the exported test helper.
+	if err := store.SetChannelPostDeleted(ctx, s, ch.ID, 2); err != nil {
+		t.Fatalf("delete post: %v", err)
+	}
 
 	rows, err := s.ChannelDialogsForUser(ctx, member.ID)
 	if err != nil {
