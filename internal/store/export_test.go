@@ -56,6 +56,21 @@ func HoldChatRowLock(ctx context.Context, s *Store, chatID int64) (release func(
 	return func() { _ = tx.Rollback(ctx) }, nil //nolint:errcheck // nothing to commit
 }
 
+// HoldChannelRowLock takes channelID's channels row lock in a transaction of
+// its own and holds it until release is called. It mirrors HoldChatRowLock for
+// the channel mutation path.
+func HoldChannelRowLock(ctx context.Context, s *Store, channelID int64) (release func(), err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.q.WithTx(tx).LockChannel(ctx, channelID); err != nil {
+		_ = tx.Rollback(ctx) //nolint:errcheck // best effort on the error path
+		return nil, err
+	}
+	return func() { _ = tx.Rollback(ctx) }, nil //nolint:errcheck // nothing to commit
+}
+
 // InsertChatMessageNoFanout writes a chat-peer message row carrying fanout_id = 0
 // — the "not a chat message" sentinel a well-formed fan-out never produces. No
 // shipped path can create one, and the guards that reject it still have to be
