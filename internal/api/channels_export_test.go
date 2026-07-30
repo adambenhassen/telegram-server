@@ -92,5 +92,17 @@ func GetChannelDifferenceForTest(s *store.Store, userID int64, req *tg.UpdatesGe
 	return testHandlers(s).handleGetChannelDifference(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// RevokeExportedChatInviteForTest invokes handleRevokeExportedChatInvite for the caller.
+func RevokeExportedChatInviteForTest(s *store.Store, userID, channelID int64, hash string) (bin.Encoder, error) {
+	var buf bin.Buffer
+	buf.PutID(revokeExportedChatInviteTypeID)
+	peer := &tg.InputPeerChannel{ChannelID: channelID, AccessHash: channelID}
+	if err := peer.Encode(&buf); err != nil {
+		return nil, err
+	}
+	buf.PutString(hash)
+	return testHandlers(s).handleRevokeExportedChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // MaxGetChannels exposes the getChannels input cap to the api_test package.
 const MaxGetChannels = maxGetChannels

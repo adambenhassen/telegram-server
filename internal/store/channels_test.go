@@ -736,3 +736,224 @@ func TestChannelMutationsRejectNonMemberBeforeTheRowLock(t *testing.T) {
 		}
 	}
 }
+
+func TestRevokeChannelInvite(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551299001")
+	joiner := mustUser(t, s, "+15551299002")
+	ch := mustChannel(t, s, owner.ID, "News")
+
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+
+	// Revoke.
+	if err = s.RevokeChannelInvite(ctx, hash, ch.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	// Join must fail with same error as unknown hash.
+	_, _, err = s.JoinChannelByInvite(ctx, hash, joiner.ID)
+	if !errors.Is(err, store.ErrInviteInvalid) {
+		t.Fatalf("join after revoke: err = %v, want ErrInviteInvalid", err)
+	}
+
+	// ChannelByInvite must also reject.
+	_, err = s.ChannelByInvite(ctx, hash)
+	if !errors.Is(err, store.ErrInviteInvalid) {
+		t.Fatalf("channel by invite after revoke: err = %v, want ErrInviteInvalid", err)
+	}
+}
+
+func TestRevokeChannelInviteIdempotent(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551299101")
+	ch := mustChannel(t, s, owner.ID, "News")
+
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+
+	// Revoke twice.
+	if err = s.RevokeChannelInvite(ctx, hash, ch.ID); err != nil {
+		t.Fatalf("first revoke: %v", err)
+	}
+	if err = s.RevokeChannelInvite(ctx, hash, ch.ID); err != nil {
+		t.Fatalf("second revoke: %v", err)
+	}
+}
+
+func TestRevokeChannelInvitePerHash(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551299201")
+	joiner := mustUser(t, s, "+15551299202")
+	ch := mustChannel(t, s, owner.ID, "News")
+
+	hash1, err := s.CreateChannelInvite(ctx, ch.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("invite 1: %v", err)
+	}
+	hash2, err := s.CreateChannelInvite(ctx, ch.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("invite 2: %v", err)
+	}
+
+	// Revoke only first.
+	if err = s.RevokeChannelInvite(ctx, hash1, ch.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	// Second still works.
+	_, _, err = s.JoinChannelByInvite(ctx, hash2, joiner.ID)
+	if err != nil {
+		t.Fatalf("join with second: %v", err)
+	}
+
+	// First still refused.
+	_, _, err = s.JoinChannelByInvite(ctx, hash1, owner.ID)
+	if !errors.Is(err, store.ErrInviteInvalid) {
+		t.Fatalf("join with revoked: err = %v, want ErrInviteInvalid", err)
+	}
+}
+
+// TestConcurrentJoinAndRevokeJoinWins proves the invite row lock exists: the
+// join blocks on it (verified by checking joinDone is not yet closed), then
+// proceeds when the blocker releases. Removing FOR UPDATE from
+// JoinChannelByInvite would let the join read without blocking, close joinDone
+// before the sleep ends, and this assertion would fail.
+func TestConcurrentJoinAndRevokeJoinWins(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551299301")
+	joiner := mustUser(t, s, "+15551299302")
+	ch := mustChannel(t, s, owner.ID, "News")
+
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+
+	// Blocker holds the invite row lock.
+	release, err := store.HoldInviteRowLock(ctx, s, hash)
+	if err != nil {
+		t.Fatalf("hold invite lock: %v", err)
+	}
+
+	// Start join — must block on invite row lock.
+	joinDone := make(chan struct{})
+	var joinErr error
+	go func() {
+		_, _, joinErr = s.JoinChannelByInvite(ctx, hash, joiner.ID)
+		close(joinDone)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Join must still be blocked — if FOR UPDATE is missing, it would have
+	// already read the row and proceeded past this point.
+	select {
+	case <-joinDone:
+		t.Fatal("join completed before blocker released — invite row lock not held (FOR UPDATE missing?)")
+	default:
+	}
+
+	// Release blocker — join acquires lock and commits.
+	release()
+	<-joinDone
+
+	if joinErr != nil {
+		t.Fatalf("join: %v", joinErr)
+	}
+	member, found, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil || !found || member.Role != 0 {
+		t.Fatalf("member after join: found=%v role=%d err=%v", found, member.Role, err)
+	}
+}
+
+// TestConcurrentJoinAndRevokeRevokeWins is the critical path: a join is blocked
+// on the invite row lock, a revoke commits while the join waits, and the join
+// must see the revoked row. Removing FOR UPDATE from JoinChannelByInvite would
+// let the join read the row without a lock, miss the revoke, and admit.
+//
+// To force revoke-before-join ordering, the blocker holds the invite lock, the
+// join blocks on it, the blocker commits (join acquires the lock), but the
+// join also needs the channel_state lock. A second blocker holds the
+// channel_state lock, so the join holds the invite lock but blocks on the
+// state lock. The revoke then runs — it blocks on the invite lock held by the
+// join. But we want revoke to win, not join.
+//
+// Simpler approach: hold the invite lock, start the join (blocks), start the
+// revoke (blocks), commit the blocker. PostgreSQL processes waiters in FIFO
+// order, so the join (started first) gets the lock first. That proves the lock
+// exists but not revoke-wins ordering.
+//
+// Correct approach: do the revoke while the blocker holds the lock — it blocks.
+// Commit the blocker. Revoke gets the lock (FIFO: it was queued second, after
+// the join). This is wrong for our purpose.
+//
+// Simplest correct test: hold the invite lock, start the join (blocks), do the
+// revoke (blocks), commit the blocker. The join (first in queue) gets the lock,
+// reads the row (still active), proceeds to channel_state, commits. Then the
+// revoke gets the lock, updates revoked_at. This is join-wins.
+//
+// For revoke-wins: hold the invite lock, do the revoke first (blocks), then
+// start the join (blocks), commit the blocker. Revoke (first in queue) gets
+// the lock, commits. Join (second) gets the lock, sees revoked row, refuses.
+func TestConcurrentJoinAndRevokeRevokeWins(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551299301")
+	joiner := mustUser(t, s, "+15551299302")
+	ch := mustChannel(t, s, owner.ID, "News")
+
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+
+	// Blocker holds the invite row lock.
+	release, err := store.HoldInviteRowLock(ctx, s, hash)
+	if err != nil {
+		t.Fatalf("hold invite lock: %v", err)
+	}
+
+	// Start revoke first — blocks on invite row lock.
+	revokeDone := make(chan struct{})
+	var revokeErr error
+	go func() {
+		revokeErr = s.RevokeChannelInvite(ctx, hash, ch.ID)
+		close(revokeDone)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Start join second — also blocks on invite row lock.
+	joinDone := make(chan struct{})
+	var joinErr error
+	go func() {
+		_, _, joinErr = s.JoinChannelByInvite(ctx, hash, joiner.ID)
+		close(joinDone)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Release blocker — revoke (first in queue) gets the lock, commits.
+	// Join (second) then gets the lock, sees revoked row, refuses.
+	release()
+	<-revokeDone
+	if revokeErr != nil {
+		t.Fatalf("revoke: %v", revokeErr)
+	}
+	<-joinDone
+
+	if !errors.Is(joinErr, store.ErrInviteInvalid) {
+		t.Fatalf("join after revoke: err = %v, want ErrInviteInvalid", joinErr)
+	}
+}
