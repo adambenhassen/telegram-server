@@ -53,7 +53,8 @@ func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
 	if err := validatePhone(req.PhoneNumber); err != nil {
 		return nil, err
 	}
-	hash, code, err := h.store.IssueCode(r.Ctx, req.PhoneNumber)
+	phone := store.NormalizePhone(req.PhoneNumber)
+	hash, code, err := h.store.IssueCode(r.Ctx, phone)
 	if err != nil {
 		if errors.Is(err, store.ErrResendTooSoon) {
 			return nil, errFloodWait
@@ -79,15 +80,16 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
+	phone := store.NormalizePhone(req.PhoneNumber)
 	code, _ := req.GetPhoneCode()
-	if err := h.store.VerifyCode(r.Ctx, req.PhoneNumber, req.PhoneCodeHash, code); err != nil {
+	if err := h.store.VerifyCode(r.Ctx, phone, req.PhoneCodeHash, code); err != nil {
 		if rpc := verifyToRPC(err); rpc != errInternal {
 			return nil, rpc
 		}
 		h.log.Error("verify code", "err", err)
 		return nil, errInternal
 	}
-	user, err := h.store.CreateUser(r.Ctx, req.PhoneNumber)
+	user, err := h.store.CreateUser(r.Ctx, phone)
 	if err != nil {
 		h.log.Error("create user", "err", err)
 		return nil, errInternal

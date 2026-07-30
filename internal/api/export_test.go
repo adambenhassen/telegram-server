@@ -319,3 +319,13 @@ func EditMessageForTest(s *store.Store, userID int64, req *tg.MessagesEditMessag
 	}
 	return testHandlers(s).handleEditMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
+
+// ResolvePhoneForTest invokes handleResolvePhone for the caller against the given
+// request buffer.
+func ResolvePhoneForTest(s *store.Store, userID int64, req *tg.ContactsResolvePhoneRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleResolvePhone(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}

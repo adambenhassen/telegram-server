@@ -88,4 +88,10 @@ var (
 	// FLOOD_WAIT is the right signal: the condition clears on its own as soon as
 	// the in-flight request finishes.
 	errDownloadBusy = rpcErr(420, "FLOOD_WAIT_1")
+	// errLookupFloodWait rejects a contacts.resolvePhone that would take the
+	// caller past their per-account lookup quota.
+	errLookupFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
+	// errPhoneNotOccupied is the byte-identical response for a phone lookup that
+	// finds no account and any target-side refusal — indistinguishable by design.
+	errPhoneNotOccupied = rpcErr(400, "PHONE_NOT_OCCUPIED")
 )
