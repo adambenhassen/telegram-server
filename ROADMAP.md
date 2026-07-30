@@ -390,11 +390,11 @@ Tracked so shortcuts don't rot into "later means never".
   Whether the current two-sided behaviour is a deliberate M5 simplification or a
   defect, and whether M5 wants the `revoke` flag at all, is the open question
   tracked in MAIN-79. — M5
-- **Full history before join.** A current member can only pull events from their
-  `join_pts` forward via `getChannelDifference`; posts before they joined are
-  inaccessible. `join_pts` is a cost-control floor, not a confidentiality
-  boundary — a member with a valid participant row is entitled to the history,
-  just not served it. — M7
+- **Full history to any current member.** `messages.getHistory` serves a member
+  the channel's whole history, including posts from before they joined.
+  `join_pts` bounds only how far back `getChannelDifference` will replay — a
+  cost control, not a confidentiality boundary. Nothing may later be built on it
+  as one. — M7
 - **Invite hash is bearer-grade.** No expiry, no usage limit, no per-invite
   revocation. `expire_date` and `usage_limit` are accepted and silently ignored.
   A leaked hash is a leaked channel until the row is deleted. — M7
@@ -415,6 +415,13 @@ Tracked so shortcuts don't rot into "later means never".
 - **No channel ownership transfer.** A creator who leaves cannot assign the
   creator role to another member. Once the creator leaves, no admin can elevate
   themselves to creator. — M7
+- **No channel media send path.** `messages.sendMedia` rejects channel peers;
+  a channel post cannot carry a document in M7. The download side is already
+  built — the M5 `FileForDownload` gate grew its channel branch in M7 — so the
+  gap is send only. — M7
+- **`store.channels.version` has no wire counterpart.** The column is written
+  and kept in Postgres but never rendered: `tg.Channel` in gotd v0.161.0
+  carries no `Version` field, unlike `tg.Chat`. — M7
 
 ## Engineering invariants
 
