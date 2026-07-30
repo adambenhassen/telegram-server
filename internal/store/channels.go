@@ -408,6 +408,23 @@ func (s *Store) beginChannelMutation(
 		return nil, nil, none, none, e
 	}
 
+	// Early reject, ahead of the channels row lock. A caller who takes that lock
+	// holds it for the rest of the transaction, so letting a non-member reach it
+	// hands an outsider two things: the members' own edits serialised behind them,
+	// and a wait whose length answers whether the channel exists — the timing half
+	// of the oracle the uniform ErrNotMember closes. This is a filter and not the
+	// authorization decision: it reads outside the row lock, so a caller removed
+	// after it passes still gets through, and the re-check below decides. Same
+	// error either way, so an absent channel stays indistinguishable from one the
+	// caller is not in.
+	member, err := qtx.IsChannelMember(ctx, db.IsChannelMemberParams{ChannelID: channelID, UserID: callerID})
+	if err != nil {
+		return fail(fmt.Errorf("is channel member: %w", err))
+	}
+	if !member {
+		return fail(ErrNotMember)
+	}
+
 	if _, err = qtx.LockChannel(ctx, channelID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fail(ErrNotMember)

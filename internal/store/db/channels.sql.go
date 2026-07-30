@@ -305,6 +305,22 @@ func (q *Queries) InsertChannelState(ctx context.Context, channelID int64) error
 	return err
 }
 
+const isChannelMember = `-- name: IsChannelMember :one
+SELECT EXISTS(SELECT 1 FROM channel_participants WHERE channel_id = $1 AND user_id = $2)
+`
+
+type IsChannelMemberParams struct {
+	ChannelID int64
+	UserID    int64
+}
+
+func (q *Queries) IsChannelMember(ctx context.Context, arg IsChannelMemberParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isChannelMember, arg.ChannelID, arg.UserID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const lockChannel = `-- name: LockChannel :one
 SELECT id, title, about, creator_id, megagroup, version, date FROM channels WHERE id = $1 FOR UPDATE
 `
