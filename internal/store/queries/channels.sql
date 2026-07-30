@@ -31,6 +31,9 @@ SELECT * FROM channel_participants WHERE channel_id = $1 ORDER BY user_id;
 -- name: ChannelParticipantByUser :one
 SELECT * FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
 
+-- name: IsChannelMember :one
+SELECT EXISTS(SELECT 1 FROM channel_participants WHERE channel_id = $1 AND user_id = $2);
+
 -- name: CountChannelParticipants :one
 SELECT count(*) FROM channel_participants WHERE channel_id = $1;
 

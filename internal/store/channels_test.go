@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -684,5 +685,54 @@ func TestJoinChannelByInviteRejectsPastThePerAccountCap(t *testing.T) {
 	// a channel it is in still returns, even though it is at the cap.
 	if _, m, err := s.JoinChannelByInvite(ctx, hashOne, joiner.ID); err != nil || m.UserID != joiner.ID {
 		t.Errorf("re-join at the cap: member=%+v err=%v", m, err)
+	}
+}
+
+// TestChannelMutationsRejectNonMemberBeforeTheRowLock pins the other half of the
+// non-member invariant: same error, and no side effect — including not taking
+// the channels row lock. A non-member that takes it holds it for the rest of its
+// transaction, which serialises the real members' edits behind an outsider, and
+// turns the wait into a timing oracle for exactly the channel existence the
+// uniform ErrNotMember exists to hide.
+//
+// The lock is held by a third transaction throughout, so the assertion is on the
+// rejection itself rather than on a wall clock: a call that reaches for the lock
+// blocks until its context expires and fails with something other than
+// ErrNotMember. Both run concurrently because they must not serialise on one
+// another either.
+func TestChannelMutationsRejectNonMemberBeforeTheRowLock(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551298001")
+	member := mustUser(t, s, "+15551298002")
+	outsider := mustUser(t, s, "+15551298003")
+	target := mustUser(t, s, "+15551298004")
+	ch, hash, err := store.SeedChannelWithMember(ctx, s, creator.ID, member.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, hash, target.ID); err != nil {
+		t.Fatalf("join target: %v", err)
+	}
+
+	release, err := store.HoldChannelRowLock(ctx, s, ch.ID)
+	if err != nil {
+		t.Fatalf("hold channel row lock: %v", err)
+	}
+	defer release()
+
+	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	wg.Go(func() { errs[0] = s.SetChannelRole(callCtx, ch.ID, outsider.ID, target.ID, 1) })
+	wg.Go(func() { errs[1] = s.SetChannelBan(callCtx, ch.ID, outsider.ID, target.ID, nil, true) })
+	wg.Wait()
+
+	for i, err := range errs {
+		if !errors.Is(err, store.ErrNotMember) {
+			t.Errorf("call %d under a held channels row lock: want ErrNotMember, got %v", i, err)
+		}
 	}
 }
