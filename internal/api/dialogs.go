@@ -47,43 +47,36 @@ const maxChannelDialogs = 100
 // returning the channel ids referenced, the entries, and the top post of each so
 // the caller can hydrate media for the whole reply in one query. A channel with
 // no posts is skipped: a dialog must name a top message and there is none.
+//
+// Single query via ChannelDialogsForUser replaces the previous per-channel
+// ChannelHistory + ChannelState loop (2N queries).
 func (h *handlers) channelDialogs(ctx context.Context, userID int64) (map[int64]bool, []tg.DialogClass, []store.ChannelMessage, error) {
-	chans, err := h.store.ChannelsForUser(ctx, userID)
+	rows, err := h.store.ChannelDialogsForUser(ctx, userID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if len(chans) > maxChannelDialogs {
-		chans = chans[:maxChannelDialogs]
+	if len(rows) > maxChannelDialogs {
+		rows = rows[:maxChannelDialogs]
 	}
 
-	ids := make(map[int64]bool, len(chans))
-	dialogs := make([]tg.DialogClass, 0, len(chans))
-	tops := make([]store.ChannelMessage, 0, len(chans))
-	for _, ch := range chans {
-		// The newest post is the top message. A membership row is what put this
-		// channel in the list, so the read is already gated.
-		newest, herr := h.store.ChannelHistory(ctx, ch.ID, 0, 1)
-		if herr != nil {
-			return nil, nil, nil, herr
-		}
-		if len(newest) == 0 {
+	ids := make(map[int64]bool, len(rows))
+	dialogs := make([]tg.DialogClass, 0, len(rows))
+	tops := make([]store.ChannelMessage, 0, len(rows))
+	for _, r := range rows {
+		if r.Top == nil {
 			continue
 		}
-		pts, perr := h.store.ChannelState(ctx, ch.ID)
-		if perr != nil {
-			return nil, nil, nil, perr
-		}
 		d := &tg.Dialog{
-			Peer:       &tg.PeerChannel{ChannelID: ch.ID},
-			TopMessage: int(newest[0].LocalID),
+			Peer:       &tg.PeerChannel{ChannelID: r.Channel.ID},
+			TopMessage: int(r.Top.LocalID),
 			// Channels keep no per-member read state in M7, so there is no read
 			// marker and no honest unread count to report.
 			UnreadCount: 0,
 		}
-		d.SetPts(pts)
-		ids[ch.ID] = true
+		d.SetPts(r.Pts)
+		ids[r.Channel.ID] = true
 		dialogs = append(dialogs, d)
-		tops = append(tops, newest[0])
+		tops = append(tops, *r.Top)
 	}
 	return ids, dialogs, tops, nil
 }
@@ -180,17 +173,16 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	// Channels write no dialogs row — they keep one message row per channel, not
-	// one per member — so the caller's channels are appended after the paged
-	// rows rather than read out of the page.
+	// one per member — so the caller's channels are prepended to the paged rows
+	// rather than read out of the page. Prepend (not append) is deliberate: the
+	// client derives its next offset_id from the last dialog's top_message, and a
+	// channel's top_message lives in a different id space (channel local_id vs
+	// dialogs local_id). By placing channels first, the last entry is always a
+	// dialogs row, so the cursor stays valid.
 	//
-	// First page only, and that is what keeps the reply honest rather than a
-	// saving: the block is not part of the paged sequence, so appending it to
-	// every page would repeat the same channels on each one and leave a client
-	// that pages to the end holding as many copies as it fetched pages.
-	// offset_id is the whole page key here (see above — offset_date and
-	// offset_peer are ignored), so offset_id == 0 is the only honest test for
-	// "first page"; adding offset_date to it would hide the channels entirely
-	// from a client that sets a field this handler does not page on.
+	// First page only: the block is not part of the paged sequence, so repeating
+	// it on every page would hand a client that pages to the end one copy per
+	// page. offset_id == 0 is the only honest test for "first page".
 	var channelIDs map[int64]bool
 	var channelDialogs []tg.DialogClass
 	if req.OffsetID == 0 {
@@ -205,11 +197,13 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 			return nil, errInternal
 		}
 		channelIDs, channelDialogs = ids, ds
-		tlDialogs = append(tlDialogs, channelDialogs...)
+		tlDialogs = append(channelDialogs, tlDialogs...)
+		channelMsgs := make([]tg.MessageClass, 0, len(channelTops)+len(tlMsgs))
 		for _, m := range channelTops {
-			tlMsgs = append(tlMsgs, channelMessageToTL(m, r.UserID, channelFiles))
+			channelMsgs = append(channelMsgs, channelMessageToTL(m, r.UserID, channelFiles))
 			peerIDs[m.FromID] = true
 		}
+		tlMsgs = append(channelMsgs, tlMsgs...)
 	}
 
 	users, err := h.loadUsers(r.Ctx, peerIDs, r.UserID)

@@ -209,3 +209,16 @@ func SetChannelPostDeleted(ctx context.Context, s *Store, channelID, localID int
 		channelID, localID)
 	return err
 }
+
+// JoinChannelMember admits userID to an existing channel through the shipped
+// invite path. Returns the invite hash used.
+func JoinChannelMember(ctx context.Context, s *Store, channelID, userID int64) (string, error) {
+	hash, err := s.CreateChannelInvite(ctx, channelID, userID)
+	if err != nil {
+		return "", err
+	}
+	if _, _, err = s.JoinChannelByInvite(ctx, hash, userID); err != nil {
+		return "", err
+	}
+	return hash, nil
+}
