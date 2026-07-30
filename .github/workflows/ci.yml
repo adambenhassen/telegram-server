@@ -61,6 +61,13 @@ jobs:
     # (a stalled pull, a container that never logs) before it burns six hours.
     timeout-minutes: 15
 
+    # The GitHub Actions cache backend writes through the Actions API, which the
+    # workflow-level contents: read does not grant. Job-level permissions replace
+    # it wholesale, so contents: read has to be restated.
+    permissions:
+      contents: read
+      actions: write
+
     services:
       # The server needs a *migrated* database, not merely a reachable one:
       # store.Open refuses to start against an empty schema, so it would never
@@ -90,10 +97,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
 
+      # type=gha needs the docker-container driver; the default builder cannot
+      # export to an external cache backend.
+      - uses: docker/setup-buildx-action@v3.11.1
+
+      # mode=max because the compiler and `go mod download` layers live in the
+      # discarded build stage: mode=min would only cache the distroless result
+      # and a source-only run would still redownload the module cache.
+      # load: true puts the image in the daemon, which every step below inspects.
       - name: Build image
-        run: |
-          docker build -t telegramd:ci .
-          docker images telegramd:ci
+        uses: docker/build-push-action@v6.18.0
+        with:
+          context: .
+          tags: telegramd:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Show image
+        run: docker images telegramd:ci
 
       - name: Assert non-root and no secrets in the image
         run: |
@@ -170,8 +192,30 @@ jobs:
     # Two boots on top of the image build, which is the slow part at roughly a
     # minute; this only catches a hang before it burns six hours.
     timeout-minutes: 20
+
+    # Same reason as the docker job: the cache backend is the Actions API, and a
+    # job-level block replaces the workflow-level contents: read entirely.
+    permissions:
+      contents: read
+      actions: write
+
     steps:
       - uses: actions/checkout@v6.1.0
+
+      # Compose builds with the default builder, which cannot read type=gha, so
+      # the image is built here instead and loaded into the daemon under the tag
+      # the telegramd service names. `up` below finds it present and skips the
+      # build — same image, same assertions, just not rebuilt from scratch.
+      - uses: docker/setup-buildx-action@v3.11.1
+
+      - name: Build image
+        uses: docker/build-push-action@v6.18.0
+        with:
+          context: .
+          tags: telegramd:local
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Write a throwaway .env
         run: |
@@ -275,7 +319,10 @@ jobs:
             docker run --rm -v "$1":/blobs busybox:1.37 cat /blobs/ci_canary
           }
 
-          docker compose up -d --build
+          # No --build: the Build image step already loaded telegramd:local, which
+          # is the tag the service names, and rebuilding here would bypass the
+          # layer cache. Compose still builds it if the image is missing.
+          docker compose up -d
           wait_listening
           docker compose logs telegramd
 

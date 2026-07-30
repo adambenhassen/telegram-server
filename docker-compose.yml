@@ -64,8 +64,11 @@ services:
 
   telegramd:
     # Built from the repo-root Dockerfile: nothing is published to a registry, so
-    # there is no image to pull.
+    # there is no image to pull. The explicit tag is what lets a build done
+    # outside compose — CI builds it with a layer cache — be picked up here
+    # instead of rebuilt; without it the name would follow the project directory.
     build: .
+    image: telegramd:local
     environment:
       TG_POSTGRES_DSN: *dsn
       TG_AUTHKEY_ENC_KEY: ${TG_AUTHKEY_ENC_KEY:?set TG_AUTHKEY_ENC_KEY in .env - generate one with openssl rand -hex 32}
