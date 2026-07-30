@@ -29,7 +29,8 @@ import (
 //  4. Remove the password; a fresh login no longer prompts.
 func TestCloudPassword2FA(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	// ponytail: 3 min budget; SRP package (~60s CPU) runs concurrently and starves this test under 90s
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
