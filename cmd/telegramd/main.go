@@ -19,6 +19,7 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -81,8 +82,20 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	// Derive the peer-hash subkey here, at process start, and hand only the
+	// subkey to the RPC layer. cfg.AuthKeyEncKey itself must not travel past
+	// store.Open: its reach today is storage, and this must not widen it.
+	peerSubkey, err := peerhash.Subkey(cfg.AuthKeyEncKey)
+	if err != nil {
+		return err
+	}
+	peers, err := peerhash.New(peerSubkey)
+	if err != nil {
+		return err
+	}
+
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
-	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes)
+	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers)
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
 	}

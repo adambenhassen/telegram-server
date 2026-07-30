@@ -21,6 +21,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
 )
 
 // migration is one Atlas migration file: its name and SQL body.
@@ -190,6 +192,22 @@ func loadMigrations() ([]migration, error) {
 // decrypts keys written by the prior instance.
 func EncKey() []byte {
 	return bytes.Repeat([]byte{0x2a}, 32)
+}
+
+// PeerDeriver returns the peer access-hash deriver an api.New under test takes,
+// built from EncKey the same way the server builds it at process start. It is
+// deterministic for the same reason EncKey is: a restart test must derive the
+// same hashes the prior instance issued.
+func PeerDeriver() *peerhash.Deriver {
+	sub, err := peerhash.Subkey(EncKey())
+	if err != nil {
+		panic(err)
+	}
+	d, err := peerhash.New(sub)
+	if err != nil {
+		panic(err)
+	}
+	return d
 }
 
 // Prewarm triggers the one-time container setup (image pull and boot) outside of
