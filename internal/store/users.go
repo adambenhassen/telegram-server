@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -14,6 +15,13 @@ type User struct {
 	Phone     string
 	FirstName string
 	LastName  string
+}
+
+// NormalizePhone strips an optional leading '+' so that '+1555...' and
+// '1555...' resolve to the same value. Used on the lookup read path only;
+// write-path normalization requires a separate backfill migration.
+func NormalizePhone(phone string) string {
+	return strings.TrimPrefix(phone, "+")
 }
 
 // CreateUser inserts a user for phone, or returns the existing row. It also

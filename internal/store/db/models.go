@@ -141,6 +141,12 @@ type PhoneCode struct {
 	CreatedAt  pgtype.Timestamptz
 }
 
+type PhoneLookup struct {
+	CallerID   int64
+	Phone      string
+	LookedUpAt pgtype.Timestamptz
+}
+
 type UpdateState struct {
 	UserID      int64
 	Pts         int64
