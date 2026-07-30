@@ -48,6 +48,13 @@ func (h *handlers) notifyEvict(ctx context.Context, userID, authKeyID int64) {
 	}
 }
 
+// notifyChannelPost emits the cross-replica nudge for a new post in channelID.
+func (h *handlers) notifyChannelPost(ctx context.Context, channelID int64) {
+	if err := h.store.Notify(ctx, store.ChannelPost, store.ChannelPostPayload(channelID)); err != nil {
+		h.log.Error("notify channel post", "channel_id", channelID, "err", err)
+	}
+}
+
 // twoUsers hydrates the caller and the peer into the update user list.
 func (h *handlers) twoUsers(ctx context.Context, selfID, peerID int64) ([]tg.UserClass, error) {
 	return h.loadUsers(ctx, map[int64]bool{selfID: true, peerID: true}, selfID)

@@ -72,6 +72,7 @@ func TestStartListenerDispatches(t *testing.T) {
 		func(_ context.Context, userID int64) { delivered <- userID },
 		func(_ context.Context, peerID, fromID int64) { typed <- [2]int64{peerID, fromID} },
 		func(_ context.Context, userID, authKeyID int64) { evicted <- [2]int64{userID, authKeyID} },
+		func(_ context.Context, _ int64) {},
 		nil,
 	)
 	if err != nil {
@@ -175,6 +176,7 @@ func TestStartListenerReconnectsAfterBackendTermination(t *testing.T) {
 		func(_ context.Context, userID int64) { delivered <- userID },
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, userID, authKeyID int64) { evicted <- [2]int64{userID, authKeyID} },
+		func(_ context.Context, _ int64) {},
 		nil,
 	)
 	if err != nil {
@@ -250,6 +252,7 @@ func TestStartListenerBacksOffWhileDatabaseIsDown(t *testing.T) {
 		func(_ context.Context, _ int64) {},
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, _, _ int64) {},
+		func(_ context.Context, _ int64) {},
 		nil,
 	)
 	if err != nil {
@@ -273,6 +276,64 @@ func TestStartListenerBacksOffWhileDatabaseIsDown(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("stop did not return while the listener was in backoff")
+	}
+}
+
+// TestStartListenerDeliversChannelPost proves the channel-post callback fires
+// with the right channelID and that a malformed payload is dropped without
+// disturbing delivery on another channel.
+func TestStartListenerDeliversChannelPost(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	delivered := make(chan int64, 1)
+	posted := make(chan int64, 1)
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(_ context.Context, userID int64) { delivered <- userID },
+		func(_ context.Context, _, _ int64) {},
+		func(_ context.Context, _, _ int64) {},
+		func(_ context.Context, channelID int64) { posted <- channelID },
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	defer func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	}()
+
+	// Malformed payload must be dropped; the channel-updates callback must still
+	// fire on the next valid notification.
+	if err := s.Notify(ctx, store.ChannelPost, "not-an-int"); err != nil {
+		t.Fatalf("notify malformed channel post: %v", err)
+	}
+	if err := s.Notify(ctx, store.ChannelUpdates, "5"); err != nil {
+		t.Fatalf("notify updates: %v", err)
+	}
+	select {
+	case got := <-delivered:
+		if got != 5 {
+			t.Fatalf("delivered userID = %d, want 5", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliver callback not invoked after malformed channel-post payload")
+	}
+
+	// Valid channel-post payload must reach the callback.
+	if err := s.Notify(ctx, store.ChannelPost, store.ChannelPostPayload(42)); err != nil {
+		t.Fatalf("notify channel post: %v", err)
+	}
+	select {
+	case got := <-posted:
+		if got != 42 {
+			t.Fatalf("channelPost channelID = %d, want 42", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("channelPost callback not invoked")
 	}
 }
 
