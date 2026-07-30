@@ -2207,3 +2207,261 @@ func TestGetChannelDifferenceSkippedEvent(t *testing.T) {
 		t.Fatalf("NewMessages = %d, want 2 (skipped event type 2)", len(diff.NewMessages))
 	}
 }
+
+// TestGetDialogsMultiChannel verifies that the batched channel dialog path
+// renders a correct multi-channel response: 2 channels + 1 DM, channels
+// prepended, each channel's TopMessage/pts correct, Messages and Chats
+// populated, DM peer in Users (not Chats).
+func TestGetDialogsMultiChannel(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551297001")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551297002")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+
+	// Create two channels, join member, post in each.
+	channels := make([]store.Channel, 2)
+	for i := range channels {
+		ch, cerr := s.CreateChannel(ctx, creator.ID, fmt.Sprintf("Ch%d", i), "", false)
+		if cerr != nil {
+			t.Fatalf("create channel %d: %v", i, cerr)
+		}
+		channels[i] = ch
+		joinChannelByInvite(t, s, ch, member.ID)
+		if _, cerr = sendToChannel(t, s, creator.ID, ch.ID, fmt.Sprintf("post%d", i), int64(i+1)); cerr != nil {
+			t.Fatalf("post %d: %v", i, cerr)
+		}
+	}
+
+	// Seed a 1:1 DM so the member has a non-channel dialog too.
+	other, err := s.CreateUser(ctx, "+15551297003")
+	if err != nil {
+		t.Fatalf("other: %v", err)
+	}
+	if _, err = api.SendMessageForTest(s, other.ID, &tg.MessagesSendMessageRequest{
+		Peer: &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID}, Message: "hi", RandomID: 999,
+	}); err != nil {
+		t.Fatalf("dm: %v", err)
+	}
+
+	enc, err := api.GetDialogsForTest(s, member.ID)
+	if err != nil {
+		t.Fatalf("get dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("reply = %T, want *tg.MessagesDialogs", enc)
+	}
+
+	// 3 dialogs: 2 channels (prepended) + 1 DM.
+	if len(res.Dialogs) != 3 {
+		t.Fatalf("dialogs = %d, want 3", len(res.Dialogs))
+	}
+
+	// First two are channels, prepended.
+	channelIDs := make(map[int64]bool)
+	for i, ch := range channels {
+		dlg, ok := res.Dialogs[i].(*tg.Dialog)
+		if !ok {
+			t.Fatalf("dialog[%d] = %T, want *tg.Dialog", i, res.Dialogs[i])
+		}
+		peer, ok := dlg.Peer.(*tg.PeerChannel)
+		if !ok {
+			t.Fatalf("dialog[%d].peer = %T, want *tg.PeerChannel", i, dlg.Peer)
+		}
+		if peer.ChannelID != ch.ID {
+			t.Errorf("dialog[%d] channel id = %d, want %d", i, peer.ChannelID, ch.ID)
+		}
+		channelIDs[peer.ChannelID] = true
+		// Each channel has 1 post, so TopMessage == 1 and pts == 1.
+		if dlg.TopMessage != 1 {
+			t.Errorf("dialog[%d] top_message = %d, want 1", i, dlg.TopMessage)
+		}
+		if pts, hasPts := dlg.GetPts(); !hasPts || pts != 1 {
+			t.Errorf("dialog[%d] pts = %d present=%v, want 1", i, pts, hasPts)
+		}
+	}
+
+	// Third dialog is the DM.
+	dmDlg, ok := res.Dialogs[2].(*tg.Dialog)
+	if !ok {
+		t.Fatalf("dialog[2] = %T, want *tg.Dialog", res.Dialogs[2])
+	}
+	dmPeer, ok := dmDlg.Peer.(*tg.PeerUser)
+	if !ok {
+		t.Fatalf("dialog[2].peer = %T, want *tg.PeerUser", dmDlg.Peer)
+	}
+	if dmPeer.UserID != other.ID {
+		t.Errorf("dialog[2] user id = %d, want %d", dmPeer.UserID, other.ID)
+	}
+
+	// Messages: 2 channel tops + 1 DM top = 3.
+	if len(res.Messages) != 3 {
+		t.Fatalf("messages = %d, want 3", len(res.Messages))
+	}
+	// Collect channel-message peer IDs, reject duplicates, assert set equals
+	// both expected channel IDs.
+	msgChannelIDs := make(map[int64]bool)
+	for _, m := range res.Messages {
+		msg, ok := m.(*tg.Message)
+		if !ok {
+			continue
+		}
+		peer, ok := msg.PeerID.(*tg.PeerChannel)
+		if !ok {
+			continue
+		}
+		if msgChannelIDs[peer.ChannelID] {
+			t.Errorf("duplicate channel top message for channel %d", peer.ChannelID)
+		}
+		msgChannelIDs[peer.ChannelID] = true
+		if msg.ID != 1 {
+			t.Errorf("channel %d message id = %d, want 1", peer.ChannelID, msg.ID)
+		}
+	}
+	if len(msgChannelIDs) != len(channels) {
+		t.Errorf("channel messages = %d, want %d", len(msgChannelIDs), len(channels))
+	}
+	for _, ch := range channels {
+		if !msgChannelIDs[ch.ID] {
+			t.Errorf("missing channel top message for channel %d", ch.ID)
+		}
+	}
+
+	// Chats: 2 channels, DM peer must NOT appear.
+	if len(res.Chats) != 2 {
+		t.Fatalf("chats = %d, want 2", len(res.Chats))
+	}
+	for _, c := range res.Chats {
+		ch, ok := c.(*tg.Channel)
+		if !ok {
+			t.Errorf("chat = %T, want *tg.Channel", c)
+			continue
+		}
+		if !channelIDs[ch.ID] {
+			t.Errorf("chat id %d not in channel set", ch.ID)
+		}
+	}
+
+	// Users: DM peer must appear.
+	gotUsers := make(map[int64]bool)
+	for _, u := range res.Users {
+		gotUsers[u.GetID()] = true
+	}
+	if !gotUsers[other.ID] {
+		t.Error("users missing DM peer")
+	}
+}
+
+// TestGetDialogsChannelCursorSafe verifies that channels are prepended (not
+// appended) so the last dialog in the reply is always a dialogs row. This keeps
+// offset_id valid across pages even when the page is truncated.
+func TestGetDialogsChannelCursorSafe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551298001")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551298002")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+
+	// Create a channel with a post.
+	ch, err := s.CreateChannel(ctx, creator.ID, "CursorTest", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	joinChannelByInvite(t, s, ch, member.ID)
+	if _, err = sendToChannel(t, s, creator.ID, ch.ID, "post", 1); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// Create 21 DM dialogs so the first page (limit 20) is truncated.
+	for i := range 21 {
+		peer, perr := s.CreateUser(ctx, fmt.Sprintf("+15551298%03d", 100+i))
+		if perr != nil {
+			t.Fatalf("peer %d: %v", i, perr)
+		}
+		if _, perr = api.SendMessageForTest(s, peer.ID, &tg.MessagesSendMessageRequest{
+			Peer: &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID}, Message: "hi", RandomID: int64(i + 1),
+		}); perr != nil {
+			t.Fatalf("dm %d: %v", i, perr)
+		}
+	}
+
+	// First page (limit 20) is truncated — channels are prepended, so the LAST
+	// dialog must be a dialogs row (not a channel) for cursor to stay valid.
+	enc, err := api.GetDialogsPageForTest(s, member.ID, &tg.MessagesGetDialogsRequest{
+		Limit: 20, OffsetPeer: &tg.InputPeerEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	slice, ok := enc.(*tg.MessagesDialogsSlice)
+	if !ok {
+		t.Fatalf("first page = %T, want *tg.MessagesDialogsSlice", enc)
+	}
+	// Last dialog must NOT be a channel — that's the cursor invariant.
+	lastDialog, ok := slice.Dialogs[len(slice.Dialogs)-1].(*tg.Dialog)
+	if !ok {
+		t.Fatalf("last dialog type = %T", slice.Dialogs[len(slice.Dialogs)-1])
+	}
+	if _, isChan := lastDialog.Peer.(*tg.PeerChannel); isChan {
+		t.Error("last dialog is a channel — cursor would break on pagination")
+	}
+	// First dialog should be the channel (prepended).
+	firstDialog, ok := slice.Dialogs[0].(*tg.Dialog)
+	if !ok {
+		t.Fatalf("first dialog type = %T", slice.Dialogs[0])
+	}
+	if _, isChan := firstDialog.Peer.(*tg.PeerChannel); !isChan {
+		t.Error("first dialog is not a channel — channels should be prepended")
+	}
+
+	// Second page: page from the last dialog's TopMessage (the cursor the client
+	// would use), and verify the exact remaining dialogs with no overlap.
+	enc, err = api.GetDialogsPageForTest(s, member.ID, &tg.MessagesGetDialogsRequest{
+		Limit: 20, OffsetID: lastDialog.TopMessage, OffsetPeer: &tg.InputPeerEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	var page2Dialogs []tg.DialogClass
+	switch p := enc.(type) {
+	case *tg.MessagesDialogs:
+		page2Dialogs = p.Dialogs
+	case *tg.MessagesDialogsSlice:
+		page2Dialogs = p.Dialogs
+	default:
+		t.Fatalf("second page = %T, want *tg.MessagesDialogs or *tg.MessagesDialogsSlice", enc)
+	}
+	// No channel on page 2.
+	for _, d := range page2Dialogs {
+		if dlg, isDialog := d.(*tg.Dialog); isDialog {
+			if _, isChan := dlg.Peer.(*tg.PeerChannel); isChan {
+				t.Error("channel appeared on non-first page")
+			}
+		}
+	}
+	// Page 2 must carry exactly the remaining dialogs (21 total - 20 on page 1 = 1).
+	if len(page2Dialogs) != 1 {
+		t.Fatalf("page 2 dialogs = %d, want 1", len(page2Dialogs))
+	}
+	// No overlap: page 2's top_message must be strictly less than the cursor.
+	p2Dlg, ok := page2Dialogs[0].(*tg.Dialog)
+	if !ok {
+		t.Fatalf("page 2 dialog type = %T", page2Dialogs[0])
+	}
+	if p2Dlg.TopMessage >= lastDialog.TopMessage {
+		t.Errorf("page 2 top_message = %d, want < %d (no overlap with page 1)", p2Dlg.TopMessage, lastDialog.TopMessage)
+	}
+}
