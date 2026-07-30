@@ -14,9 +14,10 @@ import (
 
 // Postgres LISTEN/NOTIFY channels used for cross-replica update delivery.
 const (
-	ChannelUpdates = "tg_updates" // payload: "<userID>"
-	ChannelTyping  = "tg_typing"  // payload: "<peerUserID>|<fromUserID>"
-	ChannelEvict   = "tg_evict"   // payload: "<userID>|<authKeyID>"
+	ChannelUpdates = "tg_updates"      // payload: "<userID>"
+	ChannelTyping  = "tg_typing"       // payload: "<peerUserID>|<fromUserID>"
+	ChannelEvict   = "tg_evict"        // payload: "<userID>|<authKeyID>"
+	ChannelPost    = "tg_channel_post" // payload: "<channelID>"
 )
 
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
@@ -64,12 +65,14 @@ type Listener struct {
 	closeErr error
 }
 
-// StartListener opens a dedicated connection, subscribes to the update, typing
-// and evict channels, and runs the notification loop until the returned stop
-// function is called (which cancels the loop, drains it, and returns the error
-// from closing the connection). deliver receives a userID whose events changed;
-// typing receives (peerUserID, fromUserID) for a transient typing notification;
-// evict receives (userID, authKeyID) for a session revoked on any replica.
+// StartListener opens a dedicated connection, subscribes to the update, typing,
+// evict and channel-post channels, and runs the notification loop until the
+// returned stop function is called (which cancels the loop, drains it, and
+// returns the error from closing the connection). deliver receives a userID
+// whose events changed; typing receives (peerUserID, fromUserID) for a
+// transient typing notification; evict receives (userID, authKeyID) for a
+// session revoked on any replica; channelPost receives a channelID whose post
+// was just committed.
 //
 // A broken connection is reconnected with bounded backoff rather than ending
 // delivery for the life of the process. Notifications emitted while the
@@ -84,6 +87,7 @@ func StartListener(
 	deliver func(ctx context.Context, userID int64),
 	typing func(ctx context.Context, peerID, fromID int64),
 	evict func(ctx context.Context, userID, authKeyID int64),
+	channelPost func(ctx context.Context, channelID int64),
 	log *slog.Logger,
 ) (*Listener, func() error, error) {
 	if log == nil {
@@ -97,7 +101,7 @@ func StartListener(
 	l := &Listener{log: log}
 	loopCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	wg.Go(func() { l.run(loopCtx, conn, dsn, deliver, typing, evict) })
+	wg.Go(func() { l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost) })
 
 	stop := func() error {
 		cancel()
@@ -107,7 +111,7 @@ func StartListener(
 	return l, stop, nil
 }
 
-// connectAndListen opens a connection subscribed to every channel. The three
+// connectAndListen opens a connection subscribed to every channel. All four
 // are always subscribed together: a connection carrying only some of them
 // silently drops a whole class of delivery.
 func connectAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
@@ -115,7 +119,7 @@ func connectAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listener connect: %w", err)
 	}
-	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict} {
+	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost} {
 		// ch is a constant channel identifier, never user input (no injection).
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			_ = conn.Close(ctx) //nolint:errcheck // best-effort close on setup failure
@@ -136,6 +140,7 @@ func (l *Listener) run(
 	deliver func(ctx context.Context, userID int64),
 	typing func(ctx context.Context, peerID, fromID int64),
 	evict func(ctx context.Context, userID, authKeyID int64),
+	channelPost func(ctx context.Context, channelID int64),
 ) {
 	backoff := listenerBackoffMin
 	for {
@@ -157,7 +162,7 @@ func (l *Listener) run(
 		}
 
 		up := time.Now()
-		err := l.dispatch(ctx, conn, deliver, typing, evict)
+		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost)
 		closeErr := conn.Close(context.Background())
 		conn = nil
 		if ctx.Err() != nil {
@@ -177,6 +182,7 @@ func (l *Listener) dispatch(
 	deliver func(ctx context.Context, userID int64),
 	typing func(ctx context.Context, peerID, fromID int64),
 	evict func(ctx context.Context, userID, authKeyID int64),
+	channelPost func(ctx context.Context, channelID int64),
 ) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
@@ -207,6 +213,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			evict(ctx, userID, authKeyID)
+		case ChannelPost:
+			channelID, perr := strconv.ParseInt(n.Payload, 10, 64)
+			if perr != nil {
+				l.log.Warn("bad tg_channel_post payload", "payload", n.Payload)
+				continue
+			}
+			channelPost(ctx, channelID)
 		}
 	}
 }
@@ -222,6 +235,11 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 		return true
 	}
+}
+
+// ChannelPostPayload formats a tg_channel_post NOTIFY payload from channelID.
+func ChannelPostPayload(channelID int64) string {
+	return strconv.FormatInt(channelID, 10)
 }
 
 // TypingPayload formats a tg_typing NOTIFY payload from the peer and sender ids.
