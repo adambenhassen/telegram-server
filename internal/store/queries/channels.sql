@@ -81,8 +81,12 @@ ORDER BY c.id;
 
 -- ChannelDialogsForUser returns every channel the user belongs to alongside the
 -- channel's pts and the newest non-deleted post (the "top message" for the
--- dialog list). Channels with no posts or whose newest post is deleted are
--- excluded — a dialog must name a top message and there is none without it.
+-- dialog list). Channels with no posts or whose newest post is deleted appear
+-- with top_local_id = 0 so the caller can skip them. LEFT JOIN is deliberate:
+-- the 100-channel cap applies to the candidate set (all memberships), not to
+-- the filtered set, so an empty channel still counts against the cap.
+-- COALESCE guards against NULL from the lateral join; local_id >= 1 so 0 is
+-- a safe sentinel for "no row".
 -- name: ChannelDialogsForUser :many
 SELECT
     c.id AS channel_id,
@@ -95,18 +99,18 @@ SELECT
     cs.pts,
     cs.next_local_id,
     cs.date AS state_date,
-    top.local_id   AS top_local_id,
-    top.from_id    AS top_from_id,
-    top.date       AS top_date,
-    top.message    AS top_message,
-    top.edit_date  AS top_edit_date,
-    top.deleted    AS top_deleted,
-    top.random_id  AS top_random_id,
-    top.file_id    AS top_file_id
+    COALESCE(top.local_id, 0)  AS top_local_id,
+    COALESCE(top.from_id, 0)   AS top_from_id,
+    top.date                   AS top_date,
+    COALESCE(top.message, '')  AS top_message,
+    top.edit_date              AS top_edit_date,
+    COALESCE(top.deleted, false) AS top_deleted,
+    COALESCE(top.random_id, 0) AS top_random_id,
+    top.file_id                AS top_file_id
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
-JOIN LATERAL (
+LEFT JOIN LATERAL (
     SELECT cm.*
     FROM channel_messages cm
     WHERE cm.channel_id = c.id AND cm.deleted = false

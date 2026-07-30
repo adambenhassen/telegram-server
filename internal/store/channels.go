@@ -639,17 +639,19 @@ func (s *Store) ChannelsForUser(ctx context.Context, userID int64) ([]Channel, e
 }
 
 // ChannelDialogRow carries one channel's dialog data: the channel itself, its
-// pts, and the newest non-deleted post (top message). Top is always non-nil —
-// channels with no posts are excluded by the query.
+// pts, and the newest non-deleted post (top message). Top is nil when the
+// channel has no posts or all posts are deleted.
 type ChannelDialogRow struct {
 	Channel Channel
 	Pts     int
-	Top     ChannelMessage
+	Top     *ChannelMessage
 }
 
-// ChannelDialogsForUser returns every channel the user belongs to that has at
-// least one non-deleted post, alongside the channel's pts and the newest post.
-// One query replaces the previous per-channel ChannelHistory + ChannelState calls.
+// ChannelDialogsForUser returns every channel the user belongs to alongside the
+// channel's pts and the newest non-deleted post. Channels with no posts or
+// whose newest post is deleted appear with Top == nil so the caller can skip
+// them. One query replaces the previous per-channel ChannelHistory +
+// ChannelState calls.
 func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]ChannelDialogRow, error) {
 	rows, err := s.q.ChannelDialogsForUser(ctx, userID)
 	if err != nil {
@@ -666,21 +668,25 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 			Version:   int(r.Version),
 			Date:      r.ChannelDate.Time,
 		}
-		top := ChannelMessage{
-			ChannelID: r.ChannelID,
-			LocalID:   r.TopLocalID,
-			FromID:    r.TopFromID,
-			Date:      r.TopDate.Time,
-			Message:   r.TopMessage,
-			Deleted:   r.TopDeleted,
-			RandomID:  r.TopRandomID,
-			FileID:    r.TopFileID,
+		row := ChannelDialogRow{Channel: ch, Pts: int(r.Pts)}
+		if r.TopLocalID != 0 {
+			top := ChannelMessage{
+				ChannelID: r.ChannelID,
+				LocalID:   r.TopLocalID,
+				FromID:    r.TopFromID,
+				Date:      r.TopDate.Time,
+				Message:   r.TopMessage,
+				Deleted:   r.TopDeleted,
+				RandomID:  r.TopRandomID,
+				FileID:    r.TopFileID,
+			}
+			if r.TopEditDate.Valid {
+				ed := r.TopEditDate.Time
+				top.EditDate = &ed
+			}
+			row.Top = &top
 		}
-		if r.TopEditDate.Valid {
-			ed := r.TopEditDate.Time
-			top.EditDate = &ed
-		}
-		out[i] = ChannelDialogRow{Channel: ch, Pts: int(r.Pts), Top: top}
+		out[i] = row
 	}
 	return out, nil
 }
