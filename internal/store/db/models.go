@@ -39,6 +39,7 @@ type ChannelInvite struct {
 	ChannelID int64
 	CreatorID int64
 	Date      pgtype.Timestamptz
+	RevokedAt pgtype.Timestamptz
 }
 
 type ChannelMessage struct {
@@ -139,12 +140,6 @@ type PhoneCode struct {
 	Attempts   int32
 	ConsumedAt pgtype.Timestamptz
 	CreatedAt  pgtype.Timestamptz
-}
-
-type PhoneLookup struct {
-	CallerID   int64
-	Phone      string
-	LookedUpAt pgtype.Timestamptz
 }
 
 type UpdateState struct {

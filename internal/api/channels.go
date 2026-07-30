@@ -506,6 +506,36 @@ func (h *handlers) channelMessages(r *mtproto.Request, channelID int64, msgs []s
 // would put the dense channels.id space back on the wire.
 const inviteLinkPrefix = "https://t.me/+"
 
+// revokeExportedChatInviteTypeID is the constructor id of
+// messages.revokeExportedChatInvite (0x13db322c). gotd v0.161.0 does not
+// generate this type, so the handler decodes the two fields (peer, hash)
+// directly from the buffer.
+const revokeExportedChatInviteTypeID = 0x13db322c
+
+// revokeExportedChatInviteRequest carries the decoded request for
+// messages.revokeExportedChatInvite.
+type revokeExportedChatInviteRequest struct {
+	Peer tg.InputPeerClass
+	Hash string
+}
+
+func (r *revokeExportedChatInviteRequest) Decode(b *bin.Buffer) error {
+	if err := b.ConsumeID(revokeExportedChatInviteTypeID); err != nil {
+		return err
+	}
+	peer, err := tg.DecodeInputPeer(b)
+	if err != nil {
+		return err
+	}
+	r.Peer = peer
+	h, err := b.String()
+	if err != nil {
+		return err
+	}
+	r.Hash = h
+	return nil
+}
+
 // handleExportChatInvite serves messages.exportChatInvite for a channel.
 //
 // Every rejection returns errPeerIDInvalid: no channel row, no participant row,
@@ -569,6 +599,57 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 		Date:      int(time.Now().Unix()),
 		Permanent: true,
 	}, nil
+}
+
+// handleRevokeExportedChatInvite serves messages.revokeExportedChatInvite.
+// gotd v0.161.0 does not generate this request type, so the handler decodes
+// it manually (peer, hash) and registers the constructor id directly.
+//
+// Every rejection returns errPeerIDInvalid: no channel row, no participant row,
+// role 0, a live ban, or a hash that the channel never minted. They are ONE
+// error deliberately — channels.id is dense BIGSERIAL and the peer access hash
+// is the placeholder access_hash == id, so a distinguishable "hash not found"
+// would let an account walk the invite space.
+//
+// Role 1 is the floor for the same reason export requires it: a role-0 member
+// able to revoke would be able to confirm which hashes belong to the channel.
+//
+// Revoke is idempotent: a second revoke of the same hash is a no-op. The store
+// writes nothing new and returns success.
+func (h *handlers) handleRevokeExportedChatInvite(r *mtproto.Request) (bin.Encoder, error) {
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	var req revokeExportedChatInviteRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	peerType, channelID, err := inputPeer(req.Peer)
+	if err != nil {
+		return nil, err
+	}
+	if peerType != store.PeerTypeChannel {
+		return nil, errPeerIDInvalid
+	}
+
+	// Strip link prefix if client sent full link instead of bare hash.
+	hash, _ := strings.CutPrefix(req.Hash, inviteLinkPrefix)
+
+	member, found, err := h.store.ChannelMemberOf(r.Ctx, channelID, r.UserID)
+	if err != nil {
+		h.log.Error("revoke exported chat invite membership", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !found || member.Role < 1 || member.Banned(time.Now()) {
+		return nil, errPeerIDInvalid
+	}
+
+	if err = h.store.RevokeChannelInvite(r.Ctx, hash, channelID); err != nil {
+		h.log.Error("revoke exported chat invite", "channel_id", channelID, "hash", hash, "err", err)
+		return nil, errInternal
+	}
+
+	return &tg.BoolTrue{}, nil
 }
 
 // channelMemberUpdate is the reply both membership-editing RPCs return: the

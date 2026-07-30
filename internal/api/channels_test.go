@@ -2465,3 +2465,111 @@ func TestGetDialogsChannelCursorSafe(t *testing.T) {
 		t.Errorf("page 2 top_message = %d, want < %d (no overlap with page 1)", p2Dlg.TopMessage, lastDialog.TopMessage)
 	}
 }
+
+func TestRevokeExportedChatInvite(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, joiner, ch := channelWith(t, s, "+15551294001", "+15551294002")
+
+	// Export two invites.
+	hash1 := exportInvite(t, s, creator.ID, ch)
+	hash2 := exportInvite(t, s, creator.ID, ch)
+
+	// Revoke first invite.
+	res, err := api.RevokeExportedChatInviteForTest(s, creator.ID, ch.ID, hash1)
+	if err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	_, ok := res.(*tg.BoolTrue)
+	if !ok {
+		t.Fatalf("revoke: got %T, want *tg.BoolTrue", res)
+	}
+
+	// Second invite still works.
+	res, err = api.ImportChatInviteForTest(s, joiner.ID, &tg.MessagesImportChatInviteRequest{Hash: hash2})
+	if err != nil {
+		t.Fatalf("import second: %v", err)
+	}
+	assertEncodes(t, res)
+
+	// First invite now refused with same error as unknown hash.
+	_, err = api.ImportChatInviteForTest(s, creator.ID, &tg.MessagesImportChatInviteRequest{Hash: hash1})
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("import revoked: got %s, want PEER_ID_INVALID", msg)
+	}
+	_, err = api.ImportChatInviteForTest(s, creator.ID, &tg.MessagesImportChatInviteRequest{Hash: unknownHash})
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("import unknown: got %s, want PEER_ID_INVALID", msg)
+	}
+
+	// Joiner still a member.
+	member, found, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil || !found || member.Role != 0 {
+		t.Fatalf("member: found=%v role=%d err=%v", found, member.Role, err)
+	}
+}
+
+func TestRevokeExportedChatInviteRejectsNonAdmin(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	creator, _, ch := channelWith(t, s, "+15551294101", "+15551294102")
+
+	// Add member as role 0.
+	member, err := s.CreateUser(context.Background(), "+15551294103")
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	hash := exportInvite(t, s, creator.ID, ch)
+	_, err = api.ImportChatInviteForTest(s, member.ID, &tg.MessagesImportChatInviteRequest{Hash: hash})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	// Member cannot revoke.
+	_, err = api.RevokeExportedChatInviteForTest(s, member.ID, ch.ID, hash)
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("member revoke: got %s, want PEER_ID_INVALID", msg)
+	}
+}
+
+func TestRevokeExportedChatInviteIdempotent(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	creator, _, ch := channelWith(t, s, "+15551294201", "+15551294202")
+
+	hash := exportInvite(t, s, creator.ID, ch)
+
+	// Revoke twice.
+	res1, err := api.RevokeExportedChatInviteForTest(s, creator.ID, ch.ID, hash)
+	if err != nil {
+		t.Fatalf("first revoke: %v", err)
+	}
+	_, ok := res1.(*tg.BoolTrue)
+	if !ok {
+		t.Fatalf("first revoke: got %T, want *tg.BoolTrue", res1)
+	}
+
+	res2, err := api.RevokeExportedChatInviteForTest(s, creator.ID, ch.ID, hash)
+	if err != nil {
+		t.Fatalf("second revoke: %v", err)
+	}
+	_, ok = res2.(*tg.BoolTrue)
+	if !ok {
+		t.Fatalf("second revoke: got %T, want *tg.BoolTrue", res2)
+	}
+}
+
+func TestRevokeExportedChatInviteNonMemberRefused(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	_, stranger, ch := channelWith(t, s, "+15551294301", "+15551294302")
+
+	hash := exportInvite(t, s, ch.CreatorID, ch)
+
+	// Stranger cannot revoke.
+	_, err := api.RevokeExportedChatInviteForTest(s, stranger.ID, ch.ID, hash)
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("stranger revoke: got %s, want PEER_ID_INVALID", msg)
+	}
+}
