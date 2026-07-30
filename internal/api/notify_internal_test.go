@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -269,6 +270,158 @@ func TestDeliverPushFailureDoesNotBlockOthers(t *testing.T) {
 	}
 	if broken.pts != 0 {
 		t.Fatalf("failed push advanced the watermark to %d", broken.pts)
+	}
+}
+
+// chanBatch builds a channelBatch of one UpdateNewChannelMessage per pts in
+// (fromPts, toPts], mirroring the batch helper for the per-account stream.
+func chanBatch(fromPts, toPts int) channelBatch {
+	b := channelBatch{currentPts: toPts}
+	for p := fromPts + 1; p <= toPts; p++ {
+		b.ups = append(b.ups, &tg.UpdateNewChannelMessage{
+			Message:  &tg.Message{ID: p},
+			Pts:      p,
+			PtsCount: 1,
+		})
+		b.pts = append(b.pts, p)
+	}
+	return b
+}
+
+// chanPtsOf extracts the pts sequence from a pushed tg.Updates carrying channel updates.
+func chanPtsOf(t *testing.T, up *tg.Updates) []int {
+	t.Helper()
+	out := make([]int, 0, len(up.Updates))
+	for _, u := range up.Updates {
+		nm, ok := u.(*tg.UpdateNewChannelMessage)
+		if !ok {
+			t.Fatalf("update type = %T, want *tg.UpdateNewChannelMessage", u)
+		}
+		out = append(out, nm.Pts)
+	}
+	return out
+}
+
+// TestDeliverChannelPostPushes verifies a post pushes UpdateNewChannelMessage
+// to a member's live conn and does not advance the per-account watermark.
+func TestDeliverChannelPostPushes(t *testing.T) {
+	t.Parallel()
+	conn := &fakePushConn{}
+	member := store.ChannelMember{UserID: 1, JoinPts: 0}
+	builds := 0
+	testUpdater().deliverChannel(
+		context.Background(),
+		[]store.ChannelMember{member},
+		time.Now(),
+		func(userID int64) []pushConn {
+			if userID == 1 {
+				return []pushConn{conn}
+			}
+			return nil
+		},
+		func(_ int64, fromPts int) (channelBatch, error) {
+			builds++
+			return chanBatch(fromPts, 3), nil
+		},
+	)
+	if builds != 1 {
+		t.Fatalf("builds = %d, want 1", builds)
+	}
+	if len(conn.got) != 1 {
+		t.Fatalf("member got %d pushes, want 1", len(conn.got))
+	}
+	if got := chanPtsOf(t, conn.got[0]); !slices.Equal(got, []int{1, 2, 3}) {
+		t.Fatalf("got pts %v, want 1..3", got)
+	}
+	// Channel push must not advance the per-account watermark.
+	if conn.pts != 0 {
+		t.Fatalf("account watermark = %d after channel push, want 0", conn.pts)
+	}
+}
+
+// TestDeliverChannelPostNoConnNoWork verifies a member with no live conn costs
+// no build call.
+func TestDeliverChannelPostNoConnNoWork(t *testing.T) {
+	t.Parallel()
+	member := store.ChannelMember{UserID: 1, JoinPts: 0}
+	builds := 0
+	testUpdater().deliverChannel(
+		context.Background(),
+		[]store.ChannelMember{member},
+		time.Now(),
+		func(int64) []pushConn { return nil },
+		func(_ int64, _ int) (channelBatch, error) {
+			builds++
+			return chanBatch(0, 5), nil
+		},
+	)
+	if builds != 0 {
+		t.Fatalf("builds = %d for no-conn member, want 0", builds)
+	}
+}
+
+// TestDeliverChannelPostBannedReceivesNothing verifies a banned member gets
+// no push and no build call.
+func TestDeliverChannelPostBannedReceivesNothing(t *testing.T) {
+	t.Parallel()
+	conn := &fakePushConn{}
+	until := time.Now().Add(time.Hour)
+	member := store.ChannelMember{UserID: 1, JoinPts: 0, BannedUntil: &until}
+	builds := 0
+	testUpdater().deliverChannel(
+		context.Background(),
+		[]store.ChannelMember{member},
+		time.Now(),
+		func(int64) []pushConn { return []pushConn{conn} },
+		func(_ int64, _ int) (channelBatch, error) {
+			builds++
+			return chanBatch(0, 3), nil
+		},
+	)
+	if builds != 0 {
+		t.Fatalf("builds = %d for banned member, want 0", builds)
+	}
+	if len(conn.got) != 0 {
+		t.Fatalf("banned member got %d pushes, want 0", len(conn.got))
+	}
+}
+
+// TestDeliverChannelPostTwoMembers verifies two members each receive exactly
+// one push from one notification.
+func TestDeliverChannelPostTwoMembers(t *testing.T) {
+	t.Parallel()
+	connA, connB := &fakePushConn{}, &fakePushConn{}
+	members := []store.ChannelMember{
+		{UserID: 1, JoinPts: 0},
+		{UserID: 2, JoinPts: 0},
+	}
+	builds := 0
+	testUpdater().deliverChannel(
+		context.Background(),
+		members,
+		time.Now(),
+		func(userID int64) []pushConn {
+			switch userID {
+			case 1:
+				return []pushConn{connA}
+			case 2:
+				return []pushConn{connB}
+			}
+			return nil
+		},
+		func(_ int64, fromPts int) (channelBatch, error) {
+			builds++
+			return chanBatch(fromPts, 5), nil
+		},
+	)
+	if builds != 2 {
+		t.Fatalf("builds = %d, want one per active member (2)", builds)
+	}
+	if len(connA.got) != 1 {
+		t.Fatalf("member 1 got %d pushes, want 1", len(connA.got))
+	}
+	if len(connB.got) != 1 {
+		t.Fatalf("member 2 got %d pushes, want 1", len(connB.got))
 	}
 }
 

@@ -171,6 +171,115 @@ func (u *Updater) DeliverTyping(ctx context.Context, peerID, fromID int64) {
 	}
 }
 
+// DeliverChannelPost pushes a newly-committed channel post to every non-banned
+// member that holds a live connection on this replica. It is the channelPost
+// callback for StartListener (part 2 of MAIN-96 / MAIN-114).
+//
+// Delivery cost is bounded: one ChannelMembers query, then for each non-banned
+// member O(1) in-memory registry lookups, and only then one ChannelState query
+// and one buildChannelUpdates call per member with a live conn. A replica where
+// nobody is home for the channel skips the state query entirely.
+//
+// The per-connection channel-pts watermark does not exist on Conn. Push from
+// each member's JoinPts floor instead. A duplicate UpdateNewChannelMessage is
+// safe (the client dedups on pts); a missed one is backfilled by the next
+// getChannelDifference. This is the accepted trade-off until per-channel
+// per-conn watermarks are added to the registry.
+func (u *Updater) DeliverChannelPost(ctx context.Context, channelID int64) {
+	members, err := u.h.store.ChannelMembers(ctx, channelID)
+	if err != nil {
+		u.log.Error("deliver channel post members", "channel_id", channelID, "err", err)
+		return
+	}
+	// Fast pre-check against the in-memory registry: if no non-banned member
+	// has a live conn here, skip the state query entirely. On a replica serving
+	// 2 of a 10 000-member channel, this is 10 000 in-memory lookups and then
+	// one state query, not 10 000 DB round-trips.
+	now := time.Now()
+	anyActive := false
+	for _, m := range members {
+		if !m.Banned(now) && len(u.registry.Conns(m.UserID)) > 0 {
+			anyActive = true
+			break
+		}
+	}
+	if !anyActive {
+		return
+	}
+	currentPts, err := u.h.store.ChannelState(ctx, channelID)
+	if err != nil {
+		u.log.Error("deliver channel post state", "channel_id", channelID, "err", err)
+		return
+	}
+	u.deliverChannel(ctx, members, now,
+		func(userID int64) []pushConn {
+			raw := u.registry.Conns(userID)
+			if len(raw) == 0 {
+				return nil
+			}
+			cs := make([]pushConn, len(raw))
+			for i, c := range raw {
+				cs[i] = c
+			}
+			return cs
+		},
+		func(memberID int64, fromPts int) (channelBatch, error) {
+			return u.h.buildChannelUpdates(ctx, channelID, memberID, fromPts, maxDiffEvents, currentPts)
+		},
+	)
+}
+
+// deliverChannel is the testable core of DeliverChannelPost. For each
+// non-banned member that has live conns, it calls build once (from the member's
+// JoinPts floor) and pushes the resulting updates to each conn.
+//
+// The callback runs on the listener's single goroutine; it must not block. All
+// pushes are inline. The bound that makes this acceptable: the number of members
+// with live conns on this replica is typically small (the replica serves a
+// fraction of all members), so the number of build calls is small. If a channel
+// grows so large that even the active-member fraction exceeds a safe inline
+// limit, the callback would need to hand work to a worker pool instead.
+func (u *Updater) deliverChannel(
+	ctx context.Context,
+	members []store.ChannelMember,
+	now time.Time,
+	connsFor func(userID int64) []pushConn,
+	build func(memberID int64, fromPts int) (channelBatch, error),
+) {
+	for _, m := range members {
+		if m.Banned(now) {
+			continue
+		}
+		conns := connsFor(m.UserID)
+		if len(conns) == 0 {
+			continue
+		}
+		b, err := build(m.UserID, m.JoinPts)
+		if err != nil {
+			u.log.Error("deliver channel build", "user_id", m.UserID, "err", err)
+			continue
+		}
+		if len(b.ups) == 0 {
+			continue
+		}
+		env := &tg.Updates{
+			Updates: b.ups,
+			Users:   b.users,
+			Chats:   b.chats,
+			Date:    int(now.Unix()),
+			Seq:     0,
+		}
+		for _, c := range conns {
+			// Pass pts=0: this is a channel update; the conn's lastPushedPts
+			// tracks the per-account stream and must not be corrupted by a
+			// channel pts value.
+			if _, err := c.PushTo(ctx, m.UserID, env, 0); err != nil {
+				u.log.Info("deliver channel push", "user_id", m.UserID, "err", err)
+			}
+		}
+	}
+}
+
 // Evict closes the connections of userID that still hold authKeyID, which the
 // revoking replica has just deleted from auth_keys. It is the cross-replica half
 // of revocation: without it a socket that sends no further frame keeps its
