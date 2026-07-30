@@ -2305,7 +2305,9 @@ func TestGetDialogsMultiChannel(t *testing.T) {
 	if len(res.Messages) != 3 {
 		t.Fatalf("messages = %d, want 3", len(res.Messages))
 	}
-	// Identify the two channel top messages and assert each channel id/local id pair.
+	// Collect channel-message peer IDs, reject duplicates, assert set equals
+	// both expected channel IDs.
+	msgChannelIDs := make(map[int64]bool)
 	for _, m := range res.Messages {
 		msg, ok := m.(*tg.Message)
 		if !ok {
@@ -2315,11 +2317,20 @@ func TestGetDialogsMultiChannel(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if !channelIDs[peer.ChannelID] {
-			t.Errorf("message peer channel %d not in channel set", peer.ChannelID)
+		if msgChannelIDs[peer.ChannelID] {
+			t.Errorf("duplicate channel top message for channel %d", peer.ChannelID)
 		}
+		msgChannelIDs[peer.ChannelID] = true
 		if msg.ID != 1 {
 			t.Errorf("channel %d message id = %d, want 1", peer.ChannelID, msg.ID)
+		}
+	}
+	if len(msgChannelIDs) != len(channels) {
+		t.Errorf("channel messages = %d, want %d", len(msgChannelIDs), len(channels))
+	}
+	for _, ch := range channels {
+		if !msgChannelIDs[ch.ID] {
+			t.Errorf("missing channel top message for channel %d", ch.ID)
 		}
 	}
 
