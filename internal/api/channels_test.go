@@ -1109,9 +1109,13 @@ func TestExportAndImportChannelInvite(t *testing.T) {
 		t.Fatalf("import: %v", err)
 	}
 	assertEncodes(t, res)
-	upd, ok := res.(*tg.Updates)
+	joinResult, ok := res.(*tg.MessagesChatInviteJoinResultOk)
 	if !ok {
-		t.Fatalf("import: got %T, want *tg.Updates", res)
+		t.Fatalf("import: got %T, want *tg.MessagesChatInviteJoinResultOk", res)
+	}
+	upd, ok := joinResult.Updates.(*tg.Updates)
+	if !ok {
+		t.Fatalf("import updates: got %T, want *tg.Updates", joinResult.Updates)
 	}
 	if len(upd.Updates) != 1 {
 		t.Fatalf("updates: got %d, want 1", len(upd.Updates))
@@ -1223,15 +1227,19 @@ func TestBannedMemberSeesForbiddenChannel(t *testing.T) {
 		t.Fatalf("import as banned: %v", err)
 	}
 	assertEncodes(t, res)
-	upd, ok := res.(*tg.Updates)
+	joinResult, ok := res.(*tg.MessagesChatInviteJoinResultOk)
 	if !ok {
-		t.Fatalf("import as banned: got %T, want *tg.Updates", res)
+		t.Fatalf("import as banned: got %T, want *tg.MessagesChatInviteJoinResultOk", res)
 	}
-	if len(upd.Chats) != 1 {
-		t.Fatalf("chats: got %d, want 1", len(upd.Chats))
+	bannedUpd, ok := joinResult.Updates.(*tg.Updates)
+	if !ok {
+		t.Fatalf("import as banned updates: got %T, want *tg.Updates", joinResult.Updates)
 	}
-	if f, ok := upd.Chats[0].(*tg.ChannelForbidden); !ok {
-		t.Errorf("import as banned: got %#v, want *tg.ChannelForbidden", upd.Chats[0])
+	if len(bannedUpd.Chats) != 1 {
+		t.Fatalf("chats: got %d, want 1", len(bannedUpd.Chats))
+	}
+	if f, ok := bannedUpd.Chats[0].(*tg.ChannelForbidden); !ok {
+		t.Errorf("import as banned: got %#v, want *tg.ChannelForbidden", bannedUpd.Chats[0])
 	} else if f.Title != "" {
 		t.Errorf("import as banned: forbidden channel leaked title %q", f.Title)
 	}
