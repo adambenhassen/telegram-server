@@ -194,7 +194,7 @@ func bootServerWithRegistry(t *testing.T, ctx context.Context, key *rsa.PrivateK
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdater(st, server.Registry(), log)
-	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, log)
+	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, func(_ context.Context, _ int64) {}, log)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}

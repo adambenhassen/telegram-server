@@ -267,7 +267,7 @@ func (h *handlers) requireChannelMember(ctx context.Context, channelID, userID i
 func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
 	// PostChannelMessageAs, never PostChannelMessage: the latter is the
 	// unchecked primitive and trusts its caller to have decided post rights.
-	msg, pts, _, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil)
+	msg, pts, dup, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil)
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
 	}
@@ -275,16 +275,13 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 		h.log.Error("send channel message", "user_id", r.UserID, "channel_id", channelID, "err", err)
 		return nil, errInternal
 	}
-	// No notify is emitted here. Delivery of a channel post lands in MAIN-96,
-	// which owns the channel notify payload and the member fan-out; nothing is
-	// emitted rather than inventing a payload this handler would then have to
-	// keep. When it does land it is ONE notify per post, never one per member
-	// (threat model G4): a 10 000-member channel would otherwise land 10 000
-	// notifications on the single Listener goroutine and stall live delivery for
-	// every unrelated account on the replica. A dup — a resend of an
-	// already-stored post, which moved no pts and wrote no event — announces
-	// nothing either way, the same rule the 1:1 and chat send paths follow, so
-	// the dup flag is not read here.
+	// One notify per committed post, never one per member (threat model G4): a
+	// 10 000-member channel posting in a loop would stall live delivery for every
+	// unrelated account on the replica. A dup — a resend of an already-stored
+	// post, which moved no pts and wrote no event — announces nothing.
+	if !dup {
+		h.notifyChannelPost(r.Ctx, channelID)
+	}
 
 	channels, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
 	if err != nil {
