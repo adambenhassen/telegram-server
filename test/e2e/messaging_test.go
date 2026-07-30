@@ -89,24 +89,30 @@ type serviceMsgEnvelope struct {
 	chats []tg.ChatClass
 }
 
+type chanMsgUpdate struct {
+	Msg *tg.Message
+	Pts int
+}
+
 type updateCollector struct {
-	newMsg     chan *tg.Message
-	editMsg    chan *tg.Message
-	delMsg     chan []int
-	readOutbox chan int
-	typing     chan int64
-	// serviceMsg collects *tg.MessageService from updateNewMessage.
-	serviceMsg chan serviceMsgEnvelope
+	newMsg        chan *tg.Message
+	editMsg       chan *tg.Message
+	delMsg        chan []int
+	readOutbox    chan int
+	typing        chan int64
+	serviceMsg    chan serviceMsgEnvelope
+	newChannelMsg chan chanMsgUpdate
 }
 
 func newUpdateCollector() *updateCollector {
 	return &updateCollector{
-		newMsg:     make(chan *tg.Message, 4),
-		editMsg:    make(chan *tg.Message, 4),
-		delMsg:     make(chan []int, 4),
-		readOutbox: make(chan int, 4),
-		typing:     make(chan int64, 4),
-		serviceMsg: make(chan serviceMsgEnvelope, 4),
+		newMsg:        make(chan *tg.Message, 4),
+		editMsg:       make(chan *tg.Message, 4),
+		delMsg:        make(chan []int, 4),
+		readOutbox:    make(chan int, 4),
+		typing:        make(chan int64, 4),
+		serviceMsg:    make(chan serviceMsgEnvelope, 4),
+		newChannelMsg: make(chan chanMsgUpdate, 4),
 	}
 }
 
@@ -141,6 +147,10 @@ func (u *updateCollector) dispatch(x tg.UpdateClass, chats []tg.ChatClass) {
 		send(u.readOutbox, up.MaxID)
 	case *tg.UpdateUserTyping:
 		send(u.typing, up.UserID)
+	case *tg.UpdateNewChannelMessage:
+		if m, ok := up.Message.(*tg.Message); ok {
+			send(u.newChannelMsg, chanMsgUpdate{Msg: m, Pts: up.Pts})
+		}
 	}
 }
 
@@ -194,7 +204,7 @@ func bootServerWithRegistry(t *testing.T, ctx context.Context, key *rsa.PrivateK
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdater(st, server.Registry(), log)
-	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, func(_ context.Context, _ int64) {}, log)
+	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, log)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}
