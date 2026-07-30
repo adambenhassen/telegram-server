@@ -222,3 +222,18 @@ func JoinChannelMember(ctx context.Context, s *Store, channelID, userID int64) (
 	}
 	return hash, nil
 }
+
+// HoldInviteRowLock takes the row lock on one invite hash in a transaction of
+// its own and holds it until release is called. Used by the concurrent
+// join/revoke tests to control which transaction commits first.
+func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func(), err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM channel_invites WHERE hash = $1 FOR UPDATE", hash); err != nil {
+		_ = tx.Rollback(ctx) //nolint:errcheck // best effort
+		return nil, err
+	}
+	return func() { _ = tx.Rollback(ctx) }, nil //nolint:errcheck // nothing to commit
+}

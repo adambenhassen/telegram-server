@@ -14,20 +14,21 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
-// A channel_state row lock (SELECT ... FROM channel_state WHERE channel_id = $1
-// FOR UPDATE) is the serialisation point for admission to one channel. It is the
-// only lock this file introduces: no Go lock, and no advisory lock, so nothing
-// here can be part of a lock cycle with the per-owner locks in fanout.go.
-//
-// CreateChannel does not take it — the channel does not exist yet.
-// JoinChannelByInvite takes it and holds it to commit, which is what makes the
-// pts it records and the counts the caps are decided on the same snapshot the
-// insert lands in.
+// JoinChannelByInvite takes two row locks, in fixed order: first the
+// channel_invites row (ChannelInviteByHashForUpdate), then the channel_state row
+// (ChannelStateForUpdate). Both are held to commit. The invite lock serialises
+// admission against revocation on that hash; the state lock serialises concurrent
+// joins to the same channel and anchors the pts snapshot. CreateChannel takes
+// neither — the channel does not exist yet.
 //
 // The rights mutations — SetChannelRole, SetChannelBan and LeaveChannel — take
 // the channels row lock instead (LockChannel), first and held to commit, and
 // take nothing else. Nothing anywhere takes the channel_state row and then the
-// channels row, or the reverse, so the two cannot form a cycle.
+// channels row, or the reverse, so the two cannot form a cycle. The invite row
+// lock is never taken alongside the channels row lock, so it cannot cycle either.
+//
+// No Go lock and no advisory lock exists here, so nothing can be part of a lock
+// cycle with the per-owner locks in fanout.go.
 
 // defaultMaxChannelParticipants and defaultMaxChannelsPerUser are the bounds
 // recorded in the M7 migration. They seed the per-Store fields of the same name
@@ -266,6 +267,27 @@ func (s *Store) CreateChannelInvite(ctx context.Context, channelID, creatorID in
 	return hash, nil
 }
 
+// RevokeChannelInvite marks an invite hash as revoked. The hash and channel id
+// are both required: the hash alone could resolve to a different channel if the
+// same hash happened to be minted (vanishingly unlikely, but the extra column
+// costs nothing). Already-revoked invites are a no-op (COALESCE keeps the
+// original timestamp), so a retry is safe.
+//
+// The query does not take a row lock: the update is a single-row write on a
+// known primary key, and the only reader (ChannelInviteByHash) already filters
+// on revoked_at IS NULL, so a concurrent join either sees the row as active
+// (admitted) or revoked (refused). There is no interleaving in which a revoked
+// hash admits, because both the check and the write are on the same row.
+func (s *Store) RevokeChannelInvite(ctx context.Context, hash string, channelID int64) error {
+	_, err := s.q.RevokeChannelInvite(ctx, db.RevokeChannelInviteParams{
+		Hash: hash, ChannelID: channelID,
+	})
+	if err != nil {
+		return fmt.Errorf("revoke channel invite: %w", err)
+	}
+	return nil
+}
+
 // JoinChannelByInvite admits userID to the channel the invite hash names. The
 // hash is the ONLY input that selects a channel: there is deliberately no
 // join-by-channel-id method, because channels.id is dense BIGSERIAL and the peer
@@ -274,11 +296,11 @@ func (s *Store) CreateChannelInvite(ctx context.Context, channelID, creatorID in
 // server. The participant row is an authorization boundary only while the sole
 // way to get one is a secret the server issued.
 //
-// Locking: the channel's channel_state row is taken FOR UPDATE and held to
-// commit. That is the only lock taken here, and reading pts under it is what
-// stops a post committing between the read and the participant insert — a joiner
-// would otherwise be seated at a pts below a message they must not receive, or
-// above one they should.
+// Locking: the invite row is taken first (ChannelInviteByHashForUpdate), then
+// the channel's channel_state row (ChannelStateForUpdate). Both are held to
+// commit. The invite lock serialises admission against concurrent revocation of
+// the same hash — a revoke UPDATE blocks until the join commits or rolls back.
+// The state lock serialises concurrent joins and anchors the pts snapshot.
 //
 // Re-joining is idempotent: an existing row is returned untouched, so join_pts
 // never drops and a ban is never cleared by rejoining.
@@ -295,7 +317,7 @@ func (s *Store) JoinChannelByInvite(ctx context.Context, hash string, userID int
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
-	invite, err := qtx.ChannelInviteByHash(ctx, hash)
+	invite, err := qtx.ChannelInviteByHashForUpdate(ctx, hash)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return Channel{}, ChannelMember{}, ErrInviteInvalid

@@ -69,9 +69,21 @@ INSERT INTO channel_invites (hash, channel_id, creator_id) VALUES ($1, $2, $3);
 -- ChannelInviteByHash is the ONLY way into a channel. It is keyed on the hash
 -- alone and takes no channel id, so the dense channels.id space is not an
 -- admission input and cannot be walked. An unknown hash and an unusable one are
--- one rejection upstream — see JoinChannelByInvite.
+-- one rejection upstream — see JoinChannelByInvite. Revoked invites are
+-- excluded: a revoked hash must refuse admission the same way an unknown one
+-- does.
 -- name: ChannelInviteByHash :one
-SELECT * FROM channel_invites WHERE hash = $1;
+SELECT * FROM channel_invites WHERE hash = $1 AND revoked_at IS NULL;
+
+-- ChannelInviteByHashForUpdate is the locked variant used by JoinChannelByInvite.
+-- The row lock serialises admission against revocation: a concurrent
+-- RevokeChannelInvite UPDATE blocks until the join commits or rolls back. The
+-- preview path (ChannelByInvite) keeps the unlocked ChannelInviteByHash.
+-- name: ChannelInviteByHashForUpdate :one
+SELECT * FROM channel_invites WHERE hash = $1 AND revoked_at IS NULL FOR UPDATE;
+
+-- name: RevokeChannelInvite :execrows
+UPDATE channel_invites SET revoked_at = COALESCE(revoked_at, now()) WHERE hash = $1 AND channel_id = $2;
 
 -- name: ChannelsForUser :many
 SELECT c.* FROM channels c

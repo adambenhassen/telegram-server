@@ -133,13 +133,15 @@ func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Ch
 }
 
 const channelInviteByHash = `-- name: ChannelInviteByHash :one
-SELECT hash, channel_id, creator_id, date FROM channel_invites WHERE hash = $1
+SELECT hash, channel_id, creator_id, date, revoked_at FROM channel_invites WHERE hash = $1 AND revoked_at IS NULL
 `
 
 // ChannelInviteByHash is the ONLY way into a channel. It is keyed on the hash
 // alone and takes no channel id, so the dense channels.id space is not an
 // admission input and cannot be walked. An unknown hash and an unusable one are
-// one rejection upstream — see JoinChannelByInvite.
+// one rejection upstream — see JoinChannelByInvite. Revoked invites are
+// excluded: a revoked hash must refuse admission the same way an unknown one
+// does.
 func (q *Queries) ChannelInviteByHash(ctx context.Context, hash string) (ChannelInvite, error) {
 	row := q.db.QueryRow(ctx, channelInviteByHash, hash)
 	var i ChannelInvite
@@ -148,6 +150,28 @@ func (q *Queries) ChannelInviteByHash(ctx context.Context, hash string) (Channel
 		&i.ChannelID,
 		&i.CreatorID,
 		&i.Date,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const channelInviteByHashForUpdate = `-- name: ChannelInviteByHashForUpdate :one
+SELECT hash, channel_id, creator_id, date, revoked_at FROM channel_invites WHERE hash = $1 AND revoked_at IS NULL FOR UPDATE
+`
+
+// ChannelInviteByHashForUpdate is the locked variant used by JoinChannelByInvite.
+// The row lock serialises admission against revocation: a concurrent
+// RevokeChannelInvite UPDATE blocks until the join commits or rolls back. The
+// preview path (ChannelByInvite) keeps the unlocked ChannelInviteByHash.
+func (q *Queries) ChannelInviteByHashForUpdate(ctx context.Context, hash string) (ChannelInvite, error) {
+	row := q.db.QueryRow(ctx, channelInviteByHashForUpdate, hash)
+	var i ChannelInvite
+	err := row.Scan(
+		&i.Hash,
+		&i.ChannelID,
+		&i.CreatorID,
+		&i.Date,
+		&i.RevokedAt,
 	)
 	return i, err
 }
@@ -444,6 +468,23 @@ func (q *Queries) LockChannel(ctx context.Context, id int64) (Channel, error) {
 		&i.Date,
 	)
 	return i, err
+}
+
+const revokeChannelInvite = `-- name: RevokeChannelInvite :execrows
+UPDATE channel_invites SET revoked_at = COALESCE(revoked_at, now()) WHERE hash = $1 AND channel_id = $2
+`
+
+type RevokeChannelInviteParams struct {
+	Hash      string
+	ChannelID int64
+}
+
+func (q *Queries) RevokeChannelInvite(ctx context.Context, arg RevokeChannelInviteParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeChannelInvite, arg.Hash, arg.ChannelID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateChannelParticipantBan = `-- name: UpdateChannelParticipantBan :execrows
