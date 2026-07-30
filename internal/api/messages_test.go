@@ -33,10 +33,11 @@ func TestPeerUserIDValidatesAccessHash(t *testing.T) {
 	}
 
 	for name, peer := range map[string]tg.InputPeerClass{
-		"wrong hash": &tg.InputPeerUser{UserID: 5, AccessHash: 6},
-		"zero id":    &tg.InputPeerUser{UserID: 0, AccessHash: 0},
-		"self":       &tg.InputPeerSelf{},
-		"chat":       &tg.InputPeerChat{ChatID: 1},
+		"wrong hash":           &tg.InputPeerUser{UserID: 5, AccessHash: 6},
+		"cross-account replay": &tg.InputPeerUser{UserID: 5, AccessHash: api.DeriveUserHash(999, 5)},
+		"zero id":              &tg.InputPeerUser{UserID: 0, AccessHash: 0},
+		"self":                 &tg.InputPeerSelf{},
+		"chat":                 &tg.InputPeerChat{ChatID: 1},
 	} {
 		if _, err := api.PeerUserID(peer, 5); err == nil {
 			t.Errorf("%s: expected PEER_ID_INVALID, got nil", name)

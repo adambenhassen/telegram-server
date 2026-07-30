@@ -91,6 +91,9 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 		if u.Phone != "" {
 			t.Fatalf("peer phone = %q, want empty", u.Phone)
 		}
+		if u.AccessHash != api.DeriveUserHash(b.ID, u.ID) {
+			t.Fatalf("access_hash = %d, want derived hash for viewer %d, peer %d", u.AccessHash, b.ID, u.ID)
+		}
 	}
 
 	// The sender's own copy hydrates both sides: a keeps its own phone as self,
@@ -110,11 +113,17 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 			if u.ID != a.ID || u.Phone != a.Phone {
 				t.Fatalf("self user = id %d phone %q, want id %d phone %q", u.ID, u.Phone, a.ID, a.Phone)
 			}
+			if u.AccessHash != api.DeriveUserHash(a.ID, u.ID) {
+				t.Fatalf("self access_hash = %d, want derived hash for viewer %d, peer %d", u.AccessHash, a.ID, u.ID)
+			}
 			continue
 		}
 		sawPeer = true
 		if u.ID != b.ID || u.Phone != "" {
 			t.Fatalf("peer user = id %d phone %q, want id %d phone \"\"", u.ID, u.Phone, b.ID)
+		}
+		if u.AccessHash != api.DeriveUserHash(a.ID, u.ID) {
+			t.Fatalf("peer access_hash = %d, want derived hash for viewer %d, peer %d", u.AccessHash, a.ID, u.ID)
 		}
 	}
 	if !sawSelf || !sawPeer {
