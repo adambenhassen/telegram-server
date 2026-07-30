@@ -53,7 +53,7 @@ SELECT
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
-LEFT JOIN LATERAL (
+JOIN LATERAL (
     SELECT cm.channel_id, cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date, cm.deleted, cm.random_id, cm.file_id
     FROM channel_messages cm
     WHERE cm.channel_id = c.id AND cm.deleted = false
@@ -87,9 +87,8 @@ type ChannelDialogsForUserRow struct {
 
 // ChannelDialogsForUser returns every channel the user belongs to alongside the
 // channel's pts and the newest non-deleted post (the "top message" for the
-// dialog list). A channel with no posts or whose newest post is deleted still
-// comes back so the caller can skip it; the pts is never NULL because
-// channel_state is created with the channel.
+// dialog list). Channels with no posts or whose newest post is deleted are
+// excluded — a dialog must name a top message and there is none without it.
 func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]ChannelDialogsForUserRow, error) {
 	rows, err := q.db.Query(ctx, channelDialogsForUser, userID)
 	if err != nil {

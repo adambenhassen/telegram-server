@@ -81,9 +81,8 @@ ORDER BY c.id;
 
 -- ChannelDialogsForUser returns every channel the user belongs to alongside the
 -- channel's pts and the newest non-deleted post (the "top message" for the
--- dialog list). A channel with no posts or whose newest post is deleted still
--- comes back so the caller can skip it; the pts is never NULL because
--- channel_state is created with the channel.
+-- dialog list). Channels with no posts or whose newest post is deleted are
+-- excluded — a dialog must name a top message and there is none without it.
 -- name: ChannelDialogsForUser :many
 SELECT
     c.id AS channel_id,
@@ -107,7 +106,7 @@ SELECT
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
-LEFT JOIN LATERAL (
+JOIN LATERAL (
     SELECT cm.*
     FROM channel_messages cm
     WHERE cm.channel_id = c.id AND cm.deleted = false

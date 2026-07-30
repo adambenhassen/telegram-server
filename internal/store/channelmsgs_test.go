@@ -514,8 +514,8 @@ func TestChannelDialogsForUserReturnsChannelsWithTopMessageAndPts(t *testing.T) 
 	if row.Pts != 2 {
 		t.Fatalf("pts = %d, want 2", row.Pts)
 	}
-	if row.Top == nil {
-		t.Fatal("top message is nil")
+	if row.Top.LocalID == 0 {
+		t.Fatal("top message local_id is zero")
 	}
 	if row.Top.LocalID != m2.LocalID {
 		t.Fatalf("top local_id = %d, want %d", row.Top.LocalID, m2.LocalID)
@@ -537,16 +537,13 @@ func TestChannelDialogsForUserSkipsEmptyChannel(t *testing.T) {
 		t.Fatalf("join: %v", err)
 	}
 
-	// No posts.
+	// No posts — channel excluded from results.
 	rows, err := s.ChannelDialogsForUser(ctx, member.ID)
 	if err != nil {
 		t.Fatalf("channel dialogs for user: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("rows = %d, want 1", len(rows))
-	}
-	if rows[0].Top != nil {
-		t.Fatalf("top = %+v, want nil for empty channel", rows[0].Top)
+	if len(rows) != 0 {
+		t.Fatalf("rows = %d, want 0 (empty channel excluded)", len(rows))
 	}
 }
 
@@ -578,8 +575,8 @@ func TestChannelDialogsForUserExcludesDeletedTopMessage(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
-	if rows[0].Top == nil {
-		t.Fatal("top is nil — should fall back to newest non-deleted")
+	if rows[0].Top.LocalID == 0 {
+		t.Fatal("top message local_id is zero — should be newest non-deleted")
 	}
 	// Top should be the newest non-deleted: m3 (local_id 3).
 	if rows[0].Top.LocalID != m3.LocalID {

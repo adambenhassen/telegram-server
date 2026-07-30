@@ -63,9 +63,6 @@ func (h *handlers) channelDialogs(ctx context.Context, userID int64) (map[int64]
 	dialogs := make([]tg.DialogClass, 0, len(rows))
 	tops := make([]store.ChannelMessage, 0, len(rows))
 	for _, r := range rows {
-		if r.Top == nil {
-			continue
-		}
 		d := &tg.Dialog{
 			Peer:       &tg.PeerChannel{ChannelID: r.Channel.ID},
 			TopMessage: int(r.Top.LocalID),
@@ -76,7 +73,7 @@ func (h *handlers) channelDialogs(ctx context.Context, userID int64) (map[int64]
 		d.SetPts(r.Pts)
 		ids[r.Channel.ID] = true
 		dialogs = append(dialogs, d)
-		tops = append(tops, *r.Top)
+		tops = append(tops, r.Top)
 	}
 	return ids, dialogs, tops, nil
 }
