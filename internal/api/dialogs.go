@@ -173,17 +173,16 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	// Channels write no dialogs row — they keep one message row per channel, not
-	// one per member — so the caller's channels are appended after the paged
-	// rows rather than read out of the page.
+	// one per member — so the caller's channels are prepended to the paged rows
+	// rather than read out of the page. Prepend (not append) is deliberate: the
+	// client derives its next offset_id from the last dialog's top_message, and a
+	// channel's top_message lives in a different id space (channel local_id vs
+	// dialogs local_id). By placing channels first, the last entry is always a
+	// dialogs row, so the cursor stays valid.
 	//
-	// First page only, and that is what keeps the reply honest rather than a
-	// saving: the block is not part of the paged sequence, so appending it to
-	// every page would repeat the same channels on each one and leave a client
-	// that pages to the end holding as many copies as it fetched pages.
-	// offset_id is the whole page key here (see above — offset_date and
-	// offset_peer are ignored), so offset_id == 0 is the only honest test for
-	// "first page"; adding offset_date to it would hide the channels entirely
-	// from a client that sets a field this handler does not page on.
+	// First page only: the block is not part of the paged sequence, so repeating
+	// it on every page would hand a client that pages to the end one copy per
+	// page. offset_id == 0 is the only honest test for "first page".
 	var channelIDs map[int64]bool
 	var channelDialogs []tg.DialogClass
 	if req.OffsetID == 0 {
@@ -198,11 +197,13 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 			return nil, errInternal
 		}
 		channelIDs, channelDialogs = ids, ds
-		tlDialogs = append(tlDialogs, channelDialogs...)
+		tlDialogs = append(channelDialogs, tlDialogs...)
+		channelMsgs := make([]tg.MessageClass, 0, len(channelTops)+len(tlMsgs))
 		for _, m := range channelTops {
-			tlMsgs = append(tlMsgs, channelMessageToTL(m, r.UserID, channelFiles))
+			channelMsgs = append(channelMsgs, channelMessageToTL(m, r.UserID, channelFiles))
 			peerIDs[m.FromID] = true
 		}
+		tlMsgs = append(channelMsgs, tlMsgs...)
 	}
 
 	users, err := h.loadUsers(r.Ctx, peerIDs, r.UserID)

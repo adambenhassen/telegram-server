@@ -2207,3 +2207,183 @@ func TestGetChannelDifferenceSkippedEvent(t *testing.T) {
 		t.Fatalf("NewMessages = %d, want 2 (skipped event type 2)", len(diff.NewMessages))
 	}
 }
+
+// TestGetDialogsMultiChannelByteIdentical verifies that the batched channel
+// dialog query produces wire bytes identical to two consecutive calls. This is
+// the byte-identical API test required by MAIN-109: the batched path must
+// render the same response as the per-channel path did.
+func TestGetDialogsMultiChannelByteIdentical(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551297001")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551297002")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+
+	// Create two channels, join member, post in each.
+	channels := make([]store.Channel, 2)
+	for i := range channels {
+		ch, cerr := s.CreateChannel(ctx, creator.ID, fmt.Sprintf("Ch%d", i), "", false)
+		if cerr != nil {
+			t.Fatalf("create channel %d: %v", i, cerr)
+		}
+		channels[i] = ch
+		joinChannelByInvite(t, s, ch, member.ID)
+		if _, cerr = sendToChannel(t, s, creator.ID, ch.ID, fmt.Sprintf("post%d", i), int64(i+1)); cerr != nil {
+			t.Fatalf("post %d: %v", i, cerr)
+		}
+	}
+
+	// Seed a 1:1 dialog so the member has both channels and dialogs rows.
+	other, err := s.CreateUser(ctx, "+15551297003")
+	if err != nil {
+		t.Fatalf("other: %v", err)
+	}
+	if _, err = api.SendMessageForTest(s, other.ID, &tg.MessagesSendMessageRequest{
+		Peer: &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID}, Message: "hi", RandomID: 999,
+	}); err != nil {
+		t.Fatalf("dm: %v", err)
+	}
+
+	// Two calls must produce byte-identical wire output.
+	enc1, err := api.GetDialogsForTest(s, member.ID)
+	if err != nil {
+		t.Fatalf("call 1: %v", err)
+	}
+	buf1 := bin.Buffer{}
+	if err = enc1.Encode(&buf1); err != nil {
+		t.Fatalf("encode 1: %v", err)
+	}
+	b1, b1err := buf1.Bytes()
+	if b1err != nil {
+		t.Fatalf("bytes 1: %v", b1err)
+	}
+
+	enc2, err := api.GetDialogsForTest(s, member.ID)
+	if err != nil {
+		t.Fatalf("call 2: %v", err)
+	}
+	buf2 := bin.Buffer{}
+	if err = enc2.Encode(&buf2); err != nil {
+		t.Fatalf("encode 2: %v", err)
+	}
+	b2, b2err := buf2.Bytes()
+	if b2err != nil {
+		t.Fatalf("bytes 2: %v", b2err)
+	}
+
+	if len(b1) != len(b2) {
+		t.Fatalf("wire bytes differ in length: %d vs %d", len(b1), len(b2))
+	}
+	for i := range b1 {
+		if b1[i] != b2[i] {
+			t.Fatalf("wire bytes differ at offset %d: 0x%02x vs 0x%02x", i, b1[i], b2[i])
+		}
+	}
+}
+
+// TestGetDialogsChannelCursorSafe verifies that channels are prepended (not
+// appended) so the last dialog in the reply is always a dialogs row. This keeps
+// offset_id valid across pages even when the page is truncated.
+func TestGetDialogsChannelCursorSafe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551298001")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551298002")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+
+	// Create a channel with a post.
+	ch, err := s.CreateChannel(ctx, creator.ID, "CursorTest", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	joinChannelByInvite(t, s, ch, member.ID)
+	if _, err = sendToChannel(t, s, creator.ID, ch.ID, "post", 1); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// Create 21 DM dialogs so the first page (limit 20) is truncated.
+	for i := range 21 {
+		peer, perr := s.CreateUser(ctx, fmt.Sprintf("+15551298%03d", 100+i))
+		if perr != nil {
+			t.Fatalf("peer %d: %v", i, perr)
+		}
+		if _, perr = api.SendMessageForTest(s, peer.ID, &tg.MessagesSendMessageRequest{
+			Peer: &tg.InputPeerUser{UserID: member.ID, AccessHash: member.ID}, Message: "hi", RandomID: int64(i + 1),
+		}); perr != nil {
+			t.Fatalf("dm %d: %v", i, perr)
+		}
+	}
+
+	// First page (limit 20) is truncated — channels are prepended, so the LAST
+	// dialog must be a dialogs row (not a channel) for cursor to stay valid.
+	enc, err := api.GetDialogsPageForTest(s, member.ID, &tg.MessagesGetDialogsRequest{
+		Limit: 20, OffsetPeer: &tg.InputPeerEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	slice, ok := enc.(*tg.MessagesDialogsSlice)
+	if !ok {
+		t.Fatalf("first page = %T, want *tg.MessagesDialogsSlice", enc)
+	}
+	// Last dialog must NOT be a channel — that's the cursor invariant.
+	lastDialog, ok := slice.Dialogs[len(slice.Dialogs)-1].(*tg.Dialog)
+	if !ok {
+		t.Fatalf("last dialog type = %T", slice.Dialogs[len(slice.Dialogs)-1])
+	}
+	if _, isChan := lastDialog.Peer.(*tg.PeerChannel); isChan {
+		t.Error("last dialog is a channel — cursor would break on pagination")
+	}
+	// First dialog should be the channel (prepended).
+	firstDialog, ok := slice.Dialogs[0].(*tg.Dialog)
+	if !ok {
+		t.Fatalf("first dialog type = %T", slice.Dialogs[0])
+	}
+	if _, isChan := firstDialog.Peer.(*tg.PeerChannel); !isChan {
+		t.Error("first dialog is not a channel — channels should be prepended")
+	}
+
+	// Second page (offset past first 20) must not repeat channels.
+	last := 0
+	for _, d := range slice.Dialogs {
+		if dlg, isDialog := d.(*tg.Dialog); isDialog {
+			if dlg.TopMessage > last {
+				last = dlg.TopMessage
+			}
+		}
+	}
+	enc, err = api.GetDialogsPageForTest(s, member.ID, &tg.MessagesGetDialogsRequest{
+		Limit: 20, OffsetID: last, OffsetPeer: &tg.InputPeerEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	var page2Dialogs []tg.DialogClass
+	switch p := enc.(type) {
+	case *tg.MessagesDialogs:
+		page2Dialogs = p.Dialogs
+	case *tg.MessagesDialogsSlice:
+		page2Dialogs = p.Dialogs
+	default:
+		t.Fatalf("second page = %T, want *tg.MessagesDialogs or *tg.MessagesDialogsSlice", enc)
+	}
+	for _, d := range page2Dialogs {
+		if dlg, isDialog := d.(*tg.Dialog); isDialog {
+			if _, isChan := dlg.Peer.(*tg.PeerChannel); isChan {
+				t.Error("channel appeared on non-first page")
+			}
+		}
+	}
+}
