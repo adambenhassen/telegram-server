@@ -37,11 +37,20 @@ func (s *Store) CheckAndChargeLookup(ctx context.Context, callerID int64, phone 
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 
+	// Serialize concurrent lookups for the same caller so the prune/count/insert
+	// sequence cannot race with itself.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", callerID); err != nil {
+		return fmt.Errorf("advisory lock: %w", err)
+	}
+
 	qtx := s.q.WithTx(tx)
 	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-LookupWindow), Valid: true}
 
-	// Prune expired rows so the count reflects only the current window.
-	if err := qtx.DeleteExpiredPhoneLookups(ctx, cutoff); err != nil {
+	// Prune expired rows for this caller only.
+	if err := qtx.DeleteExpiredPhoneLookups(ctx, db.DeleteExpiredPhoneLookupsParams{
+		CallerID:   callerID,
+		LookedUpAt: cutoff,
+	}); err != nil {
 		return fmt.Errorf("prune lookups: %w", err)
 	}
 

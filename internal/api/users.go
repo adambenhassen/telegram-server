@@ -39,7 +39,7 @@ func (h *handlers) handleResolvePhone(r *mtproto.Request) (bin.Encoder, error) {
 
 	user, ok, err := h.store.UserByPhone(r.Ctx, phone)
 	if err != nil {
-		h.log.Error("resolve phone: lookup", "phone", phone, "err", err)
+		h.log.Error("resolve phone: lookup", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
 	if !ok {

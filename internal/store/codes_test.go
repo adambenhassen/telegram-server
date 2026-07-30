@@ -135,7 +135,7 @@ func TestVerifyCodeExpired(t *testing.T) {
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	if _, err := conn.Exec(ctx,
 		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE phone = $1`,
-		store.NormalizePhone(phone),
+		phone,
 	); err != nil {
 		t.Fatalf("expire code: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	if _, err := conn.Exec(ctx,
 		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE phone = $1`,
-		store.NormalizePhone(expiredPhone),
+		expiredPhone,
 	); err != nil {
 		t.Fatalf("expire code: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestDeleteExpiredCodes(t *testing.T) {
 
 	var count int
 	if err := conn.QueryRow(ctx,
-		`SELECT count(*) FROM phone_codes WHERE phone = $1`, store.NormalizePhone(expiredPhone),
+		`SELECT count(*) FROM phone_codes WHERE phone = $1`, expiredPhone,
 	).Scan(&count); err != nil {
 		t.Fatalf("count expired: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestDeleteExpiredCodes(t *testing.T) {
 		t.Fatalf("expired row still present: count=%d", count)
 	}
 	if err := conn.QueryRow(ctx,
-		`SELECT count(*) FROM phone_codes WHERE phone = $1`, store.NormalizePhone(freshPhone),
+		`SELECT count(*) FROM phone_codes WHERE phone = $1`, freshPhone,
 	).Scan(&count); err != nil {
 		t.Fatalf("count fresh: %v", err)
 	}

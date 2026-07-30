@@ -12,6 +12,7 @@ INSERT INTO phone_lookups (caller_id, phone, looked_up_at)
 VALUES ($1, $2, now());
 
 -- name: DeleteExpiredPhoneLookups :exec
--- Remove lookups older than the window so the table does not grow unbounded.
+-- Remove lookups older than the window for a specific caller.
 DELETE FROM phone_lookups
-WHERE looked_up_at < $1;
+WHERE caller_id = $1
+  AND looked_up_at < $2;

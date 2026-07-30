@@ -33,12 +33,18 @@ func (q *Queries) CountPhoneLookups(ctx context.Context, arg CountPhoneLookupsPa
 
 const deleteExpiredPhoneLookups = `-- name: DeleteExpiredPhoneLookups :exec
 DELETE FROM phone_lookups
-WHERE looked_up_at < $1
+WHERE caller_id = $1
+  AND looked_up_at < $2
 `
 
-// Remove lookups older than the window so the table does not grow unbounded.
-func (q *Queries) DeleteExpiredPhoneLookups(ctx context.Context, lookedUpAt pgtype.Timestamptz) error {
-	_, err := q.db.Exec(ctx, deleteExpiredPhoneLookups, lookedUpAt)
+type DeleteExpiredPhoneLookupsParams struct {
+	CallerID   int64
+	LookedUpAt pgtype.Timestamptz
+}
+
+// Remove lookups older than the window for a specific caller.
+func (q *Queries) DeleteExpiredPhoneLookups(ctx context.Context, arg DeleteExpiredPhoneLookupsParams) error {
+	_, err := q.db.Exec(ctx, deleteExpiredPhoneLookups, arg.CallerID, arg.LookedUpAt)
 	return err
 }
 

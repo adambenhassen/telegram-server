@@ -18,8 +18,8 @@ type User struct {
 }
 
 // NormalizePhone strips an optional leading '+' so that '+1555...' and
-// '1555...' resolve to the same value. Used on both the sign-in write path
-// and the lookup read path so the two sides stay consistent.
+// '1555...' resolve to the same value. Used on the lookup read path only;
+// write-path normalization requires a separate backfill migration.
 func NormalizePhone(phone string) string {
 	return strings.TrimPrefix(phone, "+")
 }
@@ -27,10 +27,7 @@ func NormalizePhone(phone string) string {
 // CreateUser inserts a user for phone, or returns the existing row. It also
 // provisions the account's update_state row in the same transaction so the
 // update APIs and the two-sided send lock ordering never race a missing row.
-// Phone is normalized (leading '+' stripped) before the lookup so that
-// '+1555...' and '1555...' resolve to the same row.
 func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
-	phone = NormalizePhone(phone)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return User{}, fmt.Errorf("begin: %w", err)
@@ -64,9 +61,8 @@ func (s *Store) UserByID(ctx context.Context, id int64) (User, bool, error) {
 }
 
 // UserByPhone returns the user for phone, ok=false when absent.
-// Phone is normalized (leading '+' stripped) before the lookup.
 func (s *Store) UserByPhone(ctx context.Context, phone string) (User, bool, error) {
-	u, err := s.q.UserByPhone(ctx, NormalizePhone(phone))
+	u, err := s.q.UserByPhone(ctx, phone)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return User{}, false, nil
