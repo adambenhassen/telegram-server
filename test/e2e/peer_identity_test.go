@@ -24,6 +24,7 @@ import (
 // returned by the server, and B receives it live. No hand-built access hash
 // appears in the test.
 func TestPeerIdentityStrangerStart(t *testing.T) {
+	t.Skip("requires contacts.resolvePhone (MAIN-126)")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -129,6 +130,7 @@ func TestPeerIdentityStrangerStart(t *testing.T) {
 // with access_hash equal to the id (M1 placeholder) is refused — for both user
 // and channel peers.
 func TestPeerIdentityPlaceholderRefused(t *testing.T) {
+	t.Skip("requires contacts.resolvePhone (MAIN-126)")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -238,6 +240,7 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 // TestPeerIdentityReplayRefused proves that a hash the server issued to A for
 // peer B is refused when a third client C submits it.
 func TestPeerIdentityReplayRefused(t *testing.T) {
+	t.Skip("requires contacts.resolvePhone (MAIN-126)")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -592,6 +595,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 // offline reconnects, backfills through getDifference, and every peer in the
 // backfill is spendable (used for a subsequent API call).
 func TestPeerIdentityBackfillSpendable(t *testing.T) {
+	t.Skip("requires contacts.resolvePhone (MAIN-126)")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -720,6 +724,7 @@ func TestPeerIdentityBackfillSpendable(t *testing.T) {
 // from server responses (resolvePhone) and performs send, edit, delete, read
 // and typing — no locally-derived hash anywhere.
 func TestPeerIdentityRoundTrip(t *testing.T) {
+	t.Skip("requires contacts.resolvePhone (MAIN-126)")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
