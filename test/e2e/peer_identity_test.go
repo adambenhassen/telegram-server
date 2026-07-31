@@ -188,6 +188,9 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		if len(rp.Users) != 1 {
+			return errors.New("resolvePhone: no users in response")
+		}
 		bUser, ok = rp.Users[0].(*tg.User)
 		if !ok {
 			return errors.New("resolvePhone: not *tg.User")
@@ -295,6 +298,9 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 		rp, err := c.ContactsResolvePhone(ctx, phoneB)
 		if err != nil {
 			return err
+		}
+		if len(rp.Users) != 1 {
+			return errors.New("resolvePhone: no users in response")
 		}
 		bUserForA, ok = rp.Users[0].(*tg.User)
 		if !ok {

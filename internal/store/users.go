@@ -18,8 +18,7 @@ type User struct {
 }
 
 // NormalizePhone strips an optional leading '+' so that '+1555...' and
-// '1555...' resolve to the same value. Used on the lookup read path only;
-// write-path normalization requires a separate backfill migration.
+// '1555...' resolve to the same value. Used on both read and write paths.
 func NormalizePhone(phone string) string {
 	return strings.TrimPrefix(phone, "+")
 }
