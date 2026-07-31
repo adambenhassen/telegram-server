@@ -9,7 +9,7 @@ SELECT * FROM users WHERE phone = $1;
 -- name: UserByID :one
 SELECT * FROM users WHERE id = $1;
 
--- name: SetUserStatus :exec
+-- name: SetUserStatus :execrows
 UPDATE users SET is_online = $2, last_seen_at = now() WHERE id = $1;
 
 

@@ -98,27 +98,12 @@ func UserFromDB(u db.User) User {
 // marked offline. last_seen_at is set to NOW() in both cases. Returns an error
 // when the user does not exist.
 func (s *Store) SetUserStatus(ctx context.Context, userID int64, online bool) error {
-	tx, err := s.pool.Begin(ctx)
+	n, err := s.q.SetUserStatus(ctx, db.SetUserStatusParams{ID: userID, IsOnline: online})
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
-	qtx := s.q.WithTx(tx)
-
-	// Verify user exists before writing.
-	if _, err := qtx.UserByID(ctx, userID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("set user status: user %d not found", userID)
-		}
 		return fmt.Errorf("set user status: %w", err)
 	}
-
-	if err := qtx.SetUserStatus(ctx, db.SetUserStatusParams{ID: userID, IsOnline: online}); err != nil {
-		return fmt.Errorf("set user status: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit: %w", err)
+	if n == 0 {
+		return fmt.Errorf("set user status: user %d not found", userID)
 	}
 	return nil
 }

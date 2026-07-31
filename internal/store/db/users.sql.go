@@ -30,7 +30,7 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
 	return i, err
 }
 
-const setUserStatus = `-- name: SetUserStatus :exec
+const setUserStatus = `-- name: SetUserStatus :execrows
 UPDATE users SET is_online = $2, last_seen_at = now() WHERE id = $1
 `
 
@@ -39,9 +39,12 @@ type SetUserStatusParams struct {
 	IsOnline bool
 }
 
-func (q *Queries) SetUserStatus(ctx context.Context, arg SetUserStatusParams) error {
-	_, err := q.db.Exec(ctx, setUserStatus, arg.ID, arg.IsOnline)
-	return err
+func (q *Queries) SetUserStatus(ctx context.Context, arg SetUserStatusParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setUserStatus, arg.ID, arg.IsOnline)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const userByID = `-- name: UserByID :one
