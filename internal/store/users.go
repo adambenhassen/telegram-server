@@ -34,7 +34,7 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
-	u, err := qtx.CreateUser(ctx, NormalizePhone(phone))
+	u, err := qtx.CreateUser(ctx, phone)
 	if err != nil {
 		return User{}, fmt.Errorf("create user: %w", err)
 	}
@@ -59,10 +59,9 @@ func (s *Store) UserByID(ctx context.Context, id int64) (User, bool, error) {
 	return User{ID: u.ID, Phone: u.Phone, FirstName: u.FirstName, LastName: u.LastName}, true, nil
 }
 
-// UserByPhone returns the user for phone, ok=false when absent. Phone is
-// normalized before lookup so '+1555...' and '1555...' resolve to the same row.
+// UserByPhone returns the user for phone, ok=false when absent.
 func (s *Store) UserByPhone(ctx context.Context, phone string) (User, bool, error) {
-	u, err := s.q.UserByPhone(ctx, NormalizePhone(phone))
+	u, err := s.q.UserByPhone(ctx, phone)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return User{}, false, nil

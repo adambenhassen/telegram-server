@@ -24,7 +24,7 @@ import (
 // returned by the server, and B receives it live. No hand-built access hash
 // appears in the test.
 func TestPeerIdentityStrangerStart(t *testing.T) {
-	t.Skip("requires contacts.resolvePhone (MAIN-126)")
+	t.Skip("contacts.resolvePhone not yet registered: MAIN-127")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -127,10 +127,9 @@ func TestPeerIdentityStrangerStart(t *testing.T) {
 }
 
 // TestPeerIdentityPlaceholderRefused proves that a client constructing a peer
-// with access_hash equal to the id (M1 placeholder) is refused — for both user
-// and channel peers.
+// with access_hash equal to the id (M1 placeholder) is refused — for channel
+// peers. User peer test skipped (requires contacts.resolvePhone).
 func TestPeerIdentityPlaceholderRefused(t *testing.T) {
-	t.Skip("requires contacts.resolvePhone (MAIN-126)")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -160,17 +159,13 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
 	t.Cleanup(stop)
 
-	const phoneA, phoneB = "+15551271001", "+15551271002"
+	const phoneA = "+15551271001"
 
-	collB := newUpdateCollector()
-	aCmds, bCmds := make(chan command), make(chan command)
-	aID, bID := make(chan int64, 1), make(chan int64, 1)
-	errA, errB := make(chan error, 1), make(chan error, 1)
+	aCmds := make(chan command)
+	aID := make(chan int64, 1)
+	errA := make(chan error, 1)
 	go func() {
 		errA <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneA, codes), aID, aCmds)
-	}()
-	go func() {
-		errB <- runInteractive(ctx, createClient(addr.Port, key, dcID, collB, nil), flowFor(phoneB, codes), bID, bCmds)
 	}()
 
 	login := func(ch chan int64, who string) int64 {
@@ -182,65 +177,55 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 			return 0
 		}
 	}
-	aUserID := login(aID, "A")
-	login(bID, "B")
+	login(aID, "A")
 
-	// A resolves B so A has a valid peer for B too (proves placeholder is the
-	// only thing being tested, not "unknown peer").
-	var bUser *tg.User
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
-		rp, err := c.ContactsResolvePhone(ctx, phoneB)
+	// A creates channel, captures full *tg.Channel from response.
+	var ch *tg.Channel
+	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
+			Title:     "Placeholder",
+			About:     "",
+			Broadcast: true,
+		})
 		if err != nil {
 			return err
 		}
-		if len(rp.Users) != 1 {
-			return errors.New("resolvePhone: no users in response")
-		}
-		bUser, ok = rp.Users[0].(*tg.User)
+		ups, ok := res.(*tg.Updates)
 		if !ok {
-			return errors.New("resolvePhone: not *tg.User")
+			return errors.New("createChannel: unexpected updates type")
 		}
-		return nil
+		for _, c := range ups.Chats {
+			if channel, ok := c.(*tg.Channel); ok {
+				ch = channel
+				return nil
+			}
+		}
+		return errors.New("createChannel: no channel in response")
 	})
 
-	// A sends with placeholder hash (access_hash == user_id) → PEER_ID_INVALID.
+	// A calls getHistory with placeholder hash (access_hash == channel_id) → PEER_ID_INVALID.
 	assertPeerRPCError(t, aCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
-		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerUser{UserID: bUser.ID, AccessHash: bUser.ID},
-			Message:  "placeholder",
-			RandomID: 900101,
+		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:  &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+			Limit: 10,
 		})
 		return err
 	})
 
-	// A creates channel, exports invite, B joins.
-	chID := createBroadcastChannel(t, aCmds, "Placeholder")
-	hash := exportChannelInvite(t, aUserID, aCmds, chID)
-	importChannelInvite(t, bCmds, hash)
-
-	// B sends with placeholder hash (access_hash == channel_id) → PEER_ID_INVALID.
-	assertPeerRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
-		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
-			Message:  "placeholder channel",
-			RandomID: 900102,
-		})
-		return err
+	t.Run("user", func(t *testing.T) {
+		t.Skip("user placeholder test requires contacts.resolvePhone: MAIN-127")
 	})
 
 	close(aCmds)
-	close(bCmds)
-	for _, ch := range []chan error{errA, errB} {
-		if err := <-ch; err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("client run: %v", err)
-		}
+	if err := <-errA; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client run: %v", err)
 	}
 }
 
 // TestPeerIdentityReplayRefused proves that a hash the server issued to A for
-// peer B is refused when a third client C submits it.
+// a channel is refused when a third client C submits it. User peer test
+// skipped (requires contacts.resolvePhone).
 func TestPeerIdentityReplayRefused(t *testing.T) {
-	t.Skip("requires contacts.resolvePhone (MAIN-126)")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -270,16 +255,13 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
 	t.Cleanup(stop)
 
-	const phoneA, phoneB, phoneC = "+15551272001", "+15551272002", "+15551272003"
+	const phoneA, phoneC = "+15551272001", "+15551272003"
 
-	aCmds, bCmds, cCmds := make(chan command), make(chan command), make(chan command)
-	aID, bID, cID := make(chan int64, 1), make(chan int64, 1), make(chan int64, 1)
-	errA, errB, errC := make(chan error, 1), make(chan error, 1), make(chan error, 1)
+	aCmds, cCmds := make(chan command), make(chan command)
+	aID, cID := make(chan int64, 1), make(chan int64, 1)
+	errA, errC := make(chan error, 1), make(chan error, 1)
 	go func() {
 		errA <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneA, codes), aID, aCmds)
-	}()
-	go func() {
-		errB <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneB, codes), bID, bCmds)
 	}()
 	go func() {
 		errC <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneC, codes), cID, cCmds)
@@ -294,81 +276,49 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 			return 0
 		}
 	}
-	aUserID := login(aID, "A")
-	login(bID, "B")
-	_ = login(cID, "C")
+	login(aID, "A")
+	login(cID, "C")
 
-	// A resolves B → gets B's user with A's access_hash for B.
-	var bUserForA *tg.User
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
-		rp, err := c.ContactsResolvePhone(ctx, phoneB)
-		if err != nil {
-			return err
-		}
-		if len(rp.Users) != 1 {
-			return errors.New("resolvePhone: no users in response")
-		}
-		bUserForA, ok = rp.Users[0].(*tg.User)
-		if !ok {
-			return errors.New("resolvePhone: not *tg.User")
-		}
-		return nil
-	})
-
-	// C tries to send to B using A's access_hash for B → PEER_ID_INVALID.
-	assertPeerRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
-		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerUser{UserID: bUserForA.ID, AccessHash: bUserForA.AccessHash},
-			Message:  "replay",
-			RandomID: 900201,
+	// A creates channel, captures full *tg.Channel (with A's access_hash).
+	var ch *tg.Channel
+	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
+			Title:     "ReplayChannel",
+			About:     "",
+			Broadcast: true,
 		})
-		return err
-	})
-
-	// Channel replay: A creates channel, exports invite for B; B joins.
-	// Then C tries to use B's access_hash for the channel (issued to B) → refused.
-	chID := createBroadcastChannel(t, aCmds, "ReplayChannel")
-
-	// A exports invite for B.
-	hashB := exportChannelInvite(t, aUserID, aCmds, chID)
-
-	// B joins via invite; the response contains the channel with B's access_hash.
-	var chForB *tg.Channel
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
-		res, err := c.MessagesImportChatInvite(ctx, hashB)
 		if err != nil {
 			return err
 		}
-		ok, joined := res.(*tg.MessagesChatInviteJoinResultOk)
-		if !joined {
-			return errors.New("importChatInvite: unexpected response type")
+		ups, ok := res.(*tg.Updates)
+		if !ok {
+			return errors.New("createChannel: unexpected updates type")
 		}
-		ups, isUps := ok.Updates.(*tg.Updates)
-		if !isUps {
-			return errors.New("importChatInvite: unexpected Updates type")
-		}
-		for _, ch := range ups.Chats {
-			if channel, ok := ch.(*tg.Channel); ok && channel.ID == chID {
-				chForB = channel
+		for _, c := range ups.Chats {
+			if channel, ok := c.(*tg.Channel); ok {
+				ch = channel
 				return nil
 			}
 		}
-		return errors.New("channel not in import response")
+		return errors.New("createChannel: no channel in response")
 	})
 
-	// C tries to use B's channel access_hash → PEER_ID_INVALID.
+	// C tries to use A's channel access_hash → PEER_ID_INVALID.
 	assertPeerRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-			Peer:  &tg.InputPeerChannel{ChannelID: chID, AccessHash: chForB.AccessHash},
+			Peer:  &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.AccessHash},
 			Limit: 10,
 		})
 		return err
 	})
 
+	t.Run("user", func(t *testing.T) {
+		t.Skip("user replay test requires contacts.resolvePhone: MAIN-127")
+	})
+
 	close(aCmds)
-	close(bCmds)
 	close(cCmds)
-	for _, ch := range []chan error{errA, errB, errC} {
+	for _, ch := range []chan error{errA, errC} {
 		if err := <-ch; err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("client run: %v", err)
 		}
@@ -418,10 +368,10 @@ func revokeInvite(ctx context.Context, c *tg.Client, peer tg.InputPeerClass, has
 	return c.Invoker().Invoke(ctx, &rawReq{buf.Raw()}, &rawRes{})
 }
 
-// TestPeerIdentityChannelLifecycle proves criterion 5: channel lifecycle with
-// derived hashes — create, join by invite, post, history, getChannelDifference,
-// leave, and invite revocation (revoked hash refused, outstanding hash still
-// admitted).
+// TestPeerIdentityChannelLifecycle proves criterion 5: channel lifecycle using
+// only server-issued peers — create, join by invite, post, history,
+// getChannelDifference, leave, and invite revocation (revoked hash refused,
+// outstanding hash still admitted).
 func TestPeerIdentityChannelLifecycle(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
@@ -477,18 +427,59 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 			return 0
 		}
 	}
-	aUserID := login(aID, "A")
-	bUserID := login(bID, "B")
+	login(aID, "A")
+	login(bID, "B")
 	login(cID, "C")
 
-	// A creates channel.
-	chID := createBroadcastChannel(t, aCmds, "Lifecycle")
+	// A creates channel, captures full server-issued *tg.Channel.
+	var chForA *tg.Channel
+	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
+			Title:     "Lifecycle",
+			About:     "",
+			Broadcast: true,
+		})
+		if err != nil {
+			return err
+		}
+		ups, ok := res.(*tg.Updates)
+		if !ok {
+			return errors.New("createChannel: unexpected updates type")
+		}
+		for _, c := range ups.Chats {
+			if channel, ok := c.(*tg.Channel); ok {
+				chForA = channel
+				return nil
+			}
+		}
+		return errors.New("createChannel: no channel in response")
+	})
+
+	// Helper: export invite using server-issued peer.
+	exportInvite := func(peer tg.InputPeerClass) string {
+		var hash string
+		execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+			res, err := c.MessagesExportChatInvite(ctx, &tg.MessagesExportChatInviteRequest{Peer: peer})
+			if err != nil {
+				return err
+			}
+			inv, ok := res.(*tg.ChatInviteExported)
+			if !ok {
+				return errors.New("exportChatInvite: unexpected type")
+			}
+			hash = inviteHash(inv.Link)
+			return nil
+		})
+		return hash
+	}
 
 	// A exports two invites: one for B, one for C.
-	hashB := exportChannelInvite(t, aUserID, aCmds, chID)
-	hashC := exportChannelInvite(t, aUserID, aCmds, chID)
+	peerA := &tg.InputPeerChannel{ChannelID: chForA.ID, AccessHash: chForA.AccessHash}
+	hashB := exportInvite(peerA)
+	hashC := exportInvite(peerA)
 
-	// B joins via invite.
+	// B joins via invite, captures full server-issued *tg.Channel.
+	var chForB *tg.Channel
 	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesImportChatInvite(ctx, hashB)
 		if err != nil {
@@ -502,19 +493,22 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 		if !isUps {
 			return errors.New("importChatInvite: unexpected Updates type")
 		}
-		for _, ch := range ups.Chats {
-			if channel, ok := ch.(*tg.Channel); ok && channel.ID == chID {
-				_ = channel
+		for _, c := range ups.Chats {
+			if channel, ok := c.(*tg.Channel); ok && channel.ID == chForA.ID {
+				chForB = channel
 				return nil
 			}
 		}
 		return errors.New("channel not in import response")
 	})
 
+	peerB := &tg.InputPeerChannel{ChannelID: chForB.ID, AccessHash: chForB.AccessHash}
+	inputB := &tg.InputChannel{ChannelID: chForB.ID, AccessHash: chForB.AccessHash}
+
 	// A posts a message.
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     peerChannel(aUserID, chID),
+			Peer:     peerA,
 			Message:  "channel msg",
 			RandomID: 9003001,
 		})
@@ -534,7 +528,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 	// B calls getChannelDifference — peers in response are spendable.
 	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
 		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
-			Channel: inputChannel(bUserID, chID),
+			Channel: inputB,
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
 			Pts:     0,
 			Limit:   10,
@@ -554,14 +548,14 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 
 	// B leaves channel.
 	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
-		_, err := c.ChannelsLeaveChannel(ctx, inputChannel(bUserID, chID))
+		_, err := c.ChannelsLeaveChannel(ctx, inputB)
 		return err
 	})
 
 	// B can no longer read history — PEER_ID_INVALID after leave.
 	assertPeerRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-			Peer:  peerChannel(bUserID, chID),
+			Peer:  peerB,
 			Limit: 10,
 		})
 		return err
@@ -569,7 +563,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 
 	// A revokes hashB. C still joins with hashC (outstanding invite admitted).
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
-		return revokeInvite(ctx, c, peerChannel(aUserID, chID), hashB)
+		return revokeInvite(ctx, c, peerA, hashB)
 	})
 
 	// C joins with hashC → succeeds.
@@ -595,7 +589,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 // offline reconnects, backfills through getDifference, and every peer in the
 // backfill is spendable (used for a subsequent API call).
 func TestPeerIdentityBackfillSpendable(t *testing.T) {
-	t.Skip("requires contacts.resolvePhone (MAIN-126)")
+	t.Skip("contacts.resolvePhone not yet registered: MAIN-127")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -724,7 +718,7 @@ func TestPeerIdentityBackfillSpendable(t *testing.T) {
 // from server responses (resolvePhone) and performs send, edit, delete, read
 // and typing — no locally-derived hash anywhere.
 func TestPeerIdentityRoundTrip(t *testing.T) {
-	t.Skip("requires contacts.resolvePhone (MAIN-126)")
+	t.Skip("contacts.resolvePhone not yet registered: MAIN-127")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
