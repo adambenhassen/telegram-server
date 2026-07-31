@@ -51,11 +51,13 @@ func (h *handlers) inputPeer(peer tg.InputPeerClass, viewerID int64) (store.Peer
 		return store.PeerTypeChat, c.ChatID, nil
 	}
 	if c, ok := peer.(*tg.InputPeerChannel); ok {
-		// M1 placeholder for channels — not an authorization boundary, channel
-		// ids are dense and the hash is derivable from the id. Admission is the
-		// invite hash and the membership row, never this check. Channels are out
-		// of scope for MAIN-120.
-		if c.ChannelID == 0 || c.AccessHash != c.ChannelID {
+		// Channel access_hash must be derived for (viewerID, channelID). M1
+		// placeholder (access_hash == id) is no longer accepted.
+		if c.ChannelID == 0 {
+			return 0, 0, errPeerIDInvalid
+		}
+		wantHash := h.peers.Derive(viewerID, peerhash.KindChannel, c.ChannelID)
+		if c.AccessHash != wantHash {
 			return 0, 0, errPeerIDInvalid
 		}
 		return store.PeerTypeChannel, c.ChannelID, nil

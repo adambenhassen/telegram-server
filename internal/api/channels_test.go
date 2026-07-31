@@ -53,10 +53,10 @@ func banChannelMember(t *testing.T, ctx context.Context, dsn string, channelID, 
 		channelID, userID, until)
 }
 
-func inputChannels(ids ...int64) []tg.InputChannelClass {
+func inputChannels(viewerID int64, ids ...int64) []tg.InputChannelClass {
 	out := make([]tg.InputChannelClass, len(ids))
 	for i, id := range ids {
-		out[i] = &tg.InputChannel{ChannelID: id, AccessHash: id}
+		out[i] = api.InputChannel(viewerID, id)
 	}
 	return out
 }
@@ -105,8 +105,8 @@ func TestHandleCreateChannelBroadcast(t *testing.T) {
 	if ch.Title != "News" {
 		t.Errorf("title = %q, want %q", ch.Title, "News")
 	}
-	if ch.AccessHash != ch.ID {
-		t.Errorf("access hash = %d, want %d", ch.AccessHash, ch.ID)
+	if ch.AccessHash != api.DeriveChannelHash(u.ID, ch.ID) {
+		t.Errorf("access hash = %d, want %d", ch.AccessHash, api.DeriveChannelHash(u.ID, ch.ID))
 	}
 
 	stored, ok, err := s.ChannelByID(ctx, ch.ID)
@@ -207,7 +207,7 @@ func TestHandleGetChannelsHidesMetadataFromStrangers(t *testing.T) {
 	}
 	ch := createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "Secret"})
 
-	res, err := api.GetChannelsForTest(s, stranger.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(ch.ID)})
+	res, err := api.GetChannelsForTest(s, stranger.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(stranger.ID, ch.ID)})
 	if err != nil {
 		t.Fatalf("get channels: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestHandleGetChannelsHidesMetadataFromStrangers(t *testing.T) {
 	}
 
 	// The member's own view still carries the title.
-	res, err = api.GetChannelsForTest(s, owner.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(ch.ID)})
+	res, err = api.GetChannelsForTest(s, owner.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(owner.ID, ch.ID)})
 	if err != nil {
 		t.Fatalf("get channels as owner: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestHandleGetChannelsRejectsOversizedVector(t *testing.T) {
 	for i := range ids {
 		ids[i] = int64(i + 1)
 	}
-	_, err = api.GetChannelsForTest(s, u.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(ids...)})
+	_, err = api.GetChannelsForTest(s, u.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(u.ID, ids...)})
 	if msg := rpcMessage(t, err); msg != "USERS_TOO_MUCH" {
 		t.Fatalf("got %s, want USERS_TOO_MUCH", msg)
 	}
@@ -296,7 +296,7 @@ func TestHandleLeaveChannelRevokesMetadata(t *testing.T) {
 	ch := createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "News"})
 
 	res, err := api.LeaveChannelForTest(s, owner.ID, &tg.ChannelsLeaveChannelRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(owner.ID, ch.ID),
 	})
 	if err != nil {
 		t.Fatalf("leave: %v", err)
@@ -314,7 +314,7 @@ func TestHandleLeaveChannelRevokesMetadata(t *testing.T) {
 	if _, ok, err := s.ChannelByID(ctx, ch.ID); err != nil || !ok {
 		t.Fatalf("channel after creator left: ok=%v err=%v", ok, err)
 	}
-	after, err := api.GetChannelsForTest(s, owner.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(ch.ID)})
+	after, err := api.GetChannelsForTest(s, owner.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(owner.ID, ch.ID)})
 	if err != nil {
 		t.Fatalf("get channels after leave: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestHandleLeaveChannelRevokesMetadata(t *testing.T) {
 
 	// Leaving twice is the same error as leaving a channel that never existed.
 	_, err = api.LeaveChannelForTest(s, owner.ID, &tg.ChannelsLeaveChannelRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(owner.ID, ch.ID),
 	})
 	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
 		t.Errorf("second leave: got %s, want PEER_ID_INVALID", msg)
@@ -351,12 +351,12 @@ func TestChannelHandlersRejectUnauthenticated(t *testing.T) {
 			return err
 		},
 		"getChannels": func() error {
-			_, err := api.GetChannelsForTest(s, 0, &tg.ChannelsGetChannelsRequest{ID: inputChannels(1)})
+			_, err := api.GetChannelsForTest(s, 0, &tg.ChannelsGetChannelsRequest{ID: inputChannels(0, 1)})
 			return err
 		},
 		"leaveChannel": func() error {
 			_, err := api.LeaveChannelForTest(s, 0, &tg.ChannelsLeaveChannelRequest{
-				Channel: &tg.InputChannel{ChannelID: 1, AccessHash: 1},
+				Channel: api.InputChannel(0, 1),
 			})
 			return err
 		},
@@ -420,7 +420,7 @@ func TestHandleGetChannelsHidesMetadataFromBannedMember(t *testing.T) {
 
 	// While the ban is live the member is a stranger to the metadata.
 	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(time.Hour))
-	res, err := api.GetChannelsForTest(s, member.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(ch.ID)})
+	res, err := api.GetChannelsForTest(s, member.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(member.ID, ch.ID)})
 	if err != nil {
 		t.Fatalf("get channels while banned: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestHandleGetChannelsHidesMetadataFromBannedMember(t *testing.T) {
 
 	// An expired ban is not a ban: the same row gets the title back.
 	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(-time.Hour))
-	res, err = api.GetChannelsForTest(s, member.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(ch.ID)})
+	res, err = api.GetChannelsForTest(s, member.ID, &tg.ChannelsGetChannelsRequest{ID: inputChannels(member.ID, ch.ID)})
 	if err != nil {
 		t.Fatalf("get channels after ban expiry: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestHandleGetChannelsDropsUnknownIDs(t *testing.T) {
 	// An id with no channel row is dropped, not reported: a distinguishable
 	// not-found would make the dense BIGSERIAL id space enumerable.
 	res, err := api.GetChannelsForTest(s, owner.ID, &tg.ChannelsGetChannelsRequest{
-		ID: inputChannels(ch.ID, ch.ID+100000),
+		ID: inputChannels(owner.ID, ch.ID, ch.ID+100000),
 	})
 	if err != nil {
 		t.Fatalf("get channels: %v", err)
@@ -507,7 +507,7 @@ func TestHandleLeaveChannelRejectsBannedMember(t *testing.T) {
 	// Leaving under a live ban must not delete the row: the join path admits any
 	// account without one, so a successful leave here is a ban reset.
 	_, err = api.LeaveChannelForTest(s, member.ID, &tg.ChannelsLeaveChannelRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(member.ID, ch.ID),
 	})
 	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
 		t.Fatalf("banned leave: got %s, want PEER_ID_INVALID", msg)
@@ -523,7 +523,7 @@ func TestHandleLeaveChannelRejectsBannedMember(t *testing.T) {
 	// Once the ban has expired the same member leaves normally.
 	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(-time.Hour))
 	if _, err := api.LeaveChannelForTest(s, member.ID, &tg.ChannelsLeaveChannelRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(member.ID, ch.ID),
 	}); err != nil {
 		t.Fatalf("leave after ban expiry: %v", err)
 	}
@@ -548,14 +548,14 @@ func joinChannelByInvite(t *testing.T, s *store.Store, ch store.Channel, userID 
 	return m
 }
 
-func channelPeer(id int64) tg.InputPeerClass {
-	return &tg.InputPeerChannel{ChannelID: id, AccessHash: id}
+func channelPeer(viewerID, id int64) tg.InputPeerClass {
+	return api.InputPeerChannel(viewerID, id)
 }
 
 func sendToChannel(t *testing.T, s *store.Store, userID, channelID int64, text string, randomID int64) (bin.Encoder, error) {
 	t.Helper()
 	return api.SendMessageForTest(s, userID, &tg.MessagesSendMessageRequest{
-		Peer: channelPeer(channelID), Message: text, RandomID: randomID,
+		Peer: channelPeer(userID, channelID), Message: text, RandomID: randomID,
 	})
 }
 
@@ -742,7 +742,7 @@ func TestChannelReadsRejectANonMember(t *testing.T) {
 	}
 
 	_, err = api.GetChannelMessagesForTest(s, outsider.ID, &tg.ChannelsGetMessagesRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(outsider.ID, ch.ID),
 		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: 1}},
 	})
 	if err == nil {
@@ -751,7 +751,7 @@ func TestChannelReadsRejectANonMember(t *testing.T) {
 		t.Errorf("getMessages: got %s, want PEER_ID_INVALID", msg)
 	}
 
-	_, err = api.GetHistoryForTest(s, outsider.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)})
+	_, err = api.GetHistoryForTest(s, outsider.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(outsider.ID, ch.ID)})
 	if err == nil {
 		t.Fatal("getHistory: expected PEER_ID_INVALID, got nil")
 	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
@@ -786,13 +786,13 @@ func TestChannelReadsRejectABannedMember(t *testing.T) {
 
 	// The member reads fine right up to the ban, so the rejection below is the
 	// ban and not a membership problem.
-	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)}); err != nil {
+	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(member.ID, ch.ID)}); err != nil {
 		t.Fatalf("history before ban: %v", err)
 	}
 
 	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(time.Hour))
 
-	_, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)})
+	_, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(member.ID, ch.ID)})
 	if err == nil {
 		t.Fatal("getHistory: expected PEER_ID_INVALID for a banned member, got nil")
 	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
@@ -800,7 +800,7 @@ func TestChannelReadsRejectABannedMember(t *testing.T) {
 	}
 
 	_, err = api.GetChannelMessagesForTest(s, member.ID, &tg.ChannelsGetMessagesRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(member.ID, ch.ID),
 		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: 1}},
 	})
 	if err == nil {
@@ -842,7 +842,7 @@ func TestChannelHistoryServesPostsFromBeforeTheMemberJoined(t *testing.T) {
 		t.Fatalf("join_pts = %d, want 2 (the latecomer joined after both posts)", m.JoinPts)
 	}
 
-	res, err := api.GetHistoryForTest(s, latecomer.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)})
+	res, err := api.GetHistoryForTest(s, latecomer.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(latecomer.ID, ch.ID)})
 	if err != nil {
 		t.Fatalf("get history: %v", err)
 	}
@@ -883,7 +883,7 @@ func TestGetChannelMessagesReturnsTheNamedPosts(t *testing.T) {
 	}
 
 	res, err := api.GetChannelMessagesForTest(s, creator.ID, &tg.ChannelsGetMessagesRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(creator.ID, ch.ID),
 		// The third id has no row and must simply be absent from the reply.
 		ID: []tg.InputMessageClass{&tg.InputMessageID{ID: 3}, &tg.InputMessageID{ID: 1}, &tg.InputMessageID{ID: 99}},
 	})
@@ -1077,7 +1077,7 @@ func channelWith(t *testing.T, s *store.Store, creatorPhone, otherPhone string) 
 func exportInvite(t *testing.T, s *store.Store, userID int64, ch store.Channel) string {
 	t.Helper()
 	res, err := api.ExportChatInviteForTest(s, userID, &tg.MessagesExportChatInviteRequest{
-		Peer: &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Peer: api.InputPeerChannel(userID, ch.ID),
 	})
 	if err != nil {
 		t.Fatalf("export: %v", err)
@@ -1152,7 +1152,7 @@ func TestExportChatInviteRejectsUnauthorized(t *testing.T) {
 		t.Fatalf("import: %v", err)
 	}
 
-	peer := &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID}
+	peer := api.InputPeerChannel(member.ID, ch.ID)
 	if _, err := api.ExportChatInviteForTest(s, member.ID, &tg.MessagesExportChatInviteRequest{Peer: peer}); err == nil {
 		t.Error("role-0 member exported an invite")
 	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
@@ -1162,7 +1162,7 @@ func TestExportChatInviteRejectsUnauthorized(t *testing.T) {
 	// A banned admin. The creator is role 2, so banning them covers "banned" while
 	// the role check is satisfied — the ban has to be what rejects it.
 	banChannelMember(t, ctx, dsn, ch.ID, creator.ID, time.Now().Add(time.Hour))
-	if _, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{Peer: peer}); err == nil {
+	if _, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{Peer: api.InputPeerChannel(creator.ID, ch.ID)}); err == nil {
 		t.Error("banned admin exported an invite")
 	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
 		t.Errorf("banned admin: got %s, want PEER_ID_INVALID", msg)
@@ -1272,7 +1272,7 @@ func TestInviteFailuresAreIndistinguishable(t *testing.T) {
 	// A channel that DOES exist but the caller is not in, which must not be
 	// distinguishable from one that does not exist.
 	_, strangerErr := api.ExportChatInviteForTest(s, stranger.ID, &tg.MessagesExportChatInviteRequest{
-		Peer: &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Peer: api.InputPeerChannel(stranger.ID, ch.ID),
 	})
 
 	for name, err := range map[string]error{
@@ -1404,7 +1404,7 @@ func TestGetChannelDifferenceThreePosts(t *testing.T) {
 	}
 
 	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(creator.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
 		Pts:     0,
 		Limit:   100,
@@ -1448,7 +1448,7 @@ func TestGetChannelDifferencePartialPts(t *testing.T) {
 	}
 
 	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(creator.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
 		Pts:     2,
 		Limit:   100,
@@ -1492,7 +1492,7 @@ func TestGetChannelDifferenceCaughtUp(t *testing.T) {
 	}
 
 	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(creator.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
 		Pts:     3,
 		Limit:   100,
@@ -1533,7 +1533,7 @@ func TestGetChannelDifferenceAheadOfServer(t *testing.T) {
 	}
 
 	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(creator.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
 		Pts:     99,
 		Limit:   100,
@@ -1579,7 +1579,7 @@ func TestGetChannelDifferenceJoinPtsClamp(t *testing.T) {
 	}
 
 	enc, err := api.GetChannelDifferenceForTest(s, lateUser.ID, &tg.UpdatesGetChannelDifferenceRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(lateUser.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
 		Pts:     0,
 		Limit:   100,
@@ -1616,7 +1616,7 @@ func TestGetChannelDifferenceNonMember(t *testing.T) {
 		t.Fatalf("outsider: %v", err)
 	}
 	_, err = api.GetChannelDifferenceForTest(s, outsider.ID, &tg.UpdatesGetChannelDifferenceRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(outsider.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
 		Pts:     0,
 		Limit:   100,
@@ -1642,7 +1642,7 @@ func TestGetChannelDifferenceBanned(t *testing.T) {
 	banChannelMember(t, ctx, dsn, ch.ID, other.ID, banUntil)
 
 	_, err := api.GetChannelDifferenceForTest(s, other.ID, &tg.UpdatesGetChannelDifferenceRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(other.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
 		Pts:     0,
 		Limit:   100,
@@ -1672,7 +1672,7 @@ func TestGetChannelDifferenceTruncated(t *testing.T) {
 	}
 
 	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(creator.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
 		Pts:     0,
 		Limit:   2,
@@ -1707,7 +1707,7 @@ func inputUser(callerID, id int64) tg.InputUserClass {
 func promote(t *testing.T, s *store.Store, callerID int64, ch store.Channel, targetID int64) (bin.Encoder, error) {
 	t.Helper()
 	return api.EditAdminForTest(s, callerID, &tg.ChannelsEditAdminRequest{
-		Channel:     &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel:     api.InputChannel(callerID, ch.ID),
 		UserID:      inputUser(callerID, targetID),
 		AdminRights: tg.ChatAdminRights{BanUsers: true},
 		Rank:        "boss",
@@ -1719,7 +1719,7 @@ func promote(t *testing.T, s *store.Store, callerID int64, ch store.Channel, tar
 func banForever(t *testing.T, s *store.Store, callerID int64, ch store.Channel, targetID int64) (bin.Encoder, error) {
 	t.Helper()
 	return api.EditBannedForTest(s, callerID, &tg.ChannelsEditBannedRequest{
-		Channel:      &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel:      api.InputChannel(callerID, ch.ID),
 		Participant:  api.InputPeerUser(callerID, targetID),
 		BannedRights: tg.ChatBannedRights{ViewMessages: true},
 	})
@@ -1873,7 +1873,7 @@ func TestEditAdminRetryIsIdempotent(t *testing.T) {
 
 	// The demotion back to role 0 is a real transition and still works.
 	if _, err = api.EditAdminForTest(s, creator.ID, &tg.ChannelsEditAdminRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(creator.ID, ch.ID),
 		UserID:  inputUser(creator.ID, admin.ID),
 	}); err != nil {
 		t.Fatalf("demote: %v", err)
@@ -1904,7 +1904,7 @@ func TestEditBannedBansPermanentlyAndUnbans(t *testing.T) {
 	if _, err = sendToChannel(t, s, creator.ID, ch.ID, "before the ban", 8100); err != nil {
 		t.Fatalf("seed post: %v", err)
 	}
-	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)}); err != nil {
+	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(member.ID, ch.ID)}); err != nil {
 		t.Fatalf("history before ban: %v", err)
 	}
 
@@ -1920,7 +1920,7 @@ func TestEditBannedBansPermanentlyAndUnbans(t *testing.T) {
 		t.Fatalf("ban reply: got %T, want *tg.Channel for the caller", chats[0])
 	}
 
-	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)}); err == nil {
+	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(member.ID, ch.ID)}); err == nil {
 		t.Fatal("history after ban: expected PEER_ID_INVALID, got nil")
 	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
 		t.Errorf("history after ban: got %s, want PEER_ID_INVALID", msg)
@@ -1928,12 +1928,12 @@ func TestEditBannedBansPermanentlyAndUnbans(t *testing.T) {
 
 	// The zero rights struct is the unban.
 	if _, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
-		Channel:     &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel:     api.InputChannel(creator.ID, ch.ID),
 		Participant: api.InputPeerUser(creator.ID, member.ID),
 	}); err != nil {
 		t.Fatalf("unban: %v", err)
 	}
-	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)}); err != nil {
+	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(member.ID, ch.ID)}); err != nil {
 		t.Fatalf("history after unban: %v", err)
 	}
 	m, found, err := s.ChannelMemberOf(ctx, ch.ID, member.ID)
@@ -1966,7 +1966,7 @@ func TestEditBannedRejectsAPastUntilDate(t *testing.T) {
 	joinChannelByInvite(t, s, ch, member.ID)
 
 	_, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
-		Channel:     &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel:     api.InputChannel(creator.ID, ch.ID),
 		Participant: api.InputPeerUser(creator.ID, member.ID),
 		BannedRights: tg.ChatBannedRights{
 			ViewMessages: true,
@@ -2065,14 +2065,14 @@ func TestChannelEditsRejectBadInput(t *testing.T) {
 	creator, _, ch := channelWith(t, s, "+15551298071", "+15551298072")
 
 	if _, err := api.EditAdminForTest(s, 0, &tg.ChannelsEditAdminRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID}, UserID: inputUser(0, creator.ID),
+		Channel: api.InputChannel(0, ch.ID), UserID: inputUser(0, creator.ID),
 	}); err == nil {
 		t.Fatal("editAdmin unauthenticated: got nil")
 	} else if msg := rpcMessage(t, err); msg != "AUTH_KEY_UNREGISTERED" {
 		t.Errorf("editAdmin unauthenticated: got %s, want AUTH_KEY_UNREGISTERED", msg)
 	}
 	if _, err := api.EditBannedForTest(s, 0, &tg.ChannelsEditBannedRequest{
-		Channel:     &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel:     api.InputChannel(0, ch.ID),
 		Participant: api.InputPeerUser(0, creator.ID),
 	}); err == nil {
 		t.Fatal("editBanned unauthenticated: got nil")
@@ -2081,7 +2081,7 @@ func TestChannelEditsRejectBadInput(t *testing.T) {
 	}
 	// A chat peer names no channel participant row.
 	if _, err := api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
-		Channel:     &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel:     api.InputChannel(creator.ID, ch.ID),
 		Participant: &tg.InputPeerChat{ChatID: 1},
 	}); err == nil {
 		t.Fatal("editBanned on a chat peer: got nil")
@@ -2116,7 +2116,7 @@ func TestEditBannedRejectsAPartialRestriction(t *testing.T) {
 	}
 
 	_, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
-		Channel:      &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel:      api.InputChannel(creator.ID, ch.ID),
 		Participant:  api.InputPeerUser(creator.ID, member.ID),
 		BannedRights: tg.ChatBannedRights{SendMessages: true},
 	})
@@ -2134,23 +2134,23 @@ func TestEditBannedRejectsAPartialRestriction(t *testing.T) {
 	if !m.Banned(time.Now()) || !m.Forever() {
 		t.Fatalf("ban was cleared by a rejected edit: banned=%v forever=%v", m.Banned(time.Now()), m.Forever())
 	}
-	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(ch.ID)}); err == nil {
+	if _, err = api.GetHistoryForTest(s, member.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(member.ID, ch.ID)}); err == nil {
 		t.Fatal("history after a rejected edit: the ban no longer revokes reads")
 	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
 		t.Errorf("history after a rejected edit: got %s, want PEER_ID_INVALID", msg)
 	}
 
-	// The rejection is decided on the rights struct alone, so it does not need a
-	// channel to exist — which is what keeps it off the post-read error collapse.
+	// The rejection is decided on the rights struct alone, before any channel or
+	// membership lookup — which keeps it off the post-read error collapse.
 	_, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
-		Channel:      &tg.InputChannel{ChannelID: ch.ID + 1_000_000, AccessHash: ch.ID + 1_000_000},
+		Channel:      api.InputChannel(creator.ID, ch.ID),
 		Participant:  api.InputPeerUser(creator.ID, member.ID),
 		BannedRights: tg.ChatBannedRights{SendMessages: true},
 	})
 	if err == nil {
-		t.Fatal("partial restriction on an absent channel: got nil")
+		t.Fatal("partial restriction: got nil")
 	} else if msg := rpcMessage(t, err); msg != "BANNED_RIGHTS_INVALID" {
-		t.Errorf("partial restriction on an absent channel: got %s, want BANNED_RIGHTS_INVALID", msg)
+		t.Errorf("partial restriction: got %s, want BANNED_RIGHTS_INVALID", msg)
 	}
 }
 
@@ -2184,7 +2184,7 @@ func TestGetChannelDifferenceSkippedEvent(t *testing.T) {
 	}
 
 	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
-		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Channel: api.InputChannel(creator.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
 		Pts:     0,
 		Limit:   100,

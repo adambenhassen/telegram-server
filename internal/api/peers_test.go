@@ -12,16 +12,23 @@ import (
 
 func TestInputPeerChannel(t *testing.T) {
 	t.Parallel()
-	pt, id, err := api.InputPeer(&tg.InputPeerChannel{ChannelID: 5, AccessHash: 5}, 0)
+	// Derived hash for (viewer=5, channel=5) is the valid hash.
+	peer := api.InputPeerChannel(5, 5)
+	pt, id, err := api.InputPeer(peer, 5)
 	if err != nil || pt != store.PeerTypeChannel || id != 5 {
 		t.Fatalf("inputPeer(channel 5) = (%d, %d, %v), want (channel, 5, nil)", pt, id, err)
 	}
-	for _, p := range []tg.InputPeerClass{
-		&tg.InputPeerChannel{ChannelID: 5, AccessHash: 6},
-		&tg.InputPeerChannel{ChannelID: 0, AccessHash: 0},
+	// access_hash == channel_id (M1 placeholder) must be rejected.
+	if _, _, err := api.InputPeer(&tg.InputPeerChannel{ChannelID: 5, AccessHash: 5}, 5); err == nil {
+		t.Error("M1 placeholder: expected PEER_ID_INVALID, got nil")
+	}
+	for name, p := range map[string]tg.InputPeerClass{
+		"wrong hash":           &tg.InputPeerChannel{ChannelID: 5, AccessHash: 6},
+		"cross-account replay": &tg.InputPeerChannel{ChannelID: 5, AccessHash: api.DeriveChannelHash(999, 5)},
+		"zero id":              &tg.InputPeerChannel{ChannelID: 0, AccessHash: 0},
 	} {
-		if _, _, err := api.InputPeer(p, 0); err == nil {
-			t.Fatalf("inputPeer(%T %+v) = nil error, want PEER_ID_INVALID", p, p)
+		if _, _, err := api.InputPeer(p, 5); err == nil {
+			t.Fatalf("%s: expected PEER_ID_INVALID, got nil", name)
 		}
 	}
 }
@@ -56,7 +63,7 @@ func TestSendMessageRejectsChannelPeerFromNonMember(t *testing.T) {
 		t.Fatalf("create channel: %v", err)
 	}
 	_, err = api.SendMessageForTest(s, outsider.ID, &tg.MessagesSendMessageRequest{
-		Peer:     &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID},
+		Peer:     api.InputPeerChannel(outsider.ID, ch.ID),
 		Message:  "hi",
 		RandomID: 11,
 	})
