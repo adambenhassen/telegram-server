@@ -24,7 +24,6 @@ import (
 // returned by the server, and B receives it live. No hand-built access hash
 // appears in the test.
 func TestPeerIdentityStrangerStart(t *testing.T) {
-	t.Skip("contacts.resolvePhone not yet registered: MAIN-127")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -128,7 +127,7 @@ func TestPeerIdentityStrangerStart(t *testing.T) {
 
 // TestPeerIdentityPlaceholderRefused proves that a client constructing a peer
 // with access_hash equal to the id (M1 placeholder) is refused — for channel
-// peers. User peer test skipped (requires contacts.resolvePhone).
+// and user peers.
 func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -213,7 +212,30 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 	})
 
 	t.Run("user", func(t *testing.T) {
-		t.Skip("user placeholder test requires contacts.resolvePhone: MAIN-127")
+		// A resolves self via contacts.resolvePhone, then tries placeholder hash.
+		var aUser *tg.User
+		execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+			rp, err := c.ContactsResolvePhone(ctx, phoneA)
+			if err != nil {
+				return err
+			}
+			if len(rp.Users) != 1 {
+				return errors.New("resolvePhone: no users")
+			}
+			aUser, ok = rp.Users[0].(*tg.User)
+			if !ok {
+				return errors.New("resolvePhone: not *tg.User")
+			}
+			return nil
+		})
+		// A calls getHistory with placeholder hash (access_hash == user_id) → PEER_ID_INVALID.
+		assertPeerRPCError(t, aCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+			_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+				Peer:  &tg.InputPeerUser{UserID: aUser.ID, AccessHash: aUser.ID},
+				Limit: 10,
+			})
+			return err
+		})
 	})
 
 	close(aCmds)
@@ -223,8 +245,7 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 }
 
 // TestPeerIdentityReplayRefused proves that a hash the server issued to A for
-// a channel is refused when a third client C submits it. User peer test
-// skipped (requires contacts.resolvePhone).
+// a channel is refused when a third client C submits it.
 func TestPeerIdentityReplayRefused(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -313,7 +334,30 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 	})
 
 	t.Run("user", func(t *testing.T) {
-		t.Skip("user replay test requires contacts.resolvePhone: MAIN-127")
+		// A resolves C by phone → gets C's peer scoped to A.
+		var cPeer *tg.User
+		execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+			rp, err := c.ContactsResolvePhone(ctx, phoneC)
+			if err != nil {
+				return err
+			}
+			if len(rp.Users) != 1 {
+				return errors.New("resolvePhone: no users")
+			}
+			cPeer, ok = rp.Users[0].(*tg.User)
+			if !ok {
+				return errors.New("resolvePhone: not *tg.User")
+			}
+			return nil
+		})
+		// C tries to use A's hash for C → PEER_ID_INVALID.
+		assertPeerRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+			_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+				Peer:  &tg.InputPeerUser{UserID: cPeer.ID, AccessHash: cPeer.AccessHash},
+				Limit: 10,
+			})
+			return err
+		})
 	})
 
 	close(aCmds)
@@ -589,7 +633,6 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 // offline reconnects, backfills through getDifference, and every peer in the
 // backfill is spendable (used for a subsequent API call).
 func TestPeerIdentityBackfillSpendable(t *testing.T) {
-	t.Skip("contacts.resolvePhone not yet registered: MAIN-127")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -718,7 +761,6 @@ func TestPeerIdentityBackfillSpendable(t *testing.T) {
 // from server responses (resolvePhone) and performs send, edit, delete, read
 // and typing — no locally-derived hash anywhere.
 func TestPeerIdentityRoundTrip(t *testing.T) {
-	t.Skip("contacts.resolvePhone not yet registered: MAIN-127")
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()

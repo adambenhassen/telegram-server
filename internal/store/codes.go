@@ -29,6 +29,7 @@ const (
 // within resendCooldown. On success it resets the per-code hardening state
 // (attempts, consumed_at, created_at).
 func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, error) {
+	phone = NormalizePhone(phone)
 	existing, err := s.q.GetCode(ctx, phone)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -79,6 +80,7 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 // IncrementCodeAttempts is scoped by code_hash, a wrong hash matches no row and
 // charges nothing. The attempt that reaches maxAttempts exhausts the code.
 func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error {
+	phone = NormalizePhone(phone)
 	row, err := s.q.GetCode(ctx, phone)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):

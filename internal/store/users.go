@@ -34,7 +34,7 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
-	u, err := qtx.CreateUser(ctx, phone)
+	u, err := qtx.CreateUser(ctx, NormalizePhone(phone))
 	if err != nil {
 		return User{}, fmt.Errorf("create user: %w", err)
 	}
@@ -61,7 +61,7 @@ func (s *Store) UserByID(ctx context.Context, id int64) (User, bool, error) {
 
 // UserByPhone returns the user for phone, ok=false when absent.
 func (s *Store) UserByPhone(ctx context.Context, phone string) (User, bool, error) {
-	u, err := s.q.UserByPhone(ctx, phone)
+	u, err := s.q.UserByPhone(ctx, NormalizePhone(phone))
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return User{}, false, nil
