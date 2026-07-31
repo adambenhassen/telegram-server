@@ -1,4 +1,4 @@
-h1:12/v/yO+C2YzKmfN8WtWStJXwifvHJy/wTlUiyKTx7A=
+h1:Ns8DqmG1e0e/6L2+ENREPipAYt7Dn9IhCUj7fEeJDlI=
 20260721000001_baseline.sql h1:cnO6K1z0Uv3goEvecgJixKSio6ziaB1rF7cQLoCWOxs=
 20260721000002_auth_keys.sql h1:+vNabm6vdEAgu3H5ZGw2Wr8D/Y6i4ikAAUO3JbfZQeE=
 20260721000003_code_hardening.sql h1:8pbAqUpqcwOONUfac+qC51QjfC1JnObNCcXa1HC/dr0=
@@ -9,3 +9,4 @@ h1:12/v/yO+C2YzKmfN8WtWStJXwifvHJy/wTlUiyKTx7A=
 20260729000008_channels.sql h1:ms/cdyKM8K7EVf4hu3hyl1j1NdYaM1zBRtqrh+TGdVE=
 20260730000009_lookup_quota.sql h1:2nI/PaoldZZKfvTuhRG/2eSg+MsiCUYw7zUKGBMe5KU=
 20260730000010_channel_invites_revoked.sql h1:3YwX4RjSrl0yR048J3N6FU4VFisaRHlGip22Xdox2YI=
+20260731000011_normalize_phone.sql h1:DUF39ASKAUINpmW3SgdO1/MSnk9SKDPoHlDe0o+shyg=
