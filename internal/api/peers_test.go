@@ -41,12 +41,12 @@ func TestPeerToTLChannel(t *testing.T) {
 	}
 }
 
-// A channel input peer resolves in inputPeer, and the placeholder access hash it
-// validates is derivable from the id, so nothing about naming a channel here is
-// an authorization step. sendMessage now has a channel path, and what still has
-// to hold is that the path rejects a caller with no participant row: the 1:1
-// fallthrough would otherwise read the channel id as a user id and write into
-// that account's message rows.
+// A channel input peer resolves in inputPeer against a derived access hash that
+// requires the server's HMAC key and the viewerID — not derivable from the id
+// alone. sendMessage has a channel path, and what still has to hold is that the
+// path rejects a caller with no participant row: the 1:1 fallthrough would
+// otherwise read the channel id as a user id and write into that account's
+// message rows.
 func TestSendMessageRejectsChannelPeerFromNonMember(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)

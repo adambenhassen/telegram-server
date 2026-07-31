@@ -488,6 +488,48 @@ func TestHandleGetChannelsDropsUnknownIDs(t *testing.T) {
 	}
 }
 
+// TestGetChannelsEnumerationClosed verifies that submitting channel ids with
+// guessed hashes (M1 placeholder: access_hash == channel_id) returns the same
+// PEER_ID_INVALID for both live and non-existent channels. This is the AC
+// requirement: "Submitting 100 sequential channel ids with guessed hashes yields
+// the same response for live channels and non-existent ones."
+func TestGetChannelsEnumerationClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	owner, err := s.CreateUser(ctx, "+15551294016")
+	if err != nil {
+		t.Fatalf("owner: %v", err)
+	}
+	// Create a few live channels.
+	ch1 := createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "A"})
+	_ = createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "B"})
+
+	// Build a batch of 100 sequential ids with M1 placeholder hashes.
+	// Includes the live channels plus non-existent ones.
+	ids := make([]tg.InputChannelClass, 100)
+	baseID := ch1.ID
+	for i := range 100 {
+		id := baseID + int64(i)
+		ids[i] = &tg.InputChannel{ChannelID: id, AccessHash: id}
+	}
+
+	res, err := api.GetChannelsForTest(s, owner.ID, &tg.ChannelsGetChannelsRequest{ID: ids})
+	if err == nil {
+		t.Fatal("get channels with guessed hashes: expected error, got nil")
+	}
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("got %s, want PEER_ID_INVALID", msg)
+	}
+	// Response must be empty — no channels leaked.
+	if res != nil {
+		chats, ok := res.(*tg.MessagesChats)
+		if ok && len(chats.Chats) > 0 {
+			t.Fatalf("enumeration leaked %d channels", len(chats.Chats))
+		}
+	}
+}
+
 func TestHandleLeaveChannelRejectsBannedMember(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1266,8 +1308,9 @@ func TestInviteFailuresAreIndistinguishable(t *testing.T) {
 	_, checkErr := api.CheckChatInviteForTest(s, stranger.ID, &tg.MessagesCheckChatInviteRequest{Hash: unknownHash})
 	_, importErr := api.ImportChatInviteForTest(s, stranger.ID, &tg.MessagesImportChatInviteRequest{Hash: unknownHash})
 	// An id past every channel this test created, so the row genuinely is absent.
+	// Derived hash lets the peer pass validation; the channel row is still missing.
 	_, exportErr := api.ExportChatInviteForTest(s, stranger.ID, &tg.MessagesExportChatInviteRequest{
-		Peer: &tg.InputPeerChannel{ChannelID: ch.ID + 1_000_000, AccessHash: ch.ID + 1_000_000},
+		Peer: api.InputPeerChannel(stranger.ID, ch.ID+1_000_000),
 	})
 	// A channel that DOES exist but the caller is not in, which must not be
 	// distinguishable from one that does not exist.
@@ -2142,8 +2185,9 @@ func TestEditBannedRejectsAPartialRestriction(t *testing.T) {
 
 	// The rejection is decided on the rights struct alone, before any channel or
 	// membership lookup — which keeps it off the post-read error collapse.
+	// Non-existent channel with derived hash proves the check never reaches the store.
 	_, err = api.EditBannedForTest(s, creator.ID, &tg.ChannelsEditBannedRequest{
-		Channel:      api.InputChannel(creator.ID, ch.ID),
+		Channel:      api.InputChannel(creator.ID, ch.ID+1_000_000),
 		Participant:  api.InputPeerUser(creator.ID, member.ID),
 		BannedRights: tg.ChatBannedRights{SendMessages: true},
 	})

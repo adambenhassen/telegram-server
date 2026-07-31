@@ -40,9 +40,9 @@ func peerToTL(peerType store.PeerType, peerID int64) tg.PeerClass {
 // inputPeer classifies a client-supplied input peer. InputPeerChat carries no
 // access hash at all, so this only decodes the id: membership in the chat is the
 // entire authorization boundary and every caller MUST check it separately.
-// InputPeerChannel keeps the M1 placeholder (access_hash == id) — channels are
-// out of scope for MAIN-120. Anything that is none of InputPeerUser,
-// InputPeerChat or InputPeerChannel is PEER_ID_INVALID.
+// InputPeerChannel validates that access_hash was derived for (viewerID, channelID).
+// Anything that is none of InputPeerUser, InputPeerChat or InputPeerChannel is
+// PEER_ID_INVALID.
 func (h *handlers) inputPeer(peer tg.InputPeerClass, viewerID int64) (store.PeerType, int64, error) {
 	if c, ok := peer.(*tg.InputPeerChat); ok {
 		if c.ChatID == 0 {
