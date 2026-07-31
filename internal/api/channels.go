@@ -11,6 +11,7 @@ import (
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -54,15 +55,19 @@ func channelAbout(raw string) (string, error) {
 }
 
 // inputChannelID resolves a client-supplied InputChannel to a channel id.
-// Channels keep the M1 placeholder (access_hash == id); they are out of scope
-// for MAIN-120. InputChannelEmpty and InputChannelFromMessage are
-// PEER_ID_INVALID.
-func inputChannelID(c tg.InputChannelClass) (int64, error) {
+// Channel access_hash must be derived for (viewerID, channelID). M1 placeholder
+// (access_hash == id) is rejected. InputChannelEmpty and InputChannelFromMessage
+// are PEER_ID_INVALID.
+func (h *handlers) inputChannelID(c tg.InputChannelClass, viewerID int64) (int64, error) {
 	v, ok := c.(*tg.InputChannel)
 	if !ok {
 		return 0, errPeerIDInvalid
 	}
-	if v.ChannelID == 0 || v.AccessHash != v.ChannelID {
+	if v.ChannelID == 0 {
+		return 0, errPeerIDInvalid
+	}
+	wantHash := h.peers.Derive(viewerID, peerhash.KindChannel, v.ChannelID)
+	if v.AccessHash != wantHash {
 		return 0, errPeerIDInvalid
 	}
 	return v.ChannelID, nil
@@ -147,7 +152,7 @@ func (h *handlers) handleGetChannels(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	ids := make(map[int64]bool, len(req.ID))
 	for _, c := range req.ID {
-		id, err := inputChannelID(c)
+		id, err := h.inputChannelID(c, r.UserID)
 		if err != nil {
 			return nil, err
 		}
@@ -176,12 +181,10 @@ func (h *handlers) handleLeaveChannel(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	id, err := inputChannelID(req.Channel)
+	id, err := h.inputChannelID(req.Channel, r.UserID)
 	if err != nil {
 		return nil, err
 	}
-
-	// A banned member may not leave. LeaveChannel deletes the participant row and
 	// JoinChannelByInvite (internal/store/channels.go:281) admits any account that
 	// has none, so without this check leave-then-rejoin is a ban reset for anyone
 	// still holding the invite hash. It is the same errPeerIDInvalid a non-member
@@ -318,13 +321,10 @@ func (h *handlers) handleGetChannelDifference(r *mtproto.Request) (bin.Encoder, 
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	channelID, err := inputChannelID(req.Channel)
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
 	if err != nil {
 		return nil, err
 	}
-
-	// Require participant row and not banned; unknown channel and non-member
-	// return the same errPeerIDInvalid.
 	member, err := h.requireChannelMember(r.Ctx, channelID, r.UserID)
 	if err != nil {
 		return nil, err
@@ -402,7 +402,7 @@ func (h *handlers) handleGetChannelMessages(r *mtproto.Request) (bin.Encoder, er
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	channelID, err := inputChannelID(req.Channel)
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -731,7 +731,7 @@ func (h *handlers) handleEditAdmin(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	channelID, err := inputChannelID(req.Channel)
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -786,7 +786,7 @@ func (h *handlers) handleEditBanned(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	channelID, err := inputChannelID(req.Channel)
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -870,7 +870,7 @@ func (h *handlers) handleCheckChatInvite(r *mtproto.Request) (bin.Encoder, error
 		// the channel it gets back is the forbidden form, the same answer
 		// loadChannels gives. A ban that still served the live title would be
 		// cosmetic.
-		return &tg.ChatInviteAlready{Chat: channelToTL(ch, member, !member.Banned(time.Now()))}, nil
+		return &tg.ChatInviteAlready{Chat: h.channelToTL(ch, member, !member.Banned(time.Now()), r.UserID)}, nil
 	}
 	// No participants and no photo: M7 stores neither, and a preview naming who
 	// is inside a private channel would give away more than the title does.
@@ -931,7 +931,7 @@ func (h *handlers) handleImportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 			Users:   users,
 			// A re-join by a banned member returns that member's untouched row, and
 			// it must not hand back metadata the ban revoked.
-			Chats: []tg.ChatClass{channelToTL(ch, member, !member.Banned(time.Now()))},
+			Chats: []tg.ChatClass{h.channelToTL(ch, member, !member.Banned(time.Now()), r.UserID)},
 			Date:  int(time.Now().Unix()),
 		},
 	}, nil

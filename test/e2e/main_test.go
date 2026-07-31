@@ -39,3 +39,19 @@ func inputUser(viewerID, targetID int64) *tg.InputUser {
 		AccessHash: pgtest.PeerDeriver().Derive(viewerID, peerhash.KindUser, targetID),
 	}
 }
+
+// peerChannel builds an InputPeerChannel with the derived access hash.
+func peerChannel(viewerID, chID int64) *tg.InputPeerChannel {
+	return &tg.InputPeerChannel{
+		ChannelID:  chID,
+		AccessHash: pgtest.PeerDeriver().Derive(viewerID, peerhash.KindChannel, chID),
+	}
+}
+
+// inputChannel builds an InputChannel with the derived access hash.
+func inputChannel(viewerID, chID int64) *tg.InputChannel {
+	return &tg.InputChannel{
+		ChannelID:  chID,
+		AccessHash: pgtest.PeerDeriver().Derive(viewerID, peerhash.KindChannel, chID),
+	}
+}

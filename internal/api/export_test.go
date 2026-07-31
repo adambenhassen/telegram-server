@@ -142,10 +142,15 @@ func PeerUserID(peer tg.InputPeerClass, viewerID int64) (int64, error) {
 // package. PeerToTL, ChatToTL and ChannelToTL are pure and need no store.
 // InputPeer and InputUserID use the test deriver from pgtest.
 var (
-	PeerToTL    = peerToTL
-	ChatToTL    = chatToTL
-	ChannelToTL = channelToTL
+	PeerToTL = peerToTL
+	ChatToTL = chatToTL
 )
+
+// ChannelToTL exposes channelToTL for the external api_test package.
+// Uses the test deriver from pgtest.
+func ChannelToTL(c store.Channel, m store.ChannelMember, member bool, viewerID int64) tg.ChatClass {
+	return testHandlers(nil).channelToTL(c, m, member, viewerID)
+}
 
 func InputPeer(peer tg.InputPeerClass, viewerID int64) (store.PeerType, int64, error) {
 	return testHandlers(nil).inputPeer(peer, viewerID)
@@ -159,6 +164,22 @@ func InputUserID(u tg.InputUserClass, viewerID int64) (int64, error) {
 // test deriver. Tests use it to construct valid input peers.
 func DeriveUserHash(viewerID, peerID int64) int64 {
 	return pgtest.PeerDeriver().Derive(viewerID, peerhash.KindUser, peerID)
+}
+
+// DeriveChannelHash returns the access_hash viewerID carries for channelID,
+// using the test deriver. Tests use it to construct valid input peers.
+func DeriveChannelHash(viewerID, channelID int64) int64 {
+	return pgtest.PeerDeriver().Derive(viewerID, peerhash.KindChannel, channelID)
+}
+
+// InputPeerChannel builds a valid InputPeerChannel for channelID as seen by viewerID.
+func InputPeerChannel(viewerID, channelID int64) *tg.InputPeerChannel {
+	return &tg.InputPeerChannel{ChannelID: channelID, AccessHash: DeriveChannelHash(viewerID, channelID)}
+}
+
+// InputChannel builds a valid InputChannel for channelID as seen by viewerID.
+func InputChannel(viewerID, channelID int64) *tg.InputChannel {
+	return &tg.InputChannel{ChannelID: channelID, AccessHash: DeriveChannelHash(viewerID, channelID)}
 }
 
 // InputPeerUser builds a valid InputPeerUser for peerID as seen by viewerID.

@@ -83,12 +83,12 @@ func doCreateChannel(t *testing.T, cmds chan command, title string, megagroup bo
 }
 
 // exportChannelInvite exports an invite for chID and returns the bare hash.
-func exportChannelInvite(t *testing.T, cmds chan command, chID int64) string {
+func exportChannelInvite(t *testing.T, viewerID int64, cmds chan command, chID int64) string {
 	t.Helper()
 	var hash string
 	execChannel(t, cmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesExportChatInvite(ctx, &tg.MessagesExportChatInviteRequest{
-			Peer: &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer: peerChannel(viewerID, chID),
 		})
 		if err != nil {
 			return err
@@ -211,20 +211,20 @@ func TestChannelsLifecycle(t *testing.T) {
 			return 0
 		}
 	}
-	login(aID, "A")
-	login(bID, "B")
+	aUserID := login(aID, "A")
+	bUserID := login(bID, "B")
 
 	// A creates a broadcast channel.
 	chID := createBroadcastChannel(t, aCmds, "Lifecycle")
 
 	// A exports an invite; B imports it.
-	hash := exportChannelInvite(t, aCmds, chID)
+	hash := exportChannelInvite(t, aUserID, aCmds, chID)
 	importChannelInvite(t, bCmds, hash)
 
 	// B is a member: channels.getChannels returns a *tg.Channel for chID.
 	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.ChannelsGetChannels(ctx, []tg.InputChannelClass{
-			&tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			inputChannel(bUserID, chID),
 		})
 		if err != nil {
 			return err
@@ -242,7 +242,7 @@ func TestChannelsLifecycle(t *testing.T) {
 	// A posts a message.
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:     peerChannel(aUserID, chID),
 			Message:  "hello channel",
 			RandomID: 5000001,
 		})
@@ -278,7 +278,7 @@ func TestChannelsLifecycle(t *testing.T) {
 	// execChannel command reads back the channel pts to assert.
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
-			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel: inputChannel(aUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
 			Pts:     0,
 			Limit:   10,
@@ -368,13 +368,13 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 
 	// A creates broadcast channel, B joins.
 	chID := createBroadcastChannel(t, aCmds, "Broadcast")
-	hash := exportChannelInvite(t, aCmds, chID)
+	hash := exportChannelInvite(t, aUserID, aCmds, chID)
 	importChannelInvite(t, bCmds, hash)
 
 	// B (role 0) sends → PEER_ID_INVALID.
 	assertChannelRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:     peerChannel(bUserID, chID),
 			Message:  "B send before promotion",
 			RandomID: 5001001,
 		})
@@ -384,7 +384,7 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 	// A promotes B to admin.
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsEditAdmin(ctx, &tg.ChannelsEditAdminRequest{
-			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel: inputChannel(aUserID, chID),
 			UserID:  inputUser(aUserID, bUserID),
 			AdminRights: tg.ChatAdminRights{
 				PostMessages: true,
@@ -397,7 +397,7 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 	// B sends after promotion → succeeds.
 	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:     peerChannel(bUserID, chID),
 			Message:  "B send after promotion",
 			RandomID: 5001002,
 		})
@@ -466,18 +466,18 @@ func TestChannelsMegagroup(t *testing.T) {
 			return 0
 		}
 	}
-	login(aID, "A")
-	login(bID, "B")
+	aUserID := login(aID, "A")
+	bUserID := login(bID, "B")
 
 	// A creates megagroup, B joins.
 	chID := createMegagroup(t, aCmds, "Megagroup")
-	hash := exportChannelInvite(t, aCmds, chID)
+	hash := exportChannelInvite(t, aUserID, aCmds, chID)
 	importChannelInvite(t, bCmds, hash)
 
 	// B (role 0) sends to megagroup → succeeds.
 	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:     peerChannel(bUserID, chID),
 			Message:  "megagroup post by plain member",
 			RandomID: 5002001,
 		})
@@ -548,7 +548,7 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 		}
 	}
 	login(aID, "A")
-	login(cID, "C")
+	cUserID := login(cID, "C")
 
 	// A creates channel. C learns the id through the test variable — no invite.
 	chID := createBroadcastChannel(t, aCmds, "Private")
@@ -556,7 +556,7 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 	// C: getHistory → PEER_ID_INVALID.
 	assertChannelRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-			Peer:  &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:  peerChannel(cUserID, chID),
 			Limit: 10,
 		})
 		return err
@@ -565,7 +565,7 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 	// C: channels.getMessages → PEER_ID_INVALID.
 	assertChannelRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
-			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel: inputChannel(cUserID, chID),
 			ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: 1}},
 		})
 		return err
@@ -574,7 +574,7 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 	// C: getChannelDifference → PEER_ID_INVALID.
 	assertChannelRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
-			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel: inputChannel(cUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
 			Pts:     0,
 			Limit:   10,
@@ -633,14 +633,21 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 
 	// A creates channel, exports invite.
 	var (
-		chID  int64
-		hashB string
+		aUserID int64
+		bUserID int64
+		chID    int64
+		hashB   string
 	)
 	aClient := createClient(addr.Port, key, dcID, newUpdateCollector(), sessA)
 	if err := aClient.Run(ctx, func(ctx context.Context) error {
 		if err := aClient.Auth().IfNecessary(ctx, flowFor(phoneA, codes)); err != nil {
 			return err
 		}
+		self, err := aClient.Self(ctx)
+		if err != nil {
+			return err
+		}
+		aUserID = self.ID
 		api := aClient.API()
 
 		res, err := api.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
@@ -666,7 +673,7 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 		}
 
 		inv, err := api.MessagesExportChatInvite(ctx, &tg.MessagesExportChatInviteRequest{
-			Peer: &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer: peerChannel(aUserID, chID),
 		})
 		if err != nil {
 			return err
@@ -687,7 +694,12 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 		if err := bClient.Auth().IfNecessary(ctx, flowFor(phoneB, codes)); err != nil {
 			return err
 		}
-		_, err := bClient.API().MessagesImportChatInvite(ctx, hashB)
+		self, err := bClient.Self(ctx)
+		if err != nil {
+			return err
+		}
+		bUserID = self.ID
+		_, err = bClient.API().MessagesImportChatInvite(ctx, hashB)
 		return err
 	}); err != nil {
 		t.Fatalf("B join: %v", err)
@@ -699,7 +711,7 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 		api := aClient2.API()
 		for i, text := range []string{"post 1", "post 2"} {
 			if _, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-				Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+				Peer:     peerChannel(aUserID, chID),
 				Message:  text,
 				RandomID: 5003000 + int64(i),
 			}); err != nil {
@@ -716,7 +728,7 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 	bClient2 := createClient(addr.Port, key, dcID, newUpdateCollector(), sessB)
 	if err := bClient2.Run(ctx, func(ctx context.Context) error {
 		d, err := bClient2.API().UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
-			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel: inputChannel(bUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
 			Pts:     0,
 			Limit:   100,
@@ -756,7 +768,7 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 	aClient3 := createClient(addr.Port, key, dcID, newUpdateCollector(), sessA)
 	if err := aClient3.Run(ctx, func(ctx context.Context) error {
 		inv, err := aClient3.API().MessagesExportChatInvite(ctx, &tg.MessagesExportChatInviteRequest{
-			Peer: &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer: peerChannel(aUserID, chID),
 		})
 		if err != nil {
 			return err
@@ -772,13 +784,21 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 	}
 
 	// D joins fresh and calls getDifference then getHistory in one session.
-	var dDiffEmpty bool
-	var dHistoryMsgs []tg.MessageClass
+	var (
+		dDiffEmpty   bool
+		dHistoryMsgs []tg.MessageClass
+		dUserID      int64
+	)
 	dClient := createClient(addr.Port, key, dcID, newUpdateCollector(), nil)
 	if err := dClient.Run(ctx, func(ctx context.Context) error {
 		if err := dClient.Auth().IfNecessary(ctx, flowFor(phoneD, codes)); err != nil {
 			return err
 		}
+		self, err := dClient.Self(ctx)
+		if err != nil {
+			return err
+		}
+		dUserID = self.ID
 		api := dClient.API()
 
 		// D imports invite (join_pts is set to current channel pts = 2).
@@ -788,7 +808,7 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 
 		// D calls getDifference from pts 0; join_pts floor clamps it to 2 = currentPts.
 		d, err := api.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
-			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel: inputChannel(dUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
 			Pts:     0,
 			Limit:   100,
@@ -805,7 +825,7 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 
 		// D calls getHistory — full history is available to members regardless of join_pts.
 		hist, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-			Peer:  &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:  peerChannel(dUserID, chID),
 			Limit: 100,
 		})
 		if err != nil {
@@ -895,13 +915,13 @@ func TestChannelsBan(t *testing.T) {
 
 	// A creates broadcast channel. B joins via invite.
 	chID := createBroadcastChannel(t, aCmds, "BanTest")
-	hash := exportChannelInvite(t, aCmds, chID)
+	hash := exportChannelInvite(t, aUserID, aCmds, chID)
 	importChannelInvite(t, bCmds, hash)
 
 	// A posts "live 1"; B receives it to confirm live delivery works pre-ban.
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:     peerChannel(aUserID, chID),
 			Message:  "live 1",
 			RandomID: 5004001,
 		})
@@ -919,7 +939,7 @@ func TestChannelsBan(t *testing.T) {
 	// A bans B permanently.
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
-			Channel:     &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel:     inputChannel(aUserID, chID),
 			Participant: peerUser(aUserID, bUserID),
 			BannedRights: tg.ChatBannedRights{
 				ViewMessages: true,
@@ -932,7 +952,7 @@ func TestChannelsBan(t *testing.T) {
 	// B: getHistory → PEER_ID_INVALID.
 	assertChannelRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-			Peer:  &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:  peerChannel(bUserID, chID),
 			Limit: 10,
 		})
 		return err
@@ -941,7 +961,7 @@ func TestChannelsBan(t *testing.T) {
 	// B: getChannelDifference → PEER_ID_INVALID.
 	assertChannelRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
-			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel: inputChannel(bUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
 			Pts:     0,
 			Limit:   10,
@@ -952,7 +972,7 @@ func TestChannelsBan(t *testing.T) {
 	// A posts "live 2"; B should NOT receive it (banned).
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:     peerChannel(aUserID, chID),
 			Message:  "live 2",
 			RandomID: 5004002,
 		})
@@ -969,7 +989,7 @@ func TestChannelsBan(t *testing.T) {
 	// A unbans B (zero BannedRights).
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
-			Channel:      &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel:      inputChannel(aUserID, chID),
 			Participant:  peerUser(aUserID, bUserID),
 			BannedRights: tg.ChatBannedRights{},
 		})
@@ -979,7 +999,7 @@ func TestChannelsBan(t *testing.T) {
 	// B: getHistory → succeeds.
 	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-			Peer:  &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:  peerChannel(bUserID, chID),
 			Limit: 10,
 		})
 		if err != nil {
@@ -999,7 +1019,7 @@ func TestChannelsBan(t *testing.T) {
 	// and the messages posted before/during the ban (access restored after unban).
 	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
 		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
-			Channel: &tg.InputChannel{ChannelID: chID, AccessHash: chID},
+			Channel: inputChannel(bUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
 			Pts:     0,
 			Limit:   10,
@@ -1020,7 +1040,7 @@ func TestChannelsBan(t *testing.T) {
 	// A posts "live 3"; B receives it (unban restored delivery).
 	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:     peerChannel(aUserID, chID),
 			Message:  "live 3",
 			RandomID: 5004003,
 		})
@@ -1096,14 +1116,20 @@ func TestChannelsCrossReplica(t *testing.T) {
 
 	// A connects to server 1, creates channel, exports invite; B imports on server 2.
 	var (
-		chID  int64
-		hashB string
+		aUserID int64
+		chID    int64
+		hashB   string
 	)
 	aClient := createClient(port1, key, dcID, newUpdateCollector(), sessA)
 	if err := aClient.Run(ctx, func(ctx context.Context) error {
 		if err := aClient.Auth().IfNecessary(ctx, flowFor(phoneA, codes)); err != nil {
 			return err
 		}
+		self, err := aClient.Self(ctx)
+		if err != nil {
+			return err
+		}
+		aUserID = self.ID
 		api := aClient.API()
 
 		res, err := api.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
@@ -1129,7 +1155,7 @@ func TestChannelsCrossReplica(t *testing.T) {
 		}
 
 		inv, err := api.MessagesExportChatInvite(ctx, &tg.MessagesExportChatInviteRequest{
-			Peer: &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer: peerChannel(aUserID, chID),
 		})
 		if err != nil {
 			return err
@@ -1151,7 +1177,7 @@ func TestChannelsCrossReplica(t *testing.T) {
 	aClient2 := createClient(port1, key, dcID, newUpdateCollector(), sessA)
 	if err := aClient2.Run(ctx, func(ctx context.Context) error {
 		_, err := aClient2.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     &tg.InputPeerChannel{ChannelID: chID, AccessHash: chID},
+			Peer:     peerChannel(aUserID, chID),
 			Message:  "cross replica channel",
 			RandomID: 5005001,
 		})
