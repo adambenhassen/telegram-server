@@ -187,11 +187,13 @@ type UploadPart struct {
 }
 
 type User struct {
-	ID        int64
-	Phone     string
-	FirstName string
-	LastName  string
-	CreatedAt pgtype.Timestamptz
+	ID         int64
+	Phone      string
+	FirstName  string
+	LastName   string
+	CreatedAt  pgtype.Timestamptz
+	IsOnline   bool
+	LastSeenAt pgtype.Timestamptz
 }
 
 type UserPassword struct {
