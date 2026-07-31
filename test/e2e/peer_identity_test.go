@@ -700,10 +700,15 @@ func TestPeerIdentityBackfillSpendable(t *testing.T) {
 			return errors.New("difference: sender user not in Users")
 		}
 
-		// Use the server-issued peer (from backfill) to read A's info — proves
-		// the peer is spendable.
-		_, err = api.UsersGetUsers(ctx, []tg.InputUserClass{
-			&tg.InputUser{UserID: senderUser.ID, AccessHash: senderUser.AccessHash},
+		// Use the server-issued peer (from backfill) to read history — proves
+		// the peer is spendable. MessagesGetHistory routes through inputPeer
+		// which validates the access_hash, unlike UsersGetUsers which ignores it.
+		_, err = api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer: &tg.InputPeerUser{
+				UserID:     senderUser.ID,
+				AccessHash: senderUser.AccessHash,
+			},
+			Limit: 10,
 		})
 		return err
 	}); err != nil {
