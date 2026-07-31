@@ -7,7 +7,7 @@ CREATE TABLE secret_chats (
     id              INT PRIMARY KEY,
     admin_id        BIGINT NOT NULL REFERENCES users(id),
     participant_id  BIGINT NOT NULL REFERENCES users(id),
-    state           TEXT   NOT NULL,
+    state           TEXT   NOT NULL CHECK (state IN ('requested', 'active', 'discarded')),
     g_a_hash        BYTEA,
     g_a             BYTEA,
     g_a_or_b        BYTEA,
@@ -32,5 +32,7 @@ CREATE TABLE encrypted_events (
     PRIMARY KEY (owner_id, qts),
     UNIQUE (owner_id, random_id)
 );
+
+ALTER SEQUENCE secret_chats_id_seq OWNED BY secret_chats.id;
 
 ALTER TABLE update_state ADD COLUMN qts BIGINT NOT NULL DEFAULT 0;
