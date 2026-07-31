@@ -262,28 +262,44 @@ func TestChatToTLCreator(t *testing.T) {
 func TestChannelToTL(t *testing.T) {
 	t.Parallel()
 	c := store.Channel{ID: 4, Title: "news", CreatorID: 5, Date: time.Unix(1000, 0)}
+	viewerID := int64(7)
 
-	forbidden, ok := api.ChannelToTL(c, store.ChannelMember{}, false).(*tg.ChannelForbidden)
+	forbidden, ok := api.ChannelToTL(c, store.ChannelMember{}, false, viewerID).(*tg.ChannelForbidden)
 	if !ok {
 		t.Fatalf("channelToTL for non-member = %T, want *tg.ChannelForbidden", forbidden)
 	}
-	if forbidden.Title != "" || forbidden.ID != 4 || forbidden.AccessHash != 4 {
-		t.Fatalf("channelToTL for non-member = %+v, want id 4, hash 4, empty title", forbidden)
+	if forbidden.Title != "" || forbidden.ID != 4 {
+		t.Fatalf("channelToTL for non-member = %+v, want id 4, empty title", forbidden)
+	}
+	if forbidden.AccessHash != api.DeriveChannelHash(viewerID, 4) {
+		t.Fatalf("channelToTL for non-member access_hash = %d, want derived hash for viewer %d, channel %d", forbidden.AccessHash, viewerID, 4)
 	}
 
-	got, ok := api.ChannelToTL(c, store.ChannelMember{UserID: 5, Role: 2}, true).(*tg.Channel)
+	got, ok := api.ChannelToTL(c, store.ChannelMember{UserID: 5, Role: 2}, true, viewerID).(*tg.Channel)
 	if !ok {
 		t.Fatalf("channelToTL for member = %T, want *tg.Channel", got)
 	}
 	if !got.Broadcast || got.Megagroup || !got.Creator || got.Left {
 		t.Fatalf("channelToTL for creator of a broadcast = %+v", got)
 	}
-	if got.Title != "news" || got.AccessHash != 4 || got.Date != 1000 {
-		t.Fatalf("channelToTL for member = %+v, want news/hash 4/date 1000", got)
+	if got.Title != "news" || got.Date != 1000 {
+		t.Fatalf("channelToTL for member = %+v, want news/date 1000", got)
+	}
+	if got.AccessHash != api.DeriveChannelHash(viewerID, 4) {
+		t.Fatalf("channelToTL for member access_hash = %d, want derived hash for viewer %d, channel %d", got.AccessHash, viewerID, 4)
+	}
+
+	// Cross-viewer: hash for viewer 7 must differ from hash for viewer 9.
+	got2, ok := api.ChannelToTL(c, store.ChannelMember{UserID: 5, Role: 2}, true, 9).(*tg.Channel)
+	if !ok {
+		t.Fatalf("channelToTL for viewer 9 = %T, want *tg.Channel", got2)
+	}
+	if got.AccessHash == got2.AccessHash {
+		t.Error("different viewers returned same channel access_hash")
 	}
 
 	c.Megagroup = true
-	got, ok = api.ChannelToTL(c, store.ChannelMember{UserID: 9, Role: 0}, true).(*tg.Channel)
+	got, ok = api.ChannelToTL(c, store.ChannelMember{UserID: 9, Role: 0}, true, viewerID).(*tg.Channel)
 	if !ok {
 		t.Fatalf("channelToTL for megagroup member = %T, want *tg.Channel", got)
 	}

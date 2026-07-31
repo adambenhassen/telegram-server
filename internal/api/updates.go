@@ -153,11 +153,11 @@ func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
 // member are the same answer, since a ban that still served the live title would
 // be cosmetic.
 //
-// AccessHash is the M1 placeholder (access_hash == id). The forbidden form
-// carries an empty title on purpose, the rule M6 settled for ChatForbidden: the
-// row keeps changing after someone leaves, and any remaining member may rename
-// it, so serving the live title would leave a writable channel into a client
-// that is no longer entitled to it.
+// AccessHash is derived for (viewerID, c.ID) so only the viewer can use it.
+// The forbidden form carries an empty title on purpose, the rule M6 settled for
+// ChatForbidden: the row keeps changing after someone leaves, and any remaining
+// member may rename it, so serving the live title would leave a writable channel
+// into a client that is no longer entitled to it.
 //
 // M7 stores no username, participants count or admin rights, so none is ever set
 // here. store.Channel.Version has no wire counterpart either: unlike tg.Chat, the
@@ -168,14 +168,15 @@ func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
 // Conn.SendResult and takes down every reply carrying a channel — after the
 // mutation has committed. "M7 stores no photo" is said with the empty
 // constructor, not by omitting the field.
-func channelToTL(c store.Channel, m store.ChannelMember, member bool) tg.ChatClass {
+func (h *handlers) channelToTL(c store.Channel, m store.ChannelMember, member bool, viewerID int64) tg.ChatClass {
+	ah := h.peers.Derive(viewerID, peerhash.KindChannel, c.ID)
 	if !member {
-		return &tg.ChannelForbidden{ID: c.ID, AccessHash: c.ID, Title: ""}
+		return &tg.ChannelForbidden{ID: c.ID, AccessHash: ah, Title: ""}
 	}
 	return &tg.Channel{
 		ID:         c.ID,
 		Title:      c.Title,
-		AccessHash: c.ID,
+		AccessHash: ah,
 		Date:       int(c.Date.Unix()),
 		Megagroup:  c.Megagroup,
 		Broadcast:  !c.Megagroup,
@@ -509,7 +510,7 @@ func (h *handlers) loadChannels(ctx context.Context, ids map[int64]bool, viewerI
 		if err != nil {
 			return nil, err
 		}
-		channels = append(channels, channelToTL(ch, member, found && !member.Banned(time.Now())))
+		channels = append(channels, h.channelToTL(ch, member, found && !member.Banned(time.Now()), viewerID))
 	}
 	return channels, nil
 }

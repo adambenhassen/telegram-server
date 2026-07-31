@@ -96,7 +96,7 @@ func GetChannelDifferenceForTest(s *store.Store, userID int64, req *tg.UpdatesGe
 func RevokeExportedChatInviteForTest(s *store.Store, userID, channelID int64, hash string) (bin.Encoder, error) {
 	var buf bin.Buffer
 	buf.PutID(revokeExportedChatInviteTypeID)
-	peer := &tg.InputPeerChannel{ChannelID: channelID, AccessHash: channelID}
+	peer := &tg.InputPeerChannel{ChannelID: channelID, AccessHash: DeriveChannelHash(userID, channelID)}
 	if err := peer.Encode(&buf); err != nil {
 		return nil, err
 	}
