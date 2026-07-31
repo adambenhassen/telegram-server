@@ -135,7 +135,7 @@ func (q *Queries) EventsWindow(ctx context.Context, arg EventsWindowParams) ([]M
 }
 
 const getState = `-- name: GetState :one
-SELECT user_id, pts, seq, date, next_local_id FROM update_state WHERE user_id = $1
+SELECT user_id, pts, seq, date, next_local_id, qts FROM update_state WHERE user_id = $1
 `
 
 func (q *Queries) GetState(ctx context.Context, userID int64) (UpdateState, error) {
@@ -147,6 +147,7 @@ func (q *Queries) GetState(ctx context.Context, userID int64) (UpdateState, erro
 		&i.Seq,
 		&i.Date,
 		&i.NextLocalID,
+		&i.Qts,
 	)
 	return i, err
 }

@@ -95,6 +95,15 @@ type Dialog struct {
 	PeerType        int16
 }
 
+type EncryptedEvent struct {
+	OwnerID  int64
+	Qts      int64
+	ChatID   int32
+	RandomID int64
+	Bytes    []byte
+	Date     pgtype.Timestamptz
+}
+
 type File struct {
 	ID         int64
 	UploaderID int64
@@ -142,12 +151,31 @@ type PhoneCode struct {
 	CreatedAt  pgtype.Timestamptz
 }
 
+type PhoneLookup struct {
+	CallerID   int64
+	Phone      string
+	LookedUpAt pgtype.Timestamptz
+}
+
+type SecretChat struct {
+	ID             int32
+	AdminID        int64
+	ParticipantID  int64
+	State          string
+	GAHash         []byte
+	GA             []byte
+	GAOrB          []byte
+	KeyFingerprint *int64
+	Date           pgtype.Timestamptz
+}
+
 type UpdateState struct {
 	UserID      int64
 	Pts         int64
 	Seq         int64
 	Date        pgtype.Timestamptz
 	NextLocalID int64
+	Qts         int64
 }
 
 type UploadPart struct {
