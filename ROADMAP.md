@@ -57,6 +57,9 @@ Auth & account
 Users & help
 - `help.getConfig`, `users.getUsers`
 
+Contacts
+- `contacts.resolvePhone`
+
 Messaging
 - `messages.sendMessage`, `messages.getDialogs`, `messages.getHistory`,
   `messages.readHistory`, `messages.editMessage`, `messages.deleteMessages`,
@@ -74,7 +77,7 @@ Channels
 - `channels.createChannel`, `channels.getChannels`, `channels.leaveChannel`,
   `channels.editAdmin`, `channels.editBanned`, `channels.getMessages`
 - `messages.exportChatInvite`, `messages.checkChatInvite`,
-  `messages.importChatInvite`
+  `messages.importChatInvite`, `messages.revokeExportedChatInvite`
 - `updates.getChannelDifference`
 
 ## Shipped
@@ -222,10 +225,10 @@ Channels
   channel the way `update_state` + `message_events` are keyed by user. This is
   the second update stream the architecture now holds.
 - Admission is by invite hash alone; there is no join-by-channel-id path.
-  `channels.id` is dense BIGSERIAL and the peer `access_hash` placeholder is
-  `access_hash == id`, so a join keyed on the id would let any account
-  enumerate and join every channel on the server. The hash is the secret; the
-  channel id is never an input to the join path.
+  `channels.id` is dense BIGSERIAL and the peer `access_hash` placeholder was
+  `access_hash == id` at M7, so a join keyed on the id would let any account
+  enumerate and join every channel on the server. The invite hash was the
+  secret; the channel id was never an input to the join path.
 - Coarse `role` + `banned_until` rights model: 0 = member, 1 = admin,
   2 = creator. `ChatAdminRights` and `ChatBannedRights` flag sets are accepted
   and collapsed to a single bit. An admin may post in a broadcast channel; a
@@ -244,13 +247,60 @@ Channels
   join by invite, post, get history, editAdmin, editBanned, leaveChannel, and
   `getChannelDifference` backfill.
 
+### M8 — Peer identity
+- Derived per-viewer `access_hash` on every user and channel the server puts on
+  the wire. The value is HMAC-SHA256 over a versioned label with fixed-width
+  big-endian viewer id, peer kind, and peer id, truncated to 64 bits. Peer kind
+  is included because user and channel ids share no sequence and collide
+  numerically.
+- The derivation subkey is produced at process start from the auth-key master via
+  HKDF; only the subkey reaches the RPC layer, so the master's reach stays at
+  storage. Stateless: no new column, no migration, no new secret.
+- An `access_hash` is a peer reference, not an admission credential. Holding a
+  valid derived hash for a channel you are not a member of leaves you no more a
+  member than before; channel admission is still the invite hash and the
+  participant row. Per `(viewer, peer)` pair: a hash issued to one account is
+  inert in another's hands, and a leaked pair confines the damage to one
+  already-identifiable account.
+- Hard cutover from the M1 placeholder (`access_hash == id`) for both user and
+  channel peers, sequenced so the lookup RPC lands before the placeholder retires.
+  `InputPeerChat` is untouched — chat membership is their admission boundary and
+  chats carry no hash.
+- Per-pair derivation hardens the one-update-batch-per-user invariant: a rendered
+  peer is valid for exactly one viewer, so a push batch built for one user may
+  never be shared with another. The `buildUpdates` path held this before M8; M8
+  makes it a stated requirement.
+- A per-pair hash is not transferable between accounts, so forwarding and any
+  contacts export must re-derive for the recipient rather than pass a peer
+  reference along. If key handling ever adds session-surviving rotation, the peer
+  hash must gain an epoch or an accept-previous window in the same change or every
+  cached peer on every live session breaks silently.
+- `contacts.resolvePhone` — resolve a phone number to a peer, for a caller who
+  knows the number out of band. Per-account quota: 20 distinct phones per 24-hour
+  rolling window, durable DB counter. Miss and refusal return the same error; the
+  endpoint is not an existence oracle. Phone normalization (strip leading `+`)
+  unified across sign-in and lookup paths.
+- `messages.revokeExportedChatInvite` — retire a specific invite hash (admin-only,
+  idempotent). Revocation is per hash: other outstanding hashes for the same
+  channel continue admitting and no existing member is removed. A revoked hash
+  returns the same error as an unknown hash; revocation is not detectable by the
+  holder.
+- Every rejection on peer-hash and invite-revocation paths returns one uniform
+  error; neither a bad hash nor a revoked invite is an existence oracle.
+- Batched channel dialog reads: `getDialogs` fetches all channel rows in a single
+  query rather than one per channel.
+- E2E gates prove stranger-to-stranger start via `contacts.resolvePhone`, that the
+  M1 placeholder hash is refused for user and channel peers, and that a hash issued
+  to one account is refused when submitted by another.
+
 ## Planned — feature track
 
-### M8 and later
+### M9 and later
 - Secret chats (end-to-end, separate key exchange, `qts` stream).
 - Message features: forwarding, reply threading, reactions, pinned messages,
   scheduled messages.
-- Contacts, usernames, and real peer `access_hash` derivation.
+- Usernames and public channels — a global namespace with no allocation policy,
+  likely their own milestone.
 - Presence/online status, `updateUserStatus`.
 - Server-side full-text search.
 
@@ -291,10 +341,13 @@ Tracked so shortcuts don't rot into "later means never".
 - **`message_events` GC + `updates.differenceTooLong`.** All events retained;
   `getDifference` is capped and returns `differenceSlice` when truncated, but
   there is no event-log trimming or too-long path yet. — M4.
-- **Peer `access_hash`.** Placeholder scheme: `access_hash == user_id`, validated
-  but not cryptographically derived. Real hashing deferred; it ships with a
-  peer-lookup RPC or not at all, since the self-satisfying check is currently the
-  only way to name a peer you have never talked to. — M8.
+- **Peer-hash key epoch.** The `access_hash` derivation has no epoch field.
+  Session-surviving key rotation is not implemented — rotation today is a total
+  re-auth event, so every cached peer reference is already invalid when it happens
+  and an epoch buys nothing in the current model. If rotation ever becomes
+  session-safe, an epoch or accept-previous window must be added to the derivation
+  in the same change, or every cached peer on every live session breaks silently.
+  — M8.
 - **`qts`.** Column kept at 0; no secret-chat / bot update stream. — M4.
 - **Client-pts-ahead resync.** A client `pts` past the server is clamped to empty
   (single-writer invariant), not an explicit resync response. — M4.
@@ -364,9 +417,8 @@ Tracked so shortcuts don't rot into "later means never".
   per-chunk nonce, not one `Seal` over the object, because a single-object seal
   cannot serve a byte range without decrypting the whole file per request. — M5
 - **`file_reference` is a placeholder** — the 8-byte big-endian file id, echoed
-  deterministically and ignored entirely on input. Same posture as the peer
-  `access_hash` placeholder. Half-validating it would make it an oracle, which is
-  why it is ignored rather than partially checked. — M5
+  deterministically and ignored entirely on input. Half-validating it would make
+  it an oracle, which is why it is ignored rather than partially checked. — M5
 - **No rate limit on `upload.getFile`.** One in-flight download per account is the
   bound M5 ships. The rate belongs with the flood-wait work on the operational
   track, and the number cannot be chosen without measured per-replica read
