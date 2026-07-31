@@ -135,12 +135,28 @@ func TestVerifyCodeExpired(t *testing.T) {
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	if _, err := conn.Exec(ctx,
 		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE phone = $1`,
-		phone,
+		store.NormalizePhone(phone),
 	); err != nil {
 		t.Fatalf("expire code: %v", err)
 	}
 	if err := s.VerifyCode(ctx, phone, hash, code); !errors.Is(err, store.ErrCodeExpired) {
 		t.Fatalf("verify expired: got %v, want ErrCodeExpired", err)
+	}
+}
+
+func TestIssueCodeNormalization(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	// Issue code with '+' prefix.
+	hash1, code1, err := s.IssueCode(ctx, "+15551250007")
+	if err != nil {
+		t.Fatalf("issue with +: %v", err)
+	}
+	// Verify with no '+' — must hit same row.
+	if err := s.VerifyCode(ctx, "15551250007", hash1, code1); err != nil {
+		t.Fatalf("verify without +: %v", err)
 	}
 }
 
@@ -175,7 +191,7 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	if _, err := conn.Exec(ctx,
 		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE phone = $1`,
-		expiredPhone,
+		store.NormalizePhone(expiredPhone),
 	); err != nil {
 		t.Fatalf("expire code: %v", err)
 	}
@@ -190,7 +206,7 @@ func TestDeleteExpiredCodes(t *testing.T) {
 
 	var count int
 	if err := conn.QueryRow(ctx,
-		`SELECT count(*) FROM phone_codes WHERE phone = $1`, expiredPhone,
+		`SELECT count(*) FROM phone_codes WHERE phone = $1`, store.NormalizePhone(expiredPhone),
 	).Scan(&count); err != nil {
 		t.Fatalf("count expired: %v", err)
 	}
@@ -198,7 +214,7 @@ func TestDeleteExpiredCodes(t *testing.T) {
 		t.Fatalf("expired row still present: count=%d", count)
 	}
 	if err := conn.QueryRow(ctx,
-		`SELECT count(*) FROM phone_codes WHERE phone = $1`, freshPhone,
+		`SELECT count(*) FROM phone_codes WHERE phone = $1`, store.NormalizePhone(freshPhone),
 	).Scan(&count); err != nil {
 		t.Fatalf("count fresh: %v", err)
 	}
