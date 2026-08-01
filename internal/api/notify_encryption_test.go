@@ -97,6 +97,7 @@ func TestDeliverEncryptionRequested(t *testing.T) {
 		func(_ context.Context, userID, chatID int64) {
 			updater.DeliverEncryption(ctx, userID, chatID)
 		},
+		func(context.Context, int64, bool) {},
 		nil,
 	)
 	if err != nil {
@@ -168,6 +169,7 @@ func TestDeliverEncryptionActive(t *testing.T) {
 		func(_ context.Context, userID, chatID int64) {
 			updater.DeliverEncryption(ctx, userID, chatID)
 		},
+		func(context.Context, int64, bool) {},
 		nil,
 	)
 	if err != nil {
@@ -228,6 +230,7 @@ func TestDeliverEncryptionDiscarded(t *testing.T) {
 		func(_ context.Context, userID, chatID int64) {
 			updater.DeliverEncryption(ctx, userID, chatID)
 		},
+		func(context.Context, int64, bool) {},
 		nil,
 	)
 	if err != nil {
@@ -269,6 +272,7 @@ func TestDeliverEncryptionWrongChannelNeverDispatches(t *testing.T) {
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) { encrypted <- struct{}{} },
+		func(context.Context, int64, bool) {},
 		nil,
 	)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 // authorizationTTLDays is the session lifetime advertised to clients in
@@ -83,4 +84,26 @@ func (h *handlers) handleResetAuthorization(r *mtproto.Request) (bin.Encoder, fu
 	}
 	evict()
 	return &tg.BoolTrue{}, nil, nil
+}
+
+// handleUpdateStatus serves account.updateStatus. An authenticated caller sets
+// their own online/offline state. Offline=true marks the user offline;
+// Offline=false marks them online. Returns tg.BoolTrue.
+func (h *handlers) handleUpdateStatus(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.AccountUpdateStatusRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	online := !req.Offline
+	if err := h.store.SetUserStatus(r.Ctx, r.UserID, online); err != nil {
+		h.log.Error("update status", "user_id", r.UserID, "online", online, "err", err)
+		return nil, errInternal
+	}
+	if err := h.store.Notify(r.Ctx, store.ChannelStatus, store.StatusPayload(r.UserID, online)); err != nil {
+		h.log.Error("notify status", "user_id", r.UserID, "err", err)
+	}
+	return &tg.BoolTrue{}, nil
 }
