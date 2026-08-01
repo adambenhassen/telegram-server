@@ -345,6 +345,7 @@ func (u *Updater) DeliverStatus(ctx context.Context, userID int64, online bool) 
 			return
 		}
 		if !ok {
+			u.log.Warn("deliver status user not found", "user_id", userID)
 			return
 		}
 		wasOnline := int64(0)
