@@ -377,6 +377,7 @@ func TestStartListenerDeliversStatus(t *testing.T) {
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
 		func(_ context.Context, userID int64, online bool) { statused <- [2]bool{userID == 7, online} },
 		nil,
 	)

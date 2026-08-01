@@ -381,7 +381,6 @@ func ResolvePhoneForTest(s *store.Store, userID int64, req *tg.ContactsResolvePh
 	return testHandlers(s).handleResolvePhone(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
-<<<<<<< HEAD
 // InputEncryptedChat builds a valid InputEncryptedChat for chatID as seen by
 // viewerID, using the test deriver.
 func InputEncryptedChat(viewerID int64, chatID int32) tg.InputEncryptedChat {

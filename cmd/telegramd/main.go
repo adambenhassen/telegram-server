@@ -107,6 +107,7 @@ func run(log *slog.Logger) error {
 	server.OnStatusChange(func(ctx context.Context, userID int64, online bool) {
 		if err := st.SetUserStatus(ctx, userID, online); err != nil {
 			log.Error("set user status", "user_id", userID, "online", online, "err", err)
+			return
 		}
 		if err := st.Notify(ctx, store.ChannelStatus, store.StatusPayload(userID, online)); err != nil {
 			log.Error("notify status", "user_id", userID, "err", err)
