@@ -13,7 +13,7 @@ const acceptSecretChat = `-- name: AcceptSecretChat :one
 UPDATE secret_chats
 SET state = 'active', g_a_or_b = $1, key_fingerprint = $2
 WHERE id = $3 AND participant_id = $4 AND state = 'requested'
-RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date
+RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id
 `
 
 type AcceptSecretChatParams struct {
@@ -45,6 +45,7 @@ func (q *Queries) AcceptSecretChat(ctx context.Context, arg AcceptSecretChatPara
 		&i.GAOrB,
 		&i.KeyFingerprint,
 		&i.Date,
+		&i.RandomID,
 	)
 	return i, err
 }
@@ -66,7 +67,7 @@ const discardSecretChat = `-- name: DiscardSecretChat :one
 UPDATE secret_chats
 SET state = 'discarded'
 WHERE id = $1 AND state IN ('requested', 'active')
-RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date
+RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id
 `
 
 // DiscardSecretChat is idempotent by predicate: a chat already discarded matches
@@ -84,14 +85,43 @@ func (q *Queries) DiscardSecretChat(ctx context.Context, id int32) (SecretChat, 
 		&i.GAOrB,
 		&i.KeyFingerprint,
 		&i.Date,
+		&i.RandomID,
+	)
+	return i, err
+}
+
+const getSecretChatByAdminRandomID = `-- name: GetSecretChatByAdminRandomID :one
+SELECT id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id FROM secret_chats WHERE admin_id = $1 AND random_id = $2 AND random_id != 0 AND state = 'requested'
+`
+
+type GetSecretChatByAdminRandomIDParams struct {
+	AdminID  int64
+	RandomID int64
+}
+
+// ponytail: lookup-before-insert dedup; avoids ON CONFLICT and sequence waste.
+func (q *Queries) GetSecretChatByAdminRandomID(ctx context.Context, arg GetSecretChatByAdminRandomIDParams) (SecretChat, error) {
+	row := q.db.QueryRow(ctx, getSecretChatByAdminRandomID, arg.AdminID, arg.RandomID)
+	var i SecretChat
+	err := row.Scan(
+		&i.ID,
+		&i.AdminID,
+		&i.ParticipantID,
+		&i.State,
+		&i.GAHash,
+		&i.GA,
+		&i.GAOrB,
+		&i.KeyFingerprint,
+		&i.Date,
+		&i.RandomID,
 	)
 	return i, err
 }
 
 const insertSecretChat = `-- name: InsertSecretChat :one
-INSERT INTO secret_chats (id, admin_id, participant_id, state, g_a_hash, g_a)
-VALUES ($1, $2, $3, 'requested', $4, $5)
-RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date
+INSERT INTO secret_chats (id, admin_id, participant_id, state, g_a_hash, g_a, random_id)
+VALUES ($1, $2, $3, 'requested', $4, $5, $6)
+RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id
 `
 
 type InsertSecretChatParams struct {
@@ -100,6 +130,7 @@ type InsertSecretChatParams struct {
 	ParticipantID int64
 	GAHash        []byte
 	GA            []byte
+	RandomID      int64
 }
 
 func (q *Queries) InsertSecretChat(ctx context.Context, arg InsertSecretChatParams) (SecretChat, error) {
@@ -109,6 +140,7 @@ func (q *Queries) InsertSecretChat(ctx context.Context, arg InsertSecretChatPara
 		arg.ParticipantID,
 		arg.GAHash,
 		arg.GA,
+		arg.RandomID,
 	)
 	var i SecretChat
 	err := row.Scan(
@@ -121,6 +153,7 @@ func (q *Queries) InsertSecretChat(ctx context.Context, arg InsertSecretChatPara
 		&i.GAOrB,
 		&i.KeyFingerprint,
 		&i.Date,
+		&i.RandomID,
 	)
 	return i, err
 }
@@ -138,7 +171,7 @@ func (q *Queries) NextSecretChatID(ctx context.Context) (int64, error) {
 }
 
 const secretChatByID = `-- name: SecretChatByID :one
-SELECT id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date FROM secret_chats WHERE id = $1
+SELECT id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id FROM secret_chats WHERE id = $1
 `
 
 func (q *Queries) SecretChatByID(ctx context.Context, id int32) (SecretChat, error) {
@@ -154,6 +187,7 @@ func (q *Queries) SecretChatByID(ctx context.Context, id int32) (SecretChat, err
 		&i.GAOrB,
 		&i.KeyFingerprint,
 		&i.Date,
+		&i.RandomID,
 	)
 	return i, err
 }
