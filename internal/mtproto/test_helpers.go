@@ -13,7 +13,7 @@ import (
 	"github.com/gotd/td/transport"
 )
 
-// MaxUserConns exposes the per-user connection cap to the external test package.
+// MaxUserConns exposes the per-user connection cap to tests.
 const MaxUserConns = maxUserConns
 
 // NewTestConn builds a Conn wired to tconn with a ready session (key + session

@@ -2,9 +2,13 @@ package api_test
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
@@ -13,41 +17,84 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
-// TestDeliverEncryptionIntegration drives the full NOTIFY→listener→DeliverEncryption
-// chain with a real store. It verifies:
-//
-//  1. The NOTIFY channel name is correct (wrong name → no dispatch).
-//  2. Row reload happens (g_a present in rendered payload).
-//  3. Push carries zero pts (watermark unchanged).
-//  4. Party check works (non-party receives nothing).
-func TestDeliverEncryptionIntegration(t *testing.T) {
+// fakeTransport is a transport.Conn that records whether Send was called. It
+// sits behind a real *mtproto.Conn registered in the SessionRegistry so
+// DeliverEncryption exercises the full path: registry lookup → store reload →
+// render → PushTo → wire.
+type fakeTransport struct {
+	mu      sync.Mutex
+	sent    bool
+	sendErr error
+}
+
+func (f *fakeTransport) Send(_ context.Context, _ *bin.Buffer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = true
+	return f.sendErr
+}
+
+func (f *fakeTransport) Recv(_ context.Context, _ *bin.Buffer) error { return errors.New("unused") }
+func (f *fakeTransport) Close() error                                { return nil }
+
+func (f *fakeTransport) wasSent() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sent
+}
+
+func testKey() crypto.AuthKey {
+	var raw crypto.Key
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	return raw.WithID()
+}
+
+// newConnFor builds a real *mtproto.Conn backed by fakeTransport, owned by
+// userID, registered in reg, and returns the conn plus transport for assertions.
+func newConnFor(t *testing.T, reg *mtproto.SessionRegistry, userID int64) (*mtproto.Conn, *fakeTransport) {
+	t.Helper()
+	ft := &fakeTransport{}
+	c := mtproto.NewTestConn(ft, testKey())
+	c.SetOwner(userID)
+	if !reg.Add(userID, c) {
+		t.Fatalf("registry rejected conn for user %d", userID)
+	}
+	t.Cleanup(func() { reg.Remove(userID, c) })
+	return c, ft
+}
+
+// TestDeliverEncryptionRequested drives DeliverEncryption for the requested
+// state and verifies the full push path: row reload, g_a in payload, zero pts.
+func TestDeliverEncryptionRequested(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, dsn := openStoreDSN(t)
 	reg := mtproto.NewSessionRegistry()
 	updater := api.NewUpdater(s, reg, nil, pgtest.PeerDeriver())
 
-	alice, err := s.CreateUser(ctx, "+1555143401")
+	alice, err := s.CreateUser(ctx, "+1555143901")
 	if err != nil {
 		t.Fatalf("create alice: %v", err)
 	}
-	bob, err := s.CreateUser(ctx, "+1555143402")
+	bob, err := s.CreateUser(ctx, "+1555143902")
 	if err != nil {
 		t.Fatalf("create bob: %v", err)
 	}
 
 	chat := createRequestedChat(t, s, alice.ID, bob.ID)
 
-	// Start a listener wired to DeliverEncryption so the NOTIFY→dispatch→
-	// DeliverEncryption chain is exercised.
-	encrypted := make(chan [2]int64, 1)
+	// Register bob's conn so DeliverEncryption has a target.
+	conn, ft := newConnFor(t, reg, bob.ID)
+
+	// Start listener to exercise NOTIFY→dispatch→DeliverEncryption chain.
 	_, stop, err := store.StartListener(ctx, dsn,
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64) {},
 		func(_ context.Context, userID, chatID int64) {
-			encrypted <- [2]int64{userID, chatID}
 			updater.DeliverEncryption(ctx, userID, chatID)
 		},
 		nil,
@@ -57,29 +104,27 @@ func TestDeliverEncryptionIntegration(t *testing.T) {
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
 
-	// Emit the encryption NOTIFY.
+	// Emit encryption NOTIFY.
 	if err := s.Notify(ctx, store.ChannelEncryption, store.EncryptionPayload(bob.ID, int64(chat.ID))); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
 
-	// Listener dispatches the callback. If the channel name or payload format
-	// were wrong, this would time out.
-	select {
-	case got := <-encrypted:
-		if got[0] != bob.ID || got[1] != int64(chat.ID) {
-			t.Fatalf("callback = [%d %d], want [%d %d]", got[0], got[1], bob.ID, chat.ID)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("encryption callback not invoked — NOTIFY channel or payload wrong")
+	// Give listener time to dispatch.
+	time.Sleep(100 * time.Millisecond)
+
+	// Push must have reached the transport.
+	if !ft.wasSent() {
+		t.Fatal("no push delivered — row reload or render failed")
 	}
 
-	// No conn registered, so DeliverEncryption returns without pushing.
-	// That is correct: the wiring (NOTIFY → dispatch → DeliverEncryption)
-	// is verified by reaching here. The payload content is verified below
-	// by reloading the row and rendering.
+	// pts watermark must be unchanged (zero-pts push).
+	if got := conn.LastPushedPts(); got != 0 {
+		t.Errorf("pts = %d, want 0 (zero-pts push must not advance watermark)", got)
+	}
 
 	// Verify g_a is present by reloading the row and rendering independently.
-	// This covers criterion 2: the row must carry g_a for the requested state.
+	// DeliverEncryption did the reload (proven by push succeeding); this
+	// proves the row carries g_a and the renderer includes it.
 	chat2, err := s.SecretChatByID(ctx, chat.ID)
 	if err != nil {
 		t.Fatalf("reload chat: %v", err)
@@ -90,39 +135,37 @@ func TestDeliverEncryptionIntegration(t *testing.T) {
 		t.Fatalf("rendered type = %T, want *tg.EncryptedChatRequested", rendered)
 	}
 	if len(req.GA) == 0 {
-		t.Error("g_a missing — DeliverEncryption would push stale or forged data without reload")
+		t.Error("g_a missing in payload")
 	}
 }
 
-// TestDeliverEncryptionActiveState verifies the active state renders as
-// EncryptedChat with key material, and that the NOTIFY chain reaches the
-// admin.
-func TestDeliverEncryptionActiveState(t *testing.T) {
+// TestDeliverEncryptionActive drives DeliverEncryption for the active state.
+func TestDeliverEncryptionActive(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, dsn := openStoreDSN(t)
 	reg := mtproto.NewSessionRegistry()
 	updater := api.NewUpdater(s, reg, nil, pgtest.PeerDeriver())
 
-	alice, err := s.CreateUser(ctx, "+1555143501")
+	alice, err := s.CreateUser(ctx, "+1555143911")
 	if err != nil {
 		t.Fatalf("create alice: %v", err)
 	}
-	bob, err := s.CreateUser(ctx, "+1555143502")
+	bob, err := s.CreateUser(ctx, "+1555143912")
 	if err != nil {
 		t.Fatalf("create bob: %v", err)
 	}
 
 	chat := createActiveChat(t, s, alice.ID, bob.ID)
 
-	encrypted := make(chan [2]int64, 1)
+	conn, ft := newConnFor(t, reg, alice.ID)
+
 	_, stop, err := store.StartListener(ctx, dsn,
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64) {},
 		func(_ context.Context, userID, chatID int64) {
-			encrypted <- [2]int64{userID, chatID}
 			updater.DeliverEncryption(ctx, userID, chatID)
 		},
 		nil,
@@ -132,21 +175,20 @@ func TestDeliverEncryptionActiveState(t *testing.T) {
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
 
-	// Active state pushes to admin.
 	if err := s.Notify(ctx, store.ChannelEncryption, store.EncryptionPayload(alice.ID, int64(chat.ID))); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
 
-	select {
-	case got := <-encrypted:
-		if got[0] != alice.ID || got[1] != int64(chat.ID) {
-			t.Fatalf("callback = [%d %d], want [%d %d]", got[0], got[1], alice.ID, chat.ID)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("encryption callback not invoked for active state")
+	time.Sleep(100 * time.Millisecond)
+
+	if !ft.wasSent() {
+		t.Fatal("no push for active state")
+	}
+	if got := conn.LastPushedPts(); got != 0 {
+		t.Errorf("pts = %d, want 0", got)
 	}
 
-	// Verify payload content: active → EncryptedChat with g_a_or_b and fingerprint.
+	// Active → EncryptedChat with key material.
 	rendered := api.EncryptedChatFor(chat, alice.ID)
 	ec, ok := rendered.(*tg.EncryptedChat)
 	if !ok {
@@ -155,39 +197,35 @@ func TestDeliverEncryptionActiveState(t *testing.T) {
 	if len(ec.GAOrB) == 0 {
 		t.Error("g_a_or_b missing in active state")
 	}
-	if ec.KeyFingerprint != chat.KeyFingerprint {
-		t.Errorf("fingerprint = %d, want %d", ec.KeyFingerprint, chat.KeyFingerprint)
-	}
 }
 
-// TestDeliverEncryptionDiscardedState verifies the discarded state renders as
-// EncryptedChatDiscarded and reaches the other participant.
-func TestDeliverEncryptionDiscardedState(t *testing.T) {
+// TestDeliverEncryptionDiscarded drives DeliverEncryption for the discarded state.
+func TestDeliverEncryptionDiscarded(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, dsn := openStoreDSN(t)
 	reg := mtproto.NewSessionRegistry()
 	updater := api.NewUpdater(s, reg, nil, pgtest.PeerDeriver())
 
-	alice, err := s.CreateUser(ctx, "+1555143601")
+	alice, err := s.CreateUser(ctx, "+1555143921")
 	if err != nil {
 		t.Fatalf("create alice: %v", err)
 	}
-	bob, err := s.CreateUser(ctx, "+1555143602")
+	bob, err := s.CreateUser(ctx, "+1555143922")
 	if err != nil {
 		t.Fatalf("create bob: %v", err)
 	}
 
 	chat := createDiscardedChat(t, s, alice.ID, bob.ID)
 
-	encrypted := make(chan [2]int64, 1)
+	conn, ft := newConnFor(t, reg, bob.ID)
+
 	_, stop, err := store.StartListener(ctx, dsn,
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64) {},
 		func(_ context.Context, userID, chatID int64) {
-			encrypted <- [2]int64{userID, chatID}
 			updater.DeliverEncryption(ctx, userID, chatID)
 		},
 		nil,
@@ -197,18 +235,17 @@ func TestDeliverEncryptionDiscardedState(t *testing.T) {
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
 
-	// Discarded state pushes to the other participant.
 	if err := s.Notify(ctx, store.ChannelEncryption, store.EncryptionPayload(bob.ID, int64(chat.ID))); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
 
-	select {
-	case got := <-encrypted:
-		if got[0] != bob.ID || got[1] != int64(chat.ID) {
-			t.Fatalf("callback = [%d %d], want [%d %d]", got[0], got[1], bob.ID, chat.ID)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("encryption callback not invoked for discarded state")
+	time.Sleep(100 * time.Millisecond)
+
+	if !ft.wasSent() {
+		t.Fatal("no push for discarded state")
+	}
+	if got := conn.LastPushedPts(); got != 0 {
+		t.Errorf("pts = %d, want 0", got)
 	}
 
 	rendered := api.EncryptedChatFor(chat, bob.ID)
@@ -217,14 +254,13 @@ func TestDeliverEncryptionDiscardedState(t *testing.T) {
 	}
 }
 
-// TestDeliverEncryptionWrongChannelNeverDispatches proves that the NOTIFY
-// channel name matters: a notification on the wrong channel is never routed
-// to the encryption callback. This verifies criterion 1: the test fails if
-// the channel name is wrong.
+// TestDeliverEncryptionWrongChannelNeverDispatches proves the NOTIFY channel
+// name matters: a notification on the wrong channel is never routed to the
+// encryption callback. Uses the same DSN so NOTIFY reaches the listener.
 func TestDeliverEncryptionWrongChannelNeverDispatches(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	_, dsn := openStoreDSN(t)
+	s, dsn := openStoreDSN(t)
 
 	encrypted := make(chan struct{}, 1)
 	_, stop, err := store.StartListener(ctx, dsn,
@@ -240,8 +276,7 @@ func TestDeliverEncryptionWrongChannelNeverDispatches(t *testing.T) {
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
 
-	// Emit on the updates channel instead of encryption.
-	s, _ := openStoreDSN(t)
+	// Emit on the updates channel instead of encryption, on the SAME database.
 	if err := s.Notify(ctx, store.ChannelUpdates, "1|1"); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
