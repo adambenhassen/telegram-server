@@ -317,6 +317,58 @@ func (u *Updater) DeliverEncryption(ctx context.Context, userID, chatID int64) {
 	}
 }
 
+// DeliverStatus pushes updateUserStatus to every dialog partner of userID whose
+// live connections exist on this replica. It is the status callback for StartListener.
+//
+// The changed user's own connections are never pushed to — clients update their
+// own display via the account.updateStatus response, not a push.
+//
+// online=true → UserStatusOnline with a 5-minute expires window (Telegram canonical).
+// online=false → UserStatusOffline with last_seen_at from the user row.
+func (u *Updater) DeliverStatus(ctx context.Context, userID int64, online bool) {
+	partners, err := u.h.store.DialogPartners(ctx, userID)
+	if err != nil {
+		u.log.Error("deliver status partners", "user_id", userID, "err", err)
+		return
+	}
+	if len(partners) == 0 {
+		return
+	}
+
+	var status tg.UserStatusClass
+	if online {
+		status = &tg.UserStatusOnline{Expires: int(time.Now().Add(5 * time.Minute).Unix())}
+	} else {
+		user, ok, err := u.h.store.UserByID(ctx, userID)
+		if err != nil {
+			u.log.Error("deliver status user", "user_id", userID, "err", err)
+			return
+		}
+		if !ok {
+			return
+		}
+		wasOnline := int64(0)
+		if user.LastSeenAt != nil {
+			wasOnline = user.LastSeenAt.Unix()
+		}
+		status = &tg.UserStatusOffline{WasOnline: int(wasOnline)}
+	}
+
+	for _, partnerID := range partners {
+		conns := u.registry.Conns(partnerID)
+		for _, c := range conns {
+			short := &tg.UpdateShort{
+				Update: &tg.UpdateUserStatus{UserID: userID, Status: status},
+				Date:   int(time.Now().Unix()),
+			}
+			// Carries no pts, so a conn that changed hands simply drops it.
+			if _, err := c.PushTo(ctx, partnerID, short, 0); err != nil {
+				u.log.Info("deliver status push", "partner_id", partnerID, "err", err)
+			}
+		}
+	}
+}
+
 // Evict closes the connections of userID that still hold authKeyID, which the
 // revoking replica has just deleted from auth_keys. It is the cross-replica half
 // of revocation: without it a socket that sends no further frame keeps its
