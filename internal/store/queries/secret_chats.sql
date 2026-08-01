@@ -7,9 +7,13 @@ SELECT nextval('secret_chats_id_seq')::bigint;
 -- rows the caller admins are counted, so an inbound request never costs quota.
 SELECT COUNT(*) FROM secret_chats WHERE admin_id = $1 AND state = 'requested';
 
+-- name: GetSecretChatByAdminRandomID :one
+-- ponytail: lookup-before-insert dedup; avoids ON CONFLICT and sequence waste.
+SELECT * FROM secret_chats WHERE admin_id = $1 AND random_id = $2 AND random_id != 0 AND state = 'requested';
+
 -- name: InsertSecretChat :one
-INSERT INTO secret_chats (id, admin_id, participant_id, state, g_a_hash, g_a)
-VALUES ($1, $2, $3, 'requested', $4, $5)
+INSERT INTO secret_chats (id, admin_id, participant_id, state, g_a_hash, g_a, random_id)
+VALUES ($1, $2, $3, 'requested', $4, $5, $6)
 RETURNING *;
 
 -- name: SecretChatByID :one

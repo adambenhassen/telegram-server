@@ -135,12 +135,23 @@ func (h *handlers) handleRequestEncryption(r *mtproto.Request) (bin.Encoder, err
 	}
 
 	gAHash := sha256.Sum256(req.GA)
-	chat, err := h.store.CreateSecretChatRequest(r.Ctx, r.UserID, participantID, req.GA, gAHash[:])
+	chat, isDedup, err := h.store.CreateSecretChatRequest(r.Ctx, r.UserID, participantID, req.GA, gAHash[:], int64(req.RandomID))
 	if errors.Is(err, store.ErrSecretChatsTooMany) {
 		return nil, errPeerFlood
 	}
 	if err != nil {
 		return nil, err
+	}
+	// Dedup hit: the row already exists, push was already sent. Return the
+	// existing waiting state without a second notification.
+	if isDedup {
+		return &tg.EncryptedChatWaiting{
+			ID:            int(chat.ID),
+			AccessHash:    h.secretChatHash(r.UserID, chat.ID),
+			Date:          int(chat.Date.Unix()),
+			AdminID:       chat.AdminID,
+			ParticipantID: chat.ParticipantID,
+		}, nil
 	}
 
 	h.notifyEncryption(r.Ctx, participantID, chat.ID)

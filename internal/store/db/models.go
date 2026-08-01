@@ -167,6 +167,7 @@ type SecretChat struct {
 	GAOrB          []byte
 	KeyFingerprint *int64
 	Date           pgtype.Timestamptz
+	RandomID       int64
 }
 
 type UpdateState struct {
