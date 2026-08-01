@@ -449,3 +449,12 @@ const DhVersion = dhVersion
 func StaleAcceptErrorForTest(s *store.Store, chatID int32) error {
 	return testHandlers(s).staleAcceptError(context.Background(), chatID)
 }
+
+// UpdateStatusForTest invokes handleUpdateStatus for userID with the given Offline value.
+func UpdateStatusForTest(s *store.Store, userID int64, offline bool) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := (&tg.AccountUpdateStatusRequest{Offline: offline}).Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleUpdateStatus(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}

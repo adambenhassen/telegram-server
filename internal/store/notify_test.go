@@ -75,6 +75,7 @@ func TestStartListenerDispatches(t *testing.T) {
 		func(_ context.Context, userID, authKeyID int64) { evicted <- [2]int64{userID, authKeyID} },
 		func(_ context.Context, _ int64) {},
 		func(_ context.Context, userID, chatID int64) { encrypted <- [2]int64{userID, chatID} },
+		func(context.Context, int64, bool) {},
 		nil,
 	)
 	if err != nil {
@@ -197,6 +198,7 @@ func TestStartListenerReconnectsAfterBackendTermination(t *testing.T) {
 		func(_ context.Context, userID, authKeyID int64) { evicted <- [2]int64{userID, authKeyID} },
 		func(_ context.Context, _ int64) {},
 		func(_ context.Context, _, _ int64) {},
+		func(context.Context, int64, bool) {},
 		nil,
 	)
 	if err != nil {
@@ -274,6 +276,7 @@ func TestStartListenerBacksOffWhileDatabaseIsDown(t *testing.T) {
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, _ int64) {},
 		func(_ context.Context, _, _ int64) {},
+		func(context.Context, int64, bool) {},
 		nil,
 	)
 	if err != nil {
@@ -317,6 +320,7 @@ func TestStartListenerDeliversChannelPost(t *testing.T) {
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, channelID int64) { posted <- channelID },
 		func(_ context.Context, _, _ int64) {},
+		func(context.Context, int64, bool) {},
 		nil,
 	)
 	if err != nil {
@@ -356,6 +360,76 @@ func TestStartListenerDeliversChannelPost(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("channelPost callback not invoked")
+	}
+}
+
+// TestStartListenerDeliversStatus proves the status callback fires with the
+// right userID and online value, and that a malformed payload is dropped.
+func TestStartListenerDeliversStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	statused := make(chan [2]bool, 2) // [userID==7, online]
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(_ context.Context, userID int64, online bool) { statused <- [2]bool{userID == 7, online} },
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	defer func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	}()
+
+	// Malformed payload must be dropped.
+	if err := s.Notify(ctx, store.ChannelStatus, "not-a-pair"); err != nil {
+		t.Fatalf("notify malformed status: %v", err)
+	}
+
+	// Valid online payload.
+	if err := s.Notify(ctx, store.ChannelStatus, store.StatusPayload(7, true)); err != nil {
+		t.Fatalf("notify status online: %v", err)
+	}
+	select {
+	case got := <-statused:
+		if !got[0] || !got[1] {
+			t.Fatalf("status = user7=%v, online=%v, want true, true", got[0], got[1])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("status callback not invoked for online")
+	}
+
+	// Valid offline payload.
+	if err := s.Notify(ctx, store.ChannelStatus, store.StatusPayload(7, false)); err != nil {
+		t.Fatalf("notify status offline: %v", err)
+	}
+	select {
+	case got := <-statused:
+		if !got[0] || got[1] {
+			t.Fatalf("status = user7=%v, online=%v, want true, false", got[0], got[1])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("status callback not invoked for offline")
+	}
+}
+
+// TestStatusPayloadFormat pins the payload shape: "<userID>|<1 or 0>".
+func TestStatusPayloadFormat(t *testing.T) {
+	t.Parallel()
+	if got := store.StatusPayload(42, true); got != "42|1" {
+		t.Fatalf("StatusPayload(42, true) = %q, want 42|1", got)
+	}
+	if got := store.StatusPayload(42, false); got != "42|0" {
+		t.Fatalf("StatusPayload(42, false) = %q, want 42|0", got)
 	}
 }
 
