@@ -192,7 +192,7 @@ func (h *handlers) handleAcceptEncryption(r *mtproto.Request) (bin.Encoder, erro
 
 	chat, err := h.store.AcceptSecretChat(r.Ctx, chatID, r.UserID, req.GB, req.KeyFingerprint)
 	if errors.Is(err, store.ErrSecretChatStale) {
-		return nil, errEncryptionAlreadyAccepted
+		return nil, h.staleAcceptError(r.Ctx, chatID)
 	}
 	if err != nil {
 		return nil, err
@@ -208,6 +208,31 @@ func (h *handlers) handleAcceptEncryption(r *mtproto.Request) (bin.Encoder, erro
 		GAOrB:          chat.GAOrB,
 		KeyFingerprint: chat.KeyFingerprint,
 	}, nil
+}
+
+// staleAcceptError names which terminal state rejected the accept. The guard
+// matches no row for either of them, so the state has to be re-read: the
+// preflight check above only sees a discard that had already committed when the
+// handler started, and a discard landing between that read and the UPDATE would
+// otherwise be reported as an already-accepted chat the client could then wait
+// forever to key.
+//
+// It is on the error path only, so the successful accept still costs one
+// statement. A reload that fails is returned as itself rather than guessed at.
+func (h *handlers) staleAcceptError(ctx context.Context, chatID int32) error {
+	chat, err := h.store.SecretChatByID(ctx, chatID)
+	if errors.Is(err, store.ErrSecretChatNotFound) {
+		// Nothing deletes a secret chat, so this is unreachable today; report it
+		// as the naming failure rather than inventing a lifecycle answer.
+		return errEncryptionIDInvalid
+	}
+	if err != nil {
+		return err
+	}
+	if chat.State == store.SecretChatDiscarded {
+		return errEncryptionAlreadyDeclined
+	}
+	return errEncryptionAlreadyAccepted
 }
 
 // handleDiscardEncryption serves messages.discardEncryption. Either party may

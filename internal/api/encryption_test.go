@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"sync"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -542,6 +543,96 @@ func TestKeyExchangeLeavesUpdateStateUntouched(t *testing.T) {
 		}
 		if got := qtsOf(uid); got != beforeQts[uid] {
 			t.Errorf("user %d: qts moved from %d to %d", uid, beforeQts[uid], got)
+		}
+	}
+}
+
+// The accept guard matches no row for BOTH terminal states, so the error it
+// reports has to be re-derived from the row. Mapping every stale guard to
+// ENCRYPTION_ALREADY_ACCEPTED tells a client that raced a discard to wait for a
+// key that will never arrive.
+func TestStaleAcceptErrorNamesTheTerminalState(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	a, b := twoUsersFor(t, s, "+15551393001", "+15551393002")
+
+	accepted := requestChat(t, s, a, b)
+	acceptedID := int32(accepted.ID) //nolint:gosec // test id
+	if _, err := api.AcceptEncryptionForTest(s, b, &tg.MessagesAcceptEncryptionRequest{
+		Peer: api.InputEncryptedChat(b, acceptedID), GB: validGB(), KeyFingerprint: 3,
+	}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	discarded := requestChat(t, s, a, b)
+	discardedID := int32(discarded.ID) //nolint:gosec // test id
+	if _, err := api.DiscardEncryptionForTest(s, a, &tg.MessagesDiscardEncryptionRequest{ChatID: discarded.ID}); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		id   int32
+		want string
+	}{
+		"active chat":    {acceptedID, "ENCRYPTION_ALREADY_ACCEPTED"},
+		"discarded chat": {discardedID, "ENCRYPTION_ALREADY_DECLINED"},
+		"absent chat":    {discardedID + 5000, "ENCRYPTION_ID_INVALID"},
+	} {
+		if got := rpcMessage(t, api.StaleAcceptErrorForTest(s, tc.id)); got != tc.want {
+			t.Errorf("%s: error = %s, want %s", name, got, tc.want)
+		}
+	}
+}
+
+// The race itself: a discard landing between acceptEncryption's preflight read
+// and its guarded UPDATE must not be reported as an already-accepted chat.
+// Whichever call wins, the error the loser gets has to match the state the row
+// actually landed in.
+func TestAcceptRacingDiscardReportsTheRealState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a, b := twoUsersFor(t, s, "+15551394001", "+15551394002")
+
+	for i := range 20 {
+		waiting := requestChat(t, s, a, b)
+		id := int32(waiting.ID) //nolint:gosec // test id
+
+		var acceptErr, discardErr error
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, acceptErr = api.AcceptEncryptionForTest(s, b, &tg.MessagesAcceptEncryptionRequest{
+				Peer: api.InputEncryptedChat(b, id), GB: validGB(), KeyFingerprint: 11,
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, discardErr = api.DiscardEncryptionForTest(s, a, &tg.MessagesDiscardEncryptionRequest{ChatID: waiting.ID})
+		}()
+		close(start)
+		wg.Wait()
+
+		if discardErr != nil {
+			t.Fatalf("iteration %d: discard: %v", i, discardErr)
+		}
+		chat, err := s.SecretChatByID(ctx, id)
+		if err != nil {
+			t.Fatalf("iteration %d: load: %v", i, err)
+		}
+		if acceptErr == nil {
+			// Accept won the race; discard then moved the row on from 'active'.
+			continue
+		}
+		if chat.State != store.SecretChatDiscarded {
+			t.Fatalf("iteration %d: accept failed but state is %q", i, chat.State)
+		}
+		if msg := rpcMessage(t, acceptErr); msg != "ENCRYPTION_ALREADY_DECLINED" {
+			t.Fatalf("iteration %d: accept lost to a discard but reported %s, want ENCRYPTION_ALREADY_DECLINED", i, msg)
 		}
 	}
 }

@@ -442,3 +442,10 @@ const MaxDhRandomLength = maxDhRandomLength
 
 // DhVersion exposes the served parameter-set version.
 const DhVersion = dhVersion
+
+// StaleAcceptErrorForTest exposes the terminal-state mapping acceptEncryption
+// applies when its guarded UPDATE matched no row, so a test can pin which error
+// each terminal state produces without having to win a race.
+func StaleAcceptErrorForTest(s *store.Store, chatID int32) error {
+	return testHandlers(s).staleAcceptError(context.Background(), chatID)
+}
