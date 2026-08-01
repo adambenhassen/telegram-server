@@ -269,9 +269,10 @@ func TestCreateSecretChatRequestDedupSameRandomID(t *testing.T) {
 	}
 }
 
-// TestCreateSecretChatRequestDedupConcurrent proves that concurrent retries
+// TestCreateSecretChatRequestDedupConcurrent proves that concurrent callers
 // with the same random_id are safe: exactly one row is created, all callers
-// get the same id back.
+// get the same id back. The first batch starts against an empty key so the
+// initial-miss/insert race is exercised, not just the dedup path.
 func TestCreateSecretChatRequestDedupConcurrent(t *testing.T) {
 	t.Parallel()
 	s := open(t)
@@ -290,15 +291,10 @@ func TestCreateSecretChatRequestDedupConcurrent(t *testing.T) {
 	hash := sha256.Sum256(ga)
 	const randomID = int64(100)
 
-	// Seed the original row.
-	original, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], randomID)
-	if err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	// Concurrent retries.
+	// Concurrent callers, no seed — all hit the same key from scratch.
 	const n = 10
 	ids := make([]int32, n)
+	dedup := make([]bool, n)
 	errs := make([]error, n)
 	var wg sync.WaitGroup
 	ready := make(chan struct{})
@@ -307,20 +303,36 @@ func TestCreateSecretChatRequestDedupConcurrent(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-ready
-			chat, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, gaFor(i), hash[:], randomID)
+			chat, isDedup, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, gaFor(i), hash[:], randomID)
 			errs[i] = err
 			ids[i] = chat.ID
+			dedup[i] = isDedup
 		}(i)
 	}
 	close(ready)
 	wg.Wait()
 
+	var fresh, dup int
 	for i, err := range errs {
 		if err != nil {
-			t.Errorf("retry %d: %v", i, err)
+			t.Errorf("call %d: %v", i, err)
 		}
-		if ids[i] != original.ID {
-			t.Errorf("retry %d id = %d, want %d", i, ids[i], original.ID)
+		if dedup[i] {
+			dup++
+		} else {
+			fresh++
+		}
+	}
+	if fresh != 1 {
+		t.Errorf("fresh = %d, want 1", fresh)
+	}
+	if dup != n-1 {
+		t.Errorf("dedup = %d, want %d", dup, n-1)
+	}
+	// All ids must be the same.
+	for i := 1; i < n; i++ {
+		if ids[i] != ids[0] {
+			t.Errorf("call %d id = %d, want %d", i, ids[i], ids[0])
 		}
 	}
 }

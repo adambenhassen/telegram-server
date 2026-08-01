@@ -124,7 +124,9 @@ func (s *Store) CreateSecretChatRequest(ctx context.Context, adminID, participan
 			RandomID: randomID,
 		})
 		if err == nil {
-			_ = tx.Rollback(ctx) //nolint:errcheck // returning existing row
+			if rbErr := tx.Rollback(ctx); rbErr != nil {
+				return SecretChat{}, false, fmt.Errorf("rollback after dedup: %w", rbErr)
+			}
 			return secretChatFromRow(existing), true, nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
