@@ -22,13 +22,55 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
 
-      # cache: true keys the module and build caches on go.sum, so a run that
-      # changed no dependency skips `go mod download` and reuses compiled
-      # packages across Build, Lint and Test.
+      # internal/pgtest builds its template database by reading migrations/ at
+      # run time, so Go records that directory and those files as test inputs —
+      # and a recorded input is hashed with its stat, modification time
+      # included. A fresh checkout stamps a new mtime every run, so the two
+      # packages that read them (internal/pgtest, internal/store) would miss the
+      # test cache on every run while every other package hit it. Pinning the
+      # timestamps makes the recorded input identical from run to run. The
+      # children first, then the directory: adding or removing a migration still
+      # changes the directory's own size and listing, so a real change is still
+      # seen.
+      - name: Pin migration timestamps for the test cache
+        run: touch -d @0 migrations/* migrations
+
+      # cache: false because setup-go keys its cache on go.sum alone and saves
+      # only when that key missed. A run that changed no dependency therefore
+      # restores $GOCACHE and never writes it back, so the test results Go
+      # recorded during the run are discarded and the next run re-runs
+      # everything. The two steps below split the two caches and give the build
+      # cache a key that always misses, so it is always saved.
       - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+
+      # Module downloads are a pure function of go.sum, so an exact key is right
+      # here and a stale-prefix restore is harmless: `go mod download` fills in
+      # whatever the restore key missed.
+      - name: Cache Go modules
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: go-mod-${{ runner.os }}-
+
+      # $GOCACHE holds both compiled packages and Go's test result cache, and it
+      # is only useful if it comes back richer than it went in. run_id/run_attempt
+      # make the primary key miss on every run, which is what forces the save; the
+      # restore key then loads the newest cache for this go.sum. run_attempt is in
+      # there because a re-run of the same run keeps its run_id, and without it a
+      # re-run would hit its own key and save nothing.
+      #
+      # The cache grows by one entry per run. GitHub evicts by age and by the
+      # 10 GB repository limit, so it is self-trimming.
+      - name: Cache Go build and test results
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-
 
       - name: Build
         run: go build ./...
@@ -53,6 +95,10 @@ jobs:
       #
       # Via make so the flags (-race) live only in the Makefile and CI cannot
       # drift from what a local `make test` runs.
+      #
+      # A package prints (cached) here when $GOCACHE came back from the step
+      # above carrying its result. Go decides that per package, so a package
+      # whose source changed still runs in full.
       - name: Test
         run: make test
 
