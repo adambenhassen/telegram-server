@@ -381,6 +381,7 @@ func ResolvePhoneForTest(s *store.Store, userID int64, req *tg.ContactsResolvePh
 	return testHandlers(s).handleResolvePhone(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+<<<<<<< HEAD
 // InputEncryptedChat builds a valid InputEncryptedChat for chatID as seen by
 // viewerID, using the test deriver.
 func InputEncryptedChat(viewerID int64, chatID int32) tg.InputEncryptedChat {
@@ -448,4 +449,13 @@ const DhVersion = dhVersion
 // each terminal state produces without having to win a race.
 func StaleAcceptErrorForTest(s *store.Store, chatID int32) error {
 	return testHandlers(s).staleAcceptError(context.Background(), chatID)
+}
+
+// UpdateStatusForTest invokes handleUpdateStatus for userID with the given Offline value.
+func UpdateStatusForTest(s *store.Store, userID int64, offline bool) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := (&tg.AccountUpdateStatusRequest{Offline: offline}).Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleUpdateStatus(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
