@@ -91,6 +91,32 @@ var (
 	// errLookupFloodWait rejects a contacts.resolvePhone that would take the
 	// caller past their per-account lookup quota.
 	errLookupFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
+	// errRandomLengthInvalid rejects a getDhConfig random_length outside
+	// [0, maxDhRandomLength], before any allocation is made for it.
+	errRandomLengthInvalid = rpcErr(400, "RANDOM_LENGTH_INVALID")
+	// errDHValueInvalid rejects a g_a or g_b that is the wrong length or outside
+	// the safe range for the group. Telegram signals both as DH_G_A_INVALID, on
+	// requestEncryption and acceptEncryption alike.
+	errDHValueInvalid = rpcErr(400, "DH_G_A_INVALID")
+	// errEncryptionIDInvalid is every rejection that depends on naming a secret
+	// chat: an id with no row, an access hash not derived for the caller, a chat
+	// the caller is not a party to, and an accept attempted by the initiator.
+	// They are ONE error on purpose — secret chat ids are a dense sequence, so a
+	// distinguishable set would make the id space enumerable.
+	errEncryptionIDInvalid = rpcErr(400, "ENCRYPTION_ID_INVALID")
+	// errEncryptionAlreadyAccepted rejects a replayed acceptEncryption. The
+	// caller is a party to the chat and already knows it exists, so unlike the
+	// rejections above this one may be distinct.
+	errEncryptionAlreadyAccepted = rpcErr(400, "ENCRYPTION_ALREADY_ACCEPTED")
+	// errEncryptionAlreadyDeclined rejects an accept of a discarded chat.
+	errEncryptionAlreadyDeclined = rpcErr(400, "ENCRYPTION_ALREADY_DECLINED")
+	// errUserIDInvalid rejects a requestEncryption whose target is the caller
+	// themselves, and one whose target has no account.
+	errUserIDInvalid = rpcErr(400, "USER_ID_INVALID")
+	// errPeerFlood rejects a requestEncryption that would take the caller past
+	// their outstanding-request cap. The condition clears as the responder
+	// answers or the caller discards, so it is a flood signal, not a hard limit.
+	errPeerFlood = rpcErr(400, "PEER_FLOOD")
 	// errPhoneNotOccupied is the byte-identical response for a phone lookup that
 	// finds no account and any target-side refusal — indistinguishable by design.
 	errPhoneNotOccupied = rpcErr(400, "PHONE_NOT_OCCUPIED")

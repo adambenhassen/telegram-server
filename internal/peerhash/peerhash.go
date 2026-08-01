@@ -62,6 +62,9 @@ const (
 	KindUser    Kind = 1
 	KindChat    Kind = 2
 	KindChannel Kind = 3
+	// KindSecret names a secret chat. Its ids come from their own dense
+	// sequence, so they overlap user and chat ids and need their own namespace.
+	KindSecret Kind = 4
 )
 
 // Subkey derives the peer-hash subkey from the master key material at process

@@ -150,6 +150,10 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.UploadSaveBigFilePartRequestTypeID, h.handleSaveBigFilePart)
 	register(d, tg.UploadGetFileRequestTypeID, h.handleGetFile)
 	register(d, tg.ContactsResolvePhoneRequestTypeID, h.handleResolvePhone)
+	register(d, tg.MessagesGetDhConfigRequestTypeID, h.handleGetDhConfig)
+	register(d, tg.MessagesRequestEncryptionRequestTypeID, h.handleRequestEncryption)
+	register(d, tg.MessagesAcceptEncryptionRequestTypeID, h.handleAcceptEncryption)
+	register(d, tg.MessagesDiscardEncryptionRequestTypeID, h.handleDiscardEncryption)
 	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		id, err := req.Buf.PeekID()
 		if err != nil {

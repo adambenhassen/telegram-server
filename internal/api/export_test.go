@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"math/big"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -379,3 +380,65 @@ func ResolvePhoneForTest(s *store.Store, userID int64, req *tg.ContactsResolvePh
 	}
 	return testHandlers(s).handleResolvePhone(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
+
+// InputEncryptedChat builds a valid InputEncryptedChat for chatID as seen by
+// viewerID, using the test deriver.
+func InputEncryptedChat(viewerID int64, chatID int32) tg.InputEncryptedChat {
+	return tg.InputEncryptedChat{
+		ChatID:     int(chatID),
+		AccessHash: pgtest.PeerDeriver().Derive(viewerID, peerhash.KindSecret, int64(chatID)),
+	}
+}
+
+// GetDhConfigForTest encodes req and invokes handleGetDhConfig. It needs no
+// store: the group parameters are compiled in.
+func GetDhConfigForTest(req *tg.MessagesGetDhConfigRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(nil).handleGetDhConfig(&mtproto.Request{Ctx: context.Background(), Buf: &buf})
+}
+
+// RequestEncryptionForTest encodes req and invokes handleRequestEncryption.
+func RequestEncryptionForTest(s *store.Store, userID int64, req *tg.MessagesRequestEncryptionRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleRequestEncryption(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// AcceptEncryptionForTest encodes req and invokes handleAcceptEncryption.
+func AcceptEncryptionForTest(s *store.Store, userID int64, req *tg.MessagesAcceptEncryptionRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleAcceptEncryption(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// DiscardEncryptionForTest encodes req and invokes handleDiscardEncryption.
+func DiscardEncryptionForTest(s *store.Store, userID int64, req *tg.MessagesDiscardEncryptionRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleDiscardEncryption(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// EncryptedChatFor exposes the per-viewer rendering the push path uses, so a
+// test can assert what each party is shown without a live socket.
+func EncryptedChatFor(chat store.SecretChat, viewerID int64) tg.EncryptedChatClass {
+	return testHandlers(nil).encryptedChatFor(chat, viewerID)
+}
+
+// DHPrime returns the group modulus, so a test can build g_a values that sit
+// inside and outside the accepted range.
+func DHPrime() *big.Int { return new(big.Int).Set(dhPrime) }
+
+// MaxDhRandomLength exposes the getDhConfig random_length clamp.
+const MaxDhRandomLength = maxDhRandomLength
+
+// DhVersion exposes the served parameter-set version.
+const DhVersion = dhVersion
