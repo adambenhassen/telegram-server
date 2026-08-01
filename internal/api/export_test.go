@@ -433,6 +433,15 @@ func EncryptedChatFor(chat store.SecretChat, viewerID int64) tg.EncryptedChatCla
 	return testHandlers(nil).encryptedChatFor(chat, viewerID)
 }
 
+// SendEncryptedMessageForTest encodes req and invokes handleSendEncryptedMessage.
+func SendEncryptedMessageForTest(s *store.Store, userID int64, req *tg.MessagesSendEncryptedRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleSendEncryptedMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // DHPrime returns the group modulus, so a test can build g_a values that sit
 // inside and outside the accepted range.
 func DHPrime() *big.Int { return new(big.Int).Set(dhPrime) }

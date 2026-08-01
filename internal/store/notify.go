@@ -24,6 +24,10 @@ const (
 	// stream lands (MAIN-140).
 	ChannelEncryption = "tg_encryption" // payload: "<userID>|<chatID>"
 	ChannelStatus     = "tg_status"     // payload: "<userID>|<1 or 0>"
+	// ChannelEncryptedMsg carries one encrypted message event to its recipient.
+	// payload: "<recipientID>|<qts>". The handler fetches the full event from
+	// encrypted_events and pushes updateNewEncryptedMessage.
+	ChannelEncryptedMsg = "tg_encrypted_msg" // payload: "<recipientID>|<qts>"
 )
 
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
@@ -72,14 +76,15 @@ type Listener struct {
 }
 
 // StartListener opens a dedicated connection, subscribes to the update, typing,
-// evict, channel-post, encryption and status channels, and runs the notification loop until
-// the returned stop function is called (which cancels the loop, drains it, and
-// returns the error from closing the connection). deliver receives a userID
-// whose events changed; typing receives (peerUserID, fromUserID) for a
-// transient typing notification; evict receives (userID, authKeyID) for a
-// session revoked on any replica; channelPost receives a channelID whose post
-// was just committed; encryption receives (userID, chatID) for a secret-chat
-// state change; status receives (userID, online) for a status change.
+// evict, channel-post, encryption, status, and encrypted-message channels, and
+// runs the notification loop until the returned stop function is called (which
+// cancels the loop, drains it, and returns the error from closing the
+// connection). deliver receives a userID whose events changed; typing receives
+// (peerUserID, fromUserID) for a transient typing notification; evict receives
+// (userID, authKeyID) for a session revoked on any replica; channelPost receives
+// a channelID whose post was just committed; encryption receives (userID, chatID)
+// for a secret-chat state change; status receives (userID, online) for a status
+// change; encryptedMsg receives (recipientID, qts) for a secret-chat message.
 //
 // A broken connection is reconnected with bounded backoff rather than ending
 // delivery for the life of the process. Notifications emitted while the
@@ -97,6 +102,7 @@ func StartListener(
 	channelPost func(ctx context.Context, channelID int64),
 	encryption func(ctx context.Context, userID, chatID int64),
 	status func(ctx context.Context, userID int64, online bool),
+	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	log *slog.Logger,
 ) (*Listener, func() error, error) {
 	if log == nil {
@@ -110,7 +116,9 @@ func StartListener(
 	l := &Listener{log: log}
 	loopCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	wg.Go(func() { l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status) })
+	wg.Go(func() {
+		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg)
+	})
 
 	stop := func() error {
 		cancel()
@@ -128,7 +136,7 @@ func connectAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listener connect: %w", err)
 	}
-	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost, ChannelEncryption, ChannelStatus} {
+	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost, ChannelEncryption, ChannelStatus, ChannelEncryptedMsg} {
 		// ch is a constant channel identifier, never user input (no injection).
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			_ = conn.Close(ctx) //nolint:errcheck // best-effort close on setup failure
@@ -152,6 +160,7 @@ func (l *Listener) run(
 	channelPost func(ctx context.Context, channelID int64),
 	encryption func(ctx context.Context, userID, chatID int64),
 	status func(ctx context.Context, userID int64, online bool),
+	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 ) {
 	backoff := listenerBackoffMin
 	for {
@@ -173,7 +182,7 @@ func (l *Listener) run(
 		}
 
 		up := time.Now()
-		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption, status)
+		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg)
 		closeErr := conn.Close(context.Background())
 		conn = nil
 		if ctx.Err() != nil {
@@ -196,6 +205,7 @@ func (l *Listener) dispatch(
 	channelPost func(ctx context.Context, channelID int64),
 	encryption func(ctx context.Context, userID, chatID int64),
 	status func(ctx context.Context, userID int64, online bool),
+	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 ) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
@@ -247,6 +257,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			status(ctx, userID, onlineID == 1)
+		case ChannelEncryptedMsg:
+			recipientID, qts64, perr := parsePairPayload(n.Payload)
+			if perr != nil {
+				l.log.Warn("bad tg_encrypted_msg payload", "payload", n.Payload)
+				continue
+			}
+			encryptedMsg(ctx, recipientID, int(qts64))
 		}
 	}
 }
@@ -273,6 +290,12 @@ func ChannelPostPayload(channelID int64) string {
 // notify and the secret chat whose state changed.
 func EncryptionPayload(userID, chatID int64) string {
 	return pairPayload(userID, chatID)
+}
+
+// EncryptedMsgPayload formats a tg_encrypted_msg NOTIFY payload naming the
+// recipient and the qts of the event they must push.
+func EncryptedMsgPayload(recipientID int64, qts int) string {
+	return pairPayload(recipientID, int64(qts))
 }
 
 // TypingPayload formats a tg_typing NOTIFY payload from the peer and sender ids.

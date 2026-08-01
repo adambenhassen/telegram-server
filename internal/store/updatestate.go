@@ -26,6 +26,7 @@ const (
 // wire. Date is unix seconds; UnreadCount is summed across the user's dialogs.
 type State struct {
 	Pts         int
+	Qts         int
 	Seq         int
 	Date        int
 	UnreadCount int
@@ -66,6 +67,7 @@ func (s *Store) State(ctx context.Context, userID int64) (State, error) {
 	}
 	return State{
 		Pts:         int(row.Pts),
+		Qts:         int(row.Qts),
 		Seq:         int(row.Seq),
 		Date:        int(row.Date.Time.Unix()),
 		UnreadCount: unread,
