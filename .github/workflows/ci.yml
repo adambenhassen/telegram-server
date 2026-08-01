@@ -3,7 +3,34 @@ name: CI
 on:
   push:
     branches: [main]
+
+  # A PR that touches only docs or fixtures has nothing for these three jobs to
+  # gate, so the whole workflow is skipped rather than filtered per job. The list
+  # is everything any job actually reads: the module, the migrations Atlas
+  # validates and applies, the image and stack the docker/compose jobs build, and
+  # the config files their assertions depend on — .golangci.yml selects the
+  # linters, atlas.hcl names the migration dir, and the compose job asserts on
+  # both .gitignore's !.env.example negation and .env.example itself.
+  #
+  # Skipping means no check is reported at all, not a green one. If a required
+  # status check is ever added to main's protection, it has to come in through a
+  # path-independent job or a PR touching only docs blocks forever.
   pull_request:
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'migrations/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.dockerignore'
+      - '.github/workflows/ci.yml'
+      - '.golangci.yml'
+      - 'atlas.hcl'
+      - '.env.example'
+      - '.gitignore'
+      - 'internal/pgtest/testdata/**'
 
 permissions:
   contents: read
