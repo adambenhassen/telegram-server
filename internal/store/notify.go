@@ -18,6 +18,11 @@ const (
 	ChannelTyping  = "tg_typing"       // payload: "<peerUserID>|<fromUserID>"
 	ChannelEvict   = "tg_evict"        // payload: "<userID>|<authKeyID>"
 	ChannelPost    = "tg_channel_post" // payload: "<channelID>"
+	// ChannelEncryption carries a secret-chat state change to one party.
+	// payload: "<userID>|<chatID>". It is transient like ChannelTyping: no pts
+	// is spent on key exchange, so nothing backfills a missed one until the qts
+	// stream lands (MAIN-140).
+	ChannelEncryption = "tg_encryption" // payload: "<userID>|<chatID>"
 )
 
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
@@ -88,6 +93,7 @@ func StartListener(
 	typing func(ctx context.Context, peerID, fromID int64),
 	evict func(ctx context.Context, userID, authKeyID int64),
 	channelPost func(ctx context.Context, channelID int64),
+	encryption func(ctx context.Context, userID, chatID int64),
 	log *slog.Logger,
 ) (*Listener, func() error, error) {
 	if log == nil {
@@ -101,7 +107,7 @@ func StartListener(
 	l := &Listener{log: log}
 	loopCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	wg.Go(func() { l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost) })
+	wg.Go(func() { l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption) })
 
 	stop := func() error {
 		cancel()
@@ -111,15 +117,15 @@ func StartListener(
 	return l, stop, nil
 }
 
-// connectAndListen opens a connection subscribed to every channel. All four
-// are always subscribed together: a connection carrying only some of them
-// silently drops a whole class of delivery.
+// connectAndListen opens a connection subscribed to every channel. They are
+// always subscribed together: a connection carrying only some of them silently
+// drops a whole class of delivery.
 func connectAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("listener connect: %w", err)
 	}
-	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost} {
+	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost, ChannelEncryption} {
 		// ch is a constant channel identifier, never user input (no injection).
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			_ = conn.Close(ctx) //nolint:errcheck // best-effort close on setup failure
@@ -141,6 +147,7 @@ func (l *Listener) run(
 	typing func(ctx context.Context, peerID, fromID int64),
 	evict func(ctx context.Context, userID, authKeyID int64),
 	channelPost func(ctx context.Context, channelID int64),
+	encryption func(ctx context.Context, userID, chatID int64),
 ) {
 	backoff := listenerBackoffMin
 	for {
@@ -162,7 +169,7 @@ func (l *Listener) run(
 		}
 
 		up := time.Now()
-		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost)
+		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption)
 		closeErr := conn.Close(context.Background())
 		conn = nil
 		if ctx.Err() != nil {
@@ -183,6 +190,7 @@ func (l *Listener) dispatch(
 	typing func(ctx context.Context, peerID, fromID int64),
 	evict func(ctx context.Context, userID, authKeyID int64),
 	channelPost func(ctx context.Context, channelID int64),
+	encryption func(ctx context.Context, userID, chatID int64),
 ) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
@@ -220,6 +228,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			channelPost(ctx, channelID)
+		case ChannelEncryption:
+			userID, chatID, perr := parsePairPayload(n.Payload)
+			if perr != nil {
+				l.log.Warn("bad tg_encryption payload", "payload", n.Payload)
+				continue
+			}
+			encryption(ctx, userID, chatID)
 		}
 	}
 }
@@ -240,6 +255,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // ChannelPostPayload formats a tg_channel_post NOTIFY payload from channelID.
 func ChannelPostPayload(channelID int64) string {
 	return strconv.FormatInt(channelID, 10)
+}
+
+// EncryptionPayload formats a tg_encryption NOTIFY payload naming the party to
+// notify and the secret chat whose state changed.
+func EncryptionPayload(userID, chatID int64) string {
+	return pairPayload(userID, chatID)
 }
 
 // TypingPayload formats a tg_typing NOTIFY payload from the peer and sender ids.

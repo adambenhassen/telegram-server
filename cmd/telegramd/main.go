@@ -106,7 +106,7 @@ func run(log *slog.Logger) error {
 	// each user's pending updates to their live conns in this process. Drained
 	// before the store pool closes (defer registered after st.Close, runs first).
 	updater := api.NewUpdater(st, server.Registry(), log, peers)
-	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, log)
+	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, log)
 	if err != nil {
 		return err
 	}

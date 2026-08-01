@@ -68,11 +68,13 @@ func TestStartListenerDispatches(t *testing.T) {
 	delivered := make(chan int64, 1)
 	typed := make(chan [2]int64, 1)
 	evicted := make(chan [2]int64, 1)
+	encrypted := make(chan [2]int64, 1)
 	_, stop, err := store.StartListener(ctx, dsn,
 		func(_ context.Context, userID int64) { delivered <- userID },
 		func(_ context.Context, peerID, fromID int64) { typed <- [2]int64{peerID, fromID} },
 		func(_ context.Context, userID, authKeyID int64) { evicted <- [2]int64{userID, authKeyID} },
 		func(_ context.Context, _ int64) {},
+		func(_ context.Context, userID, chatID int64) { encrypted <- [2]int64{userID, chatID} },
 		nil,
 	)
 	if err != nil {
@@ -123,6 +125,23 @@ func TestStartListenerDispatches(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("evict callback not invoked")
+	}
+
+	// A malformed encryption payload is dropped rather than half-parsed: the
+	// callback discloses g_a to whoever it names.
+	if err := s.Notify(ctx, store.ChannelEncryption, "not-a-pair"); err != nil {
+		t.Fatalf("notify malformed encryption: %v", err)
+	}
+	if err := s.Notify(ctx, store.ChannelEncryption, store.EncryptionPayload(21, 5)); err != nil {
+		t.Fatalf("notify encryption: %v", err)
+	}
+	select {
+	case got := <-encrypted:
+		if got != [2]int64{21, 5} {
+			t.Fatalf("encryption = %v, want [21 5]", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("encryption callback not invoked")
 	}
 }
 
@@ -177,6 +196,7 @@ func TestStartListenerReconnectsAfterBackendTermination(t *testing.T) {
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, userID, authKeyID int64) { evicted <- [2]int64{userID, authKeyID} },
 		func(_ context.Context, _ int64) {},
+		func(_ context.Context, _, _ int64) {},
 		nil,
 	)
 	if err != nil {
@@ -253,6 +273,7 @@ func TestStartListenerBacksOffWhileDatabaseIsDown(t *testing.T) {
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, _ int64) {},
+		func(_ context.Context, _, _ int64) {},
 		nil,
 	)
 	if err != nil {
@@ -295,6 +316,7 @@ func TestStartListenerDeliversChannelPost(t *testing.T) {
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, channelID int64) { posted <- channelID },
+		func(_ context.Context, _, _ int64) {},
 		nil,
 	)
 	if err != nil {

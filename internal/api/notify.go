@@ -273,6 +273,50 @@ func (u *Updater) deliverChannel(
 	}
 }
 
+// DeliverEncryption pushes a secret chat's new state to userID's live conns as
+// updateEncryption. It is the encryption callback for StartListener.
+//
+// It carries no pts and is never persisted, exactly like DeliverTyping: key
+// exchange spends no pts, so there is nothing for getDifference to replay. That
+// makes this the one delivery path where a missed push is a real loss rather
+// than a deferred one — until the qts stream lands (MAIN-140), a client that was
+// offline for the push learns the new state only by acting on the chat. The
+// alternative, spending pts on a secret chat, would put encrypted-chat state
+// into the per-account event log the issue explicitly holds unchanged.
+//
+// The row is read only after a live conn is found, so a replica where neither
+// party is connected pays one registry lookup and no query.
+func (u *Updater) DeliverEncryption(ctx context.Context, userID, chatID int64) {
+	conns := u.registry.Conns(userID)
+	if len(conns) == 0 {
+		return
+	}
+	chat, err := u.h.store.SecretChatByID(ctx, int32(chatID)) //nolint:gosec // chat_id is int32 on the wire
+	if err != nil {
+		u.log.Error("deliver encryption load", "user_id", userID, "chat_id", chatID, "err", err)
+		return
+	}
+	if !chat.Party(userID) {
+		// A payload naming a non-party is either corrupt or forged. Dropping it
+		// is what keeps one NOTIFY line from disclosing g_a to a stranger.
+		u.log.Warn("deliver encryption to non-party", "user_id", userID, "chat_id", chatID)
+		return
+	}
+	short := &tg.UpdateShort{
+		Update: &tg.UpdateEncryption{
+			Chat: u.h.encryptedChatFor(chat, userID),
+			Date: int(time.Now().Unix()),
+		},
+		Date: int(time.Now().Unix()),
+	}
+	for _, c := range conns {
+		// Carries no pts, so a conn that changed hands simply drops it.
+		if _, err := c.PushTo(ctx, userID, short, 0); err != nil {
+			u.log.Info("deliver encryption", "user_id", userID, "err", err)
+		}
+	}
+}
+
 // Evict closes the connections of userID that still hold authKeyID, which the
 // revoking replica has just deleted from auth_keys. It is the cross-replica half
 // of revocation: without it a socket that sends no further frame keeps its
