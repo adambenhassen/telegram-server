@@ -1,5 +1,7 @@
 plans/
 bin/
+# Sentinel the ci job caches to record that this source state already passed
+.ci-test-passed
 # TG_RSA_KEY_PATH defaults to ./server_key.pem, so a local run writes a live private key here
 *.pem
 *.key

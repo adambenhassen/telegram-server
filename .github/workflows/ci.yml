@@ -53,8 +53,55 @@ jobs:
       #
       # Via make so the flags (-race) live only in the Makefile and CI cannot
       # drift from what a local `make test` runs.
+      #
+      # The suite is not covered by Go's own test cache: internal/pgtest starts a
+      # postgres container, and a Docker side effect is exactly what Go cannot
+      # track, so every run is a full run. The three steps below cache the
+      # *result* instead — a sentinel file keyed by a hash of everything that can
+      # change the outcome. Cache hit means this exact source state already went
+      # green on a runner, so the suite is skipped.
+      #
+      # git ls-files, not find: it is already sorted, it cannot pick up an
+      # untracked file a previous step wrote, and it is the same set on every
+      # runner. migrations/ and the pgtest config are in the hash because the
+      # store and e2e tests apply the one and boot postgres with the other —
+      # hashing only *.go would hand a green result to a changed schema.
+      - name: Compute test cache key
+        id: tkey
+        run: |
+          hash=$(git ls-files -z -- '*.go' go.mod go.sum Makefile 'migrations/**' 'internal/pgtest/testdata/**' \
+            | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+          echo "test inputs hash=$hash"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
+      # No restore-keys on purpose: a partial-key match would restore a sentinel
+      # written for a different source state and skip the suite on it. This key
+      # either matches exactly or it misses.
+      #
+      # The action's post step saves only when the job succeeded, so a sentinel
+      # is never written for a run whose tests failed.
+      - name: Restore test result cache
+        id: test-cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: .ci-test-passed
+          key: go-test-${{ runner.os }}-${{ steps.tkey.outputs.hash }}
+
       - name: Test
+        if: steps.test-cache.outputs.cache-hit != 'true'
         run: make test
+
+      - name: Mark test passed
+        if: steps.test-cache.outputs.cache-hit != 'true'
+        run: touch .ci-test-passed
+
+      - name: Report cache outcome
+        run: |
+          if [ "${{ steps.test-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "cache hit for ${{ steps.tkey.outputs.hash }}: make test skipped, this source state passed on an earlier run"
+          else
+            echo "cache miss for ${{ steps.tkey.outputs.hash }}: make test ran in full"
+          fi
 
   # Builds the image and boots it against a migrated database. Docker is not
   # available in the environments the Dockerfile is edited from, so this job is
