@@ -89,6 +89,9 @@ jobs:
       - name: Test
         run: make test
 
+      - name: TEMP probe - second in-job run
+        run: make test
+
   # Builds the image and boots it against a migrated database. Docker is not
   # available in the environments the Dockerfile is edited from, so this job is
   # the only place it is ever built — it is the gate that stops it rotting.
