@@ -22,6 +22,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
 
+      # internal/pgtest builds its template database by reading migrations/ at
+      # run time, so Go records that directory and those files as test inputs —
+      # and a recorded input is hashed with its stat, modification time
+      # included. A fresh checkout stamps a new mtime every run, so the two
+      # packages that read them (internal/pgtest, internal/store) would miss the
+      # test cache on every run while every other package hit it. Pinning the
+      # timestamps makes the recorded input identical from run to run. The
+      # children first, then the directory: adding or removing a migration still
+      # changes the directory's own size and listing, so a real change is still
+      # seen.
+      - name: Pin migration timestamps for the test cache
+        run: touch -d @0 migrations/* migrations
+
       # cache: false because setup-go keys its cache on go.sum alone and saves
       # only when that key missed. A run that changed no dependency therefore
       # restores $GOCACHE and never writes it back, so the test results Go
@@ -87,9 +100,6 @@ jobs:
       # above carrying its result. Go decides that per package, so a package
       # whose source changed still runs in full.
       - name: Test
-        run: make test
-
-      - name: TEMP probe - second in-job run
         run: make test
 
   # Builds the image and boots it against a migrated database. Docker is not
