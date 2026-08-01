@@ -51,6 +51,7 @@ type SecretChat struct {
 	GA             []byte
 	GAOrB          []byte
 	KeyFingerprint int64
+	RandomID       int64
 	Date           time.Time
 }
 
@@ -63,6 +64,7 @@ func secretChatFromRow(r db.SecretChat) SecretChat {
 		GAHash:        r.GAHash,
 		GA:            r.GA,
 		GAOrB:         r.GAOrB,
+		RandomID:      r.RandomID,
 		Date:          r.Date.Time,
 	}
 	if r.KeyFingerprint != nil {
@@ -91,13 +93,18 @@ func (c SecretChat) Other(userID int64) int64 {
 // adminID, storing both g_a and its SHA-256. It returns ErrSecretChatsTooMany
 // when adminID already holds MaxOutstandingSecretChats outstanding requests.
 //
+// When randomID is non-zero, a prior row with the same (adminID, randomID) is
+// returned instead of creating a new one. This implements client-side dedup: a
+// retried requestEncryption with the same random_id reuses the original row,
+// fires no second push, and consumes no additional cap.
+//
 // The count and the insert share a transaction serialised on adminID by an
 // advisory lock, so concurrent requests from one account cannot each read the
 // same pre-insert count and commit past the cap. The lock is taken on the
 // caller's own user id and released at commit; it is a leaf, never held across
 // another lock, and never taken by the message fan-out, so it takes no position
 // relative to writeMu in internal/mtproto/send.go.
-func (s *Store) CreateSecretChatRequest(ctx context.Context, adminID, participantID int64, gA, gAHash []byte) (SecretChat, error) {
+func (s *Store) CreateSecretChatRequest(ctx context.Context, adminID, participantID int64, gA, gAHash []byte, randomID int64) (SecretChat, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return SecretChat{}, fmt.Errorf("begin: %w", err)
@@ -108,6 +115,22 @@ func (s *Store) CreateSecretChatRequest(ctx context.Context, adminID, participan
 		return SecretChat{}, fmt.Errorf("advisory lock: %w", err)
 	}
 	qtx := s.q.WithTx(tx)
+
+	// Dedup lookup: if the caller already has a 'requested' row with this
+	// random_id, return it. Skips cap check and insert.
+	if randomID != 0 {
+		existing, err := qtx.GetSecretChatByAdminRandomID(ctx, db.GetSecretChatByAdminRandomIDParams{
+			AdminID:  adminID,
+			RandomID: randomID,
+		})
+		if err == nil {
+			_ = tx.Rollback(ctx) //nolint:errcheck // returning existing row
+			return secretChatFromRow(existing), nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return SecretChat{}, fmt.Errorf("dedup lookup: %w", err)
+		}
+	}
 
 	outstanding, err := qtx.CountRequestedSecretChats(ctx, adminID)
 	if err != nil {
@@ -134,6 +157,7 @@ func (s *Store) CreateSecretChatRequest(ctx context.Context, adminID, participan
 		ParticipantID: participantID,
 		GAHash:        gAHash,
 		GA:            gA,
+		RandomID:      randomID,
 	})
 	if err != nil {
 		return SecretChat{}, fmt.Errorf("insert secret chat: %w", err)

@@ -47,12 +47,16 @@ func twoUsersFor(t *testing.T, s *store.Store, a, b string) (int64, int64) {
 }
 
 // requestChat runs a successful requestEncryption from admin to participant and
-// returns the waiting chat.
+// returns the waiting chat. Each call gets a unique random_id so dedup never
+// fires inside a test that expects a fresh row.
+var requestChatSeq int64
+
 func requestChat(t *testing.T, s *store.Store, admin, participant int64) *tg.EncryptedChatWaiting {
 	t.Helper()
+	requestChatSeq++
 	enc, err := api.RequestEncryptionForTest(s, admin, &tg.MessagesRequestEncryptionRequest{
 		UserID:   api.InputUser(admin, participant),
-		RandomID: 777,
+		RandomID: int(requestChatSeq),
 		GA:       validGA(),
 	})
 	if err != nil {
