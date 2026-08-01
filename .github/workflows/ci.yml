@@ -404,3 +404,22 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose down -v
+
+  # Fires once, after every check on a PR settles (pass or fail), and posts the
+  # result to an external status webhook so downstream automation can react the
+  # moment CI finishes. Fork PRs get no secret, so the step is a no-op there;
+  # failing to post never fails the checks it reports on.
+  notify:
+    needs: [ci, docker, compose]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post check status
+        env:
+          WEBHOOK: ${{ secrets.CI_STATUS_WEBHOOK }}
+        run: |
+          [ -n "$WEBHOOK" ] || { echo "no CI_STATUS_WEBHOOK secret; skipping"; exit 0; }
+          curl -fsS -X POST "$WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            -d "{\"event\":\"ci_complete\",\"repo\":\"${{ github.repository }}\",\"pr\":\"${{ github.event.number }}\",\"sha\":\"${{ github.sha }}\",\"ci\":\"${{ needs.ci.result }}\",\"docker\":\"${{ needs.docker.result }}\",\"compose\":\"${{ needs.compose.result }}\"}" \
+            || echo "status webhook post failed (non-fatal)"
