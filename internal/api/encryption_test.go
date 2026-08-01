@@ -640,3 +640,56 @@ func TestAcceptRacingDiscardReportsTheRealState(t *testing.T) {
 		}
 	}
 }
+
+// TestRequestEncryptionDedupSameRandomID proves that a retried
+// requestEncryption with the same random_id returns the original chat
+// (encryptedChatWaiting) and creates no second row. First-time callers with
+// non-zero random_id still get a new row and a push.
+func TestRequestEncryptionDedupSameRandomID(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a, b := twoUsersFor(t, s, "+15551395001", "+15551395002")
+
+	const randomID = int64(999)
+
+	// First call with non-zero random_id creates a new row.
+	enc1, err := api.RequestEncryptionForTest(s, a, &tg.MessagesRequestEncryptionRequest{
+		UserID:   api.InputUser(a, b),
+		RandomID: int(randomID),
+		GA:       validGA(),
+	})
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	waiting1, ok := enc1.(*tg.EncryptedChatWaiting)
+	if !ok {
+		t.Fatalf("first result = %T, want *tg.EncryptedChatWaiting", enc1)
+	}
+
+	// Retry with same random_id returns the same chat.
+	enc2, err := api.RequestEncryptionForTest(s, a, &tg.MessagesRequestEncryptionRequest{
+		UserID:   api.InputUser(a, b),
+		RandomID: int(randomID),
+		GA:       validGA(),
+	})
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	waiting2, ok := enc2.(*tg.EncryptedChatWaiting)
+	if !ok {
+		t.Fatalf("retry result = %T, want *tg.EncryptedChatWaiting", enc2)
+	}
+	if waiting2.ID != waiting1.ID {
+		t.Errorf("retry id = %d, want %d (original)", waiting2.ID, waiting1.ID)
+	}
+
+	// Only one row exists in the database.
+	chat, err := s.SecretChatByID(ctx, int32(waiting1.ID)) //nolint:gosec // test id
+	if err != nil {
+		t.Fatalf("load chat: %v", err)
+	}
+	if chat.State != store.SecretChatRequested {
+		t.Errorf("state = %q, want %q", chat.State, store.SecretChatRequested)
+	}
+}

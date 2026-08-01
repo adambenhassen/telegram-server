@@ -104,15 +104,15 @@ func (c SecretChat) Other(userID int64) int64 {
 // caller's own user id and released at commit; it is a leaf, never held across
 // another lock, and never taken by the message fan-out, so it takes no position
 // relative to writeMu in internal/mtproto/send.go.
-func (s *Store) CreateSecretChatRequest(ctx context.Context, adminID, participantID int64, gA, gAHash []byte, randomID int64) (SecretChat, error) {
+func (s *Store) CreateSecretChatRequest(ctx context.Context, adminID, participantID int64, gA, gAHash []byte, randomID int64) (SecretChat, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return SecretChat{}, fmt.Errorf("begin: %w", err)
+		return SecretChat{}, false, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", adminID); err != nil {
-		return SecretChat{}, fmt.Errorf("advisory lock: %w", err)
+		return SecretChat{}, false, fmt.Errorf("advisory lock: %w", err)
 	}
 	qtx := s.q.WithTx(tx)
 
@@ -125,30 +125,30 @@ func (s *Store) CreateSecretChatRequest(ctx context.Context, adminID, participan
 		})
 		if err == nil {
 			_ = tx.Rollback(ctx) //nolint:errcheck // returning existing row
-			return secretChatFromRow(existing), nil
+			return secretChatFromRow(existing), true, nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
-			return SecretChat{}, fmt.Errorf("dedup lookup: %w", err)
+			return SecretChat{}, false, fmt.Errorf("dedup lookup: %w", err)
 		}
 	}
 
 	outstanding, err := qtx.CountRequestedSecretChats(ctx, adminID)
 	if err != nil {
-		return SecretChat{}, fmt.Errorf("count requested: %w", err)
+		return SecretChat{}, false, fmt.Errorf("count requested: %w", err)
 	}
 	if outstanding >= MaxOutstandingSecretChats {
-		return SecretChat{}, ErrSecretChatsTooMany
+		return SecretChat{}, false, ErrSecretChatsTooMany
 	}
 
 	id, err := qtx.NextSecretChatID(ctx)
 	if err != nil {
-		return SecretChat{}, fmt.Errorf("next id: %w", err)
+		return SecretChat{}, false, fmt.Errorf("next id: %w", err)
 	}
 	// Chat ids are int32 on the wire. Exhausting the sequence is not a client
 	// error and must not be reported as one, so it fails loudly here rather than
 	// as a truncated id.
 	if id > math.MaxInt32 {
-		return SecretChat{}, fmt.Errorf("secret chat id sequence exhausted: %d", id)
+		return SecretChat{}, false, fmt.Errorf("secret chat id sequence exhausted: %d", id)
 	}
 
 	row, err := qtx.InsertSecretChat(ctx, db.InsertSecretChatParams{
@@ -160,12 +160,12 @@ func (s *Store) CreateSecretChatRequest(ctx context.Context, adminID, participan
 		RandomID:      randomID,
 	})
 	if err != nil {
-		return SecretChat{}, fmt.Errorf("insert secret chat: %w", err)
+		return SecretChat{}, false, fmt.Errorf("insert secret chat: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return SecretChat{}, fmt.Errorf("commit: %w", err)
+		return SecretChat{}, false, fmt.Errorf("commit: %w", err)
 	}
-	return secretChatFromRow(row), nil
+	return secretChatFromRow(row), false, nil
 }
 
 // SecretChatByID loads one chat. A missing row is ErrSecretChatNotFound.

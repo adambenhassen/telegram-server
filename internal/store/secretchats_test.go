@@ -53,7 +53,7 @@ func TestCreateSecretChatRequestCapIsAtomic(t *testing.T) {
 			<-ready
 			ga := gaFor(i)
 			hash := sha256.Sum256(ga)
-			_, errs[i] = s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
+			_, _, errs[i] = s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
 		}(i)
 	}
 	close(ready)
@@ -96,7 +96,7 @@ func TestAcceptSecretChatIsSingleWinner(t *testing.T) {
 	}
 	ga := gaFor(1)
 	hash := sha256.Sum256(ga)
-	chat, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
+	chat, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestDiscardSecretChatIsTerminal(t *testing.T) {
 	for _, accept := range []bool{false, true} {
 		ga := gaFor(2)
 		hash := sha256.Sum256(ga)
-		chat, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
+		chat, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
 		if err != nil {
 			t.Fatalf("request: %v", err)
 		}
@@ -200,7 +200,7 @@ func TestSecretChatIDsAreNeverReused(t *testing.T) {
 	for range 3 {
 		ga := gaFor(5)
 		hash := sha256.Sum256(ga)
-		chat, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
+		chat, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
 		if err != nil {
 			t.Fatalf("request: %v", err)
 		}
@@ -236,13 +236,13 @@ func TestCreateSecretChatRequestDedupSameRandomID(t *testing.T) {
 	hash := sha256.Sum256(ga)
 	const randomID = int64(42)
 
-	first, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], randomID)
+	first, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], randomID)
 	if err != nil {
 		t.Fatalf("first request: %v", err)
 	}
 
 	// Retry with same random_id returns the same row.
-	second, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, gaFor(99), hash[:], randomID)
+	second, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, gaFor(99), hash[:], randomID)
 	if err != nil {
 		t.Fatalf("retry: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestCreateSecretChatRequestDedupSameRandomID(t *testing.T) {
 	}
 
 	// Different random_id creates a new row.
-	third, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], randomID+1)
+	third, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], randomID+1)
 	if err != nil {
 		t.Fatalf("distinct random_id: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestCreateSecretChatRequestDedupSameRandomID(t *testing.T) {
 	}
 
 	// random_id=0 always creates a new row (no dedup).
-	fourth, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
+	fourth, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], 0)
 	if err != nil {
 		t.Fatalf("zero random_id: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestCreateSecretChatRequestDedupConcurrent(t *testing.T) {
 	const randomID = int64(100)
 
 	// Seed the original row.
-	original, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], randomID)
+	original, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, ga, hash[:], randomID)
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestCreateSecretChatRequestDedupConcurrent(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-ready
-			chat, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, gaFor(i), hash[:], randomID)
+			chat, _, err := s.CreateSecretChatRequest(ctx, admin.ID, participant.ID, gaFor(i), hash[:], randomID)
 			errs[i] = err
 			ids[i] = chat.ID
 		}(i)

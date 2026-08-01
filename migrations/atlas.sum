@@ -1,4 +1,4 @@
-h1:caCEKcD3TnX8i0NOTvjt/ZFeaB9O3zm0Lg/1LwA9kGc=
+h1:60kgwhItGI3wYMsThg7slFrTm4W/ICAsEkGNL1EyryM=
 20260721000001_baseline.sql h1:cnO6K1z0Uv3goEvecgJixKSio6ziaB1rF7cQLoCWOxs=
 20260721000002_auth_keys.sql h1:+vNabm6vdEAgu3H5ZGw2Wr8D/Y6i4ikAAUO3JbfZQeE=
 20260721000003_code_hardening.sql h1:8pbAqUpqcwOONUfac+qC51QjfC1JnObNCcXa1HC/dr0=
@@ -12,4 +12,4 @@ h1:caCEKcD3TnX8i0NOTvjt/ZFeaB9O3zm0Lg/1LwA9kGc=
 20260731000011_normalize_phone.sql h1:DUF39ASKAUINpmW3SgdO1/MSnk9SKDPoHlDe0o+shyg=
 20260731000012_secret_chats.sql h1:vjWMtCA3IYvCrD6sZr7b5RFqCVcLTd9p4BSR2ijxiwg=
 20260731000013_user_status.sql h1:0+PwsdkPRyNKybc2+g+AA089Fa1bzFoH47lagJWqwx0=
-20260801000014_secret_chats_random_id.sql h1:hQImxga38uGmGfiOglsbvRE/c7Q1a8zYHIpBiRBFTfc=
+20260801000014_secret_chats_random_id.sql h1:cz9FONcSi1g57sYYfmWEMGAJOWoewwllmx6anJAm07M=
