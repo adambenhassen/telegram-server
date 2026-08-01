@@ -47,7 +47,20 @@ type Server struct {
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 
+	// onStatusChange fires when a user's connection count transitions between
+	// zero and non-zero. Called after the registry has been updated, so a
+	// callback that reads the registry does not race the bind. userID is the
+	// user whose status changed; online is true when binding, false when the
+	// last connection dropped.
+	onStatusChange func(ctx context.Context, userID int64, online bool)
+
 	log *slog.Logger
+}
+
+// OnStatusChange sets a callback that fires when a user's connection count
+// transitions between zero and non-zero.
+func (s *Server) OnStatusChange(fn func(ctx context.Context, userID int64, online bool)) {
+	s.onStatusChange = fn
 }
 
 // New creates a Server that answers on dcID using key for the handshake, keys to
@@ -164,6 +177,11 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 		conn.setOwner(userID)
 		if registeredUser != 0 {
 			s.registry.Remove(registeredUser, conn)
+			if len(s.registry.Conns(registeredUser)) == 0 {
+				if s.onStatusChange != nil {
+					s.onStatusChange(ctx, registeredUser, false)
+				}
+			}
 			registeredUser = 0
 		}
 		// Register once the auth key resolves to a bound user (post-login,
@@ -177,6 +195,9 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 				// updates will never reach.
 				conn.setOwner(0)
 				return false
+			}
+			if s.onStatusChange != nil {
+				s.onStatusChange(ctx, userID, true)
 			}
 			registeredUser = userID
 		}

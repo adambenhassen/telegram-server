@@ -23,6 +23,7 @@ const (
 	// is spent on key exchange, so nothing backfills a missed one until the qts
 	// stream lands (MAIN-140).
 	ChannelEncryption = "tg_encryption" // payload: "<userID>|<chatID>"
+	ChannelStatus     = "tg_status"     // payload: "<userID>|<1 or 0>"
 )
 
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
@@ -71,13 +72,14 @@ type Listener struct {
 }
 
 // StartListener opens a dedicated connection, subscribes to the update, typing,
-// evict and channel-post channels, and runs the notification loop until the
-// returned stop function is called (which cancels the loop, drains it, and
+// evict, channel-post, encryption and status channels, and runs the notification loop until
+// the returned stop function is called (which cancels the loop, drains it, and
 // returns the error from closing the connection). deliver receives a userID
 // whose events changed; typing receives (peerUserID, fromUserID) for a
 // transient typing notification; evict receives (userID, authKeyID) for a
 // session revoked on any replica; channelPost receives a channelID whose post
-// was just committed.
+// was just committed; encryption receives (userID, chatID) for a secret-chat
+// state change; status receives (userID, online) for a status change.
 //
 // A broken connection is reconnected with bounded backoff rather than ending
 // delivery for the life of the process. Notifications emitted while the
@@ -94,6 +96,7 @@ func StartListener(
 	evict func(ctx context.Context, userID, authKeyID int64),
 	channelPost func(ctx context.Context, channelID int64),
 	encryption func(ctx context.Context, userID, chatID int64),
+	status func(ctx context.Context, userID int64, online bool),
 	log *slog.Logger,
 ) (*Listener, func() error, error) {
 	if log == nil {
@@ -107,7 +110,7 @@ func StartListener(
 	l := &Listener{log: log}
 	loopCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	wg.Go(func() { l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption) })
+	wg.Go(func() { l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status) })
 
 	stop := func() error {
 		cancel()
@@ -125,7 +128,8 @@ func connectAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listener connect: %w", err)
 	}
-	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost, ChannelEncryption} {
+<<<<<<< HEAD
+	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost, ChannelEncryption, ChannelStatus} {
 		// ch is a constant channel identifier, never user input (no injection).
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			_ = conn.Close(ctx) //nolint:errcheck // best-effort close on setup failure
@@ -148,6 +152,7 @@ func (l *Listener) run(
 	evict func(ctx context.Context, userID, authKeyID int64),
 	channelPost func(ctx context.Context, channelID int64),
 	encryption func(ctx context.Context, userID, chatID int64),
+	status func(ctx context.Context, userID int64, online bool),
 ) {
 	backoff := listenerBackoffMin
 	for {
@@ -169,7 +174,7 @@ func (l *Listener) run(
 		}
 
 		up := time.Now()
-		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption)
+		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption, status)
 		closeErr := conn.Close(context.Background())
 		conn = nil
 		if ctx.Err() != nil {
@@ -191,6 +196,7 @@ func (l *Listener) dispatch(
 	evict func(ctx context.Context, userID, authKeyID int64),
 	channelPost func(ctx context.Context, channelID int64),
 	encryption func(ctx context.Context, userID, chatID int64),
+	status func(ctx context.Context, userID int64, online bool),
 ) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
@@ -235,6 +241,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			encryption(ctx, userID, chatID)
+		case ChannelStatus:
+			userID, onlineID, perr := parsePairPayload(n.Payload)
+			if perr != nil {
+				l.log.Warn("bad tg_status payload", "payload", n.Payload)
+				continue
+			}
+			status(ctx, userID, onlineID == 1)
 		}
 	}
 }
@@ -272,6 +285,16 @@ func TypingPayload(peerID, fromID int64) string {
 // user the deleted auth key was bound to, and the auth key id itself.
 func EvictPayload(userID, authKeyID int64) string {
 	return pairPayload(userID, authKeyID)
+}
+
+// StatusPayload formats a tg_status NOTIFY payload. The second id is 1 for
+// online, 0 for offline.
+func StatusPayload(userID int64, online bool) string {
+	second := "0"
+	if online {
+		second = "1"
+	}
+	return strconv.FormatInt(userID, 10) + "|" + second
 }
 
 // pairPayload encodes the two-id payload shape shared by the pair channels.

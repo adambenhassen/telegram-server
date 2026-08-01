@@ -102,11 +102,22 @@ func run(log *slog.Logger) error {
 
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
+	// Connection lifecycle callback: when a session binds or closes, record the
+	// status change and notify other replicas.
+	server.OnStatusChange(func(ctx context.Context, userID int64, online bool) {
+		if err := st.SetUserStatus(ctx, userID, online); err != nil {
+			log.Error("set user status", "user_id", userID, "online", online, "err", err)
+		}
+		if err := st.Notify(ctx, store.ChannelStatus, store.StatusPayload(userID, online)); err != nil {
+			log.Error("notify status", "user_id", userID, "err", err)
+		}
+	})
+
 	// Cross-replica real-time delivery: the listener wakes on NOTIFY and pushes
 	// each user's pending updates to their live conns in this process. Drained
 	// before the store pool closes (defer registered after st.Close, runs first).
 	updater := api.NewUpdater(st, server.Registry(), log, peers)
-	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, log)
+	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, func(context.Context, int64, bool) {}, log)
 	if err != nil {
 		return err
 	}
