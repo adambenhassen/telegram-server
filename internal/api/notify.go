@@ -370,6 +370,40 @@ func (u *Updater) DeliverStatus(ctx context.Context, userID int64, online bool) 
 	}
 }
 
+// DeliverEncryptedMsg pushes updateNewEncryptedMessage to the recipient's live
+// connections. It is the encryptedMsg callback for StartListener.
+//
+// The event row is fetched after finding a live conn, so a replica where the
+// recipient is offline pays one registry lookup and no query.
+func (u *Updater) DeliverEncryptedMsg(ctx context.Context, recipientID int64, qts int) {
+	conns := u.registry.Conns(recipientID)
+	if len(conns) == 0 {
+		return
+	}
+	event, err := u.h.store.GetEncryptedEvent(ctx, recipientID, qts)
+	if err != nil {
+		u.log.Error("deliver encrypted msg load", "recipient_id", recipientID, "qts", qts, "err", err)
+		return
+	}
+	update := &tg.UpdateShort{
+		Update: &tg.UpdateNewEncryptedMessage{
+			Message: &tg.EncryptedMessage{
+				RandomID: event.RandomID,
+				ChatID:   int(event.ChatID),
+				Date:     int(event.Date.Unix()),
+				Bytes:    event.Bytes,
+			},
+			Qts: qts,
+		},
+		Date: int(event.Date.Unix()),
+	}
+	for _, c := range conns {
+		if _, err := c.PushTo(ctx, recipientID, update, 0); err != nil {
+			u.log.Info("deliver encrypted msg push", "recipient_id", recipientID, "err", err)
+		}
+	}
+}
+
 // Evict closes the connections of userID that still hold authKeyID, which the
 // revoking replica has just deleted from auth_keys. It is the cross-replica half
 // of revocation: without it a socket that sends no further frame keeps its

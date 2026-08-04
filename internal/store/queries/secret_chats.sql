@@ -36,3 +36,32 @@ UPDATE secret_chats
 SET state = 'discarded'
 WHERE id = $1 AND state IN ('requested', 'active')
 RETURNING *;
+
+-- InsertEncryptedEvent stores one encrypted payload for the recipient. The qts
+-- is taken from update_state.qts + 1, which matches the value BumpQts will
+-- write in the same transaction. The advisory lock on the recipient held by the
+-- caller serialises concurrent sends so the (owner_id, qts) primary key is
+-- never contended. ON CONFLICT on (owner_id, random_id) is the dedup guard:
+-- a repeated random_id returns no rows (pgx.ErrNoRows).
+-- name: InsertEncryptedEvent :one
+INSERT INTO encrypted_events (owner_id, qts, chat_id, random_id, bytes, date)
+SELECT $1, us.qts + 1, $2, $3, $4, now()
+FROM update_state us WHERE us.user_id = $1
+ON CONFLICT (owner_id, random_id) DO NOTHING
+RETURNING *;
+
+-- BumpQts atomically increments the recipient's qts. Called in the same
+-- transaction as InsertEncryptedEvent after the insert confirms this is not a
+-- dedup. The new qts matches the value InsertEncryptedEvent stored.
+-- name: BumpQts :one
+UPDATE update_state SET qts = qts + 1, date = now() WHERE user_id = $1 RETURNING qts;
+
+-- GetEncryptedEventByRandomID fetches an existing event by dedup key for the
+-- dedup response path.
+-- name: GetEncryptedEventByRandomID :one
+SELECT * FROM encrypted_events WHERE owner_id = $1 AND random_id = $2;
+
+-- GetEncryptedEvent fetches one event by its (owner_id, qts) primary key.
+-- Used by the push handler to build updateNewEncryptedMessage after a NOTIFY.
+-- name: GetEncryptedEvent :one
+SELECT * FROM encrypted_events WHERE owner_id = $1 AND qts = $2;

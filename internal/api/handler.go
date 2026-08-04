@@ -155,6 +155,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesRequestEncryptionRequestTypeID, h.handleRequestEncryption)
 	register(d, tg.MessagesAcceptEncryptionRequestTypeID, h.handleAcceptEncryption)
 	register(d, tg.MessagesDiscardEncryptionRequestTypeID, h.handleDiscardEncryption)
+	register(d, tg.MessagesSendEncryptedRequestTypeID, h.handleSendEncryptedMessage)
 	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		id, err := req.Buf.PeekID()
 		if err != nil {

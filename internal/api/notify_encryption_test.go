@@ -43,6 +43,19 @@ func (f *fakeTransport) wasSent() bool {
 	return f.sent
 }
 
+// waitSent polls wasSent until true or 5 s elapses. NOTIFY dispatch is async
+// (listener goroutine + network round-trip), so a fixed sleep races under CI load.
+func waitSent(ft *fakeTransport) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if ft.wasSent() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
 func testKey() crypto.AuthKey {
 	var raw crypto.Key
 	for i := range raw {
@@ -98,6 +111,7 @@ func TestDeliverEncryptionRequested(t *testing.T) {
 			updater.DeliverEncryption(ctx, userID, chatID)
 		},
 		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
 		nil,
 	)
 	if err != nil {
@@ -110,11 +124,7 @@ func TestDeliverEncryptionRequested(t *testing.T) {
 		t.Fatalf("notify: %v", err)
 	}
 
-	// Give listener time to dispatch.
-	time.Sleep(100 * time.Millisecond)
-
-	// Push must have reached the transport.
-	if !ft.wasSent() {
+	if !waitSent(ft) {
 		t.Fatal("no push delivered — row reload or render failed")
 	}
 
@@ -170,6 +180,7 @@ func TestDeliverEncryptionActive(t *testing.T) {
 			updater.DeliverEncryption(ctx, userID, chatID)
 		},
 		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
 		nil,
 	)
 	if err != nil {
@@ -181,9 +192,7 @@ func TestDeliverEncryptionActive(t *testing.T) {
 		t.Fatalf("notify: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	if !ft.wasSent() {
+	if !waitSent(ft) {
 		t.Fatal("no push for active state")
 	}
 	if got := conn.LastPushedPts(); got != 0 {
@@ -231,6 +240,7 @@ func TestDeliverEncryptionDiscarded(t *testing.T) {
 			updater.DeliverEncryption(ctx, userID, chatID)
 		},
 		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
 		nil,
 	)
 	if err != nil {
@@ -242,9 +252,7 @@ func TestDeliverEncryptionDiscarded(t *testing.T) {
 		t.Fatalf("notify: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	if !ft.wasSent() {
+	if !waitSent(ft) {
 		t.Fatal("no push for discarded state")
 	}
 	if got := conn.LastPushedPts(); got != 0 {
@@ -273,6 +281,7 @@ func TestDeliverEncryptionWrongChannelNeverDispatches(t *testing.T) {
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) { encrypted <- struct{}{} },
 		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
 		nil,
 	)
 	if err != nil {

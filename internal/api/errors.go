@@ -120,4 +120,12 @@ var (
 	// errPhoneNotOccupied is the byte-identical response for a phone lookup that
 	// finds no account and any target-side refusal — indistinguishable by design.
 	errPhoneNotOccupied = rpcErr(400, "PHONE_NOT_OCCUPIED")
+	// errMessageTooLong rejects an encrypted payload over the server-side size cap.
+	errMessageTooLong = rpcErr(400, "MESSAGE_TOO_LONG")
+	// errEncryptionDeclined rejects a send to a secret chat that is not active —
+	// either still in the 'requested' state or already 'discarded'.
+	errEncryptionDeclined = rpcErr(400, "ENCRYPTION_DECLINED")
+	// errChatForbidden rejects a send from an account that is not a party to the
+	// named secret chat.
+	errChatForbidden = rpcErr(403, "CHAT_FORBIDDEN")
 )
