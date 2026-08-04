@@ -77,6 +77,39 @@ func (q *Queries) CountRequestedSecretChats(ctx context.Context, adminID int64) 
 	return count, err
 }
 
+const deleteEncryptedEventsByQts = `-- name: DeleteEncryptedEventsByQts :many
+DELETE FROM encrypted_events
+WHERE owner_id = $1 AND qts <= $2
+RETURNING random_id
+`
+
+type DeleteEncryptedEventsByQtsParams struct {
+	OwnerID int64
+	Qts     int64
+}
+
+// DeleteEncryptedEventsByQts deletes events up to the given qts watermark and
+// returns their random_id values for the receivedQueue response.
+func (q *Queries) DeleteEncryptedEventsByQts(ctx context.Context, arg DeleteEncryptedEventsByQtsParams) ([]int64, error) {
+	rows, err := q.db.Query(ctx, deleteEncryptedEventsByQts, arg.OwnerID, arg.Qts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var random_id int64
+		if err := rows.Scan(&random_id); err != nil {
+			return nil, err
+		}
+		items = append(items, random_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const discardSecretChat = `-- name: DiscardSecretChat :one
 UPDATE secret_chats
 SET state = 'discarded'
@@ -88,34 +121,6 @@ RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fing
 // zero rows, and 'discarded' is terminal.
 func (q *Queries) DiscardSecretChat(ctx context.Context, id int32) (SecretChat, error) {
 	row := q.db.QueryRow(ctx, discardSecretChat, id)
-	var i SecretChat
-	err := row.Scan(
-		&i.ID,
-		&i.AdminID,
-		&i.ParticipantID,
-		&i.State,
-		&i.GAHash,
-		&i.GA,
-		&i.GAOrB,
-		&i.KeyFingerprint,
-		&i.Date,
-		&i.RandomID,
-	)
-	return i, err
-}
-
-const getSecretChatByAdminRandomID = `-- name: GetSecretChatByAdminRandomID :one
-SELECT id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id FROM secret_chats WHERE admin_id = $1 AND random_id = $2 AND random_id != 0 AND state = 'requested'
-`
-
-type GetSecretChatByAdminRandomIDParams struct {
-	AdminID  int64
-	RandomID int64
-}
-
-// ponytail: lookup-before-insert dedup; avoids ON CONFLICT and sequence waste.
-func (q *Queries) GetSecretChatByAdminRandomID(ctx context.Context, arg GetSecretChatByAdminRandomIDParams) (SecretChat, error) {
-	row := q.db.QueryRow(ctx, getSecretChatByAdminRandomID, arg.AdminID, arg.RandomID)
 	var i SecretChat
 	err := row.Scan(
 		&i.ID,
@@ -178,6 +183,34 @@ func (q *Queries) GetEncryptedEventByRandomID(ctx context.Context, arg GetEncryp
 		&i.RandomID,
 		&i.Bytes,
 		&i.Date,
+	)
+	return i, err
+}
+
+const getSecretChatByAdminRandomID = `-- name: GetSecretChatByAdminRandomID :one
+SELECT id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id FROM secret_chats WHERE admin_id = $1 AND random_id = $2 AND random_id != 0 AND state = 'requested'
+`
+
+type GetSecretChatByAdminRandomIDParams struct {
+	AdminID  int64
+	RandomID int64
+}
+
+// ponytail: lookup-before-insert dedup; avoids ON CONFLICT and sequence waste.
+func (q *Queries) GetSecretChatByAdminRandomID(ctx context.Context, arg GetSecretChatByAdminRandomIDParams) (SecretChat, error) {
+	row := q.db.QueryRow(ctx, getSecretChatByAdminRandomID, arg.AdminID, arg.RandomID)
+	var i SecretChat
+	err := row.Scan(
+		&i.ID,
+		&i.AdminID,
+		&i.ParticipantID,
+		&i.State,
+		&i.GAHash,
+		&i.GA,
+		&i.GAOrB,
+		&i.KeyFingerprint,
+		&i.Date,
+		&i.RandomID,
 	)
 	return i, err
 }
