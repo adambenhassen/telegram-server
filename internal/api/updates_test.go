@@ -760,3 +760,100 @@ func TestGetDifferenceRendersMediaOnEditOfTheSameRow(t *testing.T) {
 		t.Fatalf("edit updates = %d, want 1", edits)
 	}
 }
+
+// TestGetDifferenceQtsGapFilling checks that missed encrypted messages are
+// returned in NewEncryptedMessages when the client's qts lags behind.
+func TestGetDifferenceQtsGapFilling(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551299001")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551299002")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	if err := s.EnsureUpdateState(ctx, alice.ID); err != nil {
+		t.Fatalf("ensure alice state: %v", err)
+	}
+	if err := s.EnsureUpdateState(ctx, bob.ID); err != nil {
+		t.Fatalf("ensure bob state: %v", err)
+	}
+
+	chat, _, err := s.CreateSecretChatRequest(ctx, alice.ID, bob.ID, []byte("ga"), []byte("hash"), 1)
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	if _, err := s.AcceptSecretChat(ctx, chat.ID, bob.ID, []byte("gb"), 0); err != nil {
+		t.Fatalf("accept chat: %v", err)
+	}
+
+	// Pre-send qts for bob is 0; alice sends one message.
+	preSendQts := 0
+	_, _, err = s.SendEncryptedMessage(ctx, store.EncryptedSend{
+		RecipientID: bob.ID,
+		ChatID:      chat.ID,
+		RandomID:    42,
+		Data:        []byte("secret"),
+	})
+	if err != nil {
+		t.Fatalf("send encrypted: %v", err)
+	}
+
+	// AC1: bob calls getDifference with pre-send qts; expects message in NewEncryptedMessages.
+	enc, err := api.GetDifferenceForTest(s, bob.ID, &tg.UpdatesGetDifferenceRequest{Pts: 0, Qts: preSendQts})
+	if err != nil {
+		t.Fatalf("get difference: %v", err)
+	}
+	diff, ok := enc.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("type = %T, want *tg.UpdatesDifference", enc)
+	}
+	if len(diff.NewEncryptedMessages) != 1 {
+		t.Fatalf("new encrypted messages = %d, want 1", len(diff.NewEncryptedMessages))
+	}
+	msg, ok := diff.NewEncryptedMessages[0].(*tg.EncryptedMessage)
+	if !ok {
+		t.Fatalf("encrypted message type = %T, want *tg.EncryptedMessage", diff.NewEncryptedMessages[0])
+	}
+	if msg.RandomID != 42 {
+		t.Fatalf("random_id = %d, want 42", msg.RandomID)
+	}
+	if diff.State.Qts != 1 {
+		t.Fatalf("state.qts = %d, want 1", diff.State.Qts)
+	}
+	// AC5: no secret chat messages in new_messages.
+	if len(diff.NewMessages) != 0 {
+		t.Fatalf("new_messages = %d, want 0", len(diff.NewMessages))
+	}
+
+	// AC2: bob already caught up (req.Qts == state.Qts) — no encrypted messages.
+	enc, err = api.GetDifferenceForTest(s, bob.ID, &tg.UpdatesGetDifferenceRequest{Pts: 0, Qts: 1})
+	if err != nil {
+		t.Fatalf("get difference caught up: %v", err)
+	}
+	switch v := enc.(type) {
+	case *tg.UpdatesDifferenceEmpty:
+		// expected — no pts events either
+	case *tg.UpdatesDifference:
+		if len(v.NewEncryptedMessages) != 0 {
+			t.Fatalf("caught-up: NewEncryptedMessages = %d, want 0", len(v.NewEncryptedMessages))
+		}
+	default:
+		t.Fatalf("caught-up type = %T", enc)
+	}
+
+	// AC3: bob ahead (req.Qts > state.Qts) — no encrypted messages; use a
+	// future date so secret_chats query returns nothing, giving differenceEmpty.
+	futureDate := int(time.Now().Add(time.Hour).Unix())
+	enc, err = api.GetDifferenceForTest(s, bob.ID, &tg.UpdatesGetDifferenceRequest{Pts: 0, Qts: 999, Date: futureDate})
+	if err != nil {
+		t.Fatalf("get difference ahead: %v", err)
+	}
+	if _, ok := enc.(*tg.UpdatesDifferenceEmpty); !ok {
+		t.Fatalf("ahead type = %T, want *tg.UpdatesDifferenceEmpty", enc)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -321,4 +322,22 @@ func encryptedEventFromRow(r db.EncryptedEvent) EncryptedEvent {
 		Bytes:    r.Bytes,
 		Date:     r.Date.Time,
 	}
+}
+
+// SecretChatsAfterDate returns all secret_chats rows where userID is admin or
+// participant and date is strictly after afterDate. Used by getDifference to
+// deliver missed updateEncryption events in other_updates.
+func (s *Store) SecretChatsAfterDate(ctx context.Context, userID int64, afterDate time.Time) ([]SecretChat, error) {
+	rows, err := s.q.SecretChatsAfterDate(ctx, db.SecretChatsAfterDateParams{
+		AdminID: userID,
+		Date:    pgtype.Timestamptz{Time: afterDate, Valid: true},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("secret chats after date: %w", err)
+	}
+	out := make([]SecretChat, len(rows))
+	for i, r := range rows {
+		out[i] = secretChatFromRow(r)
+	}
+	return out, nil
 }

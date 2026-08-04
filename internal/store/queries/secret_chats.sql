@@ -72,3 +72,19 @@ SELECT * FROM encrypted_events WHERE owner_id = $1 AND qts = $2;
 DELETE FROM encrypted_events
 WHERE owner_id = $1 AND qts <= $2
 RETURNING random_id;
+
+-- EncryptedEventsWindow returns up to limit events for owner_id with qts in
+-- (from_qts, to_qts], ordered ascending. The caller fetches limit+1 to detect
+-- truncation without a separate count query.
+-- name: EncryptedEventsWindow :many
+SELECT owner_id, qts, chat_id, random_id, bytes, date FROM encrypted_events
+WHERE owner_id = $1 AND qts > $2 AND qts <= $3
+ORDER BY qts
+LIMIT $4;
+
+-- SecretChatsAfterDate returns all secret_chats rows where user_id is a party
+-- and the row's date is strictly after after_date. Used by getDifference to
+-- deliver missed updateEncryption events.
+-- name: SecretChatsAfterDate :many
+SELECT * FROM secret_chats
+WHERE (admin_id = $1 OR participant_id = $1) AND date > $2;
