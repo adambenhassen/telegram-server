@@ -102,6 +102,7 @@ type updateCollector struct {
 	typing        chan int64
 	serviceMsg    chan serviceMsgEnvelope
 	newChannelMsg chan chanMsgUpdate
+	userStatus    chan *tg.UpdateUserStatus
 }
 
 func newUpdateCollector() *updateCollector {
@@ -113,6 +114,7 @@ func newUpdateCollector() *updateCollector {
 		typing:        make(chan int64, 4),
 		serviceMsg:    make(chan serviceMsgEnvelope, 4),
 		newChannelMsg: make(chan chanMsgUpdate, 4),
+		userStatus:    make(chan *tg.UpdateUserStatus, 8),
 	}
 }
 
@@ -151,6 +153,8 @@ func (u *updateCollector) dispatch(x tg.UpdateClass, chats []tg.ChatClass) {
 		if m, ok := up.Message.(*tg.Message); ok {
 			send(u.newChannelMsg, chanMsgUpdate{Msg: m, Pts: up.Pts})
 		}
+	case *tg.UpdateUserStatus:
+		send(u.userStatus, up)
 	}
 }
 
