@@ -12,5 +12,4 @@ h1:60kgwhItGI3wYMsThg7slFrTm4W/ICAsEkGNL1EyryM=
 20260731000011_normalize_phone.sql h1:DUF39ASKAUINpmW3SgdO1/MSnk9SKDPoHlDe0o+shyg=
 20260731000012_secret_chats.sql h1:vjWMtCA3IYvCrD6sZr7b5RFqCVcLTd9p4BSR2ijxiwg=
 20260731000013_user_status.sql h1:0+PwsdkPRyNKybc2+g+AA089Fa1bzFoH47lagJWqwx0=
-20260801000001_secret_chat.sql h1:KLDt4kCjqoPrUWTZEmUkMEz1pJdSda/QuUpv1SRd414=
 20260801000014_secret_chats_random_id.sql h1:cz9FONcSi1g57sYYfmWEMGAJOWoewwllmx6anJAm07M=

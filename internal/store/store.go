@@ -100,7 +100,7 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 // messages.fanout_id and message_events from the ones before it; update
 // them when a migration adds new schema.
 func (s *Store) checkSchema(ctx context.Context) error {
-var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents bool
+	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
