@@ -119,6 +119,11 @@ func TestDeliverEncryptionRequested(t *testing.T) {
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
 
+	// Wait for listener to actually be reading before firing NOTIFY.
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
 	// Emit encryption NOTIFY.
 	if err := s.Notify(ctx, store.ChannelEncryption, store.EncryptionPayload(bob.ID, int64(chat.ID))); err != nil {
 		t.Fatalf("notify: %v", err)
@@ -188,6 +193,10 @@ func TestDeliverEncryptionActive(t *testing.T) {
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
 
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
 	if err := s.Notify(ctx, store.ChannelEncryption, store.EncryptionPayload(alice.ID, int64(chat.ID))); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
@@ -247,6 +256,10 @@ func TestDeliverEncryptionDiscarded(t *testing.T) {
 		t.Fatalf("start listener: %v", err)
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
+
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
 
 	if err := s.Notify(ctx, store.ChannelEncryption, store.EncryptionPayload(bob.ID, int64(chat.ID))); err != nil {
 		t.Fatalf("notify: %v", err)
