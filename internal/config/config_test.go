@@ -277,6 +277,10 @@ func TestLoadAdvertiseAddr(t *testing.T) {
 
 func TestLoadEncKey(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	// Cleared explicitly: an inherited key-file path would make the empty case
+	// below generate a key and succeed, and the failure would only reproduce on
+	// the machine that has the variable set.
+	t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", "")
 	tests := map[string]string{
 		"missing":      "",
 		"not hex":      "zzzz",

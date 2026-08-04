@@ -855,7 +855,9 @@ func TestConcurrentJoinAndRevokeJoinWins(t *testing.T) {
 		_, _, joinErr = s.JoinChannelByInvite(ctx, hash, joiner.ID)
 		close(joinDone)
 	}()
-	time.Sleep(50 * time.Millisecond)
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		t.Fatalf("wait for join to block: %v", err)
+	}
 
 	// Join must still be blocked — if FOR UPDATE is missing, it would have
 	// already read the row and proceeded past this point.
@@ -933,7 +935,9 @@ func TestConcurrentJoinAndRevokeRevokeWins(t *testing.T) {
 		revokeErr = s.RevokeChannelInvite(ctx, hash, ch.ID)
 		close(revokeDone)
 	}()
-	time.Sleep(50 * time.Millisecond)
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		t.Fatalf("wait for revoke to block: %v", err)
+	}
 
 	// Start join second — also blocks on invite row lock.
 	joinDone := make(chan struct{})
@@ -942,7 +946,9 @@ func TestConcurrentJoinAndRevokeRevokeWins(t *testing.T) {
 		_, _, joinErr = s.JoinChannelByInvite(ctx, hash, joiner.ID)
 		close(joinDone)
 	}()
-	time.Sleep(50 * time.Millisecond)
+	if err := store.WaitForLockWaiters(ctx, s, 2); err != nil {
+		t.Fatalf("wait for join to queue behind revoke: %v", err)
+	}
 
 	// Release blocker — revoke (first in queue) gets the lock, commits.
 	// Join (second) then gets the lock, sees revoked row, refuses.
