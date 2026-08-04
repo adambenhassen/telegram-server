@@ -114,6 +114,18 @@ jobs:
               ss -s | head -3;
               sleep 3;
             done' > "$RUNNER_TEMP/net.log" 2>&1 &
+          nohup bash -c '
+            p=""
+            while [ -z "$p" ]; do p=$(docker port tg-test-pg 5432/tcp 2>/dev/null | head -1 | sed "s/.*://"); sleep 1; done
+            echo "probing port $p"
+            while true; do
+              if ! timeout 2 bash -c "</dev/tcp/127.0.0.1/$p" 2>/dev/null; then
+                echo "PROBE-FAIL $(date +%s.%N)"
+                ss -ltn "sport = :$p"
+                docker ps --format "{{.Names}} {{.Status}} {{.Ports}}"
+              fi
+              sleep 0.2
+            done' > "$RUNNER_TEMP/probe.log" 2>&1 &
           echo ok
 
       - name: Test
@@ -129,7 +141,8 @@ jobs:
           echo '--- docker events'; cat "$RUNNER_TEMP/docker-events.log" || true
           echo '--- postgres container log (tail)'; tail -50 "$RUNNER_TEMP/pg.log" || true
           echo '--- containers'; docker ps -a
-          echo '--- net samples'; cat "$RUNNER_TEMP/net.log" || true
+          echo '--- net samples'; tail -40 "$RUNNER_TEMP/net.log" || true
+          echo '--- probe'; grep -c PROBE-FAIL "$RUNNER_TEMP/probe.log" || true; head -60 "$RUNNER_TEMP/probe.log" || true
           echo '--- iptables nat'; sudo iptables -t nat -S DOCKER || true
           echo '--- docker-proxy'; ps aux | grep -c '[d]ocker-proxy'
           echo '--- dmesg'; sudo dmesg -T | tail -60 || true
