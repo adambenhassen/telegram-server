@@ -110,9 +110,9 @@ jobs:
             > "$RUNNER_TEMP/pg.log" 2>&1 &
           sudo sysctl -a 2>/dev/null | grep -E 'ip_local_port_range|somaxconn|nf_conntrack_max|tcp_max_syn_backlog|abort_on_overflow'
           nohup bash -c 'while true; do
-              echo "T=$(date +%s) tw=$(ss -tan state time-wait | wc -l) est=$(ss -tan state established | wc -l) ct=$(sudo conntrack -C 2>/dev/null)";
-              ss -s | head -3;
-              sleep 3;
+              echo "T=$(date +%s) tw=$(ss -tan state time-wait | wc -l) est=$(ss -tan state established | wc -l)";
+              sudo ss -tanp state all "sport = :32769" | grep -v docker-proxy | tail -n +2;
+              sleep 1;
             done' > "$RUNNER_TEMP/net.log" 2>&1 &
           nohup bash -c '
             p=""
@@ -142,7 +142,8 @@ jobs:
           echo '--- docker events'; cat "$RUNNER_TEMP/docker-events.log" || true
           echo '--- postgres container log (tail)'; tail -50 "$RUNNER_TEMP/pg.log" || true
           echo '--- containers'; docker ps -a
-          echo '--- net samples'; tail -40 "$RUNNER_TEMP/net.log" || true
+          echo '--- sockets owning the published port (non-proxy)'
+          grep -v '^T=' "$RUNNER_TEMP/net.log" | sort -u | head -40 || true
           echo '--- probe'; grep -c PROBE-FAIL "$RUNNER_TEMP/probe.log" || true; head -60 "$RUNNER_TEMP/probe.log" || true
           echo '--- iptables nat'; sudo iptables -t nat -S DOCKER || true
           echo '--- docker-proxy'; ps aux | grep -c '[d]ocker-proxy'
