@@ -486,6 +486,70 @@ func TestDiscardEncryptionRejectsNonParty(t *testing.T) {
 	}
 }
 
+// TestSendEncryptedMessageRejections covers the four handler-layer rejection
+// paths for handleSendEncryptedMessage:
+//   - AC8: payload over the 512 KB cap → MESSAGE_TOO_LONG
+//   - AC6: chat in 'requested' or 'discarded' state → ENCRYPTION_DECLINED
+//   - AC5: caller is not a participant → CHAT_FORBIDDEN
+//   - AC7: access_hash mismatch → ENCRYPTION_ID_INVALID
+func TestSendEncryptedMessageRejections(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	ctx := context.Background()
+
+	a, b := twoUsersFor(t, s, "+15551393001", "+15551393002")
+	outsider, err := s.CreateUser(ctx, "+15551393003")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
+
+	// active chat
+	waiting := requestChat(t, s, a, b)
+	activeID := int32(waiting.ID) //nolint:gosec
+	if _, err := api.AcceptEncryptionForTest(s, b, &tg.MessagesAcceptEncryptionRequest{
+		Peer: api.InputEncryptedChat(b, activeID), GB: validGB(), KeyFingerprint: 1,
+	}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	// requested (not yet accepted) chat
+	waiting2 := requestChat(t, s, a, b)
+	requestedID := int32(waiting2.ID) //nolint:gosec
+
+	// discarded chat
+	waiting3 := requestChat(t, s, a, b)
+	discardedID := int32(waiting3.ID) //nolint:gosec
+	if _, err := api.DiscardEncryptionForTest(s, a, &tg.MessagesDiscardEncryptionRequest{ChatID: int(discardedID)}); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		caller int64
+		peer   tg.InputEncryptedChat
+		data   []byte
+		want   string
+	}{
+		"AC8 data over cap":     {a, api.InputEncryptedChat(a, activeID), make([]byte, 512*1024+1), "MESSAGE_TOO_LONG"},
+		"AC6 requested state":   {a, api.InputEncryptedChat(a, requestedID), []byte("x"), "ENCRYPTION_DECLINED"},
+		"AC6 discarded state":   {a, api.InputEncryptedChat(a, discardedID), []byte("x"), "ENCRYPTION_DECLINED"},
+		"AC5 non-participant":   {outsider.ID, tg.InputEncryptedChat{ChatID: int(activeID)}, []byte("x"), "CHAT_FORBIDDEN"},
+		"AC7 wrong access hash": {a, tg.InputEncryptedChat{ChatID: int(activeID), AccessHash: 1}, []byte("x"), "ENCRYPTION_ID_INVALID"},
+	} {
+		_, err := api.SendEncryptedMessageForTest(s, tc.caller, &tg.MessagesSendEncryptedRequest{
+			Peer:     tc.peer,
+			RandomID: 999,
+			Data:     tc.data,
+		})
+		if err == nil {
+			t.Errorf("%s: expected %s, got nil", name, tc.want)
+			continue
+		}
+		if msg := rpcMessage(t, err); msg != tc.want {
+			t.Errorf("%s: error = %s, want %s", name, msg, tc.want)
+		}
+	}
+}
+
 // Key exchange spends no pts and no qts: the per-account update stream must be
 // exactly where it was.
 func TestKeyExchangeLeavesUpdateStateUntouched(t *testing.T) {

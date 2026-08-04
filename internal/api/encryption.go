@@ -287,6 +287,70 @@ func (h *handlers) handleDiscardEncryption(r *mtproto.Request) (bin.Encoder, err
 	return discarded, nil
 }
 
+// maxEncryptedData is the hard size cap on the opaque ciphertext field of
+// messages.sendEncryptedMessage. Validated before any DB work. 512 KB matches
+// the standard Telegram document-chunk ceiling and is large enough for any
+// real secret-chat message while still bounding the in-memory allocation a
+// single authenticated request can force.
+const maxEncryptedData = 512 * 1024
+
+// handleSendEncryptedMessage serves messages.sendEncryptedMessage (#44fa7a15):
+// accept an opaque ciphertext, increment the recipient's qts, store the event,
+// and push updateNewEncryptedMessage to the recipient's live connections.
+//
+// Validation order follows the issue spec exactly. The access_hash check is
+// last so that a mismatch and a membership failure both surface as
+// CHAT_ID_INVALID, preventing id enumeration via distinguishable errors.
+func (h *handlers) handleSendEncryptedMessage(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesSendEncryptedRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	// 1. Size cap before any DB work.
+	if len(req.Data) > maxEncryptedData {
+		return nil, errMessageTooLong
+	}
+	// 2. Load chat by id (no access_hash yet).
+	chatID := int32(req.Peer.ChatID) //nolint:gosec // chat_id is int32 on the wire
+	chat, err := h.store.SecretChatByID(r.Ctx, chatID)
+	if errors.Is(err, store.ErrSecretChatNotFound) {
+		return nil, errEncryptionIDInvalid
+	}
+	if err != nil {
+		return nil, err
+	}
+	// 3. Chat must be active.
+	if chat.State != store.SecretChatActive {
+		return nil, errEncryptionDeclined
+	}
+	// 4. Caller must be a party.
+	if !chat.Party(r.UserID) {
+		return nil, errChatForbidden
+	}
+	// 5. Verify access_hash. Do not reveal which check failed.
+	if req.Peer.AccessHash != h.secretChatHash(r.UserID, chatID) {
+		return nil, errEncryptionIDInvalid
+	}
+	// 6. Derive recipient (never from the request).
+	recipientID := chat.Other(r.UserID)
+
+	event, dup, err := h.store.SendEncryptedMessage(r.Ctx, store.EncryptedSend{
+		RecipientID: recipientID,
+		ChatID:      chatID,
+		RandomID:    req.RandomID,
+		Data:        req.Data,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !dup {
+		h.notifyEncryptedMsg(r.Ctx, recipientID, event.Qts)
+	}
+	return &tg.MessagesSentEncryptedMessage{
+		Date: int(event.Date.Unix()),
+	}, nil
+}
+
 // secretChatID resolves an InputEncryptedChat, validating that access_hash was
 // derived for (viewerID, chatID).
 func (h *handlers) secretChatID(peer tg.InputEncryptedChat, viewerID int64) (int32, error) {

@@ -50,6 +50,20 @@ func (q *Queries) AcceptSecretChat(ctx context.Context, arg AcceptSecretChatPara
 	return i, err
 }
 
+const bumpQts = `-- name: BumpQts :one
+UPDATE update_state SET qts = qts + 1, date = now() WHERE user_id = $1 RETURNING qts
+`
+
+// BumpQts atomically increments the recipient's qts. Called in the same
+// transaction as InsertEncryptedEvent after the insert confirms this is not a
+// dedup. The new qts matches the value InsertEncryptedEvent stored.
+func (q *Queries) BumpQts(ctx context.Context, userID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, bumpQts, userID)
+	var qts int64
+	err := row.Scan(&qts)
+	return qts, err
+}
+
 const countRequestedSecretChats = `-- name: CountRequestedSecretChats :one
 SELECT COUNT(*) FROM secret_chats WHERE admin_id = $1 AND state = 'requested'
 `
@@ -114,6 +128,96 @@ func (q *Queries) GetSecretChatByAdminRandomID(ctx context.Context, arg GetSecre
 		&i.KeyFingerprint,
 		&i.Date,
 		&i.RandomID,
+	)
+	return i, err
+}
+
+const getEncryptedEvent = `-- name: GetEncryptedEvent :one
+SELECT owner_id, qts, chat_id, random_id, bytes, date FROM encrypted_events WHERE owner_id = $1 AND qts = $2
+`
+
+type GetEncryptedEventParams struct {
+	OwnerID int64
+	Qts     int64
+}
+
+// GetEncryptedEvent fetches one event by its (owner_id, qts) primary key.
+// Used by the push handler to build updateNewEncryptedMessage after a NOTIFY.
+func (q *Queries) GetEncryptedEvent(ctx context.Context, arg GetEncryptedEventParams) (EncryptedEvent, error) {
+	row := q.db.QueryRow(ctx, getEncryptedEvent, arg.OwnerID, arg.Qts)
+	var i EncryptedEvent
+	err := row.Scan(
+		&i.OwnerID,
+		&i.Qts,
+		&i.ChatID,
+		&i.RandomID,
+		&i.Bytes,
+		&i.Date,
+	)
+	return i, err
+}
+
+const getEncryptedEventByRandomID = `-- name: GetEncryptedEventByRandomID :one
+SELECT owner_id, qts, chat_id, random_id, bytes, date FROM encrypted_events WHERE owner_id = $1 AND random_id = $2
+`
+
+type GetEncryptedEventByRandomIDParams struct {
+	OwnerID  int64
+	RandomID int64
+}
+
+// GetEncryptedEventByRandomID fetches an existing event by dedup key for the
+// dedup response path.
+func (q *Queries) GetEncryptedEventByRandomID(ctx context.Context, arg GetEncryptedEventByRandomIDParams) (EncryptedEvent, error) {
+	row := q.db.QueryRow(ctx, getEncryptedEventByRandomID, arg.OwnerID, arg.RandomID)
+	var i EncryptedEvent
+	err := row.Scan(
+		&i.OwnerID,
+		&i.Qts,
+		&i.ChatID,
+		&i.RandomID,
+		&i.Bytes,
+		&i.Date,
+	)
+	return i, err
+}
+
+const insertEncryptedEvent = `-- name: InsertEncryptedEvent :one
+INSERT INTO encrypted_events (owner_id, qts, chat_id, random_id, bytes, date)
+SELECT $1, us.qts + 1, $2, $3, $4, now()
+FROM update_state us WHERE us.user_id = $1
+ON CONFLICT (owner_id, random_id) DO NOTHING
+RETURNING owner_id, qts, chat_id, random_id, bytes, date
+`
+
+type InsertEncryptedEventParams struct {
+	OwnerID  int64
+	ChatID   int32
+	RandomID int64
+	Bytes    []byte
+}
+
+// InsertEncryptedEvent stores one encrypted payload for the recipient. The qts
+// is taken from update_state.qts + 1, which matches the value BumpQts will
+// write in the same transaction. The advisory lock on the recipient held by the
+// caller serialises concurrent sends so the (owner_id, qts) primary key is
+// never contended. ON CONFLICT on (owner_id, random_id) is the dedup guard:
+// a repeated random_id returns no rows (pgx.ErrNoRows).
+func (q *Queries) InsertEncryptedEvent(ctx context.Context, arg InsertEncryptedEventParams) (EncryptedEvent, error) {
+	row := q.db.QueryRow(ctx, insertEncryptedEvent,
+		arg.OwnerID,
+		arg.ChatID,
+		arg.RandomID,
+		arg.Bytes,
+	)
+	var i EncryptedEvent
+	err := row.Scan(
+		&i.OwnerID,
+		&i.Qts,
+		&i.ChatID,
+		&i.RandomID,
+		&i.Bytes,
+		&i.Date,
 	)
 	return i, err
 }

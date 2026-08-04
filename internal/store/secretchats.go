@@ -224,3 +224,101 @@ func (s *Store) DiscardSecretChat(ctx context.Context, id int32) (SecretChat, er
 	}
 	return secretChatFromRow(row), nil
 }
+
+// EncryptedEvent is one per-recipient event row.
+type EncryptedEvent struct {
+	OwnerID  int64
+	Qts      int
+	ChatID   int32
+	RandomID int64
+	Bytes    []byte
+	Date     time.Time
+}
+
+// EncryptedSend holds the inputs to SendEncryptedMessage.
+type EncryptedSend struct {
+	RecipientID int64
+	ChatID      int32
+	RandomID    int64
+	Data        []byte
+}
+
+// SendEncryptedMessage atomically inserts the encrypted payload for the
+// recipient and increments their qts. Returns dup=true when the random_id
+// was already stored (idempotent dedup); the returned event carries the
+// original date. Returns dup=false on a new insert; the event carries the
+// new qts.
+//
+// An advisory lock on RecipientID serialises concurrent sends so the
+// (owner_id, qts) primary key is never contended. The lock is advisory and
+// scoped to the transaction; it is never held across another lock, and the
+// message fan-out path never holds one on the same id, so it is a leaf.
+func (s *Store) SendEncryptedMessage(ctx context.Context, p EncryptedSend) (event EncryptedEvent, dup bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return EncryptedEvent{}, false, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", p.RecipientID); err != nil {
+		return EncryptedEvent{}, false, fmt.Errorf("advisory lock: %w", err)
+	}
+	qtx := s.q.WithTx(tx)
+
+	row, err := qtx.InsertEncryptedEvent(ctx, db.InsertEncryptedEventParams{
+		OwnerID:  p.RecipientID,
+		ChatID:   p.ChatID,
+		RandomID: p.RandomID,
+		Bytes:    p.Data,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Dedup: same random_id already stored; roll back without bumping qts.
+		_ = tx.Rollback(ctx) //nolint:errcheck // no-op if already rolled back
+		existing, lookupErr := s.q.GetEncryptedEventByRandomID(ctx, db.GetEncryptedEventByRandomIDParams{
+			OwnerID:  p.RecipientID,
+			RandomID: p.RandomID,
+		})
+		if lookupErr != nil {
+			return EncryptedEvent{}, false, fmt.Errorf("dedup lookup: %w", lookupErr)
+		}
+		return encryptedEventFromRow(existing), true, nil
+	}
+	if err != nil {
+		return EncryptedEvent{}, false, fmt.Errorf("insert encrypted event: %w", err)
+	}
+
+	if _, err := qtx.BumpQts(ctx, p.RecipientID); err != nil {
+		return EncryptedEvent{}, false, fmt.Errorf("bump qts: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return EncryptedEvent{}, false, fmt.Errorf("commit: %w", err)
+	}
+	return encryptedEventFromRow(row), false, nil
+}
+
+// GetEncryptedEvent loads one event by its (ownerID, qts) primary key.
+// Used by the push handler to build updateNewEncryptedMessage from a NOTIFY.
+func (s *Store) GetEncryptedEvent(ctx context.Context, ownerID int64, qts int) (EncryptedEvent, error) {
+	row, err := s.q.GetEncryptedEvent(ctx, db.GetEncryptedEventParams{
+		OwnerID: ownerID,
+		Qts:     int64(qts),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return EncryptedEvent{}, fmt.Errorf("encrypted event not found: owner=%d qts=%d", ownerID, qts)
+	}
+	if err != nil {
+		return EncryptedEvent{}, fmt.Errorf("get encrypted event: %w", err)
+	}
+	return encryptedEventFromRow(row), nil
+}
+
+func encryptedEventFromRow(r db.EncryptedEvent) EncryptedEvent {
+	return EncryptedEvent{
+		OwnerID:  r.OwnerID,
+		Qts:      int(r.Qts),
+		ChatID:   r.ChatID,
+		RandomID: r.RandomID,
+		Bytes:    r.Bytes,
+		Date:     r.Date.Time,
+	}
+}

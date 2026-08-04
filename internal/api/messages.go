@@ -55,6 +55,14 @@ func (h *handlers) notifyChannelPost(ctx context.Context, channelID int64) {
 	}
 }
 
+// notifyEncryptedMsg emits the cross-replica nudge for a new encrypted message
+// for recipientID at qts. Emitted after commit.
+func (h *handlers) notifyEncryptedMsg(ctx context.Context, recipientID int64, qts int) {
+	if err := h.store.Notify(ctx, store.ChannelEncryptedMsg, store.EncryptedMsgPayload(recipientID, qts)); err != nil {
+		h.log.Error("notify encrypted msg", "recipient_id", recipientID, "qts", qts, "err", err)
+	}
+}
+
 // twoUsers hydrates the caller and the peer into the update user list.
 func (h *handlers) twoUsers(ctx context.Context, selfID, peerID int64) ([]tg.UserClass, error) {
 	return h.loadUsers(ctx, map[int64]bool{selfID: true, peerID: true}, selfID)

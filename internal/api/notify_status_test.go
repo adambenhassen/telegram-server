@@ -69,6 +69,7 @@ func TestDeliverStatusPushesToPartnersOnly(t *testing.T) {
 		func(_ context.Context, userID int64, online bool) {
 			updater.DeliverStatus(ctx, userID, online)
 		},
+		func(context.Context, int64, int) {},
 		nil,
 	)
 	if err != nil {
@@ -130,6 +131,7 @@ func TestDeliverStatusOnline(t *testing.T) {
 		func(_ context.Context, userID int64, online bool) {
 			updater.DeliverStatus(ctx, userID, online)
 		},
+		func(context.Context, int64, int) {},
 		nil,
 	)
 	if err != nil {
@@ -170,6 +172,7 @@ func TestDeliverStatusNoPartners(t *testing.T) {
 		func(_ context.Context, userID int64, online bool) {
 			updater.DeliverStatus(ctx, userID, online)
 		},
+		func(context.Context, int64, int) {},
 		nil,
 	)
 	if err != nil {
@@ -199,6 +202,7 @@ func TestDeliverStatusMalformedPayload(t *testing.T) {
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64, bool) { close(panicOnCall) },
+		func(context.Context, int64, int) {},
 		nil,
 	)
 	if err != nil {

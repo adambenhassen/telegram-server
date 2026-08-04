@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -334,5 +335,98 @@ func TestCreateSecretChatRequestDedupConcurrent(t *testing.T) {
 		if ids[i] != ids[0] {
 			t.Errorf("call %d id = %d, want %d", i, ids[i], ids[0])
 		}
+	}
+}
+
+// TestSendEncryptedMessage is the integration test for the store-level
+// sendEncryptedMessage path: create → accept → send, assert qts + bytes, then
+// assert dedup suppresses a second insert and qts bump.
+func TestSendEncryptedMessage(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	alice, err := s.CreateUser(ctx, "+15559990001")
+	if err != nil {
+		t.Fatalf("alice: %v", err)
+	}
+	bob, err := s.CreateUser(ctx, "+15559990002")
+	if err != nil {
+		t.Fatalf("bob: %v", err)
+	}
+
+	// Create an active secret chat (request → accept).
+	ga := gaFor(10)
+	gaHash := sha256.Sum256(ga)
+	chat, _, err := s.CreateSecretChatRequest(ctx, alice.ID, bob.ID, ga, gaHash[:], 0)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	gb := gaFor(11)
+	if _, err := s.AcceptSecretChat(ctx, chat.ID, bob.ID, gb, 42); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	bobState, err := s.State(ctx, bob.ID)
+	if err != nil {
+		t.Fatalf("bob state before: %v", err)
+	}
+	wantQts := bobState.Qts + 1
+
+	payload := []byte("hello encrypted world")
+	const sendRandomID int64 = 123456789
+
+	event, dup, err := s.SendEncryptedMessage(ctx, store.EncryptedSend{
+		RecipientID: bob.ID,
+		ChatID:      chat.ID,
+		RandomID:    sendRandomID,
+		Data:        payload,
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if dup {
+		t.Fatal("first send reported dup=true")
+	}
+	if event.Qts != wantQts {
+		t.Errorf("event.Qts = %d, want %d", event.Qts, wantQts)
+	}
+	if !bytes.Equal(event.Bytes, payload) {
+		t.Errorf("bytes mismatch: got %q, want %q", event.Bytes, payload)
+	}
+
+	// qts in update_state must have incremented by exactly 1.
+	bobStateAfter, err := s.State(ctx, bob.ID)
+	if err != nil {
+		t.Fatalf("bob state after: %v", err)
+	}
+	if bobStateAfter.Qts != wantQts {
+		t.Errorf("update_state.qts = %d, want %d", bobStateAfter.Qts, wantQts)
+	}
+
+	// Dedup: same random_id returns dup=true without a second qts bump.
+	event2, dup2, err := s.SendEncryptedMessage(ctx, store.EncryptedSend{
+		RecipientID: bob.ID,
+		ChatID:      chat.ID,
+		RandomID:    sendRandomID,
+		Data:        payload,
+	})
+	if err != nil {
+		t.Fatalf("dedup send: %v", err)
+	}
+	if !dup2 {
+		t.Fatal("second send with same random_id reported dup=false")
+	}
+	if event2.Qts != event.Qts {
+		t.Errorf("dedup event.Qts = %d, want %d (original)", event2.Qts, event.Qts)
+	}
+
+	// qts must not have moved.
+	bobStateFinal, err := s.State(ctx, bob.ID)
+	if err != nil {
+		t.Fatalf("bob state final: %v", err)
+	}
+	if bobStateFinal.Qts != wantQts {
+		t.Errorf("qts after dedup = %d, want %d (no second bump)", bobStateFinal.Qts, wantQts)
 	}
 }
