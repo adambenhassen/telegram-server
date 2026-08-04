@@ -100,29 +100,19 @@ jobs:
       # sees "connection refused" against a container that was healthy the whole
       # time. Reserving the ports Docker publishes on keeps them out of the
       # ephemeral allocator; docker-proxy's own explicit bind is unaffected.
-      - name: Verify collision (MAIN-154, temporary)
+      - name: Hammer both paths (MAIN-154, temporary)
         run: |
-          docker run -d --rm -P --name portcheck postgres:16-alpine >/dev/null
-          sleep 3
-          docker ps --format '{{.Names}} {{.Ports}}'
-          python3 - <<'PY'
-          import socket
-          srv = socket.socket(); srv.bind(('127.0.0.1', 0)); srv.listen(4096)
-          port = srv.getsockname()[1]
-          socks, hits = [], []
-          for _ in range(4000):
-              c = socket.socket()
-              try:
-                  c.connect(('127.0.0.1', port))
-              except OSError as e:
-                  print('connect failed:', e); break
-              socks.append(c)
-              lp = c.getsockname()[1]
-              if lp < 33000:
-                  hits.append(lp)
-          print('ephemeral ports drawn below 33000:', sorted(set(hits)))
-          PY
-          docker rm -f portcheck >/dev/null
+          docker run -d --rm -P --name hammer-pg -e POSTGRES_PASSWORD=x postgres:16-alpine >/dev/null
+          sleep 5
+          hp=$(docker port hammer-pg 5432/tcp | head -1 | sed 's/.*://')
+          cip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hammer-pg)
+          echo "published=$hp container=$cip"
+          mkdir -p /tmp/hammer && cp .github/hammer.go /tmp/hammer/main.go
+          (cd /tmp/hammer && go mod init hammer >/dev/null 2>&1; go build -o hammer .)
+          /tmp/hammer/hammer "127.0.0.1:$hp"
+          /tmp/hammer/hammer "$cip:5432"
+          /tmp/hammer/hammer "127.0.0.1:$hp"
+          docker rm -f hammer-pg >/dev/null
 
       - name: Keep Docker's published ports out of the ephemeral range
         run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=32768-33000
