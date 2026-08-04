@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -21,7 +20,6 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/moby/moby/client"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcnet "github.com/testcontainers/testcontainers-go/network"
@@ -91,26 +89,15 @@ func setup() {
 		errSetup = fmt.Errorf("inspect container: %w", err)
 		return
 	}
-	containerID := container.GetContainerID()
-	if _, ok := inspect.NetworkSettings.Networks["bridge"]; !ok {
-		// Reused container may not have bridge network — attach it.
-		errSetup = connectToBridge(ctx, containerID)
+	if bnet, ok := inspect.NetworkSettings.Networks["bridge"]; ok {
+		adminDSN = fmt.Sprintf("postgres://postgres:postgres@%s/postgres?sslmode=disable", net.JoinHostPort(bnet.IPAddress.String(), "5432"))
+	} else {
+		// Reused container from before bridge attachment — fall back to published port.
+		adminDSN, errSetup = container.ConnectionString(ctx, "sslmode=disable")
 		if errSetup != nil {
 			return
 		}
-		inspect, err = container.Inspect(ctx)
-		if err != nil {
-			errSetup = fmt.Errorf("re-inspect container: %w", err)
-			return
-		}
 	}
-	bnet, ok := inspect.NetworkSettings.Networks["bridge"]
-	if !ok {
-		errSetup = errors.New("bridge network not found after connect")
-		return
-	}
-	bridgeIP := bnet.IPAddress.String()
-	adminDSN = fmt.Sprintf("postgres://postgres:postgres@%s/postgres?sslmode=disable", net.JoinHostPort(bridgeIP, "5432"))
 	templateName = templatePrefix + schemaHash(migrations)
 	errSetup = ensureTemplate(ctx)
 }
@@ -308,23 +295,4 @@ func replaceDBName(dsn, db string) string {
 	}
 	u.Path = "/" + db
 	return u.String()
-}
-
-// connectToBridge attaches containerID to the default "bridge" network via the
-// Docker client. Used when a reused container (WithReuseByName) was originally
-// started without the bridge network.
-func connectToBridge(ctx context.Context, containerID string) error {
-	cli, err := testcontainers.NewDockerClientWithOpts(ctx)
-	if err != nil {
-		return fmt.Errorf("docker client: %w", err)
-	}
-	defer func() { _ = cli.Close() }() //nolint:errcheck // best-effort close
-	nw, err := cli.NetworkInspect(ctx, "bridge", client.NetworkInspectOptions{})
-	if err != nil {
-		return fmt.Errorf("inspect bridge: %w", err)
-	}
-	_, err = cli.NetworkConnect(ctx, nw.Network.ID, client.NetworkConnectOptions{
-		Container: containerID,
-	})
-	return err
 }
