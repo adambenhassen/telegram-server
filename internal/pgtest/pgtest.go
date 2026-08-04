@@ -10,8 +10,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -21,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/network"
 
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
 )
@@ -70,6 +73,7 @@ func setup() {
 	migrations = migs
 	container, err := postgres.Run(ctx, "postgres:16-alpine",
 		testcontainers.WithReuseByName(containerName),
+		network.WithBridgeNetwork(),
 		postgres.WithDatabase("postgres"),
 		postgres.WithUsername("postgres"),
 		postgres.WithPassword("postgres"),
@@ -80,10 +84,27 @@ func setup() {
 		errSetup = fmt.Errorf("start container: %w", err)
 		return
 	}
-	adminDSN, errSetup = container.ConnectionString(ctx, "sslmode=disable")
-	if errSetup != nil {
+	// ponytail: bridge IP bypasses docker-proxy, which drops connections under load.
+	inspect, err := container.Inspect(ctx)
+	if err != nil {
+		errSetup = fmt.Errorf("inspect container: %w", err)
 		return
 	}
+	containerID := container.GetContainerID()
+	if _, ok := inspect.NetworkSettings.Networks["bridge"]; !ok {
+		// Reused container may not have bridge network — attach it.
+		errSetup = connectToBridge(ctx, containerID)
+		if errSetup != nil {
+			return
+		}
+		inspect, err = container.Inspect(ctx)
+		if err != nil {
+			errSetup = fmt.Errorf("re-inspect container: %w", err)
+			return
+		}
+	}
+	bridgeIP := inspect.NetworkSettings.Networks["bridge"].IPAddress.String()
+	adminDSN = fmt.Sprintf("postgres://postgres:postgres@%s/postgres?sslmode=disable", net.JoinHostPort(bridgeIP, "5432"))
 	templateName = templatePrefix + schemaHash(migrations)
 	errSetup = ensureTemplate(ctx)
 }
@@ -281,4 +302,16 @@ func replaceDBName(dsn, db string) string {
 	}
 	u.Path = "/" + db
 	return u.String()
+}
+
+// connectToBridge attaches containerID to the default "bridge" network via
+// docker network connect. Used when a reused container (WithReuseByName) was
+// originally started without the bridge network.
+func connectToBridge(ctx context.Context, containerID string) error {
+	// containerID is from testcontainers, not user input (no G204 risk).
+	cmd := exec.CommandContext(ctx, "docker", "network", "connect", "bridge", containerID[:12]) //nolint:gosec // trusted container ID
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker network connect: %s: %w", out, err)
+	}
+	return nil
 }
