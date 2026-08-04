@@ -112,6 +112,8 @@ jobs:
 
       - name: Test
         run: make test
+        env:
+          GOFLAGS: -count=1
 
       - name: Diagnostics dump (MAIN-154, temporary)
         if: always()
