@@ -20,7 +20,7 @@ jobs:
     # pull, a container that never reports ready) before it burns six hours.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
 
       # internal/pgtest builds its template database by reading migrations/ at
       # run time, so Go records that directory and those files as test inputs —
@@ -41,7 +41,7 @@ jobs:
       # recorded during the run are discarded and the next run re-runs
       # everything. The two steps below split the two caches and give the build
       # cache a key that always misses, so it is always saved.
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache: false
@@ -145,7 +145,7 @@ jobs:
       TG_AUTHKEY_ENC_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
 
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
 
       # type=gha needs the docker-container driver; the default builder cannot
       # export to an external cache backend.
@@ -250,7 +250,7 @@ jobs:
       actions: write
 
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
 
       # Compose builds with the default builder, which cannot read type=gha, so
       # the image is built here instead and loaded into the daemon under the tag
