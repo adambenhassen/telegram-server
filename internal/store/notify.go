@@ -339,3 +339,31 @@ func parsePairPayload(payload string) (first, second int64, err error) {
 	}
 	return first, second, nil
 }
+
+// WaitForNotificationListener blocks until n backends in the current database
+// are parked on a ClientRead wait — the pg_stat_activity signature of a
+// connection blocked in WaitForNotification. Tests that emit NOTIFY must
+// confirm the listener is actually reading first; otherwise the notification
+// races the initial WaitForNotification call and is lost.
+func WaitForNotificationListener(ctx context.Context, s *Store, n int) error {
+	const timeout = 30 * time.Second
+	deadline := time.Now().Add(timeout)
+	for {
+		var got int
+		err := s.pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_stat_activity
+			 WHERE datname = current_database()
+			   AND wait_event_type = 'Client'
+			   AND wait_event = 'ClientRead'`).Scan(&got)
+		if err != nil {
+			return err
+		}
+		if got >= n {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("waited %s for %d notification listeners, saw %d", timeout, n, got)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
