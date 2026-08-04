@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -218,43 +219,97 @@ func loadEncKey(log *slog.Logger) ([]byte, error) {
 }
 
 // encKeyFromFile reads the master key at path, generating and persisting one
-// when the file is absent. The create is O_EXCL rather than a write: two
-// containers starting at once must not each write a key and leave one of them
-// holding material the database was not sealed under, so the loser of the race
-// reads back what the winner wrote instead of clobbering it.
-func encKeyFromFile(path string) ([]byte, bool, error) {
-	raw, err := os.ReadFile(path) // #nosec G304,G703 -- path is the operator-configured key file, not untrusted input.
+// when the file is absent.
+//
+// The new key is written to a temporary file and linked into place, so the key
+// file only ever becomes visible complete. Creating it with O_EXCL and writing
+// afterwards looks equivalent and is not: it leaves a window where the path
+// exists and is empty, and a second server starting inside that window reads
+// nothing and fails to boot. os.Link is what closes it — it publishes the
+// finished file in one step and fails with ErrExist rather than replacing a
+// key another start already published, which a rename would do. Whoever loses
+// that race adopts the winner's key, because a replica holding different key
+// material cannot open any session the winner sealed.
+func encKeyFromFile(path string) (key []byte, generated bool, err error) {
+	key, err = readEncKeyFile(path)
 	switch {
 	case err == nil:
-		key, err := decodeEncKey(strings.TrimSpace(string(raw)), path)
-		return key, false, err
+		return key, false, nil
 	case !os.IsNotExist(err):
-		return nil, false, fmt.Errorf("read %s: %w", path, err)
+		return nil, false, err
 	}
 
 	buf := make([]byte, keycrypt.KeyLen)
 	if _, err := rand.Read(buf); err != nil {
 		return nil, false, fmt.Errorf("generate auth-key master key: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) // #nosec G304,G703 -- same operator-configured path.
+	// Same directory as the key file: os.Link cannot cross filesystems, and
+	// TempDir would be a different one under the container's read-only root.
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".enc_key-*")
 	if err != nil {
+		return nil, false, fmt.Errorf("create temp key file in %s: %w", dir, err)
+	}
+	// Reported rather than dropped: what is left behind is master-key material
+	// under a name nothing will ever read again, and a filesystem that cannot
+	// unlink is worth failing the start over. Only the first start of a fresh
+	// volume reaches here, and the next start reads the published file without
+	// creating a temp at all, so this cannot become a crash loop.
+	defer func() {
+		if rmErr := os.Remove(tmp.Name()); rmErr != nil && !os.IsNotExist(rmErr) { // #nosec G703 -- os.CreateTemp's own name in the operator-configured directory.
+			err = errors.Join(err, fmt.Errorf("remove temp key file: %w", rmErr))
+		}
+	}()
+
+	_, writeErr := tmp.WriteString(hex.EncodeToString(buf))
+	// Sync before the link, not after: the master key must be on the disk
+	// before anything can be sealed under it. Postgres commits auth-key
+	// ciphertext durably, so a key that is only in the page cache when the host
+	// loses power comes back missing while the rows it opens come back intact —
+	// every session undecryptable, which is the one failure this file exists to
+	// prevent.
+	if err := errors.Join(writeErr, tmp.Chmod(0o600), tmp.Sync(), tmp.Close()); err != nil {
+		return nil, false, fmt.Errorf("write temp key file: %w", err)
+	}
+	if err := os.Link(tmp.Name(), path); err != nil {
 		if os.IsExist(err) {
-			// Another start won the race between the read above and this
-			// create. Its key is the real one.
-			raw, err := os.ReadFile(path) // #nosec G304,G703 -- same operator-configured path.
-			if err != nil {
-				return nil, false, fmt.Errorf("read %s: %w", path, err)
-			}
-			key, err := decodeEncKey(strings.TrimSpace(string(raw)), path)
+			// Another start published its key first. Its key is the real one,
+			// and it is complete the moment the path exists.
+			key, err := readEncKeyFile(path)
 			return key, false, err
 		}
 		return nil, false, fmt.Errorf("create %s: %w", path, err)
 	}
-	_, writeErr := f.WriteString(hex.EncodeToString(buf))
-	if err := errors.Join(writeErr, f.Close()); err != nil {
-		return nil, false, fmt.Errorf("write %s: %w", path, err)
+	// The file's bytes are durable, but the directory entry naming them is not
+	// until the directory itself is synced.
+	if err := syncDir(dir); err != nil {
+		return nil, false, err
 	}
 	return buf, true, nil
+}
+
+// syncDir flushes a directory's own entries, which is what makes a newly linked
+// name survive a crash. Opened read-only: a directory cannot be opened for
+// writing, and fsync does not need it.
+func syncDir(dir string) error {
+	d, err := os.Open(dir) // #nosec G304,G703 -- the directory of the operator-configured key file.
+	if err != nil {
+		return fmt.Errorf("open %s: %w", dir, err)
+	}
+	return errors.Join(d.Sync(), d.Close())
+}
+
+// readEncKeyFile reads and validates the key file. A NotExist error is returned
+// unwrapped so the caller can tell "no key yet" from a real read failure.
+func readEncKeyFile(path string) ([]byte, error) {
+	raw, err := os.ReadFile(path) // #nosec G304,G703 -- path is the operator-configured key file, not untrusted input.
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	return decodeEncKey(strings.TrimSpace(string(raw)), path)
 }
 
 // decodeEncKey parses the hex-encoded auth-key encryption master key. It is
