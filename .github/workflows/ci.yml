@@ -131,6 +131,7 @@ jobs:
       - name: Test
         run: make test
         env:
+          # temporary: disable test result cache while diagnosing MAIN-154
           GOFLAGS: -count=1
 
       - name: Diagnostics dump (MAIN-154, temporary)
