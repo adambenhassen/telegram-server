@@ -99,8 +99,29 @@ jobs:
       # A package prints (cached) here when $GOCACHE came back from the step
       # above carrying its result. Go decides that per package, so a package
       # whose source changed still runs in full.
+      - name: Diagnostics (MAIN-154, temporary)
+        run: |
+          df -h / /mnt 2>/dev/null || df -h
+          docker info --format 'ServerVersion={{.ServerVersion}} MemTotal={{.MemTotal}} NCPU={{.NCPU}}'
+          nohup docker events --filter type=container \
+            --format '{{.Time}} {{.Actor.Attributes.name}} {{.Action}} exit={{index .Actor.Attributes "exitCode"}}' \
+            > "$RUNNER_TEMP/docker-events.log" 2>&1 &
+          nohup bash -c 'while ! docker logs -f tg-test-pg; do sleep 1; done' \
+            > "$RUNNER_TEMP/pg.log" 2>&1 &
+          echo ok
+
       - name: Test
         run: make test
+
+      - name: Diagnostics dump (MAIN-154, temporary)
+        if: always()
+        run: |
+          df -h / /mnt 2>/dev/null || df -h
+          free -m
+          echo '--- docker events'; cat "$RUNNER_TEMP/docker-events.log" || true
+          echo '--- postgres container log (tail)'; tail -50 "$RUNNER_TEMP/pg.log" || true
+          echo '--- containers'; docker ps -a
+          echo '--- dmesg oom'; sudo dmesg | grep -iE 'oom|killed process' | tail -20 || true
 
   # Builds the image and boots it against a migrated database. Docker is not
   # available in the environments the Dockerfile is edited from, so this job is
