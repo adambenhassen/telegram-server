@@ -108,6 +108,12 @@ jobs:
             > "$RUNNER_TEMP/docker-events.log" 2>&1 &
           nohup bash -c 'while ! docker logs -f tg-test-pg; do sleep 1; done' \
             > "$RUNNER_TEMP/pg.log" 2>&1 &
+          sudo sysctl -a 2>/dev/null | grep -E 'ip_local_port_range|somaxconn|nf_conntrack_max|tcp_max_syn_backlog|abort_on_overflow'
+          nohup bash -c 'while true; do
+              echo "T=$(date +%s) tw=$(ss -tan state time-wait | wc -l) est=$(ss -tan state established | wc -l) ct=$(sudo conntrack -C 2>/dev/null)";
+              ss -s | head -3;
+              sleep 3;
+            done' > "$RUNNER_TEMP/net.log" 2>&1 &
           echo ok
 
       - name: Test
@@ -123,7 +129,10 @@ jobs:
           echo '--- docker events'; cat "$RUNNER_TEMP/docker-events.log" || true
           echo '--- postgres container log (tail)'; tail -50 "$RUNNER_TEMP/pg.log" || true
           echo '--- containers'; docker ps -a
-          echo '--- dmesg oom'; sudo dmesg | grep -iE 'oom|killed process' | tail -20 || true
+          echo '--- net samples'; cat "$RUNNER_TEMP/net.log" || true
+          echo '--- iptables nat'; sudo iptables -t nat -S DOCKER || true
+          echo '--- docker-proxy'; ps aux | grep -c '[d]ocker-proxy'
+          echo '--- dmesg'; sudo dmesg -T | tail -60 || true
 
   # Builds the image and boots it against a migrated database. Docker is not
   # available in the environments the Dockerfile is edited from, so this job is
