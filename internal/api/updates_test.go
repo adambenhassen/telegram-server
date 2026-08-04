@@ -856,4 +856,58 @@ func TestGetDifferenceQtsGapFilling(t *testing.T) {
 	if _, ok := enc.(*tg.UpdatesDifferenceEmpty); !ok {
 		t.Fatalf("ahead type = %T, want *tg.UpdatesDifferenceEmpty", enc)
 	}
+
+	// AC4: differenceSlice when the gap exceeds maxDiffEvents (500).
+	// Use fresh users so their qts starts at 0.
+	carol, err := s.CreateUser(ctx, "+15551299003")
+	if err != nil {
+		t.Fatalf("create carol: %v", err)
+	}
+	dave, err := s.CreateUser(ctx, "+15551299004")
+	if err != nil {
+		t.Fatalf("create dave: %v", err)
+	}
+	if err := s.EnsureUpdateState(ctx, carol.ID); err != nil {
+		t.Fatalf("ensure carol state: %v", err)
+	}
+	if err := s.EnsureUpdateState(ctx, dave.ID); err != nil {
+		t.Fatalf("ensure dave state: %v", err)
+	}
+	chat2, _, err := s.CreateSecretChatRequest(ctx, carol.ID, dave.ID, []byte("ga2"), []byte("hash2"), 2)
+	if err != nil {
+		t.Fatalf("create chat2: %v", err)
+	}
+	if _, err := s.AcceptSecretChat(ctx, chat2.ID, dave.ID, []byte("gb2"), 0); err != nil {
+		t.Fatalf("accept chat2: %v", err)
+	}
+
+	// Seed 501 events so the window is truncated at 500.
+	const overCap = 501
+	for i := range overCap {
+		_, _, err = s.SendEncryptedMessage(ctx, store.EncryptedSend{
+			RecipientID: dave.ID,
+			ChatID:      chat2.ID,
+			RandomID:    int64(1000 + i),
+			Data:        []byte("x"),
+		})
+		if err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	// dave's state.Qts is now 501; call with Qts=0 to span the full gap.
+	enc, err = api.GetDifferenceForTest(s, dave.ID, &tg.UpdatesGetDifferenceRequest{Pts: 0, Qts: 0, Date: futureDate})
+	if err != nil {
+		t.Fatalf("get difference slice: %v", err)
+	}
+	slice, ok := enc.(*tg.UpdatesDifferenceSlice)
+	if !ok {
+		t.Fatalf("AC4 type = %T, want *tg.UpdatesDifferenceSlice", enc)
+	}
+	if len(slice.NewEncryptedMessages) != 500 {
+		t.Fatalf("AC4 encrypted messages = %d, want 500", len(slice.NewEncryptedMessages))
+	}
+	// IntermediateState.Qts must be the 500th event's qts (500), not state.Qts (501).
+	if slice.IntermediateState.Qts != 500 {
+		t.Fatalf("AC4 IntermediateState.Qts = %d, want 500", slice.IntermediateState.Qts)
+	}
 }
