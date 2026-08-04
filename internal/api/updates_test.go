@@ -624,6 +624,68 @@ func TestGetDifferenceRendersSameMediaAsHistory(t *testing.T) {
 	}
 }
 
+func TestUserStatusToTL(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+
+	// Online user → UserStatusOnline.
+	got := api.UserStatusToTL(store.User{IsOnline: true}, false)
+	if _, ok := got.(*tg.UserStatusOnline); !ok {
+		t.Fatalf("IsOnline=true → %T, want *tg.UserStatusOnline", got)
+	}
+
+	// Offline with last-seen → UserStatusOffline with correct timestamp.
+	got = api.UserStatusToTL(store.User{IsOnline: false, LastSeenAt: &now}, false)
+	off, ok := got.(*tg.UserStatusOffline)
+	if !ok {
+		t.Fatalf("IsOnline=false LastSeenAt=<time> → %T, want *tg.UserStatusOffline", got)
+	}
+	if off.WasOnline != int(now.Unix()) {
+		t.Fatalf("WasOnline = %d, want %d", off.WasOnline, int(now.Unix()))
+	}
+
+	// Offline with nil last-seen → UserStatusEmpty.
+	got = api.UserStatusToTL(store.User{IsOnline: false, LastSeenAt: nil}, false)
+	if _, ok := got.(*tg.UserStatusEmpty); !ok {
+		t.Fatalf("IsOnline=false LastSeenAt=nil → %T, want *tg.UserStatusEmpty", got)
+	}
+
+	// Self → UserStatusRecently regardless of online state.
+	got = api.UserStatusToTL(store.User{IsOnline: true, LastSeenAt: &now}, true)
+	if _, ok := got.(*tg.UserStatusRecently); !ok {
+		t.Fatalf("self=true → %T, want *tg.UserStatusRecently", got)
+	}
+	got = api.UserStatusToTL(store.User{IsOnline: false, LastSeenAt: nil}, true)
+	if _, ok := got.(*tg.UserStatusRecently); !ok {
+		t.Fatalf("self=true IsOnline=false → %T, want *tg.UserStatusRecently", got)
+	}
+}
+
+func TestUserToTLStatusField(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+
+	online := api.UserToTL(store.User{ID: 1, IsOnline: true}, 2, false)
+	if _, ok := online.Status.(*tg.UserStatusOnline); !ok {
+		t.Fatalf("online user status = %T, want *tg.UserStatusOnline", online.Status)
+	}
+
+	offline := api.UserToTL(store.User{ID: 1, IsOnline: false, LastSeenAt: &now}, 2, false)
+	if _, ok := offline.Status.(*tg.UserStatusOffline); !ok {
+		t.Fatalf("offline user status = %T, want *tg.UserStatusOffline", offline.Status)
+	}
+
+	never := api.UserToTL(store.User{ID: 1, IsOnline: false, LastSeenAt: nil}, 2, false)
+	if _, ok := never.Status.(*tg.UserStatusEmpty); !ok {
+		t.Fatalf("never-seen user status = %T, want *tg.UserStatusEmpty", never.Status)
+	}
+
+	self := api.UserToTL(store.User{ID: 2, IsOnline: true, LastSeenAt: &now}, 2, true)
+	if _, ok := self.Status.(*tg.UserStatusRecently); !ok {
+		t.Fatalf("self user status = %T, want *tg.UserStatusRecently", self.Status)
+	}
+}
+
 func TestDocumentToTLFileReferenceIsTheFileID(t *testing.T) {
 	t.Parallel()
 
