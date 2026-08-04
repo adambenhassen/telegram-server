@@ -449,4 +449,15 @@ func TestLoadEncKeyConcurrentStarts(t *testing.T) {
 	if string(onDisk) != keys[0] {
 		t.Errorf("file holds %q, servers loaded %q", onDisk, keys[0])
 	}
+
+	// Every start but one wrote a temp file it then lost the race to publish.
+	// Those hold real master-key material under a name nothing reads, so they
+	// must not survive the call that created them.
+	leftover, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".enc_key-*"))
+	if err != nil {
+		t.Fatalf("glob temp key files: %v", err)
+	}
+	if len(leftover) != 0 {
+		t.Errorf("%d temp key files left behind: %v", len(leftover), leftover)
+	}
 }

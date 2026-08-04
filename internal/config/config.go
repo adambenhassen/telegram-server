@@ -230,8 +230,8 @@ func loadEncKey(log *slog.Logger) ([]byte, error) {
 // key another start already published, which a rename would do. Whoever loses
 // that race adopts the winner's key, because a replica holding different key
 // material cannot open any session the winner sealed.
-func encKeyFromFile(path string) ([]byte, bool, error) {
-	key, err := readEncKeyFile(path)
+func encKeyFromFile(path string) (key []byte, generated bool, err error) {
+	key, err = readEncKeyFile(path)
 	switch {
 	case err == nil:
 		return key, false, nil
@@ -245,13 +245,30 @@ func encKeyFromFile(path string) ([]byte, bool, error) {
 	}
 	// Same directory as the key file: os.Link cannot cross filesystems, and
 	// TempDir would be a different one under the container's read-only root.
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".enc_key-*")
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".enc_key-*")
 	if err != nil {
-		return nil, false, fmt.Errorf("create temp key file in %s: %w", filepath.Dir(path), err)
+		return nil, false, fmt.Errorf("create temp key file in %s: %w", dir, err)
 	}
-	defer os.Remove(tmp.Name()) //nolint:errcheck // the link below is what persists; a leftover temp is harmless.
+	// Reported rather than dropped: what is left behind is master-key material
+	// under a name nothing will ever read again, and a filesystem that cannot
+	// unlink is worth failing the start over. Only the first start of a fresh
+	// volume reaches here, and the next start reads the published file without
+	// creating a temp at all, so this cannot become a crash loop.
+	defer func() {
+		if rmErr := os.Remove(tmp.Name()); rmErr != nil && !os.IsNotExist(rmErr) { // #nosec G703 -- os.CreateTemp's own name in the operator-configured directory.
+			err = errors.Join(err, fmt.Errorf("remove temp key file: %w", rmErr))
+		}
+	}()
+
 	_, writeErr := tmp.WriteString(hex.EncodeToString(buf))
-	if err := errors.Join(writeErr, tmp.Chmod(0o600), tmp.Close()); err != nil {
+	// Sync before the link, not after: the master key must be on the disk
+	// before anything can be sealed under it. Postgres commits auth-key
+	// ciphertext durably, so a key that is only in the page cache when the host
+	// loses power comes back missing while the rows it opens come back intact —
+	// every session undecryptable, which is the one failure this file exists to
+	// prevent.
+	if err := errors.Join(writeErr, tmp.Chmod(0o600), tmp.Sync(), tmp.Close()); err != nil {
 		return nil, false, fmt.Errorf("write temp key file: %w", err)
 	}
 	if err := os.Link(tmp.Name(), path); err != nil {
@@ -263,7 +280,23 @@ func encKeyFromFile(path string) ([]byte, bool, error) {
 		}
 		return nil, false, fmt.Errorf("create %s: %w", path, err)
 	}
+	// The file's bytes are durable, but the directory entry naming them is not
+	// until the directory itself is synced.
+	if err := syncDir(dir); err != nil {
+		return nil, false, err
+	}
 	return buf, true, nil
+}
+
+// syncDir flushes a directory's own entries, which is what makes a newly linked
+// name survive a crash. Opened read-only: a directory cannot be opened for
+// writing, and fsync does not need it.
+func syncDir(dir string) error {
+	d, err := os.Open(dir) // #nosec G304,G703 -- the directory of the operator-configured key file.
+	if err != nil {
+		return fmt.Errorf("open %s: %w", dir, err)
+	}
+	return errors.Join(d.Sync(), d.Close())
 }
 
 // readEncKeyFile reads and validates the key file. A NotExist error is returned
