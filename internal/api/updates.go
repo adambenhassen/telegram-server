@@ -225,7 +225,7 @@ func userStatusToTL(u store.User, self bool) tg.UserStatusClass {
 func stateToTL(s store.State) *tg.UpdatesState {
 	return &tg.UpdatesState{
 		Pts:         s.Pts,
-		Qts:         0,
+		Qts:         s.Qts,
 		Date:        s.Date,
 		Seq:         s.Seq,
 		UnreadCount: s.UnreadCount,

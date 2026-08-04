@@ -65,3 +65,10 @@ SELECT * FROM encrypted_events WHERE owner_id = $1 AND random_id = $2;
 -- Used by the push handler to build updateNewEncryptedMessage after a NOTIFY.
 -- name: GetEncryptedEvent :one
 SELECT * FROM encrypted_events WHERE owner_id = $1 AND qts = $2;
+
+-- DeleteEncryptedEventsByQts deletes events up to the given qts watermark and
+-- returns their random_id values for the receivedQueue response.
+-- name: DeleteEncryptedEventsByQts :many
+DELETE FROM encrypted_events
+WHERE owner_id = $1 AND qts <= $2
+RETURNING random_id;

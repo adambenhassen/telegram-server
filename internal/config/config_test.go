@@ -1,6 +1,10 @@
 package config_test
 
 import (
+	"encoding/hex"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,10 +15,12 @@ import (
 // validEncKey is 64 hex chars = 32 bytes, the required master-key length.
 const validEncKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 
+func discardLog() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
 func TestLoadDefaults(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
-	cfg, err := config.Load()
+	cfg, err := config.Load(discardLog())
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -48,7 +54,7 @@ func TestLoadBlobDir(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
 	t.Setenv("TG_BLOB_DIR", "/var/lib/telegramd/blobs")
-	cfg, err := config.Load()
+	cfg, err := config.Load(discardLog())
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -74,7 +80,7 @@ func TestLoadMaxUserStorageBytes(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("TG_MAX_USER_STORAGE_BYTES", tc.raw)
-			cfg, err := config.Load()
+			cfg, err := config.Load(discardLog())
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("Load: expected error, got nil")
@@ -114,7 +120,7 @@ func TestLoadMaxFileBytes(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("TG_MAX_FILE_BYTES", tc.raw)
-			cfg, err := config.Load()
+			cfg, err := config.Load(discardLog())
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for %s, got MaxFileBytes = %d", name, cfg.MaxFileBytes)
@@ -151,7 +157,7 @@ func TestLoadUploadPartTTL(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("TG_UPLOAD_PART_TTL", tc.raw)
-			cfg, err := config.Load()
+			cfg, err := config.Load(discardLog())
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for %s, got UploadPartTTL = %v", name, cfg.UploadPartTTL)
@@ -174,7 +180,7 @@ func TestLoadUploadPartTTL(t *testing.T) {
 func TestLoadRequiresDSN(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "")
 	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
-	if _, err := config.Load(); err == nil {
+	if _, err := config.Load(discardLog()); err == nil {
 		t.Fatal("expected error when DSN missing")
 	}
 }
@@ -195,7 +201,7 @@ func TestLoadLogLoginCodes(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("TG_LOG_LOGIN_CODES", tc.raw)
-			cfg, err := config.Load()
+			cfg, err := config.Load(discardLog())
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for %s, got LogLoginCodes = %v", name, cfg.LogLoginCodes)
@@ -247,7 +253,7 @@ func TestLoadAdvertiseAddr(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("TG_LISTEN_ADDR", tc.listen)
 			t.Setenv("TG_ADVERTISE_ADDR", tc.advertise)
-			cfg, err := config.Load()
+			cfg, err := config.Load(discardLog())
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for %s, got %s:%d", name, cfg.AdvertiseHost, cfg.AdvertisePort)
@@ -283,9 +289,119 @@ func TestLoadEncKey(t *testing.T) {
 	for name, key := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("TG_AUTHKEY_ENC_KEY", key)
-			if _, err := config.Load(); err == nil {
+			if _, err := config.Load(discardLog()); err == nil {
 				t.Fatalf("expected error for %s enc key", name)
 			}
 		})
+	}
+}
+
+// keyFileEnv sets the minimum environment for a key-file load: no env key, a
+// file path under t.TempDir().
+func keyFileEnv(t *testing.T) string {
+	t.Helper()
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", "")
+	path := filepath.Join(t.TempDir(), "enc_key.hex")
+	t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", path)
+	return path
+}
+
+func TestLoadEncKeyGeneratesFile(t *testing.T) {
+	path := keyFileEnv(t)
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.AuthKeyEncKey) != 32 {
+		t.Fatalf("AuthKeyEncKey len = %d, want 32", len(cfg.AuthKeyEncKey))
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat key file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("key file mode = %v, want 0600", perm)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read key file: %v", err)
+	}
+	if got := hex.EncodeToString(cfg.AuthKeyEncKey); got != string(raw) {
+		t.Errorf("file contents %q do not match loaded key %q", raw, got)
+	}
+}
+
+func TestLoadEncKeyReusesFile(t *testing.T) {
+	path := keyFileEnv(t)
+	first, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	second, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load (second): %v", err)
+	}
+	if hex.EncodeToString(first.AuthKeyEncKey) != hex.EncodeToString(second.AuthKeyEncKey) {
+		t.Errorf("key changed across loads, sessions would not survive a restart")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("stat key file: %v", err)
+	}
+}
+
+func TestLoadEncKeyEnvWins(t *testing.T) {
+	path := keyFileEnv(t)
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := hex.EncodeToString(cfg.AuthKeyEncKey); got != validEncKey {
+		t.Errorf("AuthKeyEncKey = %q, want the env value", got)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("key file was written even though the env key was set (err=%v)", err)
+	}
+}
+
+func TestLoadEncKeyFileInvalid(t *testing.T) {
+	for name, contents := range map[string]string{
+		"not hex":   strings.Repeat("z", 64),
+		"too short": "0011",
+		"empty":     "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := keyFileEnv(t)
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatalf("write key file: %v", err)
+			}
+			if _, err := config.Load(discardLog()); err == nil {
+				t.Fatalf("Load succeeded with key file %q", contents)
+			}
+		})
+	}
+}
+
+func TestLoadEncKeyFileTrailingNewline(t *testing.T) {
+	path := keyFileEnv(t)
+	if err := os.WriteFile(path, []byte(validEncKey+"\n"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := hex.EncodeToString(cfg.AuthKeyEncKey); got != validEncKey {
+		t.Errorf("AuthKeyEncKey = %q, want %q", got, validEncKey)
+	}
+}
+
+func TestLoadEncKeyNeitherSet(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", "")
+	t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", "")
+	if _, err := config.Load(discardLog()); err == nil {
+		t.Fatal("Load succeeded with neither TG_AUTHKEY_ENC_KEY nor TG_AUTHKEY_ENC_KEY_FILE set")
 	}
 }
