@@ -2,11 +2,15 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
@@ -62,8 +66,10 @@ type Config struct {
 // past any file a client can upload and leaves both terms in range.
 const MaxFileBytesLimit int64 = 1 << 40
 
-// Load reads configuration from environment variables, applying defaults.
-func Load() (Config, error) {
+// Load reads configuration from environment variables, applying defaults. The
+// logger is used only for the auth-key master key, which is the one value Load
+// can create rather than read, and a generated one has to say so.
+func Load(log *slog.Logger) (Config, error) {
 	cfg := Config{
 		ListenAddr:  envOr("TG_LISTEN_ADDR", ":2443"),
 		PostgresDSN: os.Getenv("TG_POSTGRES_DSN"),
@@ -130,7 +136,7 @@ func Load() (Config, error) {
 	if cfg.PostgresDSN == "" {
 		return Config{}, errors.New("TG_POSTGRES_DSN is required")
 	}
-	encKey, err := decodeEncKey(os.Getenv("TG_AUTHKEY_ENC_KEY"))
+	encKey, err := loadEncKey(log)
 	if err != nil {
 		return Config{}, err
 	}
@@ -184,19 +190,88 @@ func splitHostPort(addr string) (string, int) {
 	return host, port
 }
 
+// loadEncKey resolves the auth-key master key from the two sources that can
+// carry it. TG_AUTHKEY_ENC_KEY wins and is never written anywhere. Failing
+// that, TG_AUTHKEY_ENC_KEY_FILE names a file the key is read from and, on a
+// first boot where it does not exist yet, generated into — which is what lets
+// the compose stack start with an unedited .env. With neither set the server
+// refuses to boot, exactly as before: auto-generation is opt-in by naming a
+// path, never a default baked into the binary.
+func loadEncKey(log *slog.Logger) ([]byte, error) {
+	if raw := os.Getenv("TG_AUTHKEY_ENC_KEY"); raw != "" {
+		return decodeEncKey(raw, "TG_AUTHKEY_ENC_KEY")
+	}
+	path := os.Getenv("TG_AUTHKEY_ENC_KEY_FILE")
+	if path == "" {
+		return nil, errors.New("TG_AUTHKEY_ENC_KEY is required (64 hex chars = 32 bytes), or set TG_AUTHKEY_ENC_KEY_FILE to a path the key is kept in")
+	}
+	key, generated, err := encKeyFromFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if generated {
+		log.Warn("TG_AUTHKEY_ENC_KEY not set: generated a dev key", "path", path, "action", "do not use in production")
+	} else {
+		log.Info("auth-key master key loaded from file", "path", path)
+	}
+	return key, nil
+}
+
+// encKeyFromFile reads the master key at path, generating and persisting one
+// when the file is absent. The create is O_EXCL rather than a write: two
+// containers starting at once must not each write a key and leave one of them
+// holding material the database was not sealed under, so the loser of the race
+// reads back what the winner wrote instead of clobbering it.
+func encKeyFromFile(path string) ([]byte, bool, error) {
+	raw, err := os.ReadFile(path) // #nosec G304,G703 -- path is the operator-configured key file, not untrusted input.
+	switch {
+	case err == nil:
+		key, err := decodeEncKey(strings.TrimSpace(string(raw)), path)
+		return key, false, err
+	case !os.IsNotExist(err):
+		return nil, false, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	buf := make([]byte, keycrypt.KeyLen)
+	if _, err := rand.Read(buf); err != nil {
+		return nil, false, fmt.Errorf("generate auth-key master key: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) // #nosec G304,G703 -- same operator-configured path.
+	if err != nil {
+		if os.IsExist(err) {
+			// Another start won the race between the read above and this
+			// create. Its key is the real one.
+			raw, err := os.ReadFile(path) // #nosec G304,G703 -- same operator-configured path.
+			if err != nil {
+				return nil, false, fmt.Errorf("read %s: %w", path, err)
+			}
+			key, err := decodeEncKey(strings.TrimSpace(string(raw)), path)
+			return key, false, err
+		}
+		return nil, false, fmt.Errorf("create %s: %w", path, err)
+	}
+	_, writeErr := f.WriteString(hex.EncodeToString(buf))
+	if err := errors.Join(writeErr, f.Close()); err != nil {
+		return nil, false, fmt.Errorf("write %s: %w", path, err)
+	}
+	return buf, true, nil
+}
+
 // decodeEncKey parses the hex-encoded auth-key encryption master key. It is
 // required and must decode to exactly keycrypt.KeyLen bytes, so the server fails
-// fast rather than starting without at-rest encryption or with a weak key.
-func decodeEncKey(raw string) ([]byte, error) {
+// fast rather than starting without at-rest encryption or with a weak key. src
+// names where the value came from — the env var or a file path — because the
+// two failure modes are diagnosed in different places.
+func decodeEncKey(raw, src string) ([]byte, error) {
 	if raw == "" {
-		return nil, errors.New("TG_AUTHKEY_ENC_KEY is required (64 hex chars = 32 bytes)")
+		return nil, fmt.Errorf("%s is empty: expected 64 hex chars (32 bytes)", src)
 	}
 	key, err := hex.DecodeString(raw)
 	if err != nil {
-		return nil, errors.New("TG_AUTHKEY_ENC_KEY must be valid hex")
+		return nil, fmt.Errorf("%s must be valid hex", src)
 	}
 	if len(key) != keycrypt.KeyLen {
-		return nil, errors.New("TG_AUTHKEY_ENC_KEY must be 64 hex chars (32 bytes)")
+		return nil, fmt.Errorf("%s must be 64 hex chars (32 bytes)", src)
 	}
 	return key, nil
 }
