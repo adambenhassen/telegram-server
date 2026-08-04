@@ -89,33 +89,6 @@ jobs:
       - name: Validate migrations
         run: atlas migrate validate --dir file://migrations
 
-      # Docker allocates published host ports from 32768 upward, which is also
-      # where the kernel's ephemeral source-port range starts. This suite opens
-      # thousands of short-lived loopback connections, so the kernel can hand a
-      # test process the very port Postgres is published on as the source port
-      # of some other loopback connection — docker-proxy binds with SO_REUSEADDR,
-      # which is what lets the ephemeral allocator reuse it. The next connection
-      # to Postgres that draws the matching peer port then collides on the
-      # 4-tuple, the SYN lands on that already-established socket, and the client
-      # sees "connection refused" against a container that was healthy the whole
-      # time. Reserving the ports Docker publishes on keeps them out of the
-      # ephemeral allocator; docker-proxy's own explicit bind is unaffected.
-      - name: Watch who binds the published port (MAIN-154, temporary)
-        run: |
-          nohup bash -c '
-            p=""
-            while [ -z "$p" ]; do p=$(docker port tg-test-pg 5432/tcp 2>/dev/null | head -1 | sed "s/.*://"); sleep 1; done
-            echo "watching $p"
-            while true; do
-              sudo ss -tlnp "sport = :$p" | grep -v docker-proxy | tail -n +2
-              sudo ss -tnp state established "sport = :$p" | grep -v docker-proxy | tail -n +2
-              sleep 0.3
-            done' > "$RUNNER_TEMP/bind.log" 2>&1 &
-          echo ok
-
-      - name: Keep Docker's published ports out of the ephemeral range
-        run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=32768-33000
-
       # Postgres comes from testcontainers inside internal/pgtest, which starts
       # postgres:16-alpine with its own config. Nothing to wire up on the runner
       # beyond the Docker daemon ubuntu-latest already provides.
@@ -128,10 +101,6 @@ jobs:
       # whose source changed still runs in full.
       - name: Test
         run: make test
-
-      - name: Who bound the port (MAIN-154, temporary)
-        if: always()
-        run: sort -u "$RUNNER_TEMP/bind.log" | head -40
 
   # Builds the image and boots it against a migrated database. Docker is not
   # available in the environments the Dockerfile is edited from, so this job is
