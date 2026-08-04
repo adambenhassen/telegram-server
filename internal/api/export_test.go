@@ -143,9 +143,16 @@ func PeerUserID(peer tg.InputPeerClass, viewerID int64) (int64, error) {
 // package. PeerToTL, ChatToTL and ChannelToTL are pure and need no store.
 // InputPeer and InputUserID use the test deriver from pgtest.
 var (
-	PeerToTL = peerToTL
-	ChatToTL = chatToTL
+	PeerToTL       = peerToTL
+	ChatToTL       = chatToTL
+	UserStatusToTL = userStatusToTL
 )
+
+// UserToTL exposes userToTL for the external api_test package.
+// Uses the test deriver from pgtest.
+func UserToTL(u store.User, viewerID int64, self bool) *tg.User {
+	return testHandlers(nil).userToTL(u, viewerID, self)
+}
 
 // ChannelToTL exposes channelToTL for the external api_test package.
 // Uses the test deriver from pgtest.
