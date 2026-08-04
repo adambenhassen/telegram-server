@@ -81,10 +81,7 @@ func TestDeliverStatusPushesToPartnersOnly(t *testing.T) {
 		t.Fatalf("notify: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	// Bob must have received a push.
-	if !bobFT.wasSent() {
+	if !waitSent(bobFT) {
 		t.Fatal("bob received no push")
 	}
 	// Alice must NOT have received a push (no self-push).
@@ -143,9 +140,7 @@ func TestDeliverStatusOnline(t *testing.T) {
 		t.Fatalf("notify: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	if !bobFT.wasSent() {
+	if !waitSent(bobFT) {
 		t.Fatal("bob received no push for online status")
 	}
 }
@@ -184,8 +179,6 @@ func TestDeliverStatusNoPartners(t *testing.T) {
 	if err := s.Notify(ctx, store.ChannelStatus, store.StatusPayload(alice.ID, true)); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
-
-	time.Sleep(100 * time.Millisecond)
 }
 
 func TestDeliverStatusMalformedPayload(t *testing.T) {
