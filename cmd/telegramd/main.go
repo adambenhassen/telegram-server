@@ -36,7 +36,7 @@ func main() {
 const sweepInterval = 5 * time.Minute
 
 func run(log *slog.Logger) error {
-	cfg, err := config.Load()
+	cfg, err := config.Load(log)
 	if err != nil {
 		return err
 	}

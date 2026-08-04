@@ -1,12 +1,13 @@
 # Local development stack: Postgres, migrations, and the server, in that order.
 #
 #   cp .env.example .env && chmod 600 .env
-#   $EDITOR .env            # TG_AUTHKEY_ENC_KEY — openssl rand -hex 32
 #   docker compose up
 #
 # `docker compose down` keeps both volumes, which is what makes a restart
-# uneventful: the same rows, and the same RSA identity. `down -v` destroys them,
-# and the next boot hands every client a new server fingerprint.
+# uneventful: the same rows, the same RSA identity, and the same auth-key master
+# key. `down -v` destroys them, and the next boot hands every client a new server
+# fingerprint and a master key none of their stored auth keys open under, so they
+# re-handshake.
 
 # The password has exactly one source, .env, and the DSN exactly one definition
 # here — migrate and telegramd must never be able to reach different databases.
@@ -71,7 +72,14 @@ services:
     image: telegramd:local
     environment:
       TG_POSTGRES_DSN: *dsn
-      TG_AUTHKEY_ENC_KEY: ${TG_AUTHKEY_ENC_KEY:?set TG_AUTHKEY_ENC_KEY in .env - generate one with openssl rand -hex 32}
+      # Not :? — an empty value is the normal case for this stack and the line
+      # below is what makes it safe: the server generates a key into the tgkey
+      # volume on first boot and reuses it after. Set it in .env to pin a
+      # specific key, and then no file is written. The binary has no default
+      # path of its own, so a bare `docker run` with neither variable set still
+      # refuses to start rather than silently minting a key nobody kept.
+      TG_AUTHKEY_ENC_KEY: ${TG_AUTHKEY_ENC_KEY:-}
+      TG_AUTHKEY_ENC_KEY_FILE: /var/lib/telegramd/enc_key.hex
       # Not :? like the two above: there is a safe default for this stack, and a
       # .env copied before this line existed must still boot into a server you
       # can sign in to. A bare `true` here would take the knob away instead.
@@ -91,13 +99,14 @@ services:
     # TG_ADVERTISE_ADDR to the name it dials.
     #
     # Proven by the docker job in ci.yml, which already boots this image
-    # --read-only: the static binary writes nothing but its key file.
+    # --read-only: the static binary writes nothing but its key files.
     read_only: true
     volumes:
       # The two writable paths, and the only ones. A named volume takes the mountpoint's 0700 and uid
       # 65532 from the image; a bind mount would take the host directory's mode
-      # instead — root-owned means the server cannot write its key and crash
-      # loops, 0755 means a live RSA private key readable by every local user.
+      # instead — root-owned means the server cannot write its keys and crash
+      # loops, 0755 means a live RSA private key and the auth-key master key
+      # readable by every local user.
       - tgkey:/var/lib/telegramd
       # Uploaded file bodies, on their own volume: they grow without bound and
       # the key volume must not. Same 0700 uid 65532 inheritance as above.
