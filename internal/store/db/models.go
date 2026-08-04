@@ -95,6 +95,13 @@ type Dialog struct {
 	PeerType        int16
 }
 
+type EncryptedChat struct {
+	ID         int32
+	AccessHash int64
+	User1ID    int64
+	User2ID    int64
+}
+
 type EncryptedEvent struct {
 	OwnerID  int64
 	Qts      int64
@@ -169,6 +176,7 @@ type SecretChat struct {
 	Date           pgtype.Timestamptz
 	RandomID       int64
 }
+
 
 type UpdateState struct {
 	UserID      int64
