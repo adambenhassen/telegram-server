@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	tcnet "github.com/testcontainers/testcontainers-go/network"
 
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
 )
@@ -70,6 +72,7 @@ func setup() {
 	migrations = migs
 	container, err := postgres.Run(ctx, "postgres:16-alpine",
 		testcontainers.WithReuseByName(containerName),
+		tcnet.WithBridgeNetwork(),
 		postgres.WithDatabase("postgres"),
 		postgres.WithUsername("postgres"),
 		postgres.WithPassword("postgres"),
@@ -80,9 +83,20 @@ func setup() {
 		errSetup = fmt.Errorf("start container: %w", err)
 		return
 	}
-	adminDSN, errSetup = container.ConnectionString(ctx, "sslmode=disable")
-	if errSetup != nil {
+	// ponytail: bridge IP bypasses docker-proxy, which drops connections under load.
+	inspect, err := container.Inspect(ctx)
+	if err != nil {
+		errSetup = fmt.Errorf("inspect container: %w", err)
 		return
+	}
+	if bnet, ok := inspect.NetworkSettings.Networks["bridge"]; ok {
+		adminDSN = fmt.Sprintf("postgres://postgres:postgres@%s/postgres?sslmode=disable", net.JoinHostPort(bnet.IPAddress.String(), "5432"))
+	} else {
+		// Reused container from before bridge attachment — fall back to published port.
+		adminDSN, errSetup = container.ConnectionString(ctx, "sslmode=disable")
+		if errSetup != nil {
+			return
+		}
 	}
 	templateName = templatePrefix + schemaHash(migrations)
 	errSetup = ensureTemplate(ctx)
