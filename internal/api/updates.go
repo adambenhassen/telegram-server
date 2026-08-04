@@ -198,11 +198,28 @@ func (h *handlers) userToTL(u store.User, viewerID int64, self bool) *tg.User {
 		FirstName:  u.FirstName,
 		LastName:   u.LastName,
 		AccessHash: h.peers.Derive(viewerID, peerhash.KindUser, u.ID),
+		Status:     userStatusToTL(u, self),
 	}
 	if self {
 		tlUser.Phone = u.Phone
 	}
 	return tlUser
+}
+
+// userStatusToTL maps a store.User's presence fields to the wire status.
+// Self always gets UserStatusRecently — Telegram's canonical sentinel for
+// "this is your own account; your last-seen is not disclosed to yourself."
+func userStatusToTL(u store.User, self bool) tg.UserStatusClass {
+	if self {
+		return &tg.UserStatusRecently{}
+	}
+	if u.IsOnline {
+		return &tg.UserStatusOnline{Expires: int(time.Now().Add(5 * time.Minute).Unix())}
+	}
+	if u.LastSeenAt != nil {
+		return &tg.UserStatusOffline{WasOnline: int(u.LastSeenAt.Unix())}
+	}
+	return &tg.UserStatusEmpty{}
 }
 
 func stateToTL(s store.State) *tg.UpdatesState {

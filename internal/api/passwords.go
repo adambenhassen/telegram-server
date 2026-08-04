@@ -38,6 +38,7 @@ func randBytes(n int) ([]byte, error) {
 }
 
 // userTL maps a stored user to the tg.User returned in an authorization.
+// Self always carries UserStatusRecently per Telegram's privacy model.
 func userTL(u store.User) *tg.User {
 	return &tg.User{
 		ID:         u.ID,
@@ -45,6 +46,7 @@ func userTL(u store.User) *tg.User {
 		Phone:      u.Phone,
 		FirstName:  u.FirstName,
 		AccessHash: u.ID, // self access hash placeholder
+		Status:     &tg.UserStatusRecently{},
 	}
 }
 
