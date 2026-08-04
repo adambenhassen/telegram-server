@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
@@ -236,4 +237,34 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 		return nil, err
 	}
 	return func() { _ = tx.Rollback(ctx) }, nil //nolint:errcheck // nothing to commit
+}
+
+// WaitForLockWaiters blocks until n backends in this test's database are parked
+// on a lock. The concurrent join/revoke tests depend on the order goroutines
+// enter Postgres's lock queue, and that order is only decided once a statement
+// has actually reached the lock — a sleep guesses at when that happened and
+// guesses wrong on a loaded machine, admitting the second goroutine first.
+// Waiting on the observable state makes the queue order deterministic.
+//
+// Safe to filter by database because internal/pgtest clones one database per
+// test, so the only backends here are this test's.
+func WaitForLockWaiters(ctx context.Context, s *Store, n int) error {
+	const timeout = 30 * time.Second
+	deadline := time.Now().Add(timeout)
+	for {
+		var got int
+		err := s.pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_stat_activity
+			 WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&got)
+		if err != nil {
+			return err
+		}
+		if got >= n {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("waited %s for %d lock waiters, saw %d", timeout, n, got)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
