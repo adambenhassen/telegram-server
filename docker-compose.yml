@@ -79,7 +79,11 @@ services:
       # path of its own, so a bare `docker run` with neither variable set still
       # refuses to start rather than silently minting a key nobody kept.
       TG_AUTHKEY_ENC_KEY: ${TG_AUTHKEY_ENC_KEY:-}
-      TG_AUTHKEY_ENC_KEY_FILE: /var/lib/telegramd/enc_key.hex
+      # Interpolated, not hardcoded: the default is the tgkey volume, and an
+      # operator who sets the variable in .env gets their path instead. Point it
+      # outside /var/lib/telegramd or /var/lib/telegramd-blobs and the server
+      # cannot write it — the container root is read_only.
+      TG_AUTHKEY_ENC_KEY_FILE: ${TG_AUTHKEY_ENC_KEY_FILE:-/var/lib/telegramd/enc_key.hex}
       # Not :? like the two above: there is a safe default for this stack, and a
       # .env copied before this line existed must still boot into a server you
       # can sign in to. A bare `true` here would take the knob away instead.

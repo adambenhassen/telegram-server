@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -403,5 +404,60 @@ func TestLoadEncKeyNeitherSet(t *testing.T) {
 	t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", "")
 	if _, err := config.Load(discardLog()); err == nil {
 		t.Fatal("Load succeeded with neither TG_AUTHKEY_ENC_KEY nor TG_AUTHKEY_ENC_KEY_FILE set")
+	}
+}
+
+// TestLoadEncKeyConcurrentStarts is the replica case: several servers pointed at
+// the same key file start at once. Exactly one may create it, and every other
+// must end up holding that same key — a start that fails, or one that comes up
+// under a different key, loses every session sealed under the winner's.
+func TestLoadEncKeyConcurrentStarts(t *testing.T) {
+	path := keyFileEnv(t)
+
+	const starts = 64
+	keys := make([]string, starts)
+	errs := make([]error, starts)
+	var wg sync.WaitGroup
+	// Released together, so the create and the read of the loser overlap in the
+	// window where the winner has created the file but not yet written it.
+	start := make(chan struct{})
+	for i := range starts {
+		wg.Go(func() {
+			<-start
+			cfg, err := config.Load(discardLog())
+			errs[i] = err
+			keys[i] = hex.EncodeToString(cfg.AuthKeyEncKey)
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("start %d: %v", i, err)
+		}
+	}
+	for i, k := range keys {
+		if k != keys[0] {
+			t.Fatalf("start %d loaded key %q, start 0 loaded %q", i, k, keys[0])
+		}
+	}
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read key file: %v", err)
+	}
+	if string(onDisk) != keys[0] {
+		t.Errorf("file holds %q, servers loaded %q", onDisk, keys[0])
+	}
+
+	// Every start but one wrote a temp file it then lost the race to publish.
+	// Those hold real master-key material under a name nothing reads, so they
+	// must not survive the call that created them.
+	leftover, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".enc_key-*"))
+	if err != nil {
+		t.Fatalf("glob temp key files: %v", err)
+	}
+	if len(leftover) != 0 {
+		t.Errorf("%d temp key files left behind: %v", len(leftover), leftover)
 	}
 }

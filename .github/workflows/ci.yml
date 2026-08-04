@@ -272,9 +272,14 @@ jobs:
           # Inline literals, never repository secrets: `on: pull_request` means a
           # fork PR runs this job, and a job that prints container logs must not
           # hold real key material. Nothing is ever sealed under this key.
+          #
+          # TG_AUTHKEY_ENC_KEY is deliberately absent, which is what
+          # .env.example ships: the stack must boot with an unedited copy and
+          # generate its own master key into the tgkey volume. Pinning one here
+          # would leave that path — the whole point of the key-file support —
+          # untested in the only place compose ever runs.
           cat > .env <<'EOF'
           POSTGRES_PASSWORD=localdev
-          TG_AUTHKEY_ENC_KEY=0000000000000000000000000000000000000000000000000000000000000000
           EOF
           # .gitignore ignores .env.*, so the template only survives because of
           # the negation below it. Dropping or misordering that line loses the
@@ -288,6 +293,19 @@ jobs:
             echo ".env.example is git-ignored: the !.env.example negation is missing or misordered"
             exit 1
           fi
+
+          # The key-file path must be an override, not a constant: an operator
+          # pinning it in .env or the environment has to reach the server. A
+          # hardcoded value renders identically whatever is set, so render it
+          # both ways and require them to differ.
+          default_path=$(docker compose config --format json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["telegramd"]["environment"]["TG_AUTHKEY_ENC_KEY_FILE"])')
+          [ "$default_path" = /var/lib/telegramd/enc_key.hex ] \
+            || { echo "compose default key path is $default_path"; exit 1; }
+          override_path=$(TG_AUTHKEY_ENC_KEY_FILE=/var/lib/telegramd/other.hex docker compose config --format json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["telegramd"]["environment"]["TG_AUTHKEY_ENC_KEY_FILE"])')
+          [ "$override_path" = /var/lib/telegramd/other.hex ] \
+            || { echo "TG_AUTHKEY_ENC_KEY_FILE override did not reach the rendered config: got $override_path"; exit 1; }
 
       - name: Boot, restart, and check all three volumes survived
         run: |
@@ -369,6 +387,18 @@ jobs:
             docker run --rm -v "$1":/blobs busybox:1.37 cat /blobs/ci_canary
           }
 
+          # The generated master key, read off the tgkey volume the same way —
+          # telegramd is distroless and cannot cat its own file.
+          key_volume() {
+            cid=$(docker compose ps -q telegramd)
+            docker inspect "$cid" \
+              --format '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "/var/lib/telegramd")}}{{.Name}}{{end}}{{end}}'
+          }
+
+          key_file() {
+            docker run --rm -v "$1":/key busybox:1.37 cat /key/enc_key.hex
+          }
+
           # No --build: the Build image step already loaded telegramd:local, which
           # is the tag the service names, and rebuilding here would bypass the
           # layer cache. Compose still builds it if the image is missing.
@@ -387,6 +417,20 @@ jobs:
             echo "telegramd never warned that TG_LOG_LOGIN_CODES is on: the compose default no longer reaches the server"
             exit 1
           fi
+
+          # First boot has no key file, so the server must mint one and say so.
+          # The warning is the only signal an operator gets that the stack is
+          # running on a key nobody chose, so its absence is a failure even
+          # though the server boots fine without it.
+          if ! docker compose logs telegramd 2>&1 | grep -q 'generated a dev key'; then
+            echo "telegramd did not generate a master key on first boot"
+            exit 1
+          fi
+          keyvol=$(key_volume)
+          [ -n "$keyvol" ] || { echo "no named volume at /var/lib/telegramd"; exit 1; }
+          key_before=$(key_file "$keyvol")
+          printf '%s' "$key_before" | grep -Eqx '[0-9a-f]{64}' \
+            || { echo "generated key file is not 64 hex chars"; exit 1; }
 
           before=$(fingerprint)
           [ -n "$before" ] || { echo "no fingerprint in the first boot logs"; exit 1; }
@@ -423,6 +467,17 @@ jobs:
           # rather than feed an empty string to a grep that then decides.
           canary=$(blob_read "$blobs")
           [ "$canary" = canary ] || { echo "blob volume did not survive docker compose down: read '$canary'"; exit 1; }
+
+          # The master key must be read, not minted again: a new one on restart
+          # would leave every stored auth key undecryptable and silently sign
+          # every client out.
+          if docker compose logs telegramd 2>&1 | grep -q 'generated a dev key'; then
+            echo "telegramd generated a second master key instead of reusing the key file"
+            exit 1
+          fi
+          key_after=$(key_file "$(key_volume)")
+          [ "$key_before" = "$key_after" ] \
+            || { echo "master key changed across docker compose down: every session would be lost"; exit 1; }
 
           after=$(fingerprint)
           echo "second boot fingerprint=$after"
