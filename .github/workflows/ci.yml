@@ -99,54 +99,8 @@ jobs:
       # A package prints (cached) here when $GOCACHE came back from the step
       # above carrying its result. Go decides that per package, so a package
       # whose source changed still runs in full.
-      - name: Diagnostics (MAIN-154, temporary)
-        run: |
-          df -h / /mnt 2>/dev/null || df -h
-          docker info --format 'ServerVersion={{.ServerVersion}} MemTotal={{.MemTotal}} NCPU={{.NCPU}}'
-          nohup docker events --filter type=container \
-            --format '{{.Time}} {{.Actor.Attributes.name}} {{.Action}} exit={{index .Actor.Attributes "exitCode"}}' \
-            > "$RUNNER_TEMP/docker-events.log" 2>&1 &
-          nohup bash -c 'while ! docker logs -f tg-test-pg; do sleep 1; done' \
-            > "$RUNNER_TEMP/pg.log" 2>&1 &
-          sudo sysctl -a 2>/dev/null | grep -E 'ip_local_port_range|somaxconn|nf_conntrack_max|tcp_max_syn_backlog|abort_on_overflow'
-          nohup bash -c 'while true; do
-              echo "T=$(date +%s) tw=$(ss -tan state time-wait | wc -l) est=$(ss -tan state established | wc -l) ct=$(sudo conntrack -C 2>/dev/null)";
-              ss -s | head -3;
-              sleep 3;
-            done' > "$RUNNER_TEMP/net.log" 2>&1 &
-          nohup bash -c '
-            p=""
-            while [ -z "$p" ]; do p=$(docker port tg-test-pg 5432/tcp 2>/dev/null | head -1 | sed "s/.*://"); sleep 1; done
-            echo "probing port $p"
-            while true; do
-              if ! timeout 2 bash -c "</dev/tcp/127.0.0.1/$p" 2>/dev/null; then
-                echo "PROBE-FAIL $(date +%s.%N)"
-                ss -ltn "sport = :$p"
-                docker ps --format "{{.Names}} {{.Status}} {{.Ports}}"
-              fi
-              sleep 0.2
-            done' > "$RUNNER_TEMP/probe.log" 2>&1 &
-          echo ok
-
       - name: Test
         run: make test
-        env:
-          # temporary: disable test result cache while diagnosing MAIN-154
-          GOFLAGS: -count=1
-
-      - name: Diagnostics dump (MAIN-154, temporary)
-        if: always()
-        run: |
-          df -h / /mnt 2>/dev/null || df -h
-          free -m
-          echo '--- docker events'; cat "$RUNNER_TEMP/docker-events.log" || true
-          echo '--- postgres container log (tail)'; tail -50 "$RUNNER_TEMP/pg.log" || true
-          echo '--- containers'; docker ps -a
-          echo '--- net samples'; tail -40 "$RUNNER_TEMP/net.log" || true
-          echo '--- probe'; grep -c PROBE-FAIL "$RUNNER_TEMP/probe.log" || true; head -60 "$RUNNER_TEMP/probe.log" || true
-          echo '--- iptables nat'; sudo iptables -t nat -S DOCKER || true
-          echo '--- docker-proxy'; ps aux | grep -c '[d]ocker-proxy'
-          echo '--- dmesg'; sudo dmesg -T | tail -60 || true
 
   # Builds the image and boots it against a migrated database. Docker is not
   # available in the environments the Dockerfile is edited from, so this job is
