@@ -343,9 +343,19 @@ Channels
 
 ## Planned — feature track
 
-### M11 and later
-- Message features: forwarding, reply threading, reactions, pinned messages,
-  scheduled messages.
+### M11 — Message features
+Four stages in sequence:
+
+1. **Reply threading.** `reply_to_msg_id` stored and echoed on send; history and
+   update payloads carry the reply reference so clients can render threads.
+2. **Message forwarding.** `messages.forwardMessages` with a forwarded-from header;
+   per-pair `access_hash` re-derived for the recipient rather than passed through.
+3. **Reactions.** Per-message emoji reactions; reaction counts in update payloads;
+   `messages.sendReaction` and `messages.getMessagesReactions`.
+4. **Pinned messages.** `messages.updatePinnedMessage` (admin-only in channels);
+   `updatePinnedMessages` pushed to members; pinned message id surfaced in dialog.
+
+### M12 and later
 - Usernames and public channels — a global namespace with no allocation policy,
   likely their own milestone.
 - Server-side full-text search.
