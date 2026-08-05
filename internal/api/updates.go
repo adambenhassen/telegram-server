@@ -653,9 +653,8 @@ func (h *handlers) handleGetState(r *mtproto.Request) (bin.Encoder, error) {
 }
 
 // handleGetDifference serves updates.getDifference: it replays the caller's
-// events after the client's pts. When the client is caught up it returns
-// differenceEmpty; a client pts ahead of the server (impossible under a single
-// writer) is clamped to empty rather than trusted.
+// missed pts events and qts-gapped encrypted messages. When caught up it
+// returns differenceEmpty; a client ahead of the server is clamped to empty.
 func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.UpdatesGetDifferenceRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -669,9 +668,46 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 		h.log.Error("get difference", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	// No pending events (caught up, or a client pts at/ahead of the server which
-	// the single-writer invariant clamps to empty): report empty.
-	if !b.more && len(b.ups) == 0 {
+
+	// Qts gap: fill encrypted messages the client has not yet seen.
+	// req.Qts > state.Qts is the client-ahead case — same clamp as pts, treat
+	// as caught up. req.Qts == state.Qts means no gap.
+	var encMsgs []tg.EncryptedMessageClass
+	encMore := false
+	newQts := b.state.Qts
+	if req.Qts < b.state.Qts {
+		evts, eerr := h.store.EncryptedEventsWindow(r.Ctx, r.UserID, req.Qts, b.state.Qts, maxDiffEvents+1)
+		if eerr != nil {
+			h.log.Error("get difference qts", "user_id", r.UserID, "err", eerr)
+			return nil, errInternal
+		}
+		if len(evts) > maxDiffEvents {
+			evts = evts[:maxDiffEvents]
+			encMore = true
+		}
+		for _, ev := range evts {
+			encMsgs = append(encMsgs, &tg.EncryptedMessage{
+				RandomID: ev.RandomID,
+				ChatID:   int(ev.ChatID),
+				Date:     int(ev.Date.Unix()),
+				Bytes:    ev.Bytes,
+			})
+		}
+		if encMore && len(evts) > 0 {
+			newQts = evts[len(evts)-1].Qts
+		}
+	}
+
+	// updateEncryption: secret chats whose state changed after req.Date.
+	// These carry no qts and are at-least-once; deliver in other_updates.
+	clientDate := time.Unix(int64(req.Date), 0)
+	secretChats, serr := h.store.SecretChatsAfterDate(r.Ctx, r.UserID, clientDate)
+	if serr != nil {
+		h.log.Error("get difference secret chats", "user_id", r.UserID, "err", serr)
+		return nil, errInternal
+	}
+
+	if !b.more && !encMore && len(b.ups) == 0 && len(encMsgs) == 0 && len(secretChats) == 0 {
 		return &tg.UpdatesDifferenceEmpty{Date: b.state.Date, Seq: b.state.Seq}, nil
 	}
 
@@ -684,22 +720,34 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 			other = append(other, u)
 		}
 	}
-	if b.more {
-		// Partial batch: the client applies it and re-requests from the
-		// intermediate state's pts until caught up.
+	for _, sc := range secretChats {
+		other = append(other, &tg.UpdateEncryption{
+			Chat: h.encryptedChatFor(sc, r.UserID),
+			Date: int(sc.Date.Unix()),
+		})
+	}
+
+	// The intermediate/final state advertises the qts of the last included
+	// encrypted event when truncated, or state.Qts when the gap is closed.
+	st := b.state
+	st.Qts = newQts
+
+	if b.more || encMore {
 		return &tg.UpdatesDifferenceSlice{
-			NewMessages:       newMessages,
-			OtherUpdates:      other,
-			Users:             b.users,
-			Chats:             b.chats,
-			IntermediateState: *stateToTL(b.state),
+			NewMessages:          newMessages,
+			NewEncryptedMessages: encMsgs,
+			OtherUpdates:         other,
+			Users:                b.users,
+			Chats:                b.chats,
+			IntermediateState:    *stateToTL(st),
 		}, nil
 	}
 	return &tg.UpdatesDifference{
-		NewMessages:  newMessages,
-		OtherUpdates: other,
-		Users:        b.users,
-		Chats:        b.chats,
-		State:        *stateToTL(b.state),
+		NewMessages:          newMessages,
+		NewEncryptedMessages: encMsgs,
+		OtherUpdates:         other,
+		Users:                b.users,
+		Chats:                b.chats,
+		State:                *stateToTL(st),
 	}, nil
 }
