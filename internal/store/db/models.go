@@ -132,6 +132,7 @@ type Message struct {
 	ActionType   int16
 	ActionUserID int64
 	FileID       int64
+	ReplyToMsgID *int32
 }
 
 type MessageEvent struct {

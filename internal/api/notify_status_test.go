@@ -14,7 +14,7 @@ import (
 // sendStatus creates a 1:1 dialog between from and to by sending a message.
 func sendStatus(t *testing.T, s *store.Store, from, to store.User) {
 	t.Helper()
-	_, _, _, _, err := s.SendMessage(context.Background(), from.ID, to.ID, "ping", 1, 0) //nolint:dogsled // dialog creation only
+	_, _, _, _, err := s.SendMessage(context.Background(), from.ID, to.ID, "ping", 1, 0, 0) //nolint:dogsled // dialog creation only
 	if err != nil {
 		t.Fatalf("send message: %v", err)
 	}

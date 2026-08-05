@@ -151,7 +151,14 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 		return h.sendChatMessage(r, toID, &req)
 	}
 
-	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0)
+	replyToMsgID := int64(0)
+	if replyTo, ok := req.GetReplyTo(); ok {
+		if rep, ok := replyTo.(*tg.InputReplyToMessage); ok && rep.ReplyToMsgID > 0 {
+			replyToMsgID = int64(rep.ReplyToMsgID)
+		}
+	}
+
+	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0, replyToMsgID)
 	if err != nil {
 		h.log.Error("send message", "user_id", r.UserID, "err", err)
 		return nil, errInternal

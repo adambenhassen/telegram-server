@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"sort"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -13,6 +14,22 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
+
+// replySnippet returns a short preview of the quoted message text, truncated
+// to Telegram snippet width. Uses word boundaries where possible.
+func replySnippet(s string) string {
+	if len(s) <= 25 {
+		return s
+	}
+	trunc := s[:25]
+	if r, size := utf8.DecodeLastRuneInString(trunc); r == utf8.RuneError && size == 1 {
+		trunc = trunc[:len(trunc)-1]
+	} else if size > 1 {
+		// last rune cut in half
+		trunc = trunc[:len(trunc)-1]
+	}
+	return trunc
+}
 
 // messageToTL maps a stored message to the wire message. The peer follows
 // peer_type; from is always PeerUser, since the author of a chat message is a
@@ -48,6 +65,15 @@ func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Docum
 	}
 	// SetMedia rather than a plain assignment: Media is a conditional field and
 	// encodes only when its flag is set with it.
+	if m.ReplyToMsgID > 0 {
+		hdr := new(tg.MessageReplyHeader)
+		hdr.SetReplyToMsgID(int(m.ReplyToMsgID))
+		hdr.SetReplyToPeerID(peerToTL(m.PeerType, m.PeerID))
+		if m.Text != "" {
+			hdr.SetQuoteText(replySnippet(m.Text))
+		}
+		msg.SetReplyTo(hdr)
+	}
 	if d, ok := files[m.FileID]; ok && m.FileID != 0 {
 		msg.SetMedia(&tg.MessageMediaDocument{Document: d})
 	}

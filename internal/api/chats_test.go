@@ -135,7 +135,7 @@ func TestHandleCreateChatFansOutToEveryMember(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bystander: %v", err)
 	}
-	if _, _, _, _, err = s.SendMessage(ctx, creator.ID, bystander.ID, "warmup", 991, 0); err != nil {
+	if _, _, _, _, err = s.SendMessage(ctx, creator.ID, bystander.ID, "warmup", 991, 0, 0); err != nil {
 		t.Fatalf("warmup send: %v", err)
 	}
 
@@ -412,7 +412,7 @@ func TestHandleEditChatTitleRenamesAndAnnounces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bystander: %v", err)
 	}
-	if _, _, _, _, err = s.SendMessage(ctx, member.ID, bystander.ID, "warmup", 992, 0); err != nil {
+	if _, _, _, _, err = s.SendMessage(ctx, member.ID, bystander.ID, "warmup", 992, 0, 0); err != nil {
 		t.Fatalf("warmup send: %v", err)
 	}
 

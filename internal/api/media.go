@@ -188,7 +188,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 		return h.sendChatMedia(r, toID, &req, fileID)
 	}
 
-	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, fileID)
+	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, fileID, 0)
 	if err != nil {
 		h.log.Error("send media", "user_id", r.UserID, "err", err)
 		return nil, errInternal

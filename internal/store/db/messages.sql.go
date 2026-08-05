@@ -10,7 +10,7 @@ import (
 )
 
 const historyPage = `-- name: HistoryPage :many
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id FROM messages
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id FROM messages
 WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3
   AND deleted = false
   AND ($4::bigint = 0 OR local_id < $4::bigint)
@@ -58,6 +58,7 @@ func (q *Queries) HistoryPage(ctx context.Context, arg HistoryPageParams) ([]Mes
 			&i.ActionType,
 			&i.ActionUserID,
 			&i.FileID,
+			&i.ReplyToMsgID,
 		); err != nil {
 			return nil, err
 		}
@@ -71,8 +72,8 @@ func (q *Queries) HistoryPage(ctx context.Context, arg HistoryPageParams) ([]Mes
 
 const insertMessage = `-- name: InsertMessage :exec
 INSERT INTO messages (owner_id, local_id, peer_type, peer_id, from_id, message, out, random_id, peer_local_id,
-                      fanout_id, action_type, action_user_id, file_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                      fanout_id, action_type, action_user_id, file_id, reply_to_msg_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 `
 
 type InsertMessageParams struct {
@@ -89,6 +90,7 @@ type InsertMessageParams struct {
 	ActionType   int16
 	ActionUserID int64
 	FileID       int64
+	ReplyToMsgID *int32
 }
 
 func (q *Queries) InsertMessage(ctx context.Context, arg InsertMessageParams) error {
@@ -106,12 +108,13 @@ func (q *Queries) InsertMessage(ctx context.Context, arg InsertMessageParams) er
 		arg.ActionType,
 		arg.ActionUserID,
 		arg.FileID,
+		arg.ReplyToMsgID,
 	)
 	return err
 }
 
 const messageByOwnerLocal = `-- name: MessageByOwnerLocal :one
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id FROM messages WHERE owner_id = $1 AND local_id = $2
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id FROM messages WHERE owner_id = $1 AND local_id = $2
 `
 
 type MessageByOwnerLocalParams struct {
@@ -139,12 +142,13 @@ func (q *Queries) MessageByOwnerLocal(ctx context.Context, arg MessageByOwnerLoc
 		&i.ActionType,
 		&i.ActionUserID,
 		&i.FileID,
+		&i.ReplyToMsgID,
 	)
 	return i, err
 }
 
 const messageByRandomID = `-- name: MessageByRandomID :one
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id FROM messages WHERE owner_id = $1 AND random_id = $2 AND random_id <> 0
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id FROM messages WHERE owner_id = $1 AND random_id = $2 AND random_id <> 0
 `
 
 type MessageByRandomIDParams struct {
@@ -172,12 +176,13 @@ func (q *Queries) MessageByRandomID(ctx context.Context, arg MessageByRandomIDPa
 		&i.ActionType,
 		&i.ActionUserID,
 		&i.FileID,
+		&i.ReplyToMsgID,
 	)
 	return i, err
 }
 
 const messagesByFanout = `-- name: MessagesByFanout :many
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id FROM messages
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id FROM messages
 WHERE fanout_id = $1 AND fanout_id <> 0
 ORDER BY owner_id
 `
@@ -213,6 +218,7 @@ func (q *Queries) MessagesByFanout(ctx context.Context, fanoutID int64) ([]Messa
 			&i.ActionType,
 			&i.ActionUserID,
 			&i.FileID,
+			&i.ReplyToMsgID,
 		); err != nil {
 			return nil, err
 		}
