@@ -7,11 +7,13 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const acceptSecretChat = `-- name: AcceptSecretChat :one
 UPDATE secret_chats
-SET state = 'active', g_a_or_b = $1, key_fingerprint = $2
+SET state = 'active', g_a_or_b = $1, key_fingerprint = $2, date = now()
 WHERE id = $3 AND participant_id = $4 AND state = 'requested'
 RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id
 `
@@ -112,7 +114,7 @@ func (q *Queries) DeleteEncryptedEventsByQts(ctx context.Context, arg DeleteEncr
 
 const discardSecretChat = `-- name: DiscardSecretChat :one
 UPDATE secret_chats
-SET state = 'discarded'
+SET state = 'discarded', date = now()
 WHERE id = $1 AND state IN ('requested', 'active')
 RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id
 `
@@ -135,6 +137,55 @@ func (q *Queries) DiscardSecretChat(ctx context.Context, id int32) (SecretChat, 
 		&i.RandomID,
 	)
 	return i, err
+}
+
+const encryptedEventsWindow = `-- name: EncryptedEventsWindow :many
+SELECT owner_id, qts, chat_id, random_id, bytes, date FROM encrypted_events
+WHERE owner_id = $1 AND qts > $2 AND qts <= $3
+ORDER BY qts
+LIMIT $4
+`
+
+type EncryptedEventsWindowParams struct {
+	OwnerID int64
+	Qts     int64
+	Qts_2   int64
+	Limit   int32
+}
+
+// EncryptedEventsWindow returns up to limit events for owner_id with qts in
+// (from_qts, to_qts], ordered ascending. The caller fetches limit+1 to detect
+// truncation without a separate count query.
+func (q *Queries) EncryptedEventsWindow(ctx context.Context, arg EncryptedEventsWindowParams) ([]EncryptedEvent, error) {
+	rows, err := q.db.Query(ctx, encryptedEventsWindow,
+		arg.OwnerID,
+		arg.Qts,
+		arg.Qts_2,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []EncryptedEvent
+	for rows.Next() {
+		var i EncryptedEvent
+		if err := rows.Scan(
+			&i.OwnerID,
+			&i.Qts,
+			&i.ChatID,
+			&i.RandomID,
+			&i.Bytes,
+			&i.Date,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getEncryptedEvent = `-- name: GetEncryptedEvent :one
@@ -327,4 +378,48 @@ func (q *Queries) SecretChatByID(ctx context.Context, id int32) (SecretChat, err
 		&i.RandomID,
 	)
 	return i, err
+}
+
+const secretChatsAfterDate = `-- name: SecretChatsAfterDate :many
+SELECT id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id FROM secret_chats
+WHERE (admin_id = $1 OR participant_id = $1) AND date > $2
+`
+
+type SecretChatsAfterDateParams struct {
+	AdminID int64
+	Date    pgtype.Timestamptz
+}
+
+// SecretChatsAfterDate returns all secret_chats rows where user_id is a party
+// and the row's date is strictly after after_date. Used by getDifference to
+// deliver missed updateEncryption events.
+func (q *Queries) SecretChatsAfterDate(ctx context.Context, arg SecretChatsAfterDateParams) ([]SecretChat, error) {
+	rows, err := q.db.Query(ctx, secretChatsAfterDate, arg.AdminID, arg.Date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SecretChat
+	for rows.Next() {
+		var i SecretChat
+		if err := rows.Scan(
+			&i.ID,
+			&i.AdminID,
+			&i.ParticipantID,
+			&i.State,
+			&i.GAHash,
+			&i.GA,
+			&i.GAOrB,
+			&i.KeyFingerprint,
+			&i.Date,
+			&i.RandomID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

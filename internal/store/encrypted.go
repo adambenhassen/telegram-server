@@ -36,3 +36,22 @@ func (s *Store) GetQts(ctx context.Context, userID int64) (int64, error) {
 	}
 	return row.Qts, nil
 }
+
+// EncryptedEventsWindow returns up to limit events for ownerID with qts in
+// (fromQts, toQts], ordered ascending. Pass limit+1 to detect truncation.
+func (s *Store) EncryptedEventsWindow(ctx context.Context, ownerID int64, fromQts, toQts, limit int) ([]EncryptedEvent, error) {
+	rows, err := s.q.EncryptedEventsWindow(ctx, db.EncryptedEventsWindowParams{
+		OwnerID: ownerID,
+		Qts:     int64(fromQts),
+		Qts_2:   int64(toQts),
+		Limit:   int32(limit), //nolint:gosec // limit is a small server-set cap
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encrypted events window: %w", err)
+	}
+	out := make([]EncryptedEvent, len(rows))
+	for i, r := range rows {
+		out[i] = encryptedEventFromRow(r)
+	}
+	return out, nil
+}
