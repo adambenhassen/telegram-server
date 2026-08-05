@@ -19,6 +19,25 @@ jobs:
     # The suite finishes in ~2m30s; this only catches a hang (a stalled image
     # pull, a container that never reports ready) before it burns six hours.
     timeout-minutes: 20
+
+    env:
+      # Ryuk is testcontainers' reaper: it kills the containers of a test
+      # session once the last test binary disconnects from it. Every test binary
+      # keeps a TCP connection to it open for its whole life, and that
+      # connection goes to Ryuk's *published* port, i.e. through docker-proxy —
+      # the same docker-proxy that drops connections under load, which is why
+      # pgtest talks to Postgres on the bridge IP instead (MAIN-154, MAIN-156).
+      # Ryuk has no such escape hatch: drop its last connection and it SIGKILLs
+      # the shared tg-test-pg container out from under the test binaries still
+      # using it, which surfaces as "terminating connection due to unexpected
+      # postmaster exit" (57P01) and then "no route to host" for the rest of the
+      # e2e suite (MAIN-160).
+      #
+      # The runner is destroyed at the end of the job, so there is nothing for a
+      # reaper to reap here; it is pure risk. Leave it on locally, where a leaked
+      # container does outlive the run.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -101,6 +120,18 @@ jobs:
       # whose source changed still runs in full.
       - name: Test
         run: make test
+
+      # The suite talks to one shared Postgres container, so when that container
+      # dies mid-run every remaining test fails with a connection error and the
+      # log says nothing about why it died. These three answer that: the exit
+      # code and OOMKilled flag say who killed it, the Postgres log says whether
+      # it shut down on its own, and the free memory rules resources in or out.
+      - name: Postgres container state on failure
+        if: failure()
+        run: |
+          docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oomkilled={{.State.OOMKilled}} error={{.State.Error}}' tg-test-pg || echo "container gone"
+          docker logs --tail 50 tg-test-pg 2>&1 || true
+          free -m
 
   # Builds the image and boots it against a migrated database. Docker is not
   # available in the environments the Dockerfile is edited from, so this job is
