@@ -25,7 +25,7 @@ SELECT * FROM secret_chats WHERE id = $1;
 -- already keyed.
 -- name: AcceptSecretChat :one
 UPDATE secret_chats
-SET state = 'active', g_a_or_b = sqlc.arg(g_a_or_b), key_fingerprint = sqlc.arg(key_fingerprint)
+SET state = 'active', g_a_or_b = sqlc.arg(g_a_or_b), key_fingerprint = sqlc.arg(key_fingerprint), date = now()
 WHERE id = sqlc.arg(id) AND participant_id = sqlc.arg(participant_id) AND state = 'requested'
 RETURNING *;
 
@@ -33,7 +33,7 @@ RETURNING *;
 -- zero rows, and 'discarded' is terminal.
 -- name: DiscardSecretChat :one
 UPDATE secret_chats
-SET state = 'discarded'
+SET state = 'discarded', date = now()
 WHERE id = $1 AND state IN ('requested', 'active')
 RETURNING *;
 

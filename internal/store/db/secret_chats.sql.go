@@ -13,7 +13,7 @@ import (
 
 const acceptSecretChat = `-- name: AcceptSecretChat :one
 UPDATE secret_chats
-SET state = 'active', g_a_or_b = $1, key_fingerprint = $2
+SET state = 'active', g_a_or_b = $1, key_fingerprint = $2, date = now()
 WHERE id = $3 AND participant_id = $4 AND state = 'requested'
 RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id
 `
@@ -114,7 +114,7 @@ func (q *Queries) DeleteEncryptedEventsByQts(ctx context.Context, arg DeleteEncr
 
 const discardSecretChat = `-- name: DiscardSecretChat :one
 UPDATE secret_chats
-SET state = 'discarded'
+SET state = 'discarded', date = now()
 WHERE id = $1 AND state IN ('requested', 'active')
 RETURNING id, admin_id, participant_id, state, g_a_hash, g_a, g_a_or_b, key_fingerprint, date, random_id
 `

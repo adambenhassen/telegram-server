@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
@@ -756,5 +757,109 @@ func TestRequestEncryptionDedupSameRandomID(t *testing.T) {
 	}
 	if chat.State != store.SecretChatRequested {
 		t.Errorf("state = %q, want %q", chat.State, store.SecretChatRequested)
+	}
+}
+
+// TestGetDifferenceDeliversMissedAccept verifies that a client whose date
+// predates the accept transition receives updateEncryption via getDifference.
+// This requires AcceptSecretChat to stamp date = now() on transition so the
+// SecretChatsAfterDate query can see the updated row.
+func TestGetDifferenceDeliversMissedAccept(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	a, b := twoUsersFor(t, s, "+15551396001", "+15551396002")
+
+	// Record the time before the accept so we can use it as req.Date.
+	beforeAccept := time.Now()
+	waiting := requestChat(t, s, a, b)
+	id := int32(waiting.ID) //nolint:gosec // test id
+
+	if _, err := api.AcceptEncryptionForTest(s, b, &tg.MessagesAcceptEncryptionRequest{
+		Peer:           api.InputEncryptedChat(b, id),
+		GB:             validGB(),
+		KeyFingerprint: 1,
+	}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	// b calls getDifference with a date before the accept; should get updateEncryption.
+	enc, err := api.GetDifferenceForTest(s, b, &tg.UpdatesGetDifferenceRequest{
+		Pts:  0,
+		Qts:  0,
+		Date: int(beforeAccept.Unix()),
+	})
+	if err != nil {
+		t.Fatalf("get difference: %v", err)
+	}
+
+	var encUpdates []*tg.UpdateEncryption
+	switch v := enc.(type) {
+	case *tg.UpdatesDifference:
+		for _, u := range v.OtherUpdates {
+			if ue, ok := u.(*tg.UpdateEncryption); ok {
+				encUpdates = append(encUpdates, ue)
+			}
+		}
+	case *tg.UpdatesDifferenceEmpty:
+		// no updates at all — fail below
+	default:
+		t.Fatalf("type = %T", enc)
+	}
+
+	if len(encUpdates) == 0 {
+		t.Fatal("no updateEncryption in other_updates; missed accept not replayed")
+	}
+	if _, ok := encUpdates[0].Chat.(*tg.EncryptedChat); !ok {
+		t.Fatalf("chat type = %T, want *tg.EncryptedChat (active)", encUpdates[0].Chat)
+	}
+}
+
+// TestGetDifferenceDeliversMissedDiscard verifies that a client whose date
+// predates a discard transition receives updateEncryption via getDifference.
+// This requires DiscardSecretChat to stamp date = now() on transition.
+func TestGetDifferenceDeliversMissedDiscard(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	a, b := twoUsersFor(t, s, "+15551396003", "+15551396004")
+
+	waiting := requestChat(t, s, a, b)
+	id := int32(waiting.ID) //nolint:gosec // test id
+
+	// Record before the discard.
+	beforeDiscard := time.Now()
+
+	if _, err := api.DiscardEncryptionForTest(s, a, &tg.MessagesDiscardEncryptionRequest{ChatID: int(id)}); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+
+	// a calls getDifference with a date before the discard; should get updateEncryption.
+	enc, err := api.GetDifferenceForTest(s, a, &tg.UpdatesGetDifferenceRequest{
+		Pts:  0,
+		Qts:  0,
+		Date: int(beforeDiscard.Unix()),
+	})
+	if err != nil {
+		t.Fatalf("get difference: %v", err)
+	}
+
+	var encUpdates []*tg.UpdateEncryption
+	switch v := enc.(type) {
+	case *tg.UpdatesDifference:
+		for _, u := range v.OtherUpdates {
+			if ue, ok := u.(*tg.UpdateEncryption); ok {
+				encUpdates = append(encUpdates, ue)
+			}
+		}
+	case *tg.UpdatesDifferenceEmpty:
+		// no updates — fail below
+	default:
+		t.Fatalf("type = %T", enc)
+	}
+
+	if len(encUpdates) == 0 {
+		t.Fatal("no updateEncryption in other_updates; missed discard not replayed")
+	}
+	if _, ok := encUpdates[0].Chat.(*tg.EncryptedChatDiscarded); !ok {
+		t.Fatalf("chat type = %T, want *tg.EncryptedChatDiscarded", encUpdates[0].Chat)
 	}
 }
