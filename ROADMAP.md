@@ -327,10 +327,23 @@ Channels
   for a connected peer; a never-connected account renders as `UserStatusEmpty`; self always returns
   `UserStatusRecently`; a user sharing no dialog receives no status push for the changed user.
 
+### M10 — Secret chats
+- Key exchange RPC surface: `messages.requestEncryption`, `messages.acceptEncryption`,
+  `messages.discardEncryption`, `messages.getDhConfig`. Diffie–Hellman parameters
+  served from `dh_config`; key fingerprint stored and verified on accept.
+- `messages.sendEncryptedMessage` — opaque relay: the server stores and fans out the
+  encrypted blob without inspecting it; no plaintext ever leaves the sender's device.
+- `receivedQueue` acknowledgement: the server records which encrypted message ids the
+  recipient has confirmed so the sender can clear its local outbox.
+- `updates.getDifference` qts gap recovery: missed secret-chat updates are replayed
+  via the `qts` stream so clients that come back online do not lose events.
+- Schema additions: `encrypted_events` table for the opaque relay log,
+  `secret_chats` table for per-chat key state and metadata,
+  `update_state.qts` counter advancing on each secret-chat event.
+
 ## Planned — feature track
 
-### M10 and later
-- Secret chats (end-to-end, separate key exchange, `qts` stream).
+### M11 and later
 - Message features: forwarding, reply threading, reactions, pinned messages,
   scheduled messages.
 - Usernames and public channels — a global namespace with no allocation policy,
@@ -381,7 +394,6 @@ Tracked so shortcuts don't rot into "later means never".
   session-safe, an epoch or accept-previous window must be added to the derivation
   in the same change, or every cached peer on every live session breaks silently.
   — M8.
-- **`qts`.** Column kept at 0; no secret-chat / bot update stream. — M4.
 - **Client-pts-ahead resync.** A client `pts` past the server is clamped to empty
   (single-writer invariant), not an explicit resync response. — M4.
 - **`seq` on update envelopes.** Minimal; gotd relies on `pts` for dedup, so `seq`
