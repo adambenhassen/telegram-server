@@ -7,7 +7,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
@@ -768,11 +767,16 @@ func TestGetDifferenceDeliversMissedAccept(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
 	a, b := twoUsersFor(t, s, "+15551396001", "+15551396002")
+	ctx := context.Background()
 
-	// Record the time before the accept so we can use it as req.Date.
-	beforeAccept := time.Now()
 	waiting := requestChat(t, s, a, b)
 	id := int32(waiting.ID) //nolint:gosec // test id
+
+	// Load the chat before the transition to capture its creation date.
+	chatBefore, err := s.SecretChatByID(ctx, id)
+	if err != nil {
+		t.Fatalf("load before: %v", err)
+	}
 
 	if _, err := api.AcceptEncryptionForTest(s, b, &tg.MessagesAcceptEncryptionRequest{
 		Peer:           api.InputEncryptedChat(b, id),
@@ -782,11 +786,20 @@ func TestGetDifferenceDeliversMissedAccept(t *testing.T) {
 		t.Fatalf("accept: %v", err)
 	}
 
+	// AcceptSecretChat must stamp date = now() on transition.
+	chatAfter, err := s.SecretChatByID(ctx, id)
+	if err != nil {
+		t.Fatalf("load after: %v", err)
+	}
+	if !chatAfter.Date.After(chatBefore.Date) {
+		t.Fatalf("date not updated by accept: before=%v after=%v", chatBefore.Date, chatAfter.Date)
+	}
+
 	// b calls getDifference with a date before the accept; should get updateEncryption.
 	enc, err := api.GetDifferenceForTest(s, b, &tg.UpdatesGetDifferenceRequest{
 		Pts:  0,
 		Qts:  0,
-		Date: int(beforeAccept.Unix()),
+		Date: int(chatBefore.Date.Unix()),
 	})
 	if err != nil {
 		t.Fatalf("get difference: %v", err)
@@ -821,22 +834,35 @@ func TestGetDifferenceDeliversMissedDiscard(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
 	a, b := twoUsersFor(t, s, "+15551396003", "+15551396004")
+	ctx := context.Background()
 
 	waiting := requestChat(t, s, a, b)
 	id := int32(waiting.ID) //nolint:gosec // test id
 
-	// Record before the discard.
-	beforeDiscard := time.Now()
+	// Load the chat before the transition to capture its creation date.
+	chatBefore, err := s.SecretChatByID(ctx, id)
+	if err != nil {
+		t.Fatalf("load before: %v", err)
+	}
 
 	if _, err := api.DiscardEncryptionForTest(s, a, &tg.MessagesDiscardEncryptionRequest{ChatID: int(id)}); err != nil {
 		t.Fatalf("discard: %v", err)
+	}
+
+	// DiscardSecretChat must stamp date = now() on transition.
+	chatAfter, err := s.SecretChatByID(ctx, id)
+	if err != nil {
+		t.Fatalf("load after: %v", err)
+	}
+	if !chatAfter.Date.After(chatBefore.Date) {
+		t.Fatalf("date not updated by discard: before=%v after=%v", chatBefore.Date, chatAfter.Date)
 	}
 
 	// a calls getDifference with a date before the discard; should get updateEncryption.
 	enc, err := api.GetDifferenceForTest(s, a, &tg.UpdatesGetDifferenceRequest{
 		Pts:  0,
 		Qts:  0,
-		Date: int(beforeDiscard.Unix()),
+		Date: int(chatBefore.Date.Unix()),
 	})
 	if err != nil {
 		t.Fatalf("get difference: %v", err)
