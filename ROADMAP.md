@@ -53,6 +53,7 @@ Auth & account
 - `account.getPassword`, `account.getPasswordSettings`,
   `account.updatePasswordSettings`
 - `account.getAuthorizations`, `account.resetAuthorization`
+- `account.updateStatus`
 
 Users & help
 - `help.getConfig`, `users.getUsers`
@@ -293,15 +294,47 @@ Channels
   M1 placeholder hash is refused for user and channel peers, and that a hash issued
   to one account is refused when submitted by another.
 
+### M9 — Online/offline presence
+- `account.updateStatus` as the explicit online/offline toggle. Online/offline state is per-user,
+  not per-connection: a user with two open connections stays online until their last connection
+  closes or they call `account.updateStatus(offline=true)`. A single close on a multi-connection
+  account is a no-op for status.
+- Connection lifecycle is the implicit trigger. The mtproto server exposes an `OnStatusChange`
+  callback that fires `online=true` when a session first binds to a user on this process and
+  `online=false` when their last session exits. The production wiring calls `SetUserStatus` then
+  `NOTIFY` on `tg_status`, so connect and disconnect follow the same fan-out path as the explicit
+  RPC.
+- Fan-out over `LISTEN`/`NOTIFY`. Each replica's listener calls `DeliverStatus` on a `tg_status`
+  notification: it queries the changed user's 1:1 dialog partners and pushes `updateUserStatus` to
+  each partner's live connections on that replica. The changed user's own connections receive no
+  push — the client updates its own display from the RPC response, not a server-initiated message.
+- Fan-out target is the set of accounts sharing a non-deleted 1:1 dialog with the changed user. A
+  user who shares no dialog receives no status push for them. Group and channel membership do not
+  contribute to the target set; presence for bots and channels is out of scope as a user-status
+  concept.
+- `UserStatusRecently` is the self-status sentinel. `userToTL` always returns it when `self=true`,
+  so a caller's own account never discloses its real online state to itself. Every other peer
+  renders `UserStatusOnline` (5-minute `Expires`, the canonical Telegram value, not tunable) or
+  `UserStatusOffline` (with `WasOnline` from the stored `last_seen_at` timestamp). An account whose
+  `last_seen_at` is null — created but never put through the status lifecycle — renders as
+  `UserStatusEmpty`, not `UserStatusOffline{WasOnline:0}`.
+- Status pushes are transient: they carry no `pts`, are never written to the per-owner event log,
+  and never appear in `updates.getDifference`. A missed push is not a loss — the partner's next
+  `getDialogs` or `users.getUsers` reflects the current stored state.
+- E2E gates prove: connect triggers an online push to dialog partners; disconnect triggers an offline
+  push with a nonzero `WasOnline` timestamp; `account.updateStatus(offline=true)` while still
+  connected pushes offline without closing the connection; `getDialogs` returns `UserStatusOnline`
+  for a connected peer; a never-connected account renders as `UserStatusEmpty`; self always returns
+  `UserStatusRecently`; a user sharing no dialog receives no status push for the changed user.
+
 ## Planned — feature track
 
-### M9 and later
+### M10 and later
 - Secret chats (end-to-end, separate key exchange, `qts` stream).
 - Message features: forwarding, reply threading, reactions, pinned messages,
   scheduled messages.
 - Usernames and public channels — a global namespace with no allocation policy,
   likely their own milestone.
-- Presence/online status, `updateUserStatus`.
 - Server-side full-text search.
 
 ## Planned — operational track
@@ -474,6 +507,14 @@ Tracked so shortcuts don't rot into "later means never".
 - **`store.channels.version` has no wire counterpart.** The column is written
   and kept in Postgres but never rendered: `tg.Channel` in gotd v0.161.0
   carries no `Version` field, unlike `tg.Chat`. — M7
+
+- **Status privacy settings.** Any account sharing a non-deleted 1:1 dialog can see any other
+  account's live status. The Telegram hide-online-status controls (hide-all,
+  hide-from-non-contacts) are deferred pending a contacts and block-list model; the fan-out target
+  set has no membership boundary to gate on until one exists. — M9
+- **Cross-replica status delivery in the E2E gate.** The M9 E2E status tests run single-process;
+  cross-replica delivery is covered by the existing `LISTEN`/`NOTIFY` architecture but is not gated
+  against a two-replica topology. — M9
 
 ## Engineering invariants
 
