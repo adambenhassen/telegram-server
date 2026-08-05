@@ -33,6 +33,10 @@ type FanOut struct {
 	// FileID attaches an uploaded file to every per-member copy. 0 = no media.
 	FileID int64
 
+	// ReplyToMsgID is the message-local-id the message should quote in this chat.
+	// Non-zero to link; 0 means the message is not a reply.
+	ReplyToMsgID int64
+
 	// Extra is a member id to include in this fan-out even though the chat's
 	// current member set may not contain them — needed so a removed user
 	// receives the service message announcing their own removal. Nil otherwise.
@@ -220,10 +224,16 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 			unread = 0
 			senderLocalID = b.LocalID
 		}
+		replyToMsgID := (*int32)(nil)
+		if f.ReplyToMsgID > 0 {
+			id := int32(f.ReplyToMsgID)
+			replyToMsgID = &id
+		}
 		if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
 			OwnerID: owner, LocalID: b.LocalID, PeerType: int16(PeerTypeChat), PeerID: f.ChatID, FromID: f.FromID,
 			Message: f.Text, Out: out, RandomID: randomID, PeerLocalID: 0,
 			FanoutID: fanoutID, ActionType: int16(f.Action), ActionUserID: f.ActionUserID, FileID: f.FileID,
+			ReplyToMsgID: replyToMsgID,
 		}); err != nil {
 			return Message{}, nil, false, fmt.Errorf("insert message %d: %w", owner, err)
 		}

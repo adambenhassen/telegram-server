@@ -204,7 +204,7 @@ func InputUser(viewerID, peerID int64) *tg.InputUser {
 // builds by hand. Media is hydrated from the store, so it is asserted through
 // the read paths instead.
 func MessageToTL(m store.Message, createUsers []int64) tg.MessageClass {
-	return messageToTL(m, createUsers, nil)
+	return messageToTL(m, createUsers, nil, nil)
 }
 
 // DocumentToTL exposes the file-to-wire mapper for the external api_test package.

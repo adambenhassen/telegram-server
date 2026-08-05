@@ -23,10 +23,11 @@ func replySnippet(s string) string {
 	}
 	trunc := s[:25]
 	if r, size := utf8.DecodeLastRuneInString(trunc); r == utf8.RuneError && size == 1 {
+		// single byte of a multi-byte rune—drop it
 		trunc = trunc[:len(trunc)-1]
-	} else if size > 1 {
-		// last rune cut in half
-		trunc = trunc[:len(trunc)-1]
+	} else if r == utf8.RuneError {
+		// multi-byte rune started inside trunc; remove it entirely
+		trunc = trunc[:len(trunc)-size]
 	}
 	return trunc
 }
@@ -41,7 +42,7 @@ func replySnippet(s string) string {
 // the mapper stays pure, so the one action that needs a member set is handed it
 // rather than fetching it. files is the same pattern for media, keyed by file
 // id; a row whose file id is absent from it renders as a plain message.
-func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Document) tg.MessageClass {
+func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Document, replyTexts map[int32]string) tg.MessageClass {
 	if m.Action != store.ChatActionNone {
 		return &tg.MessageService{
 			ID:     int(m.LocalID),
@@ -69,8 +70,8 @@ func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Docum
 		hdr := new(tg.MessageReplyHeader)
 		hdr.SetReplyToMsgID(int(m.ReplyToMsgID))
 		hdr.SetReplyToPeerID(peerToTL(m.PeerType, m.PeerID))
-		if m.Text != "" {
-			hdr.SetQuoteText(replySnippet(m.Text))
+		if txt := replyTexts[m.ReplyToMsgID]; txt != "" {
+			hdr.SetQuoteText(replySnippet(txt))
 		}
 		msg.SetReplyTo(hdr)
 	}
@@ -422,7 +423,7 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 				}
 			}
 		}
-		tlMsg := messageToTL(m, createUsers, files)
+		tlMsg := messageToTL(m, createUsers, files, nil)
 		refs := []int64{m.FromID}
 		var chatRefs []int64
 		if m.PeerType == store.PeerTypeChat {
