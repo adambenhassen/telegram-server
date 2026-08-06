@@ -71,7 +71,7 @@ func TestDeliverStatusPushesToPartnersOnly(t *testing.T) {
 		},
 		func(context.Context, int64, int) {},
 		func(context.Context, int64, int64, int64) {},
-		func(context.Context, store.PeerType, int64, bool) {},
+		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
 	)
 	if err != nil {
@@ -132,7 +132,7 @@ func TestDeliverStatusOnline(t *testing.T) {
 		},
 		func(context.Context, int64, int) {},
 		func(context.Context, int64, int64, int64) {},
-		func(context.Context, store.PeerType, int64, bool) {},
+		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
 	)
 	if err != nil {
@@ -173,7 +173,7 @@ func TestDeliverStatusNoPartners(t *testing.T) {
 		},
 		func(context.Context, int64, int) {},
 		func(context.Context, int64, int64, int64) {},
-		func(context.Context, store.PeerType, int64, bool) {},
+		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
 	)
 	if err != nil {
@@ -203,7 +203,7 @@ func TestDeliverStatusMalformedPayload(t *testing.T) {
 		func(context.Context, int64, bool) { close(panicOnCall) },
 		func(context.Context, int64, int) {},
 		func(context.Context, int64, int64, int64) {},
-		func(context.Context, store.PeerType, int64, bool) {},
+		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
 	)
 	if err != nil {

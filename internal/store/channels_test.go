@@ -963,3 +963,45 @@ func TestConcurrentJoinAndRevokeRevokeWins(t *testing.T) {
 		t.Fatalf("join after revoke: err = %v, want ErrInviteInvalid", joinErr)
 	}
 }
+
+func TestSetChannelPinnedMessageRejectsDeletedPost(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	author := mustUser(t, s, "+15551293001")
+	ch := mustChannel(t, s, author.ID, "test channel").ID
+
+	// Post a message.
+	post, _, _, err := s.PostChannelMessage(ctx, ch, author.ID, "hello", 1, nil)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// Mark it deleted.
+	err = store.SetChannelPostDeleted(ctx, s, ch, post.LocalID)
+	if err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
+
+	// Attempt to pin the deleted post.
+	pinnedID := int32(post.LocalID) //nolint:gosec // local_id fits int32
+	_, _, err = s.SetChannelPinnedMessage(ctx, ch, author.ID, &pinnedID)
+	if !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("pin deleted post: err = %v, want ErrMessageInvalid", err)
+	}
+}
+
+func TestSetChannelPinnedMessageRejectsNonexistentPost(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	author := mustUser(t, s, "+15551293002")
+	ch := mustChannel(t, s, author.ID, "test channel").ID
+
+	// Attempt to pin a post that does not exist.
+	pinnedID := int32(999999)
+	_, _, err := s.SetChannelPinnedMessage(ctx, ch, author.ID, &pinnedID)
+	if !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("pin nonexistent post: err = %v, want ErrMessageInvalid", err)
+	}
+}

@@ -504,9 +504,15 @@ func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, chats []tg.ChatClas
 // store, and a tg.UpdatePinnedMessages is pushed to each member with live
 // connections. The update carries no pts (transient push, same model as
 // reactions).
-func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, peerID int64, pinned bool) {
+//
+// The pinned state is reloaded from the store rather than trusted from the
+// payload: a concurrent pin/unpin between commit and Notify could leave the
+// payload carrying a stale message id. Reloading ensures the push reflects
+// the authoritative committed state.
+func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, peerID int64, _ int32) {
 	var members []int64
 	var peer tg.PeerClass
+	var pinnedMsgID int32
 
 	switch peerType {
 	case store.PeerTypeChat:
@@ -521,6 +527,14 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, pe
 		}
 		peer = &tg.PeerChat{ChatID: peerID}
 
+		// Reload authoritative pinned state to avoid stale payload.
+		if id, err := u.h.store.ChatPinnedMessage(ctx, peerID); err != nil {
+			u.log.Error("deliver pinned chat reload", "peer_id", peerID, "err", err)
+			return
+		} else if id != nil {
+			pinnedMsgID = *id
+		}
+
 	case store.PeerTypeChannel:
 		chMembers, err := u.h.store.ChannelMembers(ctx, peerID)
 		if err != nil {
@@ -533,25 +547,39 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, pe
 		}
 		peer = &tg.PeerChannel{ChannelID: peerID}
 
+		// Reload authoritative pinned state to avoid stale payload.
+		if id, err := u.h.store.ChannelPinnedMessage(ctx, peerID); err != nil {
+			u.log.Error("deliver pinned channel reload", "peer_id", peerID, "err", err)
+			return
+		} else if id != nil {
+			pinnedMsgID = *id
+		}
+
 	default:
 		u.log.Warn("deliver pinned unknown peer type", "peer_type", peerType)
 		return
 	}
 
-	u.deliverPinnedToUsers(ctx, peer, members, pinned)
+	u.deliverPinnedToUsers(ctx, peer, members, pinnedMsgID)
 }
 
 // deliverPinnedToUsers pushes the pinned update to each member with live conns.
-func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64, pinned bool) {
+// pinnedMsgID is nonzero on pin, zero on unpin.
+func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64, pinnedMsgID int32) {
 	for _, memberID := range members {
 		conns := u.registry.Conns(memberID)
 		if len(conns) == 0 {
 			continue
 		}
+		var messages []int
+		if pinnedMsgID != 0 {
+			messages = []int{int(pinnedMsgID)}
+		}
 		update := &tg.UpdateShort{
 			Update: &tg.UpdatePinnedMessages{
-				Pinned: pinned,
-				Peer:   peer,
+				Pinned:   pinnedMsgID != 0,
+				Peer:     peer,
+				Messages: messages,
 			},
 			Date: int(time.Now().Unix()),
 		}

@@ -647,3 +647,61 @@ func TestCreateChatRejectsOversizeAndWritesNothing(t *testing.T) {
 		t.Fatalf("participants at the limit = %d, want 200", len(got))
 	}
 }
+
+func TestSetChatPinnedMessageRejectsDeletedMessage(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551294001")
+	b := mustUser(t, s, "+15551294002")
+	ch, err := s.CreateChat(ctx, a.ID, "test", []int64{b.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+
+	// Send a message in the chat.
+	sender, _, _, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: ch.ID, FromID: a.ID, Text: "hello", RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Mark the sender's copy as deleted.
+	err = store.SetMessageDeleted(ctx, s, a.ID, sender.LocalID)
+	if err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
+
+	// Attempt to pin the deleted message.
+	pinnedID := int32(sender.LocalID) //nolint:gosec // local_id fits int32
+	_, _, err = s.SetChatPinnedMessage(ctx, ch.ID, a.ID, &pinnedID)
+	if !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("pin deleted message: err = %v, want ErrMessageInvalid", err)
+	}
+}
+
+func TestSetChatPinnedMessageRejectsWrongPeerMessage(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551294003")
+	b := mustUser(t, s, "+15551294004")
+	ch, err := s.CreateChat(ctx, a.ID, "test", []int64{b.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+
+	// Send a 1:1 DM (not in the chat).
+	dm, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "dm", 1, 0, 0) //nolint:dogsled
+	if err != nil {
+		t.Fatalf("send DM: %v", err)
+	}
+
+	// Attempt to pin the DM message in the chat.
+	pinnedID := int32(dm.LocalID) //nolint:gosec // local_id fits int32
+	_, _, err = s.SetChatPinnedMessage(ctx, ch.ID, a.ID, &pinnedID)
+	if !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("pin wrong-peer message: err = %v, want ErrMessageInvalid", err)
+	}
+}

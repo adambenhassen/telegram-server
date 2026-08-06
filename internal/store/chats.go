@@ -429,17 +429,42 @@ func (s *Store) ChatPinnedMessage(ctx context.Context, chatID int64) (*int32, er
 // pinnedID is the local_id of the message to pin (identical across members for
 // a given fanout). Passing nil clears the pin. The caller is responsible for
 // having checked admin rights — this method does not authorise.
+//
+// When pinnedID is non-nil the message is validated inside this transaction:
+// the caller's copy must exist, belong to chatID, and not be deleted. This
+// prevents the TOCTOU window where a delete commits between an out-of-
+// transaction check and the pin mutation.
+//
 // Returns the chat with updated pinned_message_id and version.
 // Returns the member set (participant user ids) so the caller can fan out the
 // update.
 // ErrNotMember when no chat exists or caller is not a member — indistinguishable
 // on purpose to keep chat ids unprobeable.
+// ErrMessageInvalid when pinnedID names a message that does not exist, is
+// deleted, or does not belong to chatID.
 func (s *Store) SetChatPinnedMessage(ctx context.Context, chatID, callerID int64, pinnedID *int32) (chat Chat, members []int64, err error) {
 	m, err := s.beginChatMutation(ctx, chatID, callerID)
 	if err != nil {
 		return Chat{}, nil, err
 	}
 	defer func() { _ = m.tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	// Validate the pinned message under the chats row lock so a concurrent
+	// delete cannot slip between the check and the mutation.
+	if pinnedID != nil {
+		msg, err := m.qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{
+			OwnerID: callerID, LocalID: int64(*pinnedID),
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Chat{}, nil, ErrMessageInvalid
+		}
+		if err != nil {
+			return Chat{}, nil, fmt.Errorf("validate chat pin: %w", err)
+		}
+		if msg.Deleted || PeerType(msg.PeerType) != PeerTypeChat || msg.PeerID != chatID {
+			return Chat{}, nil, ErrMessageInvalid
+		}
+	}
 
 	row, err := m.qtx.SetChatPinnedMessage(ctx, db.SetChatPinnedMessageParams{
 		ID: chatID, PinnedMessageID: pinnedID,
