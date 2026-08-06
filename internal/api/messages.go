@@ -908,18 +908,6 @@ func (h *handlers) pinChatMessage(r *mtproto.Request, chatID int64, req *tg.Mess
 		pinnedID = &msgID
 	}
 
-	// Validate that the message exists in this chat and is not deleted.
-	if pinnedID != nil {
-		msg, ok, err := h.store.MessageByOwnerLocal(r.Ctx, r.UserID, int64(*pinnedID))
-		if err != nil {
-			h.log.Error("pin chat validate", "chat_id", chatID, "err", err)
-			return nil, errInternal
-		}
-		if !ok || msg.Deleted || msg.PeerType != store.PeerTypeChat || msg.PeerID != chatID {
-			return nil, errMessageIDInvalid
-		}
-	}
-
 	// Read current pinned state for idempotency check.
 	// Note: this read occurs before the row lock in SetChatPinnedMessage, so
 	// two concurrent identical requests can both see the old value and both
@@ -944,6 +932,9 @@ func (h *handlers) pinChatMessage(r *mtproto.Request, chatID int64, req *tg.Mess
 	chat, _, err := h.store.SetChatPinnedMessage(r.Ctx, chatID, r.UserID, pinnedID)
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
+	}
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
 	}
 	if err != nil {
 		h.log.Error("pin chat", "chat_id", chatID, "user_id", r.UserID, "err", err)
@@ -1005,19 +996,6 @@ func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *t
 		pinnedID = &msgID
 	}
 
-	// Validate that the channel post exists and is not deleted.
-	if pinnedID != nil {
-		posts, err := h.store.ChannelMessages(r.Ctx, channelID, []int64{int64(*pinnedID)})
-		if err != nil {
-			h.log.Error("pin channel validate", "channel_id", channelID, "err", err)
-			return nil, errInternal
-		}
-		post, ok := posts[int64(*pinnedID)]
-		if !ok || post.Deleted {
-			return nil, errMessageIDInvalid
-		}
-	}
-
 	// Read current pinned state for idempotency check.
 	// Note: same TOCTOU caveat as pinChatMessage — concurrent identical
 	// requests can both emit a push. Accepted as tolerable under the
@@ -1041,6 +1019,9 @@ func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *t
 	ch, _, err := h.store.SetChannelPinnedMessage(r.Ctx, channelID, r.UserID, pinnedID)
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
+	}
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
 	}
 	if err != nil {
 		h.log.Error("pin channel", "channel_id", channelID, "user_id", r.UserID, "err", err)

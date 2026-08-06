@@ -336,6 +336,61 @@ func TestPinnedChat(t *testing.T) {
 		t.Fatalf("A pin wrong-peer error = %v, want MESSAGE_ID_INVALID", wrongPeerErr)
 	}
 
+	// 10. Delete a chat message, then attempt to pin it — should fail.
+	var delMsgID int
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:    &tg.InputPeerChat{ChatID: chatID},
+			Message: "delete me", RandomID: 700003,
+		})
+		if err != nil {
+			return err
+		}
+		ups, ok := res.(*tg.Updates)
+		if !ok {
+			return errors.New("unexpected send result")
+		}
+		for _, u := range ups.Updates {
+			if nm, ok := u.(*tg.UpdateNewMessage); ok {
+				if m, ok := nm.Message.(*tg.Message); ok {
+					delMsgID = m.ID
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("A send delete-me: %v", err)
+	}
+	recvOr(t, collB.newMsg, "B updateNewMessage (delete-me)")
+	recvOr(t, collC.newMsg, "C updateNewMessage (delete-me)")
+
+	// Delete the message.
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{delMsgID}})
+		return err
+	}); err != nil {
+		t.Fatalf("A delete message: %v", err)
+	}
+
+	// Attempt to pin the deleted message.
+	var delMsgErr error
+	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID},
+			ID:   delMsgID,
+		})
+		delMsgErr = err
+		return nil
+	}); execErr != nil {
+		t.Fatalf("A exec deleted pin: %v", execErr)
+	}
+	if delMsgErr == nil {
+		t.Fatal("A pin deleted message: want MESSAGE_ID_INVALID, got nil")
+	}
+	if !strings.Contains(delMsgErr.Error(), "MESSAGE_ID_INVALID") {
+		t.Fatalf("A pin deleted error = %v, want MESSAGE_ID_INVALID", delMsgErr)
+	}
+
 	close(aCmds)
 	close(bCmds)
 	close(cCmds)
@@ -608,6 +663,51 @@ func TestPinnedChannel(t *testing.T) {
 	}
 	if !strings.Contains(nonexistentErr.Error(), "MESSAGE_ID_INVALID") {
 		t.Fatalf("A pin nonexistent channel error = %v, want MESSAGE_ID_INVALID", nonexistentErr)
+	}
+
+	// 10. Pin a chat message ID against a channel peer — should fail.
+	// A sends a DM to B and captures its message ID.
+	var dmMsgID int
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:    peerUser(aUserID, bUserID),
+			Message: "dm", RandomID: 800003,
+		})
+		if err != nil {
+			return err
+		}
+		ups, ok := res.(*tg.Updates)
+		if !ok {
+			return errors.New("unexpected send result")
+		}
+		for _, u := range ups.Updates {
+			if nm, ok := u.(*tg.UpdateNewMessage); ok {
+				if m, ok := nm.Message.(*tg.Message); ok {
+					dmMsgID = m.ID
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("A send DM: %v", err)
+	}
+
+	var wrongPeerErr error
+	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer: peerChannel(aUserID, channelID),
+			ID:   dmMsgID,
+		})
+		wrongPeerErr = err
+		return nil
+	}); execErr != nil {
+		t.Fatalf("A exec wrong-peer channel pin: %v", execErr)
+	}
+	if wrongPeerErr == nil {
+		t.Fatal("A pin DM message in channel: want MESSAGE_ID_INVALID, got nil")
+	}
+	if !strings.Contains(wrongPeerErr.Error(), "MESSAGE_ID_INVALID") {
+		t.Fatalf("A pin wrong-peer channel error = %v, want MESSAGE_ID_INVALID", wrongPeerErr)
 	}
 
 	close(aCmds)
