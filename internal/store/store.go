@@ -96,7 +96,7 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 //
 // ponytail: presence-check of the newest migration's artifacts, not a version
 // table — pgtest applies raw SQL and has no Atlas revisions table to read. The
-// sentinels track the latest migration (message_reactions table) plus
+// sentinels track the latest migration (pinned_message_id on chats/channels) plus
 // chat_participants, messages.fanout_id and message_events from the ones
 // before it; update them when a migration adds new schema.
 func (s *Store) checkSchema(ctx context.Context) error {

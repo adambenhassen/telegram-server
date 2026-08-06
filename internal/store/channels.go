@@ -54,13 +54,14 @@ const inviteHashBytes = 16
 
 // Channel is a broadcast peer.
 type Channel struct {
-	ID        int64
-	Title     string
-	About     string
-	CreatorID int64
-	Megagroup bool
-	Version   int
-	Date      time.Time
+	ID              int64
+	Title           string
+	About           string
+	CreatorID       int64
+	Megagroup       bool
+	Version         int
+	Date            time.Time
+	PinnedMessageID *int32
 }
 
 // Participant roles, as recorded in the M7 migration.
@@ -104,13 +105,14 @@ func (m ChannelMember) Forever() bool {
 
 func channelFromRow(r db.Channel) Channel {
 	return Channel{
-		ID:        r.ID,
-		Title:     r.Title,
-		About:     r.About,
-		CreatorID: r.CreatorID,
-		Megagroup: r.Megagroup,
-		Version:   int(r.Version),
-		Date:      r.Date.Time,
+		ID:              r.ID,
+		Title:           r.Title,
+		About:           r.About,
+		CreatorID:       r.CreatorID,
+		Megagroup:       r.Megagroup,
+		Version:         int(r.Version),
+		Date:            r.Date.Time,
+		PinnedMessageID: r.PinnedMessageID,
 	}
 }
 
@@ -711,4 +713,78 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 		out[i] = row
 	}
 	return out, nil
+}
+
+// ChannelPinnedMessage returns the current pinned message id for channelID.
+// Returns nil when no message is pinned.
+func (s *Store) ChannelPinnedMessage(ctx context.Context, channelID int64) (*int32, error) {
+	id, err := s.q.GetChannelPinnedMessage(ctx, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("channel pinned message: %w", err)
+	}
+	return id, nil
+}
+
+// SetChannelPinnedMessage sets or clears the pinned message id on channelID.
+// pinnedID is the local_id of the channel post to pin. Passing nil clears the
+// pin. The caller is responsible for having checked admin rights — this method
+// does not authorise. Returns the channel with updated pinned_message_id and
+// version.
+//
+// Returns the member set (participant user ids) so the caller can fan out the
+// update.
+// ErrNotMember when no channel exists — the indistinguishability with membership
+// follows the convention from other channel writers. Note that the store cannot
+// decide "caller not a member" or "insufficient role" without re-implementing
+// admin policy (a banned creator row etc). This writes if reached and trusts the
+// authorising check that runs on every reader that grants admin privileges. That
+// runs through IsChannelMember which takes a simple predicate rather than row
+// lock; the channels row lock serialises the write against concurrent mutations.
+func (s *Store) SetChannelPinnedMessage(ctx context.Context, channelID, callerID int64, pinnedID *int32) (ch Channel, members []int64, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Channel{}, nil, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	// Early reject, ahead of the channels row lock. Same filter pattern as
+	// beginChannelMutation: turns away a caller who was never a member, and the
+	// re-check under the lock decides.
+	member, err := qtx.IsChannelMember(ctx, db.IsChannelMemberParams{ChannelID: channelID, UserID: callerID})
+	if err != nil {
+		return Channel{}, nil, fmt.Errorf("is channel member: %w", err)
+	}
+	if !member {
+		return Channel{}, nil, ErrNotMember
+	}
+
+	if _, err = qtx.LockChannel(ctx, channelID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Channel{}, nil, ErrNotMember
+		}
+		return Channel{}, nil, fmt.Errorf("lock channel: %w", err)
+	}
+
+	row, err := qtx.SetChannelPinnedMessage(ctx, db.SetChannelPinnedMessageParams{
+		ID: channelID, PinnedMessageID: pinnedID,
+	})
+	if err != nil {
+		return Channel{}, nil, fmt.Errorf("set channel pinned message: %w", err)
+	}
+
+	// Read the member set for fan-out.
+	parts, err := qtx.ChannelParticipants(ctx, channelID)
+	if err != nil {
+		return Channel{}, nil, fmt.Errorf("channel participants: %w", err)
+	}
+	members = make([]int64, len(parts))
+	for i, p := range parts {
+		members[i] = p.UserID
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return Channel{}, nil, fmt.Errorf("commit: %w", err)
+	}
+	return channelFromRow(row), members, nil
 }

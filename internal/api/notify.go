@@ -495,3 +495,61 @@ func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, chats []tg.ChatClas
 		Seq:     state.Seq,
 	}
 }
+
+// DeliverPinned pushes updatePinnedMessages to every member of peerID that
+// holds a live connection on this replica. It is the pinned callback for
+// StartListener.
+//
+// The peerID can be a chat id or a channel id. Members are resolved from the
+// store, and a tg.UpdatePinnedMessages is pushed to each member with live
+// connections. The update carries no pts (transient push, same model as
+// reactions).
+func (u *Updater) DeliverPinned(ctx context.Context, peerID int64) {
+	// Resolve members depending on whether this is a chat or channel.
+	// Try chat first.
+	chatMembers, err := u.h.store.Participants(ctx, peerID)
+	if err == nil {
+		// It is a chat.
+		members := make([]int64, len(chatMembers))
+		for i, p := range chatMembers {
+			members[i] = p.UserID
+		}
+		u.deliverPinnedToUsers(ctx, &tg.PeerChat{ChatID: peerID}, members)
+		return
+	}
+
+	// Try channel.
+	chMembers, err := u.h.store.ChannelMembers(ctx, peerID)
+	if err != nil {
+		// Not a chat and not a channel — skip silently.
+		return
+	}
+	members := make([]int64, len(chMembers))
+	for i, m := range chMembers {
+		members[i] = m.UserID
+	}
+	u.deliverPinnedToUsers(ctx, &tg.PeerChannel{ChannelID: peerID}, members)
+}
+
+// deliverPinnedToUsers pushes the pinned update to each member with live conns.
+func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64) {
+	for _, memberID := range members {
+		conns := u.registry.Conns(memberID)
+		if len(conns) == 0 {
+			continue
+		}
+		update := &tg.UpdateShort{
+			Update: &tg.UpdatePinnedMessages{
+				Pinned: true,
+				Peer:   peer,
+			},
+			Date: int(time.Now().Unix()),
+		}
+		for _, c := range conns {
+			// Carries no pts, so a conn that changed hands simply drops it.
+			if _, err := c.PushTo(ctx, memberID, update, 0); err != nil {
+				u.log.Info("deliver pinned push", "user_id", memberID, "err", err)
+			}
+		}
+	}
+}

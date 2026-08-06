@@ -45,3 +45,13 @@ SELECT c.* FROM chats c
 JOIN chat_participants p ON p.chat_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id;
+
+-- SetChatPinnedMessage sets or clears the pinned message id on a chat.
+-- The pinned_message_id is the local_id of the pinned message (identical across
+-- members for a given fanout). NULL clears the pin.
+-- name: SetChatPinnedMessage :one
+UPDATE chats SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING *;
+
+-- GetChatPinnedMessage reads the current pinned message id for a chat.
+-- name: GetChatPinnedMessage :one
+SELECT pinned_message_id FROM chats WHERE id = $1;

@@ -18,13 +18,14 @@ type AuthKey struct {
 }
 
 type Channel struct {
-	ID        int64
-	Title     string
-	About     string
-	CreatorID int64
-	Megagroup bool
-	Version   int32
-	Date      pgtype.Timestamptz
+	ID              int64
+	Title           string
+	About           string
+	CreatorID       int64
+	Megagroup       bool
+	Version         int32
+	Date            pgtype.Timestamptz
+	PinnedMessageID *int32
 }
 
 type ChannelEvent struct {
@@ -71,11 +72,12 @@ type ChannelState struct {
 }
 
 type Chat struct {
-	ID        int64
-	Title     string
-	CreatorID int64
-	Version   int32
-	Date      pgtype.Timestamptz
+	ID              int64
+	Title           string
+	CreatorID       int64
+	Version         int32
+	Date            pgtype.Timestamptz
+	PinnedMessageID *int32
 }
 
 type ChatParticipant struct {
