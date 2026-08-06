@@ -91,6 +91,16 @@ JOIN channel_participants p ON p.channel_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id;
 
+-- SetChannelPinnedMessage sets or clears the pinned message id on a channel.
+-- The pinned_message_id is the local_id of the pinned channel post. NULL clears
+-- the pin.
+-- name: SetChannelPinnedMessage :one
+UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING *;
+
+-- GetChannelPinnedMessage reads the current pinned message id for a channel.
+-- name: GetChannelPinnedMessage :one
+SELECT pinned_message_id FROM channels WHERE id = $1;
+
 -- ChannelDialogsForUser returns every channel the user belongs to alongside the
 -- channel's pts and the newest non-deleted post (the "top message" for the
 -- dialog list). Channels with no posts or whose newest post is deleted appear

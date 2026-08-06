@@ -848,3 +848,206 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 	}
 	return &tg.Updates{Updates: updates, Users: users, Chats: chats, Date: int(date)}, nil
 }
+
+// handleUpdatePinnedMessage serves messages.updatePinnedMessage: it pins or
+// unpins a message in a group chat or channel, stores the pinned message id
+// durably, and pushes updatePinnedMessages to all members.
+//
+// For chats: any member may pin (the chat is small and has no admin role). For
+// channels: only an admin (role >= 1) may pin. Non-admin callers get
+// CHAT_ADMIN_REQUIRED.
+//
+// Pinning the currently pinned message is idempotent: returns success without
+// emitting a redundant push.
+func (h *handlers) handleUpdatePinnedMessage(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesUpdatePinnedMessageRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	peerType, peerID, err := h.inputPeer(req.Peer, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+
+	if peerType == store.PeerTypeChat {
+		return h.pinChatMessage(r, peerID, &req)
+	}
+	if peerType == store.PeerTypeChannel {
+		return h.pinChannelMessage(r, peerID, &req)
+	}
+	return nil, errPeerIDInvalid
+}
+
+// pinChatMessage pins or unpins a message in a group chat. Only the chat
+// creator may pin or unpin.
+func (h *handlers) pinChatMessage(r *mtproto.Request, chatID int64, req *tg.MessagesUpdatePinnedMessageRequest) (bin.Encoder, error) {
+	// Check membership first.
+	if err := h.requireMember(r.Ctx, chatID, r.UserID); err != nil {
+		return nil, err
+	}
+	// Only the creator may pin — a group chat has no admin role, so creator is
+	// the sole privileged member.
+	ch, ok, err := h.store.ChatByID(r.Ctx, chatID)
+	if err != nil {
+		h.log.Error("pin chat lookup", "chat_id", chatID, "err", err)
+		return nil, errInternal
+	}
+	if !ok || ch.CreatorID != r.UserID {
+		return nil, errChatAdminRequired
+	}
+
+	msgID := int32(req.ID) //nolint:gosec // G115: message id fits int32 wire space
+	var pinnedID *int32
+	if req.Unpin || req.ID == 0 {
+		// Both Unpin=true and ID=0 clear the pin.
+		pinnedID = nil
+	} else {
+		pinnedID = &msgID
+	}
+
+	// Read current pinned state for idempotency check.
+	// Note: this read occurs before the row lock in SetChatPinnedMessage, so
+	// two concurrent identical requests can both see the old value and both
+	// emit a push. This is accepted as a tolerable race — the transient push
+	// model (same as reactions) means a duplicate push is harmless.
+	currentPinned, err := h.store.ChatPinnedMessage(r.Ctx, chatID)
+	if err != nil {
+		h.log.Error("pin chat read", "chat_id", chatID, "err", err)
+		return nil, errInternal
+	}
+
+	// Idempotency: pinning the same message that is already pinned returns
+	// success without emitting a push.
+	if pinnedID != nil && currentPinned != nil && *pinnedID == *currentPinned {
+		return &tg.Updates{Date: int(time.Now().Unix())}, nil
+	}
+	// Idempotency: unpinning when nothing is pinned.
+	if pinnedID == nil && currentPinned == nil {
+		return &tg.Updates{Date: int(time.Now().Unix())}, nil
+	}
+
+	chat, _, err := h.store.SetChatPinnedMessage(r.Ctx, chatID, r.UserID, pinnedID)
+	if errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	}
+	if err != nil {
+		h.log.Error("pin chat", "chat_id", chatID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	// Emit the pinned notification so all members receive updatePinnedMessages.
+	h.notifyPinned(r.Ctx, store.PeerTypeChat, chatID, pinnedID != nil)
+
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chat.ID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("pin chat render", "chat_id", chat.ID, "err", err)
+		return nil, errInternal
+	}
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{
+			&tg.UpdatePinnedMessages{
+				Pinned: pinnedID != nil,
+				Peer:   &tg.PeerChat{ChatID: chat.ID},
+				Messages: func() []int {
+					if pinnedID != nil {
+						return []int{int(*pinnedID)}
+					}
+					return nil
+				}(),
+			},
+		},
+		Chats: chats,
+		Date:  int(time.Now().Unix()),
+	}, nil
+}
+
+// pinChannelMessage pins or unpins a message in a channel. Only admins may pin.
+//
+// Note: the admin role check occurs before the row lock in
+// SetChannelPinnedMessage, so an admin demoted between the two steps can still
+// pin. This narrow TOCTOU window is accepted as tolerable — the worst outcome
+// is a single unauthorized pin, which the admin can immediately correct.
+func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *tg.MessagesUpdatePinnedMessageRequest) (bin.Encoder, error) {
+	// Check membership and admin rights.
+	member, err := h.requireChannelMember(r.Ctx, channelID, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if member.Role < 1 {
+		return nil, errChatAdminRequired
+	}
+
+	msgID := int32(req.ID) //nolint:gosec // G115: message id fits int32 wire space
+	var pinnedID *int32
+	if req.Unpin || req.ID == 0 {
+		// Both Unpin=true and ID=0 clear the pin.
+		pinnedID = nil
+	} else {
+		pinnedID = &msgID
+	}
+
+	// Read current pinned state for idempotency check.
+	// Note: same TOCTOU caveat as pinChatMessage — concurrent identical
+	// requests can both emit a push. Accepted as tolerable under the
+	// transient-push model.
+	currentPinned, err := h.store.ChannelPinnedMessage(r.Ctx, channelID)
+	if err != nil {
+		h.log.Error("pin channel read", "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+
+	// Idempotency: pinning the same message that is already pinned returns
+	// success without emitting a push.
+	if pinnedID != nil && currentPinned != nil && *pinnedID == *currentPinned {
+		return &tg.Updates{Date: int(time.Now().Unix())}, nil
+	}
+	// Idempotency: unpinning when nothing is pinned.
+	if pinnedID == nil && currentPinned == nil {
+		return &tg.Updates{Date: int(time.Now().Unix())}, nil
+	}
+
+	ch, _, err := h.store.SetChannelPinnedMessage(r.Ctx, channelID, r.UserID, pinnedID)
+	if errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	}
+	if err != nil {
+		h.log.Error("pin channel", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	// Emit the pinned notification so all members receive updatePinnedMessages.
+	h.notifyPinned(r.Ctx, store.PeerTypeChannel, channelID, pinnedID != nil)
+
+	channels, err := h.loadChannels(r.Ctx, map[int64]bool{ch.ID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("pin channel render", "channel_id", ch.ID, "err", err)
+		return nil, errInternal
+	}
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{
+			&tg.UpdatePinnedMessages{
+				Pinned: pinnedID != nil,
+				Peer:   &tg.PeerChannel{ChannelID: ch.ID},
+				Messages: func() []int {
+					if pinnedID != nil {
+						return []int{int(*pinnedID)}
+					}
+					return nil
+				}(),
+			},
+		},
+		Chats: channels,
+		Date:  int(time.Now().Unix()),
+	}, nil
+}
+
+// notifyPinned emits the cross-replica pinned nudge for peerID (best-effort).
+// pinned=true means a message was pinned; pinned=false means it was unpinned.
+func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, peerID int64, pinned bool) {
+	if err := h.store.Notify(ctx, store.ChannelPinned, store.PinnedPayload(peerType, peerID, pinned)); err != nil {
+		h.log.Error("notify pinned", "peer_id", peerID, "err", err)
+	}
+}

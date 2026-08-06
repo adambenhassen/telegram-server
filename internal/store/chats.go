@@ -28,11 +28,12 @@ const maxChatParticipants = 200
 
 // Chat is a basic group chat.
 type Chat struct {
-	ID        int64
-	Title     string
-	CreatorID int64
-	Version   int
-	Date      time.Time
+	ID              int64
+	Title           string
+	CreatorID       int64
+	Version         int
+	Date            time.Time
+	PinnedMessageID *int32
 }
 
 // Participant is one member of a chat.
@@ -44,11 +45,12 @@ type Participant struct {
 
 func chatFromRow(r db.Chat) Chat {
 	return Chat{
-		ID:        r.ID,
-		Title:     r.Title,
-		CreatorID: r.CreatorID,
-		Version:   int(r.Version),
-		Date:      r.Date.Time,
+		ID:              r.ID,
+		Title:           r.Title,
+		CreatorID:       r.CreatorID,
+		Version:         int(r.Version),
+		Date:            r.Date.Time,
+		PinnedMessageID: r.PinnedMessageID,
 	}
 }
 
@@ -411,4 +413,42 @@ func (s *Store) ChatsForUser(ctx context.Context, userID int64) ([]Chat, error) 
 		out[i] = chatFromRow(r)
 	}
 	return out, nil
+}
+
+// ChatPinnedMessage returns the current pinned message id for chatID.
+// Returns nil when no message is pinned.
+func (s *Store) ChatPinnedMessage(ctx context.Context, chatID int64) (*int32, error) {
+	id, err := s.q.GetChatPinnedMessage(ctx, chatID)
+	if err != nil {
+		return nil, fmt.Errorf("chat pinned message: %w", err)
+	}
+	return id, nil
+}
+
+// SetChatPinnedMessage sets or clears the pinned message id on chatID.
+// pinnedID is the local_id of the message to pin (identical across members for
+// a given fanout). Passing nil clears the pin. The caller is responsible for
+// having checked admin rights — this method does not authorise.
+// Returns the chat with updated pinned_message_id and version.
+// Returns the member set (participant user ids) so the caller can fan out the
+// update.
+// ErrNotMember when no chat exists or caller is not a member — indistinguishable
+// on purpose to keep chat ids unprobeable.
+func (s *Store) SetChatPinnedMessage(ctx context.Context, chatID, callerID int64, pinnedID *int32) (chat Chat, members []int64, err error) {
+	m, err := s.beginChatMutation(ctx, chatID, callerID)
+	if err != nil {
+		return Chat{}, nil, err
+	}
+	defer func() { _ = m.tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	row, err := m.qtx.SetChatPinnedMessage(ctx, db.SetChatPinnedMessageParams{
+		ID: chatID, PinnedMessageID: pinnedID,
+	})
+	if err != nil {
+		return Chat{}, nil, fmt.Errorf("set chat pinned message: %w", err)
+	}
+	if err = m.tx.Commit(ctx); err != nil {
+		return Chat{}, nil, fmt.Errorf("commit: %w", err)
+	}
+	return chatFromRow(row), m.members, nil
 }
