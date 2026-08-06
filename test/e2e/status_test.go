@@ -693,11 +693,14 @@ func TestStatusNoCrossContamination(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("B did not receive setup message")
 	}
-	// Wait for B's offline status for A (from A's first disconnect) before reconnecting,
-	// so the subsequent recvStatus only picks up the Online push.
-	offUpd := recvStatus(t, collB, "B updateUserStatus offline (setup)")
-	if _, ok := offUpd.Status.(*tg.UserStatusOffline); !ok {
-		t.Fatalf("setup offline status type = %T, want *tg.UserStatusOffline", offUpd.Status)
+	// Drain any Online push from A's login, then wait for the Offline push
+	// (from A's disconnect). The ordering of Online vs the setup message is
+	// not guaranteed, so skip Online updates until Offline arrives.
+	for {
+		upd := recvStatus(t, collB, "B updateUserStatus offline (setup)")
+		if _, ok := upd.Status.(*tg.UserStatusOffline); ok {
+			break
+		}
 	}
 	drainStatus(collD)
 

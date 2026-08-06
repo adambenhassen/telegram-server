@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -36,6 +39,9 @@ func (s *Store) SendReaction(ctx context.Context, ownerID, localID int64, reacti
 	qtx := s.q.WithTx(tx)
 
 	msg, err := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: ownerID, LocalID: localID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrMessageInvalid
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load message: %w", err)
 	}
@@ -91,6 +97,9 @@ func (s *Store) ClearReaction(ctx context.Context, ownerID, localID int64) ([]in
 	qtx := s.q.WithTx(tx)
 
 	msg, err := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: ownerID, LocalID: localID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrMessageInvalid
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load message: %w", err)
 	}
