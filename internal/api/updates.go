@@ -457,6 +457,13 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 		} else {
 			refs = append(refs, m.PeerID)
 		}
+		// Forwarded messages reference the original sender and optionally a channel.
+		if m.FwdFromID != 0 && m.FwdChannelID == 0 {
+			refs = append(refs, m.FwdFromID)
+		}
+		if m.FwdChannelID != 0 {
+			chatRefs = append(chatRefs, m.FwdChannelID)
+		}
 		if ev.Type == store.EventEdit {
 			return &tg.UpdateEditMessage{Message: tlMsg, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil
 		}

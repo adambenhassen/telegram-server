@@ -661,6 +661,13 @@ type ForwardSource struct {
 	FileID int64
 }
 
+// ForwardedMessage is one forwarded message returned by ForwardMessages, carrying
+// the stored row and the pts at which it was inserted for the caller.
+type ForwardedMessage struct {
+	Message Message
+	Pts     int
+}
+
 // ForwardMessages forwards one or more messages owned by userID to a destination.
 // The destination is a 1:1 peer (peerType=PeerTypeUser) or a chat (peerType=PeerTypeChat).
 // Each forwarded message is a new message row with FwdFrom populated.
@@ -672,7 +679,7 @@ type ForwardSource struct {
 //
 // Dedup: a repeated random_id (per sender, per destination peer) returns the
 // previously created forwarded message id without re-inserting.
-func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType PeerType, destPeerID int64, sources []ForwardSource, randomIDs []int64) (map[int64]int, []Message, error) {
+func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType PeerType, destPeerID int64, sources []ForwardSource, randomIDs []int64) (map[int64]int, []ForwardedMessage, error) {
 	if len(sources) == 0 || len(randomIDs) != len(sources) {
 		return nil, nil, ErrMessageInvalid
 	}
@@ -745,7 +752,7 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 	}
 
 	perOwner := make(map[int64]int)
-	var sentMsgs []Message
+	var sentMsgs []ForwardedMessage
 
 	for i, src := range sources {
 		randomID := randomIDs[i]
@@ -758,8 +765,12 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 			})
 			switch {
 			case e == nil:
-				// Already forwarded — return the existing message.
-				sentMsgs = append(sentMsgs, messageFromRow(existing))
+				// Already forwarded — return the existing message with current pts.
+				st, e2 := qtx.GetState(ctx, fromID)
+				if e2 != nil {
+					return nil, nil, fmt.Errorf("get state for dedup: %w", e2)
+				}
+				sentMsgs = append(sentMsgs, ForwardedMessage{Message: messageFromRow(existing), Pts: int(st.Pts)})
 				continue
 			case !errors.Is(e, pgx.ErrNoRows):
 				return nil, nil, fmt.Errorf("random_id lookup: %w", e)
@@ -825,7 +836,7 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 			if err != nil {
 				return nil, nil, fmt.Errorf("reload sender forward: %w", err)
 			}
-			sentMsgs = append(sentMsgs, messageFromRow(stored))
+			sentMsgs = append(sentMsgs, ForwardedMessage{Message: messageFromRow(stored), Pts: int(sb.Pts)})
 		} else {
 			// Chat forward: fan out to all members.
 			fanoutID, err := qtx.NextFanoutID(ctx)
@@ -833,6 +844,7 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 				return nil, nil, fmt.Errorf("next fanout id: %w", err)
 			}
 			var senderLocalID int64
+			var senderPts int64
 			for uid := range chatMembers {
 				b, err := qtx.BumpState(ctx, uid)
 				if err != nil {
@@ -845,6 +857,7 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 					rID = randomID
 					unread = 0
 					senderLocalID = b.LocalID
+					senderPts = b.Pts
 				}
 				if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
 					OwnerID: uid, LocalID: b.LocalID, PeerType: int16(PeerTypeChat), PeerID: destPeerID,
@@ -869,7 +882,7 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 				if err != nil {
 					return nil, nil, fmt.Errorf("reload sender forward: %w", err)
 				}
-				sentMsgs = append(sentMsgs, messageFromRow(stored))
+				sentMsgs = append(sentMsgs, ForwardedMessage{Message: messageFromRow(stored), Pts: int(senderPts)})
 			}
 		}
 	}

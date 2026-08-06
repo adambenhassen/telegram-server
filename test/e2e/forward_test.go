@@ -11,6 +11,7 @@ import (
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -423,7 +424,7 @@ func TestForwardAuthRejection(t *testing.T) {
 	// C (a third user with no relation to the A-B message) tries to forward
 	// message id=1 from the A-B dialog. C does not own that message.
 	peerBFromC := peerUser(cUserID, bUserID)
-	if err := exec(cCmds, func(ctx context.Context, c *tg.Client) error {
+	forwardErr := exec(cCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesForwardMessages(ctx, &tg.MessagesForwardMessagesRequest{
 			FromPeer: peerBFromC,
 			ID:       []int{1},
@@ -431,8 +432,9 @@ func TestForwardAuthRejection(t *testing.T) {
 			ToPeer:   peerBFromC,
 		})
 		return err
-	}); err == nil {
-		t.Fatal("C forward (non-owner) should have failed")
+	})
+	if !tgerr.Is(forwardErr, "PEER_ID_INVALID") {
+		t.Fatalf("C forward (non-owner) expected PEER_ID_INVALID, got: %v", forwardErr)
 	}
 
 	close(aCmds)

@@ -629,10 +629,29 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 }
 
 // forwardReply builds the UpdatesClass reply for a forward.
-func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType, destPeerID int64, perOwner map[int64]int, sentMsgs []store.Message, randomIDs []int64) (bin.Encoder, error) {
+func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType, destPeerID int64, perOwner map[int64]int, sentMsgs []store.ForwardedMessage, randomIDs []int64) (bin.Encoder, error) {
 	// Notify all affected owners.
 	for uid := range perOwner {
 		h.notify(r.Ctx, uid)
+	}
+
+	// Collect user and chat references from forwarded messages.
+	userRefs := make(map[int64]bool)
+	chatRefs := make(map[int64]bool)
+	for _, fm := range sentMsgs {
+		m := fm.Message
+		if m.PeerType == store.PeerTypeChat {
+			chatRefs[m.PeerID] = true
+		} else {
+			userRefs[m.PeerID] = true
+		}
+		userRefs[m.FromID] = true
+		if m.FwdFromID != 0 {
+			userRefs[m.FwdFromID] = true
+		}
+		if m.FwdChannelID != 0 {
+			chatRefs[m.FwdChannelID] = true
+		}
 	}
 
 	var users []tg.UserClass
@@ -640,14 +659,58 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 	var err error
 	if destPeerType == store.PeerTypeUser {
 		users, err = h.twoUsers(r.Ctx, r.UserID, destPeerID)
+		userRefs[r.UserID] = true
+		userRefs[destPeerID] = true
 	} else {
 		recipients := make(map[int64]bool, len(perOwner))
 		for uid := range perOwner {
 			recipients[uid] = true
+			userRefs[uid] = true
 		}
+		chatRefs[destPeerID] = true
 		users, err = h.loadUsers(r.Ctx, recipients, r.UserID)
 		if err == nil {
 			chats, err = h.loadChats(r.Ctx, map[int64]bool{destPeerID: true}, r.UserID)
+		}
+	}
+	// Load extra references from fwd heads that the send/load did not cover.
+	for uid := range userRefs {
+		if uid != r.UserID {
+			u, ok, uerr := h.store.UserByID(r.Ctx, uid)
+			if uerr != nil {
+				h.log.Error("forward reply fwd user", "err", uerr)
+				return nil, errInternal
+			}
+			if ok {
+				users = append(users, h.userToTL(u, r.UserID, uid == r.UserID))
+			}
+		}
+	}
+	for chid := range chatRefs {
+		if _, loaded := chatRefs[chid]; !loaded {
+			continue
+		}
+		c, ok, cerr := h.store.ChatByID(r.Ctx, chid)
+		if cerr != nil {
+			h.log.Error("forward reply fwd chat", "err", cerr)
+			return nil, errInternal
+		}
+		if ok {
+			member, merr := h.store.IsMember(r.Ctx, chid, r.UserID)
+			if merr != nil {
+				h.log.Error("forward reply fwd chat member", "err", merr)
+				return nil, errInternal
+			}
+			var count int
+			if member {
+				parts, perr := h.store.Participants(r.Ctx, chid)
+				if perr != nil {
+					h.log.Error("forward reply fwd chat participants", "err", perr)
+					return nil, errInternal
+				}
+				count = len(parts)
+			}
+			chats = append(chats, chatToTL(c, count, r.UserID))
 		}
 	}
 	if err != nil {
@@ -655,16 +718,27 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 		return nil, errInternal
 	}
 
+	// Load files for forwarded messages.
+	msgs := make([]store.Message, len(sentMsgs))
+	for i, fm := range sentMsgs {
+		msgs[i] = fm.Message
+	}
+	files, err := h.loadFiles(r.Ctx, msgs)
+	if err != nil {
+		h.log.Error("forward reply files", "err", err)
+		return nil, errInternal
+	}
+
 	updates := make([]tg.UpdateClass, 0, len(sentMsgs)*2)
-	for i, msg := range sentMsgs {
+	for i, fm := range sentMsgs {
 		updates = append(updates,
-			&tg.UpdateMessageID{ID: int(msg.LocalID), RandomID: randomIDs[i]},
-			&tg.UpdateNewMessage{Message: messageToTL(msg, nil, nil, nil), Pts: perOwner[r.UserID], PtsCount: 1},
+			&tg.UpdateMessageID{ID: int(fm.Message.LocalID), RandomID: randomIDs[i]},
+			&tg.UpdateNewMessage{Message: messageToTL(fm.Message, nil, files, nil), Pts: fm.Pts, PtsCount: 1},
 		)
 	}
 	date := time.Now().Unix()
 	if len(sentMsgs) > 0 {
-		date = sentMsgs[0].Date.Unix()
+		date = sentMsgs[0].Message.Date.Unix()
 	}
 	return &tg.Updates{Updates: updates, Users: users, Chats: chats, Date: int(date)}, nil
 }
