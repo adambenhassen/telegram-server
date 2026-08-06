@@ -96,11 +96,11 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 //
 // ponytail: presence-check of the newest migration's artifacts, not a version
 // table — pgtest applies raw SQL and has no Atlas revisions table to read. The
-// sentinels track the latest migration (message_reactions table) plus
+// sentinels track the latest migration (pinned_message_id on chats/channels) plus
 // chat_participants, messages.fanout_id and message_events from the ones
 // before it; update them when a migration adds new schema.
 func (s *Store) checkSchema(ctx context.Context) error {
-	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions bool
+	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
@@ -111,12 +111,16 @@ func (s *Store) checkSchema(ctx context.Context) error {
 		       to_regclass('public.encrypted_events') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
 		              WHERE table_name = 'messages' AND column_name = 'fwd_from_id'),
-		       to_regclass('public.message_reactions') IS NOT NULL`,
-	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions)
+		       to_regclass('public.message_reactions') IS NOT NULL,
+		       EXISTS(SELECT 1 FROM information_schema.columns
+		              WHERE table_name = 'chats' AND column_name = 'pinned_message_id'),
+		       EXISTS(SELECT 1 FROM information_schema.columns
+		              WHERE table_name = 'channels' AND column_name = 'pinned_message_id')`,
+	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions {
+	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil

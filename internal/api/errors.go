@@ -128,4 +128,7 @@ var (
 	// errChatForbidden rejects a send from an account that is not a party to the
 	// named secret chat.
 	errChatForbidden = rpcErr(403, "CHAT_FORBIDDEN")
+	// errChatAdminRequired rejects a pin/unpin by a non-admin in a group chat or
+	// channel.
+	errChatAdminRequired = rpcErr(400, "CHAT_ADMIN_REQUIRED")
 )

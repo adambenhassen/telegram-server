@@ -134,6 +134,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesSetTypingRequestTypeID, h.handleSetTyping)
 	register(d, tg.MessagesSendReactionRequestTypeID, h.handleSendReaction)
 	register(d, tg.MessagesForwardMessagesRequestTypeID, h.handleForwardMessages)
+	register(d, tg.MessagesUpdatePinnedMessageRequestTypeID, h.handleUpdatePinnedMessage)
 	register(d, tg.MessagesCreateChatRequestTypeID, h.handleCreateChat)
 	register(d, tg.MessagesEditChatTitleRequestTypeID, h.handleEditChatTitle)
 	register(d, tg.MessagesAddChatUserRequestTypeID, h.handleAddChatUser)

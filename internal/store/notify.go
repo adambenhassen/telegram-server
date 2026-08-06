@@ -32,6 +32,10 @@ const (
 	// payload: "<userID>". The handler pushes updateMessageReactions (transient,
 	// no pts, same model as updateUserStatus).
 	ChannelReactions = "tg_reactions" // payload: "<userID>"
+	// ChannelPinned carries a pin/unpin change to all members of a chat or channel.
+	// payload: "<peerID>". The handler pushes updatePinnedMessages (transient,
+	// no pts, same model as reactions).
+	ChannelPinned = "tg_pinned" // payload: "<peerID>"
 )
 
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
@@ -80,17 +84,18 @@ type Listener struct {
 }
 
 // StartListener opens a dedicated connection, subscribes to the update, typing,
-// evict, channel-post, encryption, status, encrypted-message, and reactions
-// channels, and runs the notification loop until the returned stop function is
-// called (which cancels the loop, drains it, and returns the error from closing
-// the connection). deliver receives a userID whose events changed; typing
-// receives (peerUserID, fromUserID) for a transient typing notification; evict
-// receives (userID, authKeyID) for a session revoked on any replica; channelPost
-// receives a channelID whose post was just committed; encryption receives
-// (userID, chatID) for a secret-chat state change; status receives (userID,
-// online) for a status change; encryptedMsg receives (recipientID, qts) for a
-// secret-chat message; reactions receives (ownerID, localID, userID) for a
-// reaction change on a specific message copy.
+// evict, channel-post, encryption, status, encrypted-message, reactions, and
+// pinned channels, and runs the notification loop until the returned stop
+// function is called (which cancels the loop, drains it, and returns the error
+// from closing the connection). deliver receives a userID whose events changed;
+// typing receives (peerUserID, fromUserID) for a transient typing notification;
+// evict receives (userID, authKeyID) for a session revoked on any replica;
+// channelPost receives a channelID whose post was just committed; encryption
+// receives (userID, chatID) for a secret-chat state change; status receives
+// (userID, online) for a status change; encryptedMsg receives (recipientID, qts)
+// for a secret-chat message; reactions receives (ownerID, localID, userID) for
+// a reaction change on a specific message copy; pinned receives (peerID) for a
+// pin/unpin in a chat or channel, with peerType, peerID, and pinned=true for pin, false for unpin.
 //
 // A broken connection is reconnected with bounded backoff rather than ending
 // delivery for the life of the process. Notifications emitted while the
@@ -110,6 +115,7 @@ func StartListener(
 	status func(ctx context.Context, userID int64, online bool),
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
+	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinned bool),
 	log *slog.Logger,
 ) (*Listener, func() error, error) {
 	if log == nil {
@@ -124,7 +130,7 @@ func StartListener(
 	loopCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions)
+		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned)
 	})
 
 	stop := func() error {
@@ -143,7 +149,7 @@ func connectAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listener connect: %w", err)
 	}
-	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost, ChannelEncryption, ChannelStatus, ChannelEncryptedMsg, ChannelReactions} {
+	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost, ChannelEncryption, ChannelStatus, ChannelEncryptedMsg, ChannelReactions, ChannelPinned} {
 		// ch is a constant channel identifier, never user input (no injection).
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			_ = conn.Close(ctx) //nolint:errcheck // best-effort close on setup failure
@@ -169,6 +175,7 @@ func (l *Listener) run(
 	status func(ctx context.Context, userID int64, online bool),
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
+	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinned bool),
 ) {
 	backoff := listenerBackoffMin
 	for {
@@ -190,7 +197,7 @@ func (l *Listener) run(
 		}
 
 		up := time.Now()
-		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions)
+		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned)
 		closeErr := conn.Close(context.Background())
 		conn = nil
 		if ctx.Err() != nil {
@@ -215,6 +222,7 @@ func (l *Listener) dispatch(
 	status func(ctx context.Context, userID int64, online bool),
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
+	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinned bool),
 ) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
@@ -280,6 +288,34 @@ func (l *Listener) dispatch(
 				continue
 			}
 			reactions(ctx, opts.ownerID, opts.localID, opts.userID)
+		case ChannelPinned:
+			payload := n.Payload
+			if len(payload) < 2 {
+				l.log.Warn("bad tg_pinned payload", "payload", n.Payload)
+				continue
+			}
+			var peerType PeerType
+			switch payload[0] {
+			case 'c':
+				peerType = PeerTypeChat
+			case 'h':
+				peerType = PeerTypeChannel
+			default:
+				l.log.Warn("bad tg_pinned peer type", "payload", n.Payload)
+				continue
+			}
+			payload = payload[1:]
+			isPinned := true
+			if strings.HasPrefix(payload, "-") {
+				isPinned = false
+				payload = payload[1:]
+			}
+			peerID, perr := strconv.ParseInt(payload, 10, 64)
+			if perr != nil {
+				l.log.Warn("bad tg_pinned payload", "payload", n.Payload)
+				continue
+			}
+			pinned(ctx, peerType, peerID, isPinned)
 		}
 	}
 }
@@ -342,6 +378,22 @@ func ReactionPayload(ownerID, localID, userID int64) string {
 	return strconv.FormatInt(ownerID, 10) + "|" +
 		strconv.FormatInt(localID, 10) + "|" +
 		strconv.FormatInt(userID, 10)
+}
+
+// PinnedPayload formats a tg_pinned NOTIFY payload naming the peer whose
+// pinned message changed. Payload format: "c<peerID>" for chat pin,
+// "c-<peerID>" for chat unpin, "h<peerID>" for channel pin, "h-<peerID>"
+// for channel unpin. The leading letter disambiguates chat vs channel so
+// DeliverPinned does not need to probe both tables.
+func PinnedPayload(peerType PeerType, peerID int64, pinned bool) string {
+	prefix := "c"
+	if peerType == PeerTypeChannel {
+		prefix = "h"
+	}
+	if pinned {
+		return prefix + strconv.FormatInt(peerID, 10)
+	}
+	return prefix + "-" + strconv.FormatInt(peerID, 10)
 }
 
 // reactionPayload carries the parsed fields of a tg_reactions NOTIFY payload.

@@ -46,7 +46,7 @@ func bootServerWithStatus(t *testing.T, ctx context.Context, key *rsa.PrivateKey
 	})
 
 	updater := api.NewUpdater(st, server.Registry(), log, pgtest.PeerDeriver())
-	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, log)
+	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, log)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}

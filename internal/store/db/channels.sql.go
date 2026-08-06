@@ -12,7 +12,7 @@ import (
 )
 
 const channelByID = `-- name: ChannelByID :one
-SELECT id, title, about, creator_id, megagroup, version, date FROM channels WHERE id = $1
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id FROM channels WHERE id = $1
 `
 
 func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
@@ -26,6 +26,7 @@ func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
 		&i.Megagroup,
 		&i.Version,
 		&i.Date,
+		&i.PinnedMessageID,
 	)
 	return i, err
 }
@@ -251,7 +252,7 @@ func (q *Queries) ChannelStateForUpdate(ctx context.Context, channelID int64) (C
 }
 
 const channelsForUser = `-- name: ChannelsForUser :many
-SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date FROM channels c
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id
@@ -274,6 +275,7 @@ func (q *Queries) ChannelsForUser(ctx context.Context, userID int64) ([]Channel,
 			&i.Megagroup,
 			&i.Version,
 			&i.Date,
+			&i.PinnedMessageID,
 		); err != nil {
 			return nil, err
 		}
@@ -326,9 +328,21 @@ func (q *Queries) DeleteChannelParticipant(ctx context.Context, arg DeleteChanne
 	return result.RowsAffected(), nil
 }
 
+const getChannelPinnedMessage = `-- name: GetChannelPinnedMessage :one
+SELECT pinned_message_id FROM channels WHERE id = $1
+`
+
+// GetChannelPinnedMessage reads the current pinned message id for a channel.
+func (q *Queries) GetChannelPinnedMessage(ctx context.Context, id int64) (*int32, error) {
+	row := q.db.QueryRow(ctx, getChannelPinnedMessage, id)
+	var pinned_message_id *int32
+	err := row.Scan(&pinned_message_id)
+	return pinned_message_id, err
+}
+
 const insertChannel = `-- name: InsertChannel :one
 INSERT INTO channels (title, about, creator_id, megagroup) VALUES ($1, $2, $3, $4)
-RETURNING id, title, about, creator_id, megagroup, version, date
+RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id
 `
 
 type InsertChannelParams struct {
@@ -354,6 +368,7 @@ func (q *Queries) InsertChannel(ctx context.Context, arg InsertChannelParams) (C
 		&i.Megagroup,
 		&i.Version,
 		&i.Date,
+		&i.PinnedMessageID,
 	)
 	return i, err
 }
@@ -448,7 +463,7 @@ func (q *Queries) IsChannelMember(ctx context.Context, arg IsChannelMemberParams
 }
 
 const lockChannel = `-- name: LockChannel :one
-SELECT id, title, about, creator_id, megagroup, version, date FROM channels WHERE id = $1 FOR UPDATE
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id FROM channels WHERE id = $1 FOR UPDATE
 `
 
 // LockChannel takes the channels row lock that serialises the rights mutations:
@@ -466,6 +481,7 @@ func (q *Queries) LockChannel(ctx context.Context, id int64) (Channel, error) {
 		&i.Megagroup,
 		&i.Version,
 		&i.Date,
+		&i.PinnedMessageID,
 	)
 	return i, err
 }
@@ -485,6 +501,34 @@ func (q *Queries) RevokeChannelInvite(ctx context.Context, arg RevokeChannelInvi
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setChannelPinnedMessage = `-- name: SetChannelPinnedMessage :one
+UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id
+`
+
+type SetChannelPinnedMessageParams struct {
+	ID              int64
+	PinnedMessageID *int32
+}
+
+// SetChannelPinnedMessage sets or clears the pinned message id on a channel.
+// The pinned_message_id is the local_id of the pinned channel post. NULL clears
+// the pin.
+func (q *Queries) SetChannelPinnedMessage(ctx context.Context, arg SetChannelPinnedMessageParams) (Channel, error) {
+	row := q.db.QueryRow(ctx, setChannelPinnedMessage, arg.ID, arg.PinnedMessageID)
+	var i Channel
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.About,
+		&i.CreatorID,
+		&i.Megagroup,
+		&i.Version,
+		&i.Date,
+		&i.PinnedMessageID,
+	)
+	return i, err
 }
 
 const updateChannelParticipantBan = `-- name: UpdateChannelParticipantBan :execrows

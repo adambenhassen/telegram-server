@@ -495,3 +495,71 @@ func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, chats []tg.ChatClas
 		Seq:     state.Seq,
 	}
 }
+
+// DeliverPinned pushes updatePinnedMessages to every member of peerID that
+// holds a live connection on this replica. It is the pinned callback for
+// StartListener.
+//
+// The peerID can be a chat id or a channel id. Members are resolved from the
+// store, and a tg.UpdatePinnedMessages is pushed to each member with live
+// connections. The update carries no pts (transient push, same model as
+// reactions).
+func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, peerID int64, pinned bool) {
+	var members []int64
+	var peer tg.PeerClass
+
+	switch peerType {
+	case store.PeerTypeChat:
+		chatMembers, err := u.h.store.Participants(ctx, peerID)
+		if err != nil {
+			u.log.Error("deliver pinned chat lookup", "peer_id", peerID, "err", err)
+			return
+		}
+		members = make([]int64, len(chatMembers))
+		for i, p := range chatMembers {
+			members[i] = p.UserID
+		}
+		peer = &tg.PeerChat{ChatID: peerID}
+
+	case store.PeerTypeChannel:
+		chMembers, err := u.h.store.ChannelMembers(ctx, peerID)
+		if err != nil {
+			u.log.Error("deliver pinned channel lookup", "peer_id", peerID, "err", err)
+			return
+		}
+		members = make([]int64, len(chMembers))
+		for i, m := range chMembers {
+			members[i] = m.UserID
+		}
+		peer = &tg.PeerChannel{ChannelID: peerID}
+
+	default:
+		u.log.Warn("deliver pinned unknown peer type", "peer_type", peerType)
+		return
+	}
+
+	u.deliverPinnedToUsers(ctx, peer, members, pinned)
+}
+
+// deliverPinnedToUsers pushes the pinned update to each member with live conns.
+func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64, pinned bool) {
+	for _, memberID := range members {
+		conns := u.registry.Conns(memberID)
+		if len(conns) == 0 {
+			continue
+		}
+		update := &tg.UpdateShort{
+			Update: &tg.UpdatePinnedMessages{
+				Pinned: pinned,
+				Peer:   peer,
+			},
+			Date: int(time.Now().Unix()),
+		}
+		for _, c := range conns {
+			// Carries no pts, so a conn that changed hands simply drops it.
+			if _, err := c.PushTo(ctx, memberID, update, 0); err != nil {
+				u.log.Info("deliver pinned push", "user_id", memberID, "err", err)
+			}
+		}
+	}
+}
