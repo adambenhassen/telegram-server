@@ -710,20 +710,8 @@ func (h *handlers) handleSendReaction(r *mtproto.Request) (bin.Encoder, error) {
 		h.notifyReaction(r.Ctx, uid)
 	}
 
-	// Return messages.reactions with the current reaction state.
-	msgReactions, err := h.store.ReactionsByOwnerLocal(r.Ctx, r.UserID, localID)
-	if err != nil {
-		h.log.Error("load reactions", "user_id", r.UserID, "err", err)
-		return nil, errInternal
-	}
-	// Build reaction classes for the response.
-	reactionClasses := make([]tg.ReactionClass, len(msgReactions))
-	for i, r := range msgReactions {
-		reactionClasses[i] = &tg.ReactionEmoji{Emoticon: r.Reaction}
-	}
-	return &tg.MessagesReactions{
-		Reactions: reactionClasses,
-	}, nil
+	// messages.sendReaction returns Updates per the Telegram schema.
+	return &tg.Updates{Date: int(time.Now().Unix())}, nil
 }
 
 // notifyReaction emits the cross-replica reaction nudge for userID (best-effort).
