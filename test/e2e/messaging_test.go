@@ -103,6 +103,7 @@ type updateCollector struct {
 	serviceMsg    chan serviceMsgEnvelope
 	newChannelMsg chan chanMsgUpdate
 	userStatus    chan *tg.UpdateUserStatus
+	msgReactions  chan *tg.UpdateMessageReactions
 	points        chan int
 }
 
@@ -116,6 +117,7 @@ func newUpdateCollector() *updateCollector {
 		serviceMsg:    make(chan serviceMsgEnvelope, 4),
 		newChannelMsg: make(chan chanMsgUpdate, 4),
 		userStatus:    make(chan *tg.UpdateUserStatus, 8),
+		msgReactions:  make(chan *tg.UpdateMessageReactions, 8),
 		points:        make(chan int, 8),
 	}
 }
@@ -158,6 +160,8 @@ func (u *updateCollector) dispatch(x tg.UpdateClass, chats []tg.ChatClass) {
 		}
 	case *tg.UpdateUserStatus:
 		send(u.userStatus, up)
+	case *tg.UpdateMessageReactions:
+		send(u.msgReactions, up)
 	}
 }
 
@@ -211,7 +215,7 @@ func bootServerWithRegistry(t *testing.T, ctx context.Context, key *rsa.PrivateK
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdater(st, server.Registry(), log, pgtest.PeerDeriver())
-	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, log)
+	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, log)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}

@@ -169,7 +169,7 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	tlMsgs := make([]tg.MessageClass, 0, len(tops))
 	for i, m := range tops {
-		tlMsgs = append(tlMsgs, messageToTL(m, topCreateUsers[i], files, nil))
+		tlMsgs = append(tlMsgs, messageToTL(m, topCreateUsers[i], files, nil, nil))
 	}
 
 	// Channels write no dialogs row — they keep one message row per channel, not

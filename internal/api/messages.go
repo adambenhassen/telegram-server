@@ -177,7 +177,7 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
 			// sendMessage never carries media; the media send path builds its own reply.
-			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil, nil), Pts: senderPts, PtsCount: 1},
+			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil, nil, nil), Pts: senderPts, PtsCount: 1},
 		},
 		Users: users,
 		Date:  int(sender.Date.Unix()),
@@ -246,7 +246,7 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
 			// sendMessage never carries media; the media send path builds its own reply.
-			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil, nil), Pts: perOwner[r.UserID], PtsCount: 1},
+			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil, nil, nil), Pts: perOwner[r.UserID], PtsCount: 1},
 		},
 		Users: users,
 		Chats: chats,
@@ -305,9 +305,21 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("get history files", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	// Load reactions for each message.
+	reactionsByMsg := make(map[int64][]store.Reaction, len(msgs))
+	for _, m := range msgs {
+		reactions, rerr := h.store.ReactionsByOwnerLocal(r.Ctx, r.UserID, m.LocalID)
+		if rerr != nil {
+			h.log.Error("get history reactions", "user_id", r.UserID, "local_id", m.LocalID, "err", rerr)
+			return nil, errInternal
+		}
+		if len(reactions) > 0 {
+			reactionsByMsg[m.LocalID] = reactions
+		}
+	}
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	for i, m := range msgs {
-		tlMsgs[i] = messageToTL(m, nil, files, nil)
+		tlMsgs[i] = messageToTL(m, nil, files, nil, reactionsByMsg[m.LocalID])
 	}
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
@@ -346,10 +358,22 @@ func (h *handlers) chatHistory(r *mtproto.Request, chatID int64, msgs []store.Me
 		h.log.Error("get history files", "user_id", r.UserID, "chat_id", chatID, "err", err)
 		return nil, errInternal
 	}
+	// Load reactions for each message.
+	reactionsByMsg := make(map[int64][]store.Reaction, len(msgs))
+	for _, m := range msgs {
+		reactions, rerr := h.store.ReactionsByOwnerLocal(r.Ctx, r.UserID, m.LocalID)
+		if rerr != nil {
+			h.log.Error("get history reactions", "user_id", r.UserID, "local_id", m.LocalID, "err", rerr)
+			return nil, errInternal
+		}
+		if len(reactions) > 0 {
+			reactionsByMsg[m.LocalID] = reactions
+		}
+	}
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	authors := map[int64]bool{r.UserID: true}
 	for i, m := range msgs {
-		tlMsgs[i] = messageToTL(m, createUsers, files, nil)
+		tlMsgs[i] = messageToTL(m, createUsers, files, nil, reactionsByMsg[m.LocalID])
 		authors[m.FromID] = true
 		switch m.Action {
 		case store.ChatActionAddUser, store.ChatActionDeleteUser:
@@ -441,7 +465,7 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
-			&tg.UpdateEditMessage{Message: messageToTL(edited, nil, files, nil), Pts: newPts, PtsCount: 1},
+			&tg.UpdateEditMessage{Message: messageToTL(edited, nil, files, nil, nil), Pts: newPts, PtsCount: 1},
 		},
 		Users: users,
 		Date:  int(time.Now().Unix()),
@@ -628,6 +652,77 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 	return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, randomIDs)
 }
 
+// handleSendReaction serves messages.sendReaction: it records the caller's
+// reaction (or clears it) and pushes updateMessageReactions to all parties.
+func (h *handlers) handleSendReaction(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesSendReactionRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	peerType, peerID, err := h.inputPeer(req.Peer, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	// Reactions on channel messages are out of scope.
+	if peerType == store.PeerTypeChannel {
+		return nil, errPeerIDInvalid
+	}
+	if peerType == store.PeerTypeChat {
+		if err = h.requireMember(r.Ctx, peerID, r.UserID); err != nil {
+			return nil, err
+		}
+	}
+
+	localID := int64(req.MsgID)
+	reactions, hasReactions := req.GetReaction()
+
+	var affected []store.ReactionTarget
+	if !hasReactions || len(reactions) == 0 {
+		// Clear reaction.
+		affected, err = h.store.ClearReaction(r.Ctx, r.UserID, localID)
+	} else {
+		// Set reaction — use the first (and only) reaction emoji.
+		var reactionStr string
+		if emoji, ok := reactions[0].(*tg.ReactionEmoji); ok {
+			reactionStr = emoji.Emoticon
+		}
+		if reactionStr == "" {
+			return nil, errPeerIDInvalid
+		}
+		affected, err = h.store.SendReaction(r.Ctx, r.UserID, localID, reactionStr)
+	}
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
+	}
+	if errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	}
+	if err != nil {
+		h.log.Error("send reaction", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	// Notify all affected message copies (transient push, no pts).
+	for _, t := range affected {
+		h.notifyReaction(r.Ctx, t.OwnerID, t.LocalID)
+	}
+
+	// messages.sendReaction returns Updates per the Telegram schema.
+	return &tg.Updates{Date: int(time.Now().Unix())}, nil
+}
+
+// notifyReaction emits the cross-replica reaction nudge for userID (best-effort).
+// ownerID is the owner of the message copy being pushed to; localID is that copy's
+// local message id.
+func (h *handlers) notifyReaction(ctx context.Context, userID, localID int64) {
+	if err := h.store.Notify(ctx, store.ChannelReactions, store.ReactionPayload(userID, localID, userID)); err != nil {
+		h.log.Error("notify reaction", "user_id", userID, "err", err)
+	}
+}
+
 // forwardReply builds the UpdatesClass reply for a forward.
 func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType, destPeerID int64, perOwner map[int64]int, sentMsgs []store.ForwardedMessage, randomIDs []int64) (bin.Encoder, error) {
 	// Notify all affected owners.
@@ -744,7 +839,7 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 	for i, fm := range sentMsgs {
 		updates = append(updates,
 			&tg.UpdateMessageID{ID: int(fm.Message.LocalID), RandomID: randomIDs[i]},
-			&tg.UpdateNewMessage{Message: messageToTL(fm.Message, nil, files, nil), Pts: fm.Pts, PtsCount: 1},
+			&tg.UpdateNewMessage{Message: messageToTL(fm.Message, nil, files, nil, nil), Pts: fm.Pts, PtsCount: 1},
 		)
 	}
 	date := time.Now().Unix()

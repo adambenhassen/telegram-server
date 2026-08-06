@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -241,6 +242,10 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 	}
 	return func() { _ = tx.Rollback(ctx) }, nil //nolint:errcheck // nothing to commit
 }
+
+// StorePool returns the Store's pgxpool.Pool for tests that need a raw
+// connection independent of the Store's query layer.
+func StorePool(s *Store) *pgxpool.Pool { return s.pool }
 
 // WaitForLockWaiters blocks until n backends in this test's database are parked
 // on a lock. The concurrent join/revoke tests depend on the order goroutines
