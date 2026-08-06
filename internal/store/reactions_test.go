@@ -59,12 +59,9 @@ func TestSendReactionBlockedByDeleteLock(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait for the goroutine to reach the lock (block).
-	select {
-	case <-done:
-		t.Fatal("SendReaction returned before delete committed — lock not held")
-	case <-time.After(2 * time.Second):
-		// Good — it's blocked on the advisory lock.
+	// Wait for the goroutine to reach the advisory lock.
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		t.Fatalf("goroutine never reached advisory lock: %v", err)
 	}
 
 	// Commit the delete — this releases the advisory lock.
@@ -143,11 +140,9 @@ func TestClearReactionBlockedByDeleteLock(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		t.Fatal("ClearReaction returned before delete committed — lock not held")
-	case <-time.After(2 * time.Second):
-		// Good — blocked.
+	// Wait for the goroutine to reach the advisory lock.
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		t.Fatalf("goroutine never reached advisory lock: %v", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
