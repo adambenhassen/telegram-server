@@ -226,7 +226,7 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 		}
 		replyToMsgID := (*int32)(nil)
 		if f.ReplyToMsgID > 0 {
-			id := int32(f.ReplyToMsgID)
+			id := int32(f.ReplyToMsgID) //nolint:gosec // G115: local_id fits int32 wire space
 			replyToMsgID = &id
 		}
 		if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
