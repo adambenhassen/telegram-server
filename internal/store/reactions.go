@@ -69,7 +69,23 @@ func (s *Store) SendReaction(ctx context.Context, ownerID, localID int64, reacti
 		return affected, nil
 	}
 
-	// 1:1 message: record reaction on the caller's copy AND the peer's copy.
+	// 1:1 message: lock both owners, reload, then write.
+	// Advisory locks serialize against concurrent DeleteMessages: a reaction
+	// cannot commit after a delete that holds the same owner locks.
+	if err = lockOwners(ctx, tx, ownerID, peerID); err != nil {
+		return nil, err
+	}
+
+	msg, err = qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: ownerID, LocalID: localID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrMessageInvalid
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reload message: %w", err)
+	}
+	if msg.Deleted {
+		return nil, ErrMessageInvalid
+	}
 	peerLocalID := msg.PeerLocalID
 
 	// Upsert on caller's copy.
@@ -136,7 +152,21 @@ func (s *Store) ClearReaction(ctx context.Context, ownerID, localID int64) ([]Re
 		return affected, nil
 	}
 
-	// 1:1 message: delete reaction from both copies.
+	// 1:1 message: lock both owners, reload, then write.
+	if err = lockOwners(ctx, tx, ownerID, peerID); err != nil {
+		return nil, err
+	}
+
+	msg, err = qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: ownerID, LocalID: localID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrMessageInvalid
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reload message: %w", err)
+	}
+	if msg.Deleted {
+		return nil, ErrMessageInvalid
+	}
 	peerLocalID := msg.PeerLocalID
 
 	if err = qtx.DeleteReaction(ctx, db.DeleteReactionParams{
