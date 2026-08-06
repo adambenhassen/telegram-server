@@ -504,31 +504,41 @@ func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, chats []tg.ChatClas
 // store, and a tg.UpdatePinnedMessages is pushed to each member with live
 // connections. The update carries no pts (transient push, same model as
 // reactions).
-func (u *Updater) DeliverPinned(ctx context.Context, peerID int64, pinned bool) {
-	// Resolve members depending on whether this is a chat or channel.
-	// Try chat first.
-	chatMembers, err := u.h.store.Participants(ctx, peerID)
-	if err == nil {
-		// It is a chat.
-		members := make([]int64, len(chatMembers))
+func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, peerID int64, pinned bool) {
+	var members []int64
+	var peer tg.PeerClass
+
+	switch peerType {
+	case store.PeerTypeChat:
+		chatMembers, err := u.h.store.Participants(ctx, peerID)
+		if err != nil {
+			u.log.Error("deliver pinned chat lookup", "peer_id", peerID, "err", err)
+			return
+		}
+		members = make([]int64, len(chatMembers))
 		for i, p := range chatMembers {
 			members[i] = p.UserID
 		}
-		u.deliverPinnedToUsers(ctx, &tg.PeerChat{ChatID: peerID}, members, pinned)
+		peer = &tg.PeerChat{ChatID: peerID}
+
+	case store.PeerTypeChannel:
+		chMembers, err := u.h.store.ChannelMembers(ctx, peerID)
+		if err != nil {
+			u.log.Error("deliver pinned channel lookup", "peer_id", peerID, "err", err)
+			return
+		}
+		members = make([]int64, len(chMembers))
+		for i, m := range chMembers {
+			members[i] = m.UserID
+		}
+		peer = &tg.PeerChannel{ChannelID: peerID}
+
+	default:
+		u.log.Warn("deliver pinned unknown peer type", "peer_type", peerType)
 		return
 	}
 
-	// Try channel.
-	chMembers, err := u.h.store.ChannelMembers(ctx, peerID)
-	if err != nil {
-		// Not a chat and not a channel — skip silently.
-		return
-	}
-	members := make([]int64, len(chMembers))
-	for i, m := range chMembers {
-		members[i] = m.UserID
-	}
-	u.deliverPinnedToUsers(ctx, &tg.PeerChannel{ChannelID: peerID}, members, pinned)
+	u.deliverPinnedToUsers(ctx, peer, members, pinned)
 }
 
 // deliverPinnedToUsers pushes the pinned update to each member with live conns.
