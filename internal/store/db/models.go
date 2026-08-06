@@ -146,6 +146,14 @@ type MessageEvent struct {
 	LocalID int64
 }
 
+type MessageReaction struct {
+	OwnerID   int64
+	LocalID   int64
+	ReactorID int64
+	Reaction  string
+	CreatedAt pgtype.Timestamptz
+}
+
 type PhoneCode struct {
 	Phone      string
 	CodeHash   string

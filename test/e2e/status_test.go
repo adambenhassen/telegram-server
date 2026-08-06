@@ -46,7 +46,7 @@ func bootServerWithStatus(t *testing.T, ctx context.Context, key *rsa.PrivateKey
 	})
 
 	updater := api.NewUpdater(st, server.Registry(), log, pgtest.PeerDeriver())
-	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, log)
+	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, log)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}
@@ -174,13 +174,17 @@ func TestStatusOnlineRoundTrip(t *testing.T) {
 	}
 
 	// AC 2: A just disconnected — B must receive updateUserStatus{Offline} with nonzero WasOnline.
-	offUpd := recvStatus(t, collB, "B updateUserStatus offline")
-	if offUpd.UserID != aUserID {
-		t.Fatalf("offline UserID = %d, want %d", offUpd.UserID, aUserID)
-	}
-	off, ok := offUpd.Status.(*tg.UserStatusOffline)
-	if !ok {
-		t.Fatalf("offline status type = %T, want *tg.UserStatusOffline", offUpd.Status)
+	// Skip any Online push from A's login that may have arrived before the message was drained.
+	var off *tg.UserStatusOffline
+	for {
+		upd := recvStatus(t, collB, "B updateUserStatus offline")
+		if upd.UserID != aUserID {
+			continue
+		}
+		if o, ok := upd.Status.(*tg.UserStatusOffline); ok {
+			off = o
+			break
+		}
 	}
 	if off.WasOnline == 0 {
 		t.Fatal("WasOnline is zero — last_seen_at was not set on disconnect")
@@ -693,11 +697,14 @@ func TestStatusNoCrossContamination(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("B did not receive setup message")
 	}
-	// Wait for B's offline status for A (from A's first disconnect) before reconnecting,
-	// so the subsequent recvStatus only picks up the Online push.
-	offUpd := recvStatus(t, collB, "B updateUserStatus offline (setup)")
-	if _, ok := offUpd.Status.(*tg.UserStatusOffline); !ok {
-		t.Fatalf("setup offline status type = %T, want *tg.UserStatusOffline", offUpd.Status)
+	// Drain any Online push from A's login, then wait for the Offline push
+	// (from A's disconnect). The ordering of Online vs the setup message is
+	// not guaranteed, so skip Online updates until Offline arrives.
+	for {
+		upd := recvStatus(t, collB, "B updateUserStatus offline (setup)")
+		if _, ok := upd.Status.(*tg.UserStatusOffline); ok {
+			break
+		}
 	}
 	drainStatus(collD)
 

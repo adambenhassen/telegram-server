@@ -427,6 +427,64 @@ func (u *Updater) Evict(_ context.Context, userID, authKeyID int64) {
 	}
 }
 
+// DeliverReactions pushes updateMessageReactions to userID's live conns for
+// the single message identified by (ownerID, localID). It is the reactions
+// callback for StartListener.
+//
+// Reactions carry no pts and are never persisted in the event log, exactly like
+// typing and status: they are transient pushes. A client that missed the push
+// sees the current reaction state on the next getHistory (via messageReactions
+// on the message object), so a missed push is not a loss.
+func (u *Updater) DeliverReactions(ctx context.Context, ownerID, localID, userID int64) {
+	conns := u.registry.Conns(userID)
+	if len(conns) == 0 {
+		return
+	}
+
+	// Load the message for the peer reference.
+	msgs, err := u.h.store.MessagesByOwnerLocalIDs(ctx, ownerID, []int64{localID})
+	if err != nil {
+		u.log.Error("deliver reactions message", "user_id", userID, "local_id", localID, "err", err)
+		return
+	}
+	msg, ok := msgs[localID]
+	if !ok {
+		return
+	}
+
+	// Load current reactions for this message copy.
+	reactions, err := u.h.store.ReactionsByOwnerLocal(ctx, ownerID, localID)
+	if err != nil {
+		u.log.Error("deliver reactions load", "user_id", userID, "local_id", localID, "err", err)
+		return
+	}
+
+	reactionClasses := make([]tg.ReactionClass, len(reactions))
+	for i, r := range reactions {
+		reactionClasses[i] = &tg.ReactionEmoji{Emoticon: r.Reaction}
+	}
+	mr := &tg.MessageReactions{
+		Results: make([]tg.ReactionCount, len(reactionClasses)),
+	}
+	for i, rc := range reactionClasses {
+		mr.Results[i] = tg.ReactionCount{Reaction: rc, Count: 1}
+	}
+	update := &tg.UpdateShort{
+		Update: &tg.UpdateMessageReactions{
+			Peer:      peerToTL(msg.PeerType, msg.PeerID),
+			MsgID:     int(msg.LocalID),
+			Reactions: *mr,
+		},
+		Date: int(time.Now().Unix()),
+	}
+	for _, c := range conns {
+		// Carries no pts, so a conn that changed hands simply drops it.
+		if _, err := c.PushTo(ctx, userID, update, 0); err != nil {
+			u.log.Info("deliver reactions push", "user_id", userID, "err", err)
+		}
+	}
+}
+
 // wrapUpdates envelopes hydrated updates into a tg.Updates for a live push.
 func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, chats []tg.ChatClass, state store.State) *tg.Updates {
 	return &tg.Updates{

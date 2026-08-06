@@ -77,6 +77,7 @@ func TestStartListenerDispatches(t *testing.T) {
 		func(_ context.Context, userID, chatID int64) { encrypted <- [2]int64{userID, chatID} },
 		func(context.Context, int64, bool) {},
 		func(_ context.Context, _ int64, _ int) {},
+		func(context.Context, int64, int64, int64) {},
 		nil,
 	)
 	if err != nil {
@@ -201,6 +202,7 @@ func TestStartListenerReconnectsAfterBackendTermination(t *testing.T) {
 		func(_ context.Context, _, _ int64) {},
 		func(context.Context, int64, bool) {},
 		func(_ context.Context, _ int64, _ int) {},
+		func(context.Context, int64, int64, int64) {},
 		nil,
 	)
 	if err != nil {
@@ -280,6 +282,7 @@ func TestStartListenerBacksOffWhileDatabaseIsDown(t *testing.T) {
 		func(_ context.Context, _, _ int64) {},
 		func(context.Context, int64, bool) {},
 		func(_ context.Context, _ int64, _ int) {},
+		func(context.Context, int64, int64, int64) {},
 		nil,
 	)
 	if err != nil {
@@ -325,6 +328,7 @@ func TestStartListenerDeliversChannelPost(t *testing.T) {
 		func(_ context.Context, _, _ int64) {},
 		func(context.Context, int64, bool) {},
 		func(_ context.Context, _ int64, _ int) {},
+		func(context.Context, int64, int64, int64) {},
 		nil,
 	)
 	if err != nil {
@@ -384,6 +388,7 @@ func TestStartListenerDeliversStatus(t *testing.T) {
 		func(context.Context, int64, int64) {},
 		func(_ context.Context, userID int64, online bool) { statused <- [2]bool{userID == 7, online} },
 		func(_ context.Context, _ int64, _ int) {},
+		func(context.Context, int64, int64, int64) {},
 		nil,
 	)
 	if err != nil {
