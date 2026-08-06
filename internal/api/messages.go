@@ -147,11 +147,18 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	if peerType == store.PeerTypeChannel {
 		return h.sendChannelMessage(r, toID, &req)
 	}
-	if peerType == store.PeerTypeChat {
-		return h.sendChatMessage(r, toID, &req)
+	replyToMsgID := int64(0)
+	if replyTo, ok := req.GetReplyTo(); ok {
+		if rep, ok := replyTo.(*tg.InputReplyToMessage); ok && rep.ReplyToMsgID > 0 {
+			replyToMsgID = int64(rep.ReplyToMsgID)
+		}
 	}
 
-	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0)
+	if peerType == store.PeerTypeChat {
+		return h.sendChatMessage(r, toID, &req, replyToMsgID)
+	}
+
+	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0, replyToMsgID)
 	if err != nil {
 		h.log.Error("send message", "user_id", r.UserID, "err", err)
 		return nil, errInternal
@@ -170,7 +177,7 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
 			// sendMessage never carries media; the media send path builds its own reply.
-			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil), Pts: senderPts, PtsCount: 1},
+			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil, nil), Pts: senderPts, PtsCount: 1},
 		},
 		Users: users,
 		Date:  int(sender.Date.Unix()),
@@ -199,13 +206,14 @@ func (h *handlers) requireMember(ctx context.Context, chatID, userID int64) erro
 
 // sendChatMessage fans one message out to every member of chatID and returns the
 // sender-side Updates. The reply is the 1:1 shape plus the chat itself.
-func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.MessagesSendMessageRequest, replyToMsgID int64) (bin.Encoder, error) {
 	if err := h.requireMember(r.Ctx, chatID, r.UserID); err != nil {
 		return nil, err
 	}
 
 	sender, perOwner, dup, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
 		ChatID: chatID, FromID: r.UserID, Text: req.Message, RandomID: req.RandomID,
+		ReplyToMsgID: replyToMsgID,
 	})
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
@@ -238,7 +246,7 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
 			// sendMessage never carries media; the media send path builds its own reply.
-			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil), Pts: perOwner[r.UserID], PtsCount: 1},
+			&tg.UpdateNewMessage{Message: messageToTL(sender, nil, nil, nil), Pts: perOwner[r.UserID], PtsCount: 1},
 		},
 		Users: users,
 		Chats: chats,
@@ -299,7 +307,7 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	for i, m := range msgs {
-		tlMsgs[i] = messageToTL(m, nil, files)
+		tlMsgs[i] = messageToTL(m, nil, files, nil)
 	}
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
@@ -341,7 +349,7 @@ func (h *handlers) chatHistory(r *mtproto.Request, chatID int64, msgs []store.Me
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	authors := map[int64]bool{r.UserID: true}
 	for i, m := range msgs {
-		tlMsgs[i] = messageToTL(m, createUsers, files)
+		tlMsgs[i] = messageToTL(m, createUsers, files, nil)
 		authors[m.FromID] = true
 		switch m.Action {
 		case store.ChatActionAddUser, store.ChatActionDeleteUser:
@@ -433,7 +441,7 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
-			&tg.UpdateEditMessage{Message: messageToTL(edited, nil, files), Pts: newPts, PtsCount: 1},
+			&tg.UpdateEditMessage{Message: messageToTL(edited, nil, files, nil), Pts: newPts, PtsCount: 1},
 		},
 		Users: users,
 		Date:  int(time.Now().Unix()),

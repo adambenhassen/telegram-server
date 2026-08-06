@@ -1114,7 +1114,7 @@ func mediaMessage(t *testing.T, s *store.Store, from, to store.User, text string
 			t.Fatalf("mark stored: %v", err)
 		}
 	}
-	sender, _, _, _, err := s.SendMessage(ctx, from.ID, to.ID, text, 909, f.ID) //nolint:dogsled // only the sender row is needed here
+	sender, _, _, _, err := s.SendMessage(ctx, from.ID, to.ID, text, 909, f.ID, 0) //nolint:dogsled // only the sender row is needed here
 	if err != nil {
 		t.Fatalf("send media message: %v", err)
 	}

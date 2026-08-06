@@ -47,6 +47,9 @@ type Message struct {
 	FileID       int64
 	Action       ChatAction
 	ActionUserID int64
+	// ReplyToMsgID is the local_id of the message this message replies to,
+	// in this row's owner's local_id space.
+	ReplyToMsgID int32
 }
 
 func messageFromRow(r db.Message) Message {
@@ -71,6 +74,9 @@ func messageFromRow(r db.Message) Message {
 	if r.EditDate.Valid {
 		t := r.EditDate.Time
 		m.EditDate = &t
+	}
+	if r.ReplyToMsgID != nil {
+		m.ReplyToMsgID = *r.ReplyToMsgID
 	}
 	return m
 }
@@ -108,8 +114,9 @@ func (s *Store) MessageByRandomID(ctx context.Context, ownerID, randomID int64) 
 // SendMessage persists both sides of a 1:1 message in one transaction. Each side
 // gets its own local_id and its own pts++. A repeated randomID (per sender) is
 // deduped: the original sender message is returned with dup=true and no new rows
-// or events. Returns the sender's stored copy plus both owners' resulting pts.
-func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string, randomID, fileID int64) (sender Message, senderPts, recipientPts int, dup bool, err error) {
+// or events. replyToMsgID is the sender's local_id of the message being replied to
+// (0 if no reply). Returns the sender's stored copy plus both owners' resulting pts.
+func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string, randomID, fileID, replyToMsgID int64) (sender Message, senderPts, recipientPts int, dup bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("begin: %w", err)
@@ -155,17 +162,34 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 	}
 
 	// Sender outbox copy (dedup token lives here) + recipient inbox copy.
+	var senderReplyTo *int32
+	if replyToMsgID > 0 {
+		v := int32(replyToMsgID) //nolint:gosec // G115: local_id fits int32 wire space
+		senderReplyTo = &v
+	}
 	if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
 		OwnerID: fromID, LocalID: sb.LocalID, PeerType: int16(PeerTypeUser), PeerID: toID, FromID: fromID,
 		Message: text, Out: true, RandomID: randomID, PeerLocalID: rb.LocalID,
-		FanoutID: 0, ActionType: 0, ActionUserID: 0, FileID: fileID,
+		FanoutID: 0, ActionType: 0, ActionUserID: 0, FileID: fileID, ReplyToMsgID: senderReplyTo,
 	}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("insert sender message: %w", err)
 	}
+
+	// For the recipient's row, the reply must point to the same physical message
+	// but in the recipient's local_id space. Resolve by looking up the sender's
+	// reply target and finding its peer_local_id (which is the recipient's local_id).
+	var recipientReplyTo *int32
+	if replyToMsgID > 0 {
+		if ref, e := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: fromID, LocalID: replyToMsgID}); e == nil {
+			v := int32(ref.PeerLocalID) //nolint:gosec // G115: local_id fits int32 wire space
+			recipientReplyTo = &v
+		}
+	}
+
 	if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
 		OwnerID: toID, LocalID: rb.LocalID, PeerType: int16(PeerTypeUser), PeerID: fromID, FromID: fromID,
 		Message: text, Out: false, RandomID: 0, PeerLocalID: sb.LocalID,
-		FanoutID: 0, ActionType: 0, ActionUserID: 0, FileID: fileID,
+		FanoutID: 0, ActionType: 0, ActionUserID: 0, FileID: fileID, ReplyToMsgID: recipientReplyTo,
 	}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("insert recipient message: %w", err)
 	}
