@@ -78,6 +78,18 @@ func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Docum
 	if d, ok := files[m.FileID]; ok && m.FileID != 0 {
 		msg.SetMedia(&tg.MessageMediaDocument{Document: d})
 	}
+	if m.FwdFromID != 0 || !m.FwdDate.IsZero() {
+		fwd := tg.MessageFwdHeader{
+			Date: int(m.FwdDate.Unix()),
+		}
+		if m.FwdFromID != 0 {
+			fwd.SetFromID(&tg.PeerUser{UserID: m.FwdFromID})
+		}
+		if m.FwdChannelID != 0 {
+			fwd.SetChannelPost(int(m.FwdChannelPost))
+		}
+		msg.SetFwdFrom(fwd)
+	}
 	return msg
 }
 

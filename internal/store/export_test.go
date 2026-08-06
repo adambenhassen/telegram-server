@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
@@ -92,6 +94,7 @@ func InsertChatMessageNoFanout(ctx context.Context, s *Store, ownerID, chatID in
 		OwnerID: ownerID, LocalID: b.LocalID, PeerType: int16(PeerTypeChat), PeerID: chatID,
 		FromID: ownerID, Message: text, Out: true, RandomID: 0, PeerLocalID: 0,
 		FanoutID: 0, ActionType: 0, ActionUserID: 0,
+		FwdFromID: nil, FwdDate: pgtype.Timestamptz{}, FwdChannelID: nil, FwdChannelPost: nil,
 	}); err != nil {
 		return 0, err
 	}
