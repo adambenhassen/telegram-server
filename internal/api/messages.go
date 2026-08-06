@@ -635,13 +635,14 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 		h.notify(r.Ctx, uid)
 	}
 
-	// Collect user and chat references from forwarded messages.
+	// Collect user, chat and channel references from forwarded messages.
 	userRefs := make(map[int64]bool)
-	chatRefs := make(map[int64]bool)
+	basicChatRefs := make(map[int64]bool)
+	channelRefs := make(map[int64]bool)
 	for _, fm := range sentMsgs {
 		m := fm.Message
 		if m.PeerType == store.PeerTypeChat {
-			chatRefs[m.PeerID] = true
+			basicChatRefs[m.PeerID] = true
 		} else {
 			userRefs[m.PeerID] = true
 		}
@@ -650,7 +651,7 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 			userRefs[m.FwdFromID] = true
 		}
 		if m.FwdChannelID != 0 {
-			chatRefs[m.FwdChannelID] = true
+			channelRefs[m.FwdChannelID] = true
 		}
 	}
 
@@ -667,13 +668,13 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 			recipients[uid] = true
 			userRefs[uid] = true
 		}
-		chatRefs[destPeerID] = true
+		basicChatRefs[destPeerID] = true
 		users, err = h.loadUsers(r.Ctx, recipients, r.UserID)
 		if err == nil {
 			chats, err = h.loadChats(r.Ctx, map[int64]bool{destPeerID: true}, r.UserID)
 		}
 	}
-	// Load extra references from fwd heads that the send/load did not cover.
+	// Load extra user references from fwd heads that the send/load did not cover.
 	for uid := range userRefs {
 		if uid != r.UserID {
 			u, ok, uerr := h.store.UserByID(r.Ctx, uid)
@@ -686,8 +687,9 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 			}
 		}
 	}
-	for chid := range chatRefs {
-		if _, loaded := chatRefs[chid]; !loaded {
+	// Load basic chat references.
+	for chid := range basicChatRefs {
+		if _, loaded := basicChatRefs[chid]; !loaded {
 			continue
 		}
 		c, ok, cerr := h.store.ChatByID(r.Ctx, chid)
@@ -712,6 +714,15 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 			}
 			chats = append(chats, chatToTL(c, count, r.UserID))
 		}
+	}
+	// Load channel references with viewer-aware loader.
+	if len(channelRefs) > 0 {
+		channelTL, cerr := h.loadChannels(r.Ctx, channelRefs, r.UserID)
+		if cerr != nil {
+			h.log.Error("forward reply fwd channel", "err", cerr)
+			return nil, errInternal
+		}
+		chats = append(chats, channelTL...)
 	}
 	if err != nil {
 		h.log.Error("forward reply", "err", err)

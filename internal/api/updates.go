@@ -340,9 +340,10 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 	}
 
 	peers := map[int64]bool{}
-	chats := map[int64]bool{}
+	basicChats := map[int64]bool{}
+	channels := map[int64]bool{}
 	for _, ev := range events {
-		up, refs, chatRefs, uerr := h.eventToUpdate(ctx, userID, ev, msgs, files)
+		up, refs, chatRefs, channelRefs, uerr := h.eventToUpdate(ctx, userID, ev, msgs, files)
 		if uerr != nil {
 			return updateBatch{}, uerr
 		}
@@ -355,7 +356,10 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 			peers[id] = true
 		}
 		for _, id := range chatRefs {
-			chats[id] = true
+			basicChats[id] = true
+		}
+		for _, id := range channelRefs {
+			channels[id] = true
 		}
 	}
 	// When truncated, advertise only through the last included event's pts.
@@ -367,9 +371,16 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 	if err != nil {
 		return updateBatch{}, err
 	}
-	b.chats, err = h.loadChats(ctx, chats, userID)
+	b.chats, err = h.loadChats(ctx, basicChats, userID)
 	if err != nil {
 		return updateBatch{}, err
+	}
+	if len(channels) > 0 {
+		channelTL, cerr := h.loadChannels(ctx, channels, userID)
+		if cerr != nil {
+			return updateBatch{}, cerr
+		}
+		b.chats = append(b.chats, channelTL...)
 	}
 	return b, nil
 }
@@ -405,15 +416,16 @@ func (h *handlers) batchMessages(ctx context.Context, userID int64, events []sto
 }
 
 // eventToUpdate builds the wire update for one event owned by userID, returning
-// the update, the user ids it references and the chat ids it references. A nil
-// update (message vanished, or an empty read marker) is skipped by the caller.
+// the update, the user ids it references, the chat ids (basic chats only) and
+// the channel ids it references. A nil update (message vanished, or an empty
+// read marker) is skipped by the caller.
 // msgs and files are the batch's pre-loaded rows and their media.
-func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Event, msgs map[int64]store.Message, files map[int64]*tg.Document) (tg.UpdateClass, []int64, []int64, error) {
+func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Event, msgs map[int64]store.Message, files map[int64]*tg.Document) (tg.UpdateClass, []int64, []int64, []int64, error) {
 	switch ev.Type {
 	case store.EventNewMessage, store.EventEdit:
 		m, ok := msgs[ev.LocalID]
 		if !ok {
-			return nil, nil, nil, nil
+			return nil, nil, nil, nil, nil
 		}
 		// The create action's user list is current member ids, so it is the same
 		// disclosure loadChats gates: a viewer removed from the chat still replays
@@ -423,12 +435,12 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 		if m.Action == store.ChatActionCreate {
 			member, merr := h.store.IsMember(ctx, m.PeerID, userID)
 			if merr != nil {
-				return nil, nil, nil, merr
+				return nil, nil, nil, nil, merr
 			}
 			if member {
 				parts, perr := h.store.Participants(ctx, m.PeerID)
 				if perr != nil {
-					return nil, nil, nil, perr
+					return nil, nil, nil, nil, perr
 				}
 				createUsers = make([]int64, len(parts))
 				for i, p := range parts {
@@ -438,7 +450,7 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 		}
 		tlMsg := messageToTL(m, createUsers, files, nil)
 		refs := []int64{m.FromID}
-		var chatRefs []int64
+		var chatRefs, channelRefs []int64
 		if m.PeerType == store.PeerTypeChat {
 			// The peer is the chat, not a user, so the owner is named explicitly:
 			// a client rendering a group needs itself in the user list.
@@ -462,23 +474,23 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 			refs = append(refs, m.FwdFromID)
 		}
 		if m.FwdChannelID != 0 {
-			chatRefs = append(chatRefs, m.FwdChannelID)
+			channelRefs = []int64{m.FwdChannelID}
 		}
 		if ev.Type == store.EventEdit {
-			return &tg.UpdateEditMessage{Message: tlMsg, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil
+			return &tg.UpdateEditMessage{Message: tlMsg, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, channelRefs, nil
 		}
-		return &tg.UpdateNewMessage{Message: tlMsg, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil
+		return &tg.UpdateNewMessage{Message: tlMsg, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, channelRefs, nil
 
 	case store.EventDelete:
-		return &tg.UpdateDeleteMessages{Messages: []int{int(ev.LocalID)}, Pts: ev.Pts, PtsCount: 1}, nil, nil, nil
+		return &tg.UpdateDeleteMessages{Messages: []int{int(ev.LocalID)}, Pts: ev.Pts, PtsCount: 1}, nil, nil, nil, nil
 
 	case store.EventReadIn, store.EventReadOut:
 		if ev.LocalID == 0 {
-			return nil, nil, nil, nil
+			return nil, nil, nil, nil, nil
 		}
 		m, ok := msgs[ev.LocalID]
 		if !ok {
-			return nil, nil, nil, nil
+			return nil, nil, nil, nil, nil
 		}
 		peer := peerToTL(m.PeerType, m.PeerID)
 		var refs, chatRefs []int64
@@ -488,12 +500,12 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 			refs = []int64{m.PeerID}
 		}
 		if ev.Type == store.EventReadOut {
-			return &tg.UpdateReadHistoryOutbox{Peer: peer, MaxID: int(ev.LocalID), Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil
+			return &tg.UpdateReadHistoryOutbox{Peer: peer, MaxID: int(ev.LocalID), Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil, nil
 		}
-		return &tg.UpdateReadHistoryInbox{Peer: peer, MaxID: int(ev.LocalID), StillUnreadCount: 0, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil
+		return &tg.UpdateReadHistoryInbox{Peer: peer, MaxID: int(ev.LocalID), StillUnreadCount: 0, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil, nil
 
 	default:
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 }
 
