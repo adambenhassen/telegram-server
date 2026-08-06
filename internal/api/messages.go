@@ -567,7 +567,7 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		}
 		randomIDs := make([]int64, len(req.RandomID))
 		copy(randomIDs, req.RandomID)
-		perOwner, sentIDs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
+		perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
 		if errors.Is(err, store.ErrMessageInvalid) {
 			return nil, errMessageIDInvalid
 		}
@@ -578,7 +578,7 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 			h.log.Error("forward messages", "user_id", r.UserID, "err", err)
 			return nil, errInternal
 		}
-		return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentIDs)
+		return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, randomIDs)
 	}
 
 	// User or chat source: resolve each message from the messages table.
@@ -624,7 +624,7 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 
 	randomIDs := make([]int64, len(req.RandomID))
 	copy(randomIDs, req.RandomID)
-	perOwner, sentIDs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
+	perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
 	if errors.Is(err, store.ErrMessageInvalid) {
 		return nil, errMessageIDInvalid
 	}
@@ -635,18 +635,46 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		h.log.Error("forward messages", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentIDs)
+	return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, randomIDs)
 }
 
 // forwardReply builds the UpdatesClass reply for a forward.
-func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType, destPeerID int64, perOwner map[int64]int, sentIDs []int64) (bin.Encoder, error) {
+func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType, destPeerID int64, perOwner map[int64]int, sentMsgs []store.Message, randomIDs []int64) (bin.Encoder, error) {
 	// Notify all affected owners.
 	for uid := range perOwner {
 		h.notify(r.Ctx, uid)
 	}
 
-	return &tg.MessagesAffectedMessages{
-		Pts:      perOwner[r.UserID],
-		PtsCount: len(sentIDs),
-	}, nil
+	var users []tg.UserClass
+	var chats []tg.ChatClass
+	var err error
+	if destPeerType == store.PeerTypeUser {
+		users, err = h.twoUsers(r.Ctx, r.UserID, destPeerID)
+	} else {
+		recipients := make(map[int64]bool, len(perOwner))
+		for uid := range perOwner {
+			recipients[uid] = true
+		}
+		users, err = h.loadUsers(r.Ctx, recipients, r.UserID)
+		if err == nil {
+			chats, err = h.loadChats(r.Ctx, map[int64]bool{destPeerID: true}, r.UserID)
+		}
+	}
+	if err != nil {
+		h.log.Error("forward reply", "err", err)
+		return nil, errInternal
+	}
+
+	updates := make([]tg.UpdateClass, 0, len(sentMsgs)*2)
+	for i, msg := range sentMsgs {
+		updates = append(updates,
+			&tg.UpdateMessageID{ID: int(msg.LocalID), RandomID: randomIDs[i]},
+			&tg.UpdateNewMessage{Message: messageToTL(msg, nil, nil, nil), Pts: perOwner[r.UserID], PtsCount: 1},
+		)
+	}
+	date := time.Now().Unix()
+	if len(sentMsgs) > 0 {
+		date = sentMsgs[0].Date.Unix()
+	}
+	return &tg.Updates{Updates: updates, Users: users, Chats: chats, Date: int(date)}, nil
 }
