@@ -44,9 +44,6 @@ func (s *Store) SendReaction(ctx context.Context, ownerID, localID int64, reacti
 	qtx := s.q.WithTx(tx)
 
 	msg, err := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: ownerID, LocalID: localID})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrMessageInvalid
-	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrMessageInvalid
@@ -108,9 +105,6 @@ func (s *Store) ClearReaction(ctx context.Context, ownerID, localID int64) ([]Re
 	qtx := s.q.WithTx(tx)
 
 	msg, err := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: ownerID, LocalID: localID})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrMessageInvalid
-	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrMessageInvalid
@@ -235,37 +229,6 @@ func (s *Store) ReactionsByOwnerLocal(ctx context.Context, ownerID, localID int6
 		reactions[i] = reactionFromRow(r)
 	}
 	return reactions, nil
-}
-
-// MessageReactionGroup groups reactions by message for delivery.
-type MessageReactionGroup struct {
-	LocalID   int64
-	Reactions []Reaction
-}
-
-// ReactionsForUser returns all reactions on messages owned by userID, grouped
-// by message. Used by the reactions delivery path to push updateMessageReactions.
-func (s *Store) ReactionsForUser(ctx context.Context, ownerID int64) ([]MessageReactionGroup, error) {
-	rows, err := s.q.ReactionsByOwner(ctx, ownerID)
-	if err != nil {
-		return nil, fmt.Errorf("reactions by owner: %w", err)
-	}
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	// Group by local_id.
-	byMsg := make(map[int64][]Reaction)
-	for _, r := range rows {
-		byMsg[r.LocalID] = append(byMsg[r.LocalID], reactionFromRow(r))
-	}
-	groups := make([]MessageReactionGroup, 0, len(byMsg))
-	for localID, reactions := range byMsg {
-		groups = append(groups, MessageReactionGroup{
-			LocalID:   localID,
-			Reactions: reactions,
-		})
-	}
-	return groups, nil
 }
 
 // MessagesByOwnerLocalIDs returns messages for the given owner and local ids.

@@ -115,38 +115,6 @@ func (q *Queries) ReactionsByMessage(ctx context.Context, arg ReactionsByMessage
 	return items, nil
 }
 
-const reactionsByOwner = `-- name: ReactionsByOwner :many
-SELECT owner_id, local_id, reactor_id, reaction, created_at FROM message_reactions
-WHERE owner_id = $1
-ORDER BY local_id, reactor_id
-`
-
-func (q *Queries) ReactionsByOwner(ctx context.Context, ownerID int64) ([]MessageReaction, error) {
-	rows, err := q.db.Query(ctx, reactionsByOwner, ownerID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []MessageReaction
-	for rows.Next() {
-		var i MessageReaction
-		if err := rows.Scan(
-			&i.OwnerID,
-			&i.LocalID,
-			&i.ReactorID,
-			&i.Reaction,
-			&i.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const upsertReaction = `-- name: UpsertReaction :exec
 INSERT INTO message_reactions (owner_id, local_id, reactor_id, reaction)
 VALUES ($1, $2, $3, $4)
