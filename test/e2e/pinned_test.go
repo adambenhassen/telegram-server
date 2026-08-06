@@ -182,6 +182,31 @@ func TestPinnedChat(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A pin (idempotent): %v", err)
 	}
+	// 4b. No push should arrive for the idempotent re-pin.
+	select {
+	case <-collB.pinnedMsg:
+		t.Fatal("B received push on idempotent re-pin, want none")
+	default:
+	}
+
+	// 4c. Non-creator (B) tries to pin — should be rejected.
+	var bPinErr error
+	if execErr := exec(bCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID},
+			ID:   msgID,
+		})
+		bPinErr = err
+		return nil
+	}); execErr != nil {
+		t.Fatalf("B exec pin: %v", execErr)
+	}
+	if bPinErr == nil {
+		t.Fatal("B pin as non-creator: want CHAT_ADMIN_REQUIRED, got nil")
+	}
+	if !strings.Contains(bPinErr.Error(), "CHAT_ADMIN_REQUIRED") {
+		t.Fatalf("B pin error = %v, want CHAT_ADMIN_REQUIRED", bPinErr)
+	}
 
 	// 5. A unpins.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {

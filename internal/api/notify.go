@@ -504,7 +504,7 @@ func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, chats []tg.ChatClas
 // store, and a tg.UpdatePinnedMessages is pushed to each member with live
 // connections. The update carries no pts (transient push, same model as
 // reactions).
-func (u *Updater) DeliverPinned(ctx context.Context, peerID int64) {
+func (u *Updater) DeliverPinned(ctx context.Context, peerID int64, pinned bool) {
 	// Resolve members depending on whether this is a chat or channel.
 	// Try chat first.
 	chatMembers, err := u.h.store.Participants(ctx, peerID)
@@ -514,7 +514,7 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerID int64) {
 		for i, p := range chatMembers {
 			members[i] = p.UserID
 		}
-		u.deliverPinnedToUsers(ctx, &tg.PeerChat{ChatID: peerID}, members)
+		u.deliverPinnedToUsers(ctx, &tg.PeerChat{ChatID: peerID}, members, pinned)
 		return
 	}
 
@@ -528,11 +528,11 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerID int64) {
 	for i, m := range chMembers {
 		members[i] = m.UserID
 	}
-	u.deliverPinnedToUsers(ctx, &tg.PeerChannel{ChannelID: peerID}, members)
+	u.deliverPinnedToUsers(ctx, &tg.PeerChannel{ChannelID: peerID}, members, pinned)
 }
 
 // deliverPinnedToUsers pushes the pinned update to each member with live conns.
-func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64) {
+func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64, pinned bool) {
 	for _, memberID := range members {
 		conns := u.registry.Conns(memberID)
 		if len(conns) == 0 {
@@ -540,7 +540,7 @@ func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, m
 		}
 		update := &tg.UpdateShort{
 			Update: &tg.UpdatePinnedMessages{
-				Pinned: true,
+				Pinned: pinned,
 				Peer:   peer,
 			},
 			Date: int(time.Now().Unix()),

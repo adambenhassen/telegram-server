@@ -95,7 +95,7 @@ type Listener struct {
 // (userID, online) for a status change; encryptedMsg receives (recipientID, qts)
 // for a secret-chat message; reactions receives (ownerID, localID, userID) for
 // a reaction change on a specific message copy; pinned receives (peerID) for a
-// pin/unpin in a chat or channel.
+// pin/unpin in a chat or channel, with pinned=true for pin, false for unpin.
 //
 // A broken connection is reconnected with bounded backoff rather than ending
 // delivery for the life of the process. Notifications emitted while the
@@ -115,7 +115,7 @@ func StartListener(
 	status func(ctx context.Context, userID int64, online bool),
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
-	pinned func(ctx context.Context, peerID int64),
+	pinned func(ctx context.Context, peerID int64, pinned bool),
 	log *slog.Logger,
 ) (*Listener, func() error, error) {
 	if log == nil {
@@ -175,7 +175,7 @@ func (l *Listener) run(
 	status func(ctx context.Context, userID int64, online bool),
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
-	pinned func(ctx context.Context, peerID int64),
+	pinned func(ctx context.Context, peerID int64, pinned bool),
 ) {
 	backoff := listenerBackoffMin
 	for {
@@ -222,7 +222,7 @@ func (l *Listener) dispatch(
 	status func(ctx context.Context, userID int64, online bool),
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
-	pinned func(ctx context.Context, peerID int64),
+	pinned func(ctx context.Context, peerID int64, pinned bool),
 ) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
@@ -289,12 +289,18 @@ func (l *Listener) dispatch(
 			}
 			reactions(ctx, opts.ownerID, opts.localID, opts.userID)
 		case ChannelPinned:
-			peerID, perr := strconv.ParseInt(n.Payload, 10, 64)
+			payload := n.Payload
+			isPinned := true
+			if strings.HasPrefix(payload, "-") {
+				isPinned = false
+				payload = payload[1:]
+			}
+			peerID, perr := strconv.ParseInt(payload, 10, 64)
 			if perr != nil {
 				l.log.Warn("bad tg_pinned payload", "payload", n.Payload)
 				continue
 			}
-			pinned(ctx, peerID)
+			pinned(ctx, peerID, isPinned)
 		}
 	}
 }
@@ -360,9 +366,14 @@ func ReactionPayload(ownerID, localID, userID int64) string {
 }
 
 // PinnedPayload formats a tg_pinned NOTIFY payload naming the peer whose
-// pinned message changed.
-func PinnedPayload(peerID int64) string {
-	return strconv.FormatInt(peerID, 10)
+// pinned message changed. The payload is "<peerID>" for pin and
+// "-<peerID>" for unpin, so DeliverPinned can distinguish the two without
+// a second query.
+func PinnedPayload(peerID int64, pinned bool) string {
+	if pinned {
+		return strconv.FormatInt(peerID, 10)
+	}
+	return "-" + strconv.FormatInt(peerID, 10)
 }
 
 // reactionPayload carries the parsed fields of a tg_reactions NOTIFY payload.
