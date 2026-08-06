@@ -908,6 +908,18 @@ func (h *handlers) pinChatMessage(r *mtproto.Request, chatID int64, req *tg.Mess
 		pinnedID = &msgID
 	}
 
+	// Validate that the message exists in this chat and is not deleted.
+	if pinnedID != nil {
+		msg, ok, err := h.store.MessageByOwnerLocal(r.Ctx, r.UserID, int64(*pinnedID))
+		if err != nil {
+			h.log.Error("pin chat validate", "chat_id", chatID, "err", err)
+			return nil, errInternal
+		}
+		if !ok || msg.Deleted || msg.PeerType != store.PeerTypeChat || msg.PeerID != chatID {
+			return nil, errMessageIDInvalid
+		}
+	}
+
 	// Read current pinned state for idempotency check.
 	// Note: this read occurs before the row lock in SetChatPinnedMessage, so
 	// two concurrent identical requests can both see the old value and both
@@ -939,7 +951,11 @@ func (h *handlers) pinChatMessage(r *mtproto.Request, chatID int64, req *tg.Mess
 	}
 
 	// Emit the pinned notification so all members receive updatePinnedMessages.
-	h.notifyPinned(r.Ctx, store.PeerTypeChat, chatID, pinnedID != nil)
+	var pinnedMsgID int32
+	if pinnedID != nil {
+		pinnedMsgID = *pinnedID
+	}
+	h.notifyPinned(r.Ctx, store.PeerTypeChat, chatID, pinnedMsgID)
 
 	chats, err := h.loadChats(r.Ctx, map[int64]bool{chat.ID: true}, r.UserID)
 	if err != nil {
@@ -989,6 +1005,19 @@ func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *t
 		pinnedID = &msgID
 	}
 
+	// Validate that the channel post exists and is not deleted.
+	if pinnedID != nil {
+		posts, err := h.store.ChannelMessages(r.Ctx, channelID, []int64{int64(*pinnedID)})
+		if err != nil {
+			h.log.Error("pin channel validate", "channel_id", channelID, "err", err)
+			return nil, errInternal
+		}
+		post, ok := posts[int64(*pinnedID)]
+		if !ok || post.Deleted {
+			return nil, errMessageIDInvalid
+		}
+	}
+
 	// Read current pinned state for idempotency check.
 	// Note: same TOCTOU caveat as pinChatMessage — concurrent identical
 	// requests can both emit a push. Accepted as tolerable under the
@@ -1019,7 +1048,11 @@ func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *t
 	}
 
 	// Emit the pinned notification so all members receive updatePinnedMessages.
-	h.notifyPinned(r.Ctx, store.PeerTypeChannel, channelID, pinnedID != nil)
+	var pinnedMsgID int32
+	if pinnedID != nil {
+		pinnedMsgID = *pinnedID
+	}
+	h.notifyPinned(r.Ctx, store.PeerTypeChannel, channelID, pinnedMsgID)
 
 	channels, err := h.loadChannels(r.Ctx, map[int64]bool{ch.ID: true}, r.UserID)
 	if err != nil {
@@ -1045,9 +1078,9 @@ func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *t
 }
 
 // notifyPinned emits the cross-replica pinned nudge for peerID (best-effort).
-// pinned=true means a message was pinned; pinned=false means it was unpinned.
-func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, peerID int64, pinned bool) {
-	if err := h.store.Notify(ctx, store.ChannelPinned, store.PinnedPayload(peerType, peerID, pinned)); err != nil {
+// pinnedMsgID is nonzero on pin, zero on unpin.
+func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, peerID int64, pinnedMsgID int32) {
+	if err := h.store.Notify(ctx, store.ChannelPinned, store.PinnedPayload(peerType, peerID, pinnedMsgID)); err != nil {
 		h.log.Error("notify pinned", "peer_id", peerID, "err", err)
 	}
 }

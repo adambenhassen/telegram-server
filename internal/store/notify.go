@@ -33,9 +33,10 @@ const (
 	// no pts, same model as updateUserStatus).
 	ChannelReactions = "tg_reactions" // payload: "<userID>"
 	// ChannelPinned carries a pin/unpin change to all members of a chat or channel.
-	// payload: "<peerID>". The handler pushes updatePinnedMessages (transient,
-	// no pts, same model as reactions).
-	ChannelPinned = "tg_pinned" // payload: "<peerID>"
+	// payload: "c<peerID>[|<msgID>]" for chat, "h<peerID>[|<msgID>]" for channel.
+	// msgID is present on pin (nonzero), absent on unpin. The handler pushes
+	// updatePinnedMessages (transient, no pts, same model as reactions).
+	ChannelPinned = "tg_pinned"
 )
 
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
@@ -94,8 +95,7 @@ type Listener struct {
 // receives (userID, chatID) for a secret-chat state change; status receives
 // (userID, online) for a status change; encryptedMsg receives (recipientID, qts)
 // for a secret-chat message; reactions receives (ownerID, localID, userID) for
-// a reaction change on a specific message copy; pinned receives (peerID) for a
-// pin/unpin in a chat or channel, with peerType, peerID, and pinned=true for pin, false for unpin.
+// a reaction change on a specific message copy; pinned receives (peerType, peerID, pinnedMsgID) for a pin/unpin in a chat or channel; pinnedMsgID is nonzero on pin, zero on unpin.
 //
 // A broken connection is reconnected with bounded backoff rather than ending
 // delivery for the life of the process. Notifications emitted while the
@@ -115,7 +115,7 @@ func StartListener(
 	status func(ctx context.Context, userID int64, online bool),
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
-	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinned bool),
+	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
 	log *slog.Logger,
 ) (*Listener, func() error, error) {
 	if log == nil {
@@ -175,7 +175,7 @@ func (l *Listener) run(
 	status func(ctx context.Context, userID int64, online bool),
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
-	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinned bool),
+	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
 ) {
 	backoff := listenerBackoffMin
 	for {
@@ -222,7 +222,7 @@ func (l *Listener) dispatch(
 	status func(ctx context.Context, userID int64, online bool),
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
-	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinned bool),
+	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
 ) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
@@ -305,17 +305,31 @@ func (l *Listener) dispatch(
 				continue
 			}
 			payload = payload[1:]
-			isPinned := true
+			var pinnedMsgID int32
 			if strings.HasPrefix(payload, "-") {
-				isPinned = false
+				// Unpin: "-<peerID>"
 				payload = payload[1:]
+			} else {
+				// Pin: "<peerID>|<msgID>"
+				parts := strings.SplitN(payload, "|", 2)
+				if len(parts) != 2 {
+					l.log.Warn("bad tg_pinned payload", "payload", n.Payload)
+					continue
+				}
+				msgID, perr := strconv.ParseInt(parts[1], 10, 32)
+				if perr != nil {
+					l.log.Warn("bad tg_pinned msgID", "payload", n.Payload)
+					continue
+				}
+				pinnedMsgID = int32(msgID)
+				payload = parts[0]
 			}
 			peerID, perr := strconv.ParseInt(payload, 10, 64)
 			if perr != nil {
 				l.log.Warn("bad tg_pinned payload", "payload", n.Payload)
 				continue
 			}
-			pinned(ctx, peerType, peerID, isPinned)
+			pinned(ctx, peerType, peerID, pinnedMsgID)
 		}
 	}
 }
@@ -381,17 +395,18 @@ func ReactionPayload(ownerID, localID, userID int64) string {
 }
 
 // PinnedPayload formats a tg_pinned NOTIFY payload naming the peer whose
-// pinned message changed. Payload format: "c<peerID>" for chat pin,
-// "c-<peerID>" for chat unpin, "h<peerID>" for channel pin, "h-<peerID>"
+// pinned message changed. Payload format: "c<peerID>|<msgID>" for chat pin,
+// "c-<peerID>" for chat unpin, "h<peerID>|<msgID>" for channel pin, "h-<peerID>"
 // for channel unpin. The leading letter disambiguates chat vs channel so
-// DeliverPinned does not need to probe both tables.
-func PinnedPayload(peerType PeerType, peerID int64, pinned bool) string {
+// DeliverPinned does not need to probe both tables. pinnedMsgID is nonzero
+// on pin, zero on unpin.
+func PinnedPayload(peerType PeerType, peerID int64, pinnedMsgID int32) string {
 	prefix := "c"
 	if peerType == PeerTypeChannel {
 		prefix = "h"
 	}
-	if pinned {
-		return prefix + strconv.FormatInt(peerID, 10)
+	if pinnedMsgID != 0 {
+		return prefix + strconv.FormatInt(peerID, 10) + "|" + strconv.FormatInt(int64(pinnedMsgID), 10)
 	}
 	return prefix + "-" + strconv.FormatInt(peerID, 10)
 }

@@ -113,7 +113,7 @@ func TestDeliverEncryptionRequested(t *testing.T) {
 		func(context.Context, int64, bool) {},
 		func(context.Context, int64, int) {},
 		func(context.Context, int64, int64, int64) {},
-		func(context.Context, store.PeerType, int64, bool) {},
+		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
 	)
 	if err != nil {
@@ -189,7 +189,7 @@ func TestDeliverEncryptionActive(t *testing.T) {
 		func(context.Context, int64, bool) {},
 		func(context.Context, int64, int) {},
 		func(context.Context, int64, int64, int64) {},
-		func(context.Context, store.PeerType, int64, bool) {},
+		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
 	)
 	if err != nil {
@@ -255,7 +255,7 @@ func TestDeliverEncryptionDiscarded(t *testing.T) {
 		func(context.Context, int64, bool) {},
 		func(context.Context, int64, int) {},
 		func(context.Context, int64, int64, int64) {},
-		func(context.Context, store.PeerType, int64, bool) {},
+		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
 	)
 	if err != nil {
@@ -302,7 +302,7 @@ func TestDeliverEncryptionWrongChannelNeverDispatches(t *testing.T) {
 		func(context.Context, int64, bool) {},
 		func(context.Context, int64, int) {},
 		func(context.Context, int64, int64, int64) {},
-		func(context.Context, store.PeerType, int64, bool) {},
+		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
 	)
 	if err != nil {
