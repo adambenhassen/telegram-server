@@ -26,6 +26,7 @@ type Channel struct {
 	Version         int32
 	Date            pgtype.Timestamptz
 	PinnedMessageID *int32
+	Username        *string
 }
 
 type ChannelEvent struct {
@@ -210,6 +211,7 @@ type User struct {
 	CreatedAt  pgtype.Timestamptz
 	IsOnline   bool
 	LastSeenAt pgtype.Timestamptz
+	Username   *string
 }
 
 type UserPassword struct {
@@ -222,4 +224,10 @@ type UserPassword struct {
 	HasRecovery   bool
 	CreatedAt     pgtype.Timestamptz
 	UpdatedAt     pgtype.Timestamptz
+}
+
+type Username struct {
+	Handle    string
+	OwnerType string
+	OwnerID   int64
 }

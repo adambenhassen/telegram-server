@@ -12,7 +12,7 @@ import (
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (phone) VALUES ($1)
 ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
-RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at
+RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at, username
 `
 
 func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
@@ -26,6 +26,7 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
 		&i.CreatedAt,
 		&i.IsOnline,
 		&i.LastSeenAt,
+		&i.Username,
 	)
 	return i, err
 }
@@ -47,8 +48,25 @@ func (q *Queries) SetUserStatus(ctx context.Context, arg SetUserStatusParams) (i
 	return result.RowsAffected(), nil
 }
 
+const setUsername = `-- name: SetUsername :execrows
+UPDATE users SET username = $2 WHERE id = $1
+`
+
+type SetUsernameParams struct {
+	ID       int64
+	Username *string
+}
+
+func (q *Queries) SetUsername(ctx context.Context, arg SetUsernameParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setUsername, arg.ID, arg.Username)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const userByID = `-- name: UserByID :one
-SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at FROM users WHERE id = $1
+SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username FROM users WHERE id = $1
 `
 
 func (q *Queries) UserByID(ctx context.Context, id int64) (User, error) {
@@ -62,12 +80,13 @@ func (q *Queries) UserByID(ctx context.Context, id int64) (User, error) {
 		&i.CreatedAt,
 		&i.IsOnline,
 		&i.LastSeenAt,
+		&i.Username,
 	)
 	return i, err
 }
 
 const userByPhone = `-- name: UserByPhone :one
-SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at FROM users WHERE phone = $1
+SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username FROM users WHERE phone = $1
 `
 
 func (q *Queries) UserByPhone(ctx context.Context, phone string) (User, error) {
@@ -81,6 +100,7 @@ func (q *Queries) UserByPhone(ctx context.Context, phone string) (User, error) {
 		&i.CreatedAt,
 		&i.IsOnline,
 		&i.LastSeenAt,
+		&i.Username,
 	)
 	return i, err
 }
