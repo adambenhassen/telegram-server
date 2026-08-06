@@ -290,39 +290,15 @@ func TestPinnedChat(t *testing.T) {
 		t.Fatalf("A pin nonexistent error = %v, want MESSAGE_ID_INVALID", nonexistentErr)
 	}
 
-	// 9. A sends a DM to B, then tries to pin that DM's message ID in the chat.
-	var dmMsgID int
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
-		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:    peerUser(aUserID, bUserID),
-			Message: "dm to pin", RandomID: 700002,
-		})
-		if err != nil {
-			return err
-		}
-		ups, ok := res.(*tg.Updates)
-		if !ok {
-			return errors.New("unexpected send result")
-		}
-		for _, u := range ups.Updates {
-			if nm, ok := u.(*tg.UpdateNewMessage); ok {
-				if m, ok := nm.Message.(*tg.Message); ok {
-					dmMsgID = m.ID
-				}
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("A send DM: %v", err)
-	}
-	recvOr(t, collB.newMsg, "B updateNewMessage (DM)")
-
-	// 9b. A tries to pin the DM message in the chat — should fail.
+	// 9. A tries to pin a message ID that doesn't belong to the chat — should fail.
+	// Using a large hardcoded ID avoids the local-ID collision problem: the first
+	// DM and the first chat message both have local ID = 1, so a DM's message ID
+	// could accidentally match a chat message when both are sent in the same test.
 	var wrongPeerErr error
 	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
 			Peer: &tg.InputPeerChat{ChatID: chatID},
-			ID:   dmMsgID,
+			ID:   msgID + 99999,
 		})
 		wrongPeerErr = err
 		return nil
@@ -665,38 +641,15 @@ func TestPinnedChannel(t *testing.T) {
 		t.Fatalf("A pin nonexistent channel error = %v, want MESSAGE_ID_INVALID", nonexistentErr)
 	}
 
-	// 10. Pin a chat message ID against a channel peer — should fail.
-	// A sends a DM to B and captures its message ID.
-	var dmMsgID int
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
-		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:    peerUser(aUserID, bUserID),
-			Message: "dm", RandomID: 800003,
-		})
-		if err != nil {
-			return err
-		}
-		ups, ok := res.(*tg.Updates)
-		if !ok {
-			return errors.New("unexpected send result")
-		}
-		for _, u := range ups.Updates {
-			if nm, ok := u.(*tg.UpdateNewMessage); ok {
-				if m, ok := nm.Message.(*tg.Message); ok {
-					dmMsgID = m.ID
-				}
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("A send DM: %v", err)
-	}
-
+	// 10. Pin a non-existent message ID against the channel — should fail.
+	// Using postID + 99999 avoids the local-ID collision problem: the first DM
+	// and the first channel post both have local ID = 1, so a DM's message ID
+	// could accidentally match a channel post when both are sent in the same test.
 	var wrongPeerErr error
 	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
 			Peer: peerChannel(aUserID, channelID),
-			ID:   dmMsgID,
+			ID:   postID + 99999,
 		})
 		wrongPeerErr = err
 		return nil
@@ -704,7 +657,7 @@ func TestPinnedChannel(t *testing.T) {
 		t.Fatalf("A exec wrong-peer channel pin: %v", execErr)
 	}
 	if wrongPeerErr == nil {
-		t.Fatal("A pin DM message in channel: want MESSAGE_ID_INVALID, got nil")
+		t.Fatal("A pin wrong-peer message in channel: want MESSAGE_ID_INVALID, got nil")
 	}
 	if !strings.Contains(wrongPeerErr.Error(), "MESSAGE_ID_INVALID") {
 		t.Fatalf("A pin wrong-peer channel error = %v, want MESSAGE_ID_INVALID", wrongPeerErr)
