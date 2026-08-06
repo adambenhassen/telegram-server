@@ -7,10 +7,12 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const historyPage = `-- name: HistoryPage :many
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id FROM messages
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post FROM messages
 WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3
   AND deleted = false
   AND ($4::bigint = 0 OR local_id < $4::bigint)
@@ -59,6 +61,10 @@ func (q *Queries) HistoryPage(ctx context.Context, arg HistoryPageParams) ([]Mes
 			&i.ActionUserID,
 			&i.FileID,
 			&i.ReplyToMsgID,
+			&i.FwdFromID,
+			&i.FwdDate,
+			&i.FwdChannelID,
+			&i.FwdChannelPost,
 		); err != nil {
 			return nil, err
 		}
@@ -72,25 +78,30 @@ func (q *Queries) HistoryPage(ctx context.Context, arg HistoryPageParams) ([]Mes
 
 const insertMessage = `-- name: InsertMessage :exec
 INSERT INTO messages (owner_id, local_id, peer_type, peer_id, from_id, message, out, random_id, peer_local_id,
-                      fanout_id, action_type, action_user_id, file_id, reply_to_msg_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                      fanout_id, action_type, action_user_id, file_id, reply_to_msg_id,
+                      fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 `
 
 type InsertMessageParams struct {
-	OwnerID      int64
-	LocalID      int64
-	PeerType     int16
-	PeerID       int64
-	FromID       int64
-	Message      string
-	Out          bool
-	RandomID     int64
-	PeerLocalID  int64
-	FanoutID     int64
-	ActionType   int16
-	ActionUserID int64
-	FileID       int64
-	ReplyToMsgID *int32
+	OwnerID        int64
+	LocalID        int64
+	PeerType       int16
+	PeerID         int64
+	FromID         int64
+	Message        string
+	Out            bool
+	RandomID       int64
+	PeerLocalID    int64
+	FanoutID       int64
+	ActionType     int16
+	ActionUserID   int64
+	FileID         int64
+	ReplyToMsgID   *int32
+	FwdFromID      *int64
+	FwdDate        pgtype.Timestamptz
+	FwdChannelID   *int64
+	FwdChannelPost *int32
 }
 
 func (q *Queries) InsertMessage(ctx context.Context, arg InsertMessageParams) error {
@@ -109,12 +120,16 @@ func (q *Queries) InsertMessage(ctx context.Context, arg InsertMessageParams) er
 		arg.ActionUserID,
 		arg.FileID,
 		arg.ReplyToMsgID,
+		arg.FwdFromID,
+		arg.FwdDate,
+		arg.FwdChannelID,
+		arg.FwdChannelPost,
 	)
 	return err
 }
 
 const messageByOwnerLocal = `-- name: MessageByOwnerLocal :one
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id FROM messages WHERE owner_id = $1 AND local_id = $2
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post FROM messages WHERE owner_id = $1 AND local_id = $2
 `
 
 type MessageByOwnerLocalParams struct {
@@ -143,12 +158,16 @@ func (q *Queries) MessageByOwnerLocal(ctx context.Context, arg MessageByOwnerLoc
 		&i.ActionUserID,
 		&i.FileID,
 		&i.ReplyToMsgID,
+		&i.FwdFromID,
+		&i.FwdDate,
+		&i.FwdChannelID,
+		&i.FwdChannelPost,
 	)
 	return i, err
 }
 
 const messageByRandomID = `-- name: MessageByRandomID :one
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id FROM messages WHERE owner_id = $1 AND random_id = $2 AND random_id <> 0
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post FROM messages WHERE owner_id = $1 AND random_id = $2 AND random_id <> 0
 `
 
 type MessageByRandomIDParams struct {
@@ -177,12 +196,16 @@ func (q *Queries) MessageByRandomID(ctx context.Context, arg MessageByRandomIDPa
 		&i.ActionUserID,
 		&i.FileID,
 		&i.ReplyToMsgID,
+		&i.FwdFromID,
+		&i.FwdDate,
+		&i.FwdChannelID,
+		&i.FwdChannelPost,
 	)
 	return i, err
 }
 
 const messagesByFanout = `-- name: MessagesByFanout :many
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id FROM messages
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post FROM messages
 WHERE fanout_id = $1 AND fanout_id <> 0
 ORDER BY owner_id
 `
@@ -219,6 +242,10 @@ func (q *Queries) MessagesByFanout(ctx context.Context, fanoutID int64) ([]Messa
 			&i.ActionUserID,
 			&i.FileID,
 			&i.ReplyToMsgID,
+			&i.FwdFromID,
+			&i.FwdDate,
+			&i.FwdChannelID,
+			&i.FwdChannelPost,
 		); err != nil {
 			return nil, err
 		}

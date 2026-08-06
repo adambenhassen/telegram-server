@@ -103,6 +103,7 @@ type updateCollector struct {
 	serviceMsg    chan serviceMsgEnvelope
 	newChannelMsg chan chanMsgUpdate
 	userStatus    chan *tg.UpdateUserStatus
+	points        chan int
 }
 
 func newUpdateCollector() *updateCollector {
@@ -115,6 +116,7 @@ func newUpdateCollector() *updateCollector {
 		serviceMsg:    make(chan serviceMsgEnvelope, 4),
 		newChannelMsg: make(chan chanMsgUpdate, 4),
 		userStatus:    make(chan *tg.UpdateUserStatus, 8),
+		points:        make(chan int, 8),
 	}
 }
 
@@ -136,6 +138,7 @@ func (u *updateCollector) dispatch(x tg.UpdateClass, chats []tg.ChatClass) {
 		switch m := up.Message.(type) {
 		case *tg.Message:
 			send(u.newMsg, m)
+			send(u.points, up.Pts)
 		case *tg.MessageService:
 			send(u.serviceMsg, serviceMsgEnvelope{svc: m, chats: chats})
 		}

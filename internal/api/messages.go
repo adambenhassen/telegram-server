@@ -494,3 +494,262 @@ func (h *handlers) handleSetTyping(r *mtproto.Request) (bin.Encoder, error) {
 	h.notifyTyping(r.Ctx, toID, r.UserID)
 	return &tg.BoolTrue{}, nil
 }
+
+// handleForwardMessages serves messages.forwardMessages: forwards one or more
+// messages the caller owns to a 1:1 peer or a group chat. Each forwarded message
+// is a new message row with FwdFrom populated.
+func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesForwardMessagesRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if len(req.ID) == 0 || len(req.RandomID) != len(req.ID) {
+		return nil, errPeerIDInvalid
+	}
+
+	// Resolve destination peer.
+	destPeerType, destPeerID, err := h.inputPeer(req.ToPeer, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	// Secret chats and channels are not supported destinations.
+	if destPeerType == store.PeerTypeChannel {
+		return nil, errPeerIDInvalid
+	}
+	if destPeerType == store.PeerTypeChat {
+		if err = h.requireMember(r.Ctx, destPeerID, r.UserID); err != nil {
+			return nil, err
+		}
+	}
+
+	// Resolve source peer.
+	srcPeerType, srcPeerID, err := h.inputPeer(req.FromPeer, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	// Secret chats are not supported sources.
+	if srcPeerType == store.PeerTypeChannel {
+		// Channel source: resolve each message from the channel.
+		if _, err = h.requireChannelMember(r.Ctx, srcPeerID, r.UserID); err != nil {
+			return nil, err
+		}
+		localIDs := make([]int64, len(req.ID))
+		for i, v := range req.ID {
+			localIDs[i] = int64(v)
+		}
+		chMsgs, err := h.store.ChannelMessages(r.Ctx, srcPeerID, localIDs)
+		if err != nil {
+			h.log.Error("forward channel messages", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		sources := make([]store.ForwardSource, 0, len(req.ID))
+		for _, id := range req.ID {
+			m, ok := chMsgs[int64(id)]
+			if !ok || m.Deleted {
+				return nil, errMessageIDInvalid
+			}
+			fileID := int64(0)
+			if m.FileID != nil {
+				fileID = *m.FileID
+			}
+			post := int32(m.LocalID) //nolint:gosec // G115: local_id fits int32
+			sources = append(sources, store.ForwardSource{
+				FromID:      m.FromID,
+				Date:        m.Date,
+				Text:        m.Message,
+				ChannelID:   m.ChannelID,
+				ChannelPost: post,
+				FileID:      fileID,
+			})
+		}
+		randomIDs := make([]int64, len(req.RandomID))
+		copy(randomIDs, req.RandomID)
+		perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
+		if errors.Is(err, store.ErrMessageInvalid) {
+			return nil, errMessageIDInvalid
+		}
+		if errors.Is(err, store.ErrNotMember) {
+			return nil, errPeerIDInvalid
+		}
+		if err != nil {
+			h.log.Error("forward messages", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, randomIDs)
+	}
+
+	// User or chat source: resolve each message from the messages table.
+	localIDs := make([]int64, len(req.ID))
+	for i, v := range req.ID {
+		localIDs[i] = int64(v)
+	}
+
+	// Validate ownership of each source message.
+	sources := make([]store.ForwardSource, 0, len(req.ID))
+	for _, id := range localIDs {
+		var m store.Message
+		var ok bool
+		m, ok, err = h.store.MessageByOwnerLocal(r.Ctx, r.UserID, id)
+		if err != nil {
+			h.log.Error("forward lookup source", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		if !ok || m.Deleted {
+			return nil, errPeerIDInvalid
+		}
+		// The row must belong to the dialog the caller named in FromPeer.
+		if m.PeerType != srcPeerType || m.PeerID != srcPeerID {
+			return nil, errPeerIDInvalid
+		}
+		sources = append(sources, store.ForwardSource{
+			FromID: m.FromID,
+			Date:   m.Date,
+			Text:   m.Text,
+			FileID: m.FileID,
+		})
+	}
+
+	randomIDs := make([]int64, len(req.RandomID))
+	copy(randomIDs, req.RandomID)
+	perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
+	}
+	if errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	}
+	if err != nil {
+		h.log.Error("forward messages", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, randomIDs)
+}
+
+// forwardReply builds the UpdatesClass reply for a forward.
+func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType, destPeerID int64, perOwner map[int64]int, sentMsgs []store.ForwardedMessage, randomIDs []int64) (bin.Encoder, error) {
+	// Notify all affected owners.
+	for uid := range perOwner {
+		h.notify(r.Ctx, uid)
+	}
+
+	// Collect user, chat and channel references from forwarded messages.
+	userRefs := make(map[int64]bool)
+	basicChatRefs := make(map[int64]bool)
+	channelRefs := make(map[int64]bool)
+	for _, fm := range sentMsgs {
+		m := fm.Message
+		if m.PeerType == store.PeerTypeChat {
+			basicChatRefs[m.PeerID] = true
+		} else {
+			userRefs[m.PeerID] = true
+		}
+		userRefs[m.FromID] = true
+		if m.FwdFromID != 0 {
+			userRefs[m.FwdFromID] = true
+		}
+		if m.FwdChannelID != 0 {
+			channelRefs[m.FwdChannelID] = true
+		}
+	}
+
+	var users []tg.UserClass
+	var chats []tg.ChatClass
+	var err error
+	if destPeerType == store.PeerTypeUser {
+		users, err = h.twoUsers(r.Ctx, r.UserID, destPeerID)
+		userRefs[r.UserID] = true
+		userRefs[destPeerID] = true
+	} else {
+		recipients := make(map[int64]bool, len(perOwner))
+		for uid := range perOwner {
+			recipients[uid] = true
+			userRefs[uid] = true
+		}
+		basicChatRefs[destPeerID] = true
+		users, err = h.loadUsers(r.Ctx, recipients, r.UserID)
+		if err == nil {
+			chats, err = h.loadChats(r.Ctx, map[int64]bool{destPeerID: true}, r.UserID)
+		}
+	}
+	// Load extra user references from fwd heads that the send/load did not cover.
+	for uid := range userRefs {
+		if uid != r.UserID {
+			u, ok, uerr := h.store.UserByID(r.Ctx, uid)
+			if uerr != nil {
+				h.log.Error("forward reply fwd user", "err", uerr)
+				return nil, errInternal
+			}
+			if ok {
+				users = append(users, h.userToTL(u, r.UserID, uid == r.UserID))
+			}
+		}
+	}
+	// Load basic chat references.
+	for chid := range basicChatRefs {
+		if _, loaded := basicChatRefs[chid]; !loaded {
+			continue
+		}
+		c, ok, cerr := h.store.ChatByID(r.Ctx, chid)
+		if cerr != nil {
+			h.log.Error("forward reply fwd chat", "err", cerr)
+			return nil, errInternal
+		}
+		if ok {
+			member, merr := h.store.IsMember(r.Ctx, chid, r.UserID)
+			if merr != nil {
+				h.log.Error("forward reply fwd chat member", "err", merr)
+				return nil, errInternal
+			}
+			var count int
+			if member {
+				parts, perr := h.store.Participants(r.Ctx, chid)
+				if perr != nil {
+					h.log.Error("forward reply fwd chat participants", "err", perr)
+					return nil, errInternal
+				}
+				count = len(parts)
+			}
+			chats = append(chats, chatToTL(c, count, r.UserID))
+		}
+	}
+	// Load channel references with viewer-aware loader.
+	if len(channelRefs) > 0 {
+		channelTL, cerr := h.loadChannels(r.Ctx, channelRefs, r.UserID)
+		if cerr != nil {
+			h.log.Error("forward reply fwd channel", "err", cerr)
+			return nil, errInternal
+		}
+		chats = append(chats, channelTL...)
+	}
+	if err != nil {
+		h.log.Error("forward reply", "err", err)
+		return nil, errInternal
+	}
+
+	// Load files for forwarded messages.
+	msgs := make([]store.Message, len(sentMsgs))
+	for i, fm := range sentMsgs {
+		msgs[i] = fm.Message
+	}
+	files, err := h.loadFiles(r.Ctx, msgs)
+	if err != nil {
+		h.log.Error("forward reply files", "err", err)
+		return nil, errInternal
+	}
+
+	updates := make([]tg.UpdateClass, 0, len(sentMsgs)*2)
+	for i, fm := range sentMsgs {
+		updates = append(updates,
+			&tg.UpdateMessageID{ID: int(fm.Message.LocalID), RandomID: randomIDs[i]},
+			&tg.UpdateNewMessage{Message: messageToTL(fm.Message, nil, files, nil), Pts: fm.Pts, PtsCount: 1},
+		)
+	}
+	date := time.Now().Unix()
+	if len(sentMsgs) > 0 {
+		date = sentMsgs[0].Message.Date.Unix()
+	}
+	return &tg.Updates{Updates: updates, Users: users, Chats: chats, Date: int(date)}, nil
+}

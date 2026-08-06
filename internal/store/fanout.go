@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -47,6 +48,16 @@ type FanOut struct {
 	// never derived from request input, and it is deduped against the member set
 	// so no owner can take two rows out of one fan-out.
 	Extra []int64
+
+	// Forwarding fields: populated when this fan-out is a forwarded message.
+	// FwdFromID is the original sender's user id.
+	FwdFromID *int64
+	// FwdDate is the date of the original message.
+	FwdDate pgtype.Timestamptz
+	// FwdChannelID is the source channel id when the source is a channel post.
+	FwdChannelID *int64
+	// FwdChannelPost is the local_id of the source channel post.
+	FwdChannelPost *int32
 }
 
 // SendChatMessage writes one chat message to every member of the chat: one
@@ -233,7 +244,11 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 			OwnerID: owner, LocalID: b.LocalID, PeerType: int16(PeerTypeChat), PeerID: f.ChatID, FromID: f.FromID,
 			Message: f.Text, Out: out, RandomID: randomID, PeerLocalID: 0,
 			FanoutID: fanoutID, ActionType: int16(f.Action), ActionUserID: f.ActionUserID, FileID: f.FileID,
-			ReplyToMsgID: replyToMsgID,
+			ReplyToMsgID:   replyToMsgID,
+			FwdFromID:      f.FwdFromID,
+			FwdDate:        f.FwdDate,
+			FwdChannelID:   f.FwdChannelID,
+			FwdChannelPost: f.FwdChannelPost,
 		}); err != nil {
 			return Message{}, nil, false, fmt.Errorf("insert message %d: %w", owner, err)
 		}

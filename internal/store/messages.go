@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -50,6 +51,17 @@ type Message struct {
 	// ReplyToMsgID is the local_id of the message this message replies to,
 	// in this row's owner's local_id space.
 	ReplyToMsgID int32
+	// FwdFromID is the user id of the original sender when this is a forwarded
+	// message; 0 when not forwarded.
+	FwdFromID int64
+	// FwdDate is the date of the original message when this is a forwarded
+	// message; zero time when not forwarded.
+	FwdDate time.Time
+	// FwdChannelID is the channel id when the source is a channel post; 0 otherwise.
+	FwdChannelID int64
+	// FwdChannelPost is the local_id of the channel post when the source is a
+	// channel; 0 otherwise.
+	FwdChannelPost int32
 }
 
 func messageFromRow(r db.Message) Message {
@@ -77,6 +89,18 @@ func messageFromRow(r db.Message) Message {
 	}
 	if r.ReplyToMsgID != nil {
 		m.ReplyToMsgID = *r.ReplyToMsgID
+	}
+	if r.FwdFromID != nil {
+		m.FwdFromID = *r.FwdFromID
+	}
+	if r.FwdDate.Valid {
+		m.FwdDate = r.FwdDate.Time
+	}
+	if r.FwdChannelID != nil {
+		m.FwdChannelID = *r.FwdChannelID
+	}
+	if r.FwdChannelPost != nil {
+		m.FwdChannelPost = *r.FwdChannelPost
 	}
 	return m
 }
@@ -171,6 +195,7 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 		OwnerID: fromID, LocalID: sb.LocalID, PeerType: int16(PeerTypeUser), PeerID: toID, FromID: fromID,
 		Message: text, Out: true, RandomID: randomID, PeerLocalID: rb.LocalID,
 		FanoutID: 0, ActionType: 0, ActionUserID: 0, FileID: fileID, ReplyToMsgID: senderReplyTo,
+		FwdFromID: nil, FwdDate: pgtype.Timestamptz{}, FwdChannelID: nil, FwdChannelPost: nil,
 	}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("insert sender message: %w", err)
 	}
@@ -190,6 +215,7 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 		OwnerID: toID, LocalID: rb.LocalID, PeerType: int16(PeerTypeUser), PeerID: fromID, FromID: fromID,
 		Message: text, Out: false, RandomID: 0, PeerLocalID: sb.LocalID,
 		FanoutID: 0, ActionType: 0, ActionUserID: 0, FileID: fileID, ReplyToMsgID: recipientReplyTo,
+		FwdFromID: nil, FwdDate: pgtype.Timestamptz{}, FwdChannelID: nil, FwdChannelPost: nil,
 	}); err != nil {
 		return Message{}, 0, 0, false, fmt.Errorf("insert recipient message: %w", err)
 	}
@@ -617,4 +643,252 @@ func lockOwners(ctx context.Context, tx pgx.Tx, ids ...int64) error {
 		}
 	}
 	return nil
+}
+
+// ForwardSource describes one message to forward, resolved from its source.
+type ForwardSource struct {
+	// FromID is the original author.
+	FromID int64
+	// Date is the original message date.
+	Date time.Time
+	// Text is the message body.
+	Text string
+	// ChannelID is non-zero when the source is a channel post.
+	ChannelID int64
+	// ChannelPost is the local_id of the channel post when the source is a channel.
+	ChannelPost int32
+	// FileID is the file attached to the source message; 0 = no media.
+	FileID int64
+}
+
+// ForwardedMessage is one forwarded message returned by ForwardMessages, carrying
+// the stored row and the pts at which it was inserted for the caller.
+type ForwardedMessage struct {
+	Message Message
+	Pts     int
+}
+
+// ForwardMessages forwards one or more messages owned by userID to a destination.
+// The destination is a 1:1 peer (peerType=PeerTypeUser) or a chat (peerType=PeerTypeChat).
+// Each forwarded message is a new message row with FwdFrom populated.
+// Returns the per-owner pts for each affected user and a slice of sent IDs.
+//
+// Ownership: the caller must own every source message (be its sender or a
+// recipient/recipient-member). A missing message, one the caller does not own,
+// or one in a secret chat returns ErrMessageInvalid.
+//
+// Dedup: a repeated random_id (per sender, per destination peer) returns the
+// previously created forwarded message id without re-inserting.
+func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType PeerType, destPeerID int64, sources []ForwardSource, randomIDs []int64) (map[int64]int, []ForwardedMessage, error) {
+	if len(sources) == 0 || len(randomIDs) != len(sources) {
+		return nil, nil, ErrMessageInvalid
+	}
+
+	if destPeerType == PeerTypeUser && destPeerID == fromID {
+		// Forwarding to self is not supported; the wire does not define it.
+		return nil, nil, ErrMessageInvalid
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	// Collect all owners to lock: fromID + destPeerID (for 1:1) or chat members.
+	var lockIDs []int64
+	lockIDs = append(lockIDs, fromID)
+	if destPeerType == PeerTypeUser {
+		lockIDs = append(lockIDs, destPeerID)
+	}
+
+	// For chat destinations, we need the member set.
+	var chatMembers map[int64]bool
+	if destPeerType == PeerTypeChat {
+		// Lock the chat row first.
+		if _, err = qtx.ChatByIDForUpdate(ctx, destPeerID); errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, ErrNotMember
+		} else if err != nil {
+			return nil, nil, fmt.Errorf("lock chat: %w", err)
+		}
+		// Check sender membership.
+		member, e := qtx.IsChatMember(ctx, db.IsChatMemberParams{ChatID: destPeerID, UserID: fromID})
+		if e != nil {
+			return nil, nil, fmt.Errorf("is chat member: %w", e)
+		}
+		if !member {
+			return nil, nil, ErrNotMember
+		}
+		parts, e := qtx.ChatParticipants(ctx, destPeerID)
+		if e != nil {
+			return nil, nil, fmt.Errorf("chat participants: %w", e)
+		}
+		chatMembers = make(map[int64]bool, len(parts))
+		for _, p := range parts {
+			chatMembers[p.UserID] = true
+			lockIDs = append(lockIDs, p.UserID)
+		}
+	}
+
+	if err = lockOwners(ctx, tx, lockIDs...); err != nil {
+		return nil, nil, err
+	}
+
+	// Ensure state for all affected owners.
+	if destPeerType == PeerTypeUser {
+		if err = qtx.EnsureUpdateState(ctx, fromID); err != nil {
+			return nil, nil, fmt.Errorf("ensure sender state: %w", err)
+		}
+		if err = qtx.EnsureUpdateState(ctx, destPeerID); err != nil {
+			return nil, nil, fmt.Errorf("ensure dest state: %w", err)
+		}
+	} else {
+		for uid := range chatMembers {
+			if err = qtx.EnsureUpdateState(ctx, uid); err != nil {
+				return nil, nil, fmt.Errorf("ensure state %d: %w", uid, err)
+			}
+		}
+	}
+
+	perOwner := make(map[int64]int)
+	var sentMsgs []ForwardedMessage
+
+	for i, src := range sources {
+		randomID := randomIDs[i]
+
+		// Dedup: check if this random_id was already used for a forward to this
+		// destination by this sender.
+		if randomID != 0 {
+			existing, e := qtx.MessageByRandomID(ctx, db.MessageByRandomIDParams{
+				OwnerID: fromID, RandomID: randomID,
+			})
+			switch {
+			case e == nil:
+				// Already forwarded — return the existing message with current pts.
+				st, e2 := qtx.GetState(ctx, fromID)
+				if e2 != nil {
+					return nil, nil, fmt.Errorf("get state for dedup: %w", e2)
+				}
+				sentMsgs = append(sentMsgs, ForwardedMessage{Message: messageFromRow(existing), Pts: int(st.Pts)})
+				continue
+			case !errors.Is(e, pgx.ErrNoRows):
+				return nil, nil, fmt.Errorf("random_id lookup: %w", e)
+			}
+		}
+
+		// Build forwarding fields.
+		fwdFromID := src.FromID
+		fwdDate := pgtype.Timestamptz{Time: src.Date, Valid: true}
+		var fwdChannelID *int64
+		var fwdChannelPost *int32
+		if src.ChannelID != 0 {
+			fwdChannelID = &src.ChannelID
+			fwdChannelPost = &src.ChannelPost
+		}
+
+		if destPeerType == PeerTypeUser {
+			// 1:1 forward: insert sender + recipient rows.
+			sb, err := qtx.BumpState(ctx, fromID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("bump sender: %w", err)
+			}
+			rb, err := qtx.BumpState(ctx, destPeerID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("bump dest: %w", err)
+			}
+
+			if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
+				OwnerID: fromID, LocalID: sb.LocalID, PeerType: int16(destPeerType), PeerID: destPeerID,
+				FromID: fromID, Message: src.Text, Out: true, RandomID: randomID,
+				PeerLocalID: rb.LocalID, FanoutID: 0, ActionType: 0, ActionUserID: 0,
+				FileID: src.FileID, ReplyToMsgID: nil,
+				FwdFromID: &fwdFromID, FwdDate: fwdDate, FwdChannelID: fwdChannelID, FwdChannelPost: fwdChannelPost,
+			}); err != nil {
+				return nil, nil, fmt.Errorf("insert sender forward: %w", err)
+			}
+			if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
+				OwnerID: destPeerID, LocalID: rb.LocalID, PeerType: int16(destPeerType), PeerID: fromID,
+				FromID: fromID, Message: src.Text, Out: false, RandomID: 0,
+				PeerLocalID: sb.LocalID, FanoutID: 0, ActionType: 0, ActionUserID: 0,
+				FileID: src.FileID, ReplyToMsgID: nil,
+				FwdFromID: &fwdFromID, FwdDate: fwdDate, FwdChannelID: fwdChannelID, FwdChannelPost: fwdChannelPost,
+			}); err != nil {
+				return nil, nil, fmt.Errorf("insert dest forward: %w", err)
+			}
+			if err = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: fromID, Pts: sb.Pts, Type: int16(EventNewMessage), LocalID: sb.LocalID}); err != nil {
+				return nil, nil, fmt.Errorf("sender event: %w", err)
+			}
+			if err = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: destPeerID, Pts: rb.Pts, Type: int16(EventNewMessage), LocalID: rb.LocalID}); err != nil {
+				return nil, nil, fmt.Errorf("dest event: %w", err)
+			}
+			if err = qtx.UpsertDialog(ctx, db.UpsertDialogParams{OwnerID: fromID, PeerType: int16(destPeerType), PeerID: destPeerID, TopMessage: sb.LocalID, UnreadCount: 0}); err != nil {
+				return nil, nil, fmt.Errorf("sender dialog: %w", err)
+			}
+			if err = qtx.UpsertDialog(ctx, db.UpsertDialogParams{OwnerID: destPeerID, PeerType: int16(destPeerType), PeerID: fromID, TopMessage: rb.LocalID, UnreadCount: 1}); err != nil {
+				return nil, nil, fmt.Errorf("dest dialog: %w", err)
+			}
+			perOwner[fromID] = int(sb.Pts)
+			perOwner[destPeerID] = int(rb.Pts)
+
+			// Reload the sender's copy for the reply.
+			stored, err := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: fromID, LocalID: sb.LocalID})
+			if err != nil {
+				return nil, nil, fmt.Errorf("reload sender forward: %w", err)
+			}
+			sentMsgs = append(sentMsgs, ForwardedMessage{Message: messageFromRow(stored), Pts: int(sb.Pts)})
+		} else {
+			// Chat forward: fan out to all members.
+			fanoutID, err := qtx.NextFanoutID(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("next fanout id: %w", err)
+			}
+			var senderLocalID int64
+			var senderPts int64
+			for uid := range chatMembers {
+				b, err := qtx.BumpState(ctx, uid)
+				if err != nil {
+					return nil, nil, fmt.Errorf("bump %d: %w", uid, err)
+				}
+				out := uid == fromID
+				rID := int64(0)
+				unread := int32(1)
+				if out {
+					rID = randomID
+					unread = 0
+					senderLocalID = b.LocalID
+					senderPts = b.Pts
+				}
+				if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
+					OwnerID: uid, LocalID: b.LocalID, PeerType: int16(PeerTypeChat), PeerID: destPeerID,
+					FromID: fromID, Message: src.Text, Out: out, RandomID: rID,
+					PeerLocalID: 0, FanoutID: fanoutID, ActionType: 0, ActionUserID: 0,
+					FileID: src.FileID, ReplyToMsgID: nil,
+					FwdFromID: &fwdFromID, FwdDate: fwdDate, FwdChannelID: fwdChannelID, FwdChannelPost: fwdChannelPost,
+				}); err != nil {
+					return nil, nil, fmt.Errorf("insert forward %d: %w", uid, err)
+				}
+				if err = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: uid, Pts: b.Pts, Type: int16(EventNewMessage), LocalID: b.LocalID}); err != nil {
+					return nil, nil, fmt.Errorf("event %d: %w", uid, err)
+				}
+				if err = qtx.UpsertDialog(ctx, db.UpsertDialogParams{OwnerID: uid, PeerType: int16(PeerTypeChat), PeerID: destPeerID, TopMessage: b.LocalID, UnreadCount: unread}); err != nil {
+					return nil, nil, fmt.Errorf("dialog %d: %w", uid, err)
+				}
+				perOwner[uid] = int(b.Pts)
+			}
+			if senderLocalID != 0 {
+				// Reload the sender's copy for the reply.
+				stored, err := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: fromID, LocalID: senderLocalID})
+				if err != nil {
+					return nil, nil, fmt.Errorf("reload sender forward: %w", err)
+				}
+				sentMsgs = append(sentMsgs, ForwardedMessage{Message: messageFromRow(stored), Pts: int(senderPts)})
+			}
+		}
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("commit: %w", err)
+	}
+	return perOwner, sentMsgs, nil
 }
