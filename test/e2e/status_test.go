@@ -174,13 +174,17 @@ func TestStatusOnlineRoundTrip(t *testing.T) {
 	}
 
 	// AC 2: A just disconnected — B must receive updateUserStatus{Offline} with nonzero WasOnline.
-	offUpd := recvStatus(t, collB, "B updateUserStatus offline")
-	if offUpd.UserID != aUserID {
-		t.Fatalf("offline UserID = %d, want %d", offUpd.UserID, aUserID)
-	}
-	off, ok := offUpd.Status.(*tg.UserStatusOffline)
-	if !ok {
-		t.Fatalf("offline status type = %T, want *tg.UserStatusOffline", offUpd.Status)
+	// Skip any Online push from A's login that may have arrived before the message was drained.
+	var off *tg.UserStatusOffline
+	for {
+		upd := recvStatus(t, collB, "B updateUserStatus offline")
+		if upd.UserID != aUserID {
+			continue
+		}
+		if o, ok := upd.Status.(*tg.UserStatusOffline); ok {
+			off = o
+			break
+		}
 	}
 	if off.WasOnline == 0 {
 		t.Fatal("WasOnline is zero — last_seen_at was not set on disconnect")
