@@ -679,7 +679,7 @@ func (h *handlers) handleSendReaction(r *mtproto.Request) (bin.Encoder, error) {
 	localID := int64(req.MsgID)
 	reactions, hasReactions := req.GetReaction()
 
-	var affected []int64
+	var affected []store.ReactionTarget
 	if !hasReactions || len(reactions) == 0 {
 		// Clear reaction.
 		affected, err = h.store.ClearReaction(r.Ctx, r.UserID, localID)
@@ -705,9 +705,9 @@ func (h *handlers) handleSendReaction(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 
-	// Notify all affected users (transient push, no pts).
-	for _, uid := range affected {
-		h.notifyReaction(r.Ctx, uid)
+	// Notify all affected message copies (transient push, no pts).
+	for _, t := range affected {
+		h.notifyReaction(r.Ctx, t.OwnerID, t.LocalID)
 	}
 
 	// messages.sendReaction returns Updates per the Telegram schema.
@@ -715,8 +715,10 @@ func (h *handlers) handleSendReaction(r *mtproto.Request) (bin.Encoder, error) {
 }
 
 // notifyReaction emits the cross-replica reaction nudge for userID (best-effort).
-func (h *handlers) notifyReaction(ctx context.Context, userID int64) {
-	if err := h.store.Notify(ctx, store.ChannelReactions, store.ReactionPayload(userID)); err != nil {
+// ownerID is the owner of the message copy being pushed to; localID is that copy's
+// local message id.
+func (h *handlers) notifyReaction(ctx context.Context, userID, localID int64) {
+	if err := h.store.Notify(ctx, store.ChannelReactions, store.ReactionPayload(userID, localID, userID)); err != nil {
 		h.log.Error("notify reaction", "user_id", userID, "err", err)
 	}
 }

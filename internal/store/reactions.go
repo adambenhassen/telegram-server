@@ -5,15 +5,20 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/jackc/pgx/v5"
 )
 
 // Reaction is a single reaction on a message copy.
 type Reaction struct {
 	ReactorID int64
 	Reaction  string
+}
+
+// ReactionTarget identifies one message copy to push a reaction update to.
+type ReactionTarget struct {
+	OwnerID int64
+	LocalID int64
 }
 
 func reactionFromRow(r db.MessageReaction) Reaction {
@@ -28,9 +33,9 @@ func reactionFromRow(r db.MessageReaction) Reaction {
 // For 1:1 messages this is straightforward; for group chats every current
 // member's copy of the message gets the reaction recorded.
 //
-// Returns the set of user ids whose copies were affected (for notification).
-// The caller's id is always included.
-func (s *Store) SendReaction(ctx context.Context, ownerID, localID int64, reaction string) ([]int64, error) {
+// Returns the set of (ownerID, localID) pairs whose copies were affected,
+// for the NOTIFY fan-out that pushes updateMessageReactions.
+func (s *Store) SendReaction(ctx context.Context, ownerID, localID int64, reaction string) ([]ReactionTarget, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin: %w", err)
@@ -43,6 +48,9 @@ func (s *Store) SendReaction(ctx context.Context, ownerID, localID int64, reacti
 		return nil, ErrMessageInvalid
 	}
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrMessageInvalid
+		}
 		return nil, fmt.Errorf("load message: %w", err)
 	}
 	if msg.Deleted {
@@ -83,12 +91,15 @@ func (s *Store) SendReaction(ctx context.Context, ownerID, localID int64, reacti
 	if err = tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
-	return []int64{ownerID, peerID}, nil
+	return []ReactionTarget{
+		{OwnerID: ownerID, LocalID: localID},
+		{OwnerID: peerID, LocalID: peerLocalID},
+	}, nil
 }
 
 // ClearReaction removes the caller's reaction from a message they own.
-// Returns the set of user ids whose copies were affected (for notification).
-func (s *Store) ClearReaction(ctx context.Context, ownerID, localID int64) ([]int64, error) {
+// Returns the set of (ownerID, localID) pairs whose copies were affected.
+func (s *Store) ClearReaction(ctx context.Context, ownerID, localID int64) ([]ReactionTarget, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin: %w", err)
@@ -101,6 +112,9 @@ func (s *Store) ClearReaction(ctx context.Context, ownerID, localID int64) ([]in
 		return nil, ErrMessageInvalid
 	}
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrMessageInvalid
+		}
 		return nil, fmt.Errorf("load message: %w", err)
 	}
 	if msg.Deleted {
@@ -136,12 +150,15 @@ func (s *Store) ClearReaction(ctx context.Context, ownerID, localID int64) ([]in
 	if err = tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
-	return []int64{ownerID, peerID}, nil
+	return []ReactionTarget{
+		{OwnerID: ownerID, LocalID: localID},
+		{OwnerID: peerID, LocalID: peerLocalID},
+	}, nil
 }
 
 // sendChatReaction records the caller's reaction on every current member's
-// copy of the chat message. Returns the user ids affected.
-func sendChatReaction(ctx context.Context, qtx *db.Queries, reactorID int64, pre db.Message, reaction string) ([]int64, error) {
+// copy of the chat message. Returns the (ownerID, localID) pairs affected.
+func sendChatReaction(ctx context.Context, qtx *db.Queries, reactorID int64, pre db.Message, reaction string) ([]ReactionTarget, error) {
 	copies, err := chatCopies(ctx, qtx, pre)
 	if err != nil {
 		return nil, err
@@ -154,7 +171,7 @@ func sendChatReaction(ctx context.Context, qtx *db.Queries, reactorID int64, pre
 		return nil, ErrNotMember
 	}
 
-	affected := make([]int64, 0, len(members))
+	affected := make([]ReactionTarget, 0, len(members))
 	for _, c := range copies {
 		if !members[c.OwnerID] {
 			continue
@@ -167,7 +184,7 @@ func sendChatReaction(ctx context.Context, qtx *db.Queries, reactorID int64, pre
 		}); err != nil {
 			return nil, fmt.Errorf("upsert reaction owner %d: %w", c.OwnerID, err)
 		}
-		affected = append(affected, c.OwnerID)
+		affected = append(affected, ReactionTarget{OwnerID: c.OwnerID, LocalID: c.LocalID})
 	}
 	if len(affected) == 0 {
 		return nil, ErrNotMember
@@ -176,8 +193,8 @@ func sendChatReaction(ctx context.Context, qtx *db.Queries, reactorID int64, pre
 }
 
 // clearChatReaction removes the caller's reaction from every current member's
-// copy of the chat message. Returns the user ids affected.
-func clearChatReaction(ctx context.Context, qtx *db.Queries, reactorID int64, pre db.Message) ([]int64, error) {
+// copy of the chat message. Returns the (ownerID, localID) pairs affected.
+func clearChatReaction(ctx context.Context, qtx *db.Queries, reactorID int64, pre db.Message) ([]ReactionTarget, error) {
 	copies, err := chatCopies(ctx, qtx, pre)
 	if err != nil {
 		return nil, err
@@ -190,7 +207,7 @@ func clearChatReaction(ctx context.Context, qtx *db.Queries, reactorID int64, pr
 		return nil, ErrNotMember
 	}
 
-	affected := make([]int64, 0, len(members))
+	affected := make([]ReactionTarget, 0, len(members))
 	for _, c := range copies {
 		if !members[c.OwnerID] {
 			continue
@@ -202,7 +219,7 @@ func clearChatReaction(ctx context.Context, qtx *db.Queries, reactorID int64, pr
 		}); err != nil {
 			return nil, fmt.Errorf("delete reaction owner %d: %w", c.OwnerID, err)
 		}
-		affected = append(affected, c.OwnerID)
+		affected = append(affected, ReactionTarget{OwnerID: c.OwnerID, LocalID: c.LocalID})
 	}
 	return affected, nil
 }

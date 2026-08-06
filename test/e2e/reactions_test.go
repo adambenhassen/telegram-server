@@ -129,6 +129,19 @@ func TestReactionsRealtime(t *testing.T) {
 		t.Fatalf("A sendReaction: %v", err)
 	}
 
+	// 2b. B receives updateMessageReactions in real-time.
+	reactPush := recvOr(t, collB.msgReactions, "B updateMessageReactions")
+	if reactPush.MsgID != msgID {
+		t.Fatalf("reaction push msgID = %d, want %d", reactPush.MsgID, msgID)
+	}
+	if len(reactPush.Reactions.Results) != 1 {
+		t.Fatalf("reaction push results = %d, want 1", len(reactPush.Reactions.Results))
+	}
+	emoji, ok := reactPush.Reactions.Results[0].Reaction.(*tg.ReactionEmoji)
+	if !ok || emoji.Emoticon != "\u2764" {
+		t.Fatalf("reaction push emoji = %v, want heart", emoji)
+	}
+
 	// 3. B's getHistory shows the reaction on the message.
 	if err := exec(bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
@@ -181,6 +194,15 @@ func TestReactionsRealtime(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatalf("A clearReaction: %v", err)
+	}
+
+	// 4b. B receives updateMessageReactions reflecting cleared state.
+	clearPush := recvOr(t, collB.msgReactions, "B updateMessageReactions (clear)")
+	if clearPush.MsgID != msgID {
+		t.Fatalf("clear push msgID = %d, want %d", clearPush.MsgID, msgID)
+	}
+	if len(clearPush.Reactions.Results) != 0 {
+		t.Fatalf("clear push results = %d, want 0", len(clearPush.Reactions.Results))
 	}
 
 	// 5. B's getHistory shows no reactions.
