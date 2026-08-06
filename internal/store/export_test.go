@@ -215,6 +215,14 @@ func SetChannelPostDeleted(ctx context.Context, s *Store, channelID, localID int
 	return err
 }
 
+// SetMessageDeleted soft-deletes a message row by (owner, local_id).
+func SetMessageDeleted(ctx context.Context, s *Store, ownerID, localID int64) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE messages SET deleted = true WHERE owner_id = $1 AND local_id = $2`,
+		ownerID, localID)
+	return err
+}
+
 // JoinChannelMember admits userID to an existing channel through the shipped
 // invite path. Returns the invite hash used.
 func JoinChannelMember(ctx context.Context, s *Store, channelID, userID int64) (string, error) {

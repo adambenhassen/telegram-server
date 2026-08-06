@@ -165,11 +165,17 @@ func TestPinnedChat(t *testing.T) {
 	if !ok || peerChat.ChatID != chatID {
 		t.Fatalf("B pin push peer = %T, want *tg.PeerChat with chatID %d", pinB.Peer, chatID)
 	}
+	if len(pinB.Messages) != 1 || pinB.Messages[0] != msgID {
+		t.Fatalf("B pin push Messages = %v, want %v", pinB.Messages, []int{msgID})
+	}
 
 	// 3c. C receives updatePinnedMessages.
 	pinC := recvOr(t, collC.pinnedMsg, "C updatePinnedMessages")
 	if !pinC.Pinned {
 		t.Fatal("C pin push: Pinned = false, want true")
+	}
+	if len(pinC.Messages) != 1 || pinC.Messages[0] != msgID {
+		t.Fatalf("C pin push Messages = %v, want %v", pinC.Messages, []int{msgID})
 	}
 
 	// 4. Pinning the same message again is idempotent (no extra push).
@@ -225,11 +231,17 @@ func TestPinnedChat(t *testing.T) {
 	if unpinB.Pinned {
 		t.Fatal("B unpin push: Pinned = true, want false")
 	}
+	if len(unpinB.Messages) != 0 {
+		t.Fatalf("B unpin push Messages = %v, want nil", unpinB.Messages)
+	}
 
 	// 5c. C receives updatePinnedMessages with Pinned=false.
 	unpinC := recvOr(t, collC.pinnedMsg, "C updatePinnedMessages (unpin)")
 	if unpinC.Pinned {
 		t.Fatal("C unpin push: Pinned = true, want false")
+	}
+	if len(unpinC.Messages) != 0 {
+		t.Fatalf("C unpin push Messages = %v, want nil", unpinC.Messages)
 	}
 
 	// 6. A re-pins so we can test zero-ID unpin.
@@ -257,6 +269,102 @@ func TestPinnedChat(t *testing.T) {
 	zeroUnpinB := recvOr(t, collB.pinnedMsg, "B updatePinnedMessages (zero-ID unpin)")
 	if zeroUnpinB.Pinned {
 		t.Fatal("B zero-ID unpin push: Pinned = true, want false")
+	}
+
+	// 8. Pinning a nonexistent message ID should fail with MESSAGE_ID_INVALID.
+	var nonexistentErr error
+	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID},
+			ID:   999999,
+		})
+		nonexistentErr = err
+		return nil
+	}); execErr != nil {
+		t.Fatalf("A exec nonexistent pin: %v", execErr)
+	}
+	if nonexistentErr == nil {
+		t.Fatal("A pin nonexistent message: want MESSAGE_ID_INVALID, got nil")
+	}
+	if !strings.Contains(nonexistentErr.Error(), "MESSAGE_ID_INVALID") {
+		t.Fatalf("A pin nonexistent error = %v, want MESSAGE_ID_INVALID", nonexistentErr)
+	}
+
+	// 9. A tries to pin a message ID that doesn't belong to the chat — should fail.
+	// Using a large hardcoded ID avoids the local-ID collision problem: the first
+	// DM and the first chat message both have local ID = 1, so a DM's message ID
+	// could accidentally match a chat message when both are sent in the same test.
+	var wrongPeerErr error
+	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID},
+			ID:   msgID + 99999,
+		})
+		wrongPeerErr = err
+		return nil
+	}); execErr != nil {
+		t.Fatalf("A exec wrong-peer pin: %v", execErr)
+	}
+	if wrongPeerErr == nil {
+		t.Fatal("A pin wrong-peer message: want MESSAGE_ID_INVALID, got nil")
+	}
+	if !strings.Contains(wrongPeerErr.Error(), "MESSAGE_ID_INVALID") {
+		t.Fatalf("A pin wrong-peer error = %v, want MESSAGE_ID_INVALID", wrongPeerErr)
+	}
+
+	// 10. Delete a chat message, then attempt to pin it — should fail.
+	var delMsgID int
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:    &tg.InputPeerChat{ChatID: chatID},
+			Message: "delete me", RandomID: 700003,
+		})
+		if err != nil {
+			return err
+		}
+		ups, ok := res.(*tg.Updates)
+		if !ok {
+			return errors.New("unexpected send result")
+		}
+		for _, u := range ups.Updates {
+			if nm, ok := u.(*tg.UpdateNewMessage); ok {
+				if m, ok := nm.Message.(*tg.Message); ok {
+					delMsgID = m.ID
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("A send delete-me: %v", err)
+	}
+	recvOr(t, collB.newMsg, "B updateNewMessage (delete-me)")
+	recvOr(t, collC.newMsg, "C updateNewMessage (delete-me)")
+
+	// Delete the message.
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{delMsgID}})
+		return err
+	}); err != nil {
+		t.Fatalf("A delete message: %v", err)
+	}
+
+	// Attempt to pin the deleted message.
+	var delMsgErr error
+	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID},
+			ID:   delMsgID,
+		})
+		delMsgErr = err
+		return nil
+	}); execErr != nil {
+		t.Fatalf("A exec deleted pin: %v", execErr)
+	}
+	if delMsgErr == nil {
+		t.Fatal("A pin deleted message: want MESSAGE_ID_INVALID, got nil")
+	}
+	if !strings.Contains(delMsgErr.Error(), "MESSAGE_ID_INVALID") {
+		t.Fatalf("A pin deleted error = %v, want MESSAGE_ID_INVALID", delMsgErr)
 	}
 
 	close(aCmds)
@@ -439,6 +547,9 @@ func TestPinnedChannel(t *testing.T) {
 	if !ok || peerCh.ChannelID != channelID {
 		t.Fatalf("B channel pin push peer = %T, want *tg.PeerChannel with channelID %d", pinB.Peer, channelID)
 	}
+	if len(pinB.Messages) != 1 || pinB.Messages[0] != postID {
+		t.Fatalf("B channel pin push Messages = %v, want %v", pinB.Messages, []int{postID})
+	}
 
 	// 5. B (non-admin) tries to pin — should fail with CHAT_ADMIN_REQUIRED.
 	var pinErr error
@@ -480,6 +591,9 @@ func TestPinnedChannel(t *testing.T) {
 	if unpinB.Pinned {
 		t.Fatal("B channel unpin push: Pinned = true, want false")
 	}
+	if len(unpinB.Messages) != 0 {
+		t.Fatalf("B channel unpin push Messages = %v, want nil", unpinB.Messages)
+	}
 
 	// 7. A re-pins so we can test zero-ID unpin.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -506,6 +620,47 @@ func TestPinnedChannel(t *testing.T) {
 	zeroUnpinB := recvOr(t, collB.pinnedMsg, "B updatePinnedMessages (channel zero-ID unpin)")
 	if zeroUnpinB.Pinned {
 		t.Fatal("B channel zero-ID unpin push: Pinned = true, want false")
+	}
+
+	// 9. Pinning a nonexistent post ID should fail with MESSAGE_ID_INVALID.
+	var nonexistentErr error
+	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer: peerChannel(aUserID, channelID),
+			ID:   999999,
+		})
+		nonexistentErr = err
+		return nil
+	}); execErr != nil {
+		t.Fatalf("A exec nonexistent channel pin: %v", execErr)
+	}
+	if nonexistentErr == nil {
+		t.Fatal("A pin nonexistent channel post: want MESSAGE_ID_INVALID, got nil")
+	}
+	if !strings.Contains(nonexistentErr.Error(), "MESSAGE_ID_INVALID") {
+		t.Fatalf("A pin nonexistent channel error = %v, want MESSAGE_ID_INVALID", nonexistentErr)
+	}
+
+	// 10. Pin a non-existent message ID against the channel — should fail.
+	// Using postID + 99999 avoids the local-ID collision problem: the first DM
+	// and the first channel post both have local ID = 1, so a DM's message ID
+	// could accidentally match a channel post when both are sent in the same test.
+	var wrongPeerErr error
+	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer: peerChannel(aUserID, channelID),
+			ID:   postID + 99999,
+		})
+		wrongPeerErr = err
+		return nil
+	}); execErr != nil {
+		t.Fatalf("A exec wrong-peer channel pin: %v", execErr)
+	}
+	if wrongPeerErr == nil {
+		t.Fatal("A pin wrong-peer message in channel: want MESSAGE_ID_INVALID, got nil")
+	}
+	if !strings.Contains(wrongPeerErr.Error(), "MESSAGE_ID_INVALID") {
+		t.Fatalf("A pin wrong-peer channel error = %v, want MESSAGE_ID_INVALID", wrongPeerErr)
 	}
 
 	close(aCmds)

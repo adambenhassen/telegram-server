@@ -933,13 +933,20 @@ func (h *handlers) pinChatMessage(r *mtproto.Request, chatID int64, req *tg.Mess
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
 	}
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
+	}
 	if err != nil {
 		h.log.Error("pin chat", "chat_id", chatID, "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
 
 	// Emit the pinned notification so all members receive updatePinnedMessages.
-	h.notifyPinned(r.Ctx, store.PeerTypeChat, chatID, pinnedID != nil)
+	var pinnedMsgID int32
+	if pinnedID != nil {
+		pinnedMsgID = *pinnedID
+	}
+	h.notifyPinned(r.Ctx, store.PeerTypeChat, chatID, pinnedMsgID)
 
 	chats, err := h.loadChats(r.Ctx, map[int64]bool{chat.ID: true}, r.UserID)
 	if err != nil {
@@ -1013,13 +1020,20 @@ func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *t
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
 	}
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
+	}
 	if err != nil {
 		h.log.Error("pin channel", "channel_id", channelID, "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
 
 	// Emit the pinned notification so all members receive updatePinnedMessages.
-	h.notifyPinned(r.Ctx, store.PeerTypeChannel, channelID, pinnedID != nil)
+	var pinnedMsgID int32
+	if pinnedID != nil {
+		pinnedMsgID = *pinnedID
+	}
+	h.notifyPinned(r.Ctx, store.PeerTypeChannel, channelID, pinnedMsgID)
 
 	channels, err := h.loadChannels(r.Ctx, map[int64]bool{ch.ID: true}, r.UserID)
 	if err != nil {
@@ -1045,9 +1059,9 @@ func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *t
 }
 
 // notifyPinned emits the cross-replica pinned nudge for peerID (best-effort).
-// pinned=true means a message was pinned; pinned=false means it was unpinned.
-func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, peerID int64, pinned bool) {
-	if err := h.store.Notify(ctx, store.ChannelPinned, store.PinnedPayload(peerType, peerID, pinned)); err != nil {
+// pinnedMsgID is nonzero on pin, zero on unpin.
+func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, peerID int64, pinnedMsgID int32) {
+	if err := h.store.Notify(ctx, store.ChannelPinned, store.PinnedPayload(peerType, peerID, pinnedMsgID)); err != nil {
 		h.log.Error("notify pinned", "peer_id", peerID, "err", err)
 	}
 }

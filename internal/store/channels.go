@@ -731,6 +731,11 @@ func (s *Store) ChannelPinnedMessage(ctx context.Context, channelID int64) (*int
 // does not authorise. Returns the channel with updated pinned_message_id and
 // version.
 //
+// When pinnedID is non-nil the post is validated inside this transaction:
+// it must exist in channelID and not be deleted. This prevents the TOCTOU
+// window where a delete commits between an out-of-transaction check and the
+// pin mutation.
+//
 // Returns the member set (participant user ids) so the caller can fan out the
 // update.
 // ErrNotMember when no channel exists — the indistinguishability with membership
@@ -740,6 +745,7 @@ func (s *Store) ChannelPinnedMessage(ctx context.Context, channelID int64) (*int
 // authorising check that runs on every reader that grants admin privileges. That
 // runs through IsChannelMember which takes a simple predicate rather than row
 // lock; the channels row lock serialises the write against concurrent mutations.
+// ErrMessageInvalid when pinnedID names a post that does not exist or is deleted.
 func (s *Store) SetChannelPinnedMessage(ctx context.Context, channelID, callerID int64, pinnedID *int32) (ch Channel, members []int64, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -764,6 +770,23 @@ func (s *Store) SetChannelPinnedMessage(ctx context.Context, channelID, callerID
 			return Channel{}, nil, ErrNotMember
 		}
 		return Channel{}, nil, fmt.Errorf("lock channel: %w", err)
+	}
+
+	// Validate the pinned post under the channels row lock so a concurrent
+	// delete cannot slip between the check and the mutation.
+	if pinnedID != nil {
+		post, err := qtx.ChannelMessageByLocal(ctx, db.ChannelMessageByLocalParams{
+			ChannelID: channelID, LocalID: int64(*pinnedID),
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Channel{}, nil, ErrMessageInvalid
+		}
+		if err != nil {
+			return Channel{}, nil, fmt.Errorf("validate channel pin: %w", err)
+		}
+		if post.Deleted {
+			return Channel{}, nil, ErrMessageInvalid
+		}
 	}
 
 	row, err := qtx.SetChannelPinnedMessage(ctx, db.SetChannelPinnedMessageParams{
