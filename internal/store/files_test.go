@@ -109,7 +109,7 @@ func TestFileForDownloadGate(t *testing.T) {
 	if err := s.MarkFileStored(ctx, f.ID); err != nil {
 		t.Fatalf("mark stored: %v", err)
 	}
-	sender, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "here", 1, f.ID) //nolint:dogsled // only the stored message is needed here
+	sender, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "here", 1, f.ID, 0) //nolint:dogsled // only the stored message is needed here
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestFileForDownloadRejectsUnstoredFile(t *testing.T) {
 	b := mustUser(t, s, "+15559100042")
 
 	f := allocate(t, s, a.ID, 11)
-	if _, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "here", 1, f.ID); err != nil {
+	if _, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "here", 1, f.ID, 0); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	if _, err := s.FileForDownload(ctx, f.ID, f.AccessHash, a.ID); !errors.Is(err, store.ErrFileNotFound) {

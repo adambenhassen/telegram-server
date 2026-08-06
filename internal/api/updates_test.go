@@ -46,7 +46,7 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("user b: %v", err)
 	}
-	if _, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "hi", 7, 0); err != nil {
+	if _, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "hi", 7, 0, 0); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 

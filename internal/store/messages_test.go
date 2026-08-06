@@ -20,7 +20,7 @@ func mustUser(t *testing.T, s *store.Store, phone string) store.User {
 
 func send(t *testing.T, s *store.Store, from, to store.User, text string, rid int64) store.Message {
 	t.Helper()
-	m, _, _, _, err := s.SendMessage(context.Background(), from.ID, to.ID, text, rid, 0) //nolint:dogsled // only the stored message is needed here
+	m, _, _, _, err := s.SendMessage(context.Background(), from.ID, to.ID, text, rid, 0, 0) //nolint:dogsled // only the stored message is needed here
 	if err != nil {
 		t.Fatalf("send %q: %v", text, err)
 	}
@@ -43,7 +43,7 @@ func TestSendMessageTwoSided(t *testing.T) {
 	a := mustUser(t, s, "+15551240001")
 	b := mustUser(t, s, "+15551240002")
 
-	sender, senderPts, recipientPts, dup, err := s.SendMessage(ctx, a.ID, b.ID, "hi", 111, 0)
+	sender, senderPts, recipientPts, dup, err := s.SendMessage(ctx, a.ID, b.ID, "hi", 111, 0, 0)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestSendMessageCarriesFileIDOnBothSides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocate file: %v", err)
 	}
-	sender, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "here", 5, f.ID) //nolint:dogsled // only the stored message is needed here
+	sender, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "here", 5, f.ID, 0) //nolint:dogsled // only the stored message is needed here
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -122,11 +122,11 @@ func TestSendMessageRandomIDDedup(t *testing.T) {
 	a := mustUser(t, s, "+15551240011")
 	b := mustUser(t, s, "+15551240012")
 
-	first, _, _, dup, err := s.SendMessage(ctx, a.ID, b.ID, "once", 999, 0)
+	first, _, _, dup, err := s.SendMessage(ctx, a.ID, b.ID, "once", 999, 0, 0)
 	if err != nil || dup {
 		t.Fatalf("first send: dup=%v err=%v", dup, err)
 	}
-	again, sPts, rPts, dup, err := s.SendMessage(ctx, a.ID, b.ID, "once", 999, 0)
+	again, sPts, rPts, dup, err := s.SendMessage(ctx, a.ID, b.ID, "once", 999, 0, 0)
 	if err != nil {
 		t.Fatalf("resend: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestConcurrentOppositeFirstSends(t *testing.T) {
 	ctx := context.Background()
 
 	sendErr := func(from, to store.User, rid int64) error {
-		_, _, _, _, e := s.SendMessage(ctx, from.ID, to.ID, "x", rid, 0)
+		_, _, _, _, e := s.SendMessage(ctx, from.ID, to.ID, "x", rid, 0, 0)
 		return e
 	}
 
