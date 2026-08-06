@@ -15,13 +15,13 @@ RETURNING handle, owner_type, owner_id
 `
 
 type ClaimUsernameParams struct {
-	Lower     string
+	Handle    string
 	OwnerType string
 	OwnerID   int64
 }
 
 func (q *Queries) ClaimUsername(ctx context.Context, arg ClaimUsernameParams) (Username, error) {
-	row := q.db.QueryRow(ctx, claimUsername, arg.Lower, arg.OwnerType, arg.OwnerID)
+	row := q.db.QueryRow(ctx, claimUsername, arg.Handle, arg.OwnerType, arg.OwnerID)
 	var i Username
 	err := row.Scan(&i.Handle, &i.OwnerType, &i.OwnerID)
 	return i, err
@@ -33,8 +33,8 @@ JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
 WHERE un.handle = lower($1)
 `
 
-func (q *Queries) GetChannelByUsername(ctx context.Context, lower string) (Channel, error) {
-	row := q.db.QueryRow(ctx, getChannelByUsername, lower)
+func (q *Queries) GetChannelByUsername(ctx context.Context, handle string) (Channel, error) {
+	row := q.db.QueryRow(ctx, getChannelByUsername, handle)
 	var i Channel
 	err := row.Scan(
 		&i.ID,
@@ -56,8 +56,8 @@ JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 WHERE un.handle = lower($1)
 `
 
-func (q *Queries) GetUserByUsername(ctx context.Context, lower string) (User, error) {
-	row := q.db.QueryRow(ctx, getUserByUsername, lower)
+func (q *Queries) GetUserByUsername(ctx context.Context, handle string) (User, error) {
+	row := q.db.QueryRow(ctx, getUserByUsername, handle)
 	var i User
 	err := row.Scan(
 		&i.ID,
@@ -76,8 +76,8 @@ const getUsernameByHandle = `-- name: GetUsernameByHandle :one
 SELECT handle, owner_type, owner_id FROM usernames WHERE handle = lower($1)
 `
 
-func (q *Queries) GetUsernameByHandle(ctx context.Context, lower string) (Username, error) {
-	row := q.db.QueryRow(ctx, getUsernameByHandle, lower)
+func (q *Queries) GetUsernameByHandle(ctx context.Context, handle string) (Username, error) {
+	row := q.db.QueryRow(ctx, getUsernameByHandle, handle)
 	var i Username
 	err := row.Scan(&i.Handle, &i.OwnerType, &i.OwnerID)
 	return i, err
@@ -88,13 +88,13 @@ DELETE FROM usernames WHERE handle = lower($1) AND owner_type = $2 AND owner_id 
 `
 
 type ReleaseUsernameParams struct {
-	Lower     string
+	Handle    string
 	OwnerType string
 	OwnerID   int64
 }
 
 func (q *Queries) ReleaseUsername(ctx context.Context, arg ReleaseUsernameParams) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseUsername, arg.Lower, arg.OwnerType, arg.OwnerID)
+	result, err := q.db.Exec(ctx, releaseUsername, arg.Handle, arg.OwnerType, arg.OwnerID)
 	if err != nil {
 		return 0, err
 	}
