@@ -112,6 +112,7 @@ func TestDeliverEncryptionRequested(t *testing.T) {
 		},
 		func(context.Context, int64, bool) {},
 		func(context.Context, int64, int) {},
+		func(context.Context, int64) {},
 		nil,
 	)
 	if err != nil {
@@ -186,6 +187,7 @@ func TestDeliverEncryptionActive(t *testing.T) {
 		},
 		func(context.Context, int64, bool) {},
 		func(context.Context, int64, int) {},
+		func(context.Context, int64) {},
 		nil,
 	)
 	if err != nil {
@@ -250,6 +252,7 @@ func TestDeliverEncryptionDiscarded(t *testing.T) {
 		},
 		func(context.Context, int64, bool) {},
 		func(context.Context, int64, int) {},
+		func(context.Context, int64) {},
 		nil,
 	)
 	if err != nil {
@@ -295,6 +298,7 @@ func TestDeliverEncryptionWrongChannelNeverDispatches(t *testing.T) {
 		func(context.Context, int64, int64) { encrypted <- struct{}{} },
 		func(context.Context, int64, bool) {},
 		func(context.Context, int64, int) {},
+		func(context.Context, int64) {},
 		nil,
 	)
 	if err != nil {

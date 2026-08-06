@@ -42,7 +42,8 @@ func replySnippet(s string) string {
 // the mapper stays pure, so the one action that needs a member set is handed it
 // rather than fetching it. files is the same pattern for media, keyed by file
 // id; a row whose file id is absent from it renders as a plain message.
-func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Document, replyTexts map[int32]string) tg.MessageClass {
+// reactions, when non-nil, populates the message's Reactions field.
+func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Document, replyTexts map[int32]string, reactions []store.Reaction) tg.MessageClass {
 	if m.Action != store.ChatActionNone {
 		return &tg.MessageService{
 			ID:     int(m.LocalID),
@@ -90,6 +91,19 @@ func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Docum
 			fwd.SetFromID(&tg.PeerUser{UserID: m.FwdFromID})
 		}
 		msg.SetFwdFrom(fwd)
+	}
+	if len(reactions) > 0 {
+		reactionClasses := make([]tg.ReactionClass, len(reactions))
+		for i, r := range reactions {
+			reactionClasses[i] = &tg.ReactionEmoji{Emoticon: r.Reaction}
+		}
+		mr := &tg.MessageReactions{
+			Results: make([]tg.ReactionCount, len(reactionClasses)),
+		}
+		for i, rc := range reactionClasses {
+			mr.Results[i] = tg.ReactionCount{Reaction: rc, Count: 1}
+		}
+		msg.SetReactions(*mr)
 	}
 	return msg
 }
@@ -448,7 +462,7 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 				}
 			}
 		}
-		tlMsg := messageToTL(m, createUsers, files, nil)
+		tlMsg := messageToTL(m, createUsers, files, nil, nil)
 		refs := []int64{m.FromID}
 		var chatRefs, channelRefs []int64
 		if m.PeerType == store.PeerTypeChat {
