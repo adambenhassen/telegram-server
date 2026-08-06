@@ -3,112 +3,165 @@ package store_test
 import (
 	"context"
 	"errors"
-	"sync"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/jackc/pgx/v5"
 )
 
-// TestReactionVsDeleteConcurrent fires SendReaction and DeleteMessages
-// simultaneously across many fresh user pairs. The sorted advisory-lock
-// ordering ensures one commits first:
-//   - If delete wins: reaction must return ErrMessageInvalid, no reaction row.
-//   - If reaction wins: delete must still succeed (message not gone).
-//   - Never: both commit leaving an orphaned reaction on a deleted message.
-func TestReactionVsDeleteConcurrent(t *testing.T) {
+// TestSendReactionBlockedByDeleteLock holds the per-owner advisory locks from
+// a raw transaction, soft-deletes the message, then starts SendReaction in a
+// goroutine. SendReaction blocks at lockOwners until the holding tx commits,
+// then reloads the message and returns ErrMessageInvalid.
+func TestSendReactionBlockedByDeleteLock(t *testing.T) {
 	t.Parallel()
 	s := open(t)
 	ctx := context.Background()
+	a := mustUser(t, s, "+15551300001")
+	b := mustUser(t, s, "+15551300002")
 
-	for i := range 50 {
-		a := mustUser(t, s, "+1555128"+string(rune('a'+i%26))+"01")
-		b := mustUser(t, s, "+1555128"+string(rune('a'+i%26))+"02")
+	msg := send(t, s, a, b, "target", 1)
 
-		msg := send(t, s, a, b, "target", int64(1000+i))
+	// Open a raw connection and hold the advisory locks that SendReaction
+	// will try to acquire (lockOwners sorts ascending).
+	pool := store.StorePool(s)
+	raw, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer raw.Release()
+	tx, err := raw.Conn().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
 
-		var wg sync.WaitGroup
-		var reactErr error
-		var deleteErr error
-		wg.Go(func() {
-			_, reactErr = s.SendReaction(ctx, a.ID, msg.LocalID, "\xf0\x9f\x94\x8d") // thumbs-up
-		})
-		wg.Go(func() {
-			_, deleteErr = s.DeleteMessages(ctx, a.ID, []int64{msg.LocalID})
-		})
-		wg.Wait()
-
-		// At least one must succeed (the winner).
-		if reactErr != nil && deleteErr != nil {
-			t.Fatalf("round %d: both failed: react=%v delete=%v", i, reactErr, deleteErr)
+	ids := []int64{a.ID, b.ID}
+	slices.Sort(ids)
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", id); err != nil {
+			t.Fatalf("lock %d: %v", id, err)
 		}
+	}
 
-		// Check the invariant: no orphaned reaction on a deleted message.
-		deleted, _, err := s.MessageByOwnerLocal(ctx, a.ID, msg.LocalID)
-		if err != nil {
-			t.Fatalf("round %d: read message: %v", i, err)
-		}
-		reactions, err := s.ReactionsByOwnerLocal(ctx, a.ID, msg.LocalID)
-		if err != nil {
-			t.Fatalf("round %d: read reactions: %v", i, err)
-		}
+	// Soft-delete the message under the lock.
+	if _, err := tx.Exec(ctx, "UPDATE messages SET deleted=true WHERE owner_id=$1 AND local_id=$2", a.ID, msg.LocalID); err != nil {
+		t.Fatalf("soft-delete: %v", err)
+	}
 
-		if deleted.Deleted && len(reactions) > 0 {
-			t.Fatalf("round %d: orphaned reaction on deleted message (reactErr=%v, deleteErr=%v)", i, reactErr, deleteErr)
-		}
+	// Fire SendReaction in a goroutine — it blocks at lockOwners.
+	var reactErr error
+	done := make(chan struct{})
+	go func() {
+		_, reactErr = s.SendReaction(ctx, a.ID, msg.LocalID, "\xf0\x9f\x94\x8d")
+		close(done)
+	}()
+
+	// Wait for the goroutine to reach the lock (block).
+	select {
+	case <-done:
+		t.Fatal("SendReaction returned before delete committed — lock not held")
+	case <-time.After(2 * time.Second):
+		// Good — it's blocked on the advisory lock.
+	}
+
+	// Commit the delete — this releases the advisory lock.
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit delete: %v", err)
+	}
+
+	// SendReaction should now unblock, reload, see deleted=true, and fail.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SendReaction did not return after delete committed")
+	}
+
+	if !errors.Is(reactErr, store.ErrMessageInvalid) {
+		t.Fatalf("SendReaction: want ErrMessageInvalid, got %v", reactErr)
+	}
+
+	// No reaction row should exist.
+	reactions, err := s.ReactionsByOwnerLocal(ctx, a.ID, msg.LocalID)
+	if err != nil {
+		t.Fatalf("read reactions: %v", err)
+	}
+	if len(reactions) > 0 {
+		t.Fatalf("reaction persisted after delete: %+v", reactions)
 	}
 }
 
-// TestClearReactionVsDeleteConcurrent is the same race but with ClearReaction
-// instead of SendReaction. ClearReaction deletes a row — the invariant is that
-// it doesn't error spuriously when the message is deleted concurrently.
-func TestClearReactionVsDeleteConcurrent(t *testing.T) {
+// TestClearReactionBlockedByDeleteLock is the same deterministic pattern for
+// ClearReaction: hold the delete lock, soft-delete, then ClearReaction blocks
+// and returns ErrMessageInvalid when it unblocks.
+func TestClearReactionBlockedByDeleteLock(t *testing.T) {
 	t.Parallel()
 	s := open(t)
 	ctx := context.Background()
+	a := mustUser(t, s, "+15551300011")
+	b := mustUser(t, s, "+15551300012")
 
-	for i := range 50 {
-		a := mustUser(t, s, "+1555129"+string(rune('a'+i%26))+"01")
-		b := mustUser(t, s, "+1555129"+string(rune('a'+i%26))+"02")
+	msg := send(t, s, a, b, "target", 2)
 
-		msg := send(t, s, a, b, "target", int64(2000+i))
+	// Pre-seed a reaction so ClearReaction has something to clear.
+	if _, err := s.SendReaction(ctx, a.ID, msg.LocalID, "\xf0\x9f\x94\x8d"); err != nil {
+		t.Fatalf("setup reaction: %v", err)
+	}
 
-		// Set up a reaction first so ClearReaction has something to remove.
-		if _, err := s.SendReaction(ctx, a.ID, msg.LocalID, "\xf0\x9f\x94\x8d"); err != nil {
-			t.Fatalf("round %d: setup reaction: %v", i, err)
+	// Hold advisory locks and soft-delete.
+	pool := store.StorePool(s)
+	raw, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer raw.Release()
+	tx, err := raw.Conn().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+
+	ids := []int64{a.ID, b.ID}
+	slices.Sort(ids)
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", id); err != nil {
+			t.Fatalf("lock %d: %v", id, err)
 		}
+	}
 
-		var wg sync.WaitGroup
-		var clearErr error
-		var deleteErr error
-		wg.Go(func() {
-			_, clearErr = s.ClearReaction(ctx, a.ID, msg.LocalID)
-		})
-		wg.Go(func() {
-			_, deleteErr = s.DeleteMessages(ctx, a.ID, []int64{msg.LocalID})
-		})
-		wg.Wait()
+	if _, err := tx.Exec(ctx, "UPDATE messages SET deleted=true WHERE owner_id=$1 AND local_id=$2", a.ID, msg.LocalID); err != nil {
+		t.Fatalf("soft-delete: %v", err)
+	}
 
-		// At least one must succeed.
-		if clearErr != nil && deleteErr != nil {
-			t.Fatalf("round %d: both failed: clear=%v delete=%v", i, clearErr, deleteErr)
-		}
+	// Fire ClearReaction — blocks at lockOwners.
+	var clearErr error
+	done := make(chan struct{})
+	go func() {
+		_, clearErr = s.ClearReaction(ctx, a.ID, msg.LocalID)
+		close(done)
+	}()
 
-		// If delete won, clear should get ErrMessageInvalid (message gone).
-		// If clear won, delete still succeeds (clearing a reaction doesn't delete the message).
-		deleted, _, err := s.MessageByOwnerLocal(ctx, a.ID, msg.LocalID)
-		if err != nil {
-			t.Fatalf("round %d: read message: %v", i, err)
-		}
-		reactions, err := s.ReactionsByOwnerLocal(ctx, a.ID, msg.LocalID)
-		if err != nil {
-			t.Fatalf("round %d: read reactions: %v", i, err)
-		}
+	select {
+	case <-done:
+		t.Fatal("ClearReaction returned before delete committed — lock not held")
+	case <-time.After(2 * time.Second):
+		// Good — blocked.
+	}
 
-		// After clear wins, no reaction should remain.
-		// After delete wins, message is deleted (reaction row may or may not exist — irrelevant).
-		if !deleted.Deleted && len(reactions) > 0 {
-			t.Fatalf("round %d: reaction survived clear (clearErr=%v, deleteErr=%v)", i, clearErr, deleteErr)
-		}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit delete: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ClearReaction did not return after delete committed")
+	}
+
+	if !errors.Is(clearErr, store.ErrMessageInvalid) {
+		t.Fatalf("ClearReaction: want ErrMessageInvalid, got %v", clearErr)
 	}
 }
 
