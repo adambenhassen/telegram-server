@@ -82,11 +82,12 @@ func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Docum
 		fwd := tg.MessageFwdHeader{
 			Date: int(m.FwdDate.Unix()),
 		}
-		if m.FwdFromID != 0 {
-			fwd.SetFromID(&tg.PeerUser{UserID: m.FwdFromID})
-		}
 		if m.FwdChannelID != 0 {
+			// Channel source: FromID is the channel, not a user.
+			fwd.SetFromID(&tg.PeerChannel{ChannelID: m.FwdChannelID})
 			fwd.SetChannelPost(int(m.FwdChannelPost))
+		} else if m.FwdFromID != 0 {
+			fwd.SetFromID(&tg.PeerUser{UserID: m.FwdFromID})
 		}
 		msg.SetFwdFrom(fwd)
 	}

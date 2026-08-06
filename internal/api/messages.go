@@ -592,27 +592,17 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 	for _, id := range localIDs {
 		var m store.Message
 		var ok bool
-		if srcPeerType == store.PeerTypeChat {
-			m, ok, err = h.store.MessageByOwnerLocal(r.Ctx, r.UserID, id)
-			if err != nil {
-				h.log.Error("forward lookup chat source", "user_id", r.UserID, "err", err)
-				return nil, errInternal
-			}
-			if !ok || m.Deleted {
-				return nil, errMessageIDInvalid
-			}
-			// Must be the sender or a member (already checked).
-			// Chat messages have from_id and are stored per-member.
-		} else {
-			// 1:1 source: caller must be sender or recipient.
-			m, ok, err = h.store.MessageByOwnerLocal(r.Ctx, r.UserID, id)
-			if err != nil {
-				h.log.Error("forward lookup source", "user_id", r.UserID, "err", err)
-				return nil, errInternal
-			}
-			if !ok || m.Deleted {
-				return nil, errMessageIDInvalid
-			}
+		m, ok, err = h.store.MessageByOwnerLocal(r.Ctx, r.UserID, id)
+		if err != nil {
+			h.log.Error("forward lookup source", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		if !ok || m.Deleted {
+			return nil, errPeerIDInvalid
+		}
+		// The row must belong to the dialog the caller named in FromPeer.
+		if m.PeerType != srcPeerType || m.PeerID != srcPeerID {
+			return nil, errPeerIDInvalid
 		}
 		sources = append(sources, store.ForwardSource{
 			FromID: m.FromID,

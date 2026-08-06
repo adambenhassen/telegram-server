@@ -369,26 +369,32 @@ func TestForwardAuthRejection(t *testing.T) {
 		)
 	}
 
-	collA, collB := newUpdateCollector(), newUpdateCollector()
-	clientA, clientB := newClient(collA), newClient(collB)
-	const phoneA, phoneB = "+15551292001", "+15551292002"
+	collA, collB, collC := newUpdateCollector(), newUpdateCollector(), newUpdateCollector()
+	clientA, clientB, clientC := newClient(collA), newClient(collB), newClient(collC)
+	const phoneA, phoneB, phoneC = "+15551292001", "+15551292002", "+15551292003"
 
-	aCmds, bCmds := make(chan command), make(chan command)
-	aID, bID := make(chan int64, 1), make(chan int64, 1)
-	errA, errB := make(chan error, 1), make(chan error, 1)
+	aCmds, bCmds, cCmds := make(chan command), make(chan command), make(chan command)
+	aID, bID, cID := make(chan int64, 1), make(chan int64, 1), make(chan int64, 1)
+	errA, errB, errC := make(chan error, 1), make(chan error, 1), make(chan error, 1)
 	go func() { errA <- runInteractive(ctx, clientA, flowFor(phoneA), aID, aCmds) }()
 	go func() { errB <- runInteractive(ctx, clientB, flowFor(phoneB), bID, bCmds) }()
+	go func() { errC <- runInteractive(ctx, clientC, flowFor(phoneC), cID, cCmds) }()
 
-	var aUserID, bUserID int64
-	select {
-	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
-	}
-	select {
-	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	var aUserID, bUserID, cUserID int64
+	for i, ch := range []chan int64{aID, bID, cID} {
+		select {
+		case id := <-ch:
+			switch i {
+			case 0:
+				aUserID = id
+			case 1:
+				bUserID = id
+			case 2:
+				cUserID = id
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("client login timeout")
+		}
 	}
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
@@ -401,12 +407,12 @@ func TestForwardAuthRejection(t *testing.T) {
 		return <-d
 	}
 
-	peerA := peerUser(bUserID, aUserID)
+	peerB := peerUser(aUserID, bUserID)
 
 	// A sends a message to B.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer: peerUser(aUserID, bUserID), Message: "secret", RandomID: 500001,
+			Peer: peerB, Message: "secret", RandomID: 500001,
 		})
 		return err
 	}); err != nil {
@@ -414,29 +420,34 @@ func TestForwardAuthRejection(t *testing.T) {
 	}
 	recvOr(t, collB.newMsg, "B updateNewMessage")
 
-	// B tries to forward A's message to A, but the source is from A's side.
-	// B's copy of the message has local_id=1 in B's space, and B owns it (as recipient).
-	// The forward should succeed because B is a recipient of the message.
-	if err := exec(bCmds, func(ctx context.Context, c *tg.Client) error {
+	// C (a third user with no relation to the A-B message) tries to forward
+	// message id=1 from the A-B dialog. C does not own that message.
+	peerBFromC := peerUser(cUserID, bUserID)
+	if err := exec(cCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesForwardMessages(ctx, &tg.MessagesForwardMessagesRequest{
-			FromPeer: peerA,
+			FromPeer: peerBFromC,
 			ID:       []int{1},
 			RandomID: []int64{600001},
-			ToPeer:   peerA,
+			ToPeer:   peerBFromC,
 		})
 		return err
-	}); err != nil {
-		t.Fatalf("B forward (should succeed): %v", err)
+	}); err == nil {
+		t.Fatal("C forward (non-owner) should have failed")
 	}
 
 	close(aCmds)
 	close(bCmds)
+	close(cCmds)
 	if err := <-errA; err != nil && !errors.Is(err, context.Canceled) {
 		t.Errorf("client A run: %v", err)
 	}
 	if err := <-errB; err != nil && !errors.Is(err, context.Canceled) {
 		t.Errorf("client B run: %v", err)
 	}
+	if err := <-errC; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client C run: %v", err)
+	}
+	_ = cUserID // used above
 }
 
 func TestForwardDedup(t *testing.T) {
