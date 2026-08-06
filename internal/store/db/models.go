@@ -116,23 +116,27 @@ type File struct {
 }
 
 type Message struct {
-	OwnerID      int64
-	LocalID      int64
-	PeerID       int64
-	FromID       int64
-	Date         pgtype.Timestamptz
-	Message      string
-	Out          bool
-	EditDate     pgtype.Timestamptz
-	Deleted      bool
-	RandomID     int64
-	PeerLocalID  int64
-	PeerType     int16
-	FanoutID     int64
-	ActionType   int16
-	ActionUserID int64
-	FileID       int64
-	ReplyToMsgID *int32
+	OwnerID        int64
+	LocalID        int64
+	PeerID         int64
+	FromID         int64
+	Date           pgtype.Timestamptz
+	Message        string
+	Out            bool
+	EditDate       pgtype.Timestamptz
+	Deleted        bool
+	RandomID       int64
+	PeerLocalID    int64
+	PeerType       int16
+	FanoutID       int64
+	ActionType     int16
+	ActionUserID   int64
+	FileID         int64
+	ReplyToMsgID   *int32
+	FwdFromID      *int64
+	FwdDate        pgtype.Timestamptz
+	FwdChannelID   *int64
+	FwdChannelPost *int32
 }
 
 type MessageEvent struct {
