@@ -933,6 +933,9 @@ func (h *handlers) pinChatMessage(r *mtproto.Request, chatID int64, req *tg.Mess
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
 	}
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
+	}
 	if err != nil {
 		h.log.Error("pin chat", "chat_id", chatID, "user_id", r.UserID, "err", err)
 		return nil, errInternal
@@ -1015,6 +1018,9 @@ func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *t
 	ch, _, err := h.store.SetChannelPinnedMessage(r.Ctx, channelID, r.UserID, pinnedID)
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
+	}
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
 	}
 	if err != nil {
 		h.log.Error("pin channel", "channel_id", channelID, "user_id", r.UserID, "err", err)
