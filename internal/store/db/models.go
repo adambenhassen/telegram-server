@@ -231,3 +231,8 @@ type Username struct {
 	OwnerType string
 	OwnerID   int64
 }
+
+type UsernameChange struct {
+	UserID    int64
+	ChangedAt pgtype.Timestamptz
+}

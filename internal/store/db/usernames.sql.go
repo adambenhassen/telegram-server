@@ -100,3 +100,20 @@ func (q *Queries) ReleaseUsername(ctx context.Context, arg ReleaseUsernameParams
 	}
 	return result.RowsAffected(), nil
 }
+
+const releaseUsernameByOwner = `-- name: ReleaseUsernameByOwner :execrows
+DELETE FROM usernames WHERE owner_type = $1 AND owner_id = $2
+`
+
+type ReleaseUsernameByOwnerParams struct {
+	OwnerType string
+	OwnerID   int64
+}
+
+func (q *Queries) ReleaseUsernameByOwner(ctx context.Context, arg ReleaseUsernameByOwnerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseUsernameByOwner, arg.OwnerType, arg.OwnerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
