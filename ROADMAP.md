@@ -75,8 +75,9 @@ Updates
 - `updates.getState`, `updates.getDifference`
 
 Channels
-- `channels.createChannel`, `channels.getChannels`, `channels.leaveChannel`,
-  `channels.editAdmin`, `channels.editBanned`, `channels.getMessages`
+- `channels.createChannel`, `channels.getChannels`, `channels.joinChannel`,
+  `channels.leaveChannel`, `channels.editAdmin`, `channels.editBanned`,
+  `channels.getMessages`
 - `messages.exportChatInvite`, `messages.checkChatInvite`,
   `messages.importChatInvite`, `messages.revokeExportedChatInvite`
 - `updates.getChannelDifference`

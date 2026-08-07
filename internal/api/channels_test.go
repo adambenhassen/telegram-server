@@ -2618,3 +2618,483 @@ func TestRevokeExportedChatInviteNonMemberRefused(t *testing.T) {
 		t.Fatalf("stranger revoke: got %s, want PEER_ID_INVALID", msg)
 	}
 }
+
+// --- channels.joinChannel tests ---
+
+func TestJoinChannelPublicSucceeds(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	_, joiner, ch := channelWith(t, s, "+15551295001", "+15551295002")
+
+	// Claim a username for the channel.
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed"); err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// Join by username.
+	res, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	})
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	assertEncodes(t, res)
+	ups, ok := res.(*tg.Updates)
+	if !ok {
+		t.Fatalf("join: got %T, want *tg.Updates", res)
+	}
+	if len(ups.Chats) != 1 {
+		t.Fatalf("chats: got %d, want 1", len(ups.Chats))
+	}
+	c, ok := ups.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("chat: got %T, want *tg.Channel", ups.Chats[0])
+	}
+	if c.ID != ch.ID {
+		t.Errorf("channel id = %d, want %d", c.ID, ch.ID)
+	}
+	if c.Title != ch.Title {
+		t.Errorf("title = %q, want %q", c.Title, ch.Title)
+	}
+
+	// Verify participant row was created.
+	member, found, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil || !found {
+		t.Fatalf("member: found=%v err=%v", found, err)
+	}
+	if member.Role != 0 {
+		t.Errorf("role = %d, want 0", member.Role)
+	}
+}
+
+func TestJoinChannelPrivateRefused(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	_, joiner, ch := channelWith(t, s, "+15551295011", "+15551295012")
+	// Channel has no username (private).
+
+	_, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	})
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("private join: got %s, want PEER_ID_INVALID", msg)
+	}
+
+	// No participant row created.
+	_, found, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil || found {
+		t.Fatalf("member row: found=%v err=%v", found, err)
+	}
+}
+
+func TestJoinChannelUnknownChannelRefused(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	u, err := s.CreateUser(context.Background(), "+15551295021")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	// Non-existent channel.
+	_, err = api.JoinChannelForTest(s, u.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(u.ID, 999999),
+	})
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("unknown channel: got %s, want PEER_ID_INVALID", msg)
+	}
+}
+
+func TestJoinChannelIdempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, joiner, ch := channelWith(t, s, "+15551295031", "+15551295032")
+
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed"); err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// First join.
+	if _, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	}); err != nil {
+		t.Fatalf("first join: %v", err)
+	}
+	first, _, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+
+	// Post between joins to advance pts.
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "hello", 1, nil); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// Second join — must not change join_pts.
+	if _, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	}); err != nil {
+		t.Fatalf("second join: %v", err)
+	}
+	second, _, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	if second.JoinPts != first.JoinPts {
+		t.Errorf("join_pts changed: %d -> %d", first.JoinPts, second.JoinPts)
+	}
+
+	// Only one participant row.
+	members, err := s.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		t.Fatalf("members: %v", err)
+	}
+	if len(members) != 2 {
+		t.Errorf("participants = %d, want 2", len(members))
+	}
+}
+
+func TestJoinChannelBannedRefused(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	_, joiner, ch := channelWith(t, s, "+15551295041", "+15551295042")
+
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed"); err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// Join first.
+	if _, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	}); err != nil {
+		t.Fatalf("first join: %v", err)
+	}
+
+	// Ban the member.
+	banChannelMember(t, ctx, dsn, ch.ID, joiner.ID, time.Now().Add(time.Hour))
+
+	// Re-join while banned — must return the same error as a stranger.
+	_, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	})
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("banned rejoin: got %s, want PEER_ID_INVALID", msg)
+	}
+
+	// Verify ban survived — not cleared by re-join attempt.
+	m, found, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil || !found {
+		t.Fatalf("member: found=%v err=%v", found, err)
+	}
+	if !m.Banned(time.Now()) {
+		t.Error("ban cleared by re-join attempt")
+	}
+}
+
+func TestJoinChannelWrongAccessHashRefused(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	creator, joiner, ch := channelWith(t, s, "+15551295051", "+15551295052")
+
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed"); err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// Use creator's access hash instead of joiner's.
+	creatorHash := api.DeriveChannelHash(creator.ID, ch.ID)
+	_, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: creatorHash},
+	})
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("wrong hash: got %s, want PEER_ID_INVALID", msg)
+	}
+}
+
+func TestJoinChannelSetsJoinPts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, joiner, ch := channelWith(t, s, "+15551295061", "+15551295062")
+
+	err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed")
+	if err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// Post before join.
+	for i := range 3 {
+		if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("pre %d", i), int64(i+1), nil); err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+	}
+
+	// Join.
+	if _, err = api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+
+	member, found, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil || !found {
+		t.Fatalf("member: found=%v err=%v", found, err)
+	}
+	if member.JoinPts != 3 {
+		t.Errorf("join_pts = %d, want 3 (3 posts before join)", member.JoinPts)
+	}
+
+	// Post after join.
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "post join", 10, nil); err != nil {
+		t.Fatalf("post after join: %v", err)
+	}
+
+	// getChannelDifference from join_pts should return only the post-after-join.
+	enc, err := api.GetChannelDifferenceForTest(s, joiner.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     member.JoinPts,
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatalf("getChannelDifference: %v", err)
+	}
+	assertEncodes(t, enc)
+	diff, ok := enc.(*tg.UpdatesChannelDifference)
+	if !ok {
+		t.Fatalf("diff type: %T", enc)
+	}
+	if !diff.Final {
+		t.Fatal("Final = false, want true")
+	}
+	if len(diff.NewMessages) != 1 {
+		t.Fatalf("NewMessages = %d, want 1", len(diff.NewMessages))
+	}
+}
+
+func TestJoinChannelAtPerChannelCap(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	_, joiner, ch := channelWith(t, s, "+15551295071", "+15551295072")
+
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed"); err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// Fill the channel to the default cap (10000) minus 1 with raw SQL.
+	// Creator already has one slot, so we fill 9998 more, then joiner fills the last.
+	channelExec(t, ctx, dsn, `
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
+		SELECT $1, u.id, 0, 0
+		FROM users u
+		WHERE u.id != $2 AND u.id != $3
+		LIMIT 9998`, ch.ID, ch.CreatorID, joiner.ID)
+
+	// joiner should now take the last available seat (total 10000 = 1 creator + 9998 filled + 1 joiner).
+	if _, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	}); err != nil {
+		t.Fatalf("last join: %v", err)
+	}
+
+	// A new user — should be refused.
+	overflow, err := s.CreateUser(ctx, "+15551295074")
+	if err != nil {
+		t.Fatalf("overflow: %v", err)
+	}
+	_, err = api.JoinChannelForTest(s, overflow.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(overflow.ID, ch.ID),
+	})
+	if msg := rpcMessage(t, err); msg != "USERS_TOO_MUCH" {
+		t.Fatalf("overflow: got %s, want USERS_TOO_MUCH", msg)
+	}
+
+	// Verify no row was created for the overflow user.
+	_, found, err := s.ChannelMemberOf(ctx, ch.ID, overflow.ID)
+	if err != nil || found {
+		t.Fatalf("overflow member: found=%v err=%v", found, err)
+	}
+}
+
+func TestJoinChannelAtPerUserCap(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, joiner, ch := channelWith(t, s, "+15551295081", "+15551295082")
+
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed"); err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// Fill joiner's per-user cap (500) by joining 499 other channels through raw SQL.
+	channelExec(t, ctx, dsn, `
+		WITH filler_channels AS (
+			INSERT INTO channels (title, creator_id, megagroup)
+			SELECT 'filler ' || g, $1, false
+			FROM generate_series(1, 499) g
+			RETURNING id
+		),
+		filler_state AS (
+			INSERT INTO channel_state (channel_id)
+			SELECT id FROM filler_channels
+		),
+		filler_username AS (
+			INSERT INTO usernames (handle, owner_type, owner_id)
+			SELECT 'filler' || id, 'channel', id FROM filler_channels
+		)
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
+		SELECT fc.id, $2, 0, 0 FROM filler_channels fc`, creator.ID, joiner.ID)
+
+	// Join the target channel — should be refused (500 = 499 filler + 1 target).
+	_, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	})
+	if msg := rpcMessage(t, err); msg != "CHANNELS_TOO_MUCH" {
+		t.Fatalf("per-user cap: got %s, want CHANNELS_TOO_MUCH", msg)
+	}
+}
+
+func TestJoinChannelAppearsInGetChannels(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	_, joiner, ch := channelWith(t, s, "+15551295091", "+15551295092")
+
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed"); err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// Before join: stranger sees ChannelForbidden.
+	res, err := api.GetChannelsForTest(s, joiner.ID, &tg.ChannelsGetChannelsRequest{
+		ID: inputChannels(joiner.ID, ch.ID),
+	})
+	if err != nil {
+		t.Fatalf("get channels before: %v", err)
+	}
+	assertEncodes(t, res)
+	chats, ok := res.(*tg.MessagesChats)
+	if !ok {
+		t.Fatalf("before: got %T, want *tg.MessagesChats", res)
+	}
+	if _, ok := chats.Chats[0].(*tg.ChannelForbidden); !ok {
+		t.Fatalf("before: got %T, want *tg.ChannelForbidden", chats.Chats[0])
+	}
+
+	// Join.
+	if _, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+
+	// After join: member sees live channel.
+	res, err = api.GetChannelsForTest(s, joiner.ID, &tg.ChannelsGetChannelsRequest{
+		ID: inputChannels(joiner.ID, ch.ID),
+	})
+	if err != nil {
+		t.Fatalf("get channels after: %v", err)
+	}
+	assertEncodes(t, res)
+	chats, ok = res.(*tg.MessagesChats)
+	if !ok {
+		t.Fatalf("after: got %T, want *tg.MessagesChats", res)
+	}
+	c, ok := chats.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("after: got %T, want *tg.Channel", chats.Chats[0])
+	}
+	if c.Title != ch.Title {
+		t.Errorf("title = %q, want %q", c.Title, ch.Title)
+	}
+}
+
+func TestJoinChannelRejectsUnauthenticated(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+
+	_, err := api.JoinChannelForTest(s, 0, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(0, 1),
+	})
+	if msg := rpcMessage(t, err); msg != "AUTH_KEY_UNREGISTERED" {
+		t.Fatalf("unauthenticated: got %s, want AUTH_KEY_UNREGISTERED", msg)
+	}
+}
+
+func TestJoinChannelRaceWithUsernameClear(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	_, joiner, ch := channelWith(t, s, "+15551295101", "+15551295102")
+
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed"); err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// Clear the username (make private).
+	channelExec(t, ctx, dsn, `UPDATE channels SET username = NULL WHERE id = $1`, ch.ID)
+	channelExec(t, ctx, dsn, `DELETE FROM usernames WHERE owner_id = $1 AND owner_type = 'channel'`, ch.ID)
+
+	// Attempt join after the username is cleared — should fail with uniform error.
+	_, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	})
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("clear then join: got %s, want PEER_ID_INVALID", msg)
+	}
+}
+
+func TestJoinChannelDeliversNewPosts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, joiner, ch := channelWith(t, s, "+15551295111", "+15551295112")
+
+	err := api.ClaimChannelUsernameForTest(s, ch.ID, "newsfeed")
+	if err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+
+	// Join.
+	if _, err = api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+	}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+
+	// Post after join.
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "after join", 1, nil); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// getChannelDifference should return the new post.
+	member, found, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID)
+	if err != nil || !found {
+		t.Fatalf("member: found=%v err=%v", found, err)
+	}
+	enc, err := api.GetChannelDifferenceForTest(s, joiner.ID, &tg.UpdatesGetChannelDifferenceRequest{
+		Channel: api.InputChannel(joiner.ID, ch.ID),
+		Filter:  &tg.ChannelMessagesFilterEmpty{},
+		Pts:     member.JoinPts,
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatalf("getChannelDifference: %v", err)
+	}
+	assertEncodes(t, enc)
+	diff, ok := enc.(*tg.UpdatesChannelDifference)
+	if !ok {
+		t.Fatalf("diff type: %T", enc)
+	}
+	if len(diff.NewMessages) != 1 {
+		t.Fatalf("NewMessages = %d, want 1", len(diff.NewMessages))
+	}
+	msg, ok := diff.NewMessages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("message type: %T", diff.NewMessages[0])
+	}
+	if msg.Message != "after join" {
+		t.Errorf("message = %q, want %q", msg.Message, "after join")
+	}
+}

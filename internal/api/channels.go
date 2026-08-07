@@ -937,6 +937,60 @@ func (h *handlers) handleImportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 	}, nil
 }
 
+// handleJoinChannel serves channels.joinChannel: join a public channel by
+// username. The caller first resolves the channel via contacts.resolveUsername,
+// which returns the channel's access_hash. They then call channels.joinChannel
+// with that peer.
+//
+// The access_hash is an addressing guard, not an admission credential. The
+// admission decision is the re-read of channels.username IS NOT NULL inside
+// the store's transaction. A wrong access_hash is caught by inputChannelID
+// before the store is reached.
+//
+// Every rejection — private channel, unknown channel, banned caller — returns
+// errPeerIDInvalid. channels.id is dense BIGSERIAL; a distinguishable rejection
+// lets an attacker walk the full channel list.
+func (h *handlers) handleJoinChannel(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsJoinChannelRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+
+	ch, member, err := h.store.JoinChannelByUsername(r.Ctx, channelID, r.UserID)
+	switch {
+	case errors.Is(err, store.ErrNotMember):
+		return nil, errPeerIDInvalid
+	case errors.Is(err, store.ErrChannelFull):
+		return nil, errUsersTooMuch
+	case errors.Is(err, store.ErrTooManyChannels):
+		return nil, errChannelsTooMuch
+	case err != nil:
+		h.log.Error("join channel", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	users, err := h.loadUsers(r.Ctx, map[int64]bool{r.UserID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("join channel render users", "channel_id", ch.ID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	// A re-join by a banned member returns that member's untouched row, and
+	// it must not hand back metadata the ban revoked.
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: ch.ID}},
+		Users:   users,
+		Chats:   []tg.ChatClass{h.channelToTL(ch, member, !member.Banned(time.Now()), r.UserID)},
+		Date:    int(time.Now().Unix()),
+	}, nil
+}
+
 // handleEditChannelUsername serves channels.updateUsername. An authenticated
 // channel admin sets or clears the channel's public username. An empty string
 // clears the current username. A non-empty string must pass validation
