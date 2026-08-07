@@ -973,10 +973,9 @@ func (h *handlers) pinChatMessage(r *mtproto.Request, chatID int64, req *tg.Mess
 
 // pinChannelMessage pins or unpins a message in a channel. Only admins may pin.
 //
-// Note: the admin role check occurs before the row lock in
-// SetChannelPinnedMessage, so an admin demoted between the two steps can still
-// pin. This narrow TOCTOU window is accepted as tolerable — the worst outcome
-// is a single unauthorized pin, which the admin can immediately correct.
+// The handler-level role check is a cheap early filter. The authoritative check
+// runs inside SetChannelPinnedMessage under the channel row lock, where it
+// re-reads the caller's participant row and verifies role >= 1 and not banned.
 func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *tg.MessagesUpdatePinnedMessageRequest) (bin.Encoder, error) {
 	// Check membership and admin rights.
 	member, err := h.requireChannelMember(r.Ctx, channelID, r.UserID)
