@@ -12,7 +12,7 @@ import (
 )
 
 const channelByID = `-- name: ChannelByID :one
-SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id FROM channels WHERE id = $1
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username FROM channels WHERE id = $1
 `
 
 func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
@@ -27,6 +27,7 @@ func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.Username,
 	)
 	return i, err
 }
@@ -252,7 +253,7 @@ func (q *Queries) ChannelStateForUpdate(ctx context.Context, channelID int64) (C
 }
 
 const channelsForUser = `-- name: ChannelsForUser :many
-SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id FROM channels c
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id, c.username FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id
@@ -276,6 +277,7 @@ func (q *Queries) ChannelsForUser(ctx context.Context, userID int64) ([]Channel,
 			&i.Version,
 			&i.Date,
 			&i.PinnedMessageID,
+			&i.Username,
 		); err != nil {
 			return nil, err
 		}
@@ -342,7 +344,7 @@ func (q *Queries) GetChannelPinnedMessage(ctx context.Context, id int64) (*int32
 
 const insertChannel = `-- name: InsertChannel :one
 INSERT INTO channels (title, about, creator_id, megagroup) VALUES ($1, $2, $3, $4)
-RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id
+RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username
 `
 
 type InsertChannelParams struct {
@@ -369,6 +371,7 @@ func (q *Queries) InsertChannel(ctx context.Context, arg InsertChannelParams) (C
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.Username,
 	)
 	return i, err
 }
@@ -463,7 +466,7 @@ func (q *Queries) IsChannelMember(ctx context.Context, arg IsChannelMemberParams
 }
 
 const lockChannel = `-- name: LockChannel :one
-SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id FROM channels WHERE id = $1 FOR UPDATE
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username FROM channels WHERE id = $1 FOR UPDATE
 `
 
 // LockChannel takes the channels row lock that serialises the rights mutations:
@@ -482,6 +485,7 @@ func (q *Queries) LockChannel(ctx context.Context, id int64) (Channel, error) {
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.Username,
 	)
 	return i, err
 }
@@ -504,7 +508,7 @@ func (q *Queries) RevokeChannelInvite(ctx context.Context, arg RevokeChannelInvi
 }
 
 const setChannelPinnedMessage = `-- name: SetChannelPinnedMessage :one
-UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id
+UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username
 `
 
 type SetChannelPinnedMessageParams struct {
@@ -527,8 +531,26 @@ func (q *Queries) SetChannelPinnedMessage(ctx context.Context, arg SetChannelPin
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.Username,
 	)
 	return i, err
+}
+
+const setChannelUsername = `-- name: SetChannelUsername :execrows
+UPDATE channels SET username = $2 WHERE id = $1
+`
+
+type SetChannelUsernameParams struct {
+	ID       int64
+	Username *string
+}
+
+func (q *Queries) SetChannelUsername(ctx context.Context, arg SetChannelUsernameParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setChannelUsername, arg.ID, arg.Username)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateChannelParticipantBan = `-- name: UpdateChannelParticipantBan :execrows
