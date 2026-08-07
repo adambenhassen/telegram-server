@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/gotd/td/bin"
@@ -108,9 +109,9 @@ func (h *handlers) handleResolveUsername(r *mtproto.Request) (bin.Encoder, error
 		// Public rendering for all callers — regardless of membership.
 		// contacts.resolveUsername always returns the same public view so the
 		// response does not leak membership state.
-		chat := h.channelToTLForResolve(r.Ctx, ch, r.UserID)
-		if chat == nil {
-			h.log.Error("resolve username: render", "user_id", r.UserID, "err", "nil channel")
+		chat, err := h.channelToTLForResolve(r.Ctx, ch, r.UserID)
+		if err != nil {
+			h.log.Error("resolve username: render", "user_id", r.UserID, "err", err)
 			return nil, errInternal
 		}
 
@@ -127,12 +128,11 @@ func (h *handlers) handleResolveUsername(r *mtproto.Request) (bin.Encoder, error
 // All callers see the same public view — membership is never checked.
 // Returns title, photo, participant count, and kind flags. No membership
 // details are included.
-func (h *handlers) channelToTLForResolve(ctx context.Context, c store.Channel, viewerID int64) tg.ChatClass {
+func (h *handlers) channelToTLForResolve(ctx context.Context, c store.Channel, viewerID int64) (tg.ChatClass, error) {
 	a := h.peers.Derive(viewerID, peerhash.KindChannel, c.ID)
 	count, err := h.store.CountChannelParticipants(ctx, c.ID)
 	if err != nil {
-		h.log.Error("resolve username: participant count", "channel_id", c.ID, "err", err)
-		return nil
+		return nil, fmt.Errorf("count participants: %w", err)
 	}
 	return &tg.Channel{
 		ID:                c.ID,
@@ -144,7 +144,7 @@ func (h *handlers) channelToTLForResolve(ctx context.Context, c store.Channel, v
 		Left:              true,
 		Photo:             &tg.ChatPhotoEmpty{},
 		ParticipantsCount: int(count),
-	}
+	}, nil
 }
 
 // handleGetUsers serves users.getUsers. The request's auth key is resolved to a

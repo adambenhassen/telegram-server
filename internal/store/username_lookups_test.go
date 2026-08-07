@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -114,5 +116,73 @@ func TestUsernameLookupRetrySame(t *testing.T) {
 	retryHandle := string(rune('a')) + string(rune('a')) + string(rune('0'))
 	if err := s.CheckAndChargeUsernameLookup(ctx, user.ID, retryHandle); err != nil {
 		t.Fatalf("retry of same handle: %v", err)
+	}
+}
+
+// TestUsernameLookupConcurrentBoundary verifies that the advisory lock in
+// CheckAndChargeUsernameLookup serialises concurrent callers so exactly
+// UsernameLookupBurstLimit succeed and the rest return
+// ErrUsernameLookupQuotaExceeded.
+//
+// Without pg_advisory_xact_lock the prune/insert/count sequence races:
+// multiple goroutines see the same pre-increment count and commit past the
+// limit. Removing the lock causes this test to report more than
+// UsernameLookupBurstLimit successes.
+func TestUsernameLookupConcurrentBoundary(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	user, err := s.CreateUser(context.Background(), "15550000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = store.UsernameLookupBurstLimit + 10
+
+	type result struct{ err error }
+	results := make([]result, n)
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	ready := make(chan struct{})
+
+	for i := range n {
+		go func(i int) {
+			defer wg.Done()
+			<-ready
+			handle := fmt.Sprintf("%02d", i)
+			results[i].err = s.CheckAndChargeUsernameLookup(context.Background(), user.ID, handle)
+		}(i)
+	}
+
+	close(ready)
+	wg.Wait()
+
+	var successes, quotaErrors, other int
+	for _, r := range results {
+		switch {
+		case r.err == nil:
+			successes++
+		case errors.Is(r.err, store.ErrUsernameLookupQuotaExceeded):
+			quotaErrors++
+		default:
+			other++
+			t.Errorf("unexpected error: %v", r.err)
+		}
+	}
+
+	if successes != store.UsernameLookupBurstLimit {
+		t.Errorf("successes = %d, want %d", successes, store.UsernameLookupBurstLimit)
+	}
+	if quotaErrors != 10 {
+		t.Errorf("quota errors = %d, want 10", quotaErrors)
+	}
+	if other != 0 {
+		t.Errorf("unexpected errors = %d, want 0", other)
 	}
 }

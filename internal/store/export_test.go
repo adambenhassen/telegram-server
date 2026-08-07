@@ -264,18 +264,6 @@ func StorePool(s *Store) *pgxpool.Pool { return s.pool }
 //
 // Safe to filter by database because internal/pgtest clones one database per
 // test, so the only backends here are this test's.
-// ClaimChannelUsername inserts a row into the usernames table for a channel,
-// so tests can exercise the username resolution path without the RPC that
-// claims channel usernames (out of scope for this ticket).
-func ClaimChannelUsername(ctx context.Context, s *Store, channelID int64, handle string) error {
-	_, err := s.q.ClaimUsername(ctx, db.ClaimUsernameParams{
-		Handle:    handle,
-		OwnerType: "channel",
-		OwnerID:   channelID,
-	})
-	return err
-}
-
 func WaitForLockWaiters(ctx context.Context, s *Store, n int) error {
 	const timeout = 30 * time.Second
 	deadline := time.Now().Add(timeout)

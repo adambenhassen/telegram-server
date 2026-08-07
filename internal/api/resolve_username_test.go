@@ -2,7 +2,6 @@ package api_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -273,12 +272,13 @@ func TestResolveChannelHit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Claim the username for this channel — no shipped RPC does this yet
-	// (MAIN-181), so the test helper inserts the row directly.
+	// Claim the username for this channel atomically (both usernames table
+	// and channels.username column) — no shipped RPC does this yet (MAIN-181).
 	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "publicchannel"); err != nil {
 		t.Fatal(err)
 	}
 
+	// Resolve as an outsider (caller is not a member).
 	res, err := api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: "publicchannel"})
 	if err != nil {
 		t.Fatal(err)
@@ -310,7 +310,12 @@ func TestResolveChannelHit(t *testing.T) {
 	if chatCh.Megagroup {
 		t.Error("megagroup should be false for a channel")
 	}
-	_ = chatCh.Left // Left=true is correct: the caller is not a member.
+	if !chatCh.Left {
+		t.Error("left should be true (non-member view)")
+	}
+	if chatCh.ParticipantsCount == 0 {
+		t.Error("participant count should be > 0")
+	}
 	// Verify per-viewer access hash.
 	wantHash := pgtest.PeerDeriver().Derive(caller.ID, peerhash.KindChannel, ch.ID)
 	if chatCh.AccessHash != wantHash {
@@ -327,6 +332,27 @@ func TestResolveChannelHit(t *testing.T) {
 	}
 	if pc.ChannelID != ch.ID {
 		t.Errorf("peer channel id = %d, want %d", pc.ChannelID, ch.ID)
+	}
+
+	// Resolve as the creator (a member) — should get the same public view.
+	resCreator, err := api.ResolveUsernameForTest(s, creator.ID, &tg.ContactsResolveUsernameRequest{Username: "publicchannel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerCreator, ok := resCreator.(*tg.ContactsResolvedPeer)
+	if !ok {
+		t.Fatalf("creator: unexpected response type: %T", resCreator)
+	}
+	chatChCreator, ok := peerCreator.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("creator: chats[0] is not *tg.Channel: %T", peerCreator.Chats[0])
+	}
+	// Member should also see the public view (Left=true, no member-only fields).
+	if !chatChCreator.Left {
+		t.Error("creator should also see Left=true (public view)")
+	}
+	if chatChCreator.ParticipantsCount == 0 {
+		t.Error("creator: participant count should be > 0")
 	}
 }
 
@@ -353,10 +379,12 @@ func TestResolveChannelMiss(t *testing.T) {
 	}
 }
 
-// TestResolveUsernameBurstCap uses the store-level API to exercise the
-// per-minute burst cap (20 distinct handles). It is fast because it stays
-// within the burst window.
-func TestResolveUsernameBurstCap(t *testing.T) {
+// TestResolveUsernameQuota verifies that the quota is charged at the RPC
+// boundary (acceptance criteria 8 and 9). It charges 20 distinct lookups via
+// the store API (burst limit), then resolves a nonexistent handle through the
+// handler and asserts FLOOD_WAIT — proving the handler translates the store
+// error to the correct TG error.
+func TestResolveUsernameQuota(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
@@ -370,22 +398,22 @@ func TestResolveUsernameBurstCap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Burst cap is 20 per minute. The 21st distinct lookup in the same minute
-	// should be rate-limited.
+	// Charge 20 distinct lookups (burst limit) via the store API.
+	ctx := context.Background()
 	for i := range store.UsernameLookupBurstLimit {
-		username := string(rune('a'+i%26)) + string(rune('a'+(i/26)%26))
-		if err := s.CheckAndChargeUsernameLookup(context.Background(), caller.ID, username); err != nil {
+		handle := string(rune('a'+i%26)) + string(rune('a'+(i/26)%26))
+		if err := s.CheckAndChargeUsernameLookup(ctx, caller.ID, handle); err != nil {
 			t.Fatalf("lookup %d: %v", i, err)
 		}
 	}
 
-	// 21st distinct lookup in same minute should be rate-limited.
-	err = s.CheckAndChargeUsernameLookup(context.Background(), caller.ID, "zz")
+	// Next lookup through the handler should return FLOOD_WAIT.
+	_, err = api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: "zz"})
 	if err == nil {
-		t.Fatal("burst cap did not return error")
+		t.Fatal("quota exceeded did not return error")
 	}
-	if !errors.Is(err, store.ErrUsernameLookupQuotaExceeded) {
-		t.Errorf("got %v, want ErrUsernameLookupQuotaExceeded", err)
+	if !tgerr.Is(err, "FLOOD_WAIT") {
+		t.Errorf("got %v, want FLOOD_WAIT", err)
 	}
 }
 
