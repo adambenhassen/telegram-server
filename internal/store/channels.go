@@ -727,9 +727,14 @@ func (s *Store) ChannelPinnedMessage(ctx context.Context, channelID int64) (*int
 
 // SetChannelPinnedMessage sets or clears the pinned message id on channelID.
 // pinnedID is the local_id of the channel post to pin. Passing nil clears the
-// pin. The caller is responsible for having checked admin rights — this method
-// does not authorise. Returns the channel with updated pinned_message_id and
-// version.
+// pin. Returns the channel with updated pinned_message_id and version.
+//
+// Authorises inside the transaction: the early membership filter before the lock
+// keeps away the clear outsiders; the re-read under the lock checks role and ban
+// status, so a caller demoted or banned between the handler-level check and the
+// write is still refused. Returns ErrNotMember on any rejection — the same error
+// the handler produces for non-members, so the wire error stays indistinguishable
+// from "no such channel".
 //
 // When pinnedID is non-nil the post is validated inside this transaction:
 // it must exist in channelID and not be deleted. This prevents the TOCTOU
@@ -738,13 +743,6 @@ func (s *Store) ChannelPinnedMessage(ctx context.Context, channelID int64) (*int
 //
 // Returns the member set (participant user ids) so the caller can fan out the
 // update.
-// ErrNotMember when no channel exists — the indistinguishability with membership
-// follows the convention from other channel writers. Note that the store cannot
-// decide "caller not a member" or "insufficient role" without re-implementing
-// admin policy (a banned creator row etc). This writes if reached and trusts the
-// authorising check that runs on every reader that grants admin privileges. That
-// runs through IsChannelMember which takes a simple predicate rather than row
-// lock; the channels row lock serialises the write against concurrent mutations.
 // ErrMessageInvalid when pinnedID names a post that does not exist or is deleted.
 func (s *Store) SetChannelPinnedMessage(ctx context.Context, channelID, callerID int64, pinnedID *int32) (ch Channel, members []int64, err error) {
 	tx, err := s.pool.Begin(ctx)
@@ -770,6 +768,24 @@ func (s *Store) SetChannelPinnedMessage(ctx context.Context, channelID, callerID
 			return Channel{}, nil, ErrNotMember
 		}
 		return Channel{}, nil, fmt.Errorf("lock channel: %w", err)
+	}
+
+	// Re-read the caller's participant row under the channel lock to close the
+	// TOCTOU window: the handler checked role >= 1 before this transaction, but
+	// a demotion or ban committed in between would otherwise still let the pin
+	// through. Same error either way, so an absent channel stays indistinguishable.
+	participant, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID, UserID: callerID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Channel{}, nil, ErrNotMember
+	case err != nil:
+		return Channel{}, nil, fmt.Errorf("caller participant: %w", err)
+	}
+	caller := channelMemberFromRow(participant)
+	if caller.Role < 1 || caller.Banned(time.Now()) {
+		return Channel{}, nil, ErrNotMember
 	}
 
 	// Validate the pinned post under the channels row lock so a concurrent
