@@ -388,6 +388,16 @@ func ResolvePhoneForTest(s *store.Store, userID int64, req *tg.ContactsResolvePh
 	return testHandlers(s).handleResolvePhone(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// ResolveUsernameForTest invokes handleResolveUsername for the caller against the
+// given request.
+func ResolveUsernameForTest(s *store.Store, userID int64, req *tg.ContactsResolveUsernameRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleResolveUsername(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // InputEncryptedChat builds a valid InputEncryptedChat for chatID as seen by
 // viewerID, using the test deriver.
 func InputEncryptedChat(viewerID int64, chatID int32) tg.InputEncryptedChat {
