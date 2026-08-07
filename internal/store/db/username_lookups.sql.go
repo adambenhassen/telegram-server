@@ -50,17 +50,19 @@ func (q *Queries) DeleteExpiredUsernameLookups(ctx context.Context, arg DeleteEx
 
 const insertUsernameLookup = `-- name: InsertUsernameLookup :exec
 INSERT INTO username_lookups (caller_id, handle, looked_up_at)
-VALUES ($1, $2, now())
+VALUES ($1, $2, $3)
 `
 
 type InsertUsernameLookupParams struct {
-	CallerID int64
-	Handle   string
+	CallerID   int64
+	Handle     string
+	LookedUpAt pgtype.Timestamptz
 }
 
 // Record a lookup attempt. caller_id and handle are the normalized values.
-// COUNT DISTINCT handle enforces the quota; one row per call is expected.
+// looked_up_at is passed from Go (time.Now() after the advisory lock) so the
+// burst window is measured against wall-clock time, not transaction-start time.
 func (q *Queries) InsertUsernameLookup(ctx context.Context, arg InsertUsernameLookupParams) error {
-	_, err := q.db.Exec(ctx, insertUsernameLookup, arg.CallerID, arg.Handle)
+	_, err := q.db.Exec(ctx, insertUsernameLookup, arg.CallerID, arg.Handle, arg.LookedUpAt)
 	return err
 }

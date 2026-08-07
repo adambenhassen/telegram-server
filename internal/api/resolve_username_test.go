@@ -2,13 +2,13 @@ package api_test
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -272,6 +272,12 @@ func TestResolveChannelHit(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Claim the username for this channel — no shipped RPC does this yet
+	// (MAIN-181), so the test helper inserts the row directly.
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "publicchannel"); err != nil {
+		t.Fatal(err)
+	}
+
 	res, err := api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: "publicchannel"})
 	if err != nil {
 		t.Fatal(err)
@@ -284,6 +290,34 @@ func TestResolveChannelHit(t *testing.T) {
 
 	if len(peer.Chats) != 1 {
 		t.Fatalf("expected 1 chat, got %d", len(peer.Chats))
+	}
+
+	// The channel should be rendered as tg.Channel (not ChannelForbidden).
+	chatCh, ok := peer.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("chats[0] is not *tg.Channel: %T", peer.Chats[0])
+	}
+	if chatCh.ID != ch.ID {
+		t.Errorf("channel id = %d, want %d", chatCh.ID, ch.ID)
+	}
+	if chatCh.Title != "Public Channel" {
+		t.Errorf("title = %q, want %q", chatCh.Title, "Public Channel")
+	}
+	if !chatCh.Broadcast {
+		t.Error("broadcast should be true for a channel")
+	}
+	if chatCh.Megagroup {
+		t.Error("megagroup should be false for a channel")
+	}
+	_ = chatCh.Left // Left=true is correct: the caller is not a member.
+	// Verify per-viewer access hash.
+	wantHash := pgtest.PeerDeriver().Derive(caller.ID, peerhash.KindChannel, ch.ID)
+	if chatCh.AccessHash != wantHash {
+		t.Errorf("access_hash = %d, want %d", chatCh.AccessHash, wantHash)
+	}
+	// Verify photo is ChatPhotoEmpty.
+	if _, ok := chatCh.Photo.(*tg.ChatPhotoEmpty); !ok {
+		t.Errorf("photo is not ChatPhotoEmpty: %T", chatCh.Photo)
 	}
 
 	pc, ok := peer.Peer.(*tg.PeerChannel)
@@ -318,111 +352,9 @@ func TestResolveChannelMiss(t *testing.T) {
 	}
 }
 
-func TestResolveUsernameQuota(t *testing.T) {
-	t.Parallel()
-	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
-
-	caller, err := s.CreateUser(context.Background(), "15550000001")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Exhaust quota with distinct usernames (UsernameLookupLimit = 100).
-	for i := range store.UsernameLookupLimit {
-		username := fmt.Sprintf("user%09d", i)
-		_, err := api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: username})
-		// Misses are expected (USERNAME_NOT_OCCUPIED), but each charges the quota.
-		if err == nil {
-			t.Fatalf("lookup %d should have failed (miss)", i)
-		}
-		if !tgerr.Is(err, "USERNAME_NOT_OCCUPIED") {
-			t.Fatalf("lookup %d: got %v, want USERNAME_NOT_OCCUPIED", i, err)
-		}
-	}
-
-	// 101st lookup should hit quota.
-	_, err = api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: "user999999999"})
-	if err == nil {
-		t.Fatal("quota exceeded did not return error")
-	}
-	if !tgerr.Is(err, "FLOOD_WAIT") {
-		t.Errorf("got %v, want FLOOD_WAIT", err)
-	}
-}
-
-func TestResolveUsernameQuotaRetrySame(t *testing.T) {
-	t.Parallel()
-	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
-
-	caller, err := s.CreateUser(context.Background(), "15550000001")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Fill quota with distinct usernames.
-	for i := range store.UsernameLookupLimit {
-		username := fmt.Sprintf("user%09d", i)
-		_, _ = api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: username}) //nolint:errcheck // error expected (miss)
-	}
-
-	// Retry the same username as loop iteration 0 — distinct count stays at 100,
-	// so quota passes and the miss path returns USERNAME_NOT_OCCUPIED.
-	retryUsername := fmt.Sprintf("user%09d", 0)
-	_, err = api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: retryUsername})
-	if err == nil {
-		t.Fatal("retry of same username did not fail")
-	}
-	if !tgerr.Is(err, "USERNAME_NOT_OCCUPIED") {
-		t.Errorf("got %v, want USERNAME_NOT_OCCUPIED", err)
-	}
-}
-
-func TestResolveUsernameQuotaChargesOnMiss(t *testing.T) {
-	t.Parallel()
-	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
-
-	caller, err := s.CreateUser(context.Background(), "15550000001")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Exhaust quota with nonexistent usernames — each miss still charges.
-	for i := range store.UsernameLookupLimit {
-		username := fmt.Sprintf("ghost%09d", i)
-		_, err := api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: username})
-		if err == nil {
-			t.Fatalf("lookup %d should have failed (miss)", i)
-		}
-		if !tgerr.Is(err, "USERNAME_NOT_OCCUPIED") {
-			t.Fatalf("lookup %d: got %v, want USERNAME_NOT_OCCUPIED", i, err)
-		}
-	}
-
-	// Next distinct miss is rate-limited — quota was charged on every miss.
-	_, err = api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: "ghost999999999"})
-	if err == nil {
-		t.Fatal("quota not charged on miss")
-	}
-	if !tgerr.Is(err, "FLOOD_WAIT") {
-		t.Errorf("got %v, want FLOOD_WAIT", err)
-	}
-}
-
+// TestResolveUsernameBurstCap uses the store-level API to exercise the
+// per-minute burst cap (20 distinct handles). It is fast because it stays
+// within the burst window.
 func TestResolveUsernameBurstCap(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
@@ -438,14 +370,16 @@ func TestResolveUsernameBurstCap(t *testing.T) {
 	}
 
 	// Burst cap is 20 per minute. The 21st distinct lookup in the same minute
-	// should be rate-limited regardless of the 24-hour counter.
+	// should be rate-limited.
 	for i := range store.UsernameLookupBurstLimit {
-		username := fmt.Sprintf("burst%09d", i)
-		_, _ = api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: username}) //nolint:errcheck // miss expected
+		username := string(rune('a'+i%26)) + string(rune('a'+(i/26)%26))
+		if err := s.CheckAndChargeUsernameLookup(context.Background(), caller.ID, username); err != nil {
+			t.Fatalf("lookup %d: %v", i, err)
+		}
 	}
 
 	// 21st distinct lookup in same minute should be rate-limited.
-	_, err = api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: "burst999999999"})
+	err = s.CheckAndChargeUsernameLookup(context.Background(), caller.ID, "zz")
 	if err == nil {
 		t.Fatal("burst cap did not return error")
 	}

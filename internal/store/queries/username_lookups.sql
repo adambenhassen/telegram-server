@@ -7,9 +7,10 @@ WHERE caller_id = $1
 
 -- name: InsertUsernameLookup :exec
 -- Record a lookup attempt. caller_id and handle are the normalized values.
--- COUNT DISTINCT handle enforces the quota; one row per call is expected.
+-- looked_up_at is passed from Go (time.Now() after the advisory lock) so the
+-- burst window is measured against wall-clock time, not transaction-start time.
 INSERT INTO username_lookups (caller_id, handle, looked_up_at)
-VALUES ($1, $2, now());
+VALUES ($1, $2, $3);
 
 -- name: DeleteExpiredUsernameLookups :exec
 -- Remove lookups older than the window for a specific caller.

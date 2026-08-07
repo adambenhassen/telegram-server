@@ -1,9 +1,9 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"strings"
-	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -105,20 +105,13 @@ func (h *handlers) handleResolveUsername(r *mtproto.Request) (bin.Encoder, error
 	case store.UsernameKindChannel:
 		ch := resolution.Channel
 
-		// Check membership for rendering decision.
-		member, found, err := h.store.ChannelMemberOf(r.Ctx, ch.ID, r.UserID)
-		if err != nil {
-			h.log.Error("resolve username: membership", "user_id", r.UserID, "err", err)
+		// Public rendering for all callers — regardless of membership.
+		// contacts.resolveUsername always returns the same public view so the
+		// response does not leak membership state.
+		chat := h.channelToTLForResolve(r.Ctx, ch, r.UserID)
+		if chat == nil {
+			h.log.Error("resolve username: render", "user_id", r.UserID, "err", "nil channel")
 			return nil, errInternal
-		}
-
-		var chat tg.ChatClass
-		if found && !member.Banned(time.Now()) {
-			// Member: use the standard rendering path.
-			chat = h.channelToTL(ch, member, true, r.UserID)
-		} else {
-			// Non-member: render with title, photo, participant count.
-			chat = h.channelToTLForResolve(ch, r.UserID)
 		}
 
 		return &tg.ContactsResolvedPeer{
@@ -130,16 +123,27 @@ func (h *handlers) handleResolveUsername(r *mtproto.Request) (bin.Encoder, error
 	}
 }
 
-// channelToTLForResolve renders a channel for a non-member caller resolving
-// via username. It returns title, photo, and participant count — but not
-// membership details. This is the rendering path for public channels when the
-// caller is not a member.
-func (h *handlers) channelToTLForResolve(c store.Channel, viewerID int64) tg.ChatClass {
-	ah := h.peers.Derive(viewerID, peerhash.KindChannel, c.ID)
-	return &tg.ChannelForbidden{
-		ID:         c.ID,
-		AccessHash: ah,
-		Title:      c.Title,
+// channelToTLForResolve renders a channel for contacts.resolveUsername.
+// All callers see the same public view — membership is never checked.
+// Returns title, photo, participant count, and kind flags. No membership
+// details are included.
+func (h *handlers) channelToTLForResolve(ctx context.Context, c store.Channel, viewerID int64) tg.ChatClass {
+	a := h.peers.Derive(viewerID, peerhash.KindChannel, c.ID)
+	count, err := h.store.CountChannelParticipants(ctx, c.ID)
+	if err != nil {
+		h.log.Error("resolve username: participant count", "channel_id", c.ID, "err", err)
+		return nil
+	}
+	return &tg.Channel{
+		ID:                c.ID,
+		Title:             c.Title,
+		AccessHash:        a,
+		Date:              int(c.Date.Unix()),
+		Megagroup:         c.Megagroup,
+		Broadcast:         !c.Megagroup,
+		Left:              true,
+		Photo:             &tg.ChatPhotoEmpty{},
+		ParticipantsCount: int(count),
 	}
 }
 

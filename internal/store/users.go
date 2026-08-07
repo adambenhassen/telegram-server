@@ -265,3 +265,15 @@ func (s *Store) UpdateUsername(ctx context.Context, userID int64, username strin
 	}
 	return nil
 }
+
+// ClaimUsername inserts a row into the usernames table. It is used by the
+// resolveUsername handler's tests to claim a username for a channel — the
+// shipped RPC that does this (channels.setUsername) is a later ticket.
+func (s *Store) ClaimUsername(ctx context.Context, handle string, ownerType string, ownerID int64) error {
+	_, err := s.q.ClaimUsername(ctx, db.ClaimUsernameParams{
+		Handle:    handle,
+		OwnerType: ownerType,
+		OwnerID:   ownerID,
+	})
+	return err
+}

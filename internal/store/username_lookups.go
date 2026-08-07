@@ -56,9 +56,15 @@ func (s *Store) CheckAndChargeUsernameLookup(ctx context.Context, callerID int64
 		return fmt.Errorf("advisory lock: %w", err)
 	}
 
+	// Capture wall-clock time AFTER the advisory lock. PostgreSQL's now() is
+	// pinned to transaction-start time, so a request stalled behind a lock
+	// holder for more than a minute would insert a row outside the burst window
+	// and commit uncounted.
+	now := time.Now()
+
 	qtx := s.q.WithTx(tx)
-	windowCutoff := pgtype.Timestamptz{Time: time.Now().Add(-UsernameLookupWindow), Valid: true}
-	burstCutoff := pgtype.Timestamptz{Time: time.Now().Add(-UsernameLookupBurstWindow), Valid: true}
+	windowCutoff := pgtype.Timestamptz{Time: now.Add(-UsernameLookupWindow), Valid: true}
+	burstCutoff := pgtype.Timestamptz{Time: now.Add(-UsernameLookupBurstWindow), Valid: true}
 
 	// Prune expired rows for this caller only.
 	if err := qtx.DeleteExpiredUsernameLookups(ctx, db.DeleteExpiredUsernameLookupsParams{
@@ -68,10 +74,12 @@ func (s *Store) CheckAndChargeUsernameLookup(ctx context.Context, callerID int64
 		return fmt.Errorf("prune lookups: %w", err)
 	}
 
-	// Insert the attempt. COUNT DISTINCT handles dedup for retries.
+	// Insert the attempt with the post-lock timestamp. COUNT DISTINCT handles
+	// dedup for retries.
 	if err := qtx.InsertUsernameLookup(ctx, db.InsertUsernameLookupParams{
-		CallerID: callerID,
-		Handle:   handle,
+		CallerID:   callerID,
+		Handle:     handle,
+		LookedUpAt: pgtype.Timestamptz{Time: now, Valid: true},
 	}); err != nil {
 		return fmt.Errorf("insert lookup: %w", err)
 	}

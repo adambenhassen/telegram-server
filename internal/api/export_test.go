@@ -493,3 +493,10 @@ func UpdateUsernameForTest(s *store.Store, userID int64, username string) (bin.E
 	}
 	return testHandlers(s).handleUpdateUsername(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
+
+// ClaimChannelUsernameForTest inserts a row into the usernames table for a
+// channel, so api_test can exercise the username resolution path without the
+// RPC that claims channel usernames (out of scope for this ticket).
+func ClaimChannelUsernameForTest(s *store.Store, channelID int64, handle string) error {
+	return s.ClaimUsername(context.Background(), handle, "channel", channelID)
+}
