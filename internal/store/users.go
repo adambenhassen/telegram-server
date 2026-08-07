@@ -265,3 +265,32 @@ func (s *Store) UpdateUsername(ctx context.Context, userID int64, username strin
 	}
 	return nil
 }
+
+// ClaimChannelUsername claims a username for a channel atomically: inserts
+// into the usernames table AND updates channels.username in one transaction.
+// The shipped RPC that does this (channels.setUsername) is a later ticket;
+// this method exists so tests can seed valid channel username state without
+// violating the non-oracle invariant.
+func (s *Store) ClaimChannelUsername(ctx context.Context, channelID int64, handle string) error {
+	xHandle := strings.ToLower(handle)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+	if _, err := qtx.ClaimUsername(ctx, db.ClaimUsernameParams{
+		Handle:    xHandle,
+		OwnerType: "channel",
+		OwnerID:   channelID,
+	}); err != nil {
+		return fmt.Errorf("claim username: %w", err)
+	}
+	if _, err := qtx.SetChannelUsername(ctx, db.SetChannelUsernameParams{
+		ID:       channelID,
+		Username: &xHandle,
+	}); err != nil {
+		return fmt.Errorf("set channel username: %w", err)
+	}
+	return tx.Commit(ctx)
+}

@@ -1,12 +1,16 @@
 package api
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -49,6 +53,97 @@ func (h *handlers) handleResolvePhone(r *mtproto.Request) (bin.Encoder, error) {
 	return &tg.ContactsResolvedPeer{
 		Peer:  &tg.PeerUser{UserID: user.ID},
 		Users: []tg.UserClass{h.userToTL(user, r.UserID, false)},
+	}, nil
+}
+
+// handleResolveUsername serves contacts.resolveUsername: resolve a @username to
+// a user or channel peer. Only authorized callers may use it. Quota is checked
+// before the lookup executes; on miss the same error is returned (indistinguishability).
+//
+// A leading @ is stripped before lookup. Lookup is case-insensitive.
+//
+// For channels, title, photo, and participant count are returned even to
+// non-members — but not membership details. The phone field is never emitted.
+func (h *handlers) handleResolveUsername(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ContactsResolveUsernameRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+
+	username := strings.TrimPrefix(req.Username, "@")
+	username = strings.ToLower(username)
+	if username == "" {
+		return nil, errUsernameNotOccupied
+	}
+
+	// Charge quota before the lookup — identically on hit and miss.
+	if err := h.store.CheckAndChargeUsernameLookup(r.Ctx, r.UserID, username); err != nil {
+		if errors.Is(err, store.ErrUsernameLookupQuotaExceeded) {
+			return nil, errUsernameLookupFloodWait
+		}
+		h.log.Error("resolve username: quota", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	resolution, ok, err := h.store.UsernameByHandle(r.Ctx, username)
+	if err != nil {
+		h.log.Error("resolve username: lookup", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !ok {
+		return nil, errUsernameNotOccupied
+	}
+
+	switch resolution.Kind {
+	case store.UsernameKindUser:
+		return &tg.ContactsResolvedPeer{
+			Peer:  &tg.PeerUser{UserID: resolution.User.ID},
+			Users: []tg.UserClass{h.userToTL(resolution.User, r.UserID, false)},
+		}, nil
+	case store.UsernameKindChannel:
+		ch := resolution.Channel
+
+		// Public rendering for all callers — regardless of membership.
+		// contacts.resolveUsername always returns the same public view so the
+		// response does not leak membership state.
+		chat, err := h.channelToTLForResolve(r.Ctx, ch, r.UserID)
+		if err != nil {
+			h.log.Error("resolve username: render", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+
+		return &tg.ContactsResolvedPeer{
+			Peer:  &tg.PeerChannel{ChannelID: ch.ID},
+			Chats: []tg.ChatClass{chat},
+		}, nil
+	default:
+		return nil, errInternal
+	}
+}
+
+// channelToTLForResolve renders a channel for contacts.resolveUsername.
+// All callers see the same public view — membership is never checked.
+// Returns title, photo, participant count, and kind flags. No membership
+// details are included.
+func (h *handlers) channelToTLForResolve(ctx context.Context, c store.Channel, viewerID int64) (tg.ChatClass, error) {
+	a := h.peers.Derive(viewerID, peerhash.KindChannel, c.ID)
+	count, err := h.store.CountChannelParticipants(ctx, c.ID)
+	if err != nil {
+		return nil, fmt.Errorf("count participants: %w", err)
+	}
+	return &tg.Channel{
+		ID:                c.ID,
+		Title:             c.Title,
+		AccessHash:        a,
+		Date:              int(c.Date.Unix()),
+		Megagroup:         c.Megagroup,
+		Broadcast:         !c.Megagroup,
+		Left:              true,
+		Photo:             &tg.ChatPhotoEmpty{},
+		ParticipantsCount: int(count),
 	}, nil
 }
 

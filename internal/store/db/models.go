@@ -236,3 +236,9 @@ type UsernameChange struct {
 	UserID    int64
 	ChangedAt pgtype.Timestamptz
 }
+
+type UsernameLookup struct {
+	CallerID   int64
+	Handle     string
+	LookedUpAt pgtype.Timestamptz
+}
