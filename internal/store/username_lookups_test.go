@@ -58,12 +58,12 @@ func TestUsernameLookupQuota(t *testing.T) {
 	}
 
 	// Seed 100 distinct handles with timestamps spread across the 24-hour
-	// window (one per second), so the burst cap does not trigger.
+	// window (one per minute), so the burst cap does not trigger.
 	ctx := context.Background()
 	now := time.Now()
 	for i := range store.UsernameLookupLimit {
 		handle := string(rune('a'+i%26)) + string(rune('a'+(i/26)%26)) + string(rune('0'+i/676))
-		ts := now.Add(-time.Duration(i) * time.Second)
+		ts := now.Add(-time.Duration(i) * time.Minute)
 		if _, err := store.StorePool(s).Exec(ctx,
 			`INSERT INTO username_lookups (caller_id, handle, looked_up_at) VALUES ($1, $2, $3)`,
 			user.ID, handle, ts,
@@ -96,12 +96,12 @@ func TestUsernameLookupRetrySame(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Seed 100 distinct handles spread across 24 hours.
+	// Seed 100 distinct handles spread across 24 hours (one per minute).
 	ctx := context.Background()
 	now := time.Now()
 	for i := range store.UsernameLookupLimit {
 		handle := string(rune('a'+i%26)) + string(rune('a'+(i/26)%26)) + string(rune('0'+i/676))
-		ts := now.Add(-time.Duration(i) * time.Second)
+		ts := now.Add(-time.Duration(i) * time.Minute)
 		if _, err := store.StorePool(s).Exec(ctx,
 			`INSERT INTO username_lookups (caller_id, handle, looked_up_at) VALUES ($1, $2, $3)`,
 			user.ID, handle, ts,

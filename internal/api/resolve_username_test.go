@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -383,8 +384,8 @@ func TestResolveUsernameBurstCap(t *testing.T) {
 	if err == nil {
 		t.Fatal("burst cap did not return error")
 	}
-	if !tgerr.Is(err, "FLOOD_WAIT") {
-		t.Errorf("got %v, want FLOOD_WAIT", err)
+	if !errors.Is(err, store.ErrUsernameLookupQuotaExceeded) {
+		t.Errorf("got %v, want ErrUsernameLookupQuotaExceeded", err)
 	}
 }
 
