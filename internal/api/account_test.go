@@ -409,8 +409,8 @@ func TestUpdateUsernameReservedCaseInsensitive(t *testing.T) {
 	}
 }
 
-// TestUpdateUsernameFloodWait proves a fourth change within 24 hours returns
-// FLOOD_WAIT.
+// TestUpdateUsernameFloodWait proves a third change within 24 hours returns
+// FLOOD_WAIT (limit is 2).
 func TestUpdateUsernameFloodWait(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -430,13 +430,8 @@ func TestUpdateUsernameFloodWait(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second change: %v", err)
 	}
-	// Third change: set again.
+	// Third change: should hit flood wait (limit is 2).
 	_, err = api.UpdateUsernameForTest(s, user.ID, "alice2")
-	if err != nil {
-		t.Fatalf("third change: %v", err)
-	}
-	// Fourth change: should hit flood wait.
-	_, err = api.UpdateUsernameForTest(s, user.ID, "alice3")
 	if err == nil {
 		t.Fatal("expected error for flood wait")
 	}
@@ -471,12 +466,12 @@ func TestUpdateUsernameConcurrentBoundary(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-ready
-		_, results[0].err = api.UpdateUsernameForTest(s, user1.ID, "race")
+		_, results[0].err = api.UpdateUsernameForTest(s, user1.ID, "racing")
 	}()
 	go func() {
 		defer wg.Done()
 		<-ready
-		_, results[1].err = api.UpdateUsernameForTest(s, user2.ID, "race")
+		_, results[1].err = api.UpdateUsernameForTest(s, user2.ID, "racing")
 	}()
 
 	close(ready)
@@ -523,13 +518,8 @@ func TestUpdateUsernameClearCountsAsChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clear: %v", err)
 	}
-	// Change 3: set again.
-	_, err = api.UpdateUsernameForTest(s, user.ID, "bob")
-	if err != nil {
-		t.Fatalf("set again: %v", err)
-	}
-	// Change 4: should hit flood wait.
-	_, err = api.UpdateUsernameForTest(s, user.ID, "charlie")
+	// Third change should hit flood wait (limit is 2).
+	_, err = api.UpdateUsernameForTest(s, user.ID, "bob1234")
 	if err == nil {
 		t.Fatal("expected flood wait")
 	}
@@ -593,7 +583,7 @@ func TestUpdateUsernameTooLong(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = api.UpdateUsernameForTest(s, user.ID, "abcdefghijklmnopqrstuvwxyz123456")
+	_, err = api.UpdateUsernameForTest(s, user.ID, "abcdefghijklmnopqrstuvwxyz1234567")
 	if err == nil {
 		t.Fatal("expected error for too-long username")
 	}
@@ -608,25 +598,23 @@ func TestUpdateUsernameExactLength(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openStore(t)
-	user, err := s.CreateUser(ctx, "+15550001022")
+	user1, err := s.CreateUser(ctx, "+15550001022")
+	if err != nil {
+		t.Fatal(err)
+	}
+	user2, err := s.CreateUser(ctx, "+15550001023")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// 5 chars (minimum)
-	_, err = api.UpdateUsernameForTest(s, user.ID, "abcde")
+	_, err = api.UpdateUsernameForTest(s, user1.ID, "abcde")
 	if err != nil {
 		t.Fatalf("5-char username: %v", err)
 	}
 
-	// Clear to free the token
-	_, err = api.UpdateUsernameForTest(s, user.ID, "")
-	if err != nil {
-		t.Fatalf("clear: %v", err)
-	}
-
-	// 32 chars (maximum)
-	_, err = api.UpdateUsernameForTest(s, user.ID, "abcdefghijklmnopqrstuvwxyz123456")
+	// 32 chars (maximum) — use a second user to avoid rate limit
+	_, err = api.UpdateUsernameForTest(s, user2.ID, "abcdefghijklmnopqrstuvwxyz123456")
 	if err != nil {
 		t.Fatalf("32-char username: %v", err)
 	}

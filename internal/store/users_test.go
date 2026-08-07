@@ -321,11 +321,8 @@ func TestUpdateUsernameFloodWait(t *testing.T) {
 	if err := s.UpdateUsername(ctx, u.ID, ""); err != nil {
 		t.Fatalf("change 2: %v", err)
 	}
-	if err := s.UpdateUsername(ctx, u.ID, "test5678"); err != nil {
-		t.Fatalf("change 3: %v", err)
-	}
 
-	err := s.UpdateUsername(ctx, u.ID, "test9012")
+	err := s.UpdateUsername(ctx, u.ID, "test5678")
 	if !errors.Is(err, store.ErrUsernameFloodWait) {
 		t.Fatalf("expected ErrUsernameFloodWait, got %v", err)
 	}

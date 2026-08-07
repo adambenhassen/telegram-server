@@ -167,9 +167,10 @@ func (s *Store) DialogPartners(ctx context.Context, userID int64) ([]int64, erro
 //
 // The rate limit is enforced with the same rolling-window pattern as
 // CheckAndChargeLookup: an advisory lock serialises concurrent changes for the
-// same user, expired rows are pruned, a change is recorded, and the count is
-// verified against UsernameChangeLimit. A clear (empty string) counts as a
-// change.
+// same user, expired rows are pruned, the count is checked, and a change is
+// recorded only after a successful claim or release. A clear (empty string)
+// counts as a change. Failed claims (USERNAME_OCCUPIED) do not consume a
+// rate-limit token.
 //
 // Returns ErrUsernameOccupied when the handle is already taken by another
 // account. Returns ErrUsernameFloodWait when the rate limit is exceeded.
@@ -188,7 +189,7 @@ func (s *Store) UpdateUsername(ctx context.Context, userID int64, username strin
 
 	qtx := s.q.WithTx(tx)
 
-	// Enforce rate limit: prune expired, record change, count.
+	// Prune expired rows before counting.
 	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-UsernameChangeWindow), Valid: true}
 	if err := qtx.DeleteExpiredUsernameChanges(ctx, db.DeleteExpiredUsernameChangesParams{
 		UserID:    userID,
@@ -196,30 +197,18 @@ func (s *Store) UpdateUsername(ctx context.Context, userID int64, username strin
 	}); err != nil {
 		return fmt.Errorf("prune username changes: %w", err)
 	}
-	if err := qtx.InsertUsernameChange(ctx, userID); err != nil {
-		return fmt.Errorf("record username change: %w", err)
-	}
-	count, err := qtx.CountUsernameChanges(ctx, db.CountUsernameChangesParams{
-		UserID:    userID,
-		ChangedAt: cutoff,
-	})
-	if err != nil {
-		return fmt.Errorf("count username changes: %w", err)
-	}
-	if count > UsernameChangeLimit {
-		return ErrUsernameFloodWait
-	}
 
-	// Clear or claim the username.
+	// Clear or claim the username first — only record the rate-limit token on
+	// success, so a failed claim (USERNAME_OCCUPIED) does not consume quota.
 	if username == "" {
-		// Clear: release any existing handle for this user.
-		if _, err := qtx.ReleaseUsername(ctx, db.ReleaseUsernameParams{
-			OwnerType: "user",
-			OwnerID:   userID,
-		}); err != nil {
+		// Clear: release any existing handle for this user. The WHERE clause
+		// on owner_type + owner_id is sufficient — the handle column is a
+		// PK so at most one row matches.
+		_, err := s.pool.Exec(ctx, `DELETE FROM usernames WHERE owner_type = $1 AND owner_id = $2`, "user", userID)
+		if err != nil {
 			return fmt.Errorf("release username: %w", err)
 		}
-		// Also clear the denormalized column (handle may be empty if user had none).
+		// Also clear the denormalized column.
 		var nullStr *string
 		if _, err := qtx.SetUsername(ctx, db.SetUsernameParams{ID: userID, Username: nullStr}); err != nil {
 			return fmt.Errorf("clear username: %w", err)
@@ -243,6 +232,21 @@ func (s *Store) UpdateUsername(ctx context.Context, userID int64, username strin
 		if _, err := qtx.SetUsername(ctx, db.SetUsernameParams{ID: userID, Username: &normalized}); err != nil {
 			return fmt.Errorf("set username: %w", err)
 		}
+	}
+
+	// Record the successful change and verify the rate limit.
+	if err := qtx.InsertUsernameChange(ctx, userID); err != nil {
+		return fmt.Errorf("record username change: %w", err)
+	}
+	count, err := qtx.CountUsernameChanges(ctx, db.CountUsernameChangesParams{
+		UserID:    userID,
+		ChangedAt: cutoff,
+	})
+	if err != nil {
+		return fmt.Errorf("count username changes: %w", err)
+	}
+	if count > UsernameChangeLimit {
+		return ErrUsernameFloodWait
 	}
 
 	if err := tx.Commit(ctx); err != nil {
