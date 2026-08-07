@@ -926,11 +926,14 @@ func (s *Store) JoinChannelByUsername(ctx context.Context, channelID, userID int
 	})
 	switch {
 	case err == nil:
-		// Already a member (or banned with a row). Nothing is written.
+		m := channelMemberFromRow(member)
+		if m.Banned(time.Now()) {
+			return Channel{}, ChannelMember{}, ErrNotMember
+		}
 		if err = tx.Commit(ctx); err != nil {
 			return Channel{}, ChannelMember{}, fmt.Errorf("commit: %w", err)
 		}
-		return channelFromRow(channel), channelMemberFromRow(member), nil
+		return channelFromRow(channel), m, nil
 	case !errors.Is(err, pgx.ErrNoRows):
 		return Channel{}, ChannelMember{}, fmt.Errorf("channel participant: %w", err)
 	}

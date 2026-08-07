@@ -2885,13 +2885,16 @@ func TestJoinChannelAtPerChannelCap(t *testing.T) {
 	}
 
 	// Fill the channel to the default cap (10000) minus 1 with raw SQL.
-	// Creator already has one slot, so we fill 9998 more, then joiner fills the last.
+	// Creator already has one slot, so we create 9998 fake users and fill
+	// their seats, then joiner fills the last one.
 	channelExec(t, ctx, dsn, `
+		WITH filler_users AS (
+			INSERT INTO users (phone)
+			SELECT 'filler' || g FROM generate_series(1, 9998) g
+			RETURNING id
+		)
 		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
-		SELECT $1, u.id, 0, 0
-		FROM users u
-		WHERE u.id != $2 AND u.id != $3
-		LIMIT 9998`, ch.ID, ch.CreatorID, joiner.ID)
+		SELECT $1, id, 0, 0 FROM filler_users`, ch.ID)
 
 	// joiner should now take the last available seat (total 10000 = 1 creator + 9998 filled + 1 joiner).
 	if _, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
@@ -2929,12 +2932,13 @@ func TestJoinChannelAtPerUserCap(t *testing.T) {
 		t.Fatalf("claim username: %v", err)
 	}
 
-	// Fill joiner's per-user cap (500) by joining 499 other channels through raw SQL.
+	// Fill joiner's per-user cap (500) by joining 500 other channels through raw SQL,
+	// so that the next join attempt is the 501st and fails.
 	channelExec(t, ctx, dsn, `
 		WITH filler_channels AS (
 			INSERT INTO channels (title, creator_id, megagroup)
 			SELECT 'filler ' || g, $1, false
-			FROM generate_series(1, 499) g
+			FROM generate_series(1, 500) g
 			RETURNING id
 		),
 		filler_state AS (
@@ -2948,7 +2952,7 @@ func TestJoinChannelAtPerUserCap(t *testing.T) {
 		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
 		SELECT fc.id, $2, 0, 0 FROM filler_channels fc`, creator.ID, joiner.ID)
 
-	// Join the target channel — should be refused (500 = 499 filler + 1 target).
+	// Join the target channel — should be refused (joiner is already in 500 channels).
 	_, err := api.JoinChannelForTest(s, joiner.ID, &tg.ChannelsJoinChannelRequest{
 		Channel: api.InputChannel(joiner.ID, ch.ID),
 	})
