@@ -253,11 +253,11 @@ func TestHandleEditChannelUsernameRejectsInvalidUsername(t *testing.T) {
 	}
 
 	for name, username := range map[string]string{
-		"too short":       "abc",
-		"digit first":     "1abcde",
+		"too short":        "abc",
+		"digit first":      "1abcde",
 		"underscore first": "_abcde",
-		"bad chars":       "ab@de",
-		"spaces":          "ab de",
+		"bad chars":        "ab@de",
+		"spaces":           "ab de",
 	} {
 		_, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 			Channel:  api.InputChannel(creator.ID, ch.ID),
