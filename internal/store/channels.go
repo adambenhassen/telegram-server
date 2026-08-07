@@ -827,3 +827,12 @@ func (s *Store) SetChannelPinnedMessage(ctx context.Context, channelID, callerID
 	}
 	return channelFromRow(row), members, nil
 }
+
+// CountChannelParticipants returns the number of participant rows for channelID.
+func (s *Store) CountChannelParticipants(ctx context.Context, channelID int64) (int64, error) {
+	count, err := s.q.CountChannelParticipants(ctx, channelID)
+	if err != nil {
+		return 0, fmt.Errorf("count channel participants: %w", err)
+	}
+	return count, nil
+}

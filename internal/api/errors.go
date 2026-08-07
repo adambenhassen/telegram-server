@@ -139,4 +139,11 @@ var (
 	// errUsernameFloodWait rejects a username change that would exceed the
 	// per-account rate limit.
 	errUsernameFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
+	// errUsernameNotOccupied is the response for a username lookup that finds
+	// no account — indistinguishable from a private channel or a handle that
+	// was cleared, by the non-oracle invariant.
+	errUsernameNotOccupied = rpcErr(400, "USERNAME_NOT_OCCUPIED")
+	// errUsernameLookupFloodWait rejects a contacts.resolveUsername that would
+	// take the caller past their per-account username lookup quota.
+	errUsernameLookupFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
 )
