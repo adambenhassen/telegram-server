@@ -25,19 +25,6 @@ func execDB(t *testing.T, dsn, sql string, args ...any) {
 	}
 }
 
-func queryDB(t *testing.T, dsn string, dest any, sql string, args ...any) {
-	t.Helper()
-	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer conn.Close(ctx) //nolint:errcheck
-	if err := conn.QueryRow(ctx, sql, args...).Scan(dest); err != nil {
-		t.Fatalf("query: %v", err)
-	}
-}
-
 // TestHandleEditChannelUsernameSetsUsername covers AC 1: a channel admin
 // (creator, role 2) sets a valid, available username.
 func TestHandleEditChannelUsernameSetsUsername(t *testing.T) {
@@ -300,7 +287,7 @@ func TestHandleEditChannelUsernameRejectsReserved(t *testing.T) {
 func TestHandleEditChannelUsernameClearsUsername(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s, dsn := openStoreDSN(t)
+	s := openStore(t)
 	creator, err := s.CreateUser(ctx, "+15551295081")
 	if err != nil {
 		t.Fatalf("creator: %v", err)
@@ -340,11 +327,10 @@ func TestHandleEditChannelUsernameClearsUsername(t *testing.T) {
 		t.Errorf("stored username = %v, want nil", stored.Username)
 	}
 
-	// Verify the usernames row is gone.
-	var exists bool
-	queryDB(t, dsn, &exists, `SELECT EXISTS(SELECT 1 FROM usernames WHERE handle = $1)`, "newsroom")
-	if exists {
-		t.Fatal("username still in usernames table after clear")
+	// Verify the username resolves to USERNAME_NOT_OCCUPIED after clear.
+	_, err = api.ResolveUsernameForTest(s, creator.ID, &tg.ContactsResolveUsernameRequest{Username: "newsroom"})
+	if msg := rpcMessage(t, err); msg != "USERNAME_NOT_OCCUPIED" {
+		t.Fatalf("resolve after clear: got %s, want USERNAME_NOT_OCCUPIED", msg)
 	}
 }
 
@@ -506,7 +492,7 @@ func TestHandleEditChannelUsernameBannedAdminRejected(t *testing.T) {
 func TestHandleEditChannelUsernameSwitchUsername(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s, dsn := openStoreDSN(t)
+	s := openStore(t)
 	creator, err := s.CreateUser(ctx, "+15551295131")
 	if err != nil {
 		t.Fatalf("creator: %v", err)
@@ -543,11 +529,10 @@ func TestHandleEditChannelUsernameSwitchUsername(t *testing.T) {
 		t.Errorf("stored username = %v, want newname", stored.Username)
 	}
 
-	// Old username should be free now.
-	var exists bool
-	queryDB(t, dsn, &exists, `SELECT EXISTS(SELECT 1 FROM usernames WHERE handle = $1)`, "oldname")
-	if exists {
-		t.Fatal("old username still in usernames table")
+	// Old username should resolve to USERNAME_NOT_OCCUPIED now.
+	_, err = api.ResolveUsernameForTest(s, creator.ID, &tg.ContactsResolveUsernameRequest{Username: "oldname"})
+	if msg := rpcMessage(t, err); msg != "USERNAME_NOT_OCCUPIED" {
+		t.Fatalf("resolve oldname: got %s, want USERNAME_NOT_OCCUPIED", msg)
 	}
 }
 
@@ -724,7 +709,7 @@ func TestHandleEditChannelUsernameClearFreesHandle(t *testing.T) {
 func TestHandleEditChannelUsernameConcreteExample(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s, dsn := openStoreDSN(t)
+	s := openStore(t)
 	creator, err := s.CreateUser(ctx, "+15551295171")
 	if err != nil {
 		t.Fatalf("creator: %v", err)
@@ -745,10 +730,20 @@ func TestHandleEditChannelUsernameConcreteExample(t *testing.T) {
 	assertEncodes(t, res)
 
 	// contacts.resolveUsername("newsroom") returns C's peer.
-	var resolvedID int64
-	queryDB(t, dsn, &resolvedID, `SELECT c.id FROM channels c JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id WHERE un.handle = $1`, "newsroom")
-	if resolvedID != ch.ID {
-		t.Errorf("resolved channel id = %d, want %d", resolvedID, ch.ID)
+	res, err = api.ResolveUsernameForTest(s, creator.ID, &tg.ContactsResolveUsernameRequest{Username: "newsroom"})
+	if err != nil {
+		t.Fatalf("resolve newsroom: %v", err)
+	}
+	resolved, ok := res.(*tg.ContactsResolvedPeer)
+	if !ok {
+		t.Fatalf("resolve newsroom: got %T, want *tg.ContactsResolvedPeer", res)
+	}
+	peerCh, ok := resolved.Peer.(*tg.PeerChannel)
+	if !ok {
+		t.Fatalf("resolve newsroom: peer = %T, want *tg.PeerChannel", resolved.Peer)
+	}
+	if peerCh.ChannelID != ch.ID {
+		t.Errorf("resolved channel id = %d, want %d", peerCh.ChannelID, ch.ID)
 	}
 
 	// Creator calls editChannelUsername(C, "") -> success.
@@ -762,10 +757,9 @@ func TestHandleEditChannelUsernameConcreteExample(t *testing.T) {
 	assertEncodes(t, res)
 
 	// contacts.resolveUsername("newsroom") returns USERNAME_NOT_OCCUPIED.
-	var exists bool
-	queryDB(t, dsn, &exists, `SELECT EXISTS(SELECT 1 FROM usernames WHERE handle = $1)`, "newsroom")
-	if exists {
-		t.Fatal("newsroom still resolves after clear")
+	_, err = api.ResolveUsernameForTest(s, creator.ID, &tg.ContactsResolveUsernameRequest{Username: "newsroom"})
+	if msg := rpcMessage(t, err); msg != "USERNAME_NOT_OCCUPIED" {
+		t.Fatalf("resolve after clear: got %s, want USERNAME_NOT_OCCUPIED", msg)
 	}
 }
 
