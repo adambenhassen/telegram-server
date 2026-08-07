@@ -848,6 +848,7 @@ func (s *Store) CountChannelParticipants(ctx context.Context, channelID int64) (
 	}
 	return count, nil
 }
+
 // ChannelUsernameChangeLimit is the maximum number of username changes a single
 // channel may make within ChannelUsernameChangeWindow.
 const ChannelUsernameChangeLimit = 2
