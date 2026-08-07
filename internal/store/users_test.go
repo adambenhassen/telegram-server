@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -235,5 +237,143 @@ func TestDialogPartnersIgnoresDeletedDialog(t *testing.T) {
 	}
 	if len(partners) != 1 || partners[0] != b.ID {
 		t.Fatalf("partners before delete = %+v, want [%d]", partners, b.ID)
+	}
+}
+
+// --- UpdateUsername store tests ---
+
+func TestUpdateUsernameClaimAndClear(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15551260081")
+
+	// Claim a username.
+	if err := s.UpdateUsername(ctx, u.ID, "alice123"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	usr, ok, err := s.UserByID(ctx, u.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok=%v err=%v", ok, err)
+	}
+	if usr.Username == nil || *usr.Username != "alice123" {
+		t.Fatalf("username = %v, want alice123", usr.Username)
+	}
+
+	// Clear the username.
+	if err := s.UpdateUsername(ctx, u.ID, ""); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+
+	usr, ok, err = s.UserByID(ctx, u.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok=%v err=%v", ok, err)
+	}
+	if usr.Username != nil {
+		t.Fatalf("username = %v, want nil", usr.Username)
+	}
+}
+
+func TestUpdateUsernameOccupied(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u1 := mustUser(t, s, "+15551260091")
+	u2 := mustUser(t, s, "+15551260092")
+
+	if err := s.UpdateUsername(ctx, u1.ID, "bob1234"); err != nil {
+		t.Fatalf("u1 claim: %v", err)
+	}
+
+	err := s.UpdateUsername(ctx, u2.ID, "bob1234")
+	if !errors.Is(err, store.ErrUsernameOccupied) {
+		t.Fatalf("expected ErrUsernameOccupied, got %v", err)
+	}
+}
+
+func TestUpdateUsernameCaseInsensitive(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u1 := mustUser(t, s, "+15551260101")
+	u2 := mustUser(t, s, "+15551260102")
+
+	if err := s.UpdateUsername(ctx, u1.ID, "alice123"); err != nil {
+		t.Fatalf("u1 claim: %v", err)
+	}
+
+	err := s.UpdateUsername(ctx, u2.ID, "ALICE123")
+	if !errors.Is(err, store.ErrUsernameOccupied) {
+		t.Fatalf("expected ErrUsernameOccupied for case-insensitive clash, got %v", err)
+	}
+}
+
+func TestUpdateUsernameFloodWait(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15551260111")
+
+	if err := s.UpdateUsername(ctx, u.ID, "test1234"); err != nil {
+		t.Fatalf("change 1: %v", err)
+	}
+	if err := s.UpdateUsername(ctx, u.ID, ""); err != nil {
+		t.Fatalf("change 2: %v", err)
+	}
+	if err := s.UpdateUsername(ctx, u.ID, "test5678"); err != nil {
+		t.Fatalf("change 3: %v", err)
+	}
+
+	err := s.UpdateUsername(ctx, u.ID, "test9012")
+	if !errors.Is(err, store.ErrUsernameFloodWait) {
+		t.Fatalf("expected ErrUsernameFloodWait, got %v", err)
+	}
+}
+
+func TestUpdateUsernameConcurrent(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u1 := mustUser(t, s, "+15551260121")
+	u2 := mustUser(t, s, "+15551260122")
+
+	type result struct{ err error }
+	results := make([]result, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	ready := make(chan struct{})
+
+	go func() {
+		defer wg.Done()
+		<-ready
+		results[0].err = s.UpdateUsername(ctx, u1.ID, "race123")
+	}()
+	go func() {
+		defer wg.Done()
+		<-ready
+		results[1].err = s.UpdateUsername(ctx, u2.ID, "race123")
+	}()
+
+	close(ready)
+	wg.Wait()
+
+	var success, occupied int
+	for _, r := range results {
+		switch {
+		case r.err == nil:
+			success++
+		case errors.Is(r.err, store.ErrUsernameOccupied):
+			occupied++
+		default:
+			t.Errorf("unexpected error: %v", r.err)
+		}
+	}
+
+	if success != 1 {
+		t.Errorf("successes = %d, want 1", success)
+	}
+	if occupied != 1 {
+		t.Errorf("occupied = %d, want 1", occupied)
 	}
 }

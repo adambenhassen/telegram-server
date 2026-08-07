@@ -119,6 +119,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	registerRevoke(d, tg.AccountResetAuthorizationRequestTypeID, h.handleResetAuthorization)
 	register(d, tg.AccountGetPasswordRequestTypeID, h.handleGetPassword)
 	register(d, tg.AccountUpdateStatusRequestTypeID, h.handleUpdateStatus)
+	register(d, tg.AccountUpdateUsernameRequestTypeID, h.handleUpdateUsername)
 	register(d, tg.AuthCheckPasswordRequestTypeID, h.handleCheckPassword)
 	register(d, tg.AccountUpdatePasswordSettingsRequestTypeID, h.handleUpdatePasswordSettings)
 	register(d, tg.AccountGetPasswordSettingsRequestTypeID, h.handleGetPasswordSettings)
