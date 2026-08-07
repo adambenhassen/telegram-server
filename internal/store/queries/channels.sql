@@ -141,3 +141,6 @@ LEFT JOIN LATERAL (
 ) top ON true
 WHERE p.user_id = $1
 ORDER BY c.id;
+
+-- name: SetChannelUsername :execrows
+UPDATE channels SET username = $2 WHERE id = $1;
