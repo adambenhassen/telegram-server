@@ -857,6 +857,129 @@ const ChannelUsernameChangeLimit = 2
 // change rate limit.
 const ChannelUsernameChangeWindow = 24 * time.Hour
 
+// JoinChannelByUsername admits userID to a public channel. The channel is
+// selected by channelID (which the caller resolved via contacts.resolveUsername
+// and then constructed an InputChannel for). The access_hash check happens at
+// the API layer (inputChannelID) — this method receives a channelID that has
+// already passed that gate.
+//
+// Locking: the channel_state row is taken first (ChannelStateForUpdate), held
+// to commit. Under the same transaction the channel row is re-read to verify
+// publicness (username IS NOT NULL). The state lock serialises concurrent joins
+// and anchors the pts snapshot. The channel row lock (LockChannel) is NOT taken
+// here — the re-read of the channels row uses a plain ChannelByID under the
+// state row lock. Since the state row lock serialises all admission paths to
+// this channel, and the channels row is only written by EditChannelUsername
+// (which takes an advisory lock first, then LockChannel), there is no deadlock
+// risk: the advisory lock in EditChannelUsername is keyed on channelID and is
+// taken before LockChannel, while this path never reaches LockChannel.
+//
+// The admission decision is the re-read of channels.username inside this
+// transaction. An out-of-transaction check races a concurrent
+// EditChannelUsername("") (clear): a caller that wins the race lands a
+// participant row in a now-private channel — permanent unauthorized access.
+//
+// Re-joining is idempotent: an existing row is returned untouched, so join_pts
+// never drops and a ban is never cleared by rejoining. A banned caller receives
+// the same error as a stranger (ErrNotMember), because the participant row
+// already exists — the ON CONFLICT DO NOTHING path returns 0 rows, and the
+// re-read returns the banned row.
+//
+// Every rejection — private channel, unknown channel id, banned caller —
+// collapses to ErrNotMember. channels.id is dense BIGSERIAL; a distinguishable
+// rejection lets an attacker walk the full channel list.
+func (s *Store) JoinChannelByUsername(ctx context.Context, channelID, userID int64) (Channel, ChannelMember, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Channel{}, ChannelMember{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	// Lock the channel_state row — serialises admission and anchors pts.
+	state, err := qtx.ChannelStateForUpdate(ctx, channelID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Channel{}, ChannelMember{}, ErrNotMember
+	case err != nil:
+		return Channel{}, ChannelMember{}, fmt.Errorf("lock channel state: %w", err)
+	}
+
+	// Re-read the channel row under the state lock to verify publicness.
+	// This is the authorization decision: username IS NOT NULL means the
+	// channel is currently public and admits by username.
+	channel, err := qtx.ChannelByID(ctx, channelID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Channel{}, ChannelMember{}, ErrNotMember
+	case err != nil:
+		return Channel{}, ChannelMember{}, fmt.Errorf("channel by id: %w", err)
+	}
+	if channel.Username == nil || *channel.Username == "" {
+		// Channel is private (no username) — same error as everything else.
+		return Channel{}, ChannelMember{}, ErrNotMember
+	}
+
+	// Check if the caller already has a participant row.
+	member, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID, UserID: userID,
+	})
+	switch {
+	case err == nil:
+		m := channelMemberFromRow(member)
+		if m.Banned(time.Now()) {
+			return Channel{}, ChannelMember{}, ErrNotMember
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return Channel{}, ChannelMember{}, fmt.Errorf("commit: %w", err)
+		}
+		return channelFromRow(channel), m, nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return Channel{}, ChannelMember{}, fmt.Errorf("channel participant: %w", err)
+	}
+
+	// Both counts under the channel_state row lock — same as the invite path.
+	seats, err := qtx.CountChannelParticipants(ctx, channelID)
+	if err != nil {
+		return Channel{}, ChannelMember{}, fmt.Errorf("count participants: %w", err)
+	}
+	if seats >= int64(s.maxChannelParticipants) {
+		return Channel{}, ChannelMember{}, ErrChannelFull
+	}
+	joined, err := qtx.CountChannelsForUser(ctx, userID)
+	if err != nil {
+		return Channel{}, ChannelMember{}, fmt.Errorf("count channels for user: %w", err)
+	}
+	if joined >= int64(s.maxChannelsPerUser) {
+		return Channel{}, ChannelMember{}, ErrTooManyChannels
+	}
+
+	n, err := qtx.InsertChannelParticipantIfAbsent(ctx, db.InsertChannelParticipantIfAbsentParams{
+		ChannelID: channelID, UserID: userID, Role: 0, JoinPts: state.Pts,
+	})
+	if err != nil {
+		return Channel{}, ChannelMember{}, fmt.Errorf("insert participant: %w", err)
+	}
+	if n == 0 {
+		// Race: another admission path committed between our membership check
+		// and the insert. Re-read the row that exists.
+		if member, err = qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+			ChannelID: channelID, UserID: userID,
+		}); err != nil {
+			return Channel{}, ChannelMember{}, fmt.Errorf("channel participant: %w", err)
+		}
+	} else {
+		member = db.ChannelParticipant{
+			ChannelID: channelID, UserID: userID, Role: 0, JoinPts: state.Pts,
+		}
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return Channel{}, ChannelMember{}, fmt.Errorf("commit: %w", err)
+	}
+	return channelFromRow(channel), channelMemberFromRow(member), nil
+}
+
 // EditChannelUsername atomically sets or clears the username of a channel.
 // When username is non-empty the handle is claimed: a row is inserted into the
 // usernames table and the channels.username column is updated. When username is

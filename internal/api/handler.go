@@ -148,6 +148,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesSendMediaRequestTypeID, h.handleSendMedia)
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
 	register(d, tg.ChannelsGetChannelsRequestTypeID, h.handleGetChannels)
+	register(d, tg.ChannelsJoinChannelRequestTypeID, h.handleJoinChannel)
 	register(d, tg.ChannelsLeaveChannelRequestTypeID, h.handleLeaveChannel)
 	register(d, tg.ChannelsEditAdminRequestTypeID, h.handleEditAdmin)
 	register(d, tg.ChannelsEditBannedRequestTypeID, h.handleEditBanned)
