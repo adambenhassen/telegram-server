@@ -936,3 +936,69 @@ func (h *handlers) handleImportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 		},
 	}, nil
 }
+
+// handleEditChannelUsername serves channels.updateUsername. An authenticated
+// channel admin sets or clears the channel's public username. An empty string
+// clears the current username. A non-empty string must pass validation
+// (length, character set, first char, blocklist) before the store is consulted.
+//
+// Non-members get errPeerIDInvalid (same as every other channel read/write).
+// Members who are not admins get errChatAdminRequired. The store re-checks both
+// inside its own transaction under the channels row lock, so the handler-level
+// check is an optimisation — it keeps a clearly-unauthorized caller from taking
+// a row lock and holding it while waiting.
+//
+// Validation errors (bad format, reserved handle) are errUsernameInvalid.
+// Username already taken is errUsernameOccupied.
+// Rate limit exceeded is errUsernameFloodWait.
+func (h *handlers) handleEditChannelUsername(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsUpdateUsernameRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+
+	username := req.Username
+	// Non-empty usernames must pass validation before any DB access.
+	if username != "" {
+		if !usernameRe.MatchString(username) {
+			return nil, errUsernameInvalid
+		}
+		normalized := strings.ToLower(username)
+		if reservedUsernames[normalized] {
+			return nil, errUsernameInvalid
+		}
+	}
+
+	// Check membership and admin rights before the store transaction.
+	member, err := h.requireChannelMember(r.Ctx, channelID, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if member.Role < 1 {
+		return nil, errChatAdminRequired
+	}
+
+	if err := h.store.EditChannelUsername(r.Ctx, channelID, r.UserID, username); err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotMember):
+			// Store re-check failed (demotion/ban between handler check and
+			// transaction). Same wire error as the handler-level check.
+			return nil, errPeerIDInvalid
+		case errors.Is(err, store.ErrUsernameOccupied):
+			return nil, errUsernameOccupied
+		case errors.Is(err, store.ErrUsernameFloodWait):
+			return nil, errUsernameFloodWait
+		default:
+			h.log.Error("edit channel username", "channel_id", channelID, "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+	}
+	return &tg.BoolTrue{}, nil
+}
