@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,9 @@ import (
 // assertUsernameRPCError calls fn on cmds and asserts the result is a tgerr
 // with the given message. It does not call t.Fatal on the fn error so the
 // expected rejection can be inspected.
+//
+// For FLOOD_WAIT errors, the message carries a retry-delay suffix
+// (e.g. "FLOOD_WAIT_86400"), so the match is a prefix check.
 func assertUsernameRPCError(t *testing.T, cmds chan command, want string, fn func(ctx context.Context, c *tg.Client) error) {
 	t.Helper()
 	done := make(chan error, 1)
@@ -34,6 +38,12 @@ func assertUsernameRPCError(t *testing.T, cmds chan command, want string, fn fun
 	var tgErr *tgerr.Error
 	if !errors.As(err, &tgErr) {
 		t.Fatalf("error type = %T, want *tgerr.Error (%s)", err, want)
+	}
+	if strings.HasPrefix(want, "FLOOD_WAIT") {
+		if !strings.HasPrefix(tgErr.Message, want) {
+			t.Fatalf("error = %s, want prefix %s", tgErr.Message, want)
+		}
+		return
 	}
 	if tgErr.Message != want {
 		t.Fatalf("error = %s, want %s", tgErr.Message, want)

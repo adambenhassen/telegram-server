@@ -983,11 +983,17 @@ func (h *handlers) handleJoinChannel(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	// A re-join by a banned member returns that member's untouched row, and
 	// it must not hand back metadata the ban revoked.
-	return &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: ch.ID}},
-		Users:   users,
-		Chats:   []tg.ChatClass{h.channelToTL(ch, member, !member.Banned(time.Now()), r.UserID)},
-		Date:    int(time.Now().Unix()),
+	//
+	// Wrap in MessagesChatInviteJoinResultOk so the gotd client can decode the
+	// response: ChannelsJoinChannel expects MessagesChatInviteJoinResultClass,
+	// not bare Updates.
+	return &tg.MessagesChatInviteJoinResultOk{
+		Updates: &tg.Updates{
+			Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: ch.ID}},
+			Users:   users,
+			Chats:   []tg.ChatClass{h.channelToTL(ch, member, !member.Banned(time.Now()), r.UserID)},
+			Date:    int(time.Now().Unix()),
+		},
 	}, nil
 }
 
