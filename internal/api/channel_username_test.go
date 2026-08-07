@@ -377,8 +377,8 @@ func TestHandleEditChannelUsernameClearIdempotent(t *testing.T) {
 	}
 }
 
-// TestHandleEditChannelUsernameRateLimit covers AC 12: a fourth change attempt
-// within 24 hours returns FLOOD_WAIT.
+// TestHandleEditChannelUsernameRateLimit covers AC 12: the 3rd change attempt
+// within 24 hours returns FLOOD_WAIT (limit is 2).
 func TestHandleEditChannelUsernameRateLimit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -408,18 +408,10 @@ func TestHandleEditChannelUsernameRateLimit(t *testing.T) {
 		t.Fatalf("second change: %v", err)
 	}
 
-	// Third change: clear username.
-	if _, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
-		Channel:  api.InputChannel(creator.ID, ch.ID),
-		Username: "",
-	}); err != nil {
-		t.Fatalf("third change: %v", err)
-	}
-
-	// Fourth change: should be rejected with FLOOD_WAIT.
+	// Third change: should be rejected with FLOOD_WAIT (limit is 2).
 	_, err = api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 		Channel:  api.InputChannel(creator.ID, ch.ID),
-		Username: "chan3",
+		Username: "",
 	})
 	if msg := rpcMessage(t, err); msg != "FLOOD_WAIT_86400" {
 		t.Fatalf("got %s, want FLOOD_WAIT_86400", msg)
@@ -773,13 +765,13 @@ func TestHandleEditChannelUsernameRateLimitPerChannel(t *testing.T) {
 	// Exhaust ch1's quota with 2 changes.
 	if _, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 		Channel:  api.InputChannel(creator.ID, ch1.ID),
-		Username: "ch1a",
+		Username: "ch1aa",
 	}); err != nil {
 		t.Fatalf("ch1 first: %v", err)
 	}
 	if _, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 		Channel:  api.InputChannel(creator.ID, ch1.ID),
-		Username: "ch1b",
+		Username: "ch1bb",
 	}); err != nil {
 		t.Fatalf("ch1 second: %v", err)
 	}
@@ -787,7 +779,7 @@ func TestHandleEditChannelUsernameRateLimitPerChannel(t *testing.T) {
 	// ch2 should still have its own quota — not affected by ch1's changes.
 	res, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 		Channel:  api.InputChannel(creator.ID, ch2.ID),
-		Username: "ch2a",
+		Username: "ch2aa",
 	})
 	if err != nil {
 		t.Fatalf("ch2 first (should be independent): %v", err)
@@ -813,7 +805,7 @@ func TestHandleEditChannelUsernameClearConsumesQuota(t *testing.T) {
 	// Set username (change 1).
 	if _, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 		Channel:  api.InputChannel(creator.ID, ch.ID),
-		Username: "temp",
+		Username: "tempx",
 	}); err != nil {
 		t.Fatalf("set: %v", err)
 	}
