@@ -964,6 +964,210 @@ func TestConcurrentJoinAndRevokeRevokeWins(t *testing.T) {
 	}
 }
 
+// TestSetChannelPinnedMessageRejectsDemotedAdmin proves the TOCTOU fix: an admin
+// who passes the handler-level role check but is demoted to role 0 before the
+// store's write transaction commits is still refused.
+func TestSetChannelPinnedMessageRejectsDemotedAdmin(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551297001")
+	admin := mustUser(t, s, "+15551297002")
+	ch, hash, err := store.SeedChannelWithMember(ctx, s, creator.ID, admin.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, hash, admin.ID); err != nil {
+		t.Fatalf("re-join admin: %v", err)
+	}
+
+	// Promote admin to role 1.
+	if err := s.SetChannelRole(ctx, ch.ID, creator.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+
+	// Post a message so there is something to pin.
+	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "pin me", 1, nil)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	msgID := int32(post.LocalID) //nolint:gosec // G115: local_id fits int32
+
+	// Hold the channel row lock so SetChannelPinnedMessage blocks after the
+	// early filter but before the re-read.
+	release, err := store.HoldChannelRowLock(ctx, s, ch.ID)
+	if err != nil {
+		t.Fatalf("hold lock: %v", err)
+	}
+
+	// Start the pin call — it will block on the channel row lock.
+	pinDone := make(chan struct{})
+	var pinErr error
+	go func() {
+		_, _, pinErr = s.SetChannelPinnedMessage(ctx, ch.ID, admin.ID, &msgID)
+		close(pinDone)
+	}()
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		t.Fatalf("wait for pin to block: %v", err)
+	}
+
+	// Demote the admin to role 0 while the pin is blocked.
+	if err := store.SetChannelRole(ctx, s, ch.ID, admin.ID, 0); err != nil {
+		t.Fatalf("demote: %v", err)
+	}
+
+	// Release the lock — pin re-reads the participant row and sees role 0.
+	release()
+	<-pinDone
+
+	if !errors.Is(pinErr, store.ErrNotMember) {
+		t.Fatalf("demoted admin pin: err = %v, want ErrNotMember", pinErr)
+	}
+
+	// pinned_message_id must be unchanged.
+	ch, ok, err := s.ChannelByID(ctx, ch.ID)
+	if err != nil || !ok {
+		t.Fatalf("channel by id: ok=%v err=%v", ok, err)
+	}
+	if ch.PinnedMessageID != nil {
+		t.Errorf("pinned_message_id = %v, want nil (demoted admin must not write)", ch.PinnedMessageID)
+	}
+}
+
+// TestSetChannelPinnedMessageRejectsBannedAdmin proves the TOCTOU fix: an admin
+// who passes the handler-level role check but is banned before the store's write
+// transaction commits is still refused.
+func TestSetChannelPinnedMessageRejectsBannedAdmin(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551297011")
+	admin := mustUser(t, s, "+15551297012")
+	ch, hash, err := store.SeedChannelWithMember(ctx, s, creator.ID, admin.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, hash, admin.ID); err != nil {
+		t.Fatalf("re-join admin: %v", err)
+	}
+
+	// Promote admin to role 1.
+	if err := s.SetChannelRole(ctx, ch.ID, creator.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+
+	// Post a message so there is something to pin.
+	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "pin me", 1, nil)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	msgID := int32(post.LocalID) //nolint:gosec // G115: local_id fits int32
+
+	// Hold the channel row lock so SetChannelPinnedMessage blocks after the
+	// early filter but before the re-read.
+	release, err := store.HoldChannelRowLock(ctx, s, ch.ID)
+	if err != nil {
+		t.Fatalf("hold lock: %v", err)
+	}
+
+	// Start the pin call — it will block on the channel row lock.
+	pinDone := make(chan struct{})
+	var pinErr error
+	go func() {
+		_, _, pinErr = s.SetChannelPinnedMessage(ctx, ch.ID, admin.ID, &msgID)
+		close(pinDone)
+	}()
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		t.Fatalf("wait for pin to block: %v", err)
+	}
+
+	// Ban the admin while the pin is blocked.
+	until := time.Now().Add(time.Hour)
+	if err := store.SetChannelBan(ctx, s, ch.ID, admin.ID, &until); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+
+	// Release the lock — pin re-reads the participant row and sees banned.
+	release()
+	<-pinDone
+
+	if !errors.Is(pinErr, store.ErrNotMember) {
+		t.Fatalf("banned admin pin: err = %v, want ErrNotMember", pinErr)
+	}
+
+	// pinned_message_id must be unchanged.
+	ch, ok, err := s.ChannelByID(ctx, ch.ID)
+	if err != nil || !ok {
+		t.Fatalf("channel by id: ok=%v err=%v", ok, err)
+	}
+	if ch.PinnedMessageID != nil {
+		t.Errorf("pinned_message_id = %v, want nil (banned admin must not write)", ch.PinnedMessageID)
+	}
+}
+
+// TestSetChannelPinnedMessageAllowsLegitimateAdmin proves a legitimate admin
+// (role >= 1, not banned) can still pin and unpin messages.
+func TestSetChannelPinnedMessageAllowsLegitimateAdmin(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551297021")
+	admin := mustUser(t, s, "+15551297022")
+	ch, hash, err := store.SeedChannelWithMember(ctx, s, creator.ID, admin.ID)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, hash, admin.ID); err != nil {
+		t.Fatalf("re-join admin: %v", err)
+	}
+
+	// Promote admin to role 1.
+	if err := s.SetChannelRole(ctx, ch.ID, creator.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+
+	// Post a message so there is something to pin.
+	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "pin me", 1, nil)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	msgID := int32(post.LocalID) //nolint:gosec // G115: local_id fits int32
+
+	// Pin as admin — should succeed.
+	_, members, err := s.SetChannelPinnedMessage(ctx, ch.ID, admin.ID, &msgID)
+	if err != nil {
+		t.Fatalf("pin: %v", err)
+	}
+	if len(members) == 0 {
+		t.Fatal("no members returned")
+	}
+
+	ch, ok, err := s.ChannelByID(ctx, ch.ID)
+	if err != nil || !ok {
+		t.Fatalf("channel by id: ok=%v err=%v", ok, err)
+	}
+	if ch.PinnedMessageID == nil || *ch.PinnedMessageID != msgID {
+		t.Errorf("pinned_message_id = %v, want %d", ch.PinnedMessageID, msgID)
+	}
+
+	// Unpin as admin — should succeed.
+	_, members, err = s.SetChannelPinnedMessage(ctx, ch.ID, admin.ID, nil)
+	if err != nil {
+		t.Fatalf("unpin: %v", err)
+	}
+	if len(members) == 0 {
+		t.Fatal("no members returned")
+	}
+
+	ch, ok, err = s.ChannelByID(ctx, ch.ID)
+	if err != nil || !ok {
+		t.Fatalf("channel by id: ok=%v err=%v", ok, err)
+	}
+	if ch.PinnedMessageID != nil {
+		t.Errorf("pinned_message_id = %v after unpin, want nil", ch.PinnedMessageID)
+	}
+}
+
 func TestSetChannelPinnedMessageRejectsDeletedPost(t *testing.T) {
 	t.Parallel()
 	s := open(t)
