@@ -8,6 +8,9 @@ RETURNING handle, owner_type, owner_id;
 -- name: ReleaseUsername :execrows
 DELETE FROM usernames WHERE handle = lower(sqlc.arg(handle)) AND owner_type = sqlc.arg(owner_type) AND owner_id = sqlc.arg(owner_id);
 
+-- name: ReleaseUsernameByOwner :execrows
+DELETE FROM usernames WHERE owner_type = sqlc.arg(owner_type) AND owner_id = sqlc.arg(owner_id);
+
 -- name: GetUserByUsername :one
 SELECT u.* FROM users u
 JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id

@@ -201,11 +201,13 @@ func (s *Store) UpdateUsername(ctx context.Context, userID int64, username strin
 	// Clear or claim the username first — only record the rate-limit token on
 	// success, so a failed claim (USERNAME_OCCUPIED) does not consume quota.
 	if username == "" {
-		// Clear: release any existing handle for this user. The WHERE clause
-		// on owner_type + owner_id is sufficient — the handle column is a
-		// PK so at most one row matches.
-		_, err := s.pool.Exec(ctx, `DELETE FROM usernames WHERE owner_type = $1 AND owner_id = $2`, "user", userID)
-		if err != nil {
+		// Clear: release any existing handle for this user. Uses the
+		// transaction-bound query set so the DELETE rolls back if a later
+		// step fails.
+		if _, err := qtx.ReleaseUsernameByOwner(ctx, db.ReleaseUsernameByOwnerParams{
+			OwnerType: "user",
+			OwnerID:   userID,
+		}); err != nil {
 			return fmt.Errorf("release username: %w", err)
 		}
 		// Also clear the denormalized column.
@@ -215,6 +217,15 @@ func (s *Store) UpdateUsername(ctx context.Context, userID int64, username strin
 		}
 	} else {
 		normalized := strings.ToLower(username)
+		// Release the caller's existing handle before claiming the new one.
+		// If the INSERT below fails (USERNAME_OCCUPIED), this release rolls
+		// back with it, so the old handle is never orphaned.
+		if _, err := qtx.ReleaseUsernameByOwner(ctx, db.ReleaseUsernameByOwnerParams{
+			OwnerType: "user",
+			OwnerID:   userID,
+		}); err != nil {
+			return fmt.Errorf("release old username: %w", err)
+		}
 		// Claim: insert into usernames table. PK conflict means occupied.
 		_, err := qtx.ClaimUsername(ctx, db.ClaimUsernameParams{
 			Handle:    normalized,
