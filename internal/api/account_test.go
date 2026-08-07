@@ -435,8 +435,7 @@ func TestUpdateUsernameFloodWait(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for flood wait")
 	}
-	var rpc *tgerr.Error
-	if !errors.As(err, &rpc) || rpc.Message != "FLOOD_WAIT" {
+	if !tgerr.Is(err, "FLOOD_WAIT") {
 		t.Fatalf("error = %v, want FLOOD_WAIT", err)
 	}
 }
@@ -523,8 +522,7 @@ func TestUpdateUsernameClearCountsAsChange(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected flood wait")
 	}
-	var rpc *tgerr.Error
-	if !errors.As(err, &rpc) || rpc.Message != "FLOOD_WAIT" {
+	if !tgerr.Is(err, "FLOOD_WAIT") {
 		t.Fatalf("error = %v, want FLOOD_WAIT", err)
 	}
 }
