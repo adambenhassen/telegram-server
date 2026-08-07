@@ -106,3 +106,12 @@ func RevokeExportedChatInviteForTest(s *store.Store, userID, channelID int64, ha
 
 // MaxGetChannels exposes the getChannels input cap to the api_test package.
 const MaxGetChannels = maxGetChannels
+
+// EditChannelUsernameForTest encodes req and invokes handleEditChannelUsername for the caller.
+func EditChannelUsernameForTest(s *store.Store, userID int64, req *tg.ChannelsUpdateUsernameRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleEditChannelUsername(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}

@@ -72,6 +72,11 @@ type ChannelState struct {
 	Date        pgtype.Timestamptz
 }
 
+type ChannelUsernameChange struct {
+	ChannelID int64
+	ChangedAt pgtype.Timestamptz
+}
+
 type Chat struct {
 	ID              int64
 	Title           string
