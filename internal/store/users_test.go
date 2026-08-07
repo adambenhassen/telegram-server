@@ -403,29 +403,35 @@ func TestUpdateUsernameRollbackOnFloodWait(t *testing.T) {
 	t.Parallel()
 	s := open(t)
 	ctx := context.Background()
-	u := mustUser(t, s, "+15551260141")
+	u1 := mustUser(t, s, "+15551260141")
+	u2 := mustUser(t, s, "+15551260142")
 
-	// Set a username.
-	if err := s.UpdateUsername(ctx, u.ID, "alice123"); err != nil {
+	// Change 1: set "alice123".
+	if err := s.UpdateUsername(ctx, u1.ID, "alice123"); err != nil {
 		t.Fatalf("set username: %v", err)
 	}
-	// Clear it (second change).
-	if err := s.UpdateUsername(ctx, u.ID, ""); err != nil {
-		t.Fatalf("clear username: %v", err)
+	// Change 2: rename to "bob12345" (also verifies rename releases "alice123").
+	if err := s.UpdateUsername(ctx, u1.ID, "bob12345"); err != nil {
+		t.Fatalf("rename: %v", err)
 	}
-
-	// Third change should hit flood wait — and must not half-commit.
-	err := s.UpdateUsername(ctx, u.ID, "bob12345")
+	// Change 3: attempt clear — should hit flood wait and not half-commit.
+	err := s.UpdateUsername(ctx, u1.ID, "")
 	if !errors.Is(err, store.ErrUsernameFloodWait) {
 		t.Fatalf("expected ErrUsernameFloodWait, got %v", err)
 	}
 
-	// The username should still be nil (clear was the last successful change).
-	usr, ok, err := s.UserByID(ctx, u.ID)
+	// users.username should still be "bob12345" (clear did not commit).
+	usr, ok, err := s.UserByID(ctx, u1.ID)
 	if err != nil || !ok {
 		t.Fatalf("user lookup: ok=%v err=%v", ok, err)
 	}
-	if usr.Username != nil {
-		t.Fatalf("username = %v, want nil (flood-wait clear should not have committed)", usr.Username)
+	if usr.Username == nil || *usr.Username != "bob12345" {
+		t.Fatalf("username = %v, want bob12345 (flood-wait clear should not have committed)", usr.Username)
+	}
+
+	// The usernames row for "bob12345" should still exist — u2 cannot claim it.
+	err = s.UpdateUsername(ctx, u2.ID, "bob12345")
+	if !errors.Is(err, store.ErrUsernameOccupied) {
+		t.Fatalf("expected ErrUsernameOccupied, got %v (row was deleted despite flood-wait)", err)
 	}
 }
