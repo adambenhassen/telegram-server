@@ -12,4 +12,7 @@ SELECT * FROM users WHERE id = $1;
 -- name: SetUserStatus :execrows
 UPDATE users SET is_online = $2, last_seen_at = now() WHERE id = $1;
 
+-- name: SetUsername :execrows
+UPDATE users SET username = $2 WHERE id = $1;
+
 
