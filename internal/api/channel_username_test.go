@@ -618,23 +618,50 @@ func TestHandleEditChannelUsernameConcurrentClaim(t *testing.T) {
 		t.Fatalf("create ch2: %v", err)
 	}
 
-	// Sequential claim (concurrent would need goroutines but the PK constraint
-	// is what enforces AC 11 — the store's transaction + PK handles it).
-	// First claim succeeds.
-	if _, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
-		Channel:  api.InputChannel(creator.ID, ch1.ID),
-		Username: "contested",
-	}); err != nil {
-		t.Fatalf("ch1 claim: %v", err)
+	// Fire both claims concurrently behind a barrier.
+	type result struct {
+		err error
 	}
+	ch1Res := make(chan result, 1)
+	ch2Res := make(chan result, 1)
+	barrier := make(chan struct{})
 
-	// Second claim fails.
-	_, err = api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
-		Channel:  api.InputChannel(creator.ID, ch2.ID),
-		Username: "contested",
-	})
-	if msg := rpcMessage(t, err); msg != "USERNAME_OCCUPIED" {
-		t.Fatalf("ch2 claim: got %s, want USERNAME_OCCUPIED", msg)
+	go func() {
+		<-barrier
+		_, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
+			Channel:  api.InputChannel(creator.ID, ch1.ID),
+			Username: "contested",
+		})
+		ch1Res <- result{err: err}
+	}()
+	go func() {
+		<-barrier
+		_, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
+			Channel:  api.InputChannel(creator.ID, ch2.ID),
+			Username: "contested",
+		})
+		ch2Res <- result{err: err}
+	}()
+	close(barrier)
+
+	// Collect results.
+	r1 := <-ch1Res
+	r2 := <-ch2Res
+
+	// Exactly one must succeed and one must return USERNAME_OCCUPIED.
+	err1, err2 := r1.err, r2.err
+	success := 0
+	for i, err := range []error{err1, err2} {
+		if err == nil {
+			success++
+			continue
+		}
+		if msg := rpcMessage(t, err); msg != "USERNAME_OCCUPIED" {
+			t.Errorf("claim %d: got %s, want USERNAME_OCCUPIED", i+1, msg)
+		}
+	}
+	if success != 1 {
+		t.Errorf("successes = %d, want exactly 1 (one success, one USERNAME_OCCUPIED)", success)
 	}
 }
 

@@ -29,8 +29,14 @@ import (
 // channels row, or the reverse, so the two cannot form a cycle. The invite row
 // lock is never taken alongside the channels row lock, so it cannot cycle either.
 //
-// No Go lock and no advisory lock exists here, so nothing can be part of a lock
-// cycle with the per-owner locks in fanout.go.
+// EditChannelUsername takes an advisory lock (pg_advisory_xact_lock on channelID)
+// first, then the channels row lock (LockChannel). The advisory lock serialises
+// concurrent edits to the same channel so the prune/count/insert rate-limit
+// sequence cannot race with itself. It is keyed on channelID, not userID, so
+// two different channels competing for the same username do not share an advisory
+// lock — the usernames table PRIMARY KEY is what serialises cross-channel claims.
+// The advisory lock is released at transaction end, so it cannot cycle with the
+// per-owner advisory locks in fanout.go (which are keyed on userID).
 
 // defaultMaxChannelParticipants and defaultMaxChannelsPerUser are the bounds
 // recorded in the M7 migration. They seed the per-Store fields of the same name
