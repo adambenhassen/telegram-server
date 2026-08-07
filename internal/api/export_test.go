@@ -474,3 +474,12 @@ func UpdateStatusForTest(s *store.Store, userID int64, offline bool) (bin.Encode
 	}
 	return testHandlers(s).handleUpdateStatus(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
+
+// UpdateUsernameForTest invokes handleUpdateUsername for userID with the given username.
+func UpdateUsernameForTest(s *store.Store, userID int64, username string) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := (&tg.AccountUpdateUsernameRequest{Username: username}).Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleUpdateUsername(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}

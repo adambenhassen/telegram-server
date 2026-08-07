@@ -131,4 +131,12 @@ var (
 	// errChatAdminRequired rejects a pin/unpin by a non-admin in a group chat or
 	// channel.
 	errChatAdminRequired = rpcErr(400, "CHAT_ADMIN_REQUIRED")
+	// errUsernameInvalid rejects a username that fails validation: wrong length,
+	// invalid characters, digit/underscore leading, or a reserved handle.
+	errUsernameInvalid = rpcErr(400, "USERNAME_INVALID")
+	// errUsernameOccupied rejects a username already claimed by another account.
+	errUsernameOccupied = rpcErr(400, "USERNAME_OCCUPIED")
+	// errUsernameFloodWait rejects a username change that would exceed the
+	// per-account rate limit.
+	errUsernameFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
 )

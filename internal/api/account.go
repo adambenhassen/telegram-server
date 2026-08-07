@@ -1,6 +1,10 @@
 package api
 
 import (
+	"errors"
+	"regexp"
+	"strings"
+
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
@@ -104,6 +108,67 @@ func (h *handlers) handleUpdateStatus(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	if err := h.store.Notify(r.Ctx, store.ChannelStatus, store.StatusPayload(r.UserID, online)); err != nil {
 		h.log.Error("notify status", "user_id", r.UserID, "err", err)
+	}
+	return &tg.BoolTrue{}, nil
+}
+
+// reservedUsernames is the blocklist of handles that must never be claimed.
+var reservedUsernames = map[string]bool{
+	"admin":    true,
+	"support":  true,
+	"help":     true,
+	"me":       true,
+	"settings": true,
+	"telegram": true,
+	"channel":  true,
+	"channels": true,
+	"bot":      true,
+	"bots":     true,
+	"login":    true,
+	"signup":   true,
+}
+
+// usernameRe validates a non-empty username: 5–32 chars, ASCII letters/digits/
+// underscore, first char must be a letter.
+var usernameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{4,31}$`)
+
+// handleUpdateUsername serves account.updateUsername. An authenticated caller
+// sets or clears their own username.
+//
+// An empty string clears the current username. A non-empty string must pass
+// validation (length, character set, first char, blocklist) before the store
+// is consulted. Returns tg.BoolTrue on success.
+func (h *handlers) handleUpdateUsername(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.AccountUpdateUsernameRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+
+	username := req.Username
+	// Non-empty usernames must pass validation before any DB access.
+	if username != "" {
+		if !usernameRe.MatchString(username) {
+			return nil, errUsernameInvalid
+		}
+		normalized := strings.ToLower(username)
+		if reservedUsernames[normalized] {
+			return nil, errUsernameInvalid
+		}
+	}
+
+	if err := h.store.UpdateUsername(r.Ctx, r.UserID, username); err != nil {
+		switch {
+		case errors.Is(err, store.ErrUsernameOccupied):
+			return nil, errUsernameOccupied
+		case errors.Is(err, store.ErrUsernameFloodWait):
+			return nil, errUsernameFloodWait
+		default:
+			h.log.Error("update username", "user_id", r.UserID, "username", username, "err", err)
+			return nil, errInternal
+		}
 	}
 	return &tg.BoolTrue{}, nil
 }
