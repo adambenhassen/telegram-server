@@ -6,9 +6,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
@@ -27,8 +29,14 @@ import (
 // channels row, or the reverse, so the two cannot form a cycle. The invite row
 // lock is never taken alongside the channels row lock, so it cannot cycle either.
 //
-// No Go lock and no advisory lock exists here, so nothing can be part of a lock
-// cycle with the per-owner locks in fanout.go.
+// EditChannelUsername takes an advisory lock (pg_advisory_xact_lock on channelID)
+// first, then the channels row lock (LockChannel). The advisory lock serialises
+// concurrent edits to the same channel so the prune/count/insert rate-limit
+// sequence cannot race with itself. It is keyed on channelID, not userID, so
+// two different channels competing for the same username do not share an advisory
+// lock — the usernames table PRIMARY KEY is what serialises cross-channel claims.
+// The advisory lock is released at transaction end, so it cannot cycle with the
+// per-owner advisory locks in fanout.go (which are keyed on userID).
 
 // defaultMaxChannelParticipants and defaultMaxChannelsPerUser are the bounds
 // recorded in the M7 migration. They seed the per-Store fields of the same name
@@ -62,6 +70,9 @@ type Channel struct {
 	Version         int
 	Date            time.Time
 	PinnedMessageID *int32
+	// Username is the normalized handle claimed in the usernames table.
+	// Nil when the channel has no username.
+	Username *string
 }
 
 // Participant roles, as recorded in the M7 migration.
@@ -113,6 +124,7 @@ func channelFromRow(r db.Channel) Channel {
 		Version:         int(r.Version),
 		Date:            r.Date.Time,
 		PinnedMessageID: r.PinnedMessageID,
+		Username:        r.Username,
 	}
 }
 
@@ -835,4 +847,138 @@ func (s *Store) CountChannelParticipants(ctx context.Context, channelID int64) (
 		return 0, fmt.Errorf("count channel participants: %w", err)
 	}
 	return count, nil
+}
+
+// ChannelUsernameChangeLimit is the maximum number of username changes a single
+// channel may make within ChannelUsernameChangeWindow.
+const ChannelUsernameChangeLimit = 2
+
+// ChannelUsernameChangeWindow is the rolling window for the per-channel username
+// change rate limit.
+const ChannelUsernameChangeWindow = 24 * time.Hour
+
+// EditChannelUsername atomically sets or clears the username of a channel.
+// When username is non-empty the handle is claimed: a row is inserted into the
+// usernames table and the channels.username column is updated. When username is
+// empty the handle is released: the usernames row is deleted and
+// channels.username is cleared.
+//
+// The rate limit is per-channel: at most ChannelUsernameChangeLimit changes
+// within ChannelUsernameChangeWindow. An advisory lock on the channel id
+// serialises concurrent edits so the prune/count/insert sequence cannot race.
+// Failed claims (USERNAME_OCCUPIED) do not consume a rate-limit token.
+//
+// Returns ErrNotMember when the caller is not an admin (role >= 1) or is banned.
+// Returns ErrUsernameOccupied when the handle is already taken.
+// Returns ErrUsernameFloodWait when the per-channel rate limit is exceeded.
+func (s *Store) EditChannelUsername(ctx context.Context, channelID, callerID int64, username string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	// Serialize concurrent edits for the same channel so the prune/count/insert
+	// sequence cannot race with itself.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", channelID); err != nil {
+		return fmt.Errorf("advisory lock: %w", err)
+	}
+
+	qtx := s.q.WithTx(tx)
+
+	// Lock the channel row and check membership/role under it.
+	if _, err = qtx.LockChannel(ctx, channelID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotMember
+		}
+		return fmt.Errorf("lock channel: %w", err)
+	}
+
+	participant, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID, UserID: callerID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrNotMember
+	case err != nil:
+		return fmt.Errorf("caller participant: %w", err)
+	}
+	caller := channelMemberFromRow(participant)
+	if caller.Role < 1 || caller.Banned(time.Now()) {
+		return ErrNotMember
+	}
+
+	// Prune expired rate-limit rows before counting.
+	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-ChannelUsernameChangeWindow), Valid: true}
+	if err := qtx.DeleteExpiredChannelUsernameChanges(ctx, db.DeleteExpiredChannelUsernameChangesParams{
+		ChannelID: channelID,
+		ChangedAt: cutoff,
+	}); err != nil {
+		return fmt.Errorf("prune channel username changes: %w", err)
+	}
+
+	// Clear or claim the username first — only record the rate-limit token on
+	// success, so a failed claim (USERNAME_OCCUPIED) does not consume quota.
+	if username == "" {
+		// Clear: release any existing handle for this channel.
+		if _, err := qtx.ReleaseUsernameByOwner(ctx, db.ReleaseUsernameByOwnerParams{
+			OwnerType: "channel",
+			OwnerID:   channelID,
+		}); err != nil {
+			return fmt.Errorf("release channel username: %w", err)
+		}
+		// Also clear the denormalized column.
+		var nullStr *string
+		if _, err := qtx.SetChannelUsername(ctx, db.SetChannelUsernameParams{ID: channelID, Username: nullStr}); err != nil {
+			return fmt.Errorf("clear channel username: %w", err)
+		}
+	} else {
+		normalized := strings.ToLower(username)
+		// Release the channel's existing handle before claiming the new one.
+		// If the INSERT below fails (USERNAME_OCCUPIED), this release rolls
+		// back with it, so the old handle is never orphaned.
+		if _, err := qtx.ReleaseUsernameByOwner(ctx, db.ReleaseUsernameByOwnerParams{
+			OwnerType: "channel",
+			OwnerID:   channelID,
+		}); err != nil {
+			return fmt.Errorf("release old channel username: %w", err)
+		}
+		// Claim: insert into usernames table. PK conflict means occupied.
+		_, err := qtx.ClaimUsername(ctx, db.ClaimUsernameParams{
+			Handle:    normalized,
+			OwnerType: "channel",
+			OwnerID:   channelID,
+		})
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return ErrUsernameOccupied
+			}
+			return fmt.Errorf("claim channel username: %w", err)
+		}
+		// Update the denormalized column on the channels table.
+		if _, err := qtx.SetChannelUsername(ctx, db.SetChannelUsernameParams{ID: channelID, Username: &normalized}); err != nil {
+			return fmt.Errorf("set channel username: %w", err)
+		}
+	}
+
+	// Record the successful change and verify the rate limit.
+	if err := qtx.InsertChannelUsernameChange(ctx, channelID); err != nil {
+		return fmt.Errorf("record channel username change: %w", err)
+	}
+	count, err := qtx.CountChannelUsernameChanges(ctx, db.CountChannelUsernameChangesParams{
+		ChannelID: channelID,
+		ChangedAt: cutoff,
+	})
+	if err != nil {
+		return fmt.Errorf("count channel username changes: %w", err)
+	}
+	if count > ChannelUsernameChangeLimit {
+		return ErrUsernameFloodWait
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
 }
