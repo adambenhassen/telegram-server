@@ -60,13 +60,13 @@ Users & help
 - `help.getConfig`, `users.getUsers`
 
 Contacts
-- `contacts.resolvePhone`, `contacts.resolveUsername`
+- `contacts.resolvePhone`, `contacts.resolveUsername`, `contacts.search`
 
 Messaging
 - `messages.sendMessage`, `messages.getDialogs`, `messages.getHistory`,
   `messages.readHistory`, `messages.editMessage`, `messages.deleteMessages`,
   `messages.setTyping`, `messages.createChat`, `messages.addChatUser`,
-  `messages.deleteChatUser`, `messages.editChatTitle`
+  `messages.deleteChatUser`, `messages.editChatTitle`, `messages.search`
 
 Media
 - `upload.saveFilePart`, `upload.saveBigFilePart`, `upload.getFile`,
@@ -359,6 +359,22 @@ Channels
 - E2E gate covers: set/resolve user username, uniqueness conflict, public channel
   join and post delivery, private channel refuses direct join, rate limit.
 
+### M13 — Server-side full-text search
+- Schema additions: `message_tsv` tsvector column on `messages`, `name_tsv`
+  tsvector column on `users`; GIN indexes on both; `'simple'` dictionary (no
+  stemming, exact-token match across all locales).
+- `messages.search` — full-text keyword search over the caller's own outbound
+  messages within a named 1:1 dialog (`out = true`). Non-user peers and
+  inbound-message search are out of scope (see Known deferrals). Authorization
+  boundary: results are bounded to rows the caller owns and sent — a received
+  message is never returned even if the caller can read it via `getHistory`.
+- `contacts.search` — full-text search over display names (first name + last
+  name) of the caller's 1:1 dialog peers. Results are scoped to accounts that
+  share a non-deleted dialog with the caller; username fields are not searched.
+- E2E gates: `TestSearchMessages` proves keyword matching and the outbound-only
+  boundary; `TestContactsSearch` proves dialog-scoped name matching and that
+  non-dialog users are excluded.
+
 ## Planned — feature track
 
 ### M11 — Message features
@@ -372,9 +388,6 @@ Four stages in sequence:
    `messages.sendReaction` and `messages.getMessagesReactions`.
 4. **Pinned messages.** `messages.updatePinnedMessage` (admin-only in channels);
    `updatePinnedMessages` pushed to members; pinned message id surfaced in dialog.
-
-### Later
-- Server-side full-text search.
 
 ## Planned — operational track
 
@@ -565,6 +578,29 @@ Tracked so shortcuts don't rot into "later means never".
   hash; the existing 200-member cap is retained as a medium availability control. A follow-up
   should revisit whether a higher cap or a per-joiner rate limit is warranted once join-by-username
   traffic is observable. — M12
+
+- **`messages.search` returns only outbound messages.** `SearchMessages` carries
+  `AND out = true`, so received messages never appear in search results even
+  though the caller can read them via `getHistory`. Inbound message search is
+  deferred to M14. — M13
+- **`messages.searchGlobal` not implemented.** Cross-dialog global search is deferred to M14.
+  The index exists; the gap is the RPC and its pagination model. — M13
+- **Group-chat message search not implemented.** `messages.search` rejects every
+  non-user peer (`PeerTypeUser` check in the handler); group-chat message rows in
+  `messages` are indexed by `message_tsv` but the RPC does not accept chat peers.
+  Deferred to M14. — M13
+- **Channel and megagroup message search not implemented.** Channel posts live in
+  `channel_messages`, which has no `message_tsv` column and no GIN index.
+  Both the index and the RPC are deferred to M14. — M13
+- **Channel title search not implemented.** `contacts.search` covers user display
+  names only; the `channels` table has no tsvector column. Adding channel title
+  search requires a new column, index, and RPC path. Deferred to M14. — M13
+- **Media filename indexing deferred.** `message_tsv` on `messages` covers message
+  text only; document file names are not indexed. Whether to index them — and under
+  which dictionary — is an open decision deferred to M14. — M13
+- **Secret-chat messages are permanently non-indexable.** The server stores encrypted blobs
+  without inspecting plaintext, so full-text indexing of secret-chat content is not possible by
+  design and will not be added. — M13
 
 ## Engineering invariants
 
