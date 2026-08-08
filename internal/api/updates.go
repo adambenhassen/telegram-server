@@ -257,6 +257,9 @@ func (h *handlers) userToTL(u store.User, viewerID int64, self bool) *tg.User {
 	if self {
 		tlUser.Phone = u.Phone
 	}
+	if u.Username != nil {
+		tlUser.Username = *u.Username
+	}
 	return tlUser
 }
 

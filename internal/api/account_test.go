@@ -147,8 +147,12 @@ func TestUpdateUsernameSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("update username: %v", err)
 	}
-	if _, ok := res.(*tg.BoolTrue); !ok {
-		t.Fatalf("result = %T, want *tg.BoolTrue", res)
+	uRes, ok := res.(*tg.User)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.User", res)
+	}
+	if uRes.Username != "alice" {
+		t.Fatalf("returned user username = %q, want alice", uRes.Username)
 	}
 
 	u, ok, err := s.UserByID(ctx, user.ID)
@@ -240,8 +244,12 @@ func TestUpdateUsernameClear(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clear username: %v", err)
 	}
-	if _, ok := res.(*tg.BoolTrue); !ok {
-		t.Fatalf("result = %T, want *tg.BoolTrue", res)
+	uRes, ok := res.(*tg.User)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.User", res)
+	}
+	if uRes.Username != "" {
+		t.Fatalf("returned user username = %q, want empty", uRes.Username)
 	}
 
 	u, ok, err := s.UserByID(ctx, user.ID)
@@ -278,8 +286,12 @@ func TestUpdateUsernameClearIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clear empty username: %v", err)
 	}
-	if _, ok := res.(*tg.BoolTrue); !ok {
-		t.Fatalf("result = %T, want *tg.BoolTrue", res)
+	uRes, ok := res.(*tg.User)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.User", res)
+	}
+	if uRes.Username != "" {
+		t.Fatalf("returned user username = %q, want empty", uRes.Username)
 	}
 }
 
