@@ -1071,9 +1071,10 @@ func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, pe
 	}
 }
 
-// handleSearch serves messages.search: keyword search within a 1:1 dialog.
+// handleSearch serves messages.search: keyword search within a dialog.
 // Only InputMessagesFilterEmpty is accepted; other filters return INPUT_FILTER_INVALID.
-// Results are the caller's own messages in the named peer, ordered newest-first.
+// Results are the caller's messages (both directions) in the named peer, ordered
+// newest-first. Channel peers return PEER_ID_INVALID.
 func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesSearchRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -1096,9 +1097,15 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Only 1:1 user peers are in scope.
-	if peerType != store.PeerTypeUser {
+	// Channel search is a separate ticket.
+	if peerType == store.PeerTypeChannel {
 		return nil, errPeerIDInvalid
+	}
+	// Chat peers require membership.
+	if peerType == store.PeerTypeChat {
+		if err = h.requireMember(r.Ctx, peerID, r.UserID); err != nil {
+			return nil, err
+		}
 	}
 
 	limit := req.Limit
@@ -1121,6 +1128,10 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 
+	if peerType == store.PeerTypeChat {
+		return h.chatSearch(r, peerID, msgs, files)
+	}
+
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	for i, m := range msgs {
 		tlMsgs[i] = messageToTL(m, nil, files, nil, nil)
@@ -1133,4 +1144,26 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	return &tg.MessagesMessages{Messages: tlMsgs, Users: users}, nil
+}
+
+// chatSearch renders search results for a chat peer. It collects all authors
+// from the result set (plus the caller) and loads the chat metadata.
+func (h *handlers) chatSearch(r *mtproto.Request, chatID int64, msgs []store.Message, files map[int64]*tg.Document) (bin.Encoder, error) {
+	tlMsgs := make([]tg.MessageClass, len(msgs))
+	authors := map[int64]bool{r.UserID: true}
+	for i, m := range msgs {
+		tlMsgs[i] = messageToTL(m, nil, files, nil, nil)
+		authors[m.FromID] = true
+	}
+	users, err := h.loadUsers(r.Ctx, authors, r.UserID)
+	if err != nil {
+		h.log.Error("search messages users", "err", err)
+		return nil, errInternal
+	}
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("search messages chats", "err", err)
+		return nil, errInternal
+	}
+	return &tg.MessagesMessages{Messages: tlMsgs, Users: users, Chats: chats}, nil
 }
