@@ -1,4 +1,4 @@
-.PHONY: tools-check sqlc generate migrate-new migrate test lint build run
+.PHONY: tools-check sqlc generate migrate-new migrate test test-db docker-bridge lint build run
 
 # sqlc lives in a separate tools module (tools/go.mod) so its broken transitive
 # dep graph (grpc test deps -> a non-existent gonum package) stays out of the
@@ -26,8 +26,21 @@ migrate:
 # -race is not optional here: the hard parts of this server are ordering
 # (Conn.Push/writeMu, per-owner pts, store lock ordering), and a plain run
 # passes a build that corrupts state under concurrent load.
-test:
+test: docker-bridge
 	go test -race ./...
+
+# Postgres-backed suites only, for a quick check while working in internal/store.
+test-db: docker-bridge
+	go test -race ./internal/store/... ./test/...
+
+# pgtest starts its Postgres on Docker's default bridge network. When the tests
+# themselves run inside a container attached to some other user-defined network,
+# the two networks are isolated and every DB test dies on a connect timeout to
+# 172.17.x.x. Joining the bridge restores the route. Idempotent, and skipped
+# entirely when not running in a container.
+docker-bridge:
+	@[ -f /.dockerenv ] || exit 0; \
+	docker network connect bridge "$$(cat /etc/hostname)" 2>/dev/null || true
 
 lint:
 	golangci-lint run
