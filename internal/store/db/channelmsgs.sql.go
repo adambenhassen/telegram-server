@@ -7,6 +7,8 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const bumpChannelState = `-- name: BumpChannelState :one
@@ -78,7 +80,8 @@ func (q *Queries) ChannelEventsWindow(ctx context.Context, arg ChannelEventsWind
 }
 
 const channelHistoryPage = `-- name: ChannelHistoryPage :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id FROM channel_messages
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages
 WHERE channel_id = $1 AND deleted = false
   AND ($2::bigint = 0 OR local_id < $2::bigint)
 ORDER BY local_id DESC
@@ -91,15 +94,27 @@ type ChannelHistoryPageParams struct {
 	Lim       int32
 }
 
-func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPageParams) ([]ChannelMessage, error) {
+type ChannelHistoryPageRow struct {
+	ChannelID int64
+	LocalID   int64
+	FromID    int64
+	Date      pgtype.Timestamptz
+	Message   string
+	EditDate  pgtype.Timestamptz
+	Deleted   bool
+	RandomID  int64
+	FileID    *int64
+}
+
+func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPageParams) ([]ChannelHistoryPageRow, error) {
 	rows, err := q.db.Query(ctx, channelHistoryPage, arg.ChannelID, arg.OffsetID, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ChannelMessage
+	var items []ChannelHistoryPageRow
 	for rows.Next() {
-		var i ChannelMessage
+		var i ChannelHistoryPageRow
 		if err := rows.Scan(
 			&i.ChannelID,
 			&i.LocalID,
@@ -122,7 +137,8 @@ func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPage
 }
 
 const channelMessageByLocal = `-- name: ChannelMessageByLocal :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id FROM channel_messages WHERE channel_id = $1 AND local_id = $2
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages WHERE channel_id = $1 AND local_id = $2
 `
 
 type ChannelMessageByLocalParams struct {
@@ -130,9 +146,21 @@ type ChannelMessageByLocalParams struct {
 	LocalID   int64
 }
 
-func (q *Queries) ChannelMessageByLocal(ctx context.Context, arg ChannelMessageByLocalParams) (ChannelMessage, error) {
+type ChannelMessageByLocalRow struct {
+	ChannelID int64
+	LocalID   int64
+	FromID    int64
+	Date      pgtype.Timestamptz
+	Message   string
+	EditDate  pgtype.Timestamptz
+	Deleted   bool
+	RandomID  int64
+	FileID    *int64
+}
+
+func (q *Queries) ChannelMessageByLocal(ctx context.Context, arg ChannelMessageByLocalParams) (ChannelMessageByLocalRow, error) {
 	row := q.db.QueryRow(ctx, channelMessageByLocal, arg.ChannelID, arg.LocalID)
-	var i ChannelMessage
+	var i ChannelMessageByLocalRow
 	err := row.Scan(
 		&i.ChannelID,
 		&i.LocalID,
@@ -148,7 +176,8 @@ func (q *Queries) ChannelMessageByLocal(ctx context.Context, arg ChannelMessageB
 }
 
 const channelMessageByRandomID = `-- name: ChannelMessageByRandomID :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id FROM channel_messages WHERE channel_id = $1 AND random_id = $2 AND random_id <> 0
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages WHERE channel_id = $1 AND random_id = $2 AND random_id <> 0
 `
 
 type ChannelMessageByRandomIDParams struct {
@@ -156,9 +185,21 @@ type ChannelMessageByRandomIDParams struct {
 	RandomID  int64
 }
 
-func (q *Queries) ChannelMessageByRandomID(ctx context.Context, arg ChannelMessageByRandomIDParams) (ChannelMessage, error) {
+type ChannelMessageByRandomIDRow struct {
+	ChannelID int64
+	LocalID   int64
+	FromID    int64
+	Date      pgtype.Timestamptz
+	Message   string
+	EditDate  pgtype.Timestamptz
+	Deleted   bool
+	RandomID  int64
+	FileID    *int64
+}
+
+func (q *Queries) ChannelMessageByRandomID(ctx context.Context, arg ChannelMessageByRandomIDParams) (ChannelMessageByRandomIDRow, error) {
 	row := q.db.QueryRow(ctx, channelMessageByRandomID, arg.ChannelID, arg.RandomID)
-	var i ChannelMessage
+	var i ChannelMessageByRandomIDRow
 	err := row.Scan(
 		&i.ChannelID,
 		&i.LocalID,
@@ -174,7 +215,8 @@ func (q *Queries) ChannelMessageByRandomID(ctx context.Context, arg ChannelMessa
 }
 
 const channelMessagesByLocalIDs = `-- name: ChannelMessagesByLocalIDs :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id FROM channel_messages
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages
 WHERE channel_id = $1 AND local_id = ANY($2::bigint[])
 `
 
@@ -183,15 +225,27 @@ type ChannelMessagesByLocalIDsParams struct {
 	LocalIds  []int64
 }
 
-func (q *Queries) ChannelMessagesByLocalIDs(ctx context.Context, arg ChannelMessagesByLocalIDsParams) ([]ChannelMessage, error) {
+type ChannelMessagesByLocalIDsRow struct {
+	ChannelID int64
+	LocalID   int64
+	FromID    int64
+	Date      pgtype.Timestamptz
+	Message   string
+	EditDate  pgtype.Timestamptz
+	Deleted   bool
+	RandomID  int64
+	FileID    *int64
+}
+
+func (q *Queries) ChannelMessagesByLocalIDs(ctx context.Context, arg ChannelMessagesByLocalIDsParams) ([]ChannelMessagesByLocalIDsRow, error) {
 	rows, err := q.db.Query(ctx, channelMessagesByLocalIDs, arg.ChannelID, arg.LocalIds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ChannelMessage
+	var items []ChannelMessagesByLocalIDsRow
 	for rows.Next() {
-		var i ChannelMessage
+		var i ChannelMessagesByLocalIDsRow
 		if err := rows.Scan(
 			&i.ChannelID,
 			&i.LocalID,
