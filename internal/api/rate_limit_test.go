@@ -1,0 +1,460 @@
+package api_test
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
+
+	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/store"
+)
+
+// isFloodWait reports whether err is a 420 FLOOD_WAIT error.
+func isFloodWait(err error) bool {
+	var rpc *tgerr.Error
+	return errors.As(err, &rpc) && rpc.Code == 420
+}
+
+// TestSendMessageRateLimit proves that N+1 sends within the window are denied
+// with FLOOD_WAIT and have no side effects (no message rows, no pts advance).
+func TestSendMessageRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551293002")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a small limit for testing: 3 sends per 10s.
+	cfg := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+	peerBob := api.InputPeerUser(alice.ID, bob.ID)
+
+	// Sends 1-3 should pass.
+	for i := range 3 {
+		_, err := api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+			Peer: peerBob, Message: "msg", RandomID: int64(i + 1),
+		})
+		if err != nil {
+			t.Fatalf("send %d: %v", i+1, err)
+		}
+	}
+
+	// Send 4 should be denied with FLOOD_WAIT.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "blocked", RandomID: 4,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("send 4: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// No side effects: alice's message count should still be 3.
+	msgs, err := s.History(ctx, alice.ID, store.PeerTypeUser, bob.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("alice history = %d, want 3", len(msgs))
+	}
+
+	// A different account is unaffected.
+	_, err = api.SendMessageForTestWithLimits(s, bob.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerUser(bob.ID, alice.ID), Message: "bob sends", RandomID: 100,
+	})
+	if err != nil {
+		t.Fatalf("bob send: %v", err)
+	}
+}
+
+// TestSendMessageRateLimitWindowExpiry proves that after the window expires,
+// the same account can send again.
+func TestSendMessageRateLimitWindowExpiry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293101")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551293102")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Very short window: 2 sends per 500ms.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 500 * time.Millisecond}
+	peerBob := api.InputPeerUser(alice.ID, bob.ID)
+
+	// Exhaust the limit.
+	for i := range 2 {
+		_, err := api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+			Peer: peerBob, Message: "msg", RandomID: int64(i + 1),
+		})
+		if err != nil {
+			t.Fatalf("send %d: %v", i+1, err)
+		}
+	}
+
+	// Denied.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "blocked", RandomID: 3,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("expected FLOOD_WAIT, got %v", err)
+	}
+
+	// Wait for window to expire.
+	time.Sleep(600 * time.Millisecond)
+
+	// Should be allowed again.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "after expiry", RandomID: 4,
+	})
+	if err != nil {
+		t.Fatalf("post-expiry send: %v", err)
+	}
+}
+
+// TestCreateChatRateLimit proves that N+1 creates within the window are denied.
+func TestCreateChatRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293201")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551293202")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2 creates per 10s.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+
+	// Creates 1-2 should pass.
+	for i := range 2 {
+		_, err := api.CreateChatForTestWithLimits(s, alice.ID, cfg, &tg.MessagesCreateChatRequest{
+			Users: []tg.InputUserClass{api.InputUser(alice.ID, bob.ID)},
+			Title: "Chat " + string(rune('A'+i)),
+		})
+		if err != nil {
+			t.Fatalf("create %d: %v", i+1, err)
+		}
+	}
+
+	// Create 3 should be denied.
+	_, err = api.CreateChatForTestWithLimits(s, alice.ID, cfg, &tg.MessagesCreateChatRequest{
+		Users: []tg.InputUserClass{api.InputUser(alice.ID, bob.ID)},
+		Title: "Blocked",
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("create 3: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestAddChatUserRateLimit proves that N+1 member adds within the window are denied.
+func TestAddChatUserRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293301")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551293302")
+	if err != nil {
+		t.Fatal(err)
+	}
+	charlie, err := s.CreateUser(ctx, "+15551293303")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2 adds per 10s.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+
+	// Create a chat first (no limit on create in this test).
+	enc, err := api.CreateChatForTest(s, alice.ID, &tg.MessagesCreateChatRequest{
+		Users: []tg.InputUserClass{},
+		Title: "Test Chat",
+	})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesInvitedUsers)
+	if !ok {
+		t.Fatalf("result type = %T", enc)
+	}
+	ups, ok := res.Updates.(*tg.Updates)
+	if !ok || len(ups.Chats) != 1 {
+		t.Fatalf("updates = %T", res.Updates)
+	}
+	chat, ok := ups.Chats[0].(*tg.Chat)
+	if !ok {
+		t.Fatalf("chat type = %T", ups.Chats[0])
+	}
+
+	// Adds 1-2 should pass.
+	for _, target := range []int64{bob.ID, charlie.ID} {
+		_, err := api.AddChatUserForTestWithLimits(s, alice.ID, cfg, &tg.MessagesAddChatUserRequest{
+			ChatID: chat.ID, UserID: api.InputUser(alice.ID, target),
+		})
+		if err != nil {
+			t.Fatalf("add user: %v", err)
+		}
+	}
+
+	// Add 3 should be denied.
+	_, err = api.AddChatUserForTestWithLimits(s, alice.ID, cfg, &tg.MessagesAddChatUserRequest{
+		ChatID: chat.ID, UserID: api.InputUser(alice.ID, bob.ID),
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("add 3: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestRateLimitDisabled proves that a zero limit disables enforcement.
+func TestRateLimitDisabled(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293401")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551293402")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero limit = disabled.
+	cfg := store.RateLimitConfig{}
+	peerBob := api.InputPeerUser(alice.ID, bob.ID)
+
+	// Many sends should all pass.
+	for i := range 100 {
+		_, err := api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+			Peer: peerBob, Message: "msg", RandomID: int64(i + 1),
+		})
+		if err != nil {
+			t.Fatalf("send %d: %v", i+1, err)
+		}
+	}
+}
+
+// TestSweepVsCheckRace proves that a request whose row is swept mid-check
+// returns a flood wait or an allow, never an error.
+func TestSweepVsCheckRace(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293601")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Short window.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 500 * time.Millisecond}
+
+	// Consume the single token.
+	result, err := s.CheckRateLimit(ctx, alice.ID, "message_send", cfg)
+	if err != nil {
+		t.Fatalf("first check: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("first check: unexpected denial: %+v", result)
+	}
+
+	// Wait for the window to expire so the sweep can clean it up.
+	time.Sleep(600 * time.Millisecond)
+
+	// Manually run the sweep to delete the row.
+	if err := s.SweepExpiredRateLimits(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	// Now check again — the row was swept, so this should succeed (not error).
+	result, err = s.CheckRateLimit(ctx, alice.ID, "message_send", cfg)
+	if err != nil {
+		t.Fatalf("post-sweep check: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("post-sweep check: unexpected denial: %+v", result)
+	}
+}
+
+// TestConcurrentColdKey proves that concurrent requests on a key being created
+// for the first time are handled correctly (limit succeed, rest denied).
+func TestConcurrentColdKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293701")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+
+	const n = 10 // more than the limit
+
+	type result struct {
+		err    error
+		denied bool
+	}
+	results := make([]result, n)
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	ready := make(chan struct{})
+
+	for i := range n {
+		go func() {
+			defer wg.Done()
+			<-ready
+			rl, err := s.CheckRateLimit(ctx, alice.ID, "concurrent_cold", cfg)
+			results[i] = result{err: err, denied: rl != nil}
+		}()
+	}
+
+	close(ready)
+	wg.Wait()
+
+	var successes, denials, other int
+	for _, r := range results {
+		switch {
+		case r.err != nil:
+			other++
+			t.Errorf("unexpected error: %v", r.err)
+		case r.denied:
+			denials++
+		default:
+			successes++
+		}
+	}
+
+	if successes != cfg.Limit {
+		t.Errorf("successes = %d, want %d", successes, cfg.Limit)
+	}
+	if denials != n-cfg.Limit {
+		t.Errorf("denials = %d, want %d", denials, n-cfg.Limit)
+	}
+	if other != 0 {
+		t.Errorf("unexpected errors = %d, want 0", other)
+	}
+}
+
+// TestForwardRateLimit proves that forward draws from the shared message send budget.
+func TestForwardRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293801")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551293802")
+	if err != nil {
+		t.Fatal(err)
+	}
+	charlie, err := s.CreateUser(ctx, "+15551293803")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2 sends per 10s — shared between send and forward.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+
+	peerBob := api.InputPeerUser(alice.ID, bob.ID)
+	peerCharlie := api.InputPeerUser(alice.ID, charlie.ID)
+
+	// Send 1 message to bob.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "original", RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Send 1 message to charlie.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerCharlie, Message: "original2", RandomID: 2,
+	})
+	if err != nil {
+		t.Fatalf("send 2: %v", err)
+	}
+
+	// Forward should be denied (shared budget exhausted).
+	_, err = api.ForwardMessagesForTestWithLimits(s, alice.ID, cfg, &tg.MessagesForwardMessagesRequest{
+		ToPeer:   peerCharlie,
+		FromPeer: peerBob,
+		ID:       []int{1},
+		RandomID: []int64{999},
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("forward: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestSendMediaRateLimit proves that media send draws from the shared message send budget.
+func TestSendMediaRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293901")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551293902")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1 send per 10s — very restrictive.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	peerBob := api.InputPeerUser(alice.ID, bob.ID)
+
+	// Plain text send.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "hello", RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Media send should be denied (shared budget exhausted).
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.SendMediaForTestWithLimits(s, alice.ID, blobs, api.TestMaxUserStorageBytes, cfg, &tg.MessagesSendMediaRequest{
+		Peer: peerBob, Message: "media", RandomID: 2,
+		Media: &tg.InputMediaUploadedDocument{
+			File:     &tg.InputFile{ID: 1, Parts: 1, Name: "test.txt"},
+			MimeType: "text/plain",
+		},
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("send media: expected FLOOD_WAIT, got %v", err)
+	}
+}

@@ -255,6 +255,14 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 // connection independent of the Store's query layer.
 func StorePool(s *Store) *pgxpool.Pool { return s.pool }
 
+// CountRateLimits returns the number of rate limit rows for a given subject,
+// for tests that need to assert the rate_limits table state.
+func CountRateLimits(ctx context.Context, s *Store, subjectID int64) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx, "SELECT count(*) FROM rate_limits WHERE subject_id = $1", subjectID).Scan(&count)
+	return count, err
+}
+
 // WaitForLockWaiters blocks until n backends in this test's database are parked
 // on a lock. The concurrent join/revoke tests depend on the order goroutines
 // enter Postgres's lock queue, and that order is only decided once a statement

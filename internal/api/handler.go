@@ -4,12 +4,14 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/srp"
@@ -46,6 +48,12 @@ type handlers struct {
 	// write, so it cannot participate in a cycle with any existing lock.
 	downloadsMu sync.Mutex
 	downloads   map[int64]bool
+	// rateLimits holds the per-surface rate-limit configurations.
+	rateLimits store.RateLimitConfig
+	// rateLimitCreateChat limits messages.createChat per account.
+	rateLimitCreateChat store.RateLimitConfig
+	// rateLimitAddChatUser limits messages.addChatUser per account.
+	rateLimitAddChatUser store.RateLimitConfig
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -91,23 +99,25 @@ func selfRevocation(r *mtproto.Request, keyID int64) bool {
 // peers derives the per-viewer peer access hashes. It is required, and a nil one
 // is a programming error rather than a runtime condition, so it stops the server
 // at startup instead of surfacing as a nil dereference on the first peer emitted.
-func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver) mtproto.Handler {
+func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver, rateLimits config.RateLimitsConfig) mtproto.Handler {
 	if peers == nil {
 		panic("api: nil peer hash deriver")
 	}
 	h := &handlers{
-		peers:         peers,
-		store:         s,
-		cfg:           cfg,
-		dcID:          dcID,
-		log:           log,
-		srp:           srp.NewChallengeStore(srp.DefaultTTL),
-		logLoginCodes: logLoginCodes,
-		maxFileBytes:  maxFileBytes,
-
-		blobs:               blobs,
-		maxUserStorageBytes: maxUserStorageBytes,
-		downloads:           map[int64]bool{},
+		peers:                peers,
+		store:                s,
+		cfg:                  cfg,
+		dcID:                 dcID,
+		log:                  log,
+		srp:                  srp.NewChallengeStore(srp.DefaultTTL),
+		logLoginCodes:        logLoginCodes,
+		maxFileBytes:         maxFileBytes,
+		blobs:                blobs,
+		maxUserStorageBytes:  maxUserStorageBytes,
+		downloads:            map[int64]bool{},
+		rateLimits:           rateLimits.MessageSend,
+		rateLimitCreateChat:  rateLimits.CreateChat,
+		rateLimitAddChatUser: rateLimits.AddChatUser,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
@@ -176,6 +186,20 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		return errMethodNotImpl
 	}))
 	return mtproto.UnpackInvoke(d)
+}
+
+// checkRateLimit checks the per-account rate limit for the given surface.
+// Returns nil when allowed, or a FLOOD_WAIT error when denied.
+func (h *handlers) checkRateLimit(r *mtproto.Request, surface string, cfg store.RateLimitConfig) error {
+	result, err := h.store.CheckRateLimit(r.Ctx, r.UserID, surface, cfg)
+	if err != nil {
+		h.log.Error("rate limit check", "user_id", r.UserID, "surface", surface, "err", err)
+		return errInternal
+	}
+	if result != nil {
+		return FloodWaitError(int(result.Wait / time.Second))
+	}
+	return nil
 }
 
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {

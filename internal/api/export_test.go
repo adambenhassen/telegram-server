@@ -49,6 +49,7 @@ func testHandlers(s *store.Store) *handlers {
 		maxFileBytes: TestMaxFileBytes,
 		downloads:    map[int64]bool{},
 		peers:        pgtest.PeerDeriver(),
+		rateLimits:   store.RateLimitConfig{},
 	}
 }
 
@@ -336,6 +337,45 @@ func SendMessageForTest(s *store.Store, userID int64, req *tg.MessagesSendMessag
 		return nil, err
 	}
 	return testHandlers(s).handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SendMessageForTestWithLimits encodes req and invokes handleSendMessage for the
+// caller with a custom message send rate limit config.
+func SendMessageForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimits = rateLimit
+	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SendMediaForTestWithLimits encodes req and invokes handleSendMedia with a
+// custom message send rate limit config.
+func SendMediaForTestWithLimits(
+	s *store.Store, userID int64, blobs blob.Store, maxUserStorageBytes int64,
+	rateLimit store.RateLimitConfig, req *tg.MessagesSendMediaRequest,
+) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.blobs, h.maxUserStorageBytes, h.rateLimits = blobs, maxUserStorageBytes, rateLimit
+	return h.handleSendMedia(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// ForwardMessagesForTestWithLimits encodes req and invokes handleForwardMessages
+// with a custom message send rate limit config.
+func ForwardMessagesForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesForwardMessagesRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimits = rateLimit
+	return h.handleForwardMessages(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // SendMediaForTest encodes req and invokes handleSendMedia for the caller,

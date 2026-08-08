@@ -59,12 +59,19 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 	}
 
 	// Denied — read expires_at in a fresh snapshot so we see the row committed
-	// by the concurrent transaction that won the race.
+	// by the concurrent transaction that won the race. The sweep can delete the
+	// row between the two reads: when it laps and the sweeper deletes it before
+	// this GET fires, the row is gone. In that case the request is allowed — the
+	// window that denied it has expired, and the sweep has already cleaned up.
 	expiresAt, err := s.q.GetRateLimitExpiresAt(ctx, db.GetRateLimitExpiresAtParams{
 		SubjectID: subjectID,
 		Surface:   surface,
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Row swept between INSERT and GET — window has expired, allow.
+			return nil, nil //nolint:nilnil // swept row means expired window
+		}
 		return nil, fmt.Errorf("get rate limit: %w", err)
 	}
 

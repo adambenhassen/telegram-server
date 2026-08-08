@@ -142,6 +142,10 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
+	// Rate limit before any write: all send paths draw from one shared budget.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimits); err != nil {
+		return nil, err
+	}
 	// Before the peer split, so the chat fan-out is guarded by the same check.
 	if !validText(req.Message) {
 		return nil, errMessageEmpty
@@ -535,6 +539,11 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 	}
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
+	}
+	// Rate limit before any write: forward draws from the shared message send
+	// budget.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimits); err != nil {
+		return nil, err
 	}
 	if len(req.ID) == 0 || len(req.RandomID) != len(req.ID) {
 		return nil, errPeerIDInvalid

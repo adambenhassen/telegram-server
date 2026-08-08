@@ -90,6 +90,10 @@ func (h *handlers) handleAddChatUser(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
+	// Rate limit before any write.
+	if err := h.checkRateLimit(r, "add_chat_user", h.rateLimitAddChatUser); err != nil {
+		return nil, err
+	}
 	target, err := h.resolveTarget(r.Ctx, req.UserID, r.UserID, "add chat user target")
 	if err != nil {
 		return nil, err
