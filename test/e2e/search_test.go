@@ -628,7 +628,6 @@ func TestSearchChatPeer(t *testing.T) {
 	dID := make(chan int64, 1)
 	errD := make(chan error, 1)
 	go func() { errD <- runInteractive(ctx, clientD, flowFor(phoneD), dID, dCmds) }()
-	var _ int64
 	select {
 	case <-dID:
 	case <-time.After(30 * time.Second):
@@ -662,12 +661,34 @@ func TestSearchChatPeer(t *testing.T) {
 	}
 
 	// 4. Channel peer returns PEER_ID_INVALID.
+	// Create a real channel so the access hash is valid and the request reaches
+	// the channel-specific branch of messagesSearch.
+	var chID int64
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
+			Title:     "test channel",
+			Broadcast: true,
+		})
+		if err != nil {
+			return err
+		}
+		ups, ok := res.(*tg.Updates)
+		if !ok {
+			return errors.New("createChannel: unexpected updates type")
+		}
+		for _, ch := range ups.Chats {
+			if channel, ok := ch.(*tg.Channel); ok {
+				chID = channel.ID
+				return nil
+			}
+		}
+		return errors.New("createChannel: no channel in response")
+	}); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSearch(ctx, &tg.MessagesSearchRequest{
-			Peer: &tg.InputPeerChannel{
-				ChannelID:  1,
-				AccessHash: 0,
-			},
+			Peer:   peerChannel(aUserID, chID),
 			Q:      "hello",
 			Filter: &tg.InputMessagesFilterEmpty{},
 		})

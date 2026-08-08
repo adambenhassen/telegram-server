@@ -1149,11 +1149,36 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 // chatSearch renders search results for a chat peer. It collects all authors
 // from the result set (plus the caller) and loads the chat metadata.
 func (h *handlers) chatSearch(r *mtproto.Request, chatID int64, msgs []store.Message, files map[int64]*tg.Document) (bin.Encoder, error) {
+	// Load createUsers for any create service rows, mirroring chatHistory.
+	var createUsers []int64
+	for _, m := range msgs {
+		if m.Action == store.ChatActionCreate {
+			parts, perr := h.store.Participants(r.Ctx, chatID)
+			if perr != nil {
+				h.log.Error("search messages participants", "chat_id", chatID, "err", perr)
+				return nil, errInternal
+			}
+			createUsers = make([]int64, len(parts))
+			for i, p := range parts {
+				createUsers[i] = p.UserID
+			}
+			break
+		}
+	}
+
 	tlMsgs := make([]tg.MessageClass, len(msgs))
 	authors := map[int64]bool{r.UserID: true}
 	for i, m := range msgs {
-		tlMsgs[i] = messageToTL(m, nil, files, nil, nil)
+		tlMsgs[i] = messageToTL(m, createUsers, files, nil, nil)
 		authors[m.FromID] = true
+		switch m.Action {
+		case store.ChatActionAddUser, store.ChatActionDeleteUser:
+			authors[m.ActionUserID] = true
+		case store.ChatActionCreate:
+			for _, id := range createUsers {
+				authors[id] = true
+			}
+		}
 	}
 	users, err := h.loadUsers(r.Ctx, authors, r.UserID)
 	if err != nil {
