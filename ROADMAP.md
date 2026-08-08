@@ -612,5 +612,7 @@ Apply to every milestone.
 - Wire integers (`pts`/`date`/`seq`/message id) are gotd `int`; DB columns are
   `BIGINT`; convert at the wire boundary.
 - Per-change gates: `go build ./...`, `go test ./...`, `golangci-lint run`,
-  `atlas migrate hash|validate`.
+  `atlas migrate hash|validate`. Run the tests via `make test` / `make test-db`,
+  and read `docs/testing.md` first if you are working inside a container — the
+  Postgres suites need a Docker networking step those targets handle.
 - A real gotd client is the compatibility oracle; each milestone ships an E2E gate.
