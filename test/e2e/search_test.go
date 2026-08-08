@@ -293,34 +293,7 @@ func TestSearchMessages(t *testing.T) {
 	}
 
 	// 9. Search with a query at the cap (500 chars) succeeds without error.
-	msgs, err = func() ([]*tg.Message, error) {
-		var out []*tg.Message
-		err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
-			capQuery := strings.Repeat("a", 500)
-			res, err := c.MessagesSearch(ctx, &tg.MessagesSearchRequest{
-				Peer:     peerB,
-				Q:        capQuery,
-				Filter:   &tg.InputMessagesFilterEmpty{},
-				OffsetID: 0,
-				Limit:    10,
-			})
-			if err != nil {
-				return err
-			}
-			m, ok := res.(*tg.MessagesMessages)
-			if !ok {
-				return nil
-			}
-			out = make([]*tg.Message, 0, len(m.Messages))
-			for _, msg := range m.Messages {
-				if msg, ok := msg.(*tg.Message); ok {
-					out = append(out, msg)
-				}
-			}
-			return nil
-		})
-		return out, err
-	}()
+	msgs, err = search(aCmds, peerB, strings.Repeat("a", 500), 0, 10)
 	if err != nil {
 		t.Fatalf("A search at cap (500): %v", err)
 	}

@@ -1085,7 +1085,7 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	if req.Q == "" {
 		return nil, errSearchQueryEmpty
 	}
-	if len(req.Q) > maxSearchQueryLen {
+	if utf8.RuneCountInString(req.Q) > maxSearchQueryLen {
 		return nil, errMessageTooLong
 	}
 	// Only InputMessagesFilterEmpty is supported; everything else is not implemented.
