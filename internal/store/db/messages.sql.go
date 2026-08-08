@@ -12,7 +12,7 @@ import (
 )
 
 const historyPage = `-- name: HistoryPage :many
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post FROM messages
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post, message_tsv FROM messages
 WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3
   AND deleted = false
   AND ($4::bigint = 0 OR local_id < $4::bigint)
@@ -65,6 +65,7 @@ func (q *Queries) HistoryPage(ctx context.Context, arg HistoryPageParams) ([]Mes
 			&i.FwdDate,
 			&i.FwdChannelID,
 			&i.FwdChannelPost,
+			&i.MessageTsv,
 		); err != nil {
 			return nil, err
 		}
@@ -129,7 +130,7 @@ func (q *Queries) InsertMessage(ctx context.Context, arg InsertMessageParams) er
 }
 
 const messageByOwnerLocal = `-- name: MessageByOwnerLocal :one
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post FROM messages WHERE owner_id = $1 AND local_id = $2
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post, message_tsv FROM messages WHERE owner_id = $1 AND local_id = $2
 `
 
 type MessageByOwnerLocalParams struct {
@@ -162,12 +163,13 @@ func (q *Queries) MessageByOwnerLocal(ctx context.Context, arg MessageByOwnerLoc
 		&i.FwdDate,
 		&i.FwdChannelID,
 		&i.FwdChannelPost,
+		&i.MessageTsv,
 	)
 	return i, err
 }
 
 const messageByRandomID = `-- name: MessageByRandomID :one
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post FROM messages WHERE owner_id = $1 AND random_id = $2 AND random_id <> 0
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post, message_tsv FROM messages WHERE owner_id = $1 AND random_id = $2 AND random_id <> 0
 `
 
 type MessageByRandomIDParams struct {
@@ -200,12 +202,13 @@ func (q *Queries) MessageByRandomID(ctx context.Context, arg MessageByRandomIDPa
 		&i.FwdDate,
 		&i.FwdChannelID,
 		&i.FwdChannelPost,
+		&i.MessageTsv,
 	)
 	return i, err
 }
 
 const messagesByFanout = `-- name: MessagesByFanout :many
-SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post FROM messages
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post, message_tsv FROM messages
 WHERE fanout_id = $1 AND fanout_id <> 0
 ORDER BY owner_id
 `
@@ -246,6 +249,7 @@ func (q *Queries) MessagesByFanout(ctx context.Context, fanoutID int64) ([]Messa
 			&i.FwdDate,
 			&i.FwdChannelID,
 			&i.FwdChannelPost,
+			&i.MessageTsv,
 		); err != nil {
 			return nil, err
 		}
@@ -268,6 +272,78 @@ func (q *Queries) NextFanoutID(ctx context.Context) (int64, error) {
 	var fanout_id int64
 	err := row.Scan(&fanout_id)
 	return fanout_id, err
+}
+
+const searchMessages = `-- name: SearchMessages :many
+SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post, message_tsv FROM messages
+WHERE owner_id = $1
+  AND peer_type = $2
+  AND peer_id = $3
+  AND out = true
+  AND deleted = false
+  AND message_tsv @@ plainto_tsquery('simple', $4)
+  AND ($5::bigint = 0 OR local_id < $5::bigint)
+ORDER BY local_id DESC
+LIMIT $6::int
+`
+
+type SearchMessagesParams struct {
+	OwnerID  int64
+	PeerType int16
+	PeerID   int64
+	Query    string
+	OffsetID int64
+	Lim      int32
+}
+
+func (q *Queries) SearchMessages(ctx context.Context, arg SearchMessagesParams) ([]Message, error) {
+	rows, err := q.db.Query(ctx, searchMessages,
+		arg.OwnerID,
+		arg.PeerType,
+		arg.PeerID,
+		arg.Query,
+		arg.OffsetID,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Message
+	for rows.Next() {
+		var i Message
+		if err := rows.Scan(
+			&i.OwnerID,
+			&i.LocalID,
+			&i.PeerID,
+			&i.FromID,
+			&i.Date,
+			&i.Message,
+			&i.Out,
+			&i.EditDate,
+			&i.Deleted,
+			&i.RandomID,
+			&i.PeerLocalID,
+			&i.PeerType,
+			&i.FanoutID,
+			&i.ActionType,
+			&i.ActionUserID,
+			&i.FileID,
+			&i.ReplyToMsgID,
+			&i.FwdFromID,
+			&i.FwdDate,
+			&i.FwdChannelID,
+			&i.FwdChannelPost,
+			&i.MessageTsv,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const setDeleted = `-- name: SetDeleted :exec

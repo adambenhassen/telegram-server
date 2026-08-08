@@ -145,6 +145,7 @@ type Message struct {
 	FwdDate        pgtype.Timestamptz
 	FwdChannelID   *int64
 	FwdChannelPost *int32
+	MessageTsv     interface{}
 }
 
 type MessageEvent struct {
@@ -217,6 +218,7 @@ type User struct {
 	IsOnline   bool
 	LastSeenAt pgtype.Timestamptz
 	Username   *string
+	NameTsv    interface{}
 }
 
 type UserPassword struct {
