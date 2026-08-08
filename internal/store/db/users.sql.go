@@ -7,6 +7,8 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createUser = `-- name: CreateUser :one
@@ -51,6 +53,17 @@ type SearchContactsByNameParams struct {
 	Lim     int32
 }
 
+type SearchContactsByNameRow struct {
+	ID         int64
+	Phone      string
+	FirstName  string
+	LastName   string
+	CreatedAt  pgtype.Timestamptz
+	IsOnline   bool
+	LastSeenAt pgtype.Timestamptz
+	Username   *string
+}
+
 // Search users by name within the caller's existing dialogs.
 // Only users with whom the caller has exchanged messages (has a dialog row) are returned.
 // The single owner_id arm is sufficient: sending a message writes two dialog rows
@@ -60,15 +73,15 @@ type SearchContactsByNameParams struct {
 // path could delete the peer-owned row without deleting the caller-owned one,
 // making the second arm incorrectly permissive. It also costs ~618 ms vs 0.10 ms
 // (seq-scan vs index-only) at 200k users.
-func (q *Queries) SearchContactsByName(ctx context.Context, arg SearchContactsByNameParams) ([]User, error) {
+func (q *Queries) SearchContactsByName(ctx context.Context, arg SearchContactsByNameParams) ([]SearchContactsByNameRow, error) {
 	rows, err := q.db.Query(ctx, searchContactsByName, arg.Query, arg.OwnerID, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []User
+	var items []SearchContactsByNameRow
 	for rows.Next() {
-		var i User
+		var i SearchContactsByNameRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Phone,

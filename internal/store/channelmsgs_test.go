@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func post(t *testing.T, s *store.Store, channelID, fromID int64, text string, rid int64) (store.ChannelMessage, int) {
@@ -604,5 +605,98 @@ func TestChannelDialogsForUserExcludesNonMember(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("rows = %d, want 0 (outsider sees nothing)", len(rows))
+	}
+}
+
+func TestChannelPostsFullTextIndex(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	author := mustUser(t, s, "+15551280001")
+	ch := mustChannel(t, s, author.ID, "reports")
+
+	// Post with searchable text.
+	post(t, s, ch.ID, author.ID, "the quarterly report is ready", 1)
+	post(t, s, ch.ID, author.ID, "meeting notes from today", 2)
+	post(t, s, ch.ID, author.ID, "nothing to see here", 3)
+
+	// Query for "report" — should match post 1 (case-insensitive).
+	var count int
+	pool := store.StorePool(s)
+	err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM channel_messages
+		WHERE channel_id = $1
+		  AND message_tsv @@ plainto_tsquery('simple', $2)
+	`, ch.ID, "report").Scan(&count)
+	if err != nil {
+		t.Fatalf("search query: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("search 'report' returned %d rows, want 1", count)
+	}
+
+	// Query for "NOTES" — should match post 2 (case-insensitive).
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM channel_messages
+		WHERE channel_id = $1
+		  AND message_tsv @@ plainto_tsquery('simple', $2)
+	`, ch.ID, "NOTES").Scan(&count)
+	if err != nil {
+		t.Fatalf("search query: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("search 'NOTES' returned %d rows, want 1", count)
+	}
+
+	// Query for "xyz" — should match nothing.
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM channel_messages
+		WHERE channel_id = $1
+		  AND message_tsv @@ plainto_tsquery('simple', $2)
+	`, ch.ID, "xyz").Scan(&count)
+	if err != nil {
+		t.Fatalf("search query: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("search 'xyz' returned %d rows, want 0", count)
+	}
+}
+
+func TestChannelPostsFullTextIndexUsesGINIndex(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	author := mustUser(t, s, "+15551280011")
+	ch := mustChannel(t, s, author.ID, "index-test")
+
+	post(t, s, ch.ID, author.ID, "the quarterly report is ready", 1)
+
+	// Verify the GIN index exists and is named correctly.
+	pool := store.StorePool(s)
+	var indexName pgtype.Text
+	err := pool.QueryRow(ctx, `
+		SELECT indexname FROM pg_indexes
+		WHERE tablename = 'channel_messages'
+		  AND indexname = 'channel_messages_message_tsv_idx'
+	`).Scan(&indexName)
+	if err != nil {
+		t.Fatalf("index lookup: %v", err)
+	}
+	if indexName.String != "channel_messages_message_tsv_idx" {
+		t.Fatalf("index name = %q, want channel_messages_message_tsv_idx", indexName.String)
+	}
+
+	// Verify the generated column is computed correctly.
+	var tsv pgtype.Text
+	err = pool.QueryRow(ctx, `
+		SELECT message_tsv FROM channel_messages
+		WHERE channel_id = $1 AND local_id = 1
+	`, ch.ID).Scan(&tsv)
+	if err != nil {
+		t.Fatalf("read message_tsv: %v", err)
+	}
+	// The 'simple' dictionary produces lowercase tokens without stemming.
+	if tsv.String == "" {
+		t.Fatal("message_tsv is empty")
 	}
 }

@@ -56,7 +56,7 @@ FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
 LEFT JOIN LATERAL (
-    SELECT cm.channel_id, cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date, cm.deleted, cm.random_id, cm.file_id
+    SELECT cm.channel_id, cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date, cm.deleted, cm.random_id, cm.file_id, cm.message_tsv
     FROM channel_messages cm
     WHERE cm.channel_id = c.id AND cm.deleted = false
     ORDER BY cm.local_id DESC

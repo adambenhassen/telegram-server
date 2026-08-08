@@ -78,7 +78,7 @@ func (q *Queries) ChannelEventsWindow(ctx context.Context, arg ChannelEventsWind
 }
 
 const channelHistoryPage = `-- name: ChannelHistoryPage :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id FROM channel_messages
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, message_tsv FROM channel_messages
 WHERE channel_id = $1 AND deleted = false
   AND ($2::bigint = 0 OR local_id < $2::bigint)
 ORDER BY local_id DESC
@@ -110,6 +110,7 @@ func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPage
 			&i.Deleted,
 			&i.RandomID,
 			&i.FileID,
+			&i.MessageTsv,
 		); err != nil {
 			return nil, err
 		}
@@ -122,7 +123,7 @@ func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPage
 }
 
 const channelMessageByLocal = `-- name: ChannelMessageByLocal :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id FROM channel_messages WHERE channel_id = $1 AND local_id = $2
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, message_tsv FROM channel_messages WHERE channel_id = $1 AND local_id = $2
 `
 
 type ChannelMessageByLocalParams struct {
@@ -143,12 +144,13 @@ func (q *Queries) ChannelMessageByLocal(ctx context.Context, arg ChannelMessageB
 		&i.Deleted,
 		&i.RandomID,
 		&i.FileID,
+		&i.MessageTsv,
 	)
 	return i, err
 }
 
 const channelMessageByRandomID = `-- name: ChannelMessageByRandomID :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id FROM channel_messages WHERE channel_id = $1 AND random_id = $2 AND random_id <> 0
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, message_tsv FROM channel_messages WHERE channel_id = $1 AND random_id = $2 AND random_id <> 0
 `
 
 type ChannelMessageByRandomIDParams struct {
@@ -169,12 +171,13 @@ func (q *Queries) ChannelMessageByRandomID(ctx context.Context, arg ChannelMessa
 		&i.Deleted,
 		&i.RandomID,
 		&i.FileID,
+		&i.MessageTsv,
 	)
 	return i, err
 }
 
 const channelMessagesByLocalIDs = `-- name: ChannelMessagesByLocalIDs :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id FROM channel_messages
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, message_tsv FROM channel_messages
 WHERE channel_id = $1 AND local_id = ANY($2::bigint[])
 `
 
@@ -202,6 +205,7 @@ func (q *Queries) ChannelMessagesByLocalIDs(ctx context.Context, arg ChannelMess
 			&i.Deleted,
 			&i.RandomID,
 			&i.FileID,
+			&i.MessageTsv,
 		); err != nil {
 			return nil, err
 		}
