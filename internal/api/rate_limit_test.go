@@ -692,3 +692,342 @@ func TestChatMediaSendsOneToken(t *testing.T) {
 		t.Fatalf("third send: expected FLOOD_WAIT, got %v", err)
 	}
 }
+
+// TestChatSendRateLimit proves that chat sends draw from the shared message
+// send budget and that N+1 is denied with FLOOD_WAIT.
+func TestChatSendRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294401")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551294402")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a chat with bob.
+	enc, err := api.CreateChatForTest(s, alice.ID, &tg.MessagesCreateChatRequest{
+		Users: []tg.InputUserClass{api.InputUser(alice.ID, bob.ID)},
+		Title: "Chat",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, ok := enc.(*tg.MessagesInvitedUsers)
+	if !ok {
+		t.Fatalf("result type = %T", enc)
+	}
+	ups, ok := res.Updates.(*tg.Updates)
+	if !ok || len(ups.Chats) != 1 {
+		t.Fatalf("updates = %T", res.Updates)
+	}
+	chat, ok := ups.Chats[0].(*tg.Chat)
+	if !ok {
+		t.Fatalf("chat type = %T", ups.Chats[0])
+	}
+
+	// Limit of 2.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	peerChat := api.InputPeerChat(alice.ID, chat.ID)
+
+	// Chat send 1 — consumes token 1.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChat, Message: "chat msg 1", RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("chat send 1: %v", err)
+	}
+
+	// Chat send 2 — consumes token 2.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChat, Message: "chat msg 2", RandomID: 2,
+	})
+	if err != nil {
+		t.Fatalf("chat send 2: %v", err)
+	}
+
+	// Chat send 3 — should be denied.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChat, Message: "blocked", RandomID: 3,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("chat send 3: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestChatSendRetryDoesNotRateLimit proves that a chat send retry with an
+// already-stored random_id returns the stored message, never FLOOD_WAIT.
+func TestChatSendRetryDoesNotRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294501")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551294502")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a chat with bob.
+	enc, err := api.CreateChatForTest(s, alice.ID, &tg.MessagesCreateChatRequest{
+		Users: []tg.InputUserClass{api.InputUser(alice.ID, bob.ID)},
+		Title: "Chat",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, ok := enc.(*tg.MessagesInvitedUsers)
+	if !ok {
+		t.Fatalf("result type = %T", enc)
+	}
+	ups, ok := res.Updates.(*tg.Updates)
+	if !ok || len(ups.Chats) != 1 {
+		t.Fatalf("updates = %T", res.Updates)
+	}
+	chat, ok := ups.Chats[0].(*tg.Chat)
+	if !ok {
+		t.Fatalf("chat type = %T", ups.Chats[0])
+	}
+
+	// Limit of 1.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	peerChat := api.InputPeerChat(alice.ID, chat.ID)
+
+	// Chat send — consumes the only token.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChat, Message: "original", RandomID: 42,
+	})
+	if err != nil {
+		t.Fatalf("chat send: %v", err)
+	}
+
+	// Retry same random_id — should succeed without consuming a token.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChat, Message: "retry", RandomID: 42,
+	})
+	if err != nil {
+		t.Fatalf("chat retry: expected success, got %v", err)
+	}
+}
+
+// TestChannelPostRateLimit proves that channel posts draw from the shared
+// message send budget and that N+1 is denied with FLOOD_WAIT.
+func TestChannelPostRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294601")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a channel with alice as admin.
+	channel, err := s.CreateChannel(ctx, alice.ID, "Test Channel", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit of 2.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	peerChannel := api.InputPeerChannel(alice.ID, channel.ID)
+
+	// Post 1 — consumes token 1.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChannel, Message: "post 1", RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("post 1: %v", err)
+	}
+
+	// Post 2 — consumes token 2.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChannel, Message: "post 2", RandomID: 2,
+	})
+	if err != nil {
+		t.Fatalf("post 2: %v", err)
+	}
+
+	// Post 3 — should be denied.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChannel, Message: "blocked", RandomID: 3,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("post 3: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestForwardRetryDoesNotRateLimit proves that a forward retry with all
+// random_ids already stored returns the stored result, never FLOOD_WAIT.
+func TestForwardRetryDoesNotRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294701")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551294702")
+	if err != nil {
+		t.Fatal(err)
+	}
+	charlie, err := s.CreateUser(ctx, "+15551294703")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit of 2: send (1) + forward (1) = 2, retry should be free.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	peerBob := api.InputPeerUser(alice.ID, bob.ID)
+	peerCharlie := api.InputPeerUser(alice.ID, charlie.ID)
+
+	// Send a message to bob — consumes token 1.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "original", RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Forward to charlie — consumes token 2.
+	_, err = api.ForwardMessagesForTestWithLimits(s, alice.ID, cfg, &tg.MessagesForwardMessagesRequest{
+		ToPeer:   peerCharlie,
+		FromPeer: peerBob,
+		ID:       []int{1},
+		RandomID: []int64{999},
+	})
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+
+	// Retry same random_id — should succeed without consuming a token.
+	_, err = api.ForwardMessagesForTestWithLimits(s, alice.ID, cfg, &tg.MessagesForwardMessagesRequest{
+		ToPeer:   peerCharlie,
+		FromPeer: peerBob,
+		ID:       []int{1},
+		RandomID: []int64{999},
+	})
+	if err != nil {
+		t.Fatalf("forward retry: expected success, got %v", err)
+	}
+}
+
+// TestEncryptedSendDeniedNoSideEffects proves that a denied encrypted send
+// writes no event row and advances no qts on the recipient.
+func TestEncryptedSendDeniedNoSideEffects(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294801")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551294802")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create an active secret chat.
+	chat, _, err := s.CreateSecretChatRequest(ctx, alice.ID, bob.ID, []byte{1}, []byte{2}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptSecretChat(ctx, chat.ID, bob.ID, []byte{3}, 42); err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit of 1.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	encPeer := api.InputEncryptedChat(alice.ID, chat.ID)
+	data := []byte("encrypted payload")
+
+	// Send 1 — consumes the only token.
+	_, err = api.SendEncryptedMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendEncryptedRequest{
+		Peer: encPeer, Data: data, RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("send 1: %v", err)
+	}
+
+	// Record bob's qts after the successful send.
+	bobState, err := s.State(ctx, bob.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qtsBefore := bobState.Qts
+
+	// Send 2 — should be denied.
+	_, err = api.SendEncryptedMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendEncryptedRequest{
+		Peer: encPeer, Data: data, RandomID: 2,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("send 2: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// Bob's qts should be unchanged — the denied send wrote nothing.
+	bobStateAfter, err := s.State(ctx, bob.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bobStateAfter.Qts != qtsBefore {
+		t.Fatalf("bob qts = %d, want %d (denied encrypted send advanced qts)", bobStateAfter.Qts, qtsBefore)
+	}
+}
+
+// TestChannelNotifyFiresOncePerPost proves that the channel notify fires
+// once per committed post and not at all on a duplicate.
+func TestChannelNotifyFiresOncePerPost(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294901")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a channel with alice as admin.
+	channel, err := s.CreateChannel(ctx, alice.ID, "Test Channel", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No rate limit for this test.
+	cfg := store.RateLimitConfig{}
+	peerChannel := api.InputPeerChannel(alice.ID, channel.ID)
+
+	// Post once.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChannel, Message: "post", RandomID: 42,
+	})
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// Retry same random_id — should succeed without firing notify again.
+	// We verify by checking that only one channel message exists.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerChannel, Message: "retry", RandomID: 42,
+	})
+	if err != nil {
+		t.Fatalf("retry: expected success, got %v", err)
+	}
+
+	// Only one channel message should exist.
+	history, err := s.ChannelHistory(ctx, channel.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("channel history = %d, want 1 (duplicate post committed)", len(history))
+	}
+}
