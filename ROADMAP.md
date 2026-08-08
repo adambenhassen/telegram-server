@@ -60,13 +60,13 @@ Users & help
 - `help.getConfig`, `users.getUsers`
 
 Contacts
-- `contacts.resolvePhone`, `contacts.resolveUsername`
+- `contacts.resolvePhone`, `contacts.resolveUsername`, `contacts.search`
 
 Messaging
 - `messages.sendMessage`, `messages.getDialogs`, `messages.getHistory`,
   `messages.readHistory`, `messages.editMessage`, `messages.deleteMessages`,
   `messages.setTyping`, `messages.createChat`, `messages.addChatUser`,
-  `messages.deleteChatUser`, `messages.editChatTitle`
+  `messages.deleteChatUser`, `messages.editChatTitle`, `messages.search`
 
 Media
 - `upload.saveFilePart`, `upload.saveBigFilePart`, `upload.getFile`,
@@ -359,6 +359,19 @@ Channels
 - E2E gate covers: set/resolve user username, uniqueness conflict, public channel
   join and post delivery, private channel refuses direct join, rate limit.
 
+### M13 — Server-side full-text search
+- Schema additions: `message_tsv` tsvector column on `messages`, `name_tsv`
+  tsvector column on `users`; GIN indexes on both; `'simple'` dictionary (no
+  stemming, exact-token match across all locales).
+- `messages.search` — full-text search over 1:1 dialog message bodies. Search
+  results are bounded by the same per-owner row predicates that gate
+  `messages.getHistory`: only messages the caller owns a non-deleted row for are
+  returned, enforcing the same authorization boundary as direct reads. A message
+  the caller could not fetch via `getHistory` cannot appear in search results.
+- `contacts.search` — full-text search over usernames and display names, scoped
+  to the caller's 1:1 dialog peers. Results are bounded by the caller's dialog
+  set: only accounts the caller shares a non-deleted dialog with are eligible.
+
 ## Planned — feature track
 
 ### M11 — Message features
@@ -372,9 +385,6 @@ Four stages in sequence:
    `messages.sendReaction` and `messages.getMessagesReactions`.
 4. **Pinned messages.** `messages.updatePinnedMessage` (admin-only in channels);
    `updatePinnedMessages` pushed to members; pinned message id surfaced in dialog.
-
-### Later
-- Server-side full-text search.
 
 ## Planned — operational track
 
@@ -565,6 +575,20 @@ Tracked so shortcuts don't rot into "later means never".
   hash; the existing 200-member cap is retained as a medium availability control. A follow-up
   should revisit whether a higher cap or a per-joiner rate limit is warranted once join-by-username
   traffic is observable. — M12
+
+- **`messages.searchGlobal` not implemented.** Cross-dialog global search is deferred to M14.
+  The index exists; the gap is the RPC and its pagination model. — M13
+- **Channel and megagroup message search not implemented.** `messages.search` covers 1:1 dialogs
+  only; channel and supergroup message bodies are indexed by `message_tsv` but the search RPC
+  does not accept channel peers. Deferred to M14. — M13
+- **Channel title search not implemented.** `contacts.search` covers dialog peers (users only);
+  channel name search via `name_tsv` on `channels` is not wired. Deferred to M14. — M13
+- **Media filename indexing deferred.** `name_tsv` on `messages` covers message text; document
+  file names are not indexed. Whether to index them — and under which dictionary — is an open
+  decision deferred to M14. — M13
+- **Secret-chat messages are permanently non-indexable.** The server stores encrypted blobs
+  without inspecting plaintext, so full-text indexing of secret-chat content is not possible by
+  design and will not be added. — M13
 
 ## Engineering invariants
 
