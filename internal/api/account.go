@@ -137,7 +137,8 @@ var usernameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{4,31}$`)
 //
 // An empty string clears the current username. A non-empty string must pass
 // validation (length, character set, first char, blocklist) before the store
-// is consulted. Returns tg.BoolTrue on success.
+// is consulted. Returns the updated user (UserClass) on success, matching the
+// gotd schema for account.updateUsername.
 func (h *handlers) handleUpdateUsername(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AccountUpdateUsernameRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -170,5 +171,16 @@ func (h *handlers) handleUpdateUsername(r *mtproto.Request) (bin.Encoder, error)
 			return nil, errInternal
 		}
 	}
-	return &tg.BoolTrue{}, nil
+
+	// Return the updated user, not BoolTrue: gotd v0.161.0 declares
+	// account.updateUsername as returning UserClass.
+	updatedUser, ok, err := h.store.UserByID(r.Ctx, r.UserID)
+	if err != nil {
+		h.log.Error("update username: load user", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !ok {
+		return nil, errInternal
+	}
+	return h.userToTL(updatedUser, r.UserID, true), nil
 }

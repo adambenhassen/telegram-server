@@ -2640,9 +2640,13 @@ func TestJoinChannelPublicSucceeds(t *testing.T) {
 		t.Fatalf("join: %v", err)
 	}
 	assertEncodes(t, res)
-	ups, ok := res.(*tg.Updates)
+	joinResult, ok := res.(*tg.MessagesChatInviteJoinResultOk)
 	if !ok {
-		t.Fatalf("join: got %T, want *tg.Updates", res)
+		t.Fatalf("join: got %T, want *tg.MessagesChatInviteJoinResultOk", res)
+	}
+	ups, ok := joinResult.Updates.(*tg.Updates)
+	if !ok {
+		t.Fatalf("join updates: got %T, want *tg.Updates", joinResult.Updates)
 	}
 	if len(ups.Chats) != 1 {
 		t.Fatalf("chats: got %d, want 1", len(ups.Chats))
