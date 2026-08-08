@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1051,12 +1052,12 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 	}
 
 	// Listen for channel post notifications.
-	notifyCount := 0
+	var notifyCount atomic.Int64
 	_, stop, err := store.StartListener(ctx, dsn,
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64, int64) {},
-		func(context.Context, int64) { notifyCount++ },
+		func(context.Context, int64) { notifyCount.Add(1) },
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64, bool) {},
 		func(context.Context, int64, int) {},
@@ -1068,6 +1069,19 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 		t.Fatalf("start listener: %v", err)
 	}
 	defer func() { _ = stop() }() //nolint:errcheck
+
+	// waitForNotify polls until the counter reaches want or times out.
+	waitForNotify := func(want int64) {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		for notifyCount.Load() < want {
+			select {
+			case <-ctx.Done():
+				t.Fatalf("notify count = %d, want %d (timed out)", notifyCount.Load(), want)
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
 
 	// No rate limit for this test.
 	cfg := store.RateLimitConfig{}
@@ -1081,11 +1095,8 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 		t.Fatalf("post: %v", err)
 	}
 
-	// Wait for notification to arrive.
-	time.Sleep(50 * time.Millisecond)
-	if notifyCount != 1 {
-		t.Fatalf("notify count after post = %d, want 1", notifyCount)
-	}
+	// Wait for the notification to arrive.
+	waitForNotify(1)
 
 	// Retry same random_id — should succeed without firing notify again.
 	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
@@ -1095,9 +1106,9 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 		t.Fatalf("retry: expected success, got %v", err)
 	}
 
-	// Notify count should still be 1 (duplicate did not fire).
-	time.Sleep(50 * time.Millisecond)
-	if notifyCount != 1 {
-		t.Fatalf("notify count after retry = %d, want 1 (dup fired notify)", notifyCount)
+	// Brief pause to let any spurious notify land, then assert count is still 1.
+	time.Sleep(100 * time.Millisecond)
+	if notifyCount.Load() != 1 {
+		t.Fatalf("notify count after retry = %d, want 1 (dup fired notify)", notifyCount.Load())
 	}
 }
