@@ -511,3 +511,12 @@ func ContactsSearchForTest(s *store.Store, userID int64, req *tg.ContactsSearchR
 	}
 	return testHandlers(s).handleContactsSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
+
+// SetUserFirstNameForTest updates a user's first_name directly, so tests can
+// seed searchable names. The name_tsv column is GENERATED ALWAYS, so Postgres
+// recomputes it automatically.
+func SetUserFirstNameForTest(s *store.Store, userID int64, firstName string) error {
+	_, err := s.Pool().Exec(context.Background(),
+		"UPDATE users SET first_name = $1 WHERE id = $2", firstName, userID)
+	return err
+}

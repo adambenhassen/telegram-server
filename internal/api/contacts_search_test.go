@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -57,13 +58,37 @@ func TestContactsSearchLimitDefault(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
 
-	caller, err := s.CreateUser(context.Background(), "15550000101")
+	caller, err := s.CreateUser(context.Background(), "15550000201")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Limit=0 should default to 10 — no error, just an empty result.
-	res, err := api.ContactsSearchForTest(s, caller.ID, &tg.ContactsSearchRequest{Q: "x", Limit: 0})
+	// Create 60 partners with matching first name "Alice".
+	for i := range 60 {
+		phone := fmt.Sprintf("155500002%03d", i)
+		_, err := s.CreateUser(context.Background(), phone)
+		if err != nil {
+			t.Fatalf("create user %d: %v", i, err)
+		}
+		partner, ok, err := s.UserByPhone(context.Background(), phone)
+		if err != nil || !ok {
+			t.Fatalf("load user %d: ok=%v err=%v", i, ok, err)
+		}
+		if err := api.SetUserFirstNameForTest(s, partner.ID, "Alice"); err != nil {
+			t.Fatalf("set name %d: %v", i, err)
+		}
+		// Establish dialog: caller sends a message to partner.
+		if _, err := api.SendMessageForTest(s, caller.ID, &tg.MessagesSendMessageRequest{
+			Peer:     api.InputPeerUser(caller.ID, partner.ID),
+			Message:  "hello",
+			RandomID: int64(i + 1),
+		}); err != nil {
+			t.Fatalf("send message %d: %v", i, err)
+		}
+	}
+
+	// Limit=0 should default to 10.
+	res, err := api.ContactsSearchForTest(s, caller.ID, &tg.ContactsSearchRequest{Q: "alice", Limit: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,8 +96,8 @@ func TestContactsSearchLimitDefault(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected response type: %T", res)
 	}
-	if found == nil || len(found.MyResults) != 0 {
-		t.Errorf("expected empty result, got %v", found)
+	if len(found.MyResults) != 10 {
+		t.Errorf("Limit=0: MyResults len = %d, want 10 (default)", len(found.MyResults))
 	}
 }
 
@@ -85,13 +110,37 @@ func TestContactsSearchLimitCap(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
 
-	caller, err := s.CreateUser(context.Background(), "15550000102")
+	caller, err := s.CreateUser(context.Background(), "15550000301")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Limit=999 should be capped to 50 — no error, just an empty result.
-	res, err := api.ContactsSearchForTest(s, caller.ID, &tg.ContactsSearchRequest{Q: "x", Limit: 999})
+	// Create 60 partners with matching first name "Bob".
+	for i := range 60 {
+		phone := fmt.Sprintf("155500003%03d", i)
+		_, err := s.CreateUser(context.Background(), phone)
+		if err != nil {
+			t.Fatalf("create user %d: %v", i, err)
+		}
+		partner, ok, err := s.UserByPhone(context.Background(), phone)
+		if err != nil || !ok {
+			t.Fatalf("load user %d: ok=%v err=%v", i, ok, err)
+		}
+		if err := api.SetUserFirstNameForTest(s, partner.ID, "Bob"); err != nil {
+			t.Fatalf("set name %d: %v", i, err)
+		}
+		// Establish dialog: caller sends a message to partner.
+		if _, err := api.SendMessageForTest(s, caller.ID, &tg.MessagesSendMessageRequest{
+			Peer:     api.InputPeerUser(caller.ID, partner.ID),
+			Message:  "hello",
+			RandomID: int64(i + 1),
+		}); err != nil {
+			t.Fatalf("send message %d: %v", i, err)
+		}
+	}
+
+	// Limit=999 should be capped to 50.
+	res, err := api.ContactsSearchForTest(s, caller.ID, &tg.ContactsSearchRequest{Q: "bob", Limit: 999})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,8 +148,8 @@ func TestContactsSearchLimitCap(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected response type: %T", res)
 	}
-	if found == nil || len(found.MyResults) != 0 {
-		t.Errorf("expected empty result, got %v", found)
+	if len(found.MyResults) != 50 {
+		t.Errorf("Limit=999: MyResults len = %d, want 50 (cap)", len(found.MyResults))
 	}
 }
 
