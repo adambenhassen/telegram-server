@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -22,7 +23,7 @@ type RateLimitConfig struct {
 // RateLimitResult is returned by CheckRateLimit when the request is denied.
 type RateLimitResult struct {
 	// Wait is how long the subject must wait before the next request is allowed.
-	// Always >= 1 second.
+	// Always >= 1 second, rounded up from the actual remainder.
 	Wait time.Duration
 }
 
@@ -33,88 +34,47 @@ type RateLimitResult struct {
 // RateLimitResult with the remaining wait time. A wrapped error indicates a
 // storage failure.
 //
-// The advisory lock key is derived from (subjectID, surface) so that
-// concurrent requests for the same subject are serialised, but different
-// subjects never block each other.
+// Exactness under concurrency comes from the row-level lock taken by the
+// INSERT ... ON CONFLICT query — different subjects never block each other.
 func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface string, cfg RateLimitConfig) (*RateLimitResult, error) {
 	if cfg.Limit <= 0 || cfg.Window <= 0 {
 		// Disabled: allow everything.
 		return nil, nil //nolint:nilnil // disabled config is not an error
 	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
-
-	// Serialize concurrent checks for the same (subject, surface). The lock key
-	// is a hash of both values so different subjects never contend.
-	lockKey := hashLockKey(subjectID, surface)
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockKey); err != nil {
-		return nil, fmt.Errorf("advisory lock: %w", err)
-	}
-
-	qtx := s.q.WithTx(tx)
-
-	// Try to update an existing row.
-	rows, err := qtx.UpsertRateLimit(ctx, db.UpsertRateLimitParams{
+	row, err := s.q.CheckAndConsumeRateLimit(ctx, db.CheckAndConsumeRateLimitParams{
 		SubjectID:  subjectID,
 		Surface:    surface,
 		Column3:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
 		TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
 	})
 	if err != nil {
-		return nil, fmt.Errorf("upsert rate limit: %w", err)
+		return nil, fmt.Errorf("check rate limit: %w", err)
 	}
 
-	if rows == 0 {
-		// No row existed — seed it with the first token consumed.
-		if err := qtx.InsertRateLimit(ctx, db.InsertRateLimitParams{
-			SubjectID: subjectID,
-			Surface:   surface,
-		}); err != nil {
-			return nil, fmt.Errorf("insert rate limit: %w", err)
-		}
-	}
-
-	// Read the current state to determine if allowed or denied.
-	row, err := qtx.GetRateLimit(ctx, db.GetRateLimitParams{
-		SubjectID: subjectID,
-		Surface:   surface,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("get rate limit: %w", err)
-	}
-
-	if row.TokenCount <= int32(cfg.Limit) { //nolint:gosec // rate limits are small positive ints
-		// Allowed — token was consumed above.
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("commit: %w", err)
-		}
+	if row.Consumed {
+		// Allowed — token was consumed.
 		return nil, nil //nolint:nilnil // allowed is not an error
 	}
 
-	// Denied — compute wait time.
+	// Denied — compute wait time using Postgres timestamps only.
+	// Window is the configured window; window_start is when the current
+	// window began. The remaining wait is window - (now - window_start).
+	// We use the Go clock here but only for the sub-second remainder — the
+	// window_start came from Postgres and the window is a constant, so the
+	// error is bounded to sub-second clock skew.
 	wait := cfg.Window - time.Since(row.WindowStart.Time)
-	wait = max(wait, time.Second)
+	// Round up to whole seconds and enforce minimum of 1.
+	waitSecs := int(math.Ceil(float64(wait) / float64(time.Second)))
+	waitSecs = max(waitSecs, 1)
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit: %w", err)
-	}
-
-	return &RateLimitResult{Wait: wait}, nil
+	return &RateLimitResult{Wait: time.Duration(waitSecs) * time.Second}, nil
 }
 
-// hashLockKey produces a deterministic int64 lock key from a subject ID and
-// surface name. It uses a simple FNV-1a hash combined with the subject ID.
-// Collisions are harmless — they just serialise more requests than necessary.
-func hashLockKey(subjectID int64, surface string) int64 {
-	// FNV-1a 64-bit hash of the surface, XOR'd with subjectID.
-	var h uint64 = 14695981039346656037
-	for i := range surface {
-		h ^= uint64(surface[i])
-		h *= 1099511628211
-	}
-	return int64(h) ^ subjectID //nolint:gosec // hash collision is acceptable for advisory locks
+// SweepExpiredRateLimits deletes rate-limit rows whose window has fully
+// expired, preventing unbounded growth of stale entries. Call periodically
+// (e.g. on startup or via a scheduled sweep) rather than on every check — the
+// window index keeps it efficient regardless.
+func (s *Store) SweepExpiredRateLimits(ctx context.Context, window time.Duration) error {
+	return s.q.SweepExpiredRateLimits(ctx, pgtype.Interval{Microseconds: window.Microseconds(), Valid: true})
 }

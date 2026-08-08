@@ -391,8 +391,11 @@ func TestRateLimitDenialNotError(t *testing.T) {
 	if result == nil {
 		t.Fatal("expected denial, got allowed")
 	}
-	// Wait should be positive.
+	// Wait should be positive and rounded to whole seconds.
 	if result.Wait <= 0 {
 		t.Errorf("wait = %v, want > 0", result.Wait)
+	}
+	if result.Wait%time.Second != 0 {
+		t.Errorf("wait = %v, want whole seconds", result.Wait)
 	}
 }

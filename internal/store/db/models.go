@@ -185,6 +185,7 @@ type RateLimit struct {
 	Surface     string
 	TokenCount  int32
 	WindowStart pgtype.Timestamptz
+	Consumed    bool
 }
 
 type SecretChat struct {
