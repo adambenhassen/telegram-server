@@ -35,17 +35,21 @@ INSERT INTO channel_messages (channel_id, local_id, from_id, message, random_id,
 VALUES ($1, $2, $3, $4, $5, $6);
 
 -- name: ChannelMessageByLocal :one
-SELECT * FROM channel_messages WHERE channel_id = $1 AND local_id = $2;
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages WHERE channel_id = $1 AND local_id = $2;
 
 -- name: ChannelMessageByRandomID :one
-SELECT * FROM channel_messages WHERE channel_id = $1 AND random_id = $2 AND random_id <> 0;
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages WHERE channel_id = $1 AND random_id = $2 AND random_id <> 0;
 
 -- name: ChannelMessagesByLocalIDs :many
-SELECT * FROM channel_messages
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages
 WHERE channel_id = $1 AND local_id = ANY(sqlc.arg(local_ids)::bigint[]);
 
 -- name: ChannelHistoryPage :many
-SELECT * FROM channel_messages
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages
 WHERE channel_id = sqlc.arg(channel_id) AND deleted = false
   AND (sqlc.arg(offset_id)::bigint = 0 OR local_id < sqlc.arg(offset_id)::bigint)
 ORDER BY local_id DESC
