@@ -36,7 +36,61 @@ type ChannelMessage struct {
 	FileID    *int64
 }
 
-func channelMessageFromRow(r db.ChannelMessage) ChannelMessage {
+func channelMessageFromRow(r db.ChannelMessageByLocalRow) ChannelMessage {
+	m := ChannelMessage{
+		ChannelID: r.ChannelID,
+		LocalID:   r.LocalID,
+		FromID:    r.FromID,
+		Date:      r.Date.Time,
+		Message:   r.Message,
+		Deleted:   r.Deleted,
+		RandomID:  r.RandomID,
+		FileID:    r.FileID,
+	}
+	if r.EditDate.Valid {
+		t := r.EditDate.Time
+		m.EditDate = &t
+	}
+	return m
+}
+
+func channelMessageFromRowByRandomID(r db.ChannelMessageByRandomIDRow) ChannelMessage {
+	m := ChannelMessage{
+		ChannelID: r.ChannelID,
+		LocalID:   r.LocalID,
+		FromID:    r.FromID,
+		Date:      r.Date.Time,
+		Message:   r.Message,
+		Deleted:   r.Deleted,
+		RandomID:  r.RandomID,
+		FileID:    r.FileID,
+	}
+	if r.EditDate.Valid {
+		t := r.EditDate.Time
+		m.EditDate = &t
+	}
+	return m
+}
+
+func channelMessageFromRowByIDs(r db.ChannelMessagesByLocalIDsRow) ChannelMessage {
+	m := ChannelMessage{
+		ChannelID: r.ChannelID,
+		LocalID:   r.LocalID,
+		FromID:    r.FromID,
+		Date:      r.Date.Time,
+		Message:   r.Message,
+		Deleted:   r.Deleted,
+		RandomID:  r.RandomID,
+		FileID:    r.FileID,
+	}
+	if r.EditDate.Valid {
+		t := r.EditDate.Time
+		m.EditDate = &t
+	}
+	return m
+}
+
+func channelMessageFromHistoryRow(r db.ChannelHistoryPageRow) ChannelMessage {
 	m := ChannelMessage{
 		ChannelID: r.ChannelID,
 		LocalID:   r.LocalID,
@@ -173,7 +227,7 @@ func (s *Store) postChannelMessage(
 		})
 		switch {
 		case e == nil:
-			return channelMessageFromRow(existing), int(st.Pts), true, nil
+			return channelMessageFromRowByRandomID(existing), int(st.Pts), true, nil
 		case !errors.Is(e, pgx.ErrNoRows):
 			return ChannelMessage{}, 0, false, fmt.Errorf("random_id lookup: %w", e)
 		}
@@ -280,7 +334,7 @@ func (s *Store) ChannelMessages(ctx context.Context, channelID int64, localIDs [
 	}
 	out := make(map[int64]ChannelMessage, len(rows))
 	for _, r := range rows {
-		out[r.LocalID] = channelMessageFromRow(r)
+		out[r.LocalID] = channelMessageFromRowByIDs(r)
 	}
 	return out, nil
 }
@@ -299,7 +353,7 @@ func (s *Store) ChannelHistory(ctx context.Context, channelID int64, offsetID in
 	}
 	msgs := make([]ChannelMessage, len(rows))
 	for i, r := range rows {
-		msgs[i] = channelMessageFromRow(r)
+		msgs[i] = channelMessageFromHistoryRow(r)
 	}
 	return msgs, nil
 }

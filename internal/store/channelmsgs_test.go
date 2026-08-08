@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -615,12 +616,12 @@ func TestChannelPostsFullTextIndex(t *testing.T) {
 	author := mustUser(t, s, "+15551280001")
 	ch := mustChannel(t, s, author.ID, "reports")
 
-	// Post with searchable text.
-	post(t, s, ch.ID, author.ID, "the quarterly report is ready", 1)
+	// Post 1 uses mixed case so the stored-side fold is exercised.
+	post(t, s, ch.ID, author.ID, "The Quarterly REPORT Is Ready", 1)
 	post(t, s, ch.ID, author.ID, "meeting notes from today", 2)
 	post(t, s, ch.ID, author.ID, "nothing to see here", 3)
 
-	// Query for "report" — should match post 1 (case-insensitive).
+	// Query for "report" — should match post 1 (case-insensitive on both sides).
 	var count int
 	pool := store.StorePool(s)
 	err := pool.QueryRow(ctx, `
@@ -671,22 +672,26 @@ func TestChannelPostsFullTextIndexUsesGINIndex(t *testing.T) {
 
 	post(t, s, ch.ID, author.ID, "the quarterly report is ready", 1)
 
-	// Verify the GIN index exists and is named correctly.
 	pool := store.StorePool(s)
-	var indexName pgtype.Text
+
+	// Verify the index is GIN, not just named correctly.
+	var indexDef pgtype.Text
 	err := pool.QueryRow(ctx, `
-		SELECT indexname FROM pg_indexes
+		SELECT indexdef FROM pg_indexes
 		WHERE tablename = 'channel_messages'
 		  AND indexname = 'channel_messages_message_tsv_idx'
-	`).Scan(&indexName)
+	`).Scan(&indexDef)
 	if err != nil {
 		t.Fatalf("index lookup: %v", err)
 	}
-	if indexName.String != "channel_messages_message_tsv_idx" {
-		t.Fatalf("index name = %q, want channel_messages_message_tsv_idx", indexName.String)
+	if indexDef.String == "" {
+		t.Fatal("indexdef is empty — index does not exist")
+	}
+	if !strings.Contains(indexDef.String, "USING gin") {
+		t.Fatalf("index is not GIN: %s", indexDef.String)
 	}
 
-	// Verify the generated column is computed correctly.
+	// Verify the generated column produces lowercase tokens without stemming.
 	var tsv pgtype.Text
 	err = pool.QueryRow(ctx, `
 		SELECT message_tsv FROM channel_messages
@@ -695,8 +700,7 @@ func TestChannelPostsFullTextIndexUsesGINIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read message_tsv: %v", err)
 	}
-	// The 'simple' dictionary produces lowercase tokens without stemming.
-	if tsv.String == "" {
-		t.Fatal("message_tsv is empty")
+	if tsv.String != "'is':4 'quarterly':2 'ready':5 'report':3 'the':1" {
+		t.Fatalf("message_tsv = %q, want 'is':4 'quarterly':2 'ready':5 'report':3 'the':1", tsv.String)
 	}
 }
