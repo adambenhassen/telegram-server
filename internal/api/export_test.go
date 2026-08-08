@@ -501,3 +501,13 @@ func UpdateUsernameForTest(s *store.Store, userID int64, username string) (bin.E
 func ClaimChannelUsernameForTest(s *store.Store, channelID int64, handle string) error {
 	return s.ClaimChannelUsername(context.Background(), channelID, handle)
 }
+
+// ContactsSearchForTest invokes handleContactsSearch for the caller against the
+// given request.
+func ContactsSearchForTest(s *store.Store, userID int64, req *tg.ContactsSearchRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleContactsSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
