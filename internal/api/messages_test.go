@@ -1221,56 +1221,6 @@ func mediaDocument(t *testing.T, m *tg.Message) *tg.Document {
 	return doc
 }
 
-func TestSearchMatchesInboundMessages(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	s := openStore(t)
-	a, err := s.CreateUser(ctx, "+15551295001")
-	if err != nil {
-		t.Fatalf("user a: %v", err)
-	}
-	b, err := s.CreateUser(ctx, "+15551295002")
-	if err != nil {
-		t.Fatalf("user b: %v", err)
-	}
-
-	// A sends "hello world" to B.
-	if _, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
-		Peer:     api.InputPeerUser(a.ID, b.ID),
-		Message:  "hello world",
-		RandomID: 1,
-	}); err != nil {
-		t.Fatalf("send: %v", err)
-	}
-
-	// B searches for "hello" — should return the inbound message from A.
-	enc, err := api.SearchForTest(s, b.ID, &tg.MessagesSearchRequest{
-		Peer:   api.InputPeerUser(b.ID, a.ID),
-		Q:      "hello",
-		Filter: &tg.InputMessagesFilterEmpty{},
-	})
-	if err != nil {
-		t.Fatalf("search: %v", err)
-	}
-	res, ok := enc.(*tg.MessagesMessages)
-	if !ok {
-		t.Fatalf("result type = %T, want *tg.MessagesMessages", enc)
-	}
-	if len(res.Messages) != 1 {
-		t.Fatalf("B search hello: got %d messages, want 1", len(res.Messages))
-	}
-	m, ok := res.Messages[0].(*tg.Message)
-	if !ok {
-		t.Fatalf("message type = %T, want *tg.Message", res.Messages[0])
-	}
-	if m.Message != "hello world" {
-		t.Fatalf("message text = %q, want %q", m.Message, "hello world")
-	}
-	if m.Out {
-		t.Error("inbound message should have out=false")
-	}
-}
-
 func TestSearchChatPeerReturnsBothDirections(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)

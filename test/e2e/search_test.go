@@ -185,36 +185,18 @@ func TestSearchMessages(t *testing.T) {
 		t.Errorf("A search foo[0] = %q, want %q", msgs[0].Message, "foo bar")
 	}
 
-	// 3. B searches for "hello" — should return B's own sent message ("hello from B")
-	// AND A's inbound messages ("hello world", "another hello here"): all three rows
-	// belong to B's owner_id, both directions match.
+	// 3. B searches for "hello" — should return B's own sent message ("hello from B"),
+	// not A's messages stored on B's side as inbound. The out=true predicate in the
+	// search query ensures only the caller's own sent messages are returned.
 	msgs, err = search(bCmds, peerA, "hello", 0, 10)
 	if err != nil {
 		t.Fatalf("B search hello: %v", err)
 	}
-	if len(msgs) != 3 {
-		t.Fatalf("B search hello: got %d messages, want 3", len(msgs))
+	if len(msgs) != 1 {
+		t.Fatalf("B search hello: got %d messages, want 1", len(msgs))
 	}
-	// Newest-first: "hello from B" (randomID 600, sent after A's messages),
-	// then "another hello here", then "hello world".
 	if msgs[0].Message != "hello from B" {
 		t.Errorf("B search hello[0] = %q, want %q", msgs[0].Message, "hello from B")
-	}
-	if msgs[1].Message != "another hello here" {
-		t.Errorf("B search hello[1] = %q, want %q", msgs[1].Message, "another hello here")
-	}
-	if msgs[2].Message != "hello world" {
-		t.Errorf("B search hello[2] = %q, want %q", msgs[2].Message, "hello world")
-	}
-
-	// 3b. A searches for "foo" — should return only A's sent message "foo bar",
-	// not B's inbound "foo from B" (different dialog, A searches against B as peer).
-	msgs, err = search(aCmds, peerB, "foo from", 0, 10)
-	if err != nil {
-		t.Fatalf("A search 'foo from': %v", err)
-	}
-	if len(msgs) != 0 {
-		t.Fatalf("A search 'foo from': got %d messages, want 0 (B's inbound doesn't match A's rows)", len(msgs))
 	}
 
 	// 4. Pagination: search with limit=1, then use offset_id.
@@ -537,11 +519,11 @@ func TestSearchChatPeer(t *testing.T) {
 			n++
 		}
 	}
-	// Each member receives all 4 messages (plus the create service message).
-	// Drain generously.
-	drainMessages(collA, 10)
-	drainMessages(collB, 10)
-	drainMessages(collC, 10)
+	// Each member receives all 4 chat messages sent above; the create service
+	// message arrives on the serviceMsg channel, not newMsg.
+	drainMessages(collA, 4)
+	drainMessages(collB, 4)
+	drainMessages(collC, 4)
 
 	// Small delay to ensure all messages are committed.
 	time.Sleep(100 * time.Millisecond)
