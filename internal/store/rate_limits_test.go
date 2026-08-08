@@ -373,10 +373,8 @@ func TestRateLimitWaitRoundsUp(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
 
-	// Use a window where the remainder after consuming is guaranteed to have
-	// a fractional second. 3s window, consume immediately: remainder ~3s.
-	// After sleeping 2.5s, remainder ~0.5s → should round up to 1s.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 3 * time.Second}
+	// 2s window: consume, sleep 1.5s → remainder ~0.5s → rounds up to 1s.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 2 * time.Second}
 	ctx := context.Background()
 	const subject = 950
 	const surface = "roundup"
@@ -387,7 +385,7 @@ func TestRateLimitWaitRoundsUp(t *testing.T) {
 	}
 
 	// Sleep so the remainder is a small fraction (< 1s but > 0).
-	time.Sleep(2 * 600 * time.Millisecond) // 2.5s of 3s window = 0.5s remaining
+	time.Sleep(1 * 600 * time.Millisecond) // 1.5s of 2s window ≈ 0.5s remaining
 
 	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
 	if err != nil {
