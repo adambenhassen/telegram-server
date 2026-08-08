@@ -351,7 +351,7 @@ func (h *handlers) handleSendEncryptedMessage(r *mtproto.Request) (bin.Encoder, 
 		return nil, err
 	}
 
-	event, _, err := h.store.SendEncryptedMessage(r.Ctx, store.EncryptedSend{
+	event, dup, err := h.store.SendEncryptedMessage(r.Ctx, store.EncryptedSend{
 		RecipientID: recipientID,
 		ChatID:      chatID,
 		RandomID:    req.RandomID,
@@ -360,8 +360,11 @@ func (h *handlers) handleSendEncryptedMessage(r *mtproto.Request) (bin.Encoder, 
 	if err != nil {
 		return nil, err
 	}
-
-	h.notifyEncryptedMsg(r.Ctx, recipientID, event.Qts)
+	// Only notify when the event is new. A duplicate means another caller
+	// already committed the same random_id and fired the push.
+	if !dup {
+		h.notifyEncryptedMsg(r.Ctx, recipientID, event.Qts)
+	}
 	return &tg.MessagesSentEncryptedMessage{
 		Date: int(event.Date.Unix()),
 	}, nil

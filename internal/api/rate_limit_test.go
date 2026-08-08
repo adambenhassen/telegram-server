@@ -551,13 +551,13 @@ func TestEncryptedSendRateLimit(t *testing.T) {
 		t.Fatalf("send 3: expected FLOOD_WAIT, got %v", err)
 	}
 
-	// No side effects: only 2 events should exist.
-	events, err := s.SecretChatsAfterDate(ctx, bob.ID, time.Time{})
+	// No side effects: bob's qts should be unchanged (2 events = 2 qts bumps).
+	bobStateAfter, err := s.State(ctx, bob.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 {
-		t.Fatalf("bob secret chats = %d, want 1", len(events))
+	if bobStateAfter.Qts != 2 {
+		t.Fatalf("bob qts = %d, want 2 (denied encrypted send advanced qts)", bobStateAfter.Qts)
 	}
 }
 
