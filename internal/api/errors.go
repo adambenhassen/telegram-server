@@ -1,10 +1,23 @@
 // Package api implements the MTProto RPC method handlers.
 package api
 
-import "github.com/gotd/td/tgerr"
+import (
+	"fmt"
+
+	"github.com/gotd/td/tgerr"
+)
 
 func rpcErr(code int, msg string) *tgerr.Error {
 	return tgerr.New(code, msg)
+}
+
+// FloodWaitError returns a 420 error with a dynamic FLOOD_WAIT_<n> message,
+// where n is the number of seconds the client must wait (minimum 1).
+func FloodWaitError(seconds int) *tgerr.Error {
+	if seconds < 1 {
+		seconds = 1
+	}
+	return rpcErr(420, fmt.Sprintf("FLOOD_WAIT_%d", seconds))
 }
 
 var (
