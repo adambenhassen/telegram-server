@@ -219,7 +219,16 @@ func TestRateLimitConcurrentBoundary(t *testing.T) {
 	const subject = 600
 	const surface = "concurrent"
 
-	const n = 10 // more than the limit
+	// Pre-seed the row with 4 tokens consumed, leaving exactly 1 slot.
+	// This avoids the race between the first INSERT and the denied goroutines
+	// — all N goroutines contend for the same single slot.
+	for range 4 {
+		if _, err := s.CheckRateLimit(ctx, subject, surface, cfg); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	const n = 10 // more than the remaining slot
 
 	type result struct {
 		err    error
@@ -256,11 +265,11 @@ func TestRateLimitConcurrentBoundary(t *testing.T) {
 		}
 	}
 
-	if successes != cfg.Limit {
-		t.Errorf("successes = %d, want %d", successes, cfg.Limit)
+	if successes != 1 {
+		t.Errorf("successes = %d, want 1 (one slot remaining)", successes)
 	}
-	if denials != n-cfg.Limit {
-		t.Errorf("denials = %d, want %d", denials, n-cfg.Limit)
+	if denials != n-1 {
+		t.Errorf("denials = %d, want %d", denials, n-1)
 	}
 	if other != 0 {
 		t.Errorf("unexpected errors = %d, want 0", other)
@@ -364,7 +373,7 @@ func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
 	}
 }
 
-func TestRateLimitWaitRoundsToWholeSeconds(t *testing.T) {
+func TestRateLimitWaitRoundsUp(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
@@ -376,14 +385,14 @@ func TestRateLimitWaitRoundsToWholeSeconds(t *testing.T) {
 	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
 	ctx := context.Background()
 	const subject = 950
-	const surface = "roundtosec"
+	const surface = "roundup"
 
 	// Consume the token.
 	if _, err := s.CheckRateLimit(ctx, subject, surface, cfg); err != nil {
 		t.Fatalf("first request: %v", err)
 	}
 
-	// Denial should round to whole seconds.
+	// Denial should round up to whole seconds: 9.99s rounds to 10s.
 	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
 	if err != nil {
 		t.Fatalf("denial: %v", err)
@@ -391,11 +400,10 @@ func TestRateLimitWaitRoundsToWholeSeconds(t *testing.T) {
 	if result == nil {
 		t.Fatal("expected denial, got allowed")
 	}
-	if result.Wait%time.Second != 0 {
-		t.Errorf("wait = %v, want whole seconds", result.Wait)
+	// Must be exactly the full window rounded to seconds (ceil from ~9.99s).
+	if result.Wait != 10*time.Second {
+		t.Errorf("wait = %v, want 10s (ceil to whole seconds)", result.Wait)
 	}
-	// Round up is implicit: 9.x seconds of remaining time rounds to 10, not 9.
-	// A remainder < 1s rounds to 1s (tested in TestRateLimitWaitMinimumOneSecond).
 }
 
 func TestRateLimitDenialNotError(t *testing.T) {

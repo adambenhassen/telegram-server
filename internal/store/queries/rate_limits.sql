@@ -1,49 +1,45 @@
--- name: CheckAndConsumeRateLimit :one
--- Atomic check-and-consume on a rate-limit counter. Single query, no advisory lock.
+-- name: TryConsumeRateLimit :one
+-- Attempt to consume a rate-limit token.
 --
--- Phase 1 (upsert CTE): INSERT seeds a new counter; ON CONFLICT fires the DO UPDATE:
+-- INSERT seeds a new counter; ON CONFLICT fires the DO UPDATE:
 --   - Window expired: reset count=1, window_start=now, expires_at=now+window.
 --   - Window active, under limit: bump count.
 --   - Window active, at limit: the WHERE clause prevents the UPDATE entirely.
 --
---   The RETURNING clause fires for both INSERT and successful UPDATE. When the
---   UPDATE is prevented (at limit), the CTE produces no row.
---
--- Phase 2 (SELECT): If the CTE returned a row, the request was allowed and the
---   row carries the new state. If the CTE produced nothing, fall back to reading
---   the existing row to compute the remaining wait — the request is denied.
+-- Returns one row (from RETURNING) when the request is allowed.
+-- Returns pgx.ErrNoRows when the request is denied (UPDATE prevented by WHERE).
 --
 -- Exactness under concurrency comes from the row-level lock taken by
 -- INSERT ... ON CONFLICT — different subjects never block each other.
-WITH upsert AS (
-    INSERT INTO rate_limits (subject_id, surface, token_count, window_start, expires_at)
-    VALUES ($1, $2, 1, now(), now() + $3::INTERVAL)
-    ON CONFLICT (subject_id, surface) DO UPDATE SET
-        token_count = CASE
-            WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN 1
-            WHEN rate_limits.token_count < $4 THEN rate_limits.token_count + 1
-            ELSE rate_limits.token_count
-        END,
-        window_start = CASE
-            WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now()
-            ELSE rate_limits.window_start
-        END,
-        expires_at = CASE
-            WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now() + $3::INTERVAL
-            ELSE rate_limits.expires_at
-        END
-    WHERE now() - rate_limits.window_start >= $3::INTERVAL
-       OR rate_limits.token_count < $4
-    RETURNING token_count, window_start, expires_at
-)
-SELECT token_count, window_start, expires_at, true AS consumed
-FROM upsert
-UNION ALL
-SELECT rl.token_count, rl.window_start, rl.expires_at, false
-FROM rate_limits rl
-WHERE rl.subject_id = $1 AND rl.surface = $2
-  AND NOT EXISTS (SELECT 1 FROM upsert)
-LIMIT 1;
+INSERT INTO rate_limits (subject_id, surface, token_count, window_start, expires_at)
+VALUES ($1, $2, 1, now(), now() + $3::INTERVAL)
+ON CONFLICT (subject_id, surface) DO UPDATE SET
+    token_count = CASE
+        WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN 1
+        WHEN rate_limits.token_count < $4 THEN rate_limits.token_count + 1
+        ELSE rate_limits.token_count
+    END,
+    window_start = CASE
+        WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now()
+        ELSE rate_limits.window_start
+    END,
+    expires_at = CASE
+        WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now() + $3::INTERVAL
+        ELSE rate_limits.expires_at
+    END
+WHERE now() - rate_limits.window_start >= $3::INTERVAL
+   OR rate_limits.token_count < $4
+RETURNING token_count, window_start, expires_at;
+
+-- name: GetRateLimitExpiresAt :one
+-- Read the expiry deadline for a denied rate-limit check.
+-- Called after TryConsumeRateLimit returns ErrNoRows to compute the wait time.
+-- Uses a fresh READ COMMITTED snapshot so it sees the row committed by the
+-- concurrent transaction that won the race.
+SELECT expires_at
+FROM rate_limits
+WHERE subject_id = $1
+  AND surface = $2;
 
 -- name: SweepExpiredRateLimits :exec
 -- Delete rows whose per-row expiry deadline has passed. The deadline is stored

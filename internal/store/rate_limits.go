@@ -2,10 +2,12 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
@@ -16,7 +18,7 @@ type RateLimitConfig struct {
 	// Limit is the maximum number of tokens (requests) allowed per window.
 	// Zero disables enforcement for this surface.
 	Limit int
-	// Window is the duration of the sliding window.
+	// Window is the duration of the fixed window.
 	Window time.Duration
 }
 
@@ -42,27 +44,34 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 		return nil, nil //nolint:nilnil // disabled config is not an error
 	}
 
-	row, err := s.q.CheckAndConsumeRateLimit(ctx, db.CheckAndConsumeRateLimitParams{
+	_, err := s.q.TryConsumeRateLimit(ctx, db.TryConsumeRateLimitParams{
 		SubjectID:  subjectID,
 		Surface:    surface,
 		Column3:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
 		TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
 	})
-	if err != nil {
-		return nil, fmt.Errorf("check rate limit: %w", err)
-	}
-
-	if row.Consumed {
+	if err == nil {
 		// Allowed — token was consumed.
 		return nil, nil //nolint:nilnil // allowed is not an error
 	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("check rate limit: %w", err)
+	}
 
-	// Denied — compute wait from Postgres timestamps only.
-	// expires_at = window_start + window, so the remaining wait is
-	// expires_at - now(). Using the Go clock to measure against a
-	// Postgres timestamp is acceptable here because the error is bounded
-	// to the app/DB clock offset, which is negligible on a single host.
-	wait := time.Until(row.ExpiresAt.Time)
+	// Denied — read expires_at in a fresh snapshot so we see the row committed
+	// by the concurrent transaction that won the race.
+	expiresAt, err := s.q.GetRateLimitExpiresAt(ctx, db.GetRateLimitExpiresAtParams{
+		SubjectID: subjectID,
+		Surface:   surface,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get rate limit: %w", err)
+	}
+
+	// Compute wait from Postgres timestamp. time.Until reads the Go clock;
+	// the error is bounded to the app/DB clock offset, which is negligible
+	// on a single host.
+	wait := time.Until(expiresAt.Time)
 	// Round up to whole seconds and enforce minimum of 1.
 	waitSecs := int(math.Ceil(float64(wait) / float64(time.Second)))
 	waitSecs = max(waitSecs, 1)

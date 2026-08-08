@@ -11,87 +11,27 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const checkAndConsumeRateLimit = `-- name: CheckAndConsumeRateLimit :one
-WITH upsert AS (
-    INSERT INTO rate_limits (subject_id, surface, token_count, window_start, expires_at)
-    VALUES ($1, $2, 1, now(), now() + $3::INTERVAL)
-    ON CONFLICT (subject_id, surface) DO UPDATE SET
-        token_count = CASE
-            WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN 1
-            WHEN rate_limits.token_count < $4 THEN rate_limits.token_count + 1
-            ELSE rate_limits.token_count
-        END,
-        window_start = CASE
-            WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now()
-            ELSE rate_limits.window_start
-        END,
-        expires_at = CASE
-            WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now() + $3::INTERVAL
-            ELSE rate_limits.expires_at
-        END
-    WHERE now() - rate_limits.window_start >= $3::INTERVAL
-       OR rate_limits.token_count < $4
-    RETURNING token_count, window_start, expires_at
-)
-SELECT token_count, window_start, expires_at, true AS consumed
-FROM upsert
-UNION ALL
-SELECT rl.token_count, rl.window_start, rl.expires_at, false
-FROM rate_limits rl
-WHERE rl.subject_id = $1 AND rl.surface = $2
-  AND NOT EXISTS (SELECT 1 FROM upsert)
-LIMIT 1
+const getRateLimitExpiresAt = `-- name: GetRateLimitExpiresAt :one
+SELECT expires_at
+FROM rate_limits
+WHERE subject_id = $1
+  AND surface = $2
 `
 
-type CheckAndConsumeRateLimitParams struct {
-	SubjectID  int64
-	Surface    string
-	Column3    pgtype.Interval
-	TokenCount int32
+type GetRateLimitExpiresAtParams struct {
+	SubjectID int64
+	Surface   string
 }
 
-type CheckAndConsumeRateLimitRow struct {
-	TokenCount  int32
-	WindowStart pgtype.Timestamptz
-	ExpiresAt   pgtype.Timestamptz
-	Consumed    bool
-}
-
-// Atomic check-and-consume on a rate-limit counter. Single query, no advisory lock.
-//
-// Phase 1 (upsert CTE): INSERT seeds a new counter; ON CONFLICT fires the DO UPDATE:
-//
-//   - Window expired: reset count=1, window_start=now, expires_at=now+window.
-//
-//   - Window active, under limit: bump count.
-//
-//   - Window active, at limit: the WHERE clause prevents the UPDATE entirely.
-//
-//     The RETURNING clause fires for both INSERT and successful UPDATE. When the
-//     UPDATE is prevented (at limit), the CTE produces no row.
-//
-// Phase 2 (SELECT): If the CTE returned a row, the request was allowed and the
-//
-//	row carries the new state. If the CTE produced nothing, fall back to reading
-//	the existing row to compute the remaining wait — the request is denied.
-//
-// Exactness under concurrency comes from the row-level lock taken by
-// INSERT ... ON CONFLICT — different subjects never block each other.
-func (q *Queries) CheckAndConsumeRateLimit(ctx context.Context, arg CheckAndConsumeRateLimitParams) (CheckAndConsumeRateLimitRow, error) {
-	row := q.db.QueryRow(ctx, checkAndConsumeRateLimit,
-		arg.SubjectID,
-		arg.Surface,
-		arg.Column3,
-		arg.TokenCount,
-	)
-	var i CheckAndConsumeRateLimitRow
-	err := row.Scan(
-		&i.TokenCount,
-		&i.WindowStart,
-		&i.ExpiresAt,
-		&i.Consumed,
-	)
-	return i, err
+// Read the expiry deadline for a denied rate-limit check.
+// Called after TryConsumeRateLimit returns ErrNoRows to compute the wait time.
+// Uses a fresh READ COMMITTED snapshot so it sees the row committed by the
+// concurrent transaction that won the race.
+func (q *Queries) GetRateLimitExpiresAt(ctx context.Context, arg GetRateLimitExpiresAtParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, getRateLimitExpiresAt, arg.SubjectID, arg.Surface)
+	var expires_at pgtype.Timestamptz
+	err := row.Scan(&expires_at)
+	return expires_at, err
 }
 
 const sweepExpiredRateLimits = `-- name: SweepExpiredRateLimits :exec
@@ -105,4 +45,63 @@ WHERE expires_at < now()
 func (q *Queries) SweepExpiredRateLimits(ctx context.Context) error {
 	_, err := q.db.Exec(ctx, sweepExpiredRateLimits)
 	return err
+}
+
+const tryConsumeRateLimit = `-- name: TryConsumeRateLimit :one
+INSERT INTO rate_limits (subject_id, surface, token_count, window_start, expires_at)
+VALUES ($1, $2, 1, now(), now() + $3::INTERVAL)
+ON CONFLICT (subject_id, surface) DO UPDATE SET
+    token_count = CASE
+        WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN 1
+        WHEN rate_limits.token_count < $4 THEN rate_limits.token_count + 1
+        ELSE rate_limits.token_count
+    END,
+    window_start = CASE
+        WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now()
+        ELSE rate_limits.window_start
+    END,
+    expires_at = CASE
+        WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now() + $3::INTERVAL
+        ELSE rate_limits.expires_at
+    END
+WHERE now() - rate_limits.window_start >= $3::INTERVAL
+   OR rate_limits.token_count < $4
+RETURNING token_count, window_start, expires_at
+`
+
+type TryConsumeRateLimitParams struct {
+	SubjectID  int64
+	Surface    string
+	Column3    pgtype.Interval
+	TokenCount int32
+}
+
+type TryConsumeRateLimitRow struct {
+	TokenCount  int32
+	WindowStart pgtype.Timestamptz
+	ExpiresAt   pgtype.Timestamptz
+}
+
+// Attempt to consume a rate-limit token.
+//
+// INSERT seeds a new counter; ON CONFLICT fires the DO UPDATE:
+//   - Window expired: reset count=1, window_start=now, expires_at=now+window.
+//   - Window active, under limit: bump count.
+//   - Window active, at limit: the WHERE clause prevents the UPDATE entirely.
+//
+// Returns one row (from RETURNING) when the request is allowed.
+// Returns pgx.ErrNoRows when the request is denied (UPDATE prevented by WHERE).
+//
+// Exactness under concurrency comes from the row-level lock taken by
+// INSERT ... ON CONFLICT — different subjects never block each other.
+func (q *Queries) TryConsumeRateLimit(ctx context.Context, arg TryConsumeRateLimitParams) (TryConsumeRateLimitRow, error) {
+	row := q.db.QueryRow(ctx, tryConsumeRateLimit,
+		arg.SubjectID,
+		arg.Surface,
+		arg.Column3,
+		arg.TokenCount,
+	)
+	var i TryConsumeRateLimitRow
+	err := row.Scan(&i.TokenCount, &i.WindowStart, &i.ExpiresAt)
+	return i, err
 }

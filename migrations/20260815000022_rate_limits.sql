@@ -1,4 +1,4 @@
--- M14 rate limiter: O(1) sliding-window counter per (subject, surface).
+-- M14 rate limiter: O(1) fixed-window counter per (subject, surface).
 --
 -- Each row holds the token count, the start of the current window, and the
 -- expiry deadline (window_start + window). A check-and-consume atomically
@@ -16,7 +16,7 @@ CREATE TABLE rate_limits (
     surface      TEXT         NOT NULL,
     token_count  INT          NOT NULL DEFAULT 0,
     window_start TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    expires_at   TIMESTAMPTZ  NOT NULL DEFAULT (now() + INTERVAL '1 hour'),
+    expires_at   TIMESTAMPTZ  NOT NULL,
     PRIMARY KEY (subject_id, surface)
 );
 
