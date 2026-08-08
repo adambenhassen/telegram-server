@@ -1034,7 +1034,9 @@ func TestEncryptedSendDeniedNoSideEffects(t *testing.T) {
 }
 
 // TestChannelNotifyFiresOncePerPost proves that the channel notify fires
-// once per committed post and not at all on a duplicate.
+// once per committed post and not at all on a duplicate. The dup path is
+// only reachable when two posts sharing a random_id race past the handler's
+// read-only dedupe check, so this test drives them concurrently.
 func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1087,28 +1089,30 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 	cfg := store.RateLimitConfig{}
 	peerChannel := api.InputPeerChannel(alice.ID, channel.ID)
 
-	// Post once — should fire one notify.
-	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
-		Peer: peerChannel, Message: "post", RandomID: 42,
-	})
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
+	// Two concurrent posts sharing the same random_id: only one commits,
+	// so only one notify should fire.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{ //nolint:errcheck // race: one wins, one loses
+			Peer: peerChannel, Message: "race1", RandomID: 42,
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{ //nolint:errcheck // race: one wins, one loses
+			Peer: peerChannel, Message: "race2", RandomID: 42,
+		})
+	}()
+	wg.Wait()
 
-	// Wait for the notification to arrive.
+	// Wait for the single notification.
 	waitForNotify(1)
 
-	// Retry same random_id — should succeed without firing notify again.
-	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
-		Peer: peerChannel, Message: "retry", RandomID: 42,
-	})
-	if err != nil {
-		t.Fatalf("retry: expected success, got %v", err)
-	}
-
-	// Brief pause to let any spurious notify land, then assert count is still 1.
+	// Allow a brief window for a spurious second notify, then assert.
 	time.Sleep(100 * time.Millisecond)
 	if notifyCount.Load() != 1 {
-		t.Fatalf("notify count after retry = %d, want 1 (dup fired notify)", notifyCount.Load())
+		t.Fatalf("notify count = %d, want 1 (dup fired notify)", notifyCount.Load())
 	}
 }
