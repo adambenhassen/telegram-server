@@ -157,46 +157,63 @@ func TestSearchMessages(t *testing.T) {
 		return msgs, err
 	}
 
-	// 1. A searches for "hello" — should return exactly 2 A-owned messages.
+	// 1. A searches for "hello" — should return 3: A's two sent messages and B's
+	// "hello from B" (inbound matching, both directions).
 	msgs, err := search(aCmds, peerB, "hello", 0, 10)
 	if err != nil {
 		t.Fatalf("A search hello: %v", err)
 	}
-	if len(msgs) != 2 {
-		t.Fatalf("A search hello: got %d messages, want 2", len(msgs))
+	if len(msgs) != 3 {
+		t.Fatalf("A search hello: got %d messages, want 3", len(msgs))
 	}
-	// Results should be newest-first: "another hello here" then "hello world".
-	if msgs[0].Message != "another hello here" {
-		t.Errorf("A search hello[0] = %q, want %q", msgs[0].Message, "another hello here")
+	// Newest-first: "another hello here" (randomID 400), "hello from B" (randomID 600),
+	// "hello world" (randomID 100). Ordered by local_id DESC.
+	if msgs[0].Message != "hello from B" {
+		t.Errorf("A search hello[0] = %q, want %q", msgs[0].Message, "hello from B")
 	}
-	if msgs[1].Message != "hello world" {
-		t.Errorf("A search hello[1] = %q, want %q", msgs[1].Message, "hello world")
+	if msgs[1].Message != "another hello here" {
+		t.Errorf("A search hello[1] = %q, want %q", msgs[1].Message, "another hello here")
+	}
+	if msgs[2].Message != "hello world" {
+		t.Errorf("A search hello[2] = %q, want %q", msgs[2].Message, "hello world")
 	}
 
-	// 2. A searches for "foo" — should return exactly 1 result.
+	// 2. A searches for "foo" — should return 2: A's "foo bar" and B's "foo from B".
 	msgs, err = search(aCmds, peerB, "foo", 0, 10)
 	if err != nil {
 		t.Fatalf("A search foo: %v", err)
 	}
-	if len(msgs) != 1 {
-		t.Fatalf("A search foo: got %d messages, want 1", len(msgs))
+	if len(msgs) != 2 {
+		t.Fatalf("A search foo: got %d messages, want 2", len(msgs))
 	}
-	if msgs[0].Message != "foo bar" {
-		t.Errorf("A search foo[0] = %q, want %q", msgs[0].Message, "foo bar")
+	// Newest-first: "foo from B" (randomID 700) then "foo bar" (randomID 200).
+	if msgs[0].Message != "foo from B" {
+		t.Errorf("A search foo[0] = %q, want %q", msgs[0].Message, "foo from B")
+	}
+	if msgs[1].Message != "foo bar" {
+		t.Errorf("A search foo[1] = %q, want %q", msgs[1].Message, "foo bar")
 	}
 
-	// 3. B searches for "hello" — should return B's own sent message ("hello from B"),
-	// not A's messages stored on B's side as inbound. The out=true predicate in the
-	// search query ensures only the caller's own sent messages are returned.
+	// 3. B searches for "hello" — should return 3: B's own sent message ("hello from B")
+	// AND A's inbound messages ("hello world", "another hello here"): all three rows
+	// belong to B's owner_id, both directions match.
 	msgs, err = search(bCmds, peerA, "hello", 0, 10)
 	if err != nil {
 		t.Fatalf("B search hello: %v", err)
 	}
-	if len(msgs) != 1 {
-		t.Fatalf("B search hello: got %d messages, want 1", len(msgs))
+	if len(msgs) != 3 {
+		t.Fatalf("B search hello: got %d messages, want 3", len(msgs))
 	}
+	// Newest-first: "hello from B" (randomID 600, sent after A's messages),
+	// then "another hello here", then "hello world".
 	if msgs[0].Message != "hello from B" {
 		t.Errorf("B search hello[0] = %q, want %q", msgs[0].Message, "hello from B")
+	}
+	if msgs[1].Message != "another hello here" {
+		t.Errorf("B search hello[1] = %q, want %q", msgs[1].Message, "another hello here")
+	}
+	if msgs[2].Message != "hello world" {
+		t.Errorf("B search hello[2] = %q, want %q", msgs[2].Message, "hello world")
 	}
 
 	// 4. Pagination: search with limit=1, then use offset_id.
@@ -208,8 +225,8 @@ func TestSearchMessages(t *testing.T) {
 		t.Fatalf("A search hello (limit=1): got %d messages, want 1", len(msgs))
 	}
 	firstID := msgs[0].ID
-	if msgs[0].Message != "another hello here" {
-		t.Errorf("A search hello (limit=1)[0] = %q, want %q", msgs[0].Message, "another hello here")
+	if msgs[0].Message != "hello from B" {
+		t.Errorf("A search hello (limit=1)[0] = %q, want %q", msgs[0].Message, "hello from B")
 	}
 
 	// Follow up with offset_id to get the next result.
@@ -220,8 +237,21 @@ func TestSearchMessages(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("A search hello (offset=%d): got %d messages, want 1", firstID, len(msgs))
 	}
+	secondID := msgs[0].ID
+	if msgs[0].Message != "another hello here" {
+		t.Errorf("A search hello (offset=%d)[0] = %q, want %q", firstID, msgs[0].Message, "another hello here")
+	}
+
+	// Third page.
+	msgs, err = search(aCmds, peerB, "hello", secondID, 1)
+	if err != nil {
+		t.Fatalf("A search hello (offset=%d): %v", secondID, err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("A search hello (offset=%d): got %d messages, want 1", secondID, len(msgs))
+	}
 	if msgs[0].Message != "hello world" {
-		t.Errorf("A search hello (offset=%d)[0] = %q, want %q", firstID, msgs[0].Message, "hello world")
+		t.Errorf("A search hello (offset=%d)[0] = %q, want %q", secondID, msgs[0].Message, "hello world")
 	}
 
 	// 5. Search with empty query returns SEARCH_QUERY_EMPTY.

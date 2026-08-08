@@ -44,7 +44,6 @@ SELECT * FROM messages
 WHERE owner_id = sqlc.arg(owner_id)
   AND peer_type = sqlc.arg(peer_type)
   AND peer_id = sqlc.arg(peer_id)
-  AND (out = true OR peer_type = 2)
   AND deleted = false
   AND message_tsv @@ plainto_tsquery('simple', sqlc.arg(query))
   AND (sqlc.arg(offset_id)::bigint = 0 OR local_id < sqlc.arg(offset_id)::bigint)
