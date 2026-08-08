@@ -706,20 +706,17 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 		}
 		row := ChannelDialogRow{Channel: ch, Pts: int(r.Pts)}
 		if r.TopLocalID != 0 {
-			top := ChannelMessage{
-				ChannelID: r.ChannelID,
-				LocalID:   r.TopLocalID,
-				FromID:    r.TopFromID,
-				Date:      r.TopDate.Time,
-				Message:   r.TopMessage,
-				Deleted:   r.TopDeleted,
-				RandomID:  r.TopRandomID,
-				FileID:    r.TopFileID,
-			}
-			if r.TopEditDate.Valid {
-				ed := r.TopEditDate.Time
-				top.EditDate = &ed
-			}
+			top := channelMessageFromFields(channelMsgFields{
+				r.ChannelID,
+				r.TopLocalID,
+				r.TopFromID,
+				r.TopDate,
+				r.TopMessage,
+				r.TopEditDate,
+				r.TopDeleted,
+				r.TopRandomID,
+				r.TopFileID,
+			})
 			row.Top = &top
 		}
 		out[i] = row

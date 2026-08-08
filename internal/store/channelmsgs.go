@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -24,6 +25,10 @@ type ChannelEvent struct {
 // per channel rather than one per member, so it carries no owner and no Out.
 // FileID is nil for "no media" — channel_messages.file_id is a nullable FK,
 // where the older messages.file_id uses 0 as that sentinel.
+//
+// Field order is load-bearing: channelMessageFromFields constructs this type
+// with a positional literal, so the field sequence here is the column mapping
+// contract. Do not reorder fields without updating that function.
 type ChannelMessage struct {
 	ChannelID int64
 	LocalID   int64
@@ -36,76 +41,43 @@ type ChannelMessage struct {
 	FileID    *int64
 }
 
-func channelMessageFromRow(r db.ChannelMessageByLocalRow) ChannelMessage {
-	m := ChannelMessage{
-		ChannelID: r.ChannelID,
-		LocalID:   r.LocalID,
-		FromID:    r.FromID,
-		Date:      r.Date.Time,
-		Message:   r.Message,
-		Deleted:   r.Deleted,
-		RandomID:  r.RandomID,
-		FileID:    r.FileID,
-	}
-	if r.EditDate.Valid {
-		t := r.EditDate.Time
-		m.EditDate = &t
-	}
-	return m
+// channelMsgFields is a layout-identical copy of the four sqlc channel-message
+// row types. Any of them converts to this type via a plain type conversion, so
+// the single channelMessageFromFields function below is the only place that maps
+// database columns to ChannelMessage fields.
+type channelMsgFields struct {
+	ChannelID int64
+	LocalID   int64
+	FromID    int64
+	Date      pgtype.Timestamptz
+	Message   string
+	EditDate  pgtype.Timestamptz
+	Deleted   bool
+	RandomID  int64
+	FileID    *int64
 }
 
-func channelMessageFromRowByRandomID(r db.ChannelMessageByRandomIDRow) ChannelMessage {
-	m := ChannelMessage{
-		ChannelID: r.ChannelID,
-		LocalID:   r.LocalID,
-		FromID:    r.FromID,
-		Date:      r.Date.Time,
-		Message:   r.Message,
-		Deleted:   r.Deleted,
-		RandomID:  r.RandomID,
-		FileID:    r.FileID,
-	}
+// channelMessageFromFields is the sole row-to-struct converter for channel
+// messages. The positional ChannelMessage literal is intentional: it causes a
+// compile error if a new field is added to ChannelMessage without being wired
+// in here, rather than silently leaving it at its zero value.
+func channelMessageFromFields(r channelMsgFields) ChannelMessage {
+	var editDate *time.Time
 	if r.EditDate.Valid {
 		t := r.EditDate.Time
-		m.EditDate = &t
+		editDate = &t
 	}
-	return m
-}
-
-func channelMessageFromRowByIDs(r db.ChannelMessagesByLocalIDsRow) ChannelMessage {
-	m := ChannelMessage{
-		ChannelID: r.ChannelID,
-		LocalID:   r.LocalID,
-		FromID:    r.FromID,
-		Date:      r.Date.Time,
-		Message:   r.Message,
-		Deleted:   r.Deleted,
-		RandomID:  r.RandomID,
-		FileID:    r.FileID,
+	return ChannelMessage{
+		r.ChannelID,
+		r.LocalID,
+		r.FromID,
+		r.Date.Time,
+		r.Message,
+		editDate,
+		r.Deleted,
+		r.RandomID,
+		r.FileID,
 	}
-	if r.EditDate.Valid {
-		t := r.EditDate.Time
-		m.EditDate = &t
-	}
-	return m
-}
-
-func channelMessageFromHistoryRow(r db.ChannelHistoryPageRow) ChannelMessage {
-	m := ChannelMessage{
-		ChannelID: r.ChannelID,
-		LocalID:   r.LocalID,
-		FromID:    r.FromID,
-		Date:      r.Date.Time,
-		Message:   r.Message,
-		Deleted:   r.Deleted,
-		RandomID:  r.RandomID,
-		FileID:    r.FileID,
-	}
-	if r.EditDate.Valid {
-		t := r.EditDate.Time
-		m.EditDate = &t
-	}
-	return m
 }
 
 // ChannelState returns the channel's current pts. A channel that has never been
@@ -227,7 +199,7 @@ func (s *Store) postChannelMessage(
 		})
 		switch {
 		case e == nil:
-			return channelMessageFromRowByRandomID(existing), int(st.Pts), true, nil
+			return channelMessageFromFields(channelMsgFields(existing)), int(st.Pts), true, nil
 		case !errors.Is(e, pgx.ErrNoRows):
 			return ChannelMessage{}, 0, false, fmt.Errorf("random_id lookup: %w", e)
 		}
@@ -258,7 +230,7 @@ func (s *Store) postChannelMessage(
 	if err = tx.Commit(ctx); err != nil {
 		return ChannelMessage{}, 0, false, fmt.Errorf("commit: %w", err)
 	}
-	return channelMessageFromRow(stored), int(b.Pts), false, nil
+	return channelMessageFromFields(channelMsgFields(stored)), int(b.Pts), false, nil
 }
 
 // checkPostRights answers whether fromID may post to channelID, reading both
@@ -334,7 +306,7 @@ func (s *Store) ChannelMessages(ctx context.Context, channelID int64, localIDs [
 	}
 	out := make(map[int64]ChannelMessage, len(rows))
 	for _, r := range rows {
-		out[r.LocalID] = channelMessageFromRowByIDs(r)
+		out[r.LocalID] = channelMessageFromFields(channelMsgFields(r))
 	}
 	return out, nil
 }
@@ -353,7 +325,7 @@ func (s *Store) ChannelHistory(ctx context.Context, channelID int64, offsetID in
 	}
 	msgs := make([]ChannelMessage, len(rows))
 	for i, r := range rows {
-		msgs[i] = channelMessageFromHistoryRow(r)
+		msgs[i] = channelMessageFromFields(channelMsgFields(r))
 	}
 	return msgs, nil
 }
