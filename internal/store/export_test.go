@@ -15,6 +15,11 @@ import (
 // asserted on the rule itself instead of on a 30-second wall clock.
 func NextBackoff(prev, uptime time.Duration) time.Duration { return nextBackoff(prev, uptime) }
 
+// SetDeniedHook installs a callback that fires in CheckRateLimit after the
+// INSERT denial and before the GET. Tests use it to delete the row and
+// exercise the ErrNoRows branch. Pass nil to clear.
+func SetDeniedHook(fn func()) { deniedHook = fn }
+
 const (
 	ListenerBackoffMin = listenerBackoffMin
 	ListenerBackoffMax = listenerBackoffMax

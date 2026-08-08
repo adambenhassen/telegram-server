@@ -142,16 +142,7 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	// Rate limit before any write: all send paths draw from one shared budget.
-	// The token is consumed before the random_id dedupe in store.SendMessage,
-	// so a transport retry of an already-stored message spends budget. This is
-	// accepted: a client that retries without checking the reply is already
-	// sending more than the protocol intends, and the dedupe protects against
-	// duplication — not against spending twice on one delivery attempt.
-	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
-		return nil, err
-	}
-	// Before the peer split, so the chat fan-out is guarded by the same check.
+	// Validate text and resolve peer before any write.
 	if !validText(req.Message) {
 		return nil, errMessageEmpty
 	}
@@ -173,15 +164,49 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 		return h.sendChatMessage(r, toID, &req, replyToMsgID)
 	}
 
-	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0, replyToMsgID)
+	// Check for a transport retry (already-stored random_id) before the rate
+	// limit so that a resend returns the stored message, never FLOOD_WAIT.
+	if req.RandomID != 0 {
+		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok {
+			// Retry of a delivered message: return the sender's row with
+			// the current pts without writing or rate-limiting.
+			senderState, err := h.store.State(r.Ctx, r.UserID)
+			if err != nil {
+				h.log.Error("read sender pts on retry", "user_id", r.UserID, "err", err)
+				return nil, errInternal
+			}
+			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
+			if err != nil {
+				h.log.Error("load users on retry", "user_id", r.UserID, "err", err)
+				return nil, errInternal
+			}
+			return &tg.Updates{
+				Updates: []tg.UpdateClass{
+					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
+					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: senderState.Pts, PtsCount: 1},
+				},
+				Users: users,
+				Date:  int(existing.Date.Unix()),
+			}, nil
+		} else if err != nil {
+			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+	}
+
+	// Rate limit: new message, consume a token from the shared send budget.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+		return nil, err
+	}
+
+	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0, replyToMsgID)
 	if err != nil {
 		h.log.Error("send message", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	if !dup {
-		h.notify(r.Ctx, r.UserID)
-		h.notify(r.Ctx, toID)
-	}
+
+	h.notify(r.Ctx, r.UserID)
+	h.notify(r.Ctx, toID)
 
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
@@ -226,7 +251,46 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 		return nil, err
 	}
 
-	sender, perOwner, dup, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
+	// Check for a transport retry before the rate limit.
+	if req.RandomID != 0 {
+		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok {
+			// Retry: return the stored message without rate-limiting.
+			senderState, err := h.store.State(r.Ctx, r.UserID)
+			if err != nil {
+				h.log.Error("read sender pts on retry", "user_id", r.UserID, "err", err)
+				return nil, errInternal
+			}
+			chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+			if err != nil {
+				h.log.Error("load chats on retry", "err", err)
+				return nil, errInternal
+			}
+			users, err := h.loadUsers(r.Ctx, map[int64]bool{r.UserID: true}, r.UserID)
+			if err != nil {
+				h.log.Error("load users on retry", "err", err)
+				return nil, errInternal
+			}
+			return &tg.Updates{
+				Updates: []tg.UpdateClass{
+					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
+					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: senderState.Pts, PtsCount: 1},
+				},
+				Users: users,
+				Chats: chats,
+				Date:  int(existing.Date.Unix()),
+			}, nil
+		} else if err != nil {
+			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+	}
+
+	// Rate limit: new message, consume a token.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+		return nil, err
+	}
+
+	sender, perOwner, _, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
 		ChatID: chatID, FromID: r.UserID, Text: req.Message, RandomID: req.RandomID,
 		ReplyToMsgID: replyToMsgID,
 	})
@@ -237,10 +301,8 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 		h.log.Error("send chat message", "user_id", r.UserID, "chat_id", chatID, "err", err)
 		return nil, errInternal
 	}
-	if !dup {
-		for uid := range perOwner {
-			h.notify(r.Ctx, uid)
-		}
+	for uid := range perOwner {
+		h.notify(r.Ctx, uid)
 	}
 
 	recipients := make(map[int64]bool, len(perOwner))
@@ -545,8 +607,10 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	// Rate limit before any write: forward draws from the shared message send
-	// budget.
+	// Rate limit before the forward: one token per forward request, regardless
+	// of how many messages are forwarded or deduped. The per-message dedupe
+	// inside store.ForwardMessages cannot be exposed as a "all dups" signal
+	// without changing the store API.
 	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
 		return nil, err
 	}

@@ -281,72 +281,6 @@ func TestRateLimitDisabled(t *testing.T) {
 	}
 }
 
-// TestSweepVsCheckRace proves that a request whose row is swept mid-check
-// returns a flood wait or an allow, never an error. It drives the interleaving
-// deliberately: the row is at its limit, a concurrent sweep deletes it between
-// the INSERT (which fails with ErrNoRows) and the GET.
-func TestSweepVsCheckRace(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	s := openStore(t)
-
-	alice, err := s.CreateUser(ctx, "+15551293601")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Short window.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
-
-	// Consume the single token so the row is at its limit.
-	result, err := s.CheckRateLimit(ctx, alice.ID, "sweep_race", cfg)
-	if err != nil {
-		t.Fatalf("first check: %v", err)
-	}
-	if result != nil {
-		t.Fatalf("first check: unexpected denial: %+v", result)
-	}
-
-	// Row is at limit. Now fire a check (which will be denied) while a sweep
-	// races to delete the row between the INSERT and GET.
-	type checkResult struct {
-		result *store.RateLimitResult
-		err    error
-	}
-	var res checkResult
-	done := make(chan struct{})
-
-	// Start the check in a goroutine.
-	go func() {
-		defer close(done)
-		rl, err := s.CheckRateLimit(ctx, alice.ID, "sweep_race", cfg)
-		res = checkResult{result: rl, err: err}
-	}()
-
-	// Give the check time to reach the INSERT (which will fail with ErrNoRows
-	// because the row is at its limit), then sweep before the GET.
-	time.Sleep(10 * time.Millisecond)
-	_, err = s.SweepExpiredRateLimits(ctx)
-	if err != nil {
-		t.Fatalf("sweep: %v", err)
-	}
-
-	// Wait for the check to complete.
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("check did not complete")
-	}
-
-	// The check must not return an error — it should allow (row swept)
-	// or deny with a wait, but never error.
-	if res.err != nil {
-		t.Fatalf("check: got error, want allow or deny: %v", res.err)
-	}
-	// Either nil (allowed because row was swept) or non-nil (denied with wait)
-	// — both are valid outcomes.
-}
-
 // TestConcurrentColdKey proves that concurrent requests on a key being created
 // for the first time are handled correctly (limit succeed, rest denied).
 func TestConcurrentColdKey(t *testing.T) {
@@ -503,5 +437,53 @@ func TestSendMediaRateLimit(t *testing.T) {
 	})
 	if !isFloodWait(err) {
 		t.Fatalf("send media: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestRetryDoesNotRateLimit proves that a transport retry with an already-
+// stored random_id returns the stored message, never FLOOD_WAIT. The rate
+// limit check runs after the dedupe in store.SendMessage, so a retry is
+// caught by the dedupe and never reaches the limiter.
+func TestRetryDoesNotRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551294002")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit of 1: after the first send, the account is at its limit.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	peerBob := api.InputPeerUser(alice.ID, bob.ID)
+
+	// Send a message — consumes the only token.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "original", RandomID: 42,
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Retry with the same random_id: should return the stored message,
+	// not FLOOD_WAIT.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "retry", RandomID: 42,
+	})
+	if err != nil {
+		t.Fatalf("retry: expected success, got %v (FLOOD_WAIT on retry is a bug)", err)
+	}
+
+	// A NEW message with a different random_id should be denied.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "new", RandomID: 99,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("new message: expected FLOOD_WAIT, got %v", err)
 	}
 }
