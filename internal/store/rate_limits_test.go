@@ -1,0 +1,398 @@
+package store_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/adambenhassen/telegram-server/internal/store"
+)
+
+func TestRateLimitBasic(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 100
+	const surface = "test"
+
+	// Requests 1-3 should pass.
+	for i := range 3 {
+		result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		if result != nil {
+			t.Fatalf("request %d: unexpected denial: %+v", i+1, result)
+		}
+	}
+
+	// Request 4 should be denied.
+	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("request 4: %v", err)
+	}
+	if result == nil {
+		t.Fatal("request 4: expected denial, got allowed")
+	}
+	if result.Wait < time.Second {
+		t.Errorf("request 4: wait = %v, want >= 1s", result.Wait)
+	}
+	if result.Wait > cfg.Window {
+		t.Errorf("request 4: wait = %v, want <= %v", result.Wait, cfg.Window)
+	}
+
+	// Denied requests should not consume tokens — request 5 should also be denied.
+	result2, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("request 5: %v", err)
+	}
+	if result2 == nil {
+		t.Fatal("request 5: expected denial (denied requests consume nothing), got allowed")
+	}
+}
+
+func TestRateLimitWindowExpiry(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	// Use a very short window so we can test expiry without sleeping.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 1 * time.Second}
+	ctx := context.Background()
+	const subject = 200
+	const surface = "expiry"
+
+	// Exhaust the limit.
+	for range 2 {
+		result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+		if err != nil || result != nil {
+			t.Fatalf("initial request: result=%+v err=%v", result, err)
+		}
+	}
+
+	// Denied.
+	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("pre-expiry deny: %v", err)
+	}
+	if result == nil {
+		t.Fatal("pre-expiry: expected denial, got allowed")
+	}
+
+	// Wait for window to expire.
+	time.Sleep(1100 * time.Millisecond)
+
+	// Should be allowed again.
+	result, err = s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("post-expiry: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("post-expiry: expected allowed, got denial: %+v", result)
+	}
+}
+
+func TestRateLimitIndependentSubjects(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	ctx := context.Background()
+	const surface = "indep"
+
+	// Exhaust subject A.
+	for range 2 {
+		if _, err := s.CheckRateLimit(ctx, 300, surface, cfg); err != nil {
+			t.Fatalf("subject A: %v", err)
+		}
+	}
+
+	// Subject A should be denied.
+	resultA, err := s.CheckRateLimit(ctx, 300, surface, cfg)
+	if err != nil || resultA == nil {
+		t.Fatalf("subject A at limit: result=%+v err=%v, want denial", resultA, err)
+	}
+
+	// Subject B should be unaffected.
+	resultB, err := s.CheckRateLimit(ctx, 301, surface, cfg)
+	if err != nil {
+		t.Fatalf("subject B first request: %v", err)
+	}
+	if resultB != nil {
+		t.Fatalf("subject B first request: unexpected denial: %+v", resultB)
+	}
+
+	// Subject C (a third subject) should also be unaffected.
+	resultC, err := s.CheckRateLimit(ctx, 302, surface, cfg)
+	if err != nil {
+		t.Fatalf("subject C first request: %v", err)
+	}
+	if resultC != nil {
+		t.Fatalf("subject C first request: unexpected denial: %+v", resultC)
+	}
+}
+
+func TestRateLimitIndependentSurfaces(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 400
+
+	// Exhaust surface "alpha".
+	if _, err := s.CheckRateLimit(ctx, subject, "alpha", cfg); err != nil {
+		t.Fatalf("alpha first: %v", err)
+	}
+	result, err := s.CheckRateLimit(ctx, subject, "alpha", cfg)
+	if err != nil || result == nil {
+		t.Fatalf("alpha at limit: result=%+v err=%v, want denial", result, err)
+	}
+
+	// Surface "beta" should be independent.
+	result, err = s.CheckRateLimit(ctx, subject, "beta", cfg)
+	if err != nil {
+		t.Fatalf("beta first: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("beta first: unexpected denial: %+v", result)
+	}
+}
+
+func TestRateLimitDisabled(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	ctx := context.Background()
+	const subject = 500
+	const surface = "disabled"
+
+	// Zero limit disables enforcement.
+	cfgZero := store.RateLimitConfig{Limit: 0, Window: 10 * time.Second}
+	for range 10 {
+		result, err := s.CheckRateLimit(ctx, subject, surface, cfgZero)
+		if err != nil || result != nil {
+			t.Fatalf("zero limit: result=%+v err=%v", result, err)
+		}
+	}
+}
+
+func TestRateLimitConcurrentBoundary(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 5, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 600
+	const surface = "concurrent"
+
+	const n = 10 // more than the limit
+
+	type result struct {
+		err    error
+		denied bool
+	}
+	results := make([]result, n)
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	ready := make(chan struct{})
+
+	for i := range n {
+		go func() {
+			defer wg.Done()
+			<-ready
+			rl, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+			results[i] = result{err: err, denied: rl != nil}
+		}()
+	}
+
+	close(ready)
+	wg.Wait()
+
+	var successes, denials, other int
+	for _, r := range results {
+		switch {
+		case r.err != nil:
+			other++
+			t.Errorf("unexpected error: %v", r.err)
+		case r.denied:
+			denials++
+		default:
+			successes++
+		}
+	}
+
+	if successes != cfg.Limit {
+		t.Errorf("successes = %d, want %d", successes, cfg.Limit)
+	}
+	if denials != n-cfg.Limit {
+		t.Errorf("denials = %d, want %d", denials, n-cfg.Limit)
+	}
+	if other != 0 {
+		t.Errorf("unexpected errors = %d, want 0", other)
+	}
+}
+
+func TestRateLimitWaitAccuracy(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 1, Window: 5 * time.Second}
+	ctx := context.Background()
+	const subject = 700
+	const surface = "wait"
+
+	// Consume the single token.
+	if _, err := s.CheckRateLimit(ctx, subject, surface, cfg); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	// Denied — wait should be close to the full window.
+	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("denial: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected denial, got allowed")
+	}
+
+	// Wait should be at least 4 seconds (window is 5s, we just consumed).
+	if result.Wait < 4*time.Second {
+		t.Errorf("wait = %v, want >= 4s", result.Wait)
+	}
+	// Wait should not exceed the window.
+	if result.Wait > cfg.Window {
+		t.Errorf("wait = %v, want <= %v", result.Wait, cfg.Window)
+	}
+
+	// Wait after sleeping should decrease.
+	time.Sleep(2 * time.Second)
+	result2, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("post-sleep denial: %v", err)
+	}
+	if result2 == nil {
+		t.Fatal("post-sleep: expected denial, got allowed")
+	}
+	if result2.Wait >= result.Wait {
+		t.Errorf("wait after sleep = %v, want < %v", result2.Wait, result.Wait)
+	}
+
+	// After full window, should be allowed.
+	remaining := cfg.Window - 2*time.Second
+	time.Sleep(remaining + 100*time.Millisecond)
+	result3, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("post-window: %v", err)
+	}
+	if result3 != nil {
+		t.Fatalf("post-window: expected allowed, got denial: %+v", result3)
+	}
+}
+
+func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	// Very short window — but wait should still be >= 1s.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 100 * time.Millisecond}
+	ctx := context.Background()
+	const subject = 800
+	const surface = "minwait"
+
+	// Consume the token.
+	if _, err := s.CheckRateLimit(ctx, subject, surface, cfg); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	// Wait for the window to almost expire.
+	time.Sleep(50 * time.Millisecond)
+
+	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("denial: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected denial, got allowed")
+	}
+	if result.Wait < time.Second {
+		t.Errorf("wait = %v, want >= 1s (minimum)", result.Wait)
+	}
+}
+
+func TestRateLimitDenialNotError(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 900
+	const surface = "sentinel"
+
+	// Consume the token.
+	if _, err := s.CheckRateLimit(ctx, subject, surface, cfg); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	// The denial returns a non-nil RateLimitResult, not an error.
+	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("denial returned an error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected denial, got allowed")
+	}
+	// Wait should be positive.
+	if result.Wait <= 0 {
+		t.Errorf("wait = %v, want > 0", result.Wait)
+	}
+}
