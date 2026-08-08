@@ -8,6 +8,7 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
@@ -500,4 +501,28 @@ func UpdateUsernameForTest(s *store.Store, userID int64, username string) (bin.E
 // (out of scope for this ticket).
 func ClaimChannelUsernameForTest(s *store.Store, channelID int64, handle string) error {
 	return s.ClaimChannelUsername(context.Background(), channelID, handle)
+}
+
+// ContactsSearchForTest invokes handleContactsSearch for the caller against the
+// given request.
+func ContactsSearchForTest(s *store.Store, userID int64, req *tg.ContactsSearchRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleContactsSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SetUserFirstNameForTest updates a user's first_name directly, so tests can
+// seed searchable names. The name_tsv column is GENERATED ALWAYS, so Postgres
+// recomputes it automatically. dsn is the database connection string.
+func SetUserFirstNameForTest(dsn string, userID int64, firstName string) error {
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	_, err = pool.Exec(context.Background(),
+		"UPDATE users SET first_name = $1 WHERE id = $2", firstName, userID)
+	return err
 }
