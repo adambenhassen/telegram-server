@@ -266,6 +266,39 @@ func (s *Store) UpdateUsername(ctx context.Context, userID int64, username strin
 	return nil
 }
 
+// SearchContacts searches the caller's dialog partners by name. Only users
+// with whom the caller has an existing 1:1 dialog are returned. The query is
+// matched against the stored name_tsv tsvector (first_name + last_name) using
+// plainto_tsquery on the 'simple' dictionary.
+func (s *Store) SearchContacts(ctx context.Context, ownerID int64, query string, limit int32) ([]User, error) {
+	rows, err := s.q.SearchContactsByName(ctx, db.SearchContactsByNameParams{
+		OwnerID: ownerID,
+		Query:   query,
+		Lim:     limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search contacts: %w", err)
+	}
+	out := make([]User, len(rows))
+	for i, r := range rows {
+		var lastSeen *time.Time
+		if r.LastSeenAt.Valid {
+			t := r.LastSeenAt.Time
+			lastSeen = &t
+		}
+		out[i] = User{
+			ID:         r.ID,
+			Phone:      r.Phone,
+			FirstName:  r.FirstName,
+			LastName:   r.LastName,
+			IsOnline:   r.IsOnline,
+			LastSeenAt: lastSeen,
+			Username:   r.Username,
+		}
+	}
+	return out, nil
+}
+
 // ClaimChannelUsername claims a username for a channel atomically: inserts
 // into the usernames table AND updates channels.username in one transaction.
 // The shipped RPC that does this (channels.setUsername) is a later ticket;
