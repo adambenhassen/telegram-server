@@ -34,17 +34,20 @@ func (q *Queries) GetRateLimitExpiresAt(ctx context.Context, arg GetRateLimitExp
 	return expires_at, err
 }
 
-const sweepExpiredRateLimits = `-- name: SweepExpiredRateLimits :exec
+const sweepExpiredRateLimits = `-- name: SweepExpiredRateLimits :execrows
 DELETE FROM rate_limits
 WHERE expires_at < now()
 `
 
 // Delete rows whose per-row expiry deadline has passed. The deadline is stored
 // on the row (expires_at = window_start + window), so the sweep does not need
-// to know per-surface window durations.
-func (q *Queries) SweepExpiredRateLimits(ctx context.Context) error {
-	_, err := q.db.Exec(ctx, sweepExpiredRateLimits)
-	return err
+// to know per-surface window durations. The return value reports rows affected.
+func (q *Queries) SweepExpiredRateLimits(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, sweepExpiredRateLimits)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const tryConsumeRateLimit = `-- name: TryConsumeRateLimit :one

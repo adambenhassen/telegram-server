@@ -48,8 +48,9 @@ type handlers struct {
 	// write, so it cannot participate in a cycle with any existing lock.
 	downloadsMu sync.Mutex
 	downloads   map[int64]bool
-	// rateLimits holds the per-surface rate-limit configurations.
-	rateLimits store.RateLimitConfig
+	// rateLimitMessageSend limits all client-visible message sends (1:1, chat,
+	// channel post, media send, forward, encrypted) to one shared budget.
+	rateLimitMessageSend store.RateLimitConfig
 	// rateLimitCreateChat limits messages.createChat per account.
 	rateLimitCreateChat store.RateLimitConfig
 	// rateLimitAddChatUser limits messages.addChatUser per account.
@@ -115,7 +116,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		blobs:                blobs,
 		maxUserStorageBytes:  maxUserStorageBytes,
 		downloads:            map[int64]bool{},
-		rateLimits:           rateLimits.MessageSend,
+		rateLimitMessageSend: rateLimits.MessageSend,
 		rateLimitCreateChat:  rateLimits.CreateChat,
 		rateLimitAddChatUser: rateLimits.AddChatUser,
 	}

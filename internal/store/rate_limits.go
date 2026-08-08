@@ -88,10 +88,8 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 
 // SweepExpiredRateLimits deletes rate-limit rows whose per-row expiry deadline
 // has passed. The deadline is stored on the row (expires_at), so the sweep
-// does not need to know per-surface window durations.
-//
-// This is not wired into a caller yet — the sweep lands with MAIN-202, the
-// first ticket that wires a surface and can establish the sweep cadence.
-func (s *Store) SweepExpiredRateLimits(ctx context.Context) error {
+// does not need to know per-surface window durations. Wired to a 5-minute
+// background sweep in cmd/telegramd/main.go.
+func (s *Store) SweepExpiredRateLimits(ctx context.Context) (int64, error) {
 	return s.q.SweepExpiredRateLimits(ctx)
 }

@@ -41,9 +41,9 @@ FROM rate_limits
 WHERE subject_id = $1
   AND surface = $2;
 
--- name: SweepExpiredRateLimits :exec
+-- name: SweepExpiredRateLimits :execrows
 -- Delete rows whose per-row expiry deadline has passed. The deadline is stored
 -- on the row (expires_at = window_start + window), so the sweep does not need
--- to know per-surface window durations.
+-- to know per-surface window durations. The return value reports rows affected.
 DELETE FROM rate_limits
 WHERE expires_at < now();

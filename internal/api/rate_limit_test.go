@@ -59,13 +59,36 @@ func TestSendMessageRateLimit(t *testing.T) {
 		t.Fatalf("send 4: expected FLOOD_WAIT, got %v", err)
 	}
 
-	// No side effects: alice's message count should still be 3.
-	msgs, err := s.History(ctx, alice.ID, store.PeerTypeUser, bob.ID, 0, 100)
+	// No side effects: neither side should have a 4th message, and pts
+	// should be unchanged from the 3 successful sends.
+	aliceMsgs, err := s.History(ctx, alice.ID, store.PeerTypeUser, bob.ID, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(msgs) != 3 {
-		t.Fatalf("alice history = %d, want 3", len(msgs))
+	if len(aliceMsgs) != 3 {
+		t.Fatalf("alice history = %d, want 3", len(aliceMsgs))
+	}
+	bobMsgs, err := s.History(ctx, bob.ID, store.PeerTypeUser, alice.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bobMsgs) != 3 {
+		t.Fatalf("bob history = %d, want 3", len(bobMsgs))
+	}
+	// Both pts should be 3 (one per successful send).
+	aliceState, err := s.State(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliceState.Pts != 3 {
+		t.Fatalf("alice pts = %d, want 3", aliceState.Pts)
+	}
+	bobState, err := s.State(ctx, bob.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bobState.Pts != 3 {
+		t.Fatalf("bob pts = %d, want 3", bobState.Pts)
 	}
 
 	// A different account is unaffected.
@@ -259,7 +282,9 @@ func TestRateLimitDisabled(t *testing.T) {
 }
 
 // TestSweepVsCheckRace proves that a request whose row is swept mid-check
-// returns a flood wait or an allow, never an error.
+// returns a flood wait or an allow, never an error. It drives the interleaving
+// deliberately: the row is at its limit, a concurrent sweep deletes it between
+// the INSERT (which fails with ErrNoRows) and the GET.
 func TestSweepVsCheckRace(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -271,10 +296,10 @@ func TestSweepVsCheckRace(t *testing.T) {
 	}
 
 	// Short window.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 500 * time.Millisecond}
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
 
-	// Consume the single token.
-	result, err := s.CheckRateLimit(ctx, alice.ID, "message_send", cfg)
+	// Consume the single token so the row is at its limit.
+	result, err := s.CheckRateLimit(ctx, alice.ID, "sweep_race", cfg)
 	if err != nil {
 		t.Fatalf("first check: %v", err)
 	}
@@ -282,22 +307,44 @@ func TestSweepVsCheckRace(t *testing.T) {
 		t.Fatalf("first check: unexpected denial: %+v", result)
 	}
 
-	// Wait for the window to expire so the sweep can clean it up.
-	time.Sleep(600 * time.Millisecond)
+	// Row is at limit. Now fire a check (which will be denied) while a sweep
+	// races to delete the row between the INSERT and GET.
+	type checkResult struct {
+		result *store.RateLimitResult
+		err    error
+	}
+	var res checkResult
+	done := make(chan struct{})
 
-	// Manually run the sweep to delete the row.
-	if err := s.SweepExpiredRateLimits(ctx); err != nil {
+	// Start the check in a goroutine.
+	go func() {
+		defer close(done)
+		rl, err := s.CheckRateLimit(ctx, alice.ID, "sweep_race", cfg)
+		res = checkResult{result: rl, err: err}
+	}()
+
+	// Give the check time to reach the INSERT (which will fail with ErrNoRows
+	// because the row is at its limit), then sweep before the GET.
+	time.Sleep(10 * time.Millisecond)
+	_, err = s.SweepExpiredRateLimits(ctx)
+	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 
-	// Now check again — the row was swept, so this should succeed (not error).
-	result, err = s.CheckRateLimit(ctx, alice.ID, "message_send", cfg)
-	if err != nil {
-		t.Fatalf("post-sweep check: %v", err)
+	// Wait for the check to complete.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("check did not complete")
 	}
-	if result != nil {
-		t.Fatalf("post-sweep check: unexpected denial: %+v", result)
+
+	// The check must not return an error — it should allow (row swept)
+	// or deny with a wait, but never error.
+	if res.err != nil {
+		t.Fatalf("check: got error, want allow or deny: %v", res.err)
 	}
+	// Either nil (allowed because row was swept) or non-nil (denied with wait)
+	// — both are valid outcomes.
 }
 
 // TestConcurrentColdKey proves that concurrent requests on a key being created

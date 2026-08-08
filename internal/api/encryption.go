@@ -331,6 +331,11 @@ func (h *handlers) handleSendEncryptedMessage(r *mtproto.Request) (bin.Encoder, 
 	if req.Peer.AccessHash != h.secretChatHash(r.UserID, chatID) {
 		return nil, errEncryptionIDInvalid
 	}
+	// 5.5. Rate limit before any write: encrypted sends draw from the shared
+	// message send budget.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+		return nil, err
+	}
 	// 6. Derive recipient (never from the request).
 	recipientID := chat.Other(r.UserID)
 

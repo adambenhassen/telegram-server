@@ -48,7 +48,8 @@ func TestSweepRemovesExpiredRows(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 
 	// Sweep.
-	if err := s.SweepExpiredRateLimits(ctx); err != nil {
+	_, err = s.SweepExpiredRateLimits(ctx)
+	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 
@@ -93,7 +94,8 @@ func TestSweepVsCheckRace(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 
 	// Manually run the sweep to delete the row.
-	if err := s.SweepExpiredRateLimits(ctx); err != nil {
+	_, err = s.SweepExpiredRateLimits(ctx)
+	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 

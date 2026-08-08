@@ -130,7 +130,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	// Rate limit before any write: media send draws from the shared message
 	// send budget.
-	if err := h.checkRateLimit(r, "message_send", h.rateLimits); err != nil {
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
 		return nil, err
 	}
 	// Before the peer split, so the chat fan-out is guarded by the same check.

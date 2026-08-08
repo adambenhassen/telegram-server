@@ -206,11 +206,12 @@ func sweepExpiredRateLimits(ctx context.Context, st *store.Store, log *slog.Logg
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := st.SweepExpiredRateLimits(ctx); err != nil {
+			n, err := st.SweepExpiredRateLimits(ctx)
+			if err != nil {
 				log.Error("sweep expired rate limits", "err", err)
 				continue
 			}
-			log.Info("swept expired rate limits")
+			log.Info("swept expired rate limits", "deleted", n)
 		}
 	}
 }

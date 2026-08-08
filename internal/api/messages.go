@@ -143,7 +143,12 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errAuthKeyUnreg
 	}
 	// Rate limit before any write: all send paths draw from one shared budget.
-	if err := h.checkRateLimit(r, "message_send", h.rateLimits); err != nil {
+	// The token is consumed before the random_id dedupe in store.SendMessage,
+	// so a transport retry of an already-stored message spends budget. This is
+	// accepted: a client that retries without checking the reply is already
+	// sending more than the protocol intends, and the dedupe protects against
+	// duplication — not against spending twice on one delivery attempt.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
 		return nil, err
 	}
 	// Before the peer split, so the chat fan-out is guarded by the same check.
@@ -542,7 +547,7 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 	}
 	// Rate limit before any write: forward draws from the shared message send
 	// budget.
-	if err := h.checkRateLimit(r, "message_send", h.rateLimits); err != nil {
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
 		return nil, err
 	}
 	if len(req.ID) == 0 || len(req.RandomID) != len(req.ID) {

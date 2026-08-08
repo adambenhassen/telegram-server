@@ -44,12 +44,12 @@ func MaxFileParts() int {
 
 func testHandlers(s *store.Store) *handlers {
 	return &handlers{
-		store:        s,
-		log:          slog.New(slog.DiscardHandler),
-		maxFileBytes: TestMaxFileBytes,
-		downloads:    map[int64]bool{},
-		peers:        pgtest.PeerDeriver(),
-		rateLimits:   store.RateLimitConfig{},
+		store:                s,
+		log:                  slog.New(slog.DiscardHandler),
+		maxFileBytes:         TestMaxFileBytes,
+		downloads:            map[int64]bool{},
+		peers:                pgtest.PeerDeriver(),
+		rateLimitMessageSend: store.RateLimitConfig{},
 	}
 }
 
@@ -347,7 +347,7 @@ func SendMessageForTestWithLimits(s *store.Store, userID int64, rateLimit store.
 		return nil, err
 	}
 	h := testHandlers(s)
-	h.rateLimits = rateLimit
+	h.rateLimitMessageSend = rateLimit
 	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
@@ -362,7 +362,7 @@ func SendMediaForTestWithLimits(
 		return nil, err
 	}
 	h := testHandlers(s)
-	h.blobs, h.maxUserStorageBytes, h.rateLimits = blobs, maxUserStorageBytes, rateLimit
+	h.blobs, h.maxUserStorageBytes, h.rateLimitMessageSend = blobs, maxUserStorageBytes, rateLimit
 	return h.handleSendMedia(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
@@ -374,7 +374,7 @@ func ForwardMessagesForTestWithLimits(s *store.Store, userID int64, rateLimit st
 		return nil, err
 	}
 	h := testHandlers(s)
-	h.rateLimits = rateLimit
+	h.rateLimitMessageSend = rateLimit
 	return h.handleForwardMessages(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
