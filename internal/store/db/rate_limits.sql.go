@@ -29,8 +29,6 @@ ON CONFLICT (subject_id, surface) DO UPDATE SET
         WHEN rate_limits.token_count < $4 THEN true
         ELSE false
     END
-WHERE now() - rate_limits.window_start >= $3::INTERVAL
-   OR rate_limits.token_count < $4
 RETURNING token_count, window_start, consumed
 `
 
@@ -49,17 +47,17 @@ type CheckAndConsumeRateLimitRow struct {
 
 // Atomic check-and-consume on a rate-limit counter.
 //
-// INSERT attempts to seed a new counter; ON CONFLICT fires the DO UPDATE:
-//  1. If the window has expired, reset to count=1, window_start=now.
-//  2. If the window is active and count < limit, bump count.
-//  3. If the window is active and count >= limit, the WHERE clause prevents
-//     the UPDATE — the existing (unchanged) row is returned instead.
+// INSERT attempts to seed a new counter (always succeeds with consumed=true).
+// ON CONFLICT fires the DO UPDATE:
+//  1. If the window has expired, reset to count=1, window_start=now, consumed=true.
+//  2. If the window is active and count < limit, bump count, consumed=true.
+//  3. If the window is active and count >= limit, leave count unchanged, consumed=false.
 //
-// The RETURNING clause always produces one row. The caller checks
-// consumed=true to distinguish "allowed" from "denied".
+// The RETURNING clause always produces one row. consumed=true means allowed;
+// consumed=false means denied (and the request consumed nothing).
 //
 // Exactness under concurrency comes from the row-level lock taken by
-// INSERT ... ON CONFLICT — no advisory lock needed.
+// INSERT ... ON CONFLICT — different subjects never block each other.
 func (q *Queries) CheckAndConsumeRateLimit(ctx context.Context, arg CheckAndConsumeRateLimitParams) (CheckAndConsumeRateLimitRow, error) {
 	row := q.db.QueryRow(ctx, checkAndConsumeRateLimit,
 		arg.SubjectID,
