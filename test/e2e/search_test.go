@@ -184,20 +184,13 @@ func TestSearchMessages(t *testing.T) {
 		t.Errorf("A search foo[0] = %q, want %q", msgs[0].Message, "foo bar")
 	}
 
-	// 3. B searches for "hello" — should return 0 (B's messages don't contain "hello"
-	// from A's perspective — B's own "hello from B" is not returned because it's B's
-	// search for peer A, so B's messages are inbound in that dialog).
+	// 3. B searches for "hello" — should return B's own sent message ("hello from B"),
+	// not A's messages stored on B's side as inbound. The out=true predicate in the
+	// search query ensures only the caller's own sent messages are returned.
 	msgs, err = search(bCmds, peerA, "hello", 0, 10)
 	if err != nil {
 		t.Fatalf("B search hello: %v", err)
 	}
-	// B's search returns B's own view of the dialog with A — which includes
-	// A's messages. "hello world" and "another hello here" are from A and
-	// appear in B's history. But the authorization invariant says only
-	// owner_id = callerID is returned. So B's search returns B's OWN messages
-	// (the ones B sent), not A's.
-	// B sent "hello from B" and "foo from B" — both are B's own messages in
-	// the dialog with A. "hello from B" contains "hello", so it should appear.
 	if len(msgs) != 1 {
 		t.Fatalf("B search hello: got %d messages, want 1", len(msgs))
 	}

@@ -279,6 +279,7 @@ SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, dele
 WHERE owner_id = $1
   AND peer_type = $2
   AND peer_id = $3
+  AND out = true
   AND deleted = false
   AND search_vector @@ plainto_tsquery('english', $4)
   AND ($5::bigint = 0 OR local_id < $5::bigint)
