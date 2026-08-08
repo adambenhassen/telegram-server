@@ -691,6 +691,16 @@ func TestChatMediaSendsOneToken(t *testing.T) {
 	if !isFloodWait(err) {
 		t.Fatalf("third send: expected FLOOD_WAIT, got %v", err)
 	}
+
+	// No side effects: bob's 1:1 history should have 1 message (the first send),
+	// not 2. The denied 1:1 send wrote nothing.
+	bobMsgs, err := s.History(ctx, bob.ID, store.PeerTypeUser, alice.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bobMsgs) != 1 {
+		t.Fatalf("bob 1:1 history = %d, want 1 (denied send wrote row)", len(bobMsgs))
+	}
 }
 
 // TestChatSendRateLimit proves that chat sends draw from the shared message
@@ -756,6 +766,16 @@ func TestChatSendRateLimit(t *testing.T) {
 	})
 	if !isFloodWait(err) {
 		t.Fatalf("chat send 3: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// No side effects: bob's history should have 3 messages (1 create + 2 sends),
+	// not 4. The denied chat send wrote nothing.
+	bobMsgs, err := s.History(ctx, bob.ID, store.PeerTypeChat, chat.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bobMsgs) != 3 {
+		t.Fatalf("bob chat history = %d, want 3 (denied chat send wrote row)", len(bobMsgs))
 	}
 }
 
@@ -862,6 +882,15 @@ func TestChannelPostRateLimit(t *testing.T) {
 	if !isFloodWait(err) {
 		t.Fatalf("post 3: expected FLOOD_WAIT, got %v", err)
 	}
+
+	// No side effects: only 2 channel messages should exist.
+	history, err := s.ChannelHistory(ctx, channel.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("channel history = %d, want 2 (denied channel post wrote row)", len(history))
+	}
 }
 
 // TestForwardRetryDoesNotRateLimit proves that a forward retry with all
@@ -917,6 +946,26 @@ func TestForwardRetryDoesNotRateLimit(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("forward retry: expected success, got %v", err)
+	}
+
+	// A NEW forward — should be denied (budget exhausted by send+forward).
+	_, err = api.ForwardMessagesForTestWithLimits(s, alice.ID, cfg, &tg.MessagesForwardMessagesRequest{
+		ToPeer:   peerCharlie,
+		FromPeer: peerBob,
+		ID:       []int{1},
+		RandomID: []int64{998},
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("forward denied: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// No side effects: charlie should have only 1 forwarded message.
+	charlieMsgs, err := s.History(ctx, charlie.ID, store.PeerTypeUser, alice.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(charlieMsgs) != 1 {
+		t.Fatalf("charlie history = %d, want 1 (denied forward wrote row)", len(charlieMsgs))
 	}
 }
 
@@ -988,7 +1037,7 @@ func TestEncryptedSendDeniedNoSideEffects(t *testing.T) {
 func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	alice, err := s.CreateUser(ctx, "+15551294901")
 	if err != nil {
@@ -1001,11 +1050,30 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Listen for channel post notifications.
+	notifyCount := 0
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) { notifyCount++ },
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	defer func() { _ = stop() }() //nolint:errcheck
+
 	// No rate limit for this test.
 	cfg := store.RateLimitConfig{}
 	peerChannel := api.InputPeerChannel(alice.ID, channel.ID)
 
-	// Post once.
+	// Post once — should fire one notify.
 	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
 		Peer: peerChannel, Message: "post", RandomID: 42,
 	})
@@ -1013,8 +1081,13 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 		t.Fatalf("post: %v", err)
 	}
 
+	// Wait for notification to arrive.
+	time.Sleep(50 * time.Millisecond)
+	if notifyCount != 1 {
+		t.Fatalf("notify count after post = %d, want 1", notifyCount)
+	}
+
 	// Retry same random_id — should succeed without firing notify again.
-	// We verify by checking that only one channel message exists.
 	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
 		Peer: peerChannel, Message: "retry", RandomID: 42,
 	})
@@ -1022,12 +1095,9 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 		t.Fatalf("retry: expected success, got %v", err)
 	}
 
-	// Only one channel message should exist.
-	history, err := s.ChannelHistory(ctx, channel.ID, 0, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(history) != 1 {
-		t.Fatalf("channel history = %d, want 1 (duplicate post committed)", len(history))
+	// Notify count should still be 1 (duplicate did not fire).
+	time.Sleep(50 * time.Millisecond)
+	if notifyCount != 1 {
+		t.Fatalf("notify count after retry = %d, want 1 (dup fired notify)", notifyCount)
 	}
 }
