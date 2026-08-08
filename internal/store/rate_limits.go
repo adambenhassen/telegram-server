@@ -57,13 +57,12 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 		return nil, nil //nolint:nilnil // allowed is not an error
 	}
 
-	// Denied — compute wait time using Postgres timestamps only.
-	// Window is the configured window; window_start is when the current
-	// window began. The remaining wait is window - (now - window_start).
-	// We use the Go clock here but only for the sub-second remainder — the
-	// window_start came from Postgres and the window is a constant, so the
-	// error is bounded to sub-second clock skew.
-	wait := cfg.Window - time.Since(row.WindowStart.Time)
+	// Denied — compute wait from Postgres timestamps only.
+	// expires_at = window_start + window, so the remaining wait is
+	// expires_at - now(). Using the Go clock to measure against a
+	// Postgres timestamp is acceptable here because the error is bounded
+	// to the app/DB clock offset, which is negligible on a single host.
+	wait := time.Until(row.ExpiresAt.Time)
 	// Round up to whole seconds and enforce minimum of 1.
 	waitSecs := int(math.Ceil(float64(wait) / float64(time.Second)))
 	waitSecs = max(waitSecs, 1)
@@ -71,10 +70,12 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 	return &RateLimitResult{Wait: time.Duration(waitSecs) * time.Second}, nil
 }
 
-// SweepExpiredRateLimits deletes rate-limit rows whose window has fully
-// expired, preventing unbounded growth of stale entries. Call periodically
-// (e.g. on startup or via a scheduled sweep) rather than on every check — the
-// window index keeps it efficient regardless.
-func (s *Store) SweepExpiredRateLimits(ctx context.Context, window time.Duration) error {
-	return s.q.SweepExpiredRateLimits(ctx, pgtype.Interval{Microseconds: window.Microseconds(), Valid: true})
+// SweepExpiredRateLimits deletes rate-limit rows whose per-row expiry deadline
+// has passed. The deadline is stored on the row (expires_at), so the sweep
+// does not need to know per-surface window durations.
+//
+// This is not wired into a caller yet — the sweep lands with MAIN-202, the
+// first ticket that wires a surface and can establish the sweep cadence.
+func (s *Store) SweepExpiredRateLimits(ctx context.Context) error {
+	return s.q.SweepExpiredRateLimits(ctx)
 }

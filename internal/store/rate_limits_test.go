@@ -364,6 +364,48 @@ func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
 	}
 }
 
+func TestRateLimitWaitRoundsUp(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	// Use a window where the remainder after consuming is guaranteed to have
+	// a fractional second. 3s window, consume immediately: remainder ~3s.
+	// After sleeping 2.5s, remainder ~0.5s → should round up to 1s.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 3 * time.Second}
+	ctx := context.Background()
+	const subject = 950
+	const surface = "roundup"
+
+	// Consume the token.
+	if _, err := s.CheckRateLimit(ctx, subject, surface, cfg); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	// Sleep so the remainder is a small fraction (< 1s but > 0).
+	time.Sleep(2 * 600 * time.Millisecond) // 2.5s of 3s window = 0.5s remaining
+
+	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("denial: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected denial, got allowed")
+	}
+	// The remaining ~0.5s should round up to 1s (minimum).
+	if result.Wait < time.Second {
+		t.Errorf("wait = %v, want >= 1s (rounded up)", result.Wait)
+	}
+	// It should be exactly 1s (the minimum), not 2s.
+	if result.Wait > time.Second {
+		t.Errorf("wait = %v, want 1s (0.5s rounded up)", result.Wait)
+	}
+}
+
 func TestRateLimitDenialNotError(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
