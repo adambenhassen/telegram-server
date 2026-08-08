@@ -146,4 +146,6 @@ var (
 	// errUsernameLookupFloodWait rejects a contacts.resolveUsername that would
 	// take the caller past their per-account username lookup quota.
 	errUsernameLookupFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
+	// errSearchQueryEmpty rejects a contacts.search with an empty query string.
+	errSearchQueryEmpty = rpcErr(400, "SEARCH_QUERY_EMPTY")
 )
