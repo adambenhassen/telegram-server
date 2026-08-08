@@ -166,6 +166,10 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	if req.Q == "" {
 		return nil, errSearchQueryEmpty
 	}
+	const maxContactsSearchQuery = 256
+	if len(req.Q) > maxContactsSearchQuery {
+		return nil, errSearchQueryTooLong
+	}
 
 	limit := int32(req.Limit) //nolint:gosec // limit is a small validated page size
 	if limit <= 0 {

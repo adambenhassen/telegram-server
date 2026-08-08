@@ -104,6 +104,34 @@ func TestContactsSearchLimitCap(t *testing.T) {
 	}
 }
 
+func TestContactsSearchQueryTooLong(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	caller, err := s.CreateUser(context.Background(), "15550000104")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Query over 256 bytes should be rejected.
+	longQuery := make([]byte, 257)
+	for i := range longQuery {
+		longQuery[i] = 'a'
+	}
+	_, err = api.ContactsSearchForTest(s, caller.ID, &tg.ContactsSearchRequest{Q: string(longQuery)})
+	if err == nil {
+		t.Fatal("over-length query not refused")
+	}
+	if !tgerr.Is(err, "SEARCH_QUERY_TOO_LONG") {
+		t.Errorf("got %v, want SEARCH_QUERY_TOO_LONG", err)
+	}
+}
+
 func TestContactsSearchNoMatch(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)

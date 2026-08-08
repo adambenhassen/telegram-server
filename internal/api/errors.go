@@ -148,4 +148,6 @@ var (
 	errUsernameLookupFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
 	// errSearchQueryEmpty rejects a contacts.search with an empty query string.
 	errSearchQueryEmpty = rpcErr(400, "SEARCH_QUERY_EMPTY")
+	// errSearchQueryTooLong rejects a contacts.search query over 256 bytes.
+	errSearchQueryTooLong = rpcErr(400, "SEARCH_QUERY_TOO_LONG")
 )
