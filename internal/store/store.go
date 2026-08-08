@@ -128,12 +128,6 @@ func (s *Store) checkSchema(ctx context.Context) error {
 	return nil
 }
 
-// Pool returns the underlying pgxpool.Pool for callers that need raw
-// Postgres access (e.g. tests that seed data with SQL).
-func (s *Store) Pool() *pgxpool.Pool {
-	return s.pool
-}
-
 // Close releases the connection pool.
 func (s *Store) Close() error {
 	s.pool.Close()

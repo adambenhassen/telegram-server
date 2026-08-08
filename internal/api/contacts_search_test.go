@@ -74,7 +74,7 @@ func TestContactsSearchLimitDefault(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("load user %d: ok=%v err=%v", i, ok, err)
 		}
-		if err := api.SetUserFirstNameForTest(s, partner.ID, "Alice"); err != nil {
+		if err := api.SetUserFirstNameForTest(dsn, partner.ID, "Alice"); err != nil {
 			t.Fatalf("set name %d: %v", i, err)
 		}
 		// Establish dialog: caller sends a message to partner.
@@ -126,7 +126,7 @@ func TestContactsSearchLimitCap(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("load user %d: ok=%v err=%v", i, ok, err)
 		}
-		if err := api.SetUserFirstNameForTest(s, partner.ID, "Bob"); err != nil {
+		if err := api.SetUserFirstNameForTest(dsn, partner.ID, "Bob"); err != nil {
 			t.Fatalf("set name %d: %v", i, err)
 		}
 		// Establish dialog: caller sends a message to partner.
