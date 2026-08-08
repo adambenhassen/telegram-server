@@ -291,11 +291,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 func (h *handlers) sendChatMedia(
 	r *mtproto.Request, chatID int64, req *tg.MessagesSendMediaRequest, fileID int64,
 ) (bin.Encoder, error) {
-	// Rate limit: new message, consume a token.
-	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
-		return nil, err
-	}
-
+	// Rate limit already checked in handleSendMedia before the peer split.
 	sender, perOwner, _, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
 		ChatID: chatID, FromID: r.UserID, Text: req.Message, RandomID: req.RandomID, FileID: fileID,
 	})

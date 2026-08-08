@@ -197,6 +197,11 @@ func InputPeerUser(viewerID, peerID int64) *tg.InputPeerUser {
 	return &tg.InputPeerUser{UserID: peerID, AccessHash: DeriveUserHash(viewerID, peerID)}
 }
 
+// InputPeerChat builds a valid InputPeerChat for chatID.
+func InputPeerChat(viewerID, chatID int64) *tg.InputPeerChat {
+	return &tg.InputPeerChat{ChatID: chatID}
+}
+
 // InputUser builds a valid InputUser for peerID as seen by viewerID.
 func InputUser(viewerID, peerID int64) *tg.InputUser {
 	return &tg.InputUser{UserID: peerID, AccessHash: DeriveUserHash(viewerID, peerID)}
@@ -498,6 +503,18 @@ func SendEncryptedMessageForTest(s *store.Store, userID int64, req *tg.MessagesS
 		return nil, err
 	}
 	return testHandlers(s).handleSendEncryptedMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SendEncryptedMessageForTestWithLimits encodes req and invokes
+// handleSendEncryptedMessage with a custom message send rate limit config.
+func SendEncryptedMessageForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSendEncryptedRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMessageSend = rateLimit
+	return h.handleSendEncryptedMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // DHPrime returns the group modulus, so a test can build g_a values that sit

@@ -269,11 +269,11 @@ func (h *handlers) requireChannelMember(ctx context.Context, channelID, userID i
 func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
 	// Check for a transport retry before the rate limit.
 	if req.RandomID != 0 {
-		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok {
-			// Retry: return the stored message without rate-limiting.
-			senderState, err := h.store.State(r.Ctx, r.UserID)
+		if existing, ok, err := h.store.ChannelMessageByRandomID(r.Ctx, channelID, req.RandomID); err == nil && ok {
+			// Retry: return the stored post without rate-limiting.
+			channelState, err := h.store.ChannelState(r.Ctx, channelID)
 			if err != nil {
-				h.log.Error("read sender pts on retry", "user_id", r.UserID, "err", err)
+				h.log.Error("read channel pts on retry", "channel_id", channelID, "err", err)
 				return nil, errInternal
 			}
 			channels, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
@@ -289,7 +289,7 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 			return &tg.Updates{
 				Updates: []tg.UpdateClass{
 					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
-					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: senderState.Pts, PtsCount: 1},
+					&tg.UpdateNewChannelMessage{Message: channelMessageToTL(existing, r.UserID, nil), Pts: channelState, PtsCount: 1},
 				},
 				Users: users,
 				Chats: channels,
@@ -308,7 +308,7 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 
 	// PostChannelMessageAs, never PostChannelMessage: the latter is the
 	// unchecked primitive and trusts its caller to have decided post rights.
-	msg, pts, _, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil)
+	msg, pts, dup, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil)
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
 	}
@@ -316,8 +316,11 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 		h.log.Error("send channel message", "user_id", r.UserID, "channel_id", channelID, "err", err)
 		return nil, errInternal
 	}
-
-	h.notifyChannelPost(r.Ctx, channelID)
+	// Only notify when the post is new. A duplicate means another caller
+	// already committed the same random_id and fired the notify.
+	if !dup {
+		h.notifyChannelPost(r.Ctx, channelID)
+	}
 
 	channels, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
 	if err != nil {

@@ -487,3 +487,208 @@ func TestRetryDoesNotRateLimit(t *testing.T) {
 		t.Fatalf("new message: expected FLOOD_WAIT, got %v", err)
 	}
 }
+
+// TestEncryptedSendRateLimit proves that encrypted sends draw from the shared
+// message send budget and that a retry with the same random_id does not consume
+// a token.
+func TestEncryptedSendRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294101")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551294102")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create an active secret chat.
+	chat, _, err := s.CreateSecretChatRequest(ctx, alice.ID, bob.ID, []byte{1}, []byte{2}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptSecretChat(ctx, chat.ID, bob.ID, []byte{3}, 42); err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit of 2 sends.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	encPeer := api.InputEncryptedChat(alice.ID, chat.ID)
+	data := []byte("encrypted payload")
+
+	// Send 1 — consumes token 1.
+	_, err = api.SendEncryptedMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendEncryptedRequest{
+		Peer: encPeer, Data: data, RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("send 1: %v", err)
+	}
+
+	// Retry same random_id — should succeed without consuming a token.
+	_, err = api.SendEncryptedMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendEncryptedRequest{
+		Peer: encPeer, Data: data, RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("retry: expected success, got %v", err)
+	}
+
+	// Send 2 — consumes token 2.
+	_, err = api.SendEncryptedMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendEncryptedRequest{
+		Peer: encPeer, Data: data, RandomID: 2,
+	})
+	if err != nil {
+		t.Fatalf("send 2: %v", err)
+	}
+
+	// Send 3 — should be denied.
+	_, err = api.SendEncryptedMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendEncryptedRequest{
+		Peer: encPeer, Data: data, RandomID: 3,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("send 3: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// No side effects: only 2 events should exist.
+	events, err := s.SecretChatsAfterDate(ctx, bob.ID, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("bob secret chats = %d, want 1", len(events))
+	}
+}
+
+// TestChannelPostRetryDoesNotRateLimit proves that a channel post retry with
+// an already-stored random_id returns the stored post, never FLOOD_WAIT.
+func TestChannelPostRetryDoesNotRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294201")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a channel with alice as admin.
+	channel, err := s.CreateChannel(ctx, alice.ID, "Test Channel", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit of 1.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+
+	// Post 1 — consumes the only token.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer:    api.InputPeerChannel(alice.ID, channel.ID),
+		Message: "post", RandomID: 42,
+	})
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// Retry same random_id — should succeed without consuming a token.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer:    api.InputPeerChannel(alice.ID, channel.ID),
+		Message: "retry", RandomID: 42,
+	})
+	if err != nil {
+		t.Fatalf("retry: expected success, got %v", err)
+	}
+
+	// New post with different random_id — should be denied.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer:    api.InputPeerChannel(alice.ID, channel.ID),
+		Message: "new", RandomID: 99,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("new post: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestChatMediaSendsOneToken proves that a chat media send consumes exactly
+// one rate limit token (not two). It sends one plain text to a 1:1 dialog
+// (token 1), then a chat media (token 2), then verifies the third send is
+// denied — proving the chat media path only spent one token.
+func TestChatMediaSendsOneToken(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551294301")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551294302")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a chat and add bob.
+	enc, err := api.CreateChatForTest(s, alice.ID, &tg.MessagesCreateChatRequest{
+		Users: []tg.InputUserClass{api.InputUser(alice.ID, bob.ID)},
+		Title: "Media Chat",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, ok := enc.(*tg.MessagesInvitedUsers)
+	if !ok {
+		t.Fatalf("result type = %T", enc)
+	}
+	ups, ok := res.Updates.(*tg.Updates)
+	if !ok || len(ups.Chats) != 1 {
+		t.Fatalf("updates = %T", res.Updates)
+	}
+	chat, ok := ups.Chats[0].(*tg.Chat)
+	if !ok {
+		t.Fatalf("chat type = %T", ups.Chats[0])
+	}
+
+	// Limit of 2.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	peerBob := api.InputPeerUser(alice.ID, bob.ID)
+	peerChat := api.InputPeerChat(alice.ID, chat.ID)
+
+	// Plain text send to 1:1 — consumes token 1.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "hello", RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Chat media send — should consume token 2 and succeed.
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Upload the file parts first.
+	if _, err := api.SaveFilePartForTest(s, alice.ID, &tg.UploadSaveFilePartRequest{
+		FileID: 1, FilePart: 0, Bytes: []byte("hello"),
+	}); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	_, err = api.SendMediaForTestWithLimits(s, alice.ID, blobs, api.TestMaxUserStorageBytes, cfg, &tg.MessagesSendMediaRequest{
+		Peer: peerChat, Message: "media", RandomID: 2,
+		Media: &tg.InputMediaUploadedDocument{
+			File:     &tg.InputFile{ID: 1, Parts: 1, Name: "test.txt"},
+			MimeType: "text/plain",
+		},
+	})
+	if err != nil {
+		t.Fatalf("chat media: expected success, got %v (chat media consuming 2 tokens is a bug)", err)
+	}
+
+	// Third send — should be denied.
+	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "blocked", RandomID: 3,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("third send: expected FLOOD_WAIT, got %v", err)
+	}
+}

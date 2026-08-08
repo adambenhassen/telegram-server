@@ -334,7 +334,24 @@ func (h *handlers) handleSendEncryptedMessage(r *mtproto.Request) (bin.Encoder, 
 	// 6. Derive recipient (never from the request).
 	recipientID := chat.Other(r.UserID)
 
-	event, dup, err := h.store.SendEncryptedMessage(r.Ctx, store.EncryptedSend{
+	// Check for a transport retry before the rate limit.
+	if req.RandomID != 0 {
+		if existing, ok, err := h.store.EncryptedMessageByRandomID(r.Ctx, recipientID, req.RandomID); err == nil && ok {
+			// Retry: return the stored event without rate-limiting or writing.
+			return &tg.MessagesSentEncryptedMessage{
+				Date: int(existing.Date.Unix()),
+			}, nil
+		} else if err != nil {
+			return nil, err
+		}
+	}
+
+	// Rate limit: new encrypted message, consume a token.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+		return nil, err
+	}
+
+	event, _, err := h.store.SendEncryptedMessage(r.Ctx, store.EncryptedSend{
 		RecipientID: recipientID,
 		ChatID:      chatID,
 		RandomID:    req.RandomID,
@@ -343,14 +360,8 @@ func (h *handlers) handleSendEncryptedMessage(r *mtproto.Request) (bin.Encoder, 
 	if err != nil {
 		return nil, err
 	}
-	// Rate limit after dedupe: a retry with an already-stored random_id
-	// returns the stored event without consuming a token.
-	if !dup {
-		if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
-			return nil, err
-		}
-		h.notifyEncryptedMsg(r.Ctx, recipientID, event.Qts)
-	}
+
+	h.notifyEncryptedMsg(r.Ctx, recipientID, event.Qts)
 	return &tg.MessagesSentEncryptedMessage{
 		Date: int(event.Date.Unix()),
 	}, nil
