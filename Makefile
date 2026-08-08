@@ -27,20 +27,43 @@ migrate:
 # (Conn.Push/writeMu, per-owner pts, store lock ordering), and a plain run
 # passes a build that corrupts state under concurrent load.
 test: docker-bridge
-	go test -race ./...
+	$(TESTENV) go test -race ./...
 
-# Postgres-backed suites only, for a quick check while working in internal/store.
+# The store suite alone, for a quick check while working in internal/store.
+# Deliberately not ./test/... — e2e wants the whole machine to itself and is
+# minutes, not seconds; `make test` and CI cover it.
 test-db: docker-bridge
-	go test -race ./internal/store/... ./test/...
+	$(TESTENV) go test -race ./internal/store/...
+
+# Inside a container the host is shared with other test runs, and tg-test-pg is
+# shared with them too — it is keyed only by name. Ryuk, testcontainers' reaper,
+# SIGKILLs that container when *its own* session's last binary exits, taking
+# every concurrent run down with it ("unexpected EOF", then connection refused
+# against the old IP). CI disables it for the same reason. Off only in a
+# container, where the sandbox is thrown away anyway; on a laptop it stays on so
+# a leaked container does not outlive the run.
+TESTENV := $(shell [ -f /.dockerenv ] && echo TESTCONTAINERS_RYUK_DISABLED=true)
 
 # pgtest starts its Postgres on Docker's default bridge network. When the tests
 # themselves run inside a container attached to some other user-defined network,
 # the two networks are isolated and every DB test dies on a connect timeout to
-# 172.17.x.x. Joining the bridge restores the route. Idempotent, and skipped
-# entirely when not running in a container.
+# 172.17.x.x. Joining the bridge restores the route. Skipped entirely when not
+# running in a container.
+#
+# Only "already in the network" is ignored, and nothing else: a silent failure
+# here buys back the exact timeout this target exists to prevent, minutes later
+# and looking like a broken test. /etc/hostname is not the container's Docker
+# name under --hostname or pod-style networking, and the socket may be absent —
+# both must be loud.
 docker-bridge:
 	@[ -f /.dockerenv ] || exit 0; \
-	docker network connect bridge "$$(cat /etc/hostname)" 2>/dev/null || true
+	out=$$(docker network connect bridge "$$(cat /etc/hostname)" 2>&1) || \
+	case "$$out" in \
+	*"already exists in network"*) ;; \
+	*) echo "$$out" >&2; \
+	   echo "make: cannot join the docker bridge network; the Postgres tests will time out. See docs/testing.md" >&2; \
+	   exit 1;; \
+	esac
 
 lint:
 	golangci-lint run
