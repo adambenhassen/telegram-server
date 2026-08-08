@@ -1220,3 +1220,156 @@ func mediaDocument(t *testing.T, m *tg.Message) *tg.Document {
 	}
 	return doc
 }
+
+func TestSearchMatchesInboundMessages(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a, err := s.CreateUser(ctx, "+15551295001")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551295002")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+
+	// A sends "hello world" to B.
+	if _, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
+		Peer:     api.InputPeerUser(a.ID, b.ID),
+		Message:  "hello world",
+		RandomID: 1,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// B searches for "hello" — should return the inbound message from A.
+	enc, err := api.SearchForTest(s, b.ID, &tg.MessagesSearchRequest{
+		Peer:   api.InputPeerUser(b.ID, a.ID),
+		Q:      "hello",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesMessages", enc)
+	}
+	if len(res.Messages) != 1 {
+		t.Fatalf("B search hello: got %d messages, want 1", len(res.Messages))
+	}
+	m, ok := res.Messages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("message type = %T, want *tg.Message", res.Messages[0])
+	}
+	if m.Message != "hello world" {
+		t.Fatalf("message text = %q, want %q", m.Message, "hello world")
+	}
+	if m.Out {
+		t.Error("inbound message should have out=false")
+	}
+}
+
+func TestSearchChatPeerReturnsBothDirections(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	users, chat := chatWith(t, s, "+15551295011", "+15551295012")
+
+	// A sends "quarterly report" to the chat.
+	if _, err := api.SendMessageForTest(s, users[0].ID, &tg.MessagesSendMessageRequest{
+		Peer:     &tg.InputPeerChat{ChatID: chat.ID},
+		Message:  "quarterly report",
+		RandomID: 1,
+	}); err != nil {
+		t.Fatalf("send A: %v", err)
+	}
+	// B sends "review quarterly" to the chat.
+	if _, err := api.SendMessageForTest(s, users[1].ID, &tg.MessagesSendMessageRequest{
+		Peer:     &tg.InputPeerChat{ChatID: chat.ID},
+		Message:  "review quarterly",
+		RandomID: 2,
+	}); err != nil {
+		t.Fatalf("send B: %v", err)
+	}
+
+	// B searches chat for "quarterly" — should return both messages.
+	enc, err := api.SearchForTest(s, users[1].ID, &tg.MessagesSearchRequest{
+		Peer:   &tg.InputPeerChat{ChatID: chat.ID},
+		Q:      "quarterly",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesMessages", enc)
+	}
+	if len(res.Messages) != 2 {
+		t.Fatalf("B search chat quarterly: got %d messages, want 2", len(res.Messages))
+	}
+	// Newest-first: B's own "review quarterly" then A's "quarterly report".
+	got := make([]string, len(res.Messages))
+	for i, m := range res.Messages {
+		if msg, ok := m.(*tg.Message); ok {
+			got[i] = msg.Message
+		} else {
+			t.Fatalf("message %d type = %T", i, m)
+		}
+	}
+	if got[0] != "review quarterly" {
+		t.Errorf("search[0] = %q, want %q", got[0], "review quarterly")
+	}
+	if got[1] != "quarterly report" {
+		t.Errorf("search[1] = %q, want %q", got[1], "quarterly report")
+	}
+	// Chats should be populated for chat peers.
+	if len(res.Chats) != 1 {
+		t.Fatalf("chats = %d, want 1", len(res.Chats))
+	}
+	c, ok := res.Chats[0].(*tg.Chat)
+	if !ok {
+		t.Fatalf("chat type = %T, want *tg.Chat", res.Chats[0])
+	}
+	if c.ID != chat.ID {
+		t.Errorf("chat id = %d, want %d", c.ID, chat.ID)
+	}
+}
+
+func TestSearchChatPeerRejectsNonMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	_, chat := chatWith(t, s, "+15551295021", "+15551295022")
+	outsider, err := s.CreateUser(ctx, "+15551295023")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
+
+	_, err = api.SearchForTest(s, outsider.ID, &tg.MessagesSearchRequest{
+		Peer:   &tg.InputPeerChat{ChatID: chat.ID},
+		Q:      "hello",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	})
+	rpcError(t, err, "PEER_ID_INVALID")
+}
+
+func TestSearchChannelPeerReturnsInvalid(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	u, err := s.CreateUser(context.Background(), "+15551295031")
+	if err != nil {
+		t.Fatalf("user: %v", err)
+	}
+
+	_, err = api.SearchForTest(s, u.ID, &tg.MessagesSearchRequest{
+		Peer: &tg.InputPeerChannel{
+			ChannelID:  1,
+			AccessHash: api.DeriveChannelHash(u.ID, 1),
+		},
+		Q:      "hello",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	})
+	rpcError(t, err, "PEER_ID_INVALID")
+}
