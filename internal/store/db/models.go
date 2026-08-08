@@ -145,6 +145,7 @@ type Message struct {
 	FwdDate        pgtype.Timestamptz
 	FwdChannelID   *int64
 	FwdChannelPost *int32
+	SearchVector   interface{}
 }
 
 type MessageEvent struct {

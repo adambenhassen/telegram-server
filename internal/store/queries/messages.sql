@@ -38,3 +38,14 @@ UPDATE messages SET message = $3, edit_date = now() WHERE owner_id = $1 AND loca
 
 -- name: SetDeleted :exec
 UPDATE messages SET deleted = true WHERE owner_id = $1 AND local_id = $2;
+
+-- name: SearchMessages :many
+SELECT * FROM messages
+WHERE owner_id = sqlc.arg(owner_id)
+  AND peer_type = sqlc.arg(peer_type)
+  AND peer_id = sqlc.arg(peer_id)
+  AND deleted = false
+  AND search_vector @@ plainto_tsquery('english', sqlc.arg(query))
+  AND (sqlc.arg(offset_id)::bigint = 0 OR local_id < sqlc.arg(offset_id)::bigint)
+ORDER BY local_id DESC
+LIMIT sqlc.arg(lim)::int;
