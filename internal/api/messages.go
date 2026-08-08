@@ -607,15 +607,55 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	// Rate limit before the forward: one token per forward request, regardless
-	// of how many messages are forwarded or deduped. The per-message dedupe
-	// inside store.ForwardMessages cannot be exposed as a "all dups" signal
-	// without changing the store API.
-	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
-		return nil, err
-	}
 	if len(req.ID) == 0 || len(req.RandomID) != len(req.ID) {
 		return nil, errPeerIDInvalid
+	}
+
+	// Check for a full retry: if every random_id is already stored, return
+	// the forwarded messages without consuming a token.
+	allDup := true
+	var dupMsgs []store.Message
+	for _, rid := range req.RandomID {
+		if rid == 0 {
+			allDup = false
+			break
+		}
+		existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, rid)
+		if err != nil {
+			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		if !ok {
+			allDup = false
+			break
+		}
+		dupMsgs = append(dupMsgs, existing)
+	}
+	if allDup {
+		// Full retry: return stored messages without rate-limiting.
+		senderState, err := h.store.State(r.Ctx, r.UserID)
+		if err != nil {
+			h.log.Error("read sender pts on retry", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		perOwner := make(map[int64]int)
+		sentMsgs := make([]store.ForwardedMessage, 0, len(dupMsgs))
+		for _, m := range dupMsgs {
+			sentMsgs = append(sentMsgs, store.ForwardedMessage{Message: m, Pts: senderState.Pts})
+			if m.PeerType == store.PeerTypeChat {
+				perOwner[m.OwnerID] = senderState.Pts
+			}
+		}
+		destPeerType, destPeerID, err := h.inputPeer(req.ToPeer, r.UserID)
+		if err != nil {
+			return nil, err
+		}
+		return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, req.RandomID)
+	}
+
+	// Rate limit: at least one new forward, consume a token.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+		return nil, err
 	}
 
 	// Resolve destination peer.

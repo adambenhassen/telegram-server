@@ -25,6 +25,11 @@ type Store struct {
 	// t.Parallel().
 	maxChannelParticipants int
 	maxChannelsPerUser     int
+
+	// deniedHook is a test-only callback fired in CheckRateLimit after the
+	// INSERT denial and before the GET. Scoped to the Store so parallel tests
+	// each own their own hook without racing.
+	deniedHook func()
 }
 
 // Sentinel errors returned by the login-code methods.

@@ -17,8 +17,9 @@ func NextBackoff(prev, uptime time.Duration) time.Duration { return nextBackoff(
 
 // SetDeniedHook installs a callback that fires in CheckRateLimit after the
 // INSERT denial and before the GET. Tests use it to delete the row and
-// exercise the ErrNoRows branch. Pass nil to clear.
-func SetDeniedHook(fn func()) { deniedHook = fn }
+// exercise the ErrNoRows branch. Scoped to the Store so parallel tests
+// each own their own hook without racing.
+func SetDeniedHook(s *Store, fn func()) { s.deniedHook = fn }
 
 const (
 	ListenerBackoffMin = listenerBackoffMin

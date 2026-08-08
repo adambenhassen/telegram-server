@@ -29,11 +29,6 @@ type RateLimitResult struct {
 	Wait time.Duration
 }
 
-// deniedHook is a test-only callback fired after the INSERT denial and before
-// the GET. It is nil in production. Tests set it via SetDeniedHook to control
-// the interleaving between the two reads.
-var deniedHook func()
-
 // CheckRateLimit checks whether subjectID is allowed to make a request on the
 // given surface, consuming a token if allowed.
 //
@@ -64,8 +59,8 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 	}
 
 	// Test hook: fires after INSERT denial, before GET.
-	if deniedHook != nil {
-		deniedHook()
+	if s.deniedHook != nil {
+		s.deniedHook()
 	}
 
 	// Denied — read expires_at in a fresh snapshot so we see the row committed

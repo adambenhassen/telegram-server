@@ -94,13 +94,13 @@ func TestSweepVsCheckRace(t *testing.T) {
 
 	// Install the hook: fires after INSERT denial, before GET.
 	// Deletes the row so the GET returns ErrNoRows.
-	store.SetDeniedHook(func() {
+	store.SetDeniedHook(s, func() {
 		_, _ = pool.Exec(ctx, //nolint:errcheck // test hook: best-effort delete
 			`DELETE FROM rate_limits WHERE subject_id = $1 AND surface = $2`,
 			alice.ID, "sweep_race",
 		)
 	})
-	defer store.SetDeniedHook(nil)
+	defer store.SetDeniedHook(s, nil)
 
 	// Fire the check. INSERT fails (at limit), hook fires (deletes row),
 	// GET returns ErrNoRows → branch fires → allowed.
