@@ -7,14 +7,12 @@ package db
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (phone) VALUES ($1)
 ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
-RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at, username, name_tsv
+RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at, username
 `
 
 func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
@@ -29,7 +27,6 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
-		&i.NameTsv,
 	)
 	return i, err
 }
@@ -37,43 +34,32 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
 const searchContactsByName = `-- name: SearchContactsByName :many
 SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at, u.username
 FROM users u
-JOIN dialogs d ON (
-    (d.owner_id = $1::bigint AND d.peer_id = u.id AND d.peer_type = 1)
-    OR
-    (d.peer_id = $1::bigint AND d.owner_id = u.id)
-)
-WHERE u.name_tsv @@ plainto_tsquery('simple', $2)
+WHERE u.name_tsv @@ plainto_tsquery('simple', $1)
+  AND EXISTS (
+      SELECT 1 FROM dialogs d
+      WHERE (d.owner_id = $2::bigint AND d.peer_id = u.id AND d.peer_type = 1)
+         OR (d.peer_id = $2::bigint AND d.owner_id = u.id AND d.peer_type = 1)
+  )
 LIMIT $3::int
 `
 
 type SearchContactsByNameParams struct {
-	OwnerID int64
 	Query   string
+	OwnerID int64
 	Lim     int32
-}
-
-type SearchContactsByNameRow struct {
-	ID         int64
-	Phone      string
-	FirstName  string
-	LastName   string
-	CreatedAt  pgtype.Timestamptz
-	IsOnline   bool
-	LastSeenAt pgtype.Timestamptz
-	Username   *string
 }
 
 // Search users by name within the caller's existing dialogs.
 // Only users with whom the caller has exchanged messages (has a dialog row) are returned.
-func (q *Queries) SearchContactsByName(ctx context.Context, arg SearchContactsByNameParams) ([]SearchContactsByNameRow, error) {
-	rows, err := q.db.Query(ctx, searchContactsByName, arg.OwnerID, arg.Query, arg.Lim)
+func (q *Queries) SearchContactsByName(ctx context.Context, arg SearchContactsByNameParams) ([]User, error) {
+	rows, err := q.db.Query(ctx, searchContactsByName, arg.Query, arg.OwnerID, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []SearchContactsByNameRow
+	var items []User
 	for rows.Next() {
-		var i SearchContactsByNameRow
+		var i User
 		if err := rows.Scan(
 			&i.ID,
 			&i.Phone,
@@ -129,7 +115,7 @@ func (q *Queries) SetUsername(ctx context.Context, arg SetUsernameParams) (int64
 }
 
 const userByID = `-- name: UserByID :one
-SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username, name_tsv FROM users WHERE id = $1
+SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username FROM users WHERE id = $1
 `
 
 func (q *Queries) UserByID(ctx context.Context, id int64) (User, error) {
@@ -144,13 +130,12 @@ func (q *Queries) UserByID(ctx context.Context, id int64) (User, error) {
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
-		&i.NameTsv,
 	)
 	return i, err
 }
 
 const userByPhone = `-- name: UserByPhone :one
-SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username, name_tsv FROM users WHERE phone = $1
+SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username FROM users WHERE phone = $1
 `
 
 func (q *Queries) UserByPhone(ctx context.Context, phone string) (User, error) {
@@ -165,7 +150,6 @@ func (q *Queries) UserByPhone(ctx context.Context, phone string) (User, error) {
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
-		&i.NameTsv,
 	)
 	return i, err
 }

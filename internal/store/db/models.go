@@ -217,7 +217,6 @@ type User struct {
 	IsOnline   bool
 	LastSeenAt pgtype.Timestamptz
 	Username   *string
-	NameTsv    interface{}
 }
 
 type UserPassword struct {
