@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -71,29 +72,31 @@ func TestContactsSearch(t *testing.T) {
 	const phoneB = "+15551290002"
 	const phoneC = "+15551290003"
 
-	// Log in all three users and capture their user IDs.
-	logIn := func(phone string) int64 {
-		var userID int64
-		client := newClient()
-		if err := client.Run(ctx, func(ctx context.Context) error {
-			if err := client.Auth().IfNecessary(ctx, flowFor(phone)); err != nil {
-				return err
-			}
-			self, err := client.Self(ctx)
-			if err != nil {
-				return err
-			}
-			userID = self.ID
-			return nil
-		}); err != nil {
-			t.Fatalf("login %s: %v", phone, err)
-		}
-		return userID
-	}
+	// Launch all three clients as interactive sessions so auth state persists.
+	clientA, clientB, clientC := newClient(), newClient(), newClient()
+	aCmds, bCmds, cCmds := make(chan command), make(chan command), make(chan command)
+	aID, bID, cID := make(chan int64, 1), make(chan int64, 1), make(chan int64, 1)
+	errA, errB, errC := make(chan error, 1), make(chan error, 1), make(chan error, 1)
+	go func() { errA <- runInteractive(ctx, clientA, flowFor(phoneA), aID, aCmds) }()
+	go func() { errB <- runInteractive(ctx, clientB, flowFor(phoneB), bID, bCmds) }()
+	go func() { errC <- runInteractive(ctx, clientC, flowFor(phoneC), cID, cCmds) }()
 
-	aUserID := logIn(phoneA)
-	bUserID := logIn(phoneB)
-	cUserID := logIn(phoneC)
+	var aUserID, bUserID, cUserID int64
+	for i, ch := range []chan int64{aID, bID, cID} {
+		select {
+		case id := <-ch:
+			switch i {
+			case 0:
+				aUserID = id
+			case 1:
+				bUserID = id
+			case 2:
+				cUserID = id
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("client login timeout (user %d)", i)
+		}
+	}
 
 	// Fetch B and C's first names so we can search for them.
 	bUser, ok, err := st.UserByID(ctx, bUserID)
@@ -105,10 +108,19 @@ func TestContactsSearch(t *testing.T) {
 		t.Fatalf("load C user: ok=%v err=%v", ok, err)
 	}
 
+	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
+		d := make(chan error, 1)
+		select {
+		case cmds <- command{fn: fn, done: d}:
+		case <-time.After(10 * time.Second):
+			t.Fatal("command enqueue timeout")
+		}
+		return <-d
+	}
+
 	// A sends a message to B to establish a dialog.
-	aClient := newClient()
-	if err := aClient.Run(ctx, func(ctx context.Context) error {
-		_, err := aClient.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerUser(aUserID, bUserID),
 			Message:  "hello B",
 			RandomID: 1,
@@ -120,9 +132,9 @@ func TestContactsSearch(t *testing.T) {
 
 	// contacts.search from A for B's first name — should return B.
 	var foundB *tg.ContactsFound
-	if err := aClient.Run(ctx, func(ctx context.Context) error {
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		var err error
-		foundB, err = aClient.API().ContactsSearch(ctx, &tg.ContactsSearchRequest{
+		foundB, err = c.ContactsSearch(ctx, &tg.ContactsSearchRequest{
 			Q:     bUser.FirstName,
 			Limit: 10,
 		})
@@ -160,9 +172,9 @@ func TestContactsSearch(t *testing.T) {
 	// contacts.search from A for C's first name — should return nothing
 	// (no dialog between A and C).
 	var foundC *tg.ContactsFound
-	if err := aClient.Run(ctx, func(ctx context.Context) error {
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		var err error
-		foundC, err = aClient.API().ContactsSearch(ctx, &tg.ContactsSearchRequest{
+		foundC, err = c.ContactsSearch(ctx, &tg.ContactsSearchRequest{
 			Q:     cUser.FirstName,
 			Limit: 10,
 		})
@@ -179,8 +191,8 @@ func TestContactsSearch(t *testing.T) {
 
 	// contacts.search from A with empty query — should return SEARCH_QUERY_EMPTY.
 	var searchEmptyErr error
-	if err := aClient.Run(ctx, func(ctx context.Context) error {
-		_, searchEmptyErr = aClient.API().ContactsSearch(ctx, &tg.ContactsSearchRequest{
+	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, searchEmptyErr = c.ContactsSearch(ctx, &tg.ContactsSearchRequest{
 			Q:     "",
 			Limit: 10,
 		})
@@ -190,5 +202,19 @@ func TestContactsSearch(t *testing.T) {
 	}
 	if searchEmptyErr == nil {
 		t.Fatal("contacts.search(\"\") should return error, got nil")
+	}
+
+	// Shut down clients.
+	close(aCmds)
+	close(bCmds)
+	close(cCmds)
+	if err := <-errA; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client A run: %v", err)
+	}
+	if err := <-errB; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client B run: %v", err)
+	}
+	if err := <-errC; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client C run: %v", err)
 	}
 }
