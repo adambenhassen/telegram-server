@@ -1064,3 +1064,64 @@ func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, pe
 		h.log.Error("notify pinned", "peer_id", peerID, "err", err)
 	}
 }
+
+// handleSearch serves messages.search: keyword search within a 1:1 dialog.
+// Only InputMessagesFilterEmpty is accepted; other filters return INPUT_FILTER_INVALID.
+// Results are the caller's own messages in the named peer, ordered newest-first.
+func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesSearchRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if req.Q == "" {
+		return nil, errSearchQueryEmpty
+	}
+	// Only InputMessagesFilterEmpty is supported; everything else is not implemented.
+	if _, ok := req.Filter.(*tg.InputMessagesFilterEmpty); !ok {
+		return nil, errInputFilterInvalid
+	}
+	peerType, peerID, err := h.inputPeer(req.Peer, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	// Only 1:1 user peers are in scope.
+	if peerType != store.PeerTypeUser {
+		return nil, errPeerIDInvalid
+	}
+
+	limit := req.Limit
+	if limit <= 0 {
+		limit = defaultHistoryLimit
+	}
+	if limit > maxHistoryLimit {
+		limit = maxHistoryLimit
+	}
+
+	msgs, err := h.store.SearchMessages(r.Ctx, r.UserID, peerType, peerID, req.Q, req.OffsetID, limit)
+	if err != nil {
+		h.log.Error("search messages", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	files, err := h.loadFiles(r.Ctx, msgs)
+	if err != nil {
+		h.log.Error("search messages files", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	tlMsgs := make([]tg.MessageClass, len(msgs))
+	for i, m := range msgs {
+		tlMsgs[i] = messageToTL(m, nil, files, nil, nil)
+	}
+
+	users, err := h.twoUsers(r.Ctx, r.UserID, peerID)
+	if err != nil {
+		h.log.Error("search messages users", "err", err)
+		return nil, errInternal
+	}
+
+	return &tg.MessagesMessages{Messages: tlMsgs, Users: users}, nil
+}

@@ -12,7 +12,7 @@ import (
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (phone) VALUES ($1)
 ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
-RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at, username
+RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at, username, name_tsv
 `
 
 func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
@@ -27,6 +27,7 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
+		&i.NameTsv,
 	)
 	return i, err
 }
@@ -66,7 +67,7 @@ func (q *Queries) SetUsername(ctx context.Context, arg SetUsernameParams) (int64
 }
 
 const userByID = `-- name: UserByID :one
-SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username FROM users WHERE id = $1
+SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username, name_tsv FROM users WHERE id = $1
 `
 
 func (q *Queries) UserByID(ctx context.Context, id int64) (User, error) {
@@ -81,12 +82,13 @@ func (q *Queries) UserByID(ctx context.Context, id int64) (User, error) {
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
+		&i.NameTsv,
 	)
 	return i, err
 }
 
 const userByPhone = `-- name: UserByPhone :one
-SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username FROM users WHERE phone = $1
+SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username, name_tsv FROM users WHERE phone = $1
 `
 
 func (q *Queries) UserByPhone(ctx context.Context, phone string) (User, error) {
@@ -101,6 +103,7 @@ func (q *Queries) UserByPhone(ctx context.Context, phone string) (User, error) {
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
+		&i.NameTsv,
 	)
 	return i, err
 }
