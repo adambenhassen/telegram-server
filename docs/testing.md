@@ -41,7 +41,7 @@ That is a routing problem, not a broken Docker socket: the container starts
 fine, it just is not reachable. The fix is to join the bridge network as well:
 
 ```bash
-docker network connect bridge "$(cat /etc/hostname)"
+docker network connect --gw-priority=-100 bridge "$(cat /etc/hostname)"
 ```
 
 `make test` and `make test-db` do this for you via the `docker-bridge` target.
@@ -50,6 +50,22 @@ container's own network attachments, and it is quiet only about already being
 in the network — any other failure stops the run rather than letting it die on
 the timeout above twenty minutes later. If you invoke `go test` directly instead
 of going through `make`, run that command first.
+
+`--gw-priority` is what keeps the join from being felt outside the test run.
+Plain `docker network connect bridge` also makes the bridge gateway the
+container's **default route**, and nothing puts the old one back: a container
+that booted with `default via 172.18.0.1` sends every non-local packet via
+`172.17.0.1` from the first `make test` onward, for the rest of its life. The
+negative priority loses the gateway election while still giving the suite its
+route to `tg-test-pg`, and embedded DNS on the user-defined network is
+unaffected.
+
+The flag needs Docker 28 (API 1.48). On an older daemon the target prints a
+warning that the default route moves and joins without it, rather than failing
+setup — the tests still run there, at the old cost. Priority is fixed at attach
+time, so a container that already joined the bridge the old way keeps the
+hijacked route; `docker network disconnect bridge "$(cat /etc/hostname)"` once,
+then let `make` reattach it.
 
 ## `no route to host` / `connection refused` mid-run
 
