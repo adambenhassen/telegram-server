@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,6 +270,85 @@ func TestSearchMessages(t *testing.T) {
 	}
 	if rpcErr.Code != 400 || rpcErr.Message != "INPUT_FILTER_INVALID" {
 		t.Fatalf("A search photos filter: got %d %s, want 400 INPUT_FILTER_INVALID", rpcErr.Code, rpcErr.Message)
+	}
+
+	// 8. Search with oversized query returns MESSAGE_TOO_LONG.
+	err = exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		longQuery := strings.Repeat("a", 501)
+		_, err := c.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+			Peer:   peerB,
+			Q:      longQuery,
+			Filter: &tg.InputMessagesFilterEmpty{},
+		})
+		return err
+	})
+	if err == nil {
+		t.Fatal("A search oversized query: expected error, got nil")
+	}
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("A search oversized query: expected RPC error, got %T: %v", err, err)
+	}
+	if rpcErr.Code != 400 || rpcErr.Message != "MESSAGE_TOO_LONG" {
+		t.Fatalf("A search oversized query: got %d %s, want 400 MESSAGE_TOO_LONG", rpcErr.Code, rpcErr.Message)
+	}
+
+	// 9. Search with a query at the cap (500 chars) succeeds without error.
+	msgs, err = search(aCmds, peerB, strings.Repeat("a", 500), 0, 10)
+	if err != nil {
+		t.Fatalf("A search at cap (500): %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("A search at cap (500): got %d messages, want 0", len(msgs))
+	}
+
+	// 10. Search with a forged AccessHash returns PEER_ID_INVALID.
+	err = exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+			Peer: &tg.InputPeerUser{
+				UserID:     bUserID,
+				AccessHash: 999999999, // wrong hash
+			},
+			Q:      "hello",
+			Filter: &tg.InputMessagesFilterEmpty{},
+		})
+		return err
+	})
+	if err == nil {
+		t.Fatal("A search forged hash: expected error, got nil")
+	}
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("A search forged hash: expected RPC error, got %T: %v", err, err)
+	}
+	if rpcErr.Code != 400 || rpcErr.Message != "PEER_ID_INVALID" {
+		t.Fatalf("A search forged hash: got %d %s, want 400 PEER_ID_INVALID", rpcErr.Code, rpcErr.Message)
+	}
+
+	// 11. Search a dialog with a user the caller has never exchanged messages with
+	// returns empty results, not an error.
+	collC := newUpdateCollector()
+	clientC := newClient(collC)
+	const phoneC = "+15551284003"
+	cCmds := make(chan command)
+	cID := make(chan int64, 1)
+	errC := make(chan error, 1)
+	go func() { errC <- runInteractive(ctx, clientC, flowFor(phoneC), cID, cCmds) }()
+	var cUserID int64
+	select {
+	case cUserID = <-cID:
+	case <-time.After(30 * time.Second):
+		t.Fatal("client C login timeout")
+	}
+	peerC := peerUser(aUserID, cUserID)
+	msgs, err = search(aCmds, peerC, "hello", 0, 10)
+	if err != nil {
+		t.Fatalf("A search unknown peer: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("A search unknown peer: got %d messages, want 0", len(msgs))
+	}
+	close(cCmds)
+	if err := <-errC; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("client C run: %v", err)
 	}
 
 	close(aCmds)
