@@ -54,12 +54,13 @@ Auth & account
   `account.updatePasswordSettings`
 - `account.getAuthorizations`, `account.resetAuthorization`
 - `account.updateStatus`
+- `account.updateUsername`
 
 Users & help
 - `help.getConfig`, `users.getUsers`
 
 Contacts
-- `contacts.resolvePhone`
+- `contacts.resolvePhone`, `contacts.resolveUsername`
 
 Messaging
 - `messages.sendMessage`, `messages.getDialogs`, `messages.getHistory`,
@@ -77,7 +78,7 @@ Updates
 Channels
 - `channels.createChannel`, `channels.getChannels`, `channels.joinChannel`,
   `channels.leaveChannel`, `channels.editAdmin`, `channels.editBanned`,
-  `channels.getMessages`
+  `channels.getMessages`, `channels.editChannelUsername`
 - `messages.exportChatInvite`, `messages.checkChatInvite`,
   `messages.importChatInvite`, `messages.revokeExportedChatInvite`
 - `updates.getChannelDifference`
@@ -342,6 +343,22 @@ Channels
   `secret_chats` table for per-chat key state and metadata,
   `update_state.qts` counter advancing on each secret-chat event.
 
+### M12 — Usernames & public channels
+- Shared `usernames` table: globally unique, case-insensitive handles covering
+  both user and channel names.
+- `account.updateUsername` — self-service username set/clear; 5–32 chars
+  `[a-z0-9_]` letter-first; reserved-handle blocklist; 2 changes/24h rate limit.
+- `channels.editChannelUsername` — admin-only; same validation and rate limit as
+  `account.updateUsername`.
+- `contacts.resolveUsername` — resolves @username to user or channel peer with
+  per-viewer `access_hash`; 100 distinct lookups/24h + 20/min burst cap;
+  pre-charged quota (no hit/miss oracle).
+- `channels.joinChannel` extended: public channel join via resolved `access_hash`;
+  publicness verified inside the admission transaction (TOCTOU-safe); same ban and
+  cap checks as invite-join; `join_pts` set under the state lock.
+- E2E gate covers: set/resolve user username, uniqueness conflict, public channel
+  join and post delivery, private channel refuses direct join, rate limit.
+
 ## Planned — feature track
 
 ### M11 — Message features
@@ -356,9 +373,7 @@ Four stages in sequence:
 4. **Pinned messages.** `messages.updatePinnedMessage` (admin-only in channels);
    `updatePinnedMessages` pushed to members; pinned message id surfaced in dialog.
 
-### M12 and later
-- Usernames and public channels — a global namespace with no allocation policy,
-  likely their own milestone.
+### Later
 - Server-side full-text search.
 
 ## Planned — operational track
@@ -538,6 +553,18 @@ Tracked so shortcuts don't rot into "later means never".
 - **Cross-replica status delivery in the E2E gate.** The M9 E2E status tests run single-process;
   cross-replica delivery is covered by the existing `LISTEN`/`NOTIFY` architecture but is not gated
   against a two-replica topology. — M9
+
+- **Username display in `User`/`Channel` objects.** Existing RPCs that return user or channel
+  objects do not yet populate the `Username` field. Clients cannot yet surface usernames from
+  their contact list or dialog headers without a separate `contacts.resolveUsername` lookup. — M12
+- **Username privacy controls.** Any holder of an @username can resolve it to a peer. The
+  Telegram hide-from-non-contacts control is deferred pending a contacts and block-list model;
+  the resolution endpoint has no membership boundary to gate on until one exists. — M12
+- **`maxChannelParticipants` cap on public channels.** Public channels (username set) are
+  attacker-reachable via `contacts.resolveUsername` + `channels.joinChannel` without an invite
+  hash; the existing 200-member cap is retained as a medium availability control. A follow-up
+  should revisit whether a higher cap or a per-joiner rate limit is warranted once join-by-username
+  traffic is observable. — M12
 
 ## Engineering invariants
 
