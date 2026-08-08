@@ -363,14 +363,17 @@ Channels
 - Schema additions: `message_tsv` tsvector column on `messages`, `name_tsv`
   tsvector column on `users`; GIN indexes on both; `'simple'` dictionary (no
   stemming, exact-token match across all locales).
-- `messages.search` — full-text search over 1:1 dialog message bodies. Search
-  results are bounded by the same per-owner row predicates that gate
-  `messages.getHistory`: only messages the caller owns a non-deleted row for are
-  returned, enforcing the same authorization boundary as direct reads. A message
-  the caller could not fetch via `getHistory` cannot appear in search results.
-- `contacts.search` — full-text search over usernames and display names, scoped
-  to the caller's 1:1 dialog peers. Results are bounded by the caller's dialog
-  set: only accounts the caller shares a non-deleted dialog with are eligible.
+- `messages.search` — full-text keyword search over the caller's own outbound
+  messages within a named 1:1 dialog (`out = true`). Non-user peers and
+  inbound-message search are out of scope (see Known deferrals). Authorization
+  boundary: results are bounded to rows the caller owns and sent — a received
+  message is never returned even if the caller can read it via `getHistory`.
+- `contacts.search` — full-text search over display names (first name + last
+  name) of the caller's 1:1 dialog peers. Results are scoped to accounts that
+  share a non-deleted dialog with the caller; username fields are not searched.
+- E2E gates: `TestSearchMessages` proves keyword matching and the outbound-only
+  boundary; `TestContactsSearch` proves dialog-scoped name matching and that
+  non-dialog users are excluded.
 
 ## Planned — feature track
 
@@ -576,16 +579,25 @@ Tracked so shortcuts don't rot into "later means never".
   should revisit whether a higher cap or a per-joiner rate limit is warranted once join-by-username
   traffic is observable. — M12
 
+- **`messages.search` returns only outbound messages.** `SearchMessages` carries
+  `AND out = true`, so received messages never appear in search results even
+  though the caller can read them via `getHistory`. Inbound message search is
+  deferred to M14. — M13
 - **`messages.searchGlobal` not implemented.** Cross-dialog global search is deferred to M14.
   The index exists; the gap is the RPC and its pagination model. — M13
-- **Channel and megagroup message search not implemented.** `messages.search` covers 1:1 dialogs
-  only; channel and supergroup message bodies are indexed by `message_tsv` but the search RPC
-  does not accept channel peers. Deferred to M14. — M13
-- **Channel title search not implemented.** `contacts.search` covers dialog peers (users only);
-  channel name search via `name_tsv` on `channels` is not wired. Deferred to M14. — M13
-- **Media filename indexing deferred.** `name_tsv` on `messages` covers message text; document
-  file names are not indexed. Whether to index them — and under which dictionary — is an open
-  decision deferred to M14. — M13
+- **Group-chat message search not implemented.** `messages.search` rejects every
+  non-user peer (`PeerTypeUser` check in the handler); group-chat message rows in
+  `messages` are indexed by `message_tsv` but the RPC does not accept chat peers.
+  Deferred to M14. — M13
+- **Channel and megagroup message search not implemented.** Channel posts live in
+  `channel_messages`, which has no `message_tsv` column and no GIN index.
+  Both the index and the RPC are deferred to M14. — M13
+- **Channel title search not implemented.** `contacts.search` covers user display
+  names only; the `channels` table has no tsvector column. Adding channel title
+  search requires a new column, index, and RPC path. Deferred to M14. — M13
+- **Media filename indexing deferred.** `message_tsv` on `messages` covers message
+  text only; document file names are not indexed. Whether to index them — and under
+  which dictionary — is an open decision deferred to M14. — M13
 - **Secret-chat messages are permanently non-indexable.** The server stores encrypted blobs
   without inspecting plaintext, so full-text indexing of secret-chat content is not possible by
   design and will not be added. — M13
