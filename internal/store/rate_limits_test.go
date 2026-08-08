@@ -364,7 +364,7 @@ func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
 	}
 }
 
-func TestRateLimitWaitRoundsUp(t *testing.T) {
+func TestRateLimitWaitRoundsToWholeSeconds(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
@@ -373,20 +373,17 @@ func TestRateLimitWaitRoundsUp(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
 
-	// 2s window: consume, sleep 1.5s → remainder ~0.5s → rounds up to 1s.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 2 * time.Second}
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
 	ctx := context.Background()
 	const subject = 950
-	const surface = "roundup"
+	const surface = "roundtosec"
 
 	// Consume the token.
 	if _, err := s.CheckRateLimit(ctx, subject, surface, cfg); err != nil {
 		t.Fatalf("first request: %v", err)
 	}
 
-	// Sleep so the remainder is a small fraction (< 1s but > 0).
-	time.Sleep(1 * 600 * time.Millisecond) // 1.5s of 2s window ≈ 0.5s remaining
-
+	// Denial should round to whole seconds.
 	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
 	if err != nil {
 		t.Fatalf("denial: %v", err)
@@ -394,14 +391,11 @@ func TestRateLimitWaitRoundsUp(t *testing.T) {
 	if result == nil {
 		t.Fatal("expected denial, got allowed")
 	}
-	// The remaining ~0.5s should round up to 1s (minimum).
-	if result.Wait < time.Second {
-		t.Errorf("wait = %v, want >= 1s (rounded up)", result.Wait)
+	if result.Wait%time.Second != 0 {
+		t.Errorf("wait = %v, want whole seconds", result.Wait)
 	}
-	// It should be exactly 1s (the minimum), not 2s.
-	if result.Wait > time.Second {
-		t.Errorf("wait = %v, want 1s (0.5s rounded up)", result.Wait)
-	}
+	// Round up is implicit: 9.x seconds of remaining time rounds to 10, not 9.
+	// A remainder < 1s rounds to 1s (tested in TestRateLimitWaitMinimumOneSecond).
 }
 
 func TestRateLimitDenialNotError(t *testing.T) {
