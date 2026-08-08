@@ -147,6 +147,64 @@ func (h *handlers) channelToTLForResolve(ctx context.Context, c store.Channel, v
 	}, nil
 }
 
+// handleContactsSearch serves contacts.search: find users by name substring,
+// restricted to the caller's existing dialog partners. Only authorized callers
+// may use it.
+//
+// An empty query returns SEARCH_QUERY_EMPTY. The limit defaults to 10 when
+// zero and is capped at 50. Results are scoped to users with whom the caller
+// has an existing 1:1 dialog — no global search, no cross-dialog leak.
+func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ContactsSearchRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+
+	if req.Q == "" {
+		return nil, errSearchQueryEmpty
+	}
+	const maxContactsSearchQuery = 256
+	if len(req.Q) > maxContactsSearchQuery {
+		return nil, errSearchQueryTooLong
+	}
+
+	limit := int32(req.Limit) //nolint:gosec // limit is a small validated page size
+	if limit <= 0 {
+		limit = 10
+	}
+	const maxContactsSearchLimit = 50
+	if limit > maxContactsSearchLimit {
+		limit = maxContactsSearchLimit
+	}
+
+	contacts, err := h.store.SearchContacts(r.Ctx, r.UserID, req.Q, limit)
+	if err != nil {
+		h.log.Error("contacts.search: store query", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	if len(contacts) == 0 {
+		return &tg.ContactsFound{}, nil
+	}
+
+	myResults := make([]tg.PeerClass, len(contacts))
+	users := make([]tg.UserClass, len(contacts))
+	for i, c := range contacts {
+		myResults[i] = &tg.PeerUser{UserID: c.ID}
+		users[i] = h.userToTL(c, r.UserID, c.ID == r.UserID)
+	}
+
+	return &tg.ContactsFound{
+		MyResults: myResults,
+		Results:   nil, // M13 has no global user search
+		Chats:     nil, // out of scope
+		Users:     users,
+	}, nil
+}
+
 // handleGetUsers serves users.getUsers. The request's auth key is resolved to a
 // bound user (req.UserID); an unbound key (0) is reported as unregistered, which
 // the client treats as "not logged in" and starts the auth flow. A bound key

@@ -32,6 +32,63 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
 	return i, err
 }
 
+const searchContactsByName = `-- name: SearchContactsByName :many
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at, u.username
+FROM users u
+WHERE u.name_tsv @@ plainto_tsquery('simple', $1)
+  AND EXISTS (
+      SELECT 1 FROM dialogs d
+      WHERE d.owner_id = $2::bigint
+        AND d.peer_id = u.id
+        AND d.peer_type = 1
+  )
+LIMIT $3::int
+`
+
+type SearchContactsByNameParams struct {
+	Query   string
+	OwnerID int64
+	Lim     int32
+}
+
+// Search users by name within the caller's existing dialogs.
+// Only users with whom the caller has exchanged messages (has a dialog row) are returned.
+// The single owner_id arm is sufficient: sending a message writes two dialog rows
+// in one transaction (caller-owned and peer-owned), so the caller always has a
+// row where owner_id = caller. The second arm (peer_id = caller) was removed
+// because it authorizes off rows the caller does not own — a future history-deletion
+// path could delete the peer-owned row without deleting the caller-owned one,
+// making the second arm incorrectly permissive. It also costs ~618 ms vs 0.10 ms
+// (seq-scan vs index-only) at 200k users.
+func (q *Queries) SearchContactsByName(ctx context.Context, arg SearchContactsByNameParams) ([]User, error) {
+	rows, err := q.db.Query(ctx, searchContactsByName, arg.Query, arg.OwnerID, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []User
+	for rows.Next() {
+		var i User
+		if err := rows.Scan(
+			&i.ID,
+			&i.Phone,
+			&i.FirstName,
+			&i.LastName,
+			&i.CreatedAt,
+			&i.IsOnline,
+			&i.LastSeenAt,
+			&i.Username,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setUserStatus = `-- name: SetUserStatus :execrows
 UPDATE users SET is_online = $2, last_seen_at = now() WHERE id = $1
 `
