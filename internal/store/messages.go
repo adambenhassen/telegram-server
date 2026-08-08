@@ -266,6 +266,28 @@ func (s *Store) History(ctx context.Context, ownerID int64, peerType PeerType, p
 	return msgs, nil
 }
 
+// SearchMessages returns the caller's messages in the named peer whose text
+// matches query, ordered newest-first (descending local_id), with pagination by
+// offsetID. Only non-deleted messages owned by ownerID are returned.
+func (s *Store) SearchMessages(ctx context.Context, ownerID int64, peerType PeerType, peerID int64, query string, offsetID, limit int) ([]Message, error) {
+	rows, err := s.q.SearchMessages(ctx, db.SearchMessagesParams{
+		OwnerID:  ownerID,
+		PeerType: int16(peerType),
+		PeerID:   peerID,
+		Query:    query,
+		OffsetID: int64(offsetID),
+		Lim:      int32(limit), //nolint:gosec // limit is a small validated page size
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	msgs := make([]Message, len(rows))
+	for i, r := range rows {
+		msgs[i] = messageFromRow(r)
+	}
+	return msgs, nil
+}
+
 // EditMessage edits the caller's own outgoing message and its mirror on the
 // peer's side, bumping both owners' pts with an edit event. Returns the peer id
 // and the editor's new pts. ErrMessageInvalid if the message is absent, deleted,

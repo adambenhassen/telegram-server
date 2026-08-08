@@ -146,8 +146,10 @@ var (
 	// errUsernameLookupFloodWait rejects a contacts.resolveUsername that would
 	// take the caller past their per-account username lookup quota.
 	errUsernameLookupFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
-	// errSearchQueryEmpty rejects a contacts.search with an empty query string.
+	// errSearchQueryEmpty rejects a search RPC with an empty query string.
 	errSearchQueryEmpty = rpcErr(400, "SEARCH_QUERY_EMPTY")
 	// errSearchQueryTooLong rejects a contacts.search query over 256 bytes.
 	errSearchQueryTooLong = rpcErr(400, "SEARCH_QUERY_TOO_LONG")
+	// errInputFilterInvalid rejects messages.search with an unsupported filter type.
+	errInputFilterInvalid = rpcErr(400, "INPUT_FILTER_INVALID")
 )
