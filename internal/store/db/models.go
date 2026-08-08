@@ -180,6 +180,14 @@ type PhoneLookup struct {
 	LookedUpAt pgtype.Timestamptz
 }
 
+type RateLimit struct {
+	SubjectID   int64
+	Surface     string
+	TokenCount  int32
+	WindowStart pgtype.Timestamptz
+	ExpiresAt   pgtype.Timestamptz
+}
+
 type SecretChat struct {
 	ID             int32
 	AdminID        int64
