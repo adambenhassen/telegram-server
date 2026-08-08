@@ -21,6 +21,12 @@ const (
 
 	defaultDialogsLimit = 20
 	maxDialogsLimit     = 100
+
+	// maxSearchQueryLen bounds the query string in messages.search. A query past
+	// this cap is rejected before reaching the database, following the same
+	// precedent as oversized message payloads (errMessageTooLong). 500 matches
+	// Telegram's own cap on fulltext search terms.
+	maxSearchQueryLen = 500
 )
 
 // notify emits the cross-replica update nudge for userID (best-effort).
@@ -1078,6 +1084,9 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	if req.Q == "" {
 		return nil, errSearchQueryEmpty
+	}
+	if len(req.Q) > maxSearchQueryLen {
+		return nil, errMessageTooLong
 	}
 	// Only InputMessagesFilterEmpty is supported; everything else is not implemented.
 	if _, ok := req.Filter.(*tg.InputMessagesFilterEmpty); !ok {
