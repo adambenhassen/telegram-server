@@ -11,6 +11,7 @@ import (
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -98,15 +99,22 @@ func TestContactsSearch(t *testing.T) {
 		}
 	}
 
-	// Fetch B and C's first names so we can search for them.
-	bUser, ok, err := st.UserByID(ctx, bUserID)
-	if err != nil || !ok {
-		t.Fatalf("load B user: ok=%v err=%v", ok, err)
+	// Set B and C's first names — CreateUser only sets phone, so first_name is empty.
+	// The name_tsv column is GENERATED ALWAYS, so Postgres recomputes it automatically.
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
 	}
-	cUser, ok, err := st.UserByID(ctx, cUserID)
-	if err != nil || !ok {
-		t.Fatalf("load C user: ok=%v err=%v", ok, err)
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, "UPDATE users SET first_name = $1 WHERE id = $2", "Bob", bUserID); err != nil {
+		t.Fatalf("set B first name: %v", err)
 	}
+	if _, err := pool.Exec(ctx, "UPDATE users SET first_name = $1 WHERE id = $2", "Carol", cUserID); err != nil {
+		t.Fatalf("set C first name: %v", err)
+	}
+
+	const searchB = "Bob"
+	const searchC = "Carol"
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 		d := make(chan error, 1)
@@ -135,7 +143,7 @@ func TestContactsSearch(t *testing.T) {
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		var err error
 		foundB, err = c.ContactsSearch(ctx, &tg.ContactsSearchRequest{
-			Q:     bUser.FirstName,
+			Q:     searchB,
 			Limit: 10,
 		})
 		return err
@@ -175,7 +183,7 @@ func TestContactsSearch(t *testing.T) {
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		var err error
 		foundC, err = c.ContactsSearch(ctx, &tg.ContactsSearchRequest{
-			Q:     cUser.FirstName,
+			Q:     searchC,
 			Limit: 10,
 		})
 		return err
