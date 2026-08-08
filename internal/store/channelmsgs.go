@@ -25,6 +25,10 @@ type ChannelEvent struct {
 // per channel rather than one per member, so it carries no owner and no Out.
 // FileID is nil for "no media" — channel_messages.file_id is a nullable FK,
 // where the older messages.file_id uses 0 as that sentinel.
+//
+// Field order is load-bearing: channelMessageFromFields constructs this type
+// with a positional literal, so the field sequence here is the column mapping
+// contract. Do not reorder fields without updating that function.
 type ChannelMessage struct {
 	ChannelID int64
 	LocalID   int64
