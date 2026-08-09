@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 // TestReadProxyV2FamilyAndTransport pins the one decision the parser makes about
@@ -114,4 +115,39 @@ func testProxyV2Header(cmd, famProto byte, addr netip.Addr) []byte {
 		binary.BigEndian.PutUint16(h[14:16], uint16(len(body))) // #nosec G115 -- fixed 12 or 36.
 	}
 	return append(h[:], body...)
+}
+
+// TestLogSamplerCountsSuppressed is what the sampled log line is actually for.
+//
+// The bound alone would turn a flood into silence: an operator who sees one
+// refusal cannot tell it from ten thousand. The count is the difference, and the
+// listener test cannot reach it — all its refusals land in one window, so the
+// line it reads carries a zero and proves only that the field exists. Two
+// windows are needed, which is why this is here.
+func TestLogSamplerCountsSuppressed(t *testing.T) {
+	t.Parallel()
+
+	const interval = time.Minute
+	var s logSampler
+	start := time.Now()
+
+	if dropped, ok := s.allow(start, interval); !ok || dropped != 0 {
+		t.Fatalf("first line: dropped=%d ok=%v, want 0 and emitted", dropped, ok)
+	}
+	// Everything else inside the window is suppressed and counted.
+	const suppressed = 24
+	for i := range suppressed {
+		if dropped, ok := s.allow(start.Add(time.Duration(i)*time.Second), interval); ok {
+			t.Fatalf("line %d was emitted inside the window (dropped=%d)", i, dropped)
+		}
+	}
+
+	// The next window reports what it stood for.
+	if dropped, ok := s.allow(start.Add(interval), interval); !ok || dropped != suppressed {
+		t.Fatalf("second line: dropped=%d ok=%v, want %d and emitted", dropped, ok, suppressed)
+	}
+	// And the counter starts again, so the next line is not cumulative.
+	if dropped, ok := s.allow(start.Add(2*interval), interval); !ok || dropped != 0 {
+		t.Fatalf("third line: dropped=%d ok=%v, want 0 and emitted", dropped, ok)
+	}
 }
