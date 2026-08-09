@@ -58,13 +58,25 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 		return nil, fmt.Errorf("check rate limit: %w", err)
 	}
 
+	// Test hook: fires after INSERT denial, before GET.
+	if s.deniedHook != nil {
+		s.deniedHook()
+	}
+
 	// Denied — read expires_at in a fresh snapshot so we see the row committed
-	// by the concurrent transaction that won the race.
+	// by the concurrent transaction that won the race. The sweep can delete the
+	// row between the two reads: when it laps and the sweeper deletes it before
+	// this GET fires, the row is gone. In that case the request is allowed — the
+	// window that denied it has expired, and the sweep has already cleaned up.
 	expiresAt, err := s.q.GetRateLimitExpiresAt(ctx, db.GetRateLimitExpiresAtParams{
 		SubjectID: subjectID,
 		Surface:   surface,
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Row swept between INSERT and GET — window has expired, allow.
+			return nil, nil //nolint:nilnil // swept row means expired window
+		}
 		return nil, fmt.Errorf("get rate limit: %w", err)
 	}
 
@@ -81,10 +93,8 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 
 // SweepExpiredRateLimits deletes rate-limit rows whose per-row expiry deadline
 // has passed. The deadline is stored on the row (expires_at), so the sweep
-// does not need to know per-surface window durations.
-//
-// This is not wired into a caller yet — the sweep lands with MAIN-202, the
-// first ticket that wires a surface and can establish the sweep cadence.
-func (s *Store) SweepExpiredRateLimits(ctx context.Context) error {
+// does not need to know per-surface window durations. Wired to a 5-minute
+// background sweep in cmd/telegramd/main.go.
+func (s *Store) SweepExpiredRateLimits(ctx context.Context) (int64, error) {
 	return s.q.SweepExpiredRateLimits(ctx)
 }

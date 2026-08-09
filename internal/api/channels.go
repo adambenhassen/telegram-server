@@ -267,6 +267,45 @@ func (h *handlers) requireChannelMember(ctx context.Context, channelID, userID i
 // broadcast" and "no such channel" alike, and all four must stay one wire error
 // so channel ids are not enumerable.
 func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+	// Check for a transport retry before the rate limit.
+	if req.RandomID != 0 {
+		if existing, ok, err := h.store.ChannelMessageByRandomID(r.Ctx, channelID, req.RandomID); err == nil && ok {
+			// Retry: return the stored post without rate-limiting.
+			channelState, err := h.store.ChannelState(r.Ctx, channelID)
+			if err != nil {
+				h.log.Error("read channel pts on retry", "channel_id", channelID, "err", err)
+				return nil, errInternal
+			}
+			channels, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
+			if err != nil {
+				h.log.Error("load channels on retry", "err", err)
+				return nil, errInternal
+			}
+			users, err := h.loadUsers(r.Ctx, map[int64]bool{r.UserID: true}, r.UserID)
+			if err != nil {
+				h.log.Error("load users on retry", "err", err)
+				return nil, errInternal
+			}
+			return &tg.Updates{
+				Updates: []tg.UpdateClass{
+					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
+					&tg.UpdateNewChannelMessage{Message: channelMessageToTL(existing, r.UserID, nil), Pts: channelState, PtsCount: 1},
+				},
+				Users: users,
+				Chats: channels,
+				Date:  int(existing.Date.Unix()),
+			}, nil
+		} else if err != nil {
+			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+	}
+
+	// Rate limit: new message, consume a token.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+		return nil, err
+	}
+
 	// PostChannelMessageAs, never PostChannelMessage: the latter is the
 	// unchecked primitive and trusts its caller to have decided post rights.
 	msg, pts, dup, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil)
@@ -277,10 +316,8 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 		h.log.Error("send channel message", "user_id", r.UserID, "channel_id", channelID, "err", err)
 		return nil, errInternal
 	}
-	// One notify per committed post, never one per member (threat model G4): a
-	// 10 000-member channel posting in a loop would stall live delivery for every
-	// unrelated account on the replica. A dup — a resend of an already-stored
-	// post, which moved no pts and wrote no event — announces nothing.
+	// Only notify when the post is new. A duplicate means another caller
+	// already committed the same random_id and fired the notify.
 	if !dup {
 		h.notifyChannelPost(r.Ctx, channelID)
 	}

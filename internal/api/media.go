@@ -128,7 +128,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	// Before the peer split, so the chat fan-out is guarded by the same check.
+	// Validate before any expensive work.
 	if !validText(req.Message) {
 		return nil, errMessageEmpty
 	}
@@ -147,6 +147,65 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 		}
 	}
 
+	// Check for a transport retry before any expensive work.
+	if req.RandomID != 0 {
+		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok {
+			// Retry: return the stored message without rate-limiting or file assembly.
+			senderState, err := h.store.State(r.Ctx, r.UserID)
+			if err != nil {
+				h.log.Error("read sender pts on retry", "user_id", r.UserID, "err", err)
+				return nil, errInternal
+			}
+			if peerType == store.PeerTypeChat {
+				chats, err := h.loadChats(r.Ctx, map[int64]bool{toID: true}, r.UserID)
+				if err != nil {
+					h.log.Error("load chats on retry", "err", err)
+					return nil, errInternal
+				}
+				users, err := h.loadUsers(r.Ctx, map[int64]bool{r.UserID: true}, r.UserID)
+				if err != nil {
+					h.log.Error("load users on retry", "err", err)
+					return nil, errInternal
+				}
+				files, err := h.loadFiles(r.Ctx, []store.Message{existing})
+				if err != nil {
+					h.log.Error("load files on retry", "err", err)
+					return nil, errInternal
+				}
+				return &tg.Updates{
+					Updates: []tg.UpdateClass{
+						&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
+						&tg.UpdateNewMessage{Message: messageToTL(existing, nil, files, nil, nil), Pts: senderState.Pts, PtsCount: 1},
+					},
+					Users: users,
+					Chats: chats,
+					Date:  int(existing.Date.Unix()),
+				}, nil
+			}
+			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
+			if err != nil {
+				h.log.Error("load users on retry", "err", err)
+				return nil, errInternal
+			}
+			files, err := h.loadFiles(r.Ctx, []store.Message{existing})
+			if err != nil {
+				h.log.Error("load files on retry", "err", err)
+				return nil, errInternal
+			}
+			return &tg.Updates{
+				Updates: []tg.UpdateClass{
+					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
+					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, files, nil, nil), Pts: senderState.Pts, PtsCount: 1},
+				},
+				Users: users,
+				Date:  int(existing.Date.Unix()),
+			}, nil
+		} else if err != nil {
+			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+	}
+
 	// One media type only. An uploaded photo is rejected too: serving a
 	// tg.Photo requires pixel dimensions, which requires the server to decode
 	// an uploaded image, and an image parser running on attacker-supplied
@@ -160,6 +219,12 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	// handler has nowhere to put.
 	if _, ok = media.GetThumb(); ok {
 		return nil, errMediaInvalid
+	}
+
+	// Rate limit before the expensive file assembly: new message, consume a
+	// token. The dedupe check above already caught retries.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+		return nil, err
 	}
 
 	clientFileID, parts, name, err := inputFileParts(media.File)
@@ -188,15 +253,14 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 		return h.sendChatMedia(r, toID, &req, fileID)
 	}
 
-	sender, senderPts, _, dup, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, fileID, 0)
+	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, fileID, 0)
 	if err != nil {
 		h.log.Error("send media", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	if !dup {
-		h.notify(r.Ctx, r.UserID)
-		h.notify(r.Ctx, toID)
-	}
+
+	h.notify(r.Ctx, r.UserID)
+	h.notify(r.Ctx, toID)
 
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
@@ -227,7 +291,8 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 func (h *handlers) sendChatMedia(
 	r *mtproto.Request, chatID int64, req *tg.MessagesSendMediaRequest, fileID int64,
 ) (bin.Encoder, error) {
-	sender, perOwner, dup, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
+	// Rate limit already checked in handleSendMedia before the peer split.
+	sender, perOwner, _, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
 		ChatID: chatID, FromID: r.UserID, Text: req.Message, RandomID: req.RandomID, FileID: fileID,
 	})
 	if errors.Is(err, store.ErrNotMember) {
@@ -237,10 +302,8 @@ func (h *handlers) sendChatMedia(
 		h.log.Error("send chat media", "user_id", r.UserID, "chat_id", chatID, "err", err)
 		return nil, errInternal
 	}
-	if !dup {
-		for uid := range perOwner {
-			h.notify(r.Ctx, uid)
-		}
+	for uid := range perOwner {
+		h.notify(r.Ctx, uid)
 	}
 
 	recipients := make(map[int64]bool, len(perOwner))

@@ -297,6 +297,27 @@ func (s *Store) SendEncryptedMessage(ctx context.Context, p EncryptedSend) (even
 	return encryptedEventFromRow(row), false, nil
 }
 
+// EncryptedMessageByRandomID looks up an encrypted event by the sender's
+// random_id. Returns ok=false when absent. It is the read half of the dedup
+// token for encrypted sends, used by the handler to catch transport retries
+// before the rate limit.
+func (s *Store) EncryptedMessageByRandomID(ctx context.Context, recipientID, randomID int64) (EncryptedEvent, bool, error) {
+	if randomID == 0 {
+		return EncryptedEvent{}, false, nil
+	}
+	row, err := s.q.GetEncryptedEventByRandomID(ctx, db.GetEncryptedEventByRandomIDParams{
+		OwnerID:  recipientID,
+		RandomID: randomID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return EncryptedEvent{}, false, nil
+	case err != nil:
+		return EncryptedEvent{}, false, fmt.Errorf("encrypted event by random id: %w", err)
+	}
+	return encryptedEventFromRow(row), true, nil
+}
+
 // GetEncryptedEvent loads one event by its (ownerID, qts) primary key.
 // Used by the push handler to build updateNewEncryptedMessage from a NOTIFY.
 func (s *Store) GetEncryptedEvent(ctx context.Context, ownerID int64, qts int) (EncryptedEvent, error) {

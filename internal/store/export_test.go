@@ -15,6 +15,12 @@ import (
 // asserted on the rule itself instead of on a 30-second wall clock.
 func NextBackoff(prev, uptime time.Duration) time.Duration { return nextBackoff(prev, uptime) }
 
+// SetDeniedHook installs a callback that fires in CheckRateLimit after the
+// INSERT denial and before the GET. Tests use it to delete the row and
+// exercise the ErrNoRows branch. Scoped to the Store so parallel tests
+// each own their own hook without racing.
+func SetDeniedHook(s *Store, fn func()) { s.deniedHook = fn }
+
 const (
 	ListenerBackoffMin = listenerBackoffMin
 	ListenerBackoffMax = listenerBackoffMax
@@ -254,6 +260,14 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 // StorePool returns the Store's pgxpool.Pool for tests that need a raw
 // connection independent of the Store's query layer.
 func StorePool(s *Store) *pgxpool.Pool { return s.pool }
+
+// CountRateLimits returns the number of rate limit rows for a given subject,
+// for tests that need to assert the rate_limits table state.
+func CountRateLimits(ctx context.Context, s *Store, subjectID int64) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx, "SELECT count(*) FROM rate_limits WHERE subject_id = $1", subjectID).Scan(&count)
+	return count, err
+}
 
 // WaitForLockWaiters blocks until n backends in this test's database are parked
 // on a lock. The concurrent join/revoke tests depend on the order goroutines

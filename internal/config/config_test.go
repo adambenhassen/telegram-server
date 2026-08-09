@@ -49,6 +49,25 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.MaxUserStorageBytes != 2<<30 {
 		t.Errorf("MaxUserStorageBytes = %d, want %d", cfg.MaxUserStorageBytes, int64(2<<30))
 	}
+	// Rate limit defaults.
+	if cfg.RateLimits.MessageSend.Limit != 60 {
+		t.Errorf("MessageSend limit = %d, want 60", cfg.RateLimits.MessageSend.Limit)
+	}
+	if cfg.RateLimits.MessageSend.Window != 60*time.Second {
+		t.Errorf("MessageSend window = %v, want 60s", cfg.RateLimits.MessageSend.Window)
+	}
+	if cfg.RateLimits.CreateChat.Limit != 20 {
+		t.Errorf("CreateChat limit = %d, want 20", cfg.RateLimits.CreateChat.Limit)
+	}
+	if cfg.RateLimits.CreateChat.Window != 24*time.Hour {
+		t.Errorf("CreateChat window = %v, want 24h", cfg.RateLimits.CreateChat.Window)
+	}
+	if cfg.RateLimits.AddChatUser.Limit != 120 {
+		t.Errorf("AddChatUser limit = %d, want 120", cfg.RateLimits.AddChatUser.Limit)
+	}
+	if cfg.RateLimits.AddChatUser.Window != 24*time.Hour {
+		t.Errorf("AddChatUser window = %v, want 24h", cfg.RateLimits.AddChatUser.Window)
+	}
 }
 
 func TestLoadBlobDir(t *testing.T) {
@@ -459,5 +478,60 @@ func TestLoadEncKeyConcurrentStarts(t *testing.T) {
 	}
 	if len(leftover) != 0 {
 		t.Errorf("%d temp key files left behind: %v", len(leftover), leftover)
+	}
+}
+
+func TestLoadRateLimitEnv(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+
+	// Override send limit.
+	t.Setenv("TG_RATE_LIMIT_SEND", "10")
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.MessageSend.Limit != 10 {
+		t.Errorf("MessageSend limit = %d, want 10", cfg.RateLimits.MessageSend.Limit)
+	}
+
+	// Override create chat limit.
+	t.Setenv("TG_RATE_LIMIT_CREATE_CHAT", "5")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.CreateChat.Limit != 5 {
+		t.Errorf("CreateChat limit = %d, want 5", cfg.RateLimits.CreateChat.Limit)
+	}
+
+	// Override add chat user limit.
+	t.Setenv("TG_RATE_LIMIT_ADD_CHAT_USER", "50")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.AddChatUser.Limit != 50 {
+		t.Errorf("AddChatUser limit = %d, want 50", cfg.RateLimits.AddChatUser.Limit)
+	}
+
+	// Zero disables enforcement.
+	t.Setenv("TG_RATE_LIMIT_SEND", "0")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.MessageSend.Limit != 0 {
+		t.Errorf("MessageSend limit = %d, want 0 (disabled)", cfg.RateLimits.MessageSend.Limit)
+	}
+
+	// Invalid env var.
+	t.Setenv("TG_RATE_LIMIT_SEND", "abc")
+	_, err = config.Load(discardLog())
+	if err == nil {
+		t.Fatal("expected error for invalid TG_RATE_LIMIT_SEND")
+	}
+	if !strings.Contains(err.Error(), "TG_RATE_LIMIT_SEND") {
+		t.Errorf("error %q does not name TG_RATE_LIMIT_SEND", err)
 	}
 }

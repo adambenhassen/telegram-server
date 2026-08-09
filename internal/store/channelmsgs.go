@@ -311,6 +311,25 @@ func (s *Store) ChannelMessages(ctx context.Context, channelID int64, localIDs [
 	return out, nil
 }
 
+// ChannelMessageByRandomID looks up a channel post by random_id. Returns
+// ok=false when absent. It is the read half of the dedup token for channel
+// posts, used by the handler to catch transport retries before the rate limit.
+func (s *Store) ChannelMessageByRandomID(ctx context.Context, channelID, randomID int64) (ChannelMessage, bool, error) {
+	if randomID == 0 {
+		return ChannelMessage{}, false, nil
+	}
+	row, err := s.q.ChannelMessageByRandomID(ctx, db.ChannelMessageByRandomIDParams{
+		ChannelID: channelID, RandomID: randomID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ChannelMessage{}, false, nil
+	case err != nil:
+		return ChannelMessage{}, false, fmt.Errorf("channel message by random id: %w", err)
+	}
+	return channelMessageFromFields(channelMsgFields(row)), true, nil
+}
+
 // ChannelHistory returns the channel's posts newest-first, excluding deleted.
 // offsetID > 0 pages strictly older than that local_id (0 = from the newest),
 // the same convention History uses for user peers.
