@@ -185,23 +185,12 @@ func send[T any](ch chan T, v T) {
 	}
 }
 
-func recvOr[T any](t *testing.T, ch chan T, what string) T {
-	t.Helper()
-	select {
-	case v := <-ch:
-		return v
-	case <-time.After(10 * time.Second):
-		t.Fatalf("timed out waiting for %s", what)
-		var zero T
-		return zero
-	}
-}
-
-// recvOrCtx is like recvOr but bounded by the provided context instead of a
-// fixed 10s deadline, so tests that already carry a generous outer timeout
-// (e.g. 120s) do not lose time to a sub-deadline that expired while the
-// harness was waiting for a shared resource (Postgres template lock, CPU
-// contention from other packages).
+// recvOrCtx receives one value from ch, bounded only by the test's own context,
+// and fails naming what it was waiting for. The bound is deliberately the whole
+// test budget and never a sub-deadline: under full parallelism a wait can sit
+// runnable but unscheduled for tens of seconds (Postgres template lock, CPU
+// contention from other packages), and a fixed constant turns that into a
+// failure of whichever wait the scheduler starved rather than of the code.
 func recvOrCtx[T any](t *testing.T, ctx context.Context, ch chan T, what string) T {
 	t.Helper()
 	select {
@@ -355,21 +344,21 @@ func TestMessagingRealtime(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -386,7 +375,7 @@ func TestMessagingRealtime(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A send: %v", err)
 	}
-	got := recvOr(t, collB.newMsg, "B updateNewMessage")
+	got := recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
 	if got.Message != "hello realtime" {
 		t.Fatalf("B received %q, want %q", got.Message, "hello realtime")
 	}
@@ -421,7 +410,7 @@ func TestMessagingRealtime(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("B readHistory: %v", err)
 	}
-	recvOr(t, collA.readOutbox, "A updateReadHistoryOutbox")
+	recvOrCtx(t, ctx, collA.readOutbox, "A updateReadHistoryOutbox")
 
 	// 4. A edits → B receives updateEditMessage.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -430,7 +419,7 @@ func TestMessagingRealtime(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A edit: %v", err)
 	}
-	edited := recvOr(t, collB.editMsg, "B updateEditMessage")
+	edited := recvOrCtx(t, ctx, collB.editMsg, "B updateEditMessage")
 	if edited.Message != "edited live" {
 		t.Fatalf("B edit text = %q", edited.Message)
 	}
@@ -442,7 +431,7 @@ func TestMessagingRealtime(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A setTyping: %v", err)
 	}
-	if from := recvOr(t, collB.typing, "B updateUserTyping"); from != aUserID {
+	if from := recvOrCtx(t, ctx, collB.typing, "B updateUserTyping"); from != aUserID {
 		t.Fatalf("typing from = %d, want %d", from, aUserID)
 	}
 
@@ -453,7 +442,7 @@ func TestMessagingRealtime(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A delete: %v", err)
 	}
-	recvOr(t, collB.delMsg, "B updateDeleteMessages")
+	recvOrCtx(t, ctx, collB.delMsg, "B updateDeleteMessages")
 
 	close(aCmds)
 	close(bCmds)
@@ -649,8 +638,8 @@ func TestMessagingCrossReplica(t *testing.T) {
 	var bUserID int64
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	// A connects to server 1 and sends to B.
@@ -675,7 +664,7 @@ func TestMessagingCrossReplica(t *testing.T) {
 		t.Fatalf("A login+send: %v", err)
 	}
 
-	got := recvOr(t, collB.newMsg, "B cross-replica updateNewMessage")
+	got := recvOrCtx(t, ctx, collB.newMsg, "B cross-replica updateNewMessage")
 	if got.Message != "across replicas" {
 		t.Fatalf("B received %q, want %q", got.Message, "across replicas")
 	}

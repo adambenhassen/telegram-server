@@ -103,8 +103,8 @@ func TestSearchRateLimitE2E(t *testing.T) {
 			case 1:
 				bUserID = id
 			}
-		case <-time.After(30 * time.Second):
-			t.Fatalf("client login timeout (user %d)", i)
+		case <-ctx.Done():
+			t.Fatalf("client login timeout (user %d): %v", i, ctx.Err())
 		}
 	}
 
@@ -112,8 +112,8 @@ func TestSearchRateLimitE2E(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
