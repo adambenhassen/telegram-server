@@ -65,7 +65,7 @@ func TestRequestCarriesTheSocketPeerAddress(t *testing.T) {
 			}
 			srvCtx, stopServer := context.WithCancel(ctx)
 			served := make(chan error, 1)
-			go func() { served <- srv.Serve(srvCtx, mtproto.Listen(nl)) }()
+			go func() { served <- srv.Serve(srvCtx, nl) }()
 			t.Cleanup(func() {
 				stopServer()
 				if err := <-served; err != nil {

@@ -27,6 +27,11 @@ import (
 const (
 	defaultReadTimeout  = 30 * time.Second
 	defaultWriteTimeout = 30 * time.Second
+	// defaultHandshakeTimeout bounds how long an accepted socket may take to
+	// declare its transport. A client that sends nothing is closed after it,
+	// which is what keeps a silent connection from costing the server a slot
+	// for as long as the peer cares to hold it open.
+	defaultHandshakeTimeout = 30 * time.Second
 	// touchInterval throttles per-connection last-seen updates so an active
 	// session writes its activity time at most once per interval, not per frame.
 	touchInterval = 60 * time.Second
@@ -47,6 +52,9 @@ type Server struct {
 
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+	// handshakeTimeout bounds transport negotiation on a freshly accepted
+	// socket, before any frame exists to apply readTimeout to.
+	handshakeTimeout time.Duration
 
 	// onStatusChange fires when a user's connection count transitions between
 	// zero and non-zero. Called after the registry has been updated, so a
@@ -72,17 +80,18 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 	}
 	c := clock.System
 	return &Server{
-		dcID:         dcID,
-		key:          key,
-		keys:         keys,
-		handler:      handler,
-		registry:     NewSessionRegistry(),
-		cipher:       crypto.NewServerCipher(crypto.DefaultRand()),
-		clock:        c,
-		msgID:        proto.NewMessageIDGen(c.Now),
-		readTimeout:  defaultReadTimeout,
-		writeTimeout: defaultWriteTimeout,
-		log:          log,
+		dcID:             dcID,
+		key:              key,
+		keys:             keys,
+		handler:          handler,
+		registry:         NewSessionRegistry(),
+		cipher:           crypto.NewServerCipher(crypto.DefaultRand()),
+		clock:            c,
+		msgID:            proto.NewMessageIDGen(c.Now),
+		readTimeout:      defaultReadTimeout,
+		writeTimeout:     defaultWriteTimeout,
+		handshakeTimeout: defaultHandshakeTimeout,
+		log:              log,
 	}
 }
 
@@ -98,24 +107,55 @@ func (s *Server) Key() exchange.PublicKey {
 }
 
 // Serve accepts connections on l until ctx is cancelled or l is closed.
-func (s *Server) Serve(ctx context.Context, l Listener) error {
+//
+// Serving belongs to every client at once, so nothing a single connection does
+// may end it: the accept loop only takes sockets off the listener, and
+// everything that reads from one — transport negotiation included — happens in
+// that connection's own goroutine. Serve returns when the listener is closed or
+// fails permanently, and for no other reason.
+//
+// l is a plain net.Listener because the socket, not a negotiated connection, is
+// what the accept path hands over: the peer address is read from it and the
+// codec detected from it, both per connection. An address source other than the
+// socket — a load balancer's, say — arrives as a listener whose connections
+// report it as their RemoteAddr, leaving everything here unchanged.
+func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	grp := tdsync.NewCancellableGroup(ctx)
 	grp.Go(func(ctx context.Context) error {
 		// Unblock the sibling shutdown goroutine when the accept loop exits
 		// (e.g. listener closed while ctx is still live).
 		defer grp.Cancel()
+		var backoff time.Duration
 		for {
-			conn, addr, err := l.Accept()
+			sock, err := l.Accept()
 			if err != nil {
 				if errors.Is(err, net.ErrClosed) {
 					return nil
 				}
+				if isTransientAccept(err) {
+					// Wait for the condition to pass instead of spinning on it,
+					// and keep the listener open: it is still good.
+					backoff = nextAcceptBackoff(backoff)
+					// A fault still there once the retry interval has saturated
+					// is no longer a blip: the process is accepting nobody, and
+					// at Info a server that serves no one reads as healthy.
+					if backoff >= maxAcceptBackoff {
+						s.log.Warn("accept still failing at maximum backoff", "err", err)
+					} else {
+						s.log.Info("accept failed, retrying", "err", err)
+					}
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(backoff):
+					}
+					continue
+				}
 				return errors.Join(errors.New("accept"), err)
 			}
+			backoff = 0
 			grp.Go(func(ctx context.Context) error {
-				if err := s.serveConn(ctx, conn, addr); err != nil && !isDisconnect(err) {
-					s.log.Info("connection handler error", "err", err)
-				}
+				s.serveSocket(ctx, sock)
 				return nil
 			})
 		}
@@ -128,6 +168,43 @@ func (s *Server) Serve(ctx context.Context, l Listener) error {
 		return nil
 	})
 	return grp.Wait()
+}
+
+// serveSocket negotiates the transport of an accepted socket and then serves
+// it. Every failure here is one connection's own — a peer that closed early,
+// sent a transport nobody speaks, or sent nothing at all — so it ends that
+// connection and is reported no further.
+func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
+	// Read the peer address before negotiation consumes the first client
+	// bytes, so the address every per-IP limit is keyed on cannot be a function
+	// of anything the client wrote.
+	addr := peerAddr(sock.RemoteAddr())
+
+	// Cancellation has to reach this socket wherever it happens to be, and the
+	// reads it blocks in take no context: gotd re-derives a read deadline from
+	// one per frame, so a deadline expired at cancel is undone by the very next
+	// read. Closing is the one signal that handoff cannot reset, and it covers
+	// every wait the connection has — negotiating, or idle between frames — so
+	// a stopping process never waits out a timeout on a peer that has gone
+	// quiet. Both sides then close: the loser gets ErrClosed, which is a
+	// disconnect like any other.
+	stop := context.AfterFunc(ctx, func() {
+		if err := sock.Close(); err != nil && !isDisconnect(err) {
+			s.log.Info("close connection at shutdown", "err", err)
+		}
+	})
+	defer stop()
+
+	conn, err := s.negotiate(sock)
+	if err != nil {
+		if !isDisconnect(err) {
+			s.log.Info("transport negotiation error", "err", err)
+		}
+		return
+	}
+	if err := s.serveConn(ctx, conn, addr); err != nil && !isDisconnect(err) {
+		s.log.Info("connection handler error", "err", err)
+	}
 }
 
 // isDisconnect reports whether err is an expected client disconnect rather than
