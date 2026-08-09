@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -27,6 +28,11 @@ import (
 const (
 	defaultReadTimeout  = 30 * time.Second
 	defaultWriteTimeout = 30 * time.Second
+	// defaultHandshakeTimeout bounds how long an accepted socket may take to
+	// declare its transport. A client that sends nothing is closed after it,
+	// which is what keeps a silent connection from costing the server a slot
+	// for as long as the peer cares to hold it open.
+	defaultHandshakeTimeout = 30 * time.Second
 	// touchInterval throttles per-connection last-seen updates so an active
 	// session writes its activity time at most once per interval, not per frame.
 	touchInterval = 60 * time.Second
@@ -47,6 +53,18 @@ type Server struct {
 
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+	// handshakeTimeout bounds transport negotiation on a freshly accepted
+	// socket, before any frame exists to apply readTimeout to.
+	handshakeTimeout time.Duration
+
+	// proxyV2 is the balancer allowlist when client addresses come from PROXY
+	// protocol v2 headers, and nil when they come from the socket itself.
+	// Written once before Serve and only read after, so the accept path needs
+	// no synchronisation to see it.
+	proxyV2 *proxyV2Source
+	// negotiationLog thins the per-connection negotiation failure line, which
+	// anyone who can reach the port can provoke.
+	negotiationLog logSampler
 
 	// onStatusChange fires when a user's connection count transitions between
 	// zero and non-zero. Called after the registry has been updated, so a
@@ -64,6 +82,19 @@ func (s *Server) OnStatusChange(fn func(ctx context.Context, userID int64, onlin
 	s.onStatusChange = fn
 }
 
+// TrustProxyV2Headers makes the server take each client address from a PROXY
+// protocol v2 header instead of the socket it arrived on, honoured only from a
+// source in allow. Call it before Serve.
+//
+// This is the mode for running behind an L4 load balancer, where every socket's
+// peer address is the balancer's and socket keying puts every client on earth in
+// one bucket. See proxyV2Source for what the allowlist is load-bearing for.
+func (s *Server) TrustProxyV2Headers(allow []netip.Prefix) {
+	// Cloned: the allowlist is the trust decision, and it must not change under
+	// the server because a caller reused the slice it passed in.
+	s.proxyV2 = &proxyV2Source{allow: slices.Clone(allow)}
+}
+
 // New creates a Server that answers on dcID using key for the handshake, keys to
 // persist auth keys, and handler for RPC requests.
 func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, log *slog.Logger) *Server {
@@ -72,17 +103,18 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 	}
 	c := clock.System
 	return &Server{
-		dcID:         dcID,
-		key:          key,
-		keys:         keys,
-		handler:      handler,
-		registry:     NewSessionRegistry(),
-		cipher:       crypto.NewServerCipher(crypto.DefaultRand()),
-		clock:        c,
-		msgID:        proto.NewMessageIDGen(c.Now),
-		readTimeout:  defaultReadTimeout,
-		writeTimeout: defaultWriteTimeout,
-		log:          log,
+		dcID:             dcID,
+		key:              key,
+		keys:             keys,
+		handler:          handler,
+		registry:         NewSessionRegistry(),
+		cipher:           crypto.NewServerCipher(crypto.DefaultRand()),
+		clock:            c,
+		msgID:            proto.NewMessageIDGen(c.Now),
+		readTimeout:      defaultReadTimeout,
+		writeTimeout:     defaultWriteTimeout,
+		handshakeTimeout: defaultHandshakeTimeout,
+		log:              log,
 	}
 }
 
@@ -98,24 +130,55 @@ func (s *Server) Key() exchange.PublicKey {
 }
 
 // Serve accepts connections on l until ctx is cancelled or l is closed.
-func (s *Server) Serve(ctx context.Context, l Listener) error {
+//
+// Serving belongs to every client at once, so nothing a single connection does
+// may end it: the accept loop only takes sockets off the listener, and
+// everything that reads from one — transport negotiation included — happens in
+// that connection's own goroutine. Serve returns when the listener is closed or
+// fails permanently, and for no other reason.
+//
+// l is a plain net.Listener because the socket, not a negotiated connection, is
+// what the accept path hands over: the peer address is read from it and the
+// codec detected from it, both per connection. An address source other than the
+// socket — a load balancer's, say — arrives as a listener whose connections
+// report it as their RemoteAddr, leaving everything here unchanged.
+func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	grp := tdsync.NewCancellableGroup(ctx)
 	grp.Go(func(ctx context.Context) error {
 		// Unblock the sibling shutdown goroutine when the accept loop exits
 		// (e.g. listener closed while ctx is still live).
 		defer grp.Cancel()
+		var backoff time.Duration
 		for {
-			conn, addr, err := l.Accept()
+			sock, err := l.Accept()
 			if err != nil {
 				if errors.Is(err, net.ErrClosed) {
 					return nil
 				}
+				if isTransientAccept(err) {
+					// Wait for the condition to pass instead of spinning on it,
+					// and keep the listener open: it is still good.
+					backoff = nextAcceptBackoff(backoff)
+					// A fault still there once the retry interval has saturated
+					// is no longer a blip: the process is accepting nobody, and
+					// at Info a server that serves no one reads as healthy.
+					if backoff >= maxAcceptBackoff {
+						s.log.Warn("accept still failing at maximum backoff", "err", err)
+					} else {
+						s.log.Info("accept failed, retrying", "err", err)
+					}
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(backoff):
+					}
+					continue
+				}
 				return errors.Join(errors.New("accept"), err)
 			}
+			backoff = 0
 			grp.Go(func(ctx context.Context) error {
-				if err := s.serveConn(ctx, conn, addr); err != nil && !isDisconnect(err) {
-					s.log.Info("connection handler error", "err", err)
-				}
+				s.serveSocket(ctx, sock)
 				return nil
 			})
 		}
@@ -128,6 +191,30 @@ func (s *Server) Serve(ctx context.Context, l Listener) error {
 		return nil
 	})
 	return grp.Wait()
+}
+
+// serveSocket negotiates the transport of an accepted socket and then serves
+// it. Every failure here is one connection's own — a peer that closed early,
+// sent a transport nobody speaks, or sent nothing at all — so it ends that
+// connection and is reported no further.
+func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
+	conn, addr, err := s.negotiate(ctx, sock)
+	if err != nil {
+		// Sampled: a refused or malformed connection is driven by whoever can
+		// reach the port, unauthenticated, so a line each is a log an attacker
+		// writes as fast as it can open sockets. The line that does come out
+		// says how many it stands for, or the bound would turn a flood into
+		// silence.
+		if !isDisconnect(err) {
+			if dropped, ok := s.negotiationLog.allow(time.Now(), negotiationLogInterval); ok {
+				s.log.Info("transport negotiation error", "err", err, "suppressed", dropped)
+			}
+		}
+		return
+	}
+	if err := s.serveConn(ctx, conn, addr); err != nil && !isDisconnect(err) {
+		s.log.Info("connection handler error", "err", err)
+	}
 }
 
 // isDisconnect reports whether err is an expected client disconnect rather than

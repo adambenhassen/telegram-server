@@ -73,16 +73,14 @@ func TestSendCodeBehindBalancerKeysOnRealClients(t *testing.T) {
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), limits)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
-
-	ln := mustListen(t, ctx, "127.0.0.1:0")
 	// The balancers below all connect from loopback, which is what the
 	// allowlist has to name for their headers to be believed.
-	proxies := []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
+	server.TrustProxyV2Headers([]netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")})
+
+	ln := mustListen(t, ctx, "127.0.0.1:0")
 	srvCtx, srvCancel := context.WithCancel(ctx)
 	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- server.Serve(srvCtx, mtproto.ListenProxyV2(ln, proxies, codes.Logger()))
-	}()
+	go func() { serveErr <- server.Serve(srvCtx, ln) }()
 	t.Cleanup(func() {
 		srvCancel()
 		if serr := <-serveErr; serr != nil && !errors.Is(serr, context.Canceled) {

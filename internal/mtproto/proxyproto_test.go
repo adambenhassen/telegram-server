@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"net"
 	"net/netip"
 	"slices"
@@ -53,29 +54,12 @@ func TestProxyV2UsesTheHeaderAddress(t *testing.T) {
 			defer cancel()
 
 			nl := mustListenTCP(t, ctx, tt.listen)
-			key := rebindTestKey()
-			seen := serveRequests(t, ctx, mtproto.ListenProxyV2(nl, loopback, nil), key)
+			seen, key := serveClients(t, ctx, nl, loopback, nil)
 
-			raw := dial(t, ctx, nl.Addr().String())
-			mustWrite(t, raw, proxyV2Header(proxyCmdProxy, tt.client))
-			client, err := transport.Intermediate.Handshake(raw)
-			if err != nil {
-				t.Fatalf("transport handshake: %v", err)
-			}
-			// help.getConfig rather than a ping: service messages are answered
-			// inside the serve loop and never reach a Handler.
-			frame := clientFrame(t, key, 42, int64(1)<<32, &tg.HelpGetConfigRequest{})
-			if err := client.Send(ctx, &bin.Buffer{Buf: slices.Clone(frame)}); err != nil {
-				t.Fatalf("send frame: %v", err)
-			}
+			speak(t, ctx, nl.Addr().String(), proxyV2Header(proxyCmdProxy, tt.client), transport.Intermediate, key)
 
-			select {
-			case got := <-seen:
-				if got != tt.client {
-					t.Errorf("handler saw client address %s, want the address the balancer reported, %s", got, tt.client)
-				}
-			case <-ctx.Done():
-				t.Fatal("no request reached the handler")
+			if got := wantClientAddr(t, ctx, seen); got != tt.client {
+				t.Errorf("handler saw client address %s, want the address the balancer reported, %s", got, tt.client)
 			}
 		})
 	}
@@ -111,34 +95,22 @@ func TestProxyV2RefusesAllowlistedSenderWithoutAHeader(t *testing.T) {
 			defer cancel()
 
 			nl := mustListenTCP(t, ctx, "127.0.0.1:0")
-			accepted := acceptLoop(t, mtproto.ListenProxyV2(nl, loopback, nil))
+			seen, key := serveClients(t, ctx, nl, loopback, nil)
 
-			refused := dial(t, ctx, nl.Addr().String())
+			refused := dialClient(t, ctx, nl.Addr().String())
 			mustWrite(t, refused, tt.prelude)
 			// Half-closed so a header this short is short for good: a balancer
-			// writes its header in one go, and waiting out the header timeout
-			// would prove the same refusal ten seconds later.
+			// writes its header in one go, and waiting out the handshake bound
+			// would prove the same refusal half a minute later.
 			closeWrite(t, refused)
 			assertClosed(t, refused)
 
-			// The next connection is served: one refusal drops its own socket,
-			// not the listener. A crash here would mean any peer can take the
+			// The next connection is served: one refusal ends its own socket,
+			// not the server. A failure here would mean any peer can take the
 			// server off the air by writing four bytes.
-			good := dial(t, ctx, nl.Addr().String())
-			mustWrite(t, good, proxyV2Header(proxyCmdProxy, client))
-			if _, err := transport.Intermediate.Handshake(good); err != nil {
-				t.Fatalf("transport handshake: %v", err)
-			}
-			select {
-			case got, ok := <-accepted:
-				if !ok {
-					t.Fatal("the listener stopped accepting after a refused connection")
-				}
-				if got.addr != client {
-					t.Errorf("accepted address %s, want %s", got.addr, client)
-				}
-			case <-ctx.Done():
-				t.Fatal("the connection after a refused one was never accepted")
+			speak(t, ctx, nl.Addr().String(), proxyV2Header(proxyCmdProxy, client), transport.Intermediate, key)
+			if got := wantClientAddr(t, ctx, seen); got != client {
+				t.Errorf("served address %s, want %s", got, client)
 			}
 		})
 	}
@@ -163,19 +135,12 @@ func TestProxyV2RefusesUnallowlistedSender(t *testing.T) {
 	// untrusted sender.
 	allow := []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
-	accepted := acceptLoop(t, mtproto.ListenProxyV2(nl, allow, nil))
+	seen, _ := serveClients(t, ctx, nl, allow, nil)
 
-	raw := dial(t, ctx, nl.Addr().String())
+	raw := dialClient(t, ctx, nl.Addr().String())
 	mustWrite(t, raw, proxyV2Header(proxyCmdProxy, netip.MustParseAddr("203.0.113.9")))
 	assertClosed(t, raw)
-
-	select {
-	case got, ok := <-accepted:
-		if ok {
-			t.Fatalf("a sender outside the allowlist was accepted, keyed on %s", got.addr)
-		}
-	case <-time.After(500 * time.Millisecond):
-	}
+	wantNoClient(t, seen)
 }
 
 // TestProxyV2RefusesUnsupportedFamilyOrTransport is the listener half of the
@@ -207,21 +172,14 @@ func TestProxyV2RefusesUnsupportedFamilyOrTransport(t *testing.T) {
 			defer cancel()
 
 			nl := mustListenTCP(t, ctx, "127.0.0.1:0")
-			accepted := acceptLoop(t, mtproto.ListenProxyV2(nl, loopback, nil))
+			seen, _ := serveClients(t, ctx, nl, loopback, nil)
 
-			raw := dial(t, ctx, nl.Addr().String())
+			raw := dialClient(t, ctx, nl.Addr().String())
 			// Header plus the abridged codec tag: everything a served
 			// connection needs, so only the family and transport decide it.
 			mustWrite(t, raw, append(withFamilyProto(proxyV2Header(proxyCmdProxy, client), tt.famProto), 0xef))
 			assertClosed(t, raw)
-
-			select {
-			case got, ok := <-accepted:
-				if ok {
-					t.Fatalf("family/transport %#x was served, keyed on %s", tt.famProto, got.addr)
-				}
-			case <-time.After(500 * time.Millisecond):
-			}
+			wantNoClient(t, seen)
 		})
 	}
 }
@@ -250,24 +208,12 @@ func TestProxyV2HeaderWithoutAClientAddress(t *testing.T) {
 			defer cancel()
 
 			nl := mustListenTCP(t, ctx, "127.0.0.1:0")
-			accepted := acceptLoop(t, mtproto.ListenProxyV2(nl, loopback, nil))
+			seen, key := serveClients(t, ctx, nl, loopback, nil)
 
-			raw := dial(t, ctx, nl.Addr().String())
-			mustWrite(t, raw, tt.header)
-			if _, err := transport.Intermediate.Handshake(raw); err != nil {
-				t.Fatalf("transport handshake: %v", err)
-			}
+			speak(t, ctx, nl.Addr().String(), tt.header, transport.Intermediate, key)
 
-			select {
-			case got, ok := <-accepted:
-				if !ok {
-					t.Fatal("the listener stopped accepting")
-				}
-				if got.addr.IsValid() {
-					t.Errorf("connection carries address %s, want none: the header named no client", got.addr)
-				}
-			case <-ctx.Done():
-				t.Fatal("the connection was never accepted")
+			if got := wantClientAddr(t, ctx, seen); got.IsValid() {
+				t.Errorf("request carries address %s, want none: the header named no client", got)
 			}
 		})
 	}
@@ -279,28 +225,28 @@ func TestProxyV2HeaderWithoutAClientAddress(t *testing.T) {
 // the unrecognised tag lands on Full, whose frames then decode as garbage.
 //
 // Every codec the server accepts has to keep working in both modes, so each one
-// negotiates and round-trips a frame here.
+// negotiates and carries a real frame to a handler here. The frame is the
+// assertion: it only decodes if the codec was detected on the right byte.
 func TestListenerAcceptsEveryCodec(t *testing.T) {
 	t.Parallel()
 
 	client := netip.MustParseAddr("203.0.113.22")
 	for _, mode := range []struct {
-		name   string
-		listen func(net.Listener) mtproto.Listener
+		name  string
+		allow []netip.Prefix
 		// prelude is written before the codec header, as a balancer would.
 		prelude []byte
 		want    func(net.Conn) netip.Addr
 	}{
 		{
-			name:   "socket",
-			listen: mtproto.Listen,
+			name: "socket",
 			want: func(c net.Conn) netip.Addr {
 				return netip.MustParseAddrPort(c.LocalAddr().String()).Addr().Unmap()
 			},
 		},
 		{
 			name:    "proxy-v2",
-			listen:  func(ln net.Listener) mtproto.Listener { return mtproto.ListenProxyV2(ln, loopback, nil) },
+			allow:   loopback,
 			prelude: proxyV2Header(proxyCmdProxy, client),
 			want:    func(net.Conn) netip.Addr { return client },
 		},
@@ -320,42 +266,13 @@ func TestListenerAcceptsEveryCodec(t *testing.T) {
 				defer cancel()
 
 				nl := mustListenTCP(t, ctx, "127.0.0.1:0")
-				accepted := acceptLoop(t, mode.listen(nl))
+				seen, key := serveClients(t, ctx, nl, mode.allow, nil)
 
-				raw := dial(t, ctx, nl.Addr().String())
-				mustWrite(t, raw, mode.prelude)
-				client, err := codec.proto.Handshake(raw)
-				if err != nil {
-					t.Fatalf("transport handshake: %v", err)
-				}
-				// Longer than four bytes and word-aligned: a four-byte frame is
-				// read as a protocol error code, and two codecs refuse to write
-				// anything that is not a multiple of four.
-				payload := []byte("proxy-protocol-v2-payload-000000")
-				if err := client.Send(ctx, &bin.Buffer{Buf: slices.Clone(payload)}); err != nil {
-					t.Fatalf("send frame: %v", err)
-				}
+				raw := speak(t, ctx, nl.Addr().String(), mode.prelude, codec.proto, key)
 
-				var got acceptedConn
-				select {
-				case c, ok := <-accepted:
-					if !ok {
-						t.Fatal("the listener stopped accepting")
-					}
-					got = c
-				case <-ctx.Done():
-					t.Fatal("the connection was never accepted")
-				}
-				if want := mode.want(raw); got.addr != want {
-					t.Errorf("client address %s, want %s", got.addr, want)
-				}
-
-				var b bin.Buffer
-				if err := got.conn.Recv(ctx, &b); err != nil {
-					t.Fatalf("recv frame: %v", err)
-				}
-				if string(b.Buf) != string(payload) {
-					t.Errorf("frame decoded as %q, want %q: the codec was mis-detected", b.Buf, payload)
+				got := wantClientAddr(t, ctx, seen)
+				if want := mode.want(raw); got != want {
+					t.Errorf("client address %s, want %s", got, want)
 				}
 			})
 		}
@@ -414,45 +331,21 @@ func withVersion(header []byte, version byte) []byte {
 	return out
 }
 
-// acceptedConn is one connection the listener handed back.
-type acceptedConn struct {
-	conn transport.Conn
-	addr netip.Addr
-}
-
-// acceptLoop drains l in the background so a refused connection shows up as the
-// absence of a result rather than a blocked test, and so a later connection can
-// prove the listener kept going. The channel closes when the listener stops.
-func acceptLoop(t *testing.T, l mtproto.Listener) <-chan acceptedConn {
+// serveClients runs a server on ln and reports the client address of every
+// request that reaches a handler. A non-nil allow puts it in proxy-v2 mode.
+//
+// The address is asserted here, at the handler, rather than at the accept path:
+// that is where every per-IP limit reads it, and between the two sit the header
+// read, the codec sniff and the serve loop — each a place it could be lost or
+// replaced.
+func serveClients(t *testing.T, ctx context.Context, ln net.Listener, allow []netip.Prefix, log *slog.Logger) (<-chan netip.Addr, crypto.AuthKey) {
 	t.Helper()
-	out := make(chan acceptedConn, 4)
-	go func() {
-		defer close(out)
-		for {
-			conn, addr, err := l.Accept()
-			if err != nil {
-				return
-			}
-			out <- acceptedConn{conn: conn, addr: addr}
-		}
-	}()
-	t.Cleanup(func() {
-		if err := l.Close(); err != nil {
-			t.Errorf("close listener: %v", err)
-		}
-	})
-	return out
-}
-
-// serveRequests runs a server on l and reports the client address of every
-// request that reaches a handler.
-func serveRequests(t *testing.T, ctx context.Context, l mtproto.Listener, key crypto.AuthKey) <-chan netip.Addr {
-	t.Helper()
+	key := rebindTestKey()
 	keys := mtproto.NewMemoryAuthKeyStore()
 	if err := keys.Save(ctx, key); err != nil {
 		t.Fatalf("save key: %v", err)
 	}
-	seen := make(chan netip.Addr, 1)
+	seen := make(chan netip.Addr, 8)
 	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		select {
 		case seen <- req.ClientAddr:
@@ -462,17 +355,65 @@ func serveRequests(t *testing.T, ctx context.Context, l mtproto.Listener, key cr
 	})
 	// No key exchange runs here: the client sends an encrypted frame under a key
 	// the store already holds, so the server needs no private key of its own.
-	srv := mtproto.New(exchange.PrivateKey{}, 2, keys, handler, nil)
+	srv := mtproto.New(exchange.PrivateKey{}, 2, keys, handler, log)
+	if allow != nil {
+		srv.TrustProxyV2Headers(allow)
+	}
 	srvCtx, stop := context.WithCancel(ctx)
 	served := make(chan error, 1)
-	go func() { served <- srv.Serve(srvCtx, l) }()
+	go func() { served <- srv.Serve(srvCtx, ln) }()
 	t.Cleanup(func() {
 		stop()
 		if err := <-served; err != nil {
 			t.Errorf("serve: %v", err)
 		}
 	})
-	return seen
+	return seen, key
+}
+
+// speak completes a connection the way a client does: the prelude a balancer
+// would have written, then the codec handshake, then one encrypted frame. The
+// frame is what makes the connection observable at the handler, and it decodes
+// only if the codec was detected on the right byte.
+func speak(t *testing.T, ctx context.Context, addr string, prelude []byte, proto transport.Protocol, key crypto.AuthKey) net.Conn {
+	t.Helper()
+	raw := dialClient(t, ctx, addr)
+	mustWrite(t, raw, prelude)
+	client, err := proto.Handshake(raw)
+	if err != nil {
+		t.Fatalf("transport handshake: %v", err)
+	}
+	// help.getConfig rather than a ping: service messages are answered inside
+	// the serve loop and never reach a Handler.
+	frame := clientFrame(t, key, 42, int64(1)<<32, &tg.HelpGetConfigRequest{})
+	if err := client.Send(ctx, &bin.Buffer{Buf: slices.Clone(frame)}); err != nil {
+		t.Fatalf("send frame: %v", err)
+	}
+	return raw
+}
+
+// wantClientAddr waits for one request and reports the address it carried.
+func wantClientAddr(t *testing.T, ctx context.Context, seen <-chan netip.Addr) netip.Addr {
+	t.Helper()
+	select {
+	case got := <-seen:
+		return got
+	case <-ctx.Done():
+		t.Fatal("no request reached the handler")
+		return netip.Addr{}
+	}
+}
+
+// wantNoClient asserts nothing was served on a connection that should have been
+// refused. The grace is short on purpose: a refusal is immediate, so a served
+// connection shows up well inside it.
+func wantNoClient(t *testing.T, seen <-chan netip.Addr) {
+	t.Helper()
+	select {
+	case got := <-seen:
+		t.Fatalf("a refused connection served a request, keyed on %s", got)
+	case <-time.After(500 * time.Millisecond):
+	}
 }
 
 func mustListenTCP(t *testing.T, ctx context.Context, addr string) net.Listener {
@@ -484,9 +425,10 @@ func mustListenTCP(t *testing.T, ctx context.Context, addr string) net.Listener 
 	return ln
 }
 
-// dial opens a client connection that is closed before the server it is talking
-// to, so the serve loop sees the disconnect and returns.
-func dial(t *testing.T, ctx context.Context, addr string) net.Conn {
+// dialClient opens a client connection that is closed before the server it is
+// talking to, so the serve loop sees the disconnect and returns. Named apart
+// from the accept suite's own dial, which takes no test.
+func dialClient(t *testing.T, ctx context.Context, addr string) net.Conn {
 	t.Helper()
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {

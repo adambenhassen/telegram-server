@@ -108,6 +108,9 @@ func run(log *slog.Logger) error {
 	cfg.WarnClientAddrTrust(log)
 
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewPgAuthKeyStore(st), handler, log)
+	if err := trustClientAddr(server, cfg, log); err != nil {
+		return err
+	}
 
 	// Connection lifecycle callback: when a session binds or closes, record the
 	// status change and notify other replicas.
@@ -143,30 +146,27 @@ func run(log *slog.Logger) error {
 	advertise := net.JoinHostPort(cfg.AdvertiseHost, strconv.Itoa(cfg.AdvertisePort))
 	log.Info("listening", "addr", cfg.ListenAddr, "advertise", advertise, "dc", cfg.DCID)
 
-	listener, err := clientListener(cfg, ln, log)
-	if err != nil {
-		return err
-	}
-	return server.Serve(ctx, listener)
+	return server.Serve(ctx, ln)
 }
 
-// clientListener builds the accept path the configured trust mode names.
+// trustClientAddr applies the configured client-address source to the server.
 //
 // The switch is exhaustive on purpose and has no permissive default: config
 // validation already rejects any other value, and a fallback to socket keying
 // added here would be the silent collapse into one global bucket that the mode
 // exists to prevent.
-func clientListener(cfg config.Config, ln net.Listener, log *slog.Logger) (mtproto.Listener, error) {
+func trustClientAddr(server *mtproto.Server, cfg config.Config, log *slog.Logger) error {
 	switch cfg.ClientAddrTrust {
 	case config.ClientAddrSocket:
-		return mtproto.Listen(ln), nil
+		return nil
 	case config.ClientAddrProxyV2:
 		log.Info("client addresses are read from PROXY protocol v2 headers",
 			"trust", string(cfg.ClientAddrTrust),
 			"balancers", cfg.ClientAddrProxies)
-		return mtproto.ListenProxyV2(ln, cfg.ClientAddrProxies, log), nil
+		server.TrustProxyV2Headers(cfg.ClientAddrProxies)
+		return nil
 	default:
-		return nil, fmt.Errorf("unsupported client address trust mode %q", cfg.ClientAddrTrust)
+		return fmt.Errorf("unsupported client address trust mode %q", cfg.ClientAddrTrust)
 	}
 }
 

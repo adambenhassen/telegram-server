@@ -6,45 +6,38 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"net"
 	"net/netip"
 	"slices"
+	"sync/atomic"
+	"time"
 )
 
-// ListenProxyV2 accepts MTProto connections on ln, attributing each to the
-// address a PROXY protocol v2 header names, and only when that header arrives
-// from a source in allow.
-//
-// This is the mode for running behind an L4 load balancer. There every socket's
-// peer address is the balancer's, so socket keying puts every client on earth in
-// one bucket and a per-IP cap becomes a global one that locks out every login at
-// the same moment. The balancer knows the address it accepted from and writes it
-// ahead of the stream; this reads it back.
-//
-// The header is client-supplied bytes, and allow is the entire reason any of
-// them can be believed. Both directions fail closed:
-//
-//   - a connection from an allowed source that carries no valid v2 header is
-//     refused, never served on the balancer's own address;
-//   - a header from any other source is never honoured — that connection is
-//     refused before a byte of it is read, so the header cannot be credited and
-//     cannot pass through as protocol either.
-//
-// There is no third path and no fallback. A spoofable client address is worse
-// than none: it lets an attacker step out of their own bucket and push an
-// innocent address into denial at the same time.
-//
-// log records refusals. It is the signal an operator has for a misconfigured
-// allowlist, which otherwise looks like every client failing to connect at once;
-// nil discards.
-func ListenProxyV2(ln net.Listener, allow []netip.Prefix, log *slog.Logger) Listener {
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
+// negotiationLogInterval bounds how often a failed negotiation is logged. The
+// failures are driven by whoever can reach the port, unauthenticated, so an
+// unsampled line each is a log an attacker writes; each line that does come out
+// carries how many were suppressed behind it.
+const negotiationLogInterval = 10 * time.Second
+
+// logSampler thins a log line that anyone who can reach the port can provoke.
+// It holds no lock — the compare-and-swap is the whole of it, and a caller that
+// loses the swap is one of the callers being dropped anyway.
+type logSampler struct {
+	// last is the unix-nanosecond time of the line that was emitted, 0 before
+	// the first one. dropped counts the lines suppressed since then.
+	last    atomic.Int64
+	dropped atomic.Int64
+}
+
+// allow reports whether a line may be emitted now and, when it may, how many
+// were dropped since the previous one.
+func (s *logSampler) allow(now time.Time, interval time.Duration) (int64, bool) {
+	n := now.UnixNano()
+	last := s.last.Load()
+	if n-last < int64(interval) || !s.last.CompareAndSwap(last, n) {
+		s.dropped.Add(1)
+		return 0, false
 	}
-	// Cloned: the allowlist is the trust decision, and it must not change under
-	// the accept loop because a caller reused the slice it passed in.
-	return newListener(ln, proxyV2Source{allow: slices.Clone(allow)}, log)
+	return s.dropped.Swap(0), true
 }
 
 const (
@@ -83,33 +76,19 @@ const (
 // not a header this mode may read.
 var proxyV2Signature = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
 
-// proxyV2Source takes the client address from a PROXY v2 header written by an
-// allowlisted balancer.
+// proxyV2Source is the balancer allowlist that makes a PROXY v2 header
+// believable.
+//
+// The header is client-supplied bytes, and the allowlist is the entire reason
+// any of them can be trusted. Both directions fail closed: a connection from an
+// allowed source carrying no valid v2 header is refused rather than served on
+// the balancer's own address, and a header from any other source is refused
+// before a byte of it is read, so it can neither be credited nor pass through as
+// protocol. There is no third path and no fallback — a spoofable client address
+// is worse than none, because it lets an attacker step out of their own bucket
+// and push an innocent address into denial at the same time.
 type proxyV2Source struct {
 	allow []netip.Prefix
-}
-
-// clientAddr checks the sender against the allowlist, then reads exactly one
-// PROXY v2 header off the connection.
-//
-// Exactly one: the header is self-delimiting — a fixed 16 bytes that carry the
-// length of the address block after them — so the read stops on the byte the
-// transport codec header starts at. Nothing is buffered past it, which is what
-// keeps codec detection seeing the same first byte it would have seen without a
-// balancer in front.
-//
-// The read runs under the deadline listener.setup armed. That deadline covers
-// the codec sniff after this too, so it is not cleared here: a sender that
-// writes a valid header and then goes quiet must be bounded by the same clock as
-// one that writes nothing at all.
-func (s proxyV2Source) clientAddr(conn net.Conn) (netip.Addr, error) {
-	peer := peerAddr(conn.RemoteAddr())
-	if !s.allowed(peer) {
-		// Refused before any read: bytes from a sender outside the allowlist
-		// are never interpreted, as a header or as anything else.
-		return netip.Addr{}, fmt.Errorf("no PROXY header is accepted from %s: not an allowlisted balancer", peer)
-	}
-	return readProxyV2(conn)
 }
 
 // allowed reports whether a header from peer may be believed. An address the
