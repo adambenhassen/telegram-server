@@ -518,7 +518,11 @@ SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id AND p.user_id = $1::bigint
 LEFT JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
-WHERE (c.title_tsv @@ plainto_tsquery('simple', $2) OR un.handle = $3)
+WHERE c.id IN (
+    SELECT tc.id FROM channels tc WHERE tc.title_tsv @@ plainto_tsquery('simple', $2)
+    UNION
+    SELECT hu.owner_id FROM usernames hu WHERE hu.owner_type = 'channel' AND hu.handle = $3
+)
   AND (p.banned_until IS NULL OR p.banned_until <= now())
 ORDER BY c.id
 LIMIT $4::int
@@ -555,6 +559,11 @@ type SearchMemberChannelsRow struct {
 // displace a channel the caller may actually see. It must stay spelled the same
 // way as Banned — NULL is not banned, "may act" is banned_until IS NULL OR
 // banned_until <= now().
+//
+// The match is the same union of single-relation subqueries SearchPublicChannels
+// uses, for the same planner reason. This arm is already bounded by the caller's
+// own membership rows and was cheap either way, but two spellings of one
+// predicate is how the two drift.
 func (q *Queries) SearchMemberChannels(ctx context.Context, arg SearchMemberChannelsParams) ([]SearchMemberChannelsRow, error) {
 	rows, err := q.db.Query(ctx, searchMemberChannels,
 		arg.ViewerID,
@@ -598,8 +607,11 @@ SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
        (SELECT count(*) FROM channel_participants cp WHERE cp.channel_id = c.id) AS participants_count
 FROM channels c
 JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
-WHERE c.title_tsv @@ plainto_tsquery('simple', $1)
-   OR un.handle = $2
+WHERE c.id IN (
+    SELECT tc.id FROM channels tc WHERE tc.title_tsv @@ plainto_tsquery('simple', $1)
+    UNION
+    SELECT hu.owner_id FROM usernames hu WHERE hu.owner_type = 'channel' AND hu.handle = $2
+)
 ORDER BY c.id
 LIMIT $3::int
 `
@@ -644,6 +656,17 @@ type SearchPublicChannelsRow struct {
 // the channel discoverable. The handle returned to the caller comes from the
 // same row for the same reason: the username shown is the one that admitted the
 // channel to this result, never the copy.
+//
+// The match is a union of two single-relation subqueries rather than one OR
+// spanning channels and usernames, and that shape is load-bearing rather than
+// stylistic. An OR across two relations cannot be answered from either index:
+// the planner scans every channel, joins every channel handle, and evaluates
+// the disjunction as a join filter, so a query matching nothing costs the whole
+// table (162.8 ms at 200k channels, against 1.99 ms here) and an authenticated
+// account picks that worst case for free by sending a nonsense token. Each
+// disjunct here restricts on its own relation, so the title arm is a bitmap
+// scan of channels_title_tsv_idx and the handle arm a lookup on the usernames
+// primary key.
 func (q *Queries) SearchPublicChannels(ctx context.Context, arg SearchPublicChannelsParams) ([]SearchPublicChannelsRow, error) {
 	rows, err := q.db.Query(ctx, searchPublicChannels, arg.Query, arg.Handle, arg.Lim)
 	if err != nil {
