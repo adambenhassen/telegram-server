@@ -13,7 +13,6 @@ import (
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
-	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -70,7 +69,7 @@ func TestRateLimitE2E(t *testing.T) {
 
 	srvCtx, srvCancel := context.WithCancel(ctx)
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(srvCtx, transport.Listen(ln)) }()
+	go func() { serveErr <- server.Serve(srvCtx, mtproto.Listen(ln)) }()
 	t.Cleanup(func() {
 		srvCancel()
 		if serr := <-serveErr; serr != nil && !errors.Is(serr, context.Canceled) {
