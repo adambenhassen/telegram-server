@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
@@ -41,6 +42,15 @@ const (
 	containerName   = "tg-test-pg"
 	templatePrefix  = "tg_template_"
 	advisoryLockKey = 0x7467 // "tg"
+
+	// readyTimeout bounds the wait for Postgres to accept connections, matching
+	// testcontainers' own 60s startup deadline: long enough for a fresh
+	// container's initdb-then-restart, short enough that a container which will
+	// never answer fails the suite instead of hanging it.
+	readyTimeout = 60 * time.Second
+	// readyProbe bounds one connection attempt, readyInterval spaces them out.
+	readyProbe    = 5 * time.Second
+	readyInterval = 250 * time.Millisecond
 )
 
 var (
@@ -70,15 +80,7 @@ func setup() {
 		return
 	}
 	migrations = migs
-	container, err := postgres.Run(ctx, "postgres:16-alpine",
-		testcontainers.WithReuseByName(containerName),
-		tcnet.WithBridgeNetwork(),
-		postgres.WithDatabase("postgres"),
-		postgres.WithUsername("postgres"),
-		postgres.WithPassword("postgres"),
-		postgres.WithConfigFile(fastConfPath()),
-		postgres.BasicWaitStrategies(),
-	)
+	container, err := postgres.Run(ctx, "postgres:16-alpine", containerOptions()...)
 	if err != nil {
 		errSetup = fmt.Errorf("start container: %w", err)
 		return
@@ -98,8 +100,80 @@ func setup() {
 			return
 		}
 	}
+	if err := waitAccepting(ctx, adminDSN, readyTimeout); err != nil {
+		errSetup = err
+		return
+	}
 	templateName = templatePrefix + schemaHash(migrations)
 	errSetup = ensureTemplate(ctx)
+}
+
+// containerOptions builds the create-or-reuse options for the shared container.
+//
+// Readiness is deliberately not a testcontainers wait strategy. The container is
+// reused for days, and Docker's json-file log rotation eventually discards the
+// "database system is ready to accept connections" startup lines that a log
+// strategy counts, so a healthy Postgres starts failing every run with "matched
+// 0 times, expected 2" — and reuse means it never boots again to write fresh
+// ones. waitAccepting asks Postgres itself instead, which nothing can rotate
+// away, and asks over the same DSN the tests use.
+func containerOptions() []testcontainers.ContainerCustomizer {
+	return []testcontainers.ContainerCustomizer{
+		testcontainers.WithReuseByName(containerName),
+		tcnet.WithBridgeNetwork(),
+		postgres.WithDatabase("postgres"),
+		postgres.WithUsername("postgres"),
+		postgres.WithPassword("postgres"),
+		postgres.WithConfigFile(fastConfPath()),
+	}
+}
+
+// waitAccepting polls dsn until Postgres answers a query, or timeout elapses.
+// A fresh container is refusing connections through initdb and its restart; a
+// container that never answers fails setup here with the last connection error.
+func waitAccepting(ctx context.Context, dsn string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	for {
+		err := probeAccepting(ctx, dsn)
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("postgres at %s not accepting connections within %s: %w", dsnHost(dsn), timeout, err)
+		case <-time.After(readyInterval):
+		}
+	}
+}
+
+// probeAccepting runs one bounded connect-and-query against dsn.
+func probeAccepting(ctx context.Context, dsn string) error {
+	ctx, cancel := context.WithTimeout(ctx, readyProbe)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close of probe conn
+
+	var one int
+	if err := conn.QueryRow(ctx, `SELECT 1`).Scan(&one); err != nil {
+		return fmt.Errorf("query: %w", err)
+	}
+	return nil
+}
+
+// dsnHost returns the host:port of a DSN for error messages, keeping the
+// credentials out of them.
+func dsnHost(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "unknown host"
+	}
+	return u.Host
 }
 
 // ensureTemplate builds the content-addressed template crash-safely: the schema
