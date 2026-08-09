@@ -23,13 +23,13 @@ import (
 //
 // For FLOOD_WAIT errors, the message carries a retry-delay suffix
 // (e.g. "FLOOD_WAIT_86400"), so the match is a prefix check.
-func assertUsernameRPCError(t *testing.T, cmds chan command, want string, fn func(ctx context.Context, c *tg.Client) error) {
+func assertUsernameRPCError(t *testing.T, ctx context.Context, cmds chan command, want string, fn func(ctx context.Context, c *tg.Client) error) {
 	t.Helper()
 	done := make(chan error, 1)
 	select {
 	case cmds <- command{fn: fn, done: done}:
-	case <-time.After(10 * time.Second):
-		t.Fatal("command enqueue timeout")
+	case <-ctx.Done():
+		t.Fatalf("command enqueue timeout: %v", ctx.Err())
 	}
 	err := <-done
 	if err == nil {
@@ -100,7 +100,7 @@ func TestUsernameSetAndResolveUser(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -109,13 +109,13 @@ func TestUsernameSetAndResolveUser(t *testing.T) {
 	_ = login(bID, "B")
 
 	// A sets username "alice".
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.AccountUpdateUsername(ctx, "alice")
 		return err
 	})
 
 	// B resolves "alice" → receives A's user peer with a valid access_hash.
-	execChat(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: "alice"})
 		if err != nil {
 			return err
@@ -137,7 +137,7 @@ func TestUsernameSetAndResolveUser(t *testing.T) {
 	})
 
 	// B resolves "Alice" → same result (case-insensitive).
-	execChat(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: "Alice"})
 		if err != nil {
 			return err
@@ -156,13 +156,13 @@ func TestUsernameSetAndResolveUser(t *testing.T) {
 	})
 
 	// A clears the username.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.AccountUpdateUsername(ctx, "")
 		return err
 	})
 
 	// B resolves "alice" → returns USERNAME_NOT_OCCUPIED.
-	assertUsernameRPCError(t, bCmds, "USERNAME_NOT_OCCUPIED", func(ctx context.Context, c *tg.Client) error {
+	assertUsernameRPCError(t, ctx, bCmds, "USERNAME_NOT_OCCUPIED", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: "alice"})
 		return err
 	})
@@ -224,7 +224,7 @@ func TestUsernameUniqueness(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -233,25 +233,25 @@ func TestUsernameUniqueness(t *testing.T) {
 	_ = login(bID, "B")
 
 	// A sets username "taken".
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.AccountUpdateUsername(ctx, "taken")
 		return err
 	})
 
 	// B attempts "Taken" → USERNAME_OCCUPIED (case-insensitive).
-	assertUsernameRPCError(t, bCmds, "USERNAME_OCCUPIED", func(ctx context.Context, c *tg.Client) error {
+	assertUsernameRPCError(t, ctx, bCmds, "USERNAME_OCCUPIED", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.AccountUpdateUsername(ctx, "Taken")
 		return err
 	})
 
 	// A clears the username.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.AccountUpdateUsername(ctx, "")
 		return err
 	})
 
 	// B sets "taken" → succeeds.
-	execChat(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.AccountUpdateUsername(ctx, "taken")
 		return err
 	})
@@ -314,7 +314,7 @@ func TestPublicChannelJoinByUsername(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -323,10 +323,10 @@ func TestPublicChannelJoinByUsername(t *testing.T) {
 	bUserID := login(bID, "B")
 
 	// A creates a broadcast channel.
-	chID := createBroadcastChannel(t, aCmds, "Public Channel")
+	chID := createBroadcastChannel(t, ctx, aCmds, "Public Channel")
 
 	// A sets the channel username via channels.updateUsername.
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsUpdateUsername(ctx, &tg.ChannelsUpdateUsernameRequest{
 			Channel:  inputChannel(aUserID, chID),
 			Username: "publicchan",
@@ -336,7 +336,7 @@ func TestPublicChannelJoinByUsername(t *testing.T) {
 
 	// B resolves "publicchan" → receives the channel peer.
 	var resolvedChID int64
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: "publicchan"})
 		if err != nil {
 			return err
@@ -356,13 +356,13 @@ func TestPublicChannelJoinByUsername(t *testing.T) {
 	})
 
 	// B calls channels.joinChannel → succeeds and becomes a member.
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsJoinChannel(ctx, inputChannel(bUserID, resolvedChID))
 		return err
 	})
 
 	// A posts a message to the channel.
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerChannel(aUserID, chID),
 			Message:  "hello public channel",
@@ -377,12 +377,12 @@ func TestPublicChannelJoinByUsername(t *testing.T) {
 		if upd.Msg.Message != "hello public channel" {
 			t.Fatalf("B channel msg = %q, want %q", upd.Msg.Message, "hello public channel")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("B timed out waiting for channel message")
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for channel message: %v", ctx.Err())
 	}
 
 	// B calls getChannelDifference from join_pts → receives the new post.
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
 			Channel: inputChannel(bUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
@@ -410,7 +410,7 @@ func TestPublicChannelJoinByUsername(t *testing.T) {
 	})
 
 	// B's getDialogs includes the channel.
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
 			OffsetPeer: &tg.InputPeerEmpty{},
 			Limit:      20,
@@ -498,7 +498,7 @@ func TestPrivateChannelRefusesDirectJoin(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -507,10 +507,10 @@ func TestPrivateChannelRefusesDirectJoin(t *testing.T) {
 	bUserID := login(bID, "B")
 
 	// A creates a broadcast channel with no username set.
-	chID := createBroadcastChannel(t, aCmds, "Private Channel")
+	chID := createBroadcastChannel(t, ctx, aCmds, "Private Channel")
 
 	// B attempts channels.joinChannel → PEER_ID_INVALID (no username = private).
-	assertChannelRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertChannelRPCError(t, ctx, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsJoinChannel(ctx, inputChannel(bUserID, chID))
 		return err
 	})
@@ -569,7 +569,7 @@ func TestResolveUsernameRateLimit(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -579,14 +579,14 @@ func TestResolveUsernameRateLimit(t *testing.T) {
 	// 20 distinct username lookups — all USERNAME_NOT_OCCUPIED but succeed.
 	for i := range 20 {
 		username := fmt.Sprintf("nobody_%d", i)
-		assertUsernameRPCError(t, aCmds, "USERNAME_NOT_OCCUPIED", func(ctx context.Context, c *tg.Client) error {
+		assertUsernameRPCError(t, ctx, aCmds, "USERNAME_NOT_OCCUPIED", func(ctx context.Context, c *tg.Client) error {
 			_, err := c.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
 			return err
 		})
 	}
 
 	// 21st distinct lookup → rate-limit error.
-	assertUsernameRPCError(t, aCmds, "FLOOD_WAIT", func(ctx context.Context, c *tg.Client) error {
+	assertUsernameRPCError(t, ctx, aCmds, "FLOOD_WAIT", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: "nobody_21"})
 		return err
 	})

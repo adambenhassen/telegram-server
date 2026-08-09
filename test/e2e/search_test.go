@@ -81,21 +81,21 @@ func TestSearchMessages(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -365,8 +365,8 @@ func TestSearchMessages(t *testing.T) {
 	var cUserID int64
 	select {
 	case cUserID = <-cID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client C login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client C login timeout: %v", ctx.Err())
 	}
 	peerC := peerUser(aUserID, cUserID)
 	msgs, err = search(aCmds, peerC, "hello", 0, 10)
@@ -458,7 +458,7 @@ func TestSearchChatPeer(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -469,8 +469,8 @@ func TestSearchChatPeer(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -543,8 +543,8 @@ func TestSearchChatPeer(t *testing.T) {
 		for range count {
 			select {
 			case <-coll.newMsg:
-			case <-time.After(5 * time.Second):
-				t.Fatalf("timeout waiting for message %d", n)
+			case <-ctx.Done():
+				t.Fatalf("timeout waiting for message %d: %v", n, ctx.Err())
 			}
 			n++
 		}
@@ -630,8 +630,8 @@ func TestSearchChatPeer(t *testing.T) {
 	go func() { errD <- runInteractive(ctx, clientD, flowFor(phoneD), dID, dCmds) }()
 	select {
 	case <-dID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client D login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client D login timeout: %v", ctx.Err())
 	}
 	var searchErr error
 	if err := exec(dCmds, func(ctx context.Context, c *tg.Client) error {

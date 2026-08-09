@@ -107,8 +107,8 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 	var aUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 
 	// Baseline: replica 1 really holds A's socket, so a later empty bucket is the
@@ -146,8 +146,8 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 	var bUserID int64
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	// A second session of the same user, on replica 2, revokes A's key.
@@ -184,8 +184,8 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 		})
 		return err
 	}, done: done}:
-	case <-time.After(10 * time.Second):
-		t.Fatal("B send enqueue timeout")
+	case <-ctx.Done():
+		t.Fatalf("B send enqueue timeout: %v", ctx.Err())
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("B send: %v", err)

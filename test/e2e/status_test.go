@@ -72,14 +72,14 @@ func bootServerWithStatus(t *testing.T, ctx context.Context, key *rsa.PrivateKey
 	}
 }
 
-// recvStatus waits for an updateUserStatus on coll's channel with a 10 s timeout.
-func recvStatus(t *testing.T, coll *updateCollector, what string) *tg.UpdateUserStatus {
+// recvStatus waits for an updateUserStatus on coll's channel, bounded by ctx.
+func recvStatus(t *testing.T, ctx context.Context, coll *updateCollector, what string) *tg.UpdateUserStatus {
 	t.Helper()
 	select {
 	case upd := <-coll.userStatus:
 		return upd
-	case <-time.After(10 * time.Second):
-		t.Fatalf("timed out waiting for %s", what)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", what, ctx.Err())
 		return nil
 	}
 }
@@ -141,8 +141,8 @@ func TestStatusOnlineRoundTrip(t *testing.T) {
 	var bUserID int64
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("B login timeout: %v", ctx.Err())
 	}
 
 	// Phase 1: A logs in with sessA, establishes a dialog with B, then disconnects.
@@ -170,15 +170,15 @@ func TestStatusOnlineRoundTrip(t *testing.T) {
 	// B received A's message — drain it.
 	select {
 	case <-collB.newMsg:
-	case <-time.After(10 * time.Second):
-		t.Fatal("B did not receive A's message")
+	case <-ctx.Done():
+		t.Fatalf("B did not receive A's message: %v", ctx.Err())
 	}
 
 	// AC 2: A just disconnected — B must receive updateUserStatus{Offline} with nonzero WasOnline.
 	// Skip any Online push from A's login that may have arrived before the message was drained.
 	var off *tg.UserStatusOffline
 	for {
-		upd := recvStatus(t, collB, "B updateUserStatus offline")
+		upd := recvStatus(t, ctx, collB, "B updateUserStatus offline")
 		if upd.UserID != aUserID {
 			continue
 		}
@@ -207,12 +207,12 @@ func TestStatusOnlineRoundTrip(t *testing.T) {
 	}()
 	select {
 	case <-aReady:
-	case <-time.After(20 * time.Second):
-		t.Fatal("A reconnect timeout")
+	case <-ctx.Done():
+		t.Fatalf("A reconnect timeout: %v", ctx.Err())
 	}
 
 	// AC 1: B must receive updateUserStatus{Online} for A.
-	onUpd := recvStatus(t, collB, "B updateUserStatus online")
+	onUpd := recvStatus(t, ctx, collB, "B updateUserStatus online")
 	if onUpd.UserID != aUserID {
 		t.Fatalf("online UserID = %d, want %d", onUpd.UserID, aUserID)
 	}
@@ -278,17 +278,17 @@ func TestStatusExplicitUpdateStatus(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("B login timeout: %v", ctx.Err())
 	}
 
 	// Establish dialog A→B.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerUser(aUserID, bUserID),
 			Message:  "setup",
@@ -296,20 +296,20 @@ func TestStatusExplicitUpdateStatus(t *testing.T) {
 		})
 		return err
 	})
-	recvOr(t, collB.newMsg, "B newMsg setup")
+	recvOrCtx(t, ctx, collB.newMsg, "B newMsg setup")
 
 	// Drain any status updates from the connection/setup phase.
 	drainStatus(collA)
 	drainStatus(collB)
 
 	// A calls account.updateStatus(offline=true) while still connected.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.AccountUpdateStatus(ctx, true)
 		return err
 	})
 
 	// B must receive updateUserStatus{Offline} for A.
-	upd := recvStatus(t, collB, "B updateUserStatus offline from updateStatus RPC")
+	upd := recvStatus(t, ctx, collB, "B updateUserStatus offline from updateStatus RPC")
 	if upd.UserID != aUserID {
 		t.Fatalf("status UserID = %d, want %d", upd.UserID, aUserID)
 	}
@@ -318,7 +318,7 @@ func TestStatusExplicitUpdateStatus(t *testing.T) {
 	}
 
 	// A is still connected — prove it by making a subsequent RPC.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.UpdatesGetState(ctx)
 		return err
 	})
@@ -379,18 +379,18 @@ func TestStatusGetDialogsCarriesOnline(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("B login timeout: %v", ctx.Err())
 	}
 	_ = bUserID
 
 	// A sends B a message so B has A in their dialog list.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerUser(aUserID, bUserID),
 			Message:  "hello",
@@ -400,7 +400,7 @@ func TestStatusGetDialogsCarriesOnline(t *testing.T) {
 	})
 
 	// B calls getDialogs; A must appear with UserStatusOnline.
-	execChat(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
 			OffsetPeer: &tg.InputPeerEmpty{},
 			Limit:      20,
@@ -486,8 +486,8 @@ func TestStatusNeverConnected(t *testing.T) {
 	}()
 	select {
 	case <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("B login timeout: %v", ctx.Err())
 	}
 
 	// C logs in (creates the user row via auth.signIn) then immediately disconnects.
@@ -500,7 +500,7 @@ func TestStatusNeverConnected(t *testing.T) {
 	}
 
 	// B resolves C; C's status must be UserStatusEmpty — not UserStatusOffline{WasOnline:0}.
-	execChat(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		rp, err := c.ContactsResolvePhone(ctx, phoneC)
 		if err != nil {
 			return err
@@ -577,12 +577,12 @@ func TestStatusSelfRecently(t *testing.T) {
 	var aUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("A login timeout: %v", ctx.Err())
 	}
 
 	// A calls users.getUsers for itself; status must be UserStatusRecently.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUserSelf{}})
 		if err != nil {
 			return err
@@ -660,13 +660,13 @@ func TestStatusNoCrossContamination(t *testing.T) {
 	var bUserID int64
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("B login timeout: %v", ctx.Err())
 	}
 	select {
 	case <-dID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("D login timeout")
+	case <-ctx.Done():
+		t.Fatalf("D login timeout: %v", ctx.Err())
 	}
 
 	// Phase 1: A logs in with sessA, sends B a message (A↔B dialog only), disconnects.
@@ -695,14 +695,14 @@ func TestStatusNoCrossContamination(t *testing.T) {
 	// Drain B's message.
 	select {
 	case <-collB.newMsg:
-	case <-time.After(10 * time.Second):
-		t.Fatal("B did not receive setup message")
+	case <-ctx.Done():
+		t.Fatalf("B did not receive setup message: %v", ctx.Err())
 	}
 	// Drain any Online push from A's login, then wait for the Offline push
 	// (from A's disconnect). The ordering of Online vs the setup message is
 	// not guaranteed, so skip Online updates until Offline arrives.
 	for {
-		upd := recvStatus(t, collB, "B updateUserStatus offline (setup)")
+		upd := recvStatus(t, ctx, collB, "B updateUserStatus offline (setup)")
 		if _, ok := upd.Status.(*tg.UserStatusOffline); ok {
 			break
 		}
@@ -724,12 +724,12 @@ func TestStatusNoCrossContamination(t *testing.T) {
 	}()
 	select {
 	case <-aReady:
-	case <-time.After(20 * time.Second):
-		t.Fatal("A reconnect timeout")
+	case <-ctx.Done():
+		t.Fatalf("A reconnect timeout: %v", ctx.Err())
 	}
 
 	// B must receive Online push for A — proves the push system fired.
-	onUpd := recvStatus(t, collB, "B updateUserStatus online for A")
+	onUpd := recvStatus(t, ctx, collB, "B updateUserStatus online for A")
 	if _, ok := onUpd.Status.(*tg.UserStatusOnline); !ok {
 		t.Errorf("B status = %T, want *tg.UserStatusOnline", onUpd.Status)
 	}

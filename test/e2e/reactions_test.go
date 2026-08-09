@@ -66,7 +66,7 @@ func TestReactionsRealtime(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -80,8 +80,8 @@ func TestReactionsRealtime(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -113,7 +113,7 @@ func TestReactionsRealtime(t *testing.T) {
 		t.Fatalf("A send: %v", err)
 	}
 	// Drain B's new message.
-	recvOr(t, collB.newMsg, "B updateNewMessage")
+	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
 
 	// 2. A reacts with a heart emoji.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -130,7 +130,7 @@ func TestReactionsRealtime(t *testing.T) {
 	}
 
 	// 2b. B receives updateMessageReactions in real-time.
-	reactPush := recvOr(t, collB.msgReactions, "B updateMessageReactions")
+	reactPush := recvOrCtx(t, ctx, collB.msgReactions, "B updateMessageReactions")
 	if reactPush.MsgID != msgID {
 		t.Fatalf("reaction push msgID = %d, want %d", reactPush.MsgID, msgID)
 	}
@@ -197,7 +197,7 @@ func TestReactionsRealtime(t *testing.T) {
 	}
 
 	// 4b. B receives updateMessageReactions reflecting cleared state.
-	clearPush := recvOr(t, collB.msgReactions, "B updateMessageReactions (clear)")
+	clearPush := recvOrCtx(t, ctx, collB.msgReactions, "B updateMessageReactions (clear)")
 	if clearPush.MsgID != msgID {
 		t.Fatalf("clear push msgID = %d, want %d", clearPush.MsgID, msgID)
 	}
@@ -289,12 +289,12 @@ func TestReactionsRealtime(t *testing.T) {
 	go func() { errC <- runInteractive(ctx, clientC, flowFor(phoneC, codes), cID, cCmds) }()
 	select {
 	case cUserID = <-cID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client C login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client C login timeout: %v", ctx.Err())
 	}
 
 	var reactErr error
-	execChat(t, cCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendReaction(ctx, &tg.MessagesSendReactionRequest{
 			Peer:  peerUser(cUserID, aUserID),
 			MsgID: msgID,
@@ -382,7 +382,7 @@ func TestReactionsChatFanout(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -393,8 +393,8 @@ func TestReactionsChatFanout(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -429,8 +429,8 @@ func TestReactionsChatFanout(t *testing.T) {
 		t.Fatalf("createChat: %v", err)
 	}
 	// Drain B and C service messages for create.
-	recvOr(t, collB.serviceMsg, "B create service")
-	recvOr(t, collC.serviceMsg, "C create service")
+	recvOrCtx(t, ctx, collB.serviceMsg, "B create service")
+	recvOrCtx(t, ctx, collC.serviceMsg, "C create service")
 
 	// 2. A sends a message to the chat.
 	var msgID int
@@ -459,8 +459,8 @@ func TestReactionsChatFanout(t *testing.T) {
 		t.Fatalf("A send to chat: %v", err)
 	}
 	// Drain B and C new messages.
-	recvOr(t, collB.newMsg, "B updateNewMessage")
-	recvOr(t, collC.newMsg, "C updateNewMessage")
+	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
+	recvOrCtx(t, ctx, collC.newMsg, "C updateNewMessage")
 
 	// 3. A reacts with a heart emoji.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -477,7 +477,7 @@ func TestReactionsChatFanout(t *testing.T) {
 	}
 
 	// 3b. B receives updateMessageReactions.
-	reactB := recvOr(t, collB.msgReactions, "B updateMessageReactions (chat)")
+	reactB := recvOrCtx(t, ctx, collB.msgReactions, "B updateMessageReactions (chat)")
 	if reactB.MsgID != msgID {
 		t.Fatalf("B reaction push msgID = %d, want %d", reactB.MsgID, msgID)
 	}
@@ -490,7 +490,7 @@ func TestReactionsChatFanout(t *testing.T) {
 	}
 
 	// 3c. C receives updateMessageReactions.
-	reactC := recvOr(t, collC.msgReactions, "C updateMessageReactions (chat)")
+	reactC := recvOrCtx(t, ctx, collC.msgReactions, "C updateMessageReactions (chat)")
 	if reactC.MsgID != msgID {
 		t.Fatalf("C reaction push msgID = %d, want %d", reactC.MsgID, msgID)
 	}

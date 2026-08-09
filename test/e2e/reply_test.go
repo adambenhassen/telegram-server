@@ -79,20 +79,20 @@ func TestReplyPersisted(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	peerB := peerUser(aUserID, bUserID)
 
 	// 1. A sends a normal message (no reply) — get its local_id.
 	var firstMsgID int
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+	if err := exec(ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerB,
 			Message:  "first message",
@@ -126,17 +126,17 @@ func TestReplyPersisted(t *testing.T) {
 	}
 
 	// Drain both sides' push for the first message.
-	firstFromB := recvOr(t, collB.newMsg, "B updateNewMessage for first message")
+	firstFromB := recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage for first message")
 	if firstFromB.Message != "first message" {
 		t.Fatalf("B first message = %q, want %q", firstFromB.Message, "first message")
 	}
-	firstFromA := recvOr(t, collA.newMsg, "A updateNewMessage for first message")
+	firstFromA := recvOrCtx(t, ctx, collA.newMsg, "A updateNewMessage for first message")
 	if firstFromA.Message != "first message" {
 		t.Fatalf("A first message = %q, want %q", firstFromA.Message, "first message")
 	}
 
 	// 2. A sends a reply to the first message.
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+	if err := exec(ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		req := &tg.MessagesSendMessageRequest{
 			Peer:     peerB,
 			Message:  "reply to first",
@@ -150,7 +150,7 @@ func TestReplyPersisted(t *testing.T) {
 	}
 
 	// 3. B receives the reply via updateNewMessage and checks ReplyTo field.
-	replyMsg := recvOr(t, collB.newMsg, "B updateNewMessage for reply")
+	replyMsg := recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage for reply")
 	if replyMsg.Message != "reply to first" {
 		t.Fatalf("B received %q, want %q", replyMsg.Message, "reply to first")
 	}
@@ -165,7 +165,7 @@ func TestReplyPersisted(t *testing.T) {
 	}
 
 	// 4. A's own view of the reply also has ReplyTo set.
-	aReplyMsg := recvOr(t, collA.newMsg, "A updateNewMessage for reply")
+	aReplyMsg := recvOrCtx(t, ctx, collA.newMsg, "A updateNewMessage for reply")
 	if replyTo, ok := aReplyMsg.GetReplyTo(); !ok {
 		t.Fatal("A's own reply message missing ReplyTo field")
 	} else if hdr, ok := replyTo.(*tg.MessageReplyHeader); !ok {
@@ -248,13 +248,13 @@ func TestReplyInHistory(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	peerB := peerUser(aUserID, bUserID)
@@ -262,7 +262,7 @@ func TestReplyInHistory(t *testing.T) {
 
 	// 1. A sends a normal message.
 	var firstMsgID int
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+	if err := exec(ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerB,
 			Message:  "original",
@@ -293,11 +293,11 @@ func TestReplyInHistory(t *testing.T) {
 	}
 
 	// Drain both sides' push for the first message.
-	recvOr(t, collB.newMsg, "B updateNewMessage for original")
-	recvOr(t, collA.newMsg, "A updateNewMessage for original")
+	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage for original")
+	recvOrCtx(t, ctx, collA.newMsg, "A updateNewMessage for original")
 
 	// 2. A sends a reply.
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+	if err := exec(ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		req := &tg.MessagesSendMessageRequest{
 			Peer:     peerB,
 			Message:  "reply",
@@ -314,7 +314,7 @@ func TestReplyInHistory(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// 3. B calls getHistory and verifies the reply message has ReplyTo set.
-	if err := exec(bCmds, func(ctx context.Context, c *tg.Client) error {
+	if err := exec(ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peerA, Limit: 10})
 		if err != nil {
 			return err
@@ -424,20 +424,20 @@ func TestNoReplyToWhenZero(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	peerB := peerUser(aUserID, bUserID)
 	peerA := peerUser(bUserID, aUserID)
 
 	// 1. A sends a message with no reply_to — neither side should see ReplyTo.
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+	if err := exec(ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerB,
 			Message:  "no reply here",
@@ -449,19 +449,19 @@ func TestNoReplyToWhenZero(t *testing.T) {
 	}
 
 	// B receives via updateNewMessage.
-	got := recvOr(t, collB.newMsg, "B updateNewMessage")
+	got := recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
 	if replyTo, ok := got.GetReplyTo(); ok {
 		t.Fatalf("non-reply message has ReplyTo = %+v, want none", replyTo)
 	}
 
 	// A also receives their own copy.
-	aGot := recvOr(t, collA.newMsg, "A updateNewMessage")
+	aGot := recvOrCtx(t, ctx, collA.newMsg, "A updateNewMessage")
 	if replyTo, ok := aGot.GetReplyTo(); ok {
 		t.Fatalf("A's own non-reply message has ReplyTo = %+v, want none", replyTo)
 	}
 
 	// 2. Verify via getHistory as well.
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+	if err := exec(ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peerB, Limit: 10})
 		if err != nil {
 			return err
@@ -488,7 +488,7 @@ func TestNoReplyToWhenZero(t *testing.T) {
 		t.Fatalf("A getHistory: %v", err)
 	}
 
-	if err := exec(bCmds, func(ctx context.Context, c *tg.Client) error {
+	if err := exec(ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peerA, Limit: 10})
 		if err != nil {
 			return err
@@ -528,12 +528,12 @@ func TestNoReplyToWhenZero(t *testing.T) {
 // exec sends a command to the interactive client and waits for the result.
 // The server/bootstrap helpers and type helpers live in messaging_test.go,
 // as does the bootServerWithRegistry entrypoint for these e2e tests.
-func exec(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
+func exec(ctx context.Context, cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 	d := make(chan error, 1)
 	select {
 	case cmds <- command{fn: fn, done: d}:
-	case <-time.After(10 * time.Second):
-		panic("command enqueue timeout")
+	case <-ctx.Done():
+		panic("command enqueue timeout: " + ctx.Err().Error())
 	}
 	return <-d
 }

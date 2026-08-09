@@ -70,7 +70,7 @@ func TestPeerIdentityStrangerStart(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -80,7 +80,7 @@ func TestPeerIdentityStrangerStart(t *testing.T) {
 
 	// A resolves B's phone → gets B's user with server-issued access_hash.
 	var bUser *tg.User
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		rp, err := c.ContactsResolvePhone(ctx, phoneB)
 		if err != nil {
 			return err
@@ -97,7 +97,7 @@ func TestPeerIdentityStrangerStart(t *testing.T) {
 
 	// A sends message to B using only the peer from resolvePhone (no derived
 	// hash — the server's access_hash on bUser is used directly).
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     &tg.InputPeerUser{UserID: bUser.ID, AccessHash: bUser.AccessHash},
 			Message:  "stranger hello",
@@ -112,8 +112,8 @@ func TestPeerIdentityStrangerStart(t *testing.T) {
 		if m.Message != "stranger hello" {
 			t.Fatalf("B received %q, want %q", m.Message, "stranger hello")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("B timed out waiting for stranger message")
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for stranger message: %v", ctx.Err())
 	}
 
 	close(aCmds)
@@ -171,7 +171,7 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -180,7 +180,7 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 
 	// A creates channel, captures full *tg.Channel from response.
 	var ch *tg.Channel
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
 			Title:     "Placeholder",
 			About:     "",
@@ -203,7 +203,7 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 	})
 
 	// A calls getHistory with placeholder hash (access_hash == channel_id) → PEER_ID_INVALID.
-	assertPeerRPCError(t, aCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertPeerRPCError(t, ctx, aCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:  &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.ID},
 			Limit: 10,
@@ -214,7 +214,7 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 	t.Run("user", func(t *testing.T) {
 		// A resolves self via contacts.resolvePhone, then tries placeholder hash.
 		var aUser *tg.User
-		execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+		execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 			rp, err := c.ContactsResolvePhone(ctx, phoneA)
 			if err != nil {
 				return err
@@ -229,7 +229,7 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 			return nil
 		})
 		// A calls getHistory with placeholder hash (access_hash == user_id) → PEER_ID_INVALID.
-		assertPeerRPCError(t, aCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+		assertPeerRPCError(t, ctx, aCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 			_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 				Peer:  &tg.InputPeerUser{UserID: aUser.ID, AccessHash: aUser.ID},
 				Limit: 10,
@@ -292,7 +292,7 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -302,7 +302,7 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 
 	// A creates channel, captures full *tg.Channel (with A's access_hash).
 	var ch *tg.Channel
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
 			Title:     "ReplayChannel",
 			About:     "",
@@ -325,7 +325,7 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 	})
 
 	// C tries to use A's channel access_hash → PEER_ID_INVALID.
-	assertPeerRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertPeerRPCError(t, ctx, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:  &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.AccessHash},
 			Limit: 10,
@@ -336,7 +336,7 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 	t.Run("user", func(t *testing.T) {
 		// A resolves C by phone → gets C's peer scoped to A.
 		var cPeer *tg.User
-		execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+		execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 			rp, err := c.ContactsResolvePhone(ctx, phoneC)
 			if err != nil {
 				return err
@@ -351,7 +351,7 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 			return nil
 		})
 		// C tries to use A's hash for C → PEER_ID_INVALID.
-		assertPeerRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+		assertPeerRPCError(t, ctx, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 			_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 				Peer:  &tg.InputPeerUser{UserID: cPeer.ID, AccessHash: cPeer.AccessHash},
 				Limit: 10,
@@ -466,7 +466,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -477,7 +477,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 
 	// A creates channel, captures full server-issued *tg.Channel.
 	var chForA *tg.Channel
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
 			Title:     "Lifecycle",
 			About:     "",
@@ -502,7 +502,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 	// Helper: export invite using server-issued peer.
 	exportInvite := func(peer tg.InputPeerClass) string {
 		var hash string
-		execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+		execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 			res, err := c.MessagesExportChatInvite(ctx, &tg.MessagesExportChatInviteRequest{Peer: peer})
 			if err != nil {
 				return err
@@ -524,7 +524,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 
 	// B joins via invite, captures full server-issued *tg.Channel.
 	var chForB *tg.Channel
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesImportChatInvite(ctx, hashB)
 		if err != nil {
 			return err
@@ -550,7 +550,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 	inputB := &tg.InputChannel{ChannelID: chForB.ID, AccessHash: chForB.AccessHash}
 
 	// A posts a message.
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerA,
 			Message:  "channel msg",
@@ -565,12 +565,12 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 		if upd.Msg.Message != "channel msg" {
 			t.Fatalf("B channel msg = %q, want %q", upd.Msg.Message, "channel msg")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("B timed out waiting for channel message")
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for channel message: %v", ctx.Err())
 	}
 
 	// B calls getChannelDifference — peers in response are spendable.
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
 			Channel: inputB,
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
@@ -591,13 +591,13 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 	})
 
 	// B leaves channel.
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsLeaveChannel(ctx, inputB)
 		return err
 	})
 
 	// B can no longer read history — PEER_ID_INVALID after leave.
-	assertPeerRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertPeerRPCError(t, ctx, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:  peerB,
 			Limit: 10,
@@ -606,15 +606,15 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 	})
 
 	// A revokes hashB. C still joins with hashC (outstanding invite admitted).
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		return revokeInvite(ctx, c, peerA, hashB)
 	})
 
 	// C joins with hashC → succeeds.
-	importChannelInvite(t, cCmds, hashC)
+	importChannelInvite(t, ctx, cCmds, hashC)
 
 	// C tries to join with revoked hashB → PEER_ID_INVALID.
-	assertPeerRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertPeerRPCError(t, ctx, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesImportChatInvite(ctx, hashB)
 		return err
 	})
@@ -807,7 +807,7 @@ func TestPeerIdentityRoundTrip(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -817,7 +817,7 @@ func TestPeerIdentityRoundTrip(t *testing.T) {
 
 	// A resolves B → gets B's peer with server-issued access_hash.
 	var bPeer *tg.InputPeerUser
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		rp, err := c.ContactsResolvePhone(ctx, phoneB)
 		if err != nil {
 			return err
@@ -835,7 +835,7 @@ func TestPeerIdentityRoundTrip(t *testing.T) {
 
 	// 1. Send.
 	var msgID int
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer: bPeer, Message: "round trip", RandomID: 9005001,
 		})
@@ -860,13 +860,13 @@ func TestPeerIdentityRoundTrip(t *testing.T) {
 	// the message (the FromID on a Message is int64, but the full User with
 	// access_hash comes from the Users vector in the update).
 	var aPeer *tg.InputPeerUser
-	recvMsg := recvOr(t, collB.newMsg, "B updateNewMessage")
+	recvMsg := recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
 	// The message.FromID is the sender; we need the access_hash from the
 	// server-issued user. The message itself carries FromID (int64), but the
 	// full user with access_hash is in the update's Users vector. Since
 	// updateCollector only captures the Message, we resolve A via resolvePhone
 	// on B's side — still server-issued, no local derivation.
-	execChat(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		rp, err := c.ContactsResolvePhone(ctx, phoneA)
 		if err != nil {
 			return err
@@ -884,39 +884,39 @@ func TestPeerIdentityRoundTrip(t *testing.T) {
 	_ = recvMsg // message received, peer obtained from server
 
 	// 2. Edit.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
 			Peer: bPeer, ID: msgID, Message: "edited",
 		})
 		return err
 	})
-	recvOr(t, collB.editMsg, "B updateEditMessage")
+	recvOrCtx(t, ctx, collB.editMsg, "B updateEditMessage")
 
 	// 3. Read (B marks read → A gets read receipt).
-	execChat(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{
 			Peer: aPeer, MaxID: msgID,
 		})
 		return err
 	})
-	recvOr(t, collA.readOutbox, "A updateReadHistoryOutbox")
+	recvOrCtx(t, ctx, collA.readOutbox, "A updateReadHistoryOutbox")
 
 	// 4. Typing (B types → A gets typing notification).
-	execChat(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{
 			Peer:   aPeer,
 			Action: &tg.SendMessageTypingAction{},
 		})
 		return err
 	})
-	recvOr(t, collA.typing, "A updateUserTyping")
+	recvOrCtx(t, ctx, collA.typing, "A updateUserTyping")
 
 	// 5. Delete.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{msgID}})
 		return err
 	})
-	recvOr(t, collB.delMsg, "B updateDeleteMessages")
+	recvOrCtx(t, ctx, collB.delMsg, "B updateDeleteMessages")
 
 	close(aCmds)
 	close(bCmds)
@@ -930,13 +930,13 @@ func TestPeerIdentityRoundTrip(t *testing.T) {
 // assertPeerRPCError calls fn on cmds and asserts the result is a tgerr with the
 // given message. Unlike execChat, it does not fail on error — the error is
 // expected and inspected.
-func assertPeerRPCError(t *testing.T, cmds chan command, want string, fn func(ctx context.Context, c *tg.Client) error) {
+func assertPeerRPCError(t *testing.T, ctx context.Context, cmds chan command, want string, fn func(ctx context.Context, c *tg.Client) error) {
 	t.Helper()
 	done := make(chan error, 1)
 	select {
 	case cmds <- command{fn: fn, done: done}:
-	case <-time.After(10 * time.Second):
-		t.Fatal("command enqueue timeout")
+	case <-ctx.Done():
+		t.Fatalf("command enqueue timeout: %v", ctx.Err())
 	}
 	err := <-done
 	if err == nil {

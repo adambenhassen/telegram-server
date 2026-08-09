@@ -44,13 +44,13 @@ func flowFor(phone string, codes *multiCodeSink) auth.Flow {
 	)
 }
 
-func execChat(t *testing.T, cmds chan command, fn func(ctx context.Context, c *tg.Client) error) {
+func execChat(t *testing.T, ctx context.Context, cmds chan command, fn func(ctx context.Context, c *tg.Client) error) {
 	t.Helper()
 	d := make(chan error, 1)
 	select {
 	case cmds <- command{fn: fn, done: d}:
-	case <-time.After(10 * time.Second):
-		t.Fatal("command enqueue timeout")
+	case <-ctx.Done():
+		t.Fatalf("command enqueue timeout: %v", ctx.Err())
 	}
 	if err := <-d; err != nil {
 		t.Fatalf("exec: %v", err)
@@ -168,7 +168,7 @@ func TestChatsRealtime(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -177,7 +177,7 @@ func TestChatsRealtime(t *testing.T) {
 
 	// 1. A creates chat with B and C, title "Team".
 	var chatID int64
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		inv, err := c.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
 			Title: "Team",
 			Users: []tg.InputUserClass{
@@ -231,7 +231,7 @@ func TestChatsRealtime(t *testing.T) {
 	waitSvc(collC, "C")
 
 	// 3. B sends message to chat; A and C receive it.
-	execChat(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     &tg.InputPeerChat{ChatID: chatID},
 			Message:  "hello from B",
@@ -261,8 +261,8 @@ func TestChatsRealtime(t *testing.T) {
 				t.Fatalf("%s fromID = %d, want %d", who, from.UserID, wantFrom)
 			}
 			return m
-		case <-time.After(10 * time.Second):
-			t.Fatalf("%s timed out waiting for message", who)
+		case <-ctx.Done():
+			t.Fatalf("%s timed out waiting for message: %v", who, ctx.Err())
 			return nil
 		}
 	}
@@ -272,7 +272,7 @@ func TestChatsRealtime(t *testing.T) {
 	recvMsg(collB, "B", "hello from B", bUserID)
 
 	// 4. A edits title to "Team 2"; B and C receive editTitle.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesEditChatTitle(ctx, &tg.MessagesEditChatTitleRequest{
 			ChatID: chatID, Title: "Team 2",
 		})
@@ -298,7 +298,7 @@ func TestChatsRealtime(t *testing.T) {
 	waitEditTitle(collC, "C")
 
 	// 5. A adds D; D receives add service message.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesAddChatUser(ctx, &tg.MessagesAddChatUserRequest{
 			ChatID:   chatID,
 			UserID:   inputUser(aUserID, dUserID),
@@ -325,7 +325,7 @@ func TestChatsRealtime(t *testing.T) {
 	waitAddUser(collD, "D")
 
 	// D sees chat in getDialogs.
-	execChat(t, dCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, dCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
 			OffsetDate: 0, OffsetID: 0, OffsetPeer: &tg.InputPeerEmpty{}, Limit: 100,
 		})
@@ -352,7 +352,7 @@ func TestChatsRealtime(t *testing.T) {
 	})
 
 	// 6. A removes C; C receives delete service message.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesDeleteChatUser(ctx, &tg.MessagesDeleteChatUserRequest{
 			ChatID: chatID, UserID: inputUser(aUserID, cUserID),
 		})
@@ -377,7 +377,7 @@ func TestChatsRealtime(t *testing.T) {
 	waitDeleteUser(collC, "C")
 
 	// 7. A sends one more message; B and D receive it, C does not.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     &tg.InputPeerChat{ChatID: chatID},
 			Message:  "after C left",
@@ -454,7 +454,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -464,7 +464,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	// A and C create a chat (A invites C).
 	var chatID int64
 	var cMsgID int
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		inv, err := c.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
 			Title: "Two",
 			Users: []tg.InputUserClass{
@@ -487,7 +487,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	})
 
 	// C sends a message to the chat.
-	execChat(t, cCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     &tg.InputPeerChat{ChatID: chatID},
 			Message:  "C message",
@@ -511,7 +511,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	})
 
 	// A removes C.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesDeleteChatUser(ctx, &tg.MessagesDeleteChatUserRequest{
 			ChatID: chatID, UserID: inputUser(aUserID, cUserID),
 		})
@@ -527,7 +527,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 
 	// F1: C tries editMessage → MESSAGE_ID_INVALID; A does not receive edit.
 	var editErr error
-	execChat(t, cCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
 			Peer: &tg.InputPeerChat{ChatID: chatID}, ID: cMsgID, Message: "C edited",
 		})
@@ -556,7 +556,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 
 	// F1: C tries deleteMessages → MESSAGE_ID_INVALID.
 	var delErr error
-	execChat(t, cCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{cMsgID}})
 		delErr = err
 		return nil
@@ -609,11 +609,11 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 		}
 		return errors.New("chat not in dialogs")
 	}
-	execChat(t, cCmds, checkForbidden)
+	execChat(t, ctx, cCmds, checkForbidden)
 
 	// F6: A renames the chat after the removal. C must not track it — no
 	// chatEditTitle service message reaches C, and the dialog stays forbidden.
-	execChat(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesEditChatTitle(ctx, &tg.MessagesEditChatTitleRequest{
 			ChatID: chatID, Title: "Two renamed",
 		})
@@ -624,11 +624,11 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 		t.Errorf("C should not receive title change after removal: %v", err)
 	}
 	noTitleCancel()
-	execChat(t, cCmds, checkForbidden)
+	execChat(t, ctx, cCmds, checkForbidden)
 
 	// F3: C's sendMessage → PEER_ID_INVALID.
 	var sendErr error
-	execChat(t, cCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     &tg.InputPeerChat{ChatID: chatID},
 			Message:  "C after removal",
@@ -650,7 +650,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 
 	// F3: C's getHistory → PEER_ID_INVALID.
 	var histErr error
-	execChat(t, cCmds, func(ctx context.Context, c *tg.Client) error {
+	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer: &tg.InputPeerChat{ChatID: chatID}, Limit: 10,
 		})
@@ -898,8 +898,8 @@ func TestChatsCrossReplica(t *testing.T) {
 	var bUserID int64
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	// A connects to server 1, logs in, creates chat with B.
@@ -953,8 +953,8 @@ func TestChatsCrossReplica(t *testing.T) {
 		if m.Message != "cross replica msg" {
 			t.Fatalf("B received %q, want %q", m.Message, "cross replica msg")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("B timed out waiting for cross-replica message")
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for cross-replica message: %v", ctx.Err())
 	}
 
 	close(bCmds)
