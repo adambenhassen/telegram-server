@@ -261,6 +261,18 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 // connection independent of the Store's query layer.
 func StorePool(s *Store) *pgxpool.Pool { return s.pool }
 
+// UploadPartDate returns one upload part's stored date — the column the TTL
+// sweep compares against. Tests read it back because "the re-save did not move
+// the expiry clock" is a statement about this column, and a wall-clock
+// measurement in the test process cannot distinguish it from a fast run.
+func UploadPartDate(ctx context.Context, s *Store, userID, fileID int64, partIndex int32) (time.Time, error) {
+	var at time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT date FROM upload_parts WHERE user_id = $1 AND file_id = $2 AND part_index = $3`,
+		userID, fileID, partIndex).Scan(&at)
+	return at, err
+}
+
 // CountRateLimits returns the number of rate limit rows for a given subject,
 // for tests that need to assert the rate_limits table state.
 func CountRateLimits(ctx context.Context, s *Store, subjectID int64) (int, error) {

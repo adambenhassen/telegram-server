@@ -160,12 +160,34 @@ func (s *Store) DeleteUploadParts(ctx context.Context, userID, fileID int64) (in
 	return n, nil
 }
 
-// DeleteExpiredUploadParts drops parts older than cutoff, returning the row
-// count. This is the only delete in M5 that removes stored bytes, and it can
-// only ever remove parts no message references: a part row is deleted at
-// assembly, so anything left is an upload that was never sent.
-func (s *Store) DeleteExpiredUploadParts(ctx context.Context, cutoff time.Time) (int64, error) {
-	n, err := s.q.DeleteExpiredUploadParts(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
+// ExpiredPartSweepBatch is how many expired parts one sweep pass removes. It
+// bounds the statement, not the retention: the caller repeats a full pass until
+// one comes back short, so a backlog still drains within a tick, in
+// transactions whose lock and WAL footprint do not grow with it.
+const ExpiredPartSweepBatch = 1000
+
+// DeleteExpiredUploadParts drops up to batch parts stored before cutoff, oldest
+// first, returning the row count. A pass returning batch means there is more to
+// take: the caller repeats until a pass comes back short.
+//
+// cutoff is compared against when a part was first stored, not when it was last
+// written — re-saving a part does not extend its life, or an account could hold
+// an outstanding set forever by touching it.
+//
+// This is the only delete in M5 that removes stored bytes, and it can only ever
+// remove parts no message references: a part row is deleted at assembly, so
+// anything left is an upload that was never sent.
+func (s *Store) DeleteExpiredUploadParts(ctx context.Context, cutoff time.Time, batch int) (int64, error) {
+	// Refused rather than read as "no bound": the unbounded DELETE is exactly
+	// what this parameter exists to prevent, and a caller that computed a zero
+	// batch has a bug that must not silently restore it.
+	if batch <= 0 || batch > math.MaxInt32 {
+		return 0, fmt.Errorf("delete expired upload parts: batch %d out of range", batch)
+	}
+	n, err := s.q.DeleteExpiredUploadParts(ctx, db.DeleteExpiredUploadPartsParams{
+		Date: pgtype.Timestamptz{Time: cutoff, Valid: true},
+		Lim:  int32(batch),
+	})
 	if err != nil {
 		return 0, fmt.Errorf("delete expired upload parts: %w", err)
 	}

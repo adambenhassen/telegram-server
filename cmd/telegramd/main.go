@@ -212,12 +212,37 @@ func sweepExpiredUploadParts(ctx context.Context, st *store.Store, ttl time.Dura
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			n, err := st.DeleteExpiredUploadParts(ctx, time.Now().Add(-ttl))
+			n, err := drainExpiredUploadParts(ctx, st, ttl)
 			if err != nil {
-				log.Error("sweep expired upload parts", "err", err)
+				log.Error("sweep expired upload parts", "deleted", n, "err", err)
 				continue
 			}
 			log.Info("swept expired upload parts", "deleted", n)
+		}
+	}
+}
+
+// drainExpiredUploadParts runs bounded sweep passes until one comes back short,
+// which is what makes the batch a bound on each statement rather than on how
+// much a tick can retire: a backlog left by a long outage still clears in one
+// tick, in transactions whose lock and WAL footprint stay the size of a batch.
+//
+// The cutoff is recomputed per pass so a long drain keeps taking rows as they
+// expire under it, and the count returned covers the passes that succeeded, so
+// a failure mid-drain still reports what was retired.
+func drainExpiredUploadParts(ctx context.Context, st *store.Store, ttl time.Duration) (int64, error) {
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, nil //nolint:nilerr // shutdown, not a sweep failure
+		}
+		n, err := st.DeleteExpiredUploadParts(ctx, time.Now().Add(-ttl), store.ExpiredPartSweepBatch)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n < store.ExpiredPartSweepBatch {
+			return total, nil
 		}
 	}
 }

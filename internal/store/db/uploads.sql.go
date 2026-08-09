@@ -12,11 +12,35 @@ import (
 )
 
 const deleteExpiredUploadParts = `-- name: DeleteExpiredUploadParts :execrows
-DELETE FROM upload_parts WHERE date < $1
+DELETE FROM upload_parts p
+USING (
+    SELECT old.user_id, old.file_id, old.part_index FROM upload_parts old
+    WHERE old.date < $1
+    ORDER BY old.date
+    LIMIT $2::int
+    FOR UPDATE SKIP LOCKED
+) expired
+WHERE p.user_id = expired.user_id
+  AND p.file_id = expired.file_id
+  AND p.part_index = expired.part_index
 `
 
-func (q *Queries) DeleteExpiredUploadParts(ctx context.Context, date pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteExpiredUploadParts, date)
+type DeleteExpiredUploadPartsParams struct {
+	Date pgtype.Timestamptz
+	Lim  int32
+}
+
+// DeleteExpiredUploadParts removes at most one batch of expired parts, oldest
+// first. The bound is the point: unbounded, this is one DELETE over every
+// account's expired rows, holding row locks and writing WAL in proportion to
+// whatever accumulated while the sweep was down. The caller repeats it until a
+// pass comes back short.
+//
+// SKIP LOCKED because every replica runs this sweep: a batch another replica
+// already holds is its work, and blocking on it would serialise the sweeps into
+// one and re-create the long transaction the bound removes.
+func (q *Queries) DeleteExpiredUploadParts(ctx context.Context, arg DeleteExpiredUploadPartsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredUploadParts, arg.Date, arg.Lim)
 	if err != nil {
 		return 0, err
 	}
@@ -107,7 +131,7 @@ const upsertUploadPart = `-- name: UpsertUploadPart :exec
 INSERT INTO upload_parts (user_id, file_id, part_index, payload)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (user_id, file_id, part_index)
-DO UPDATE SET payload = excluded.payload, date = now()
+DO UPDATE SET payload = excluded.payload
 `
 
 type UpsertUploadPartParams struct {
@@ -120,6 +144,11 @@ type UpsertUploadPartParams struct {
 // UpsertUploadPart writes one part of an in-flight upload. Re-saving the same
 // part is legal — a client retries a failed part — so this is an upsert, and
 // the caller re-reads the sums afterwards rather than tracking a delta.
+//
+// date is deliberately NOT refreshed on conflict: it is what the TTL sweep
+// measures from, so a re-save that moved it would let an account hold an
+// outstanding set alive forever by touching each part every TTL/2. The payload
+// still wins, so a retry's bytes are the ones assembled.
 func (q *Queries) UpsertUploadPart(ctx context.Context, arg UpsertUploadPartParams) error {
 	_, err := q.db.Exec(ctx, upsertUploadPart,
 		arg.UserID,

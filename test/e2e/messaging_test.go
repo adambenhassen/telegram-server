@@ -215,13 +215,24 @@ func bootServerWithDelivery(t *testing.T, ctx context.Context, key *rsa.PrivateK
 // session registry, for tests that assert which sockets a replica still holds.
 func bootServerWithRegistry(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, dsn string, log *slog.Logger, ln net.Listener) (*mtproto.SessionRegistry, func()) {
 	t.Helper()
+	return bootServerWithLimits(t, ctx, key, dcID, st, dsn, log, ln, config.RateLimitsConfig{})
+}
+
+// bootServerWithLimits is bootServerWithRegistry against a chosen rate-limit
+// configuration, for the tests whose subject is what the shipped numbers do to
+// an ordinary client.
+func bootServerWithLimits(
+	t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store,
+	dsn string, log *slog.Logger, ln net.Listener, rateLimits config.RateLimitsConfig,
+) (*mtproto.SessionRegistry, func()) {
+	t.Helper()
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	// Sign-in here reads the code off the log, so the gated line must be on.
 	blobs, err := blob.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
 	}
-	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{})
+	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdater(st, server.Registry(), log, pgtest.PeerDeriver())

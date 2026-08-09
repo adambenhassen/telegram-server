@@ -380,7 +380,7 @@ func TestDeleteExpiredUploadParts(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	n, err := s.DeleteExpiredUploadParts(ctx, time.Now().Add(-time.Hour))
+	n, err := s.DeleteExpiredUploadParts(ctx, time.Now().Add(-time.Hour), sweepBatch)
 	if err != nil {
 		t.Fatalf("sweep past cutoff: %v", err)
 	}
@@ -388,7 +388,7 @@ func TestDeleteExpiredUploadParts(t *testing.T) {
 		t.Fatalf("past cutoff deleted %d rows", n)
 	}
 
-	n, err = s.DeleteExpiredUploadParts(ctx, time.Now().Add(time.Hour))
+	n, err = s.DeleteExpiredUploadParts(ctx, time.Now().Add(time.Hour), sweepBatch)
 	if err != nil {
 		t.Fatalf("sweep future cutoff: %v", err)
 	}
@@ -397,6 +397,127 @@ func TestDeleteExpiredUploadParts(t *testing.T) {
 	}
 	if parts, _, _, err := s.UploadPartsSummary(ctx, u.ID, 1); err != nil || parts != 0 {
 		t.Fatalf("after sweep: parts=%d err=%v", parts, err)
+	}
+}
+
+// sweepBatch is a bound wide enough that the tests not about batching drain in
+// one pass.
+const sweepBatch = 1000
+
+// TestUploadPartExpiresFromFirstStore is the retention invariant: expiry is
+// measured from when a part was first stored, so a client re-saving the same
+// part cannot hold an outstanding set past its TTL by touching it forever.
+//
+// The assertion is on the row's own stored date rather than on a wall clock:
+// the sweep compares against that column, and reading it back is the only way
+// to tell "the re-save did not move it" from "the test was fast enough".
+func TestUploadPartExpiresFromFirstStore(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000030")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	if err := s.SaveUploadPart(ctx, u.ID, 1, 0, part('a', 100), maxFile); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	stored, err := store.UploadPartDate(ctx, s, u.ID, 1, 0)
+	if err != nil {
+		t.Fatalf("read date: %v", err)
+	}
+
+	// The retry a real client makes: same part, new bytes, later.
+	if err := s.SaveUploadPart(ctx, u.ID, 1, 0, part('b', 100), maxFile); err != nil {
+		t.Fatalf("re-save: %v", err)
+	}
+	resaved, err := store.UploadPartDate(ctx, s, u.ID, 1, 0)
+	if err != nil {
+		t.Fatalf("read date after re-save: %v", err)
+	}
+	if !resaved.Equal(stored) {
+		t.Fatalf("re-save moved the expiry clock: %s -> %s", stored, resaved)
+	}
+	// The re-save still wins on content — dedupe semantics are unchanged.
+	got, ok, err := s.UploadPart(ctx, u.ID, 1, 0)
+	if err != nil || !ok {
+		t.Fatalf("read part: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(got, part('b', 100)) {
+		t.Fatalf("re-saved payload not stored")
+	}
+
+	// A sweep at first-store time + TTL takes it, however recent the re-save.
+	n, err := s.DeleteExpiredUploadParts(ctx, stored.Add(time.Millisecond), sweepBatch)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("sweep deleted %d rows, want 1", n)
+	}
+}
+
+// TestDeleteExpiredUploadPartsBounded pins the batch bound: one pass removes at
+// most the bound, and repeated passes drain the rest. Unbounded, the sweep is
+// one DELETE across every account's expired rows, which is the statement that
+// holds locks and WAL proportional to whatever accumulated.
+func TestDeleteExpiredUploadPartsBounded(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000031")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	const rows = 5
+	for i := range rows {
+		if err := s.SaveUploadPart(ctx, u.ID, 1, i, part('a', 100), maxFile); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+	}
+
+	cutoff := time.Now().Add(time.Hour)
+	const batch = 2
+	deleted := int64(0)
+	for pass := 1; ; pass++ {
+		n, err := s.DeleteExpiredUploadParts(ctx, cutoff, batch)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if n > batch {
+			t.Fatalf("pass %d deleted %d rows, over the bound of %d", pass, n, batch)
+		}
+		deleted += n
+		if n == 0 {
+			break
+		}
+		if pass > rows {
+			t.Fatalf("sweep did not drain after %d passes", pass)
+		}
+	}
+	if deleted != rows {
+		t.Fatalf("drained %d rows, want %d", deleted, rows)
+	}
+	if parts, _, _, err := s.UploadPartsSummary(ctx, u.ID, 1); err != nil || parts != 0 {
+		t.Fatalf("after drain: parts=%d err=%v", parts, err)
+	}
+}
+
+// TestDeleteExpiredUploadPartsRejectsUnboundedBatch pins the guard on the bound
+// itself: a non-positive batch is a caller bug, and reading it as "no limit"
+// would silently restore the unbounded DELETE this bound exists to prevent.
+func TestDeleteExpiredUploadPartsRejectsUnboundedBatch(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	if _, err := s.DeleteExpiredUploadParts(ctx, time.Now(), 0); err == nil {
+		t.Fatal("batch 0: expected an error")
+	}
+	if _, err := s.DeleteExpiredUploadParts(ctx, time.Now(), -1); err == nil {
+		t.Fatal("batch -1: expected an error")
 	}
 }
 

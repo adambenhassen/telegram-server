@@ -11,6 +11,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -30,9 +31,15 @@ type mediaClient struct {
 }
 
 // bootMediaEnv boots a server with delivery and logs in one client per phone.
-// The blob directory comes from bootServerWithDelivery, which already gives
-// each booted server its own t.TempDir(), so nothing here reads the
-// environment and t.Parallel() stays usable.
+// The blob directory comes from the boot helper, which already gives each
+// booted server its own t.TempDir(), so nothing here reads the environment and
+// t.Parallel() stays usable.
+//
+// Unlike the other e2e environments this one runs under the shipped rate-limit
+// defaults rather than with limits off. The upload surface is paced per part,
+// and a per-part limit is the one that a legitimate multi-part upload can trip:
+// the number that bounds an abusive client has to be proven not to stop an
+// ordinary one, and only a real client uploading real parts proves it.
 func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaClient {
 	t.Helper()
 
@@ -55,7 +62,8 @@ func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaC
 	codes := newMultiCodeSink()
 	ln := mustListen(t, ctx, "127.0.0.1:0")
 	port := tcpPort(t, ln)
-	t.Cleanup(bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln))
+	_, stop := bootServerWithLimits(t, ctx, key, dcID, st, dsn, codes.Logger(), ln, config.DefaultRateLimits())
+	t.Cleanup(stop)
 
 	clients := make([]*mediaClient, 0, len(phones))
 	t.Cleanup(func() {
@@ -270,7 +278,9 @@ func fileNameOf(doc *tg.Document) string {
 }
 
 // TestMediaRoundTrip is the M5 gate: A uploads a multi-part payload, sends it to
-// B, and B downloads bytes identical to what A uploaded.
+// B, and B downloads bytes identical to what A uploaded — under the shipped
+// rate-limit defaults, which is what makes it also the proof that the
+// saveFilePart limit paces an abusive client without stopping a real one.
 func TestMediaRoundTrip(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
