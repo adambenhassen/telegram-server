@@ -26,8 +26,24 @@ migrate:
 # -race is not optional here: the hard parts of this server are ordering
 # (Conn.Push/writeMu, per-owner pts, store lock ordering), and a plain run
 # passes a build that corrupts state under concurrent load.
+#
+# e2e runs in its own invocation with -count=1, and the packages below exclude
+# it so it is not run twice. Go caches a test result keyed on the package's
+# sources and recorded inputs, so a commit that changed only another package
+# replays e2e's earlier result — the run then reports success for an
+# end-to-end path that never started on that commit. That is exactly the layer
+# where wiring and environment breakage shows up, so it is re-run every time;
+# every other package keeps its cache.
+#
+# -timeout 15m: Go's default 10m killed a healthy run at 602s under CPU
+# contention (observed runtime ~300s). 15m gives 3x headroom while staying
+# inside CI's timeout-minutes: 20 so Go's goroutine dump fires before GitHub
+# cancels the job.
+E2E_PKG := github.com/adambenhassen/telegram-server/test/e2e
+
 test: docker-bridge
-	$(TESTENV) go test -race ./...
+	$(TESTENV) go test -race $$(go list ./... | grep -v '^$(E2E_PKG)$$')
+	$(TESTENV) go test -race -count=1 -timeout 15m $(E2E_PKG)
 
 # The store suite alone, for a quick check while working in internal/store.
 # Deliberately not ./test/... — e2e wants the whole machine to itself and is

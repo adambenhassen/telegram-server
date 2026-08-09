@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,6 +19,13 @@ type RateLimitConfig struct {
 	Limit int
 	// Window is the duration of the fixed window.
 	Window time.Duration
+}
+
+// enabled reports whether this config enforces anything. One definition, so the
+// surfaces that check a limit and the ones that skip a disabled one cannot
+// drift apart on what "disabled" means.
+func (c RateLimitConfig) enabled() bool {
+	return c.Limit > 0 && c.Window > 0
 }
 
 // RateLimitResult is returned by CheckRateLimit when the request is denied.
@@ -39,7 +45,7 @@ type RateLimitResult struct {
 // Exactness under concurrency comes from the row-level lock taken by the
 // INSERT ... ON CONFLICT query — different subjects never block each other.
 func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface string, cfg RateLimitConfig) (*RateLimitResult, error) {
-	if cfg.Limit <= 0 || cfg.Window <= 0 {
+	if !cfg.enabled() {
 		// Disabled: allow everything.
 		return nil, nil //nolint:nilnil // disabled config is not an error
 	}
@@ -80,15 +86,7 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 		return nil, fmt.Errorf("get rate limit: %w", err)
 	}
 
-	// Compute wait from Postgres timestamp. time.Until reads the Go clock;
-	// the error is bounded to the app/DB clock offset, which is negligible
-	// on a single host.
-	wait := time.Until(expiresAt.Time)
-	// Round up to whole seconds and enforce minimum of 1.
-	waitSecs := int(math.Ceil(float64(wait) / float64(time.Second)))
-	waitSecs = max(waitSecs, 1)
-
-	return &RateLimitResult{Wait: time.Duration(waitSecs) * time.Second}, nil
+	return &RateLimitResult{Wait: waitUntil(expiresAt.Time)}, nil
 }
 
 // SweepExpiredRateLimits deletes rate-limit rows whose per-row expiry deadline

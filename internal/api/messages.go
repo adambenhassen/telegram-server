@@ -1219,6 +1219,16 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	if peerType == store.PeerTypeChannel {
 		return nil, errPeerIDInvalid
 	}
+	// Rate limit before any lookup: the membership probe below is a database
+	// query, so charging after it would leave a non-member's chat-peer probe
+	// uncharged and unbounded. Charging here also keeps the quota uniform —
+	// neither membership nor what the query matches changes what the caller is
+	// charged, so the quota cannot be read as an oracle. Everything above is
+	// pure input validation with no database access.
+	if err := h.checkRateLimit(r, "messages_search", h.rateLimitSearchMessages); err != nil {
+		return nil, err
+	}
+
 	// Chat peers require membership.
 	if peerType == store.PeerTypeChat {
 		if err = h.requireMember(r.Ctx, peerID, r.UserID); err != nil {

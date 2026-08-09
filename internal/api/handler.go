@@ -55,6 +55,16 @@ type handlers struct {
 	rateLimitCreateChat store.RateLimitConfig
 	// rateLimitAddChatUser limits messages.addChatUser per account.
 	rateLimitAddChatUser store.RateLimitConfig
+	// rateLimitCreateChannel limits channels.createChannel per account.
+	rateLimitCreateChannel store.RateLimitConfig
+	// rateLimitSearchMessages limits messages.search per account.
+	rateLimitSearchMessages store.RateLimitConfig
+	// rateLimitSearchContacts limits contacts.search per account.
+	rateLimitSearchContacts store.RateLimitConfig
+	// rateLimitSendCodeIP limits auth.sendCode per client network. It is the
+	// one limit here that is not keyed on an account: sendCode is
+	// unauthenticated, so the connection's address is the only subject there is.
+	rateLimitSendCodeIP store.SendCodeIPLimits
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -105,20 +115,24 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		panic("api: nil peer hash deriver")
 	}
 	h := &handlers{
-		peers:                peers,
-		store:                s,
-		cfg:                  cfg,
-		dcID:                 dcID,
-		log:                  log,
-		srp:                  srp.NewChallengeStore(srp.DefaultTTL),
-		logLoginCodes:        logLoginCodes,
-		maxFileBytes:         maxFileBytes,
-		blobs:                blobs,
-		maxUserStorageBytes:  maxUserStorageBytes,
-		downloads:            map[int64]bool{},
-		rateLimitMessageSend: rateLimits.MessageSend,
-		rateLimitCreateChat:  rateLimits.CreateChat,
-		rateLimitAddChatUser: rateLimits.AddChatUser,
+		peers:                   peers,
+		store:                   s,
+		cfg:                     cfg,
+		dcID:                    dcID,
+		log:                     log,
+		srp:                     srp.NewChallengeStore(srp.DefaultTTL),
+		logLoginCodes:           logLoginCodes,
+		maxFileBytes:            maxFileBytes,
+		blobs:                   blobs,
+		maxUserStorageBytes:     maxUserStorageBytes,
+		downloads:               map[int64]bool{},
+		rateLimitMessageSend:    rateLimits.MessageSend,
+		rateLimitCreateChat:     rateLimits.CreateChat,
+		rateLimitAddChatUser:    rateLimits.AddChatUser,
+		rateLimitCreateChannel:  rateLimits.CreateChannel,
+		rateLimitSearchMessages: rateLimits.SearchMessages,
+		rateLimitSearchContacts: rateLimits.SearchContacts,
+		rateLimitSendCodeIP:     rateLimits.SendCodeIP,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
