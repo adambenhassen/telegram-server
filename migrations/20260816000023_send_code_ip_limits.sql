@@ -11,9 +11,16 @@
 -- may grow a row per call.
 
 -- send_code_ip_calls is a fixed-window counter, one row per key regardless of
--- how many calls land in the window. Same shape as rate_limits: token_count is
--- reset and bumped by an upsert, and expires_at (window_start + window) lets
--- the sweep delete fully-expired rows without knowing the window duration.
+-- how many calls land in the window. token_count is reset and bumped by an
+-- upsert.
+--
+-- expires_at is the window: it is written when the window opens and is the only
+-- thing that says when it closes, for the upsert and for the sweep alike.
+-- Neither recomputes the boundary from window_start plus the configured
+-- duration, because the configured duration can change while a row is live and
+-- the two readers would then disagree about the same row. window_start is kept
+-- for diagnosis — with expires_at it shows the duration a live window opened
+-- under, which is what a config change makes differ from the current setting.
 CREATE TABLE send_code_ip_calls (
     ip_key       CIDR         NOT NULL PRIMARY KEY,
     token_count  INT          NOT NULL,

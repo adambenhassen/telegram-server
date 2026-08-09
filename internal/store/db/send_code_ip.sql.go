@@ -141,18 +141,18 @@ INSERT INTO send_code_ip_calls (ip_key, token_count, window_start, expires_at)
 VALUES ($1, 1, now(), now() + $2::INTERVAL)
 ON CONFLICT (ip_key) DO UPDATE SET
     token_count = CASE
-        WHEN now() - send_code_ip_calls.window_start >= $2::INTERVAL THEN 1
+        WHEN send_code_ip_calls.expires_at <= now() THEN 1
         ELSE send_code_ip_calls.token_count + 1
     END,
     window_start = CASE
-        WHEN now() - send_code_ip_calls.window_start >= $2::INTERVAL THEN now()
+        WHEN send_code_ip_calls.expires_at <= now() THEN now()
         ELSE send_code_ip_calls.window_start
     END,
     expires_at = CASE
-        WHEN now() - send_code_ip_calls.window_start >= $2::INTERVAL THEN now() + $2::INTERVAL
+        WHEN send_code_ip_calls.expires_at <= now() THEN now() + $2::INTERVAL
         ELSE send_code_ip_calls.expires_at
     END
-WHERE now() - send_code_ip_calls.window_start >= $2::INTERVAL
+WHERE send_code_ip_calls.expires_at <= now()
    OR send_code_ip_calls.token_count < $3
 RETURNING token_count, expires_at
 `
@@ -171,9 +171,18 @@ type TryConsumeSendCodeIPCallRow struct {
 // Attempt to consume one sendCode token for an IP key.
 //
 // INSERT seeds a new counter; ON CONFLICT fires the DO UPDATE:
-//   - Window expired: reset count=1, window_start=now, expires_at=now+window.
-//   - Window active, under limit: bump count.
-//   - Window active, at limit: the WHERE clause prevents the UPDATE entirely.
+//   - Window closed: reset count=1, window_start=now, expires_at=now+window.
+//   - Window open, under limit: bump count.
+//   - Window open, at limit: the WHERE clause prevents the UPDATE entirely.
+//
+// Whether the window is closed is read from expires_at, the deadline stored
+// when the window opened, and never recomputed as window_start + the current
+// config. That is the one boundary the sweep can also see, and the two must
+// agree: derive it from the live config instead and changing the config splits
+// them, so the sweep collects a row the limiter is still counting against and
+// the key silently gets a fresh budget. The consequence is deliberate — a
+// config change takes effect at the next window rather than mid-flight, in
+// either direction, and never grants a key more than the window it opened with.
 //
 // Returns one row when the call is allowed, and pgx.ErrNoRows when it is not.
 // One row per key per window, never one per call: this is an unauthenticated

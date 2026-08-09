@@ -184,6 +184,75 @@ func TestSendCodeIPDeniedCallConsumesNothing(t *testing.T) {
 	}
 }
 
+// TestSendCodeIPCallWindowRunsToItsRecordedDeadline pins which boundary decides
+// a window: the deadline stored on the row when it opened, not window_start plus
+// whatever the config says today.
+//
+// They are only the same while the config never changes. Deriving the boundary
+// from the live config lets a shortened window reset a counter whose stored
+// deadline is still hours away — a row the sweep would not touch, so the
+// limiter and the sweep would be reading one row as two different windows.
+func TestSendCodeIPCallWindowRunsToItsRecordedDeadline(t *testing.T) {
+	t.Parallel()
+	s := openSendCodeStore(t)
+	addr := netip.MustParseAddr("203.0.113.60")
+	opened := store.SendCodeIPLimits{Calls: store.RateLimitConfig{Limit: 1, Window: time.Hour}}
+	shortened := store.SendCodeIPLimits{Calls: store.RateLimitConfig{Limit: 1, Window: 50 * time.Millisecond}}
+
+	if res := charge(t, s, addr, phoneN(0), opened); res != nil {
+		t.Fatalf("first call denied: wait %s", res.Wait)
+	}
+	// Past the shortened window, far inside the one this row actually opened.
+	time.Sleep(100 * time.Millisecond)
+
+	if res := charge(t, s, addr, phoneN(1), shortened); res == nil {
+		t.Error("the counter reset while its recorded deadline was still an hour out: the shorter window took effect mid-flight and handed back a budget the row had already spent")
+	}
+}
+
+// TestSendCodeIPSweepCannotChangeTheAnswer is the property the deadline has to
+// carry: the sweep is garbage collection, so whether it has run must never
+// change what the limiter decides.
+//
+// It bites when a window is enlarged. The row keeps the deadline it opened
+// with, the sweep collects it the moment that passes, and a limiter reading the
+// live config instead would still be counting against it — so the same call is
+// denied before the sweep and allowed after it, and an attacker gets a fresh
+// budget for free by waiting for the sweeper.
+func TestSendCodeIPSweepCannotChangeTheAnswer(t *testing.T) {
+	t.Parallel()
+	opened := store.SendCodeIPLimits{Calls: store.RateLimitConfig{Limit: 1, Window: 50 * time.Millisecond}}
+	enlarged := store.SendCodeIPLimits{Calls: store.RateLimitConfig{Limit: 1, Window: time.Hour}}
+
+	for _, swept := range []bool{false, true} {
+		t.Run(fmt.Sprintf("swept=%v", swept), func(t *testing.T) {
+			t.Parallel()
+			s := openSendCodeStore(t)
+			addr := netip.MustParseAddr("203.0.113.61")
+
+			if res := charge(t, s, addr, phoneN(0), opened); res != nil {
+				t.Fatalf("first call denied: wait %s", res.Wait)
+			}
+			// The deadline this row opened with has now passed, which is exactly
+			// the condition the sweep collects on.
+			time.Sleep(100 * time.Millisecond)
+			if swept {
+				n, err := s.SweepExpiredSendCodeIPLimits(context.Background())
+				if err != nil {
+					t.Fatalf("sweep: %v", err)
+				}
+				if n != 1 {
+					t.Fatalf("sweep deleted %d rows, want the 1 counter row past its deadline", n)
+				}
+			}
+
+			if res := charge(t, s, addr, phoneN(1), enlarged); res != nil {
+				t.Errorf("denied after the recorded window closed: wait %s — the answer depends on whether the sweep has run", res.Wait)
+			}
+		})
+	}
+}
+
 // TestSendCodeIPRefusesAnUnkeyableRequest proves an address the transport could
 // not parse is reported rather than folded into a shared bucket, and that a
 // disabled limiter does not care about the address at all.
