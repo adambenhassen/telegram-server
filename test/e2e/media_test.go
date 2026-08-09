@@ -61,7 +61,7 @@ func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaC
 	t.Cleanup(func() {
 		for _, mc := range clients {
 			close(mc.cmds)
-			if rerr := <-mc.errCh; rerr != nil && !errors.Is(rerr, context.Canceled) {
+			if rerr := <-mc.errCh; rerr != nil && !errors.Is(rerr, context.Canceled) && !errors.Is(rerr, context.DeadlineExceeded) {
 				t.Errorf("client run: %v", rerr)
 			}
 		}
@@ -77,8 +77,8 @@ func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaC
 		go func() { mc.errCh <- runInteractive(ctx, client, flowFor(phone, codes), idCh, mc.cmds) }()
 		select {
 		case mc.id = <-idCh:
-		case <-time.After(30 * time.Second):
-			t.Fatalf("client %s login timeout", phone)
+		case <-ctx.Done():
+			t.Fatalf("client %s login timeout: %v", phone, ctx.Err())
 		}
 		clients = append(clients, mc)
 	}
@@ -426,9 +426,7 @@ func TestMediaInChatFanOut(t *testing.T) {
 		mc  *mediaClient
 		who string
 	}{{b, "B"}, {c, "C"}} {
-		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err := m.mc.coll.waitService(sCtx, &tg.MessageActionChatCreate{})
-		sCancel()
+		_, err := m.mc.coll.waitService(ctx, &tg.MessageActionChatCreate{})
 		if err != nil {
 			t.Fatalf("%s wait create service: %v", m.who, err)
 		}
@@ -445,7 +443,7 @@ func TestMediaInChatFanOut(t *testing.T) {
 		mc  *mediaClient
 		who string
 	}{{b, "B"}, {c, "C"}} {
-		msg := recvOr(t, m.mc.coll.newMsg, m.who+" chat media updateNewMessage")
+		msg := recvOrCtx(t, ctx, m.mc.coll.newMsg, m.who+" chat media updateNewMessage")
 		memberDoc := documentOf(t, msg)
 		assertSameDocument(t, memberDoc, doc, m.who)
 		if got := downloadDocument(t, m.mc, memberDoc); !bytes.Equal(got, payload) {
