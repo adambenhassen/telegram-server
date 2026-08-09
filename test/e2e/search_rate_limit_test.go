@@ -57,10 +57,12 @@ func TestSearchRateLimitE2E(t *testing.T) {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
 
-	// Boot server with a small search rate limit: 3 searches per 2 seconds.
+	// Boot server with small search rate limits. The two surfaces get
+	// deliberately different limits and windows: identical settings would let a
+	// transposed assignment in api.New pass, and each surface is driven below.
 	stop := bootServerWithSearchLimits(t, ctx, key, dcID, st, dsn, codes.Logger(), ln,
 		store.RateLimitConfig{Limit: 3, Window: 2 * time.Second},
-		store.RateLimitConfig{Limit: 3, Window: 2 * time.Second},
+		store.RateLimitConfig{Limit: 2, Window: 30 * time.Second},
 	)
 	t.Cleanup(stop)
 
@@ -252,6 +254,49 @@ func TestSearchRateLimitE2E(t *testing.T) {
 	}
 	if len(msgsB) != 1 {
 		t.Fatalf("B search: got %d messages, want 1", len(msgsB))
+	}
+
+	// contacts.search carries its own quota, 2 per 30s. There is no RPC to set
+	// a display name, so these queries match nothing — which is the point: the
+	// quota is charged on a miss exactly as on a hit, so it cannot be read as
+	// an existence oracle.
+	contactsSearch := func() error {
+		return exec(aCmds, func(ctx context.Context, c *tg.Client) error {
+			found, cerr := c.ContactsSearch(ctx, &tg.ContactsSearchRequest{Q: "bravo", Limit: 10})
+			if cerr != nil {
+				return cerr
+			}
+			if len(found.MyResults) != 0 {
+				return errors.New("unexpected contacts match")
+			}
+			return nil
+		})
+	}
+	for i := range 2 {
+		if err := contactsSearch(); err != nil {
+			t.Fatalf("A contacts search %d: %v", i+1, err)
+		}
+	}
+
+	// A's 3rd contacts search should be denied, while the messages quota it
+	// already refilled stays untouched.
+	err = contactsSearch()
+	if err == nil {
+		t.Fatal("A contacts search 3: expected FLOOD_WAIT, got nil")
+	}
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("A contacts search 3: expected RPC error, got %T: %v", err, err)
+	}
+	if rpcErr.Code != 420 {
+		t.Fatalf("A contacts search 3: code = %d, want 420", rpcErr.Code)
+	}
+
+	// B's contacts quota is independent and still spends.
+	if err := exec(bCmds, func(ctx context.Context, c *tg.Client) error {
+		_, cerr := c.ContactsSearch(ctx, &tg.ContactsSearchRequest{Q: "bravo", Limit: 10})
+		return cerr
+	}); err != nil {
+		t.Fatalf("B contacts search: %v", err)
 	}
 
 	close(aCmds)

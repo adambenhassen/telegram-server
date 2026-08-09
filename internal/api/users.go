@@ -180,7 +180,8 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 		limit = maxContactsSearchLimit
 	}
 
-	// Rate limit: pre-charged, before the search query.
+	// Rate limit before the lookup, charged identically whether or not the
+	// query matches, so the quota cannot be read as an existence oracle.
 	if err := h.checkRateLimit(r, "contacts_search", h.rateLimitSearchContacts); err != nil {
 		return nil, err
 	}

@@ -2,9 +2,11 @@ package api_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
@@ -239,7 +241,7 @@ func TestSearchMessagesRateLimitWindowExpiry(t *testing.T) {
 func TestContactsSearchRateLimit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	alice, err := s.CreateUser(ctx, "+15551296401")
 	if err != nil {
@@ -248,6 +250,11 @@ func TestContactsSearchRateLimit(t *testing.T) {
 	bob, err := s.CreateUser(ctx, "+15551296402")
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Bob needs a searchable name: name_tsv is empty for a phone-only user, so
+	// every query would miss and the assertions below would prove nothing.
+	if err := api.SetUserFirstNameForTest(dsn, bob.ID, "Bravo"); err != nil {
+		t.Fatalf("set bob name: %v", err)
 	}
 
 	// A sends a message to B to establish a dialog.
@@ -262,26 +269,21 @@ func TestContactsSearchRateLimit(t *testing.T) {
 	// 2 searches per 10s.
 	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
 
-	// Searches 1-2 should pass.
+	// Searches 1-2 should pass and return Bob.
 	for i := range 2 {
 		enc, err := api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-			Q:     "test",
+			Q:     "bravo",
 			Limit: 10,
 		})
 		if err != nil {
 			t.Fatalf("search %d: %v", i+1, err)
 		}
-		res, ok := enc.(*tg.ContactsFound)
-		if !ok {
-			t.Fatalf("search %d: result type = %T, want *tg.ContactsFound", i+1, enc)
-		}
-		// May return 0 or 1 results depending on name state, but no error.
-		_ = len(res.MyResults)
+		assertContactsFound(t, fmt.Sprintf("search %d", i+1), enc, 1)
 	}
 
 	// Search 3 should be denied with FLOOD_WAIT.
 	_, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "test",
+		Q:     "bravo",
 		Limit: 10,
 	})
 	if !isFloodWait(err) {
@@ -294,7 +296,7 @@ func TestContactsSearchRateLimit(t *testing.T) {
 func TestContactsSearchRateLimitIndependentAccounts(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	alice, err := s.CreateUser(ctx, "+15551296501")
 	if err != nil {
@@ -304,20 +306,38 @@ func TestContactsSearchRateLimitIndependentAccounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Both need searchable names so each side's search returns a real match.
+	if err := api.SetUserFirstNameForTest(dsn, alice.ID, "Alpha"); err != nil {
+		t.Fatalf("set alice name: %v", err)
+	}
+	if err := api.SetUserFirstNameForTest(dsn, bob.ID, "Bravo"); err != nil {
+		t.Fatalf("set bob name: %v", err)
+	}
+	// One send writes both dialog rows, so each of them can see the other.
+	if _, err := api.SendMessageForTest(s, alice.ID, &tg.MessagesSendMessageRequest{
+		Peer:     api.InputPeerUser(alice.ID, bob.ID),
+		Message:  "hello",
+		RandomID: 1,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
 
 	// Limit of 1.
 	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
 
 	// Alice exhausts her quota.
-	if _, err := api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "test",
+	enc, err := api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
+		Q:     "bravo",
 		Limit: 10,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("alice search 1: %v", err)
 	}
+	assertContactsFound(t, "alice search 1", enc, 1)
+
 	// Alice's second search should be denied.
 	_, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "test",
+		Q:     "bravo",
 		Limit: 10,
 	})
 	if !isFloodWait(err) {
@@ -325,12 +345,26 @@ func TestContactsSearchRateLimitIndependentAccounts(t *testing.T) {
 	}
 
 	// Bob's first search should still succeed (independent quota).
-	_, err = api.ContactsSearchForTestWithLimits(s, bob.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "test",
+	enc, err = api.ContactsSearchForTestWithLimits(s, bob.ID, cfg, &tg.ContactsSearchRequest{
+		Q:     "alpha",
 		Limit: 10,
 	})
 	if err != nil {
 		t.Fatalf("bob search 1: expected success, got %v", err)
+	}
+	assertContactsFound(t, "bob search 1", enc, 1)
+}
+
+// assertContactsFound checks that enc is a *tg.ContactsFound carrying want
+// results, so a rate-limit test cannot pass on an empty result set.
+func assertContactsFound(t *testing.T, label string, enc bin.Encoder, want int) {
+	t.Helper()
+	res, ok := enc.(*tg.ContactsFound)
+	if !ok {
+		t.Fatalf("%s: result type = %T, want *tg.ContactsFound", label, enc)
+	}
+	if len(res.MyResults) != want {
+		t.Fatalf("%s: got %d results, want %d", label, len(res.MyResults), want)
 	}
 }
 
@@ -339,28 +373,43 @@ func TestContactsSearchRateLimitIndependentAccounts(t *testing.T) {
 func TestContactsSearchRateLimitWindowExpiry(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	alice, err := s.CreateUser(ctx, "+15551296601")
 	if err != nil {
 		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551296602")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.SetUserFirstNameForTest(dsn, bob.ID, "Bravo"); err != nil {
+		t.Fatalf("set bob name: %v", err)
+	}
+	if _, err := api.SendMessageForTest(s, alice.ID, &tg.MessagesSendMessageRequest{
+		Peer:     api.InputPeerUser(alice.ID, bob.ID),
+		Message:  "hello",
+		RandomID: 1,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
 	}
 
 	// Very short window: 1 search per 500ms.
 	cfg := store.RateLimitConfig{Limit: 1, Window: 500 * time.Millisecond}
 
 	// Exhaust the limit.
-	_, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "test",
+	enc, err := api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
+		Q:     "bravo",
 		Limit: 10,
 	})
 	if err != nil {
 		t.Fatalf("search 1: %v", err)
 	}
+	assertContactsFound(t, "search 1", enc, 1)
 
 	// Denied.
 	_, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "test",
+		Q:     "bravo",
 		Limit: 10,
 	})
 	if !isFloodWait(err) {
@@ -370,22 +419,27 @@ func TestContactsSearchRateLimitWindowExpiry(t *testing.T) {
 	// Wait for window to expire.
 	time.Sleep(600 * time.Millisecond)
 
-	// Should be allowed again.
-	_, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "test",
+	// Should be allowed again, and still return the match.
+	enc, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
+		Q:     "bravo",
 		Limit: 10,
 	})
 	if err != nil {
 		t.Fatalf("post-expiry search: %v", err)
 	}
+	assertContactsFound(t, "post-expiry search", enc, 1)
 }
 
-// TestSearchMessagesPreCharged proves that a rate limit denial does not
-// consume the query: a denied search returns FLOOD_WAIT without reaching the
-// database search query. An empty query still returns SEARCH_QUERY_EMPTY even
-// when the account is over its rate limit, because input validation runs before
-// the rate limit check.
-func TestSearchMessagesPreCharged(t *testing.T) {
+// TestSearchMessagesChargeIsUniform proves the ticket's core invariant for
+// messages.search: what a query matches does not change what the caller is
+// charged, so the quota cannot be read as an existence oracle. A matching
+// query and a query that matches nothing each spend one token out of two, and
+// the third search is denied.
+//
+// It also pins the ordering the other way: an empty query is rejected by input
+// validation before the limiter is consulted, so it neither spends a token nor
+// reports FLOOD_WAIT.
+func TestSearchMessagesChargeIsUniform(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openStore(t)
@@ -408,92 +462,177 @@ func TestSearchMessagesPreCharged(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	// Limit of 1.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	// Limit of 2.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
 	peerBob := api.InputPeerUser(alice.ID, bob.ID)
 
-	// First search with valid query — consumes the only token.
-	_, err = api.SearchForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSearchRequest{
-		Peer:   peerBob,
-		Q:      "hello",
-		Filter: &tg.InputMessagesFilterEmpty{},
-	})
+	search := func(q string) (bin.Encoder, error) {
+		return api.SearchForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSearchRequest{
+			Peer:   peerBob,
+			Q:      q,
+			Filter: &tg.InputMessagesFilterEmpty{},
+		})
+	}
+
+	// Token 1: a query that matches.
+	enc, err := search("hello")
 	if err != nil {
-		t.Fatalf("search 1: %v", err)
+		t.Fatalf("matching search: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("matching search: result type = %T, want *tg.MessagesMessages", enc)
+	}
+	if len(res.Messages) != 1 {
+		t.Fatalf("matching search: got %d messages, want 1", len(res.Messages))
 	}
 
-	// Second search with valid query — denied with FLOOD_WAIT.
-	_, err = api.SearchForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSearchRequest{
-		Peer:   peerBob,
-		Q:      "hello",
-		Filter: &tg.InputMessagesFilterEmpty{},
-	})
-	if !isFloodWait(err) {
-		t.Fatalf("search 2: expected FLOOD_WAIT, got %v", err)
+	// Token 2: a query that matches nothing. Costs the same token.
+	enc, err = search("zzzznothingmatchesthis")
+	if err != nil {
+		t.Fatalf("non-matching search: %v", err)
+	}
+	res, ok = enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("non-matching search: result type = %T, want *tg.MessagesMessages", enc)
+	}
+	if len(res.Messages) != 0 {
+		t.Fatalf("non-matching search: got %d messages, want 0", len(res.Messages))
 	}
 
-	// Third search with empty query — returns SEARCH_QUERY_EMPTY (validation
-	// before rate limit), not FLOOD_WAIT. This proves the invariant that
-	// charging is uniform: whether a query matches must not change what the
-	// caller is charged. An empty query is rejected before the rate limit.
-	_, err = api.SearchForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSearchRequest{
-		Peer:   peerBob,
-		Q:      "",
-		Filter: &tg.InputMessagesFilterEmpty{},
-	})
+	// Quota is spent: the third search is denied regardless of what it would
+	// have matched.
+	if _, err := search("hello"); !isFloodWait(err) {
+		t.Fatalf("third search: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// An empty query is rejected before the limiter, so it reports
+	// SEARCH_QUERY_EMPTY rather than FLOOD_WAIT even over the limit.
+	_, err = search("")
 	if err == nil {
-		t.Fatal("search 3 (empty query): expected error, got nil")
+		t.Fatal("empty query: expected error, got nil")
 	}
-	// The error should be SEARCH_QUERY_EMPTY, not FLOOD_WAIT.
 	if isFloodWait(err) {
-		t.Fatal("search 3 (empty query): expected SEARCH_QUERY_EMPTY, got FLOOD_WAIT")
+		t.Fatal("empty query: expected SEARCH_QUERY_EMPTY, got FLOOD_WAIT")
 	}
 }
 
-// TestContactsSearchPreCharged proves that a denied contacts search does not
-// reach the database query, and that input validation still runs before the
-// rate limit.
-func TestContactsSearchPreCharged(t *testing.T) {
+// TestSearchMessagesChargedBeforeMembershipCheck proves that a chat-peer search
+// by a non-member is charged: the membership probe is a database query, so a
+// charge behind it would let a non-member probe chat membership at unbounded
+// rate, and would also make the quota a membership oracle.
+func TestSearchMessagesChargedBeforeMembershipCheck(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551296901")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551296902")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mallory, err := s.CreateUser(ctx, "+15551296903")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice and Bob share a chat. Mallory is not a member.
+	chat, err := s.CreateChat(ctx, alice.ID, "private chat", []int64{bob.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+
+	// Limit of 1.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	probe := func() error {
+		_, err := api.SearchForTestWithLimits(s, mallory.ID, cfg, &tg.MessagesSearchRequest{
+			Peer:   &tg.InputPeerChat{ChatID: chat.ID},
+			Q:      "hello",
+			Filter: &tg.InputMessagesFilterEmpty{},
+		})
+		return err
+	}
+
+	// First probe: refused as PEER_ID_INVALID, and charged.
+	err = probe()
+	if err == nil {
+		t.Fatal("probe 1: expected PEER_ID_INVALID, got nil")
+	}
+	if isFloodWait(err) {
+		t.Fatalf("probe 1: expected PEER_ID_INVALID, got %v", err)
+	}
+
+	// Second probe: the token was spent by the first, so the limiter answers
+	// before the membership query runs.
+	if err := probe(); !isFloodWait(err) {
+		t.Fatalf("probe 2: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestContactsSearchChargeIsUniform proves the same invariant for
+// contacts.search: a query matching nothing costs the same token as one that
+// matches, and an empty query is rejected before the limiter.
+func TestContactsSearchChargeIsUniform(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
 
 	alice, err := s.CreateUser(ctx, "+15551296801")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// Limit of 1.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
-
-	// First search — consumes the only token.
-	_, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "test",
-		Limit: 10,
-	})
+	bob, err := s.CreateUser(ctx, "+15551296802")
 	if err != nil {
-		t.Fatalf("search 1: %v", err)
+		t.Fatal(err)
+	}
+	if err := api.SetUserFirstNameForTest(dsn, bob.ID, "Bravo"); err != nil {
+		t.Fatalf("set bob name: %v", err)
+	}
+	if _, err := api.SendMessageForTest(s, alice.ID, &tg.MessagesSendMessageRequest{
+		Peer:     api.InputPeerUser(alice.ID, bob.ID),
+		Message:  "hello",
+		RandomID: 1,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
 	}
 
-	// Second search — denied with FLOOD_WAIT.
-	_, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "test",
-		Limit: 10,
-	})
-	if !isFloodWait(err) {
-		t.Fatalf("search 2: expected FLOOD_WAIT, got %v", err)
+	// Limit of 2.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	search := func(q string) (bin.Encoder, error) {
+		return api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
+			Q:     q,
+			Limit: 10,
+		})
 	}
 
-	// Third search with empty query — returns SEARCH_QUERY_EMPTY (validation
-	// before rate limit).
-	_, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
-		Q:     "",
-		Limit: 10,
-	})
+	// Token 1: a query that matches.
+	enc, err := search("bravo")
+	if err != nil {
+		t.Fatalf("matching search: %v", err)
+	}
+	assertContactsFound(t, "matching search", enc, 1)
+
+	// Token 2: a query that matches nothing. Costs the same token.
+	enc, err = search("zzzznothingmatchesthis")
+	if err != nil {
+		t.Fatalf("non-matching search: %v", err)
+	}
+	assertContactsFound(t, "non-matching search", enc, 0)
+
+	// Quota is spent.
+	if _, err := search("bravo"); !isFloodWait(err) {
+		t.Fatalf("third search: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// An empty query is rejected before the limiter.
+	_, err = search("")
 	if err == nil {
-		t.Fatal("search 3 (empty query): expected error, got nil")
+		t.Fatal("empty query: expected error, got nil")
 	}
 	if isFloodWait(err) {
-		t.Fatal("search 3 (empty query): expected SEARCH_QUERY_EMPTY, got FLOOD_WAIT")
+		t.Fatal("empty query: expected SEARCH_QUERY_EMPTY, got FLOOD_WAIT")
 	}
 }
