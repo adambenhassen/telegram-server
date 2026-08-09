@@ -3,6 +3,8 @@ package config_test
 import (
 	"bytes"
 	"log/slog"
+	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,8 +52,10 @@ func TestLoadClientAddrTrustRejectsUnsupported(t *testing.T) {
 	if !strings.Contains(err.Error(), "TG_CLIENT_ADDR_TRUST") {
 		t.Errorf("error %q does not name the variable", err)
 	}
-	if !strings.Contains(err.Error(), string(config.ClientAddrSocket)) {
-		t.Errorf("error %q does not name the supported value %q", err, config.ClientAddrSocket)
+	for _, want := range []config.ClientAddrTrust{config.ClientAddrSocket, config.ClientAddrProxyV2} {
+		if !strings.Contains(err.Error(), string(want)) {
+			t.Errorf("error %q does not name the supported value %q", err, want)
+		}
 	}
 }
 
@@ -149,5 +153,132 @@ func TestWarnClientAddrTrust(t *testing.T) {
 	cfg.WarnClientAddrTrust(log)
 	if buf.Len() != 0 {
 		t.Errorf("warned with the per-IP limits disabled:\n%s", buf.String())
+	}
+}
+
+// TestLoadClientAddrProxyV2 covers the mode that reads the address out of a
+// PROXY protocol v2 header. The allowlist is the whole of the trust decision, so
+// it is parsed here and asserted entry by entry: a CIDR that silently widened or
+// dropped would decide which senders may name any address they like.
+func TestLoadClientAddrProxyV2(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_CLIENT_ADDR_TRUST", string(config.ClientAddrProxyV2))
+	// Mixed forms on purpose: an operator with one balancer writes a bare
+	// address, one with a subnet writes a CIDR, and both have to work.
+	t.Setenv("TG_CLIENT_ADDR_PROXY_CIDRS", "10.0.0.0/8, 192.0.2.7 ,2001:db8::/32")
+
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ClientAddrTrust != config.ClientAddrProxyV2 {
+		t.Errorf("ClientAddrTrust = %q, want %q", cfg.ClientAddrTrust, config.ClientAddrProxyV2)
+	}
+	want := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("192.0.2.7/32"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
+	if !slices.Equal(cfg.ClientAddrProxies, want) {
+		t.Errorf("ClientAddrProxies = %v, want %v", cfg.ClientAddrProxies, want)
+	}
+}
+
+// TestLoadClientAddrProxyV2RequiresAllowlist is the fail-closed startup rule. An
+// empty allowlist in this mode is not "trust nobody" by accident and must never
+// be read as "trust everybody": either reading is a guess, so the server refuses
+// to start and names the variable that is missing.
+func TestLoadClientAddrProxyV2RequiresAllowlist(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		cidrs string
+	}{
+		{name: "unset", cidrs: ""},
+		{name: "blank", cidrs: "  "},
+		{name: "separators only", cidrs: ", ,"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+			t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+			t.Setenv("TG_CLIENT_ADDR_TRUST", string(config.ClientAddrProxyV2))
+			t.Setenv("TG_CLIENT_ADDR_PROXY_CIDRS", tt.cidrs)
+
+			_, err := config.Load(discardLog())
+			if err == nil {
+				t.Fatal("started with no balancer allowlist: every sender could name any client address")
+			}
+			if !strings.Contains(err.Error(), "TG_CLIENT_ADDR_PROXY_CIDRS") {
+				t.Errorf("error %q does not name the variable", err)
+			}
+		})
+	}
+}
+
+// TestLoadClientAddrProxyV2RejectsBadCIDR fails the start on an allowlist entry
+// that does not parse, rather than enforcing the entries that did. A dropped
+// entry is a balancer whose connections are all refused, which looks like an
+// outage rather than a typo.
+func TestLoadClientAddrProxyV2RejectsBadCIDR(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_CLIENT_ADDR_TRUST", string(config.ClientAddrProxyV2))
+	t.Setenv("TG_CLIENT_ADDR_PROXY_CIDRS", "10.0.0.0/8,not-an-address")
+
+	_, err := config.Load(discardLog())
+	if err == nil {
+		t.Fatal("an unparsable allowlist entry started the server")
+	}
+	if !strings.Contains(err.Error(), "TG_CLIENT_ADDR_PROXY_CIDRS") {
+		t.Errorf("error %q does not name the variable", err)
+	}
+	if !strings.Contains(err.Error(), "not-an-address") {
+		t.Errorf("error %q does not name the entry that failed", err)
+	}
+}
+
+// TestLoadClientAddrProxiesRejectedInSocketMode catches the misconfiguration
+// this ticket exists to prevent: an operator who lists their balancers but does
+// not switch the mode is behind a load balancer with socket keying, which is the
+// collapsed global bucket. Their allowlist is proof of intent, so the mismatch
+// fails the start instead of being ignored.
+func TestLoadClientAddrProxiesRejectedInSocketMode(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_CLIENT_ADDR_PROXY_CIDRS", "10.0.0.0/8")
+
+	_, err := config.Load(discardLog())
+	if err == nil {
+		t.Fatal("a balancer allowlist was accepted in socket mode, where nothing reads it")
+	}
+	for _, want := range []string{"TG_CLIENT_ADDR_PROXY_CIDRS", "TG_CLIENT_ADDR_TRUST"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %s", err, want)
+		}
+	}
+}
+
+// TestWarnClientAddrTrustSilentInProxyV2 pins the other half of the warning's
+// contract. The socket-mode line warns about a risk proxy-v2 mode does not carry
+// — the balancer's address is exactly what it stops keying on — and a warning
+// that is not true where it is printed is one an operator learns to ignore.
+func TestWarnClientAddrTrustSilentInProxyV2(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_CLIENT_ADDR_TRUST", string(config.ClientAddrProxyV2))
+	t.Setenv("TG_CLIENT_ADDR_PROXY_CIDRS", "10.0.0.0/8")
+
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.RateLimits.SendCodeIP.Enabled() {
+		t.Fatal("the per-IP limits are off: this test would prove nothing")
+	}
+
+	var buf bytes.Buffer
+	cfg.WarnClientAddrTrust(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	if buf.Len() != 0 {
+		t.Errorf("warned about socket keying in %s mode:\n%s", config.ClientAddrProxyV2, buf.String())
 	}
 }

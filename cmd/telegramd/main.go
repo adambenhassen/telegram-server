@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -142,7 +143,31 @@ func run(log *slog.Logger) error {
 	advertise := net.JoinHostPort(cfg.AdvertiseHost, strconv.Itoa(cfg.AdvertisePort))
 	log.Info("listening", "addr", cfg.ListenAddr, "advertise", advertise, "dc", cfg.DCID)
 
-	return server.Serve(ctx, mtproto.Listen(ln))
+	listener, err := clientListener(cfg, ln, log)
+	if err != nil {
+		return err
+	}
+	return server.Serve(ctx, listener)
+}
+
+// clientListener builds the accept path the configured trust mode names.
+//
+// The switch is exhaustive on purpose and has no permissive default: config
+// validation already rejects any other value, and a fallback to socket keying
+// added here would be the silent collapse into one global bucket that the mode
+// exists to prevent.
+func clientListener(cfg config.Config, ln net.Listener, log *slog.Logger) (mtproto.Listener, error) {
+	switch cfg.ClientAddrTrust {
+	case config.ClientAddrSocket:
+		return mtproto.Listen(ln), nil
+	case config.ClientAddrProxyV2:
+		log.Info("client addresses are read from PROXY protocol v2 headers",
+			"trust", string(cfg.ClientAddrTrust),
+			"balancers", cfg.ClientAddrProxies)
+		return mtproto.ListenProxyV2(ln, cfg.ClientAddrProxies, log), nil
+	default:
+		return nil, fmt.Errorf("unsupported client address trust mode %q", cfg.ClientAddrTrust)
+	}
 }
 
 // sweepExpiredCodes periodically deletes expired login codes until ctx is

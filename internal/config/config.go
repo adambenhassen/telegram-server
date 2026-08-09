@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -63,8 +64,12 @@ type Config struct {
 	// disables enforcement for that surface.
 	RateLimits RateLimitsConfig
 	// ClientAddrTrust names where the address a request is attributed to comes
-	// from. Only the connection's own peer address is supported today.
+	// from: the connection's own peer address, or a PROXY protocol v2 header.
 	ClientAddrTrust ClientAddrTrust
+	// ClientAddrProxies is the allowlist of balancer source addresses a PROXY
+	// header is honoured from. It is the whole of the trust decision in
+	// ClientAddrProxyV2 mode and is empty in every other mode.
+	ClientAddrProxies []netip.Prefix
 }
 
 // ClientAddrTrust names the source a client address is taken from.
@@ -76,11 +81,21 @@ type ClientAddrTrust string
 // forgeable by whoever sends it.
 const ClientAddrSocket ClientAddrTrust = "socket"
 
-// clientAddrTrustValues lists every supported value, for the startup error. A
-// load-balancer-supplied address is a separate mode and lands with its own
-// listener; until it does, an operator naming it must be told plainly rather
-// than silently served socket addresses that all belong to the balancer.
-var clientAddrTrustValues = []ClientAddrTrust{ClientAddrSocket}
+// ClientAddrProxyV2 attributes every request to the address a PROXY protocol v2
+// header names, and only when that header arrives from an address in
+// ClientAddrProxies. It is what makes per-IP limits mean anything behind an L4
+// load balancer, where every peer address is the balancer's and socket keying
+// collapses into one global bucket.
+//
+// The allowlist is the entire reason the header can be believed: it is
+// client-supplied bytes, so a sender outside the allowlist is refused rather
+// than credited with an address it chose. There is no third source.
+const ClientAddrProxyV2 ClientAddrTrust = "proxy-v2"
+
+// clientAddrTrustValues lists every supported value, for the startup error. An
+// operator naming a mode this build does not implement must be told plainly
+// rather than silently served socket addresses that all belong to the balancer.
+var clientAddrTrustValues = []ClientAddrTrust{ClientAddrSocket, ClientAddrProxyV2}
 
 // RateLimitsConfig holds the rate-limit parameters for each RPC surface.
 type RateLimitsConfig struct {
@@ -306,6 +321,11 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.ClientAddrTrust = trust
+	proxies, err := clientAddrProxies(os.Getenv("TG_CLIENT_ADDR_PROXY_CIDRS"), trust)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ClientAddrProxies = proxies
 	advertiseHost, advertisePort, err := advertiseAddr(os.Getenv("TG_ADVERTISE_ADDR"), cfg.ListenAddr)
 	if err != nil {
 		return Config{}, err
@@ -342,6 +362,68 @@ func clientAddrTrust(raw string) (ClientAddrTrust, error) {
 	return "", fmt.Errorf("TG_CLIENT_ADDR_TRUST must be one of: %s", strings.Join(names, ", "))
 }
 
+// clientAddrProxies resolves the balancer allowlist and refuses every way of
+// getting it wrong, in both directions.
+//
+// In proxy-v2 mode an empty list cannot be defaulted: read as "trust nobody" it
+// refuses every connection, read as "trust anybody" it lets any sender name any
+// client address, and guessing between them is not the config loader's call. So
+// the mode requires the list.
+//
+// The reverse mismatch fails just as hard. A list set while the mode is socket
+// is an operator who believes they are behind a balancer and is in fact keying
+// every client on the balancer's address — the collapsed global bucket this mode
+// exists to prevent, and the one misconfiguration that looks fine at startup and
+// locks out every login at once.
+func clientAddrProxies(raw string, trust ClientAddrTrust) ([]netip.Prefix, error) {
+	prefixes, err := parsePrefixes(raw)
+	if err != nil {
+		return nil, err
+	}
+	if trust != ClientAddrProxyV2 {
+		if len(prefixes) > 0 {
+			return nil, fmt.Errorf("TG_CLIENT_ADDR_PROXY_CIDRS is set while TG_CLIENT_ADDR_TRUST is %q: the allowlist is only read in %q mode, and %q keys every client on the balancer's own address", trust, ClientAddrProxyV2, trust)
+		}
+		return nil, nil
+	}
+	if len(prefixes) == 0 {
+		return nil, fmt.Errorf("TG_CLIENT_ADDR_TRUST=%s requires TG_CLIENT_ADDR_PROXY_CIDRS to list the balancer addresses a PROXY header is accepted from", ClientAddrProxyV2)
+	}
+	return prefixes, nil
+}
+
+// parsePrefixes reads a comma-separated allowlist. A bare address is its own
+// single-host prefix, which is what an operator with one balancer writes.
+// Anything that does not parse fails the start naming the entry: dropping it
+// would leave a balancer whose connections are all refused, which reads as an
+// outage rather than a typo.
+func parsePrefixes(raw string) ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for entry := range strings.SplitSeq(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			p, err := netip.ParsePrefix(entry)
+			if err != nil {
+				return nil, fmt.Errorf("TG_CLIENT_ADDR_PROXY_CIDRS entry %q is not a CIDR", entry)
+			}
+			prefixes = append(prefixes, p)
+			continue
+		}
+		addr, err := netip.ParseAddr(entry)
+		if err != nil {
+			return nil, fmt.Errorf("TG_CLIENT_ADDR_PROXY_CIDRS entry %q is not an address or CIDR", entry)
+		}
+		// Unmapped so a 4-in-6 spelling matches the same peer addresses the
+		// listener reports, which are unmapped for the same reason.
+		addr = addr.Unmap()
+		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return prefixes, nil
+}
+
 // WarnClientAddrTrust states the operational assumption socket mode makes,
 // once, at startup.
 //
@@ -354,10 +436,13 @@ func clientAddrTrust(raw string) (ClientAddrTrust, error) {
 // IPv4 address, so the whole carrier spends a single key's budget and the 21st
 // distinct number from it in a day is refused for up to a day.
 //
-// Both are accepted risks until an address source that can see past them lands,
-// and this line is the whole of the mitigation: it is what tells an operator
-// where the support tickets will come from before they arrive. Silent when no
-// per-IP limit is enabled, since nothing is then keyed on an address at all.
+// The balancer half has an answer now — ClientAddrProxyV2 keys on the address
+// the balancer reports rather than its own — and this line is what tells an
+// operator running without it where the support tickets will come from before
+// they arrive. The carrier-NAT half remains an accepted risk in every mode.
+// Silent in proxy-v2 mode, where the assumption it names is not the one being
+// made, and silent when no per-IP limit is enabled, since nothing is then keyed
+// on an address at all.
 func (c Config) WarnClientAddrTrust(log *slog.Logger) {
 	if c.ClientAddrTrust != ClientAddrSocket || !c.RateLimits.SendCodeIP.Enabled() {
 		return
