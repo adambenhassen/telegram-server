@@ -31,6 +31,16 @@ SELECT * FROM channel_participants WHERE channel_id = $1 ORDER BY user_id;
 -- name: ChannelParticipantByUser :one
 SELECT * FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
 
+-- ChannelParticipantsForViewer answers "which of these channels is this caller
+-- in" in one query, for a caller-supplied set bounded by a page. It returns the
+-- whole participant row rather than a boolean so the ban stays ChannelMember's
+-- decision: this feeds a rendering choice, not a row set that a LIMIT then cuts,
+-- so there is no reason to spell the predicate a second time here.
+-- name: ChannelParticipantsForViewer :many
+SELECT * FROM channel_participants
+WHERE user_id = sqlc.arg(viewer_id)::bigint
+  AND channel_id = ANY(sqlc.arg(channel_ids)::bigint[]);
+
 -- name: IsChannelMember :one
 SELECT EXISTS(SELECT 1 FROM channel_participants WHERE channel_id = $1 AND user_id = $2);
 

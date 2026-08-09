@@ -693,6 +693,39 @@ type MemberChannelMatch struct {
 	Member  ChannelMember
 }
 
+// ChannelMembershipsOf reports which of channelIDs viewerID is an unbanned
+// member of, keyed by channel id. Channels the caller never joined, and ones
+// they are banned from, are simply absent.
+//
+// It exists so a caller-facing page can decide membership for every channel it
+// names in one query instead of one per row, and so the membership of a channel
+// found by a caller-independent search is answered separately from that search
+// rather than by adding a viewer to it.
+func (s *Store) ChannelMembershipsOf(
+	ctx context.Context, viewerID int64, channelIDs []int64,
+) (map[int64]ChannelMember, error) {
+	if len(channelIDs) == 0 {
+		return map[int64]ChannelMember{}, nil
+	}
+	rows, err := s.q.ChannelParticipantsForViewer(ctx, db.ChannelParticipantsForViewerParams{
+		ViewerID:   viewerID,
+		ChannelIds: channelIDs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("channel participants for viewer: %w", err)
+	}
+	now := time.Now()
+	out := make(map[int64]ChannelMember, len(rows))
+	for _, r := range rows {
+		m := channelMemberFromRow(r)
+		if m.Banned(now) {
+			continue
+		}
+		out[r.ChannelID] = m
+	}
+	return out, nil
+}
+
 // searchHandle reduces a search query to the handle it could be naming: the
 // same normalisation contacts.resolveUsername applies to its argument, so a
 // caller finds a channel by its @username on either RPC. A query that is not a

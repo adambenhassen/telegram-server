@@ -233,6 +233,49 @@ func (q *Queries) ChannelParticipants(ctx context.Context, channelID int64) ([]C
 	return items, nil
 }
 
+const channelParticipantsForViewer = `-- name: ChannelParticipantsForViewer :many
+SELECT channel_id, user_id, role, banned_until, join_pts, date FROM channel_participants
+WHERE user_id = $1::bigint
+  AND channel_id = ANY($2::bigint[])
+`
+
+type ChannelParticipantsForViewerParams struct {
+	ViewerID   int64
+	ChannelIds []int64
+}
+
+// ChannelParticipantsForViewer answers "which of these channels is this caller
+// in" in one query, for a caller-supplied set bounded by a page. It returns the
+// whole participant row rather than a boolean so the ban stays ChannelMember's
+// decision: this feeds a rendering choice, not a row set that a LIMIT then cuts,
+// so there is no reason to spell the predicate a second time here.
+func (q *Queries) ChannelParticipantsForViewer(ctx context.Context, arg ChannelParticipantsForViewerParams) ([]ChannelParticipant, error) {
+	rows, err := q.db.Query(ctx, channelParticipantsForViewer, arg.ViewerID, arg.ChannelIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChannelParticipant
+	for rows.Next() {
+		var i ChannelParticipant
+		if err := rows.Scan(
+			&i.ChannelID,
+			&i.UserID,
+			&i.Role,
+			&i.BannedUntil,
+			&i.JoinPts,
+			&i.Date,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const channelStateForUpdate = `-- name: ChannelStateForUpdate :one
 SELECT channel_id, pts, next_local_id, date FROM channel_state WHERE channel_id = $1 FOR UPDATE
 `

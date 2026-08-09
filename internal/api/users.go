@@ -188,6 +188,9 @@ func (h *handlers) channelToTLPublic(c store.Channel, participants int64, viewer
 // A channel that is both public and the caller's own matches two arms and is
 // named in both peer vectors, but is rendered once in Chats, as the member view
 // — a client indexes Chats by id and cannot hold two renderings of one channel.
+// Which vector named it does not decide that rendering and neither does the
+// budget: membership does, so a caller is never handed their own channel marked
+// Left because a page boundary fell in the wrong place.
 //
 // The rate limit is charged once for the whole call, before any arm runs, so
 // one query costs one quota unit whatever it matches.
@@ -260,21 +263,59 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	// own limit: sharing one budget across both would let the caller's own
 	// memberships shrink public discovery, which is caller-independent by
 	// construction.
-	budget := max(int(limit)-len(contacts), 0)
-	if len(myChannels) > budget {
-		myChannels = myChannels[:budget]
+	// Membership is decided from every member match, not from the ones that
+	// survive the budget. The budget shortens the peer vector; it says nothing
+	// about whether the caller is in a channel, so it must not reach the
+	// rendering. A public channel the caller belongs to that is squeezed out of
+	// MyResults is still named in Results, and rendering it from the truncated
+	// set served the caller their own channel as Left, which a client caches as
+	// one they left.
+	memberOf := make(map[int64]store.ChannelMember, len(myChannels))
+	for _, m := range myChannels {
+		memberOf[m.Channel.ID] = m.Member
 	}
 
-	myResults := make([]tg.PeerClass, 0, len(contacts)+len(myChannels))
+	// The member arm is itself capped at limit, so a caller in more matching
+	// channels than that has memberships it never returned — and a public match
+	// outside its page would render as Left for a channel the caller is in, the
+	// same defect one level down. Membership for the channels Results names is
+	// therefore answered directly, in one bounded query rather than one per row.
+	//
+	// It is a separate query and not a viewer joined into the discovery arm on
+	// purpose: which rows Results contains stays caller-independent, and
+	// membership is applied afterwards, as a rendering input only.
+	unknown := make([]int64, 0, len(publicChannels))
+	for _, p := range publicChannels {
+		if _, ok := memberOf[p.Channel.ID]; !ok {
+			unknown = append(unknown, p.Channel.ID)
+		}
+	}
+	extra, err := h.store.ChannelMembershipsOf(r.Ctx, r.UserID, unknown)
+	if err != nil {
+		h.log.Error("contacts.search: memberships", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	for id, m := range extra {
+		memberOf[id] = m
+	}
+
+	budget := max(int(limit)-len(contacts), 0)
+	namedChannels := myChannels
+	if len(namedChannels) > budget {
+		namedChannels = namedChannels[:budget]
+	}
+
+	myResults := make([]tg.PeerClass, 0, len(contacts)+len(namedChannels))
 	users := make([]tg.UserClass, 0, len(contacts))
 	for _, c := range contacts {
 		myResults = append(myResults, &tg.PeerUser{UserID: c.ID})
 		users = append(users, h.userToTL(c, r.UserID, c.ID == r.UserID))
 	}
 
-	chats := make([]tg.ChatClass, 0, len(myChannels)+len(publicChannels))
-	rendered := make(map[int64]bool, len(myChannels))
-	for _, m := range myChannels {
+	// Only a channel some vector names is rendered, and each is rendered once.
+	chats := make([]tg.ChatClass, 0, len(namedChannels)+len(publicChannels))
+	rendered := make(map[int64]bool, len(namedChannels)+len(publicChannels))
+	for _, m := range namedChannels {
 		myResults = append(myResults, &tg.PeerChannel{ChannelID: m.Channel.ID})
 		chats = append(chats, h.channelToTL(m.Channel, m.Member, true, r.UserID))
 		rendered[m.Channel.ID] = true
@@ -284,6 +325,11 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	for _, p := range publicChannels {
 		results = append(results, &tg.PeerChannel{ChannelID: p.Channel.ID})
 		if rendered[p.Channel.ID] {
+			continue
+		}
+		rendered[p.Channel.ID] = true
+		if m, ok := memberOf[p.Channel.ID]; ok {
+			chats = append(chats, h.channelToTL(p.Channel, m, true, r.UserID))
 			continue
 		}
 		chats = append(chats, h.channelToTLPublic(p.Channel, p.ParticipantsCount, r.UserID))

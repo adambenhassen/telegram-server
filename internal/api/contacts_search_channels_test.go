@@ -226,6 +226,164 @@ func TestContactsSearchMyResultsDeterministic(t *testing.T) {
 	}
 }
 
+// TestContactsSearchTruncatedMemberStillRendersAsMember proves the budget
+// shortens the peer vector without changing how a channel is rendered.
+//
+// A public channel the caller belongs to matches both arms. When the user
+// matches fill the MyResults budget it is squeezed out of that vector, but it
+// is still named in Results, and the caller is still a member — so the Chats
+// entry must stay the member view. Deciding that from the truncated member
+// matches instead of all of them rendered the caller's own channel as
+// Left: true, Creator: false, which a client caches as a channel they left.
+func TestContactsSearchTruncatedMemberStillRendersAsMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+
+	caller, err := s.CreateUser(ctx, "15550015001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The caller creates the channel, so it is theirs at role 2, and gives it a
+	// username so the public arm names it too.
+	ch, err := s.CreateChannel(ctx, caller.ID, "Squeezed Broadcast", "About", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "squeezedbroadcast"); err != nil {
+		t.Fatal(err)
+	}
+	// Ten matching contacts consume the whole default budget.
+	seedMixedMyResults(t, s, dsn, caller.ID, "1555001510", "Squeezed", 10, 0)
+
+	found := searchChannels(t, s, caller.ID, "Squeezed", 10)
+
+	if got := channelPeerIDs(found.MyResults); len(got) != 0 {
+		t.Fatalf("MyResults channels = %v, want none — the users fill the budget", got)
+	}
+	if len(found.MyResults) != 10 {
+		t.Fatalf("MyResults len = %d, want 10", len(found.MyResults))
+	}
+	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != ch.ID {
+		t.Fatalf("Results channels = %v, want [%d]", got, ch.ID)
+	}
+
+	var rendered *tg.Channel
+	for _, c := range found.Chats {
+		if channel, ok := c.(*tg.Channel); ok && channel.ID == ch.ID {
+			rendered = channel
+		}
+	}
+	if rendered == nil {
+		t.Fatalf("channel %d missing from Chats", ch.ID)
+	}
+	if rendered.Left {
+		t.Error("Chats Left = true for the caller's own channel — truncation changed the rendering")
+	}
+	if !rendered.Creator {
+		t.Error("Chats Creator = false for a channel the caller created")
+	}
+	if rendered.Title != "Squeezed Broadcast" {
+		t.Errorf("Chats Title = %q, want %q", rendered.Title, "Squeezed Broadcast")
+	}
+}
+
+// TestContactsSearchMemberBeyondMemberArmPageRendersAsMember covers the same
+// defect one level down: the member arm is itself capped at the limit in SQL, so
+// a caller in more matching channels than that has memberships the arm never
+// returned. A public match outside its page must still render as the member
+// view — deciding membership from the arm's rows alone left the caller's own
+// channel marked Left here too, with no Go-side truncation involved.
+func TestContactsSearchMemberBeyondMemberArmPageRendersAsMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	caller, err := s.CreateUser(ctx, "15550016001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Eleven private matches sort ahead of the public one, filling the member
+	// arm's page of ten so the public channel falls outside it.
+	for i := range 11 {
+		if _, err := s.CreateChannel(ctx, caller.ID, fmt.Sprintf("Beyondpage Private %d", i), "About", false); err != nil {
+			t.Fatalf("create private channel %d: %v", i, err)
+		}
+	}
+	pub, err := s.CreateChannel(ctx, caller.ID, "Beyondpage Public", "About", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimChannelUsernameForTest(s, pub.ID, "beyondpagepublic"); err != nil {
+		t.Fatal(err)
+	}
+
+	found := searchChannels(t, s, caller.ID, "Beyondpage", 10)
+
+	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != pub.ID {
+		t.Fatalf("Results channels = %v, want [%d]", got, pub.ID)
+	}
+	var rendered *tg.Channel
+	for _, c := range found.Chats {
+		if channel, ok := c.(*tg.Channel); ok && channel.ID == pub.ID {
+			rendered = channel
+		}
+	}
+	if rendered == nil {
+		t.Fatalf("channel %d missing from Chats", pub.ID)
+	}
+	if rendered.Left || !rendered.Creator {
+		t.Errorf("Chats for the caller's own channel = Left %v Creator %v, want Left false Creator true",
+			rendered.Left, rendered.Creator)
+	}
+}
+
+// TestContactsSearchBannedMemberRendersAsNonMember proves the membership lookup
+// that feeds the rendering carries the ban with it: a banned member is a
+// non-member for the public channel they can still discover, so the public view
+// is the right one and the ban is not cosmetic in the rendering either.
+func TestContactsSearchBannedMemberRendersAsNonMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	banned, err := s.CreateUser(ctx, "15550017001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	creator, err := s.CreateUser(ctx, "15550017002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "Bannedrender Club", "About", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "bannedrenderclub"); err != nil {
+		t.Fatal(err)
+	}
+	joinChannelByInvite(t, s, ch, banned.ID)
+	if err := s.SetChannelBan(ctx, ch.ID, creator.ID, banned.ID, nil, true); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+
+	found := searchChannels(t, s, banned.ID, "Bannedrender", 10)
+
+	if got := channelPeerIDs(found.MyResults); len(got) != 0 {
+		t.Fatalf("banned caller MyResults channels = %v, want none", got)
+	}
+	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != ch.ID {
+		t.Fatalf("Results channels = %v, want [%d] — the channel is still public", got, ch.ID)
+	}
+	rendered, ok := found.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("Chats[0] type = %T, want *tg.Channel", found.Chats[0])
+	}
+	if !rendered.Left {
+		t.Error("Chats Left = false for a banned caller, want the public view")
+	}
+}
+
 // TestContactsSearchLimitIsPerVector proves the shared budget is MyResults's
 // own: the public discovery arm is a separate vector with its own limit, and
 // capping them jointly would let the caller's memberships shrink public
