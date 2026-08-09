@@ -57,6 +57,10 @@ type handlers struct {
 	rateLimitAddChatUser store.RateLimitConfig
 	// rateLimitCreateChannel limits channels.createChannel per account.
 	rateLimitCreateChannel store.RateLimitConfig
+	// rateLimitSearchMessages limits messages.search per account.
+	rateLimitSearchMessages store.RateLimitConfig
+	// rateLimitSearchContacts limits contacts.search per account.
+	rateLimitSearchContacts store.RateLimitConfig
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -107,21 +111,23 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		panic("api: nil peer hash deriver")
 	}
 	h := &handlers{
-		peers:                  peers,
-		store:                  s,
-		cfg:                    cfg,
-		dcID:                   dcID,
-		log:                    log,
-		srp:                    srp.NewChallengeStore(srp.DefaultTTL),
-		logLoginCodes:          logLoginCodes,
-		maxFileBytes:           maxFileBytes,
-		blobs:                  blobs,
-		maxUserStorageBytes:    maxUserStorageBytes,
-		downloads:              map[int64]bool{},
-		rateLimitMessageSend:   rateLimits.MessageSend,
-		rateLimitCreateChat:    rateLimits.CreateChat,
-		rateLimitAddChatUser:   rateLimits.AddChatUser,
-		rateLimitCreateChannel: rateLimits.CreateChannel,
+		peers:                   peers,
+		store:                   s,
+		cfg:                     cfg,
+		dcID:                    dcID,
+		log:                     log,
+		srp:                     srp.NewChallengeStore(srp.DefaultTTL),
+		logLoginCodes:           logLoginCodes,
+		maxFileBytes:            maxFileBytes,
+		blobs:                   blobs,
+		maxUserStorageBytes:     maxUserStorageBytes,
+		downloads:               map[int64]bool{},
+		rateLimitMessageSend:    rateLimits.MessageSend,
+		rateLimitCreateChat:     rateLimits.CreateChat,
+		rateLimitAddChatUser:    rateLimits.AddChatUser,
+		rateLimitCreateChannel:  rateLimits.CreateChannel,
+		rateLimitSearchMessages: rateLimits.SearchMessages,
+		rateLimitSearchContacts: rateLimits.SearchContacts,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
