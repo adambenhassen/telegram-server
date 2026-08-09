@@ -30,17 +30,18 @@ import (
 //  4. Remove the password; a fresh login no longer prompts.
 func TestCloudPassword2FA(t *testing.T) {
 	t.Parallel()
-	// Budget derived by measurement, not chosen round. This test is twelve
-	// sequential fresh-session logins (RSA+DH handshake, then SRP) under -race:
-	// the time goes on cryptography the test has to do, not on a wait that
-	// could be tightened, so wall time scales with how little of the host it
-	// gets. Measured on the 4-vCPU host, busy loops standing in for foreign
-	// suites (one e2e suite saturates roughly four threads; 8-12 loops is the
-	// two-to-three foreign suites this has actually been seen failing under):
+	// Budget derived by measurement, not chosen round. This test is eight
+	// sequential fresh-session logins (RSA+DH handshake, then SRP) plus three
+	// reconnects on the persisted key, all under -race: the time goes on
+	// cryptography the test has to do, not on a wait that could be tightened,
+	// so wall time scales with how little of the host it gets. Measured on the
+	// 4-vCPU host, busy loops standing in for foreign suites (one e2e suite
+	// saturates roughly four threads; 8-12 loops is the two-to-three foreign
+	// suites this has actually been seen failing under):
 	//
 	//	quiet host      68s, 79s, 81s
 	//	 4 busy loops   176s
-	//	 8 busy loops   147s, 160s, 209s, 210s, 216s, 278s, and one run past 180s
+	//	 8 busy loops   147s, 160s, 209s, 210s, 216s, 278s
 	//	12 busy loops   220s
 	//	16 busy loops   337s
 	//
@@ -62,10 +63,18 @@ func TestCloudPassword2FA(t *testing.T) {
 	fail := func(t *testing.T, step, detail string) {
 		t.Helper()
 		if ctx.Err() != nil {
-			t.Fatalf("%s: %s budget exhausted after %s: %v", step, budget, time.Since(started).Round(time.Second), ctx.Err())
+			t.Fatalf("%s: %s budget exhausted after %s: %v: %s", step, budget, time.Since(started).Round(time.Second), ctx.Err(), detail)
 		}
 		t.Fatalf("%s: %s", step, detail)
 	}
+
+	// rejected reports whether err is the server refusing the SRP proof
+	// (PASSWORD_HASH_INVALID, which gotd converts to ErrPasswordInvalid) rather
+	// than the budget expiring mid-login. The two rejection checks below are the
+	// only ones satisfied by an error instead of by its absence, so without this
+	// an expiry passes them silently and is then reported against a later step
+	// than the one that actually ran out.
+	rejected := func(err error) bool { return errors.Is(err, auth.ErrPasswordInvalid) }
 
 	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
 	if err != nil {
@@ -171,8 +180,8 @@ func TestCloudPassword2FA(t *testing.T) {
 		fail(t, "phase 2: login with correct password", fmt.Sprintf("authed=%v err=%v", authed, err))
 	}
 	// Wrong password is rejected.
-	if authed, err := flowLogin(t, "wrongpw"); err == nil || authed {
-		fail(t, "phase 2: login with wrong password", fmt.Sprintf("should have failed: authed=%v err=%v", authed, err))
+	if authed, err := flowLogin(t, "wrongpw"); authed || !rejected(err) {
+		fail(t, "phase 2: login with wrong password", fmt.Sprintf("want ErrPasswordInvalid: authed=%v err=%v", authed, err))
 	}
 
 	// --- Phase 3: change the password. ---
@@ -185,8 +194,8 @@ func TestCloudPassword2FA(t *testing.T) {
 	if authed, err := flowLogin(t, "pw2"); err != nil || !authed {
 		fail(t, "phase 3: login with new password", fmt.Sprintf("authed=%v err=%v", authed, err))
 	}
-	if authed, err := flowLogin(t, "pw1"); err == nil || authed {
-		fail(t, "phase 3: login with old password", fmt.Sprintf("should have failed: authed=%v err=%v", authed, err))
+	if authed, err := flowLogin(t, "pw1"); authed || !rejected(err) {
+		fail(t, "phase 3: login with old password", fmt.Sprintf("want ErrPasswordInvalid: authed=%v err=%v", authed, err))
 	}
 
 	// --- Phase 3b: an email-only update must NOT disable 2FA. ---
