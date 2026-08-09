@@ -36,6 +36,236 @@ func channelPeerIDs(peers []tg.PeerClass) []int64 {
 	return out
 }
 
+// userPeerIDs extracts the user ids from a peer vector, ignoring channels.
+func userPeerIDs(peers []tg.PeerClass) []int64 {
+	var out []int64
+	for _, p := range peers {
+		if u, ok := p.(*tg.PeerUser); ok {
+			out = append(out, u.UserID)
+		}
+	}
+	return out
+}
+
+// seedMixedMyResults gives the caller users users it has a dialog with and
+// channels channels it created, all matching token, so both MyResults arms have
+// candidates. Both id slices come back in creation order, which is ascending id
+// order — the order the arms are required to page in.
+func seedMixedMyResults(
+	t *testing.T, s *store.Store, dsn string, callerID int64, phonePrefix, token string, users, channels int,
+) (userIDs, channelIDs []int64) {
+	t.Helper()
+	ctx := context.Background()
+	for i := range users {
+		phone := fmt.Sprintf("%s%03d", phonePrefix, i)
+		if _, err := s.CreateUser(ctx, phone); err != nil {
+			t.Fatalf("create user %d: %v", i, err)
+		}
+		partner, ok, err := s.UserByPhone(ctx, phone)
+		if err != nil || !ok {
+			t.Fatalf("load user %d: ok=%v err=%v", i, ok, err)
+		}
+		if err := api.SetUserFirstNameForTest(dsn, partner.ID, token); err != nil {
+			t.Fatalf("set name %d: %v", i, err)
+		}
+		if _, err := api.SendMessageForTest(s, callerID, &tg.MessagesSendMessageRequest{
+			Peer:     api.InputPeerUser(callerID, partner.ID),
+			Message:  "hello",
+			RandomID: int64(i + 1),
+		}); err != nil {
+			t.Fatalf("send message %d: %v", i, err)
+		}
+		userIDs = append(userIDs, partner.ID)
+	}
+	for i := range channels {
+		// The caller creates the channel, so it holds an unbanned role-2 row.
+		ch, err := s.CreateChannel(ctx, callerID, fmt.Sprintf("%s Channel %d", token, i), "About", false)
+		if err != nil {
+			t.Fatalf("create channel %d: %v", i, err)
+		}
+		channelIDs = append(channelIDs, ch.ID)
+	}
+	return userIDs, channelIDs
+}
+
+// TestContactsSearchMyResultsSharedLimitDefault proves the two MyResults arms
+// share one limit budget at the default limit. Each arm is capped at the limit
+// on its own, so a mixed match returned up to twice the limit before this was
+// one budget — the M13 contract is a maximum on MyResults, not per arm.
+func TestContactsSearchMyResultsSharedLimitDefault(t *testing.T) {
+	t.Parallel()
+	s, dsn := openStoreDSN(t)
+
+	caller, err := s.CreateUser(context.Background(), "15550010001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, wantChannels := seedMixedMyResults(t, s, dsn, caller.ID, "1555001010", "Sharedtoken", 6, 6)
+
+	found := searchChannels(t, s, caller.ID, "Sharedtoken", 0)
+
+	if len(found.MyResults) != 10 {
+		t.Fatalf("MyResults len = %d, want 10 (the default limit, shared across both arms)", len(found.MyResults))
+	}
+	// Users first, then channels: the order is what makes truncation
+	// deterministic, so it is pinned rather than left to the arms.
+	if got := len(userPeerIDs(found.MyResults)); got != 6 {
+		t.Errorf("MyResults user peers = %d, want 6", got)
+	}
+	// The four channels kept are the four lowest ids, not an arbitrary four:
+	// both arms page in id order, which is what fixes who survives truncation.
+	gotChannels := channelPeerIDs(found.MyResults)
+	if len(gotChannels) != 4 {
+		t.Fatalf("MyResults channel peers = %v, want 4 (the remaining budget)", gotChannels)
+	}
+	for i, want := range wantChannels[:4] {
+		if gotChannels[i] != want {
+			t.Errorf("MyResults channel peer %d = %d, want %d (lowest ids first)", i, gotChannels[i], want)
+		}
+	}
+	for i, p := range found.MyResults {
+		if _, isUser := p.(*tg.PeerUser); isUser && i >= 6 {
+			t.Errorf("MyResults[%d] is a user peer after the channel peers began", i)
+		}
+	}
+	// Every named channel peer must be hydrated in Chats, and no more.
+	if len(found.Chats) != 4 {
+		t.Errorf("Chats len = %d, want 4 (only the channels actually named)", len(found.Chats))
+	}
+	if len(found.Users) != 6 {
+		t.Errorf("Users len = %d, want 6", len(found.Users))
+	}
+}
+
+// TestContactsSearchMyResultsSharedLimitCap proves the shared budget is the
+// capped limit, not the requested one, when both arms have candidates.
+func TestContactsSearchMyResultsSharedLimitCap(t *testing.T) {
+	t.Parallel()
+	s, dsn := openStoreDSN(t)
+
+	caller, err := s.CreateUser(context.Background(), "15550011001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedMixedMyResults(t, s, dsn, caller.ID, "1555001110", "Captoken", 30, 30)
+
+	found := searchChannels(t, s, caller.ID, "Captoken", 999)
+
+	if len(found.MyResults) != 50 {
+		t.Fatalf("MyResults len = %d, want 50 (the cap, shared across both arms)", len(found.MyResults))
+	}
+	if got := len(userPeerIDs(found.MyResults)); got != 30 {
+		t.Errorf("MyResults user peers = %d, want 30", got)
+	}
+	if got := len(channelPeerIDs(found.MyResults)); got != 20 {
+		t.Errorf("MyResults channel peers = %d, want 20 (the remaining budget)", got)
+	}
+}
+
+// TestContactsSearchMyResultsBudgetExhaustedByUsers proves the budget is spent
+// in one order: users fill it first, and the channel arm is squeezed out rather
+// than appended past the limit.
+func TestContactsSearchMyResultsBudgetExhaustedByUsers(t *testing.T) {
+	t.Parallel()
+	s, dsn := openStoreDSN(t)
+
+	caller, err := s.CreateUser(context.Background(), "15550012001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedMixedMyResults(t, s, dsn, caller.ID, "1555001210", "Fulltoken", 12, 3)
+
+	found := searchChannels(t, s, caller.ID, "Fulltoken", 10)
+
+	if len(found.MyResults) != 10 {
+		t.Fatalf("MyResults len = %d, want 10", len(found.MyResults))
+	}
+	if got := channelPeerIDs(found.MyResults); len(got) != 0 {
+		t.Errorf("MyResults channel peers = %v, want none — users filled the budget", got)
+	}
+	if len(found.Chats) != 0 {
+		t.Errorf("Chats len = %d, want 0 — no channel was named", len(found.Chats))
+	}
+}
+
+// TestContactsSearchMyResultsDeterministic pins which rows survive truncation,
+// not merely that successive calls agree. 14 matching users against a budget of
+// 10 means four are dropped, and the ten kept must be the ten lowest ids.
+//
+// Honest limit of this test: at this data size the plan returns rows in id
+// order with or without the ORDER BY on the user arm, so it cannot falsify the
+// ordering — dropping the ORDER BY leaves it green. The ORDER BY is what makes
+// the surviving set a contract rather than a property of the current plan, and
+// this test states the contract; it is the shared budget below that the suite
+// actually proves by failing without it.
+func TestContactsSearchMyResultsDeterministic(t *testing.T) {
+	t.Parallel()
+	s, dsn := openStoreDSN(t)
+
+	caller, err := s.CreateUser(context.Background(), "15550013001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantUsers, _ := seedMixedMyResults(t, s, dsn, caller.ID, "1555001310", "Stabletoken", 14, 4)
+
+	for call := range 5 {
+		found := searchChannels(t, s, caller.ID, "Stabletoken", 10)
+		if len(found.MyResults) != 10 {
+			t.Fatalf("call %d: MyResults len = %d, want 10", call, len(found.MyResults))
+		}
+		got := userPeerIDs(found.MyResults)
+		if len(got) != 10 {
+			t.Fatalf("call %d: MyResults user peers = %d, want 10 (users fill the budget)", call, len(got))
+		}
+		for i, want := range wantUsers[:10] {
+			if got[i] != want {
+				t.Fatalf("call %d: MyResults user peer %d = %d, want %d (lowest ids first)",
+					call, i, got[i], want)
+			}
+		}
+	}
+}
+
+// TestContactsSearchLimitIsPerVector proves the shared budget is MyResults's
+// own: the public discovery arm is a separate vector with its own limit, and
+// capping them jointly would let the caller's memberships shrink public
+// discovery.
+func TestContactsSearchLimitIsPerVector(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+
+	caller, err := s.CreateUser(ctx, "15550014001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.CreateUser(ctx, "15550014002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The caller fills its own MyResults budget with users and one channel.
+	seedMixedMyResults(t, s, dsn, caller.ID, "1555001410", "Vectortoken", 10, 1)
+	// Someone else owns three public channels matching the same token.
+	for i := range 3 {
+		ch, err := s.CreateChannel(ctx, other.ID, fmt.Sprintf("Vectortoken Public %d", i), "About", false)
+		if err != nil {
+			t.Fatalf("create public channel %d: %v", i, err)
+		}
+		if err := api.ClaimChannelUsernameForTest(s, ch.ID, fmt.Sprintf("vectorpub%d", i)); err != nil {
+			t.Fatalf("claim username %d: %v", i, err)
+		}
+	}
+
+	found := searchChannels(t, s, caller.ID, "Vectortoken", 10)
+
+	if len(found.MyResults) != 10 {
+		t.Errorf("MyResults len = %d, want 10", len(found.MyResults))
+	}
+	if got := channelPeerIDs(found.Results); len(got) != 3 {
+		t.Errorf("Results channels = %v, want 3 — Results has its own limit", got)
+	}
+}
+
 // TestContactsSearchPublicChannelByTitle proves a non-member finds a channel
 // with a public username by its title, in Results, carrying the access_hash
 // derived for that caller — the same one contacts.resolveUsername hands them,

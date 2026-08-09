@@ -170,7 +170,8 @@ func (h *handlers) channelToTLPublic(c store.Channel, participants int64, viewer
 // Only authorized callers may use it.
 //
 // An empty query returns SEARCH_QUERY_EMPTY. The limit defaults to 10 when
-// zero and is capped at 50; it bounds each arm of the search separately.
+// zero and is capped at 50. It bounds each returned vector: MyResults spends
+// one budget across the two arms it unions, and Results has its own.
 //
 // Three arms, each with its own predicate and none relaxed to match another:
 //
@@ -243,6 +244,25 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	// "no such channel" must not be three answers.
 	if len(contacts) == 0 && len(myChannels) == 0 && len(publicChannels) == 0 {
 		return &tg.ContactsFound{}, nil
+	}
+
+	// MyResults unions two arms, so the limit is one budget across both rather
+	// than one each: each store call is capped at limit on its own, and
+	// concatenating them would return up to twice what the caller asked for and
+	// twice what M13 promised. Users are taken first and channels fill what is
+	// left, which is a rule rather than a preference — both arms come back
+	// ordered by id, so the surviving page is the same on every identical
+	// search. The cost is that a caller whose contacts already fill the budget
+	// sees none of their channels for that query; raising the limit is the
+	// client's lever, and it is capped at 50.
+	//
+	// This budget is MyResults's alone. Results is a separate vector with its
+	// own limit: sharing one budget across both would let the caller's own
+	// memberships shrink public discovery, which is caller-independent by
+	// construction.
+	budget := max(int(limit)-len(contacts), 0)
+	if len(myChannels) > budget {
+		myChannels = myChannels[:budget]
 	}
 
 	myResults := make([]tg.PeerClass, 0, len(contacts)+len(myChannels))
