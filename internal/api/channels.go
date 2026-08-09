@@ -87,6 +87,10 @@ func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) 
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
+	// Rate limit before any write.
+	if err := h.checkRateLimit(r, "create_channel", h.rateLimitCreateChannel); err != nil {
+		return nil, err
+	}
 	title, err := chatTitle(req.Title)
 	if err != nil {
 		return nil, err

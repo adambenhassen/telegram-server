@@ -68,6 +68,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.RateLimits.AddChatUser.Window != 24*time.Hour {
 		t.Errorf("AddChatUser window = %v, want 24h", cfg.RateLimits.AddChatUser.Window)
 	}
+	if cfg.RateLimits.CreateChannel.Limit != 20 {
+		t.Errorf("CreateChannel limit = %d, want 20", cfg.RateLimits.CreateChannel.Limit)
+	}
+	if cfg.RateLimits.CreateChannel.Window != 24*time.Hour {
+		t.Errorf("CreateChannel window = %v, want 24h", cfg.RateLimits.CreateChannel.Window)
+	}
 }
 
 func TestLoadBlobDir(t *testing.T) {
@@ -513,6 +519,26 @@ func TestLoadRateLimitEnv(t *testing.T) {
 	}
 	if cfg.RateLimits.AddChatUser.Limit != 50 {
 		t.Errorf("AddChatUser limit = %d, want 50", cfg.RateLimits.AddChatUser.Limit)
+	}
+
+	// Override create channel limit.
+	t.Setenv("TG_RATE_LIMIT_CREATE_CHANNEL", "7")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.CreateChannel.Limit != 7 {
+		t.Errorf("CreateChannel limit = %d, want 7", cfg.RateLimits.CreateChannel.Limit)
+	}
+
+	// Override create channel window.
+	t.Setenv("TG_RATE_LIMIT_CREATE_CHANNEL_WINDOW", "12h")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.CreateChannel.Window != 12*time.Hour {
+		t.Errorf("CreateChannel window = %v, want 12h", cfg.RateLimits.CreateChannel.Window)
 	}
 
 	// Zero disables enforcement.
