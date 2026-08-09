@@ -44,11 +44,12 @@ func MaxFileParts() int {
 
 func testHandlers(s *store.Store) *handlers {
 	return &handlers{
-		store:        s,
-		log:          slog.New(slog.DiscardHandler),
-		maxFileBytes: TestMaxFileBytes,
-		downloads:    map[int64]bool{},
-		peers:        pgtest.PeerDeriver(),
+		store:                s,
+		log:                  slog.New(slog.DiscardHandler),
+		maxFileBytes:         TestMaxFileBytes,
+		downloads:            map[int64]bool{},
+		peers:                pgtest.PeerDeriver(),
+		rateLimitMessageSend: store.RateLimitConfig{},
 	}
 }
 
@@ -196,6 +197,11 @@ func InputPeerUser(viewerID, peerID int64) *tg.InputPeerUser {
 	return &tg.InputPeerUser{UserID: peerID, AccessHash: DeriveUserHash(viewerID, peerID)}
 }
 
+// InputPeerChat builds a valid InputPeerChat for chatID.
+func InputPeerChat(viewerID, chatID int64) *tg.InputPeerChat {
+	return &tg.InputPeerChat{ChatID: chatID}
+}
+
 // InputUser builds a valid InputUser for peerID as seen by viewerID.
 func InputUser(viewerID, peerID int64) *tg.InputUser {
 	return &tg.InputUser{UserID: peerID, AccessHash: DeriveUserHash(viewerID, peerID)}
@@ -338,6 +344,45 @@ func SendMessageForTest(s *store.Store, userID int64, req *tg.MessagesSendMessag
 	return testHandlers(s).handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SendMessageForTestWithLimits encodes req and invokes handleSendMessage for the
+// caller with a custom message send rate limit config.
+func SendMessageForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMessageSend = rateLimit
+	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SendMediaForTestWithLimits encodes req and invokes handleSendMedia with a
+// custom message send rate limit config.
+func SendMediaForTestWithLimits(
+	s *store.Store, userID int64, blobs blob.Store, maxUserStorageBytes int64,
+	rateLimit store.RateLimitConfig, req *tg.MessagesSendMediaRequest,
+) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.blobs, h.maxUserStorageBytes, h.rateLimitMessageSend = blobs, maxUserStorageBytes, rateLimit
+	return h.handleSendMedia(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// ForwardMessagesForTestWithLimits encodes req and invokes handleForwardMessages
+// with a custom message send rate limit config.
+func ForwardMessagesForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesForwardMessagesRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMessageSend = rateLimit
+	return h.handleForwardMessages(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SendMediaForTest encodes req and invokes handleSendMedia for the caller,
 // against blobs and the account-lifetime storage cap maxUserStorageBytes.
 func SendMediaForTest(
@@ -458,6 +503,18 @@ func SendEncryptedMessageForTest(s *store.Store, userID int64, req *tg.MessagesS
 		return nil, err
 	}
 	return testHandlers(s).handleSendEncryptedMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SendEncryptedMessageForTestWithLimits encodes req and invokes
+// handleSendEncryptedMessage with a custom message send rate limit config.
+func SendEncryptedMessageForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSendEncryptedRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMessageSend = rateLimit
+	return h.handleSendEncryptedMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // DHPrime returns the group modulus, so a test can build g_a values that sit

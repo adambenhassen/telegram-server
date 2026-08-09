@@ -334,6 +334,23 @@ func (h *handlers) handleSendEncryptedMessage(r *mtproto.Request) (bin.Encoder, 
 	// 6. Derive recipient (never from the request).
 	recipientID := chat.Other(r.UserID)
 
+	// Check for a transport retry before the rate limit.
+	if req.RandomID != 0 {
+		if existing, ok, err := h.store.EncryptedMessageByRandomID(r.Ctx, recipientID, req.RandomID); err == nil && ok {
+			// Retry: return the stored event without rate-limiting or writing.
+			return &tg.MessagesSentEncryptedMessage{
+				Date: int(existing.Date.Unix()),
+			}, nil
+		} else if err != nil {
+			return nil, err
+		}
+	}
+
+	// Rate limit: new encrypted message, consume a token.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+		return nil, err
+	}
+
 	event, dup, err := h.store.SendEncryptedMessage(r.Ctx, store.EncryptedSend{
 		RecipientID: recipientID,
 		ChatID:      chatID,
@@ -343,6 +360,8 @@ func (h *handlers) handleSendEncryptedMessage(r *mtproto.Request) (bin.Encoder, 
 	if err != nil {
 		return nil, err
 	}
+	// Only notify when the event is new. A duplicate means another caller
+	// already committed the same random_id and fired the push.
 	if !dup {
 		h.notifyEncryptedMsg(r.Ctx, recipientID, event.Qts)
 	}

@@ -72,6 +72,9 @@ func run(log *slog.Logger) error {
 	sweepWG.Go(func() {
 		sweepExpiredUploadParts(sweepCtx, st, cfg.UploadPartTTL, log)
 	})
+	sweepWG.Go(func() {
+		sweepExpiredRateLimits(sweepCtx, st, log)
+	})
 	defer func() {
 		cancelSweep()
 		sweepWG.Wait()
@@ -95,7 +98,7 @@ func run(log *slog.Logger) error {
 	}
 
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
-	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers)
+	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits)
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
 	}
@@ -187,6 +190,28 @@ func sweepExpiredUploadParts(ctx context.Context, st *store.Store, ttl time.Dura
 				continue
 			}
 			log.Info("swept expired upload parts", "deleted", n)
+		}
+	}
+}
+
+// sweepExpiredRateLimits periodically deletes rate-limit rows whose per-row
+// expiry deadline has passed. This is what bounds the rate_limits table: rows
+// are only created by the limiter (not on every request) and only deleted by
+// this sweep.
+func sweepExpiredRateLimits(ctx context.Context, st *store.Store, log *slog.Logger) {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := st.SweepExpiredRateLimits(ctx)
+			if err != nil {
+				log.Error("sweep expired rate limits", "err", err)
+				continue
+			}
+			log.Info("swept expired rate limits", "deleted", n)
 		}
 	}
 }

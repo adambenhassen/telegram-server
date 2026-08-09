@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 // Config holds server configuration.
@@ -58,6 +59,20 @@ type Config struct {
 	// within minutes, and the TTL is the term that makes worst-case retained
 	// bytes finite at accounts x cap.
 	UploadPartTTL time.Duration
+	// RateLimits holds the per-surface rate-limit configurations. Zero limit
+	// disables enforcement for that surface.
+	RateLimits RateLimitsConfig
+}
+
+// RateLimitsConfig holds the rate-limit parameters for each RPC surface.
+type RateLimitsConfig struct {
+	// MessageSend limits all client-visible message sends (1:1, chat, channel
+	// post, media send, forward) to one shared budget per account.
+	MessageSend store.RateLimitConfig
+	// CreateChat limits messages.createChat per account.
+	CreateChat store.RateLimitConfig
+	// AddChatUser limits messages.addChatUser per account.
+	AddChatUser store.RateLimitConfig
 }
 
 // MaxFileBytesLimit is the ceiling on TG_MAX_FILE_BYTES. It is a bound on the
@@ -128,6 +143,55 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_LOG_LOGIN_CODES must be a boolean")
 		}
 		cfg.LogLoginCodes = on
+	}
+	// Rate-limit defaults: 60 sends per 60s, 20 chat creates per 24h, 120 member
+	// adds per 24h. Zero or unset disables enforcement for that surface.
+	cfg.RateLimits = RateLimitsConfig{
+		MessageSend: store.RateLimitConfig{Limit: 60, Window: 60 * time.Second},
+		CreateChat:  store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
+		AddChatUser: store.RateLimitConfig{Limit: 120, Window: 24 * time.Hour},
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_SEND"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SEND must be an integer")
+		}
+		cfg.RateLimits.MessageSend.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_SEND_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SEND_WINDOW must be a duration")
+		}
+		cfg.RateLimits.MessageSend.Window = d
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_CREATE_CHAT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_CREATE_CHAT must be an integer")
+		}
+		cfg.RateLimits.CreateChat.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_CREATE_CHAT_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_CREATE_CHAT_WINDOW must be a duration")
+		}
+		cfg.RateLimits.CreateChat.Window = d
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_ADD_CHAT_USER"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_ADD_CHAT_USER must be an integer")
+		}
+		cfg.RateLimits.AddChatUser.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_ADD_CHAT_USER_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_ADD_CHAT_USER_WINDOW must be a duration")
+		}
+		cfg.RateLimits.AddChatUser.Window = d
 	}
 	advertiseHost, advertisePort, err := advertiseAddr(os.Getenv("TG_ADVERTISE_ADDR"), cfg.ListenAddr)
 	if err != nil {

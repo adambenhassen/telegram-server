@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adambenhassen/telegram-server/internal/config"
+
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
@@ -55,7 +57,7 @@ func TestClientLogin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
 	}
-	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver())
+	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{})
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
 
 	var lc net.ListenConfig
