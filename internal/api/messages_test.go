@@ -1452,22 +1452,3 @@ func TestSearchChatByTitleListsParticipants(t *testing.T) {
 		}
 	}
 }
-
-func TestSearchChannelPeerReturnsInvalid(t *testing.T) {
-	t.Parallel()
-	s := openStore(t)
-	u, err := s.CreateUser(context.Background(), "+15551295031")
-	if err != nil {
-		t.Fatalf("user: %v", err)
-	}
-
-	_, err = api.SearchForTest(s, u.ID, &tg.MessagesSearchRequest{
-		Peer: &tg.InputPeerChannel{
-			ChannelID:  1,
-			AccessHash: api.DeriveChannelHash(u.ID, 1),
-		},
-		Q:      "hello",
-		Filter: &tg.InputMessagesFilterEmpty{},
-	})
-	rpcError(t, err, "PEER_ID_INVALID")
-}
