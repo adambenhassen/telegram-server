@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net/netip"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -24,6 +25,20 @@ var (
 	NewSentCode    = newSentCode
 	SelfRevocation = selfRevocation
 )
+
+// SendCodeForTest invokes handleSendCode for a request arriving from addr,
+// against the per-IP limits given. The address is the one the serve loop reads
+// off the socket in production, so a test supplies it the same way a connection
+// would rather than through anything in the request body.
+func SendCodeForTest(s *store.Store, addr netip.Addr, limits store.SendCodeIPLimits, phone string) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := (&tg.AuthSendCodeRequest{PhoneNumber: phone}).Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitSendCodeIP = limits
+	return h.handleSendCode(&mtproto.Request{Ctx: context.Background(), ClientAddr: addr, Buf: &buf})
+}
 
 // LogIssuedCodeForTest drives the gated login-code log line for the external
 // api_test package, without needing a store or a database.

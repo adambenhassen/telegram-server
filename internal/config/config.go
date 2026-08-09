@@ -62,7 +62,25 @@ type Config struct {
 	// RateLimits holds the per-surface rate-limit configurations. Zero limit
 	// disables enforcement for that surface.
 	RateLimits RateLimitsConfig
+	// ClientAddrTrust names where the address a request is attributed to comes
+	// from. Only the connection's own peer address is supported today.
+	ClientAddrTrust ClientAddrTrust
 }
+
+// ClientAddrTrust names the source a client address is taken from.
+type ClientAddrTrust string
+
+// ClientAddrSocket attributes every request to the peer address of the socket
+// it arrived on. It is the only source that cannot be influenced by the client:
+// MTProto carries no address field, and any header a future one gained would be
+// forgeable by whoever sends it.
+const ClientAddrSocket ClientAddrTrust = "socket"
+
+// clientAddrTrustValues lists every supported value, for the startup error. A
+// load-balancer-supplied address is a separate mode and lands with its own
+// listener; until it does, an operator naming it must be told plainly rather
+// than silently served socket addresses that all belong to the balancer.
+var clientAddrTrustValues = []ClientAddrTrust{ClientAddrSocket}
 
 // RateLimitsConfig holds the rate-limit parameters for each RPC surface.
 type RateLimitsConfig struct {
@@ -79,6 +97,10 @@ type RateLimitsConfig struct {
 	SearchMessages store.RateLimitConfig
 	// SearchContacts limits contacts.search per account.
 	SearchContacts store.RateLimitConfig
+	// SendCodeIP limits auth.sendCode per client network. It is keyed on the
+	// connection's address rather than an account because the surface is
+	// unauthenticated: there is no account yet to hold a budget.
+	SendCodeIP store.SendCodeIPLimits
 }
 
 // MaxFileBytesLimit is the ceiling on TG_MAX_FILE_BYTES. It is a bound on the
@@ -152,8 +174,9 @@ func Load(log *slog.Logger) (Config, error) {
 	}
 	// Rate-limit defaults: 60 sends per 60s, 20 chat creates per 24h, 120 member
 	// adds per 24h, 20 channel creates per 24h, 300 message searches per hour,
-	// 300 contacts searches per hour. Zero or unset disables enforcement for
-	// that surface.
+	// 300 contacts searches per hour, and per client network 10 sendCode calls
+	// per hour across at most 20 distinct phone numbers per 24h. Zero or unset
+	// disables enforcement for that surface.
 	cfg.RateLimits = RateLimitsConfig{
 		MessageSend:    store.RateLimitConfig{Limit: 60, Window: 60 * time.Second},
 		CreateChat:     store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
@@ -161,6 +184,10 @@ func Load(log *slog.Logger) (Config, error) {
 		CreateChannel:  store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
 		SearchMessages: store.RateLimitConfig{Limit: 300, Window: time.Hour},
 		SearchContacts: store.RateLimitConfig{Limit: 300, Window: time.Hour},
+		SendCodeIP: store.SendCodeIPLimits{
+			Calls:  store.RateLimitConfig{Limit: 10, Window: time.Hour},
+			Phones: store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
+		},
 	}
 	if v := os.Getenv("TG_RATE_LIMIT_SEND"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -246,6 +273,39 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.RateLimits.SearchContacts.Window = d
 	}
+	if v := os.Getenv("TG_RATE_LIMIT_SEND_CODE_IP"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SEND_CODE_IP must be an integer")
+		}
+		cfg.RateLimits.SendCodeIP.Calls.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_SEND_CODE_IP_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SEND_CODE_IP_WINDOW must be a duration")
+		}
+		cfg.RateLimits.SendCodeIP.Calls.Window = d
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_SEND_CODE_IP_PHONES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SEND_CODE_IP_PHONES must be an integer")
+		}
+		cfg.RateLimits.SendCodeIP.Phones.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_SEND_CODE_IP_PHONES_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SEND_CODE_IP_PHONES_WINDOW must be a duration")
+		}
+		cfg.RateLimits.SendCodeIP.Phones.Window = d
+	}
+	trust, err := clientAddrTrust(os.Getenv("TG_CLIENT_ADDR_TRUST"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ClientAddrTrust = trust
 	advertiseHost, advertisePort, err := advertiseAddr(os.Getenv("TG_ADVERTISE_ADDR"), cfg.ListenAddr)
 	if err != nil {
 		return Config{}, err
@@ -260,6 +320,52 @@ func Load(log *slog.Logger) (Config, error) {
 	}
 	cfg.AuthKeyEncKey = encKey
 	return cfg, nil
+}
+
+// clientAddrTrust resolves the client-address source. An unset value is the
+// socket, which is the only one implemented; anything else is refused by name
+// rather than falling back, because a silent fallback to socket addresses
+// behind a load balancer would key every client in the world to one bucket.
+func clientAddrTrust(raw string) (ClientAddrTrust, error) {
+	if raw == "" {
+		return ClientAddrSocket, nil
+	}
+	for _, v := range clientAddrTrustValues {
+		if ClientAddrTrust(raw) == v {
+			return v, nil
+		}
+	}
+	names := make([]string, len(clientAddrTrustValues))
+	for i, v := range clientAddrTrustValues {
+		names[i] = string(v)
+	}
+	return "", fmt.Errorf("TG_CLIENT_ADDR_TRUST must be one of: %s", strings.Join(names, ", "))
+}
+
+// WarnClientAddrTrust states the operational assumption socket mode makes,
+// once, at startup.
+//
+// It is not decoration. Per-IP limits in socket mode assume one peer address is
+// one client, and the same collapse breaks that from either end. In front of
+// the server, a proxy or an L4 load balancer makes every peer address the
+// balancer's, so one bucket holds every client on earth and the per-IP cap
+// becomes a global cap that locks everybody out at the same moment. In front of
+// the clients, a carrier NAT puts thousands of mobile subscribers behind one
+// IPv4 address, so the whole carrier spends a single key's budget and the 21st
+// distinct number from it in a day is refused for up to a day.
+//
+// Both are accepted risks until an address source that can see past them lands,
+// and this line is the whole of the mitigation: it is what tells an operator
+// where the support tickets will come from before they arrive. Silent when no
+// per-IP limit is enabled, since nothing is then keyed on an address at all.
+func (c Config) WarnClientAddrTrust(log *slog.Logger) {
+	if c.ClientAddrTrust != ClientAddrSocket || !c.RateLimits.SendCodeIP.Enabled() {
+		return
+	}
+	log.Warn("per-IP limits are keyed on each connection's own peer address",
+		"trust", string(c.ClientAddrTrust),
+		"assumes", "one peer address is one client, reaching this process directly",
+		"risk", "behind a proxy or L4 load balancer every client shares one bucket and the per-IP cap becomes a global one; behind a carrier NAT a whole mobile network shares one bucket and its subscribers are refused on each other's traffic")
 }
 
 // advertiseAddr resolves the address clients are told to dial. An explicit

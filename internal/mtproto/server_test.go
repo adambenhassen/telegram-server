@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/gotd/td/exchange"
-	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
@@ -19,7 +18,7 @@ func TestServeReturnsOnListenerClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	l := transport.Listen(nl)
+	l := mtproto.Listen(nl)
 
 	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
 
