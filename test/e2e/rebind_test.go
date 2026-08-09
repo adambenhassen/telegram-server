@@ -87,22 +87,22 @@ func TestRebindStopsPushToPreviousUser(t *testing.T) {
 	var victimUserID int64
 	select {
 	case victimUserID = <-victimID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("victim login timeout")
+	case <-ctx.Done():
+		t.Fatalf("victim login timeout: %v", ctx.Err())
 	}
 	var senderUserID int64
 	select {
 	case senderUserID = <-senderID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("sender login timeout")
+	case <-ctx.Done():
+		t.Fatalf("sender login timeout: %v", ctx.Err())
 	}
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -122,7 +122,7 @@ func TestRebindStopsPushToPreviousUser(t *testing.T) {
 	// Baseline: push to the victim's socket works before the rebind, so a later
 	// silence is the resync and not a dead delivery path.
 	sendToVictim("before rebind", 29001)
-	if got := recvOr(t, collVictim.newMsg, "victim updateNewMessage"); got.Message != "before rebind" {
+	if got := recvOrCtx(t, ctx, collVictim.newMsg, "victim updateNewMessage"); got.Message != "before rebind" {
 		t.Fatalf("victim received %q, want %q", got.Message, "before rebind")
 	}
 
