@@ -2,9 +2,19 @@
 -- Attempt to consume a rate-limit token.
 --
 -- INSERT seeds a new counter; ON CONFLICT fires the DO UPDATE:
---   - Window expired: reset count=1, window_start=now, expires_at=now+window.
---   - Window active, under limit: bump count.
---   - Window active, at limit: the WHERE clause prevents the UPDATE entirely.
+--   - Window closed: reset count=1, window_start=now, expires_at=now+window.
+--   - Window open, under limit: bump count.
+--   - Window open, at limit: the WHERE clause prevents the UPDATE entirely.
+--
+-- Whether the window is closed is read from expires_at, the deadline stored
+-- when the window opened, and never recomputed as window_start + the current
+-- config. That is the one boundary the sweep can also see, and the two must
+-- agree: derive it from the live config instead and changing the config splits
+-- them, so the sweep collects a row the limiter is still counting against and
+-- the subject silently gets a fresh budget. The consequence is deliberate — a
+-- config change takes effect at the next window rather than mid-flight, in
+-- either direction, and never grants a subject more than the window it opened
+-- with.
 --
 -- Returns one row (from RETURNING) when the request is allowed.
 -- Returns pgx.ErrNoRows when the request is denied (UPDATE prevented by WHERE).
@@ -15,19 +25,18 @@ INSERT INTO rate_limits (subject_id, surface, token_count, window_start, expires
 VALUES ($1, $2, 1, now(), now() + $3::INTERVAL)
 ON CONFLICT (subject_id, surface) DO UPDATE SET
     token_count = CASE
-        WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN 1
-        WHEN rate_limits.token_count < $4 THEN rate_limits.token_count + 1
-        ELSE rate_limits.token_count
+        WHEN rate_limits.expires_at <= now() THEN 1
+        ELSE rate_limits.token_count + 1
     END,
     window_start = CASE
-        WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now()
+        WHEN rate_limits.expires_at <= now() THEN now()
         ELSE rate_limits.window_start
     END,
     expires_at = CASE
-        WHEN now() - rate_limits.window_start >= $3::INTERVAL THEN now() + $3::INTERVAL
+        WHEN rate_limits.expires_at <= now() THEN now() + $3::INTERVAL
         ELSE rate_limits.expires_at
     END
-WHERE now() - rate_limits.window_start >= $3::INTERVAL
+WHERE rate_limits.expires_at <= now()
    OR rate_limits.token_count < $4
 RETURNING token_count, window_start, expires_at;
 

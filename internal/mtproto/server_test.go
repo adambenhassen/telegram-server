@@ -18,6 +18,7 @@ func TestServeReturnsOnListenerClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+
 	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
 
 	done := make(chan error, 1)

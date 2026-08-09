@@ -74,6 +74,9 @@ func run(log *slog.Logger) error {
 	sweepWG.Go(func() {
 		sweepExpiredRateLimits(sweepCtx, st, log)
 	})
+	sweepWG.Go(func() {
+		sweepExpiredSendCodeIPLimits(sweepCtx, st, log)
+	})
 	defer func() {
 		cancelSweep()
 		sweepWG.Wait()
@@ -101,6 +104,7 @@ func run(log *slog.Logger) error {
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
 	}
+	cfg.WarnClientAddrTrust(log)
 
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
@@ -211,6 +215,28 @@ func sweepExpiredRateLimits(ctx context.Context, st *store.Store, log *slog.Logg
 				continue
 			}
 			log.Info("swept expired rate limits", "deleted", n)
+		}
+	}
+}
+
+// sweepExpiredSendCodeIPLimits periodically deletes per-IP sendCode rows past
+// their deadline. A network that keeps calling prunes its own rows on write;
+// this is what clears the ones that go quiet, and it is what holds retention of
+// the network-to-number rows to the limit window rather than forever.
+func sweepExpiredSendCodeIPLimits(ctx context.Context, st *store.Store, log *slog.Logger) {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := st.SweepExpiredSendCodeIPLimits(ctx)
+			if err != nil {
+				log.Error("sweep expired send code ip limits", "err", err)
+				continue
+			}
+			log.Info("swept expired send code ip limits", "deleted", n)
 		}
 	}
 }

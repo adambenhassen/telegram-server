@@ -3,6 +3,7 @@ package mtproto
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"syscall"
 	"time"
 
@@ -42,6 +43,20 @@ func (s *Server) negotiate(sock net.Conn) (transport.Conn, error) {
 		return nil, errors.Join(errors.New("clear handshake deadline"), err, conn.Close())
 	}
 	return conn, nil
+}
+
+// peerAddr parses the transport peer address of an accepted socket. An address
+// that is absent, or from a network that has no IP, yields the zero Addr: this
+// server only ever listens on TCP, so that is a transport-layer fault rather
+// than a client-reachable state, and it must not silently become a usable key.
+func peerAddr(a net.Addr) netip.Addr {
+	ap, ok := a.(interface{ AddrPort() netip.AddrPort })
+	if !ok {
+		return netip.Addr{}
+	}
+	// TCPAddr reports an IPv4 peer as a 4-in-6 address; unmapping keeps one
+	// host from being two different addresses depending on the socket family.
+	return ap.AddrPort().Addr().Unmap()
 }
 
 // singleConn presents one already-accepted socket as a net.Listener, so gotd's

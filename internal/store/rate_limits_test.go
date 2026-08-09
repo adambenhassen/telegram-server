@@ -105,6 +105,44 @@ func TestRateLimitWindowExpiry(t *testing.T) {
 	}
 }
 
+// TestRateLimitWindowRunsToItsRecordedDeadline pins which boundary decides a
+// window: the deadline stored on the row when it opened, not window_start plus
+// whatever the config says today.
+//
+// They are only the same while the config never changes. Deriving the boundary
+// from the live config lets a shortened window reset a counter whose stored
+// deadline is still hours away — a row the sweep would not touch, so the
+// limiter and the sweep would be reading one row as two different windows.
+func TestRateLimitWindowRunsToItsRecordedDeadline(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	ctx := context.Background()
+	const subject = 1000
+	const surface = "recorded_deadline"
+	opened := store.RateLimitConfig{Limit: 1, Window: time.Hour}
+	shortened := store.RateLimitConfig{Limit: 1, Window: 50 * time.Millisecond}
+
+	if result, err := s.CheckRateLimit(ctx, subject, surface, opened); err != nil || result != nil {
+		t.Fatalf("first request: result=%+v err=%v", result, err)
+	}
+	// Past the shortened window, far inside the one this row actually opened.
+	time.Sleep(100 * time.Millisecond)
+
+	result, err := s.CheckRateLimit(ctx, subject, surface, shortened)
+	if err != nil {
+		t.Fatalf("post-shorten: %v", err)
+	}
+	if result == nil {
+		t.Error("the counter reset while its recorded deadline was still an hour out: the shorter window took effect mid-flight and handed back a budget the row had already spent")
+	}
+}
+
 func TestRateLimitIndependentSubjects(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)

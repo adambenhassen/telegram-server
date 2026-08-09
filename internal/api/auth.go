@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"regexp"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -53,6 +54,12 @@ func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
 	if err := validatePhone(req.PhoneNumber); err != nil {
 		return nil, err
 	}
+	// The per-IP limits run before the phone is touched at all: nothing is read
+	// or written about the account, so a denial cannot vary with whether the
+	// number is registered or already holds a live code.
+	if err := h.checkSendCodeIP(r, req.PhoneNumber); err != nil {
+		return nil, err
+	}
 	hash, code, err := h.store.IssueCode(r.Ctx, req.PhoneNumber)
 	if err != nil {
 		if errors.Is(err, store.ErrResendTooSoon) {
@@ -63,6 +70,53 @@ func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	h.logIssuedCode(req.PhoneNumber, code)
 	return newSentCode(hash), nil
+}
+
+// checkSendCodeIP charges the per-IP sendCode counters for the network the
+// request's connection came from. It returns nil when the call may proceed, and
+// a flood wait when it may not.
+//
+// Every rejection is the same 420 with the wait the network's own counters
+// imply, so the error tells a caller nothing except how long its own address is
+// held back. Neither the address nor the phone number reaches the log here: the
+// two together are exactly the join the short-lived limiter rows exist to avoid
+// keeping, and a log line would outlive them by whatever the retention is.
+func (h *handlers) checkSendCodeIP(r *mtproto.Request, phone string) error {
+	if !h.rateLimitSendCodeIP.Enabled() {
+		return nil
+	}
+	res, err := h.store.CheckAndChargeSendCodeIP(r.Ctx, r.ClientAddr, phone, h.rateLimitSendCodeIP)
+	if err != nil {
+		if errors.Is(err, store.ErrNoClientAddr) {
+			// The socket had no address to attribute the call to, so the limit
+			// cannot hold for it. Refused rather than waved through: every TCP
+			// peer has an address, so this is a fault in the server's own
+			// transport path, and an attacker who could provoke it would
+			// otherwise have found the way around the limit.
+			h.log.Error("send code: connection carries no client address")
+			return FloodWaitError(int(h.sendCodeIPRetry() / time.Second))
+		}
+		h.log.Error("send code: ip rate limit", "err", err)
+		return errInternal
+	}
+	if res != nil {
+		return FloodWaitError(int(res.Wait / time.Second))
+	}
+	return nil
+}
+
+// sendCodeIPRetry is the wait handed out when the limits are enforced but the
+// request could not be keyed at all. It is the shortest enabled window, so an
+// operator who hits this in a healthy deployment sees clients retrying rather
+// than locked out for a day.
+func (h *handlers) sendCodeIPRetry() time.Duration {
+	var shortest time.Duration
+	for _, c := range []store.RateLimitConfig{h.rateLimitSendCodeIP.Calls, h.rateLimitSendCodeIP.Phones} {
+		if c.Limit > 0 && c.Window > 0 && (shortest == 0 || c.Window < shortest) {
+			shortest = c.Window
+		}
+	}
+	return max(shortest, time.Second)
 }
 
 // logIssuedCode writes the code to the log only when the operator opted in

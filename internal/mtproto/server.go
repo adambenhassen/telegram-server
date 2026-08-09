@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -112,6 +113,12 @@ func (s *Server) Key() exchange.PublicKey {
 // everything that reads from one — transport negotiation included — happens in
 // that connection's own goroutine. Serve returns when the listener is closed or
 // fails permanently, and for no other reason.
+//
+// l is a plain net.Listener because the socket, not a negotiated connection, is
+// what the accept path hands over: the peer address is read from it and the
+// codec detected from it, both per connection. An address source other than the
+// socket — a load balancer's, say — arrives as a listener whose connections
+// report it as their RemoteAddr, leaving everything here unchanged.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	grp := tdsync.NewCancellableGroup(ctx)
 	grp.Go(func(ctx context.Context) error {
@@ -161,6 +168,11 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 // sent a transport nobody speaks, or sent nothing at all — so it ends that
 // connection and is reported no further.
 func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
+	// Read the peer address before negotiation consumes the first client
+	// bytes, so the address every per-IP limit is keyed on cannot be a function
+	// of anything the client wrote.
+	addr := peerAddr(sock.RemoteAddr())
+
 	conn, err := s.negotiate(sock)
 	if err != nil {
 		if !isDisconnect(err) {
@@ -168,7 +180,7 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
 		}
 		return
 	}
-	if err := s.serveConn(ctx, conn); err != nil && !isDisconnect(err) {
+	if err := s.serveConn(ctx, conn, addr); err != nil && !isDisconnect(err) {
 		s.log.Info("connection handler error", "err", err)
 	}
 }
@@ -189,7 +201,11 @@ func isDisconnect(err error) bool {
 // serveConn reads frames from conn: zero auth key ID starts key exchange, a
 // known ID drives the RPC path, and an unknown non-zero ID gets an
 // AuthKeyNotFound protocol error.
-func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr error) {
+//
+// clientAddr is the peer address of this socket, captured at accept. It travels
+// with every request the connection produces and is never re-read from
+// anything the client sends.
+func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr netip.Addr) (rErr error) {
 	defer func() {
 		if err := tconn.Close(); err != nil && rErr == nil && !isDisconnect(err) {
 			rErr = err
@@ -304,7 +320,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 		}
 
 		conn.setKey(key)
-		if err := s.rpcHandle(ctx, conn, b, userID); err != nil {
+		if err := s.rpcHandle(ctx, conn, b, userID, clientAddr); err != nil {
 			return err
 		}
 

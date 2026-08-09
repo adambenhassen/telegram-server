@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"maps"
+	"net/netip"
 	"slices"
 	"time"
 
@@ -33,9 +34,11 @@ func (s *Server) SetHandshakeTimeout(d time.Duration) {
 }
 
 // ServeConn exposes the per-connection serve loop so tests can drive it with a
-// scripted transport instead of a real client handshake.
+// scripted transport instead of a real client handshake. The connection carries
+// no peer address: a scripted transport is not a socket, and the zero address is
+// what a handler must be able to cope with in that case.
 func (s *Server) ServeConn(ctx context.Context, tconn transport.Conn) error {
-	return s.serveConn(ctx, tconn)
+	return s.serveConn(ctx, tconn, netip.Addr{})
 }
 
 // SetOwner exposes the conn's ownership hand-off, which only the serve loop
