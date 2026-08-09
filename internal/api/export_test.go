@@ -130,6 +130,30 @@ func SaveFilePartCappedForTest(s *store.Store, userID int64, maxFileBytes int64,
 	return h.handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SaveFilePartForTestWithLimits is SaveFilePartForTest against a custom
+// saveFilePart rate limit.
+func SaveFilePartForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.UploadSaveFilePartRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitSaveFilePart = rateLimit
+	return h.handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SaveBigFilePartForTestWithLimits is SaveBigFilePartForTest against a custom
+// saveFilePart rate limit, which both save surfaces share.
+func SaveBigFilePartForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.UploadSaveBigFilePartRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitSaveFilePart = rateLimit
+	return h.handleSaveBigFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SaveBigFilePartForTest encodes req and invokes handleSaveBigFilePart.
 func SaveBigFilePartForTest(s *store.Store, userID int64, req *tg.UploadSaveBigFilePartRequest) (bin.Encoder, error) {
 	var buf bin.Buffer

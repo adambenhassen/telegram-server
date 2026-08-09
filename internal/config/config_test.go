@@ -86,6 +86,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.RateLimits.SearchContacts.Window != time.Hour {
 		t.Errorf("SearchContacts window = %v, want 1h", cfg.RateLimits.SearchContacts.Window)
 	}
+	if cfg.RateLimits.SaveFilePart.Limit != 600 {
+		t.Errorf("SaveFilePart limit = %d, want 600", cfg.RateLimits.SaveFilePart.Limit)
+	}
+	if cfg.RateLimits.SaveFilePart.Window != 60*time.Second {
+		t.Errorf("SaveFilePart window = %v, want 60s", cfg.RateLimits.SaveFilePart.Window)
+	}
 }
 
 func TestLoadBlobDir(t *testing.T) {
@@ -575,6 +581,20 @@ func TestLoadRateLimitEnv(t *testing.T) {
 	}
 	if cfg.RateLimits.SearchContacts.Window != 45*time.Minute {
 		t.Errorf("SearchContacts window = %v, want 45m", cfg.RateLimits.SearchContacts.Window)
+	}
+
+	// Override the upload part limit and window.
+	t.Setenv("TG_RATE_LIMIT_SAVE_FILE_PART", "17")
+	t.Setenv("TG_RATE_LIMIT_SAVE_FILE_PART_WINDOW", "90s")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.SaveFilePart.Limit != 17 {
+		t.Errorf("SaveFilePart limit = %d, want 17", cfg.RateLimits.SaveFilePart.Limit)
+	}
+	if cfg.RateLimits.SaveFilePart.Window != 90*time.Second {
+		t.Errorf("SaveFilePart window = %v, want 90s", cfg.RateLimits.SaveFilePart.Window)
 	}
 
 	// Zero disables enforcement.

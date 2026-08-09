@@ -212,9 +212,12 @@ func sweepExpiredUploadParts(ctx context.Context, st *store.Store, ttl time.Dura
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			n, err := st.DeleteExpiredUploadParts(ctx, time.Now().Add(-ttl))
+			// One sweep is as many bounded passes as it takes: the batch bounds
+			// each statement, not how much a tick may retire, so a backlog left
+			// by a long outage clears here rather than one batch per tick.
+			n, err := st.SweepExpiredUploadParts(ctx, time.Now().Add(-ttl), store.ExpiredPartSweepBatch)
 			if err != nil {
-				log.Error("sweep expired upload parts", "err", err)
+				log.Error("sweep expired upload parts", "deleted", n, "err", err)
 				continue
 			}
 			log.Info("swept expired upload parts", "deleted", n)

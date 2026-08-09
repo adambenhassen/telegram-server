@@ -61,6 +61,9 @@ type handlers struct {
 	rateLimitSearchMessages store.RateLimitConfig
 	// rateLimitSearchContacts limits contacts.search per account.
 	rateLimitSearchContacts store.RateLimitConfig
+	// rateLimitSaveFilePart limits upload.saveFilePart and upload.saveBigFilePart
+	// to one shared budget per account: both write the same parts table.
+	rateLimitSaveFilePart store.RateLimitConfig
 	// rateLimitSendCodeIP limits auth.sendCode per client network. It is the
 	// one limit here that is not keyed on an account: sendCode is
 	// unauthenticated, so the connection's address is the only subject there is.
@@ -132,6 +135,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitCreateChannel:  rateLimits.CreateChannel,
 		rateLimitSearchMessages: rateLimits.SearchMessages,
 		rateLimitSearchContacts: rateLimits.SearchContacts,
+		rateLimitSaveFilePart:   rateLimits.SaveFilePart,
 		rateLimitSendCodeIP:     rateLimits.SendCodeIP,
 	}
 	d := mtproto.NewDispatcher()
