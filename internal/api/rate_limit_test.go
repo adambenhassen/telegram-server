@@ -1201,15 +1201,58 @@ func TestCreateChannelRateLimitDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Zero limit = disabled.
+	// Zero limit = disabled. Loop past the default (20) to prove enforcement is off.
 	cfg := store.RateLimitConfig{}
 
-	for i := range 5 {
+	for i := range 25 {
 		_, err := api.CreateChannelForTestWithLimits(s, alice.ID, cfg, &tg.ChannelsCreateChannelRequest{
-			Title: "Channel " + string(rune('A'+i)), About: "", Broadcast: true,
+			Title: "Channel " + string(rune('A'+i%26)), About: "", Broadcast: true,
 		})
 		if err != nil {
 			t.Fatalf("create %d: %v", i+1, err)
 		}
+	}
+}
+
+// TestCreateChannelRateLimitWindowExpiry proves that after the window expires,
+// the same account can create a channel again.
+func TestCreateChannelRateLimitWindowExpiry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551295201")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Very short window: 1 create per 500ms.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 500 * time.Millisecond}
+
+	// Exhaust the limit.
+	_, err = api.CreateChannelForTestWithLimits(s, alice.ID, cfg, &tg.ChannelsCreateChannelRequest{
+		Title: "First", About: "", Broadcast: true,
+	})
+	if err != nil {
+		t.Fatalf("create 1: %v", err)
+	}
+
+	// Denied.
+	_, err = api.CreateChannelForTestWithLimits(s, alice.ID, cfg, &tg.ChannelsCreateChannelRequest{
+		Title: "Blocked", About: "", Broadcast: true,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("expected FLOOD_WAIT, got %v", err)
+	}
+
+	// Wait for window to expire.
+	time.Sleep(600 * time.Millisecond)
+
+	// Should be allowed again.
+	_, err = api.CreateChannelForTestWithLimits(s, alice.ID, cfg, &tg.ChannelsCreateChannelRequest{
+		Title: "After Expiry", About: "", Broadcast: true,
+	})
+	if err != nil {
+		t.Fatalf("post-expiry create: %v", err)
 	}
 }
