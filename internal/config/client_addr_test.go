@@ -320,3 +320,80 @@ func TestLoadClientAddrProxyRejectsDefaultRoute(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadClientAddrProxyMatchesPeerAddresses is the invariant the mapped-CIDR
+// finding turned up: no accepted entry may boot and never match.
+//
+// The listener unmaps every peer address before it looks, so a prefix left in
+// IPv4-mapped form is 128 bits wide against a 32-bit address and matches
+// nothing. That entry starts the server and then refuses every connection from
+// the balancer it was written to name — an outage that reads as the limiter
+// working. So each entry here is checked against the address a peer would
+// actually arrive as, rather than against how it was spelled.
+func TestLoadClientAddrProxyMatchesPeerAddresses(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_CLIENT_ADDR_TRUST", string(config.ClientAddrProxyV2))
+	t.Setenv("TG_CLIENT_ADDR_PROXY_CIDRS", "10.0.0.0/8, ::ffff:192.0.2.0/120, 2001:db8::/32, ::ffff:198.51.100.7")
+
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		// Normalized: the mapped /120 is the IPv4 /24 it means.
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("2001:db8::/32"),
+		netip.MustParsePrefix("198.51.100.7/32"),
+	}
+	if !slices.Equal(cfg.ClientAddrProxies, want) {
+		t.Fatalf("ClientAddrProxies = %v, want %v", cfg.ClientAddrProxies, want)
+	}
+
+	// The peers, as the listener reports them: unmapped, which is the whole
+	// point of the normalization above.
+	for _, peer := range []netip.Addr{
+		netip.MustParseAddr("10.1.2.3"),
+		netip.MustParseAddr("192.0.2.9"),
+		netip.MustParseAddr("2001:db8::1"),
+		netip.MustParseAddr("198.51.100.7"),
+	} {
+		if !slices.ContainsFunc(cfg.ClientAddrProxies, func(p netip.Prefix) bool { return p.Contains(peer) }) {
+			t.Errorf("no accepted entry matches peer %s: it would boot and refuse that balancer forever", peer)
+		}
+	}
+}
+
+// TestLoadClientAddrProxyRejectsUnusableMappedCIDR covers the two mapped forms
+// that must not start the server: a disguised default route, which the
+// zero-length guard has to catch after normalization rather than before, and a
+// mapped prefix too short to name an IPv4 network at all.
+func TestLoadClientAddrProxyRejectsUnusableMappedCIDR(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		cidrs string
+	}{
+		{name: "disguised default route", cidrs: "::ffff:0.0.0.0/96"},
+		{name: "shorter than the mapped range", cidrs: "::ffff:0.0.0.0/64"},
+		{name: "alongside a real balancer", cidrs: "10.0.0.0/8,::ffff:0.0.0.0/96"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+			t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+			t.Setenv("TG_CLIENT_ADDR_TRUST", string(config.ClientAddrProxyV2))
+			t.Setenv("TG_CLIENT_ADDR_PROXY_CIDRS", tt.cidrs)
+
+			_, err := config.Load(discardLog())
+			if err == nil {
+				t.Fatal("an unusable mapped prefix started the server")
+			}
+			if !strings.Contains(err.Error(), "TG_CLIENT_ADDR_PROXY_CIDRS") {
+				t.Errorf("error %q does not name the variable", err)
+			}
+			if !strings.Contains(err.Error(), "::ffff:0.0.0.0") {
+				t.Errorf("error %q does not name the offending entry", err)
+			}
+		})
+	}
+}

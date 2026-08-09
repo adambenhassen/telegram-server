@@ -392,6 +392,33 @@ func clientAddrProxies(raw string, trust ClientAddrTrust) ([]netip.Prefix, error
 	return prefixes, nil
 }
 
+// mappedPrefixOffset is where the IPv4 part of an IPv4-mapped address starts:
+// the first 96 bits are the ::ffff: wrapper.
+const mappedPrefixOffset = 96
+
+// normalizePrefix rewrites an IPv4-mapped prefix into the IPv4 one it means.
+//
+// It has to, because the two sides would otherwise never meet: the listener
+// unmaps every peer address it reports, so a prefix left in mapped form is 128
+// bits wide against a 32-bit address and matches nothing. The entry would start
+// the server and then refuse every connection from the balancer it was written
+// to name — an outage that looks like the limiter working, which is a worse
+// failure than the default route, not a lesser one.
+//
+// A mapped prefix shorter than /96 covers more than the mapped range and has no
+// IPv4 network to take, so it is refused rather than guessed at. Everything from
+// /96 down takes its IPv4 meaning, which puts a disguised default route
+// (::ffff:0.0.0.0/96) in front of the zero-length guard rather than past it.
+func normalizePrefix(p netip.Prefix, entry string) (netip.Prefix, error) {
+	if !p.Addr().Is4In6() {
+		return p, nil
+	}
+	if p.Bits() < mappedPrefixOffset {
+		return netip.Prefix{}, fmt.Errorf("TG_CLIENT_ADDR_PROXY_CIDRS entry %q is an IPv4-mapped prefix shorter than /%d, which names no IPv4 network: write it as an IPv4 CIDR", entry, mappedPrefixOffset)
+	}
+	return netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-mappedPrefixOffset), nil
+}
+
 // parsePrefixes reads a comma-separated allowlist. A bare address is its own
 // single-host prefix, which is what an operator with one balancer writes.
 // Anything that does not parse fails the start naming the entry: dropping it
@@ -408,6 +435,11 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 			p, err := netip.ParsePrefix(entry)
 			if err != nil {
 				return nil, fmt.Errorf("TG_CLIENT_ADDR_PROXY_CIDRS entry %q is not a CIDR", entry)
+			}
+			// Before the guard below, so a default route written in mapped form
+			// is caught by it rather than slipping past as a 96-bit prefix.
+			if p, err = normalizePrefix(p, entry); err != nil {
+				return nil, err
 			}
 			// A default route trusts every peer on the internet as a balancer,
 			// which hands any client the right to name any source address: to
