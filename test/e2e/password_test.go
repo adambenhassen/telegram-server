@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -29,9 +30,51 @@ import (
 //  4. Remove the password; a fresh login no longer prompts.
 func TestCloudPassword2FA(t *testing.T) {
 	t.Parallel()
-	// ponytail: 3 min budget; SRP package (~60s CPU) runs concurrently and starves this test under 90s
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// Budget derived by measurement, not chosen round. This test is eight
+	// sequential fresh-session logins (RSA+DH handshake, then SRP) plus three
+	// reconnects on the persisted key, all under -race: the time goes on
+	// cryptography the test has to do, not on a wait that could be tightened,
+	// so wall time scales with how little of the host it gets. Measured on the
+	// 4-vCPU host, busy loops standing in for foreign suites (one e2e suite
+	// saturates roughly four threads; 8-12 loops is the two-to-three foreign
+	// suites this has actually been seen failing under):
+	//
+	//	quiet host      68s, 79s, 81s
+	//	 4 busy loops   176s
+	//	 8 busy loops   147s, 160s, 209s, 210s, 216s, 278s
+	//	12 busy loops   220s
+	//	16 busy loops   337s
+	//
+	// 8m is 1.4x the slowest measured and 1.7x the slowest inside that
+	// two-to-three suite band, and stays under the package's 15m -timeout so a
+	// real hang still fails here, naming the step it hung in, rather than as a
+	// suite-wide goroutine dump. The previous 180s sat inside the band and
+	// failed the test for contention the rest of the suite survives (MAIN-240).
+	const budget = 8 * time.Minute
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+
+	// fail reports a failed step by name, and says when the budget rather than
+	// the server is what ended it. Every wait below bottoms out in client.Run
+	// returning a bare "context deadline exceeded" that names neither the step
+	// it was in nor the budget as the cause, and under contention that is the
+	// error every one of these call sites reports.
+	fail := func(t *testing.T, step, detail string) {
+		t.Helper()
+		if ctx.Err() != nil {
+			t.Fatalf("%s: %s budget exhausted after %s: %v: %s", step, budget, time.Since(started).Round(time.Second), ctx.Err(), detail)
+		}
+		t.Fatalf("%s: %s", step, detail)
+	}
+
+	// rejected reports whether err is the server refusing the SRP proof
+	// (PASSWORD_HASH_INVALID, which gotd converts to ErrPasswordInvalid) rather
+	// than the budget expiring mid-login. The two rejection checks below are the
+	// only ones satisfied by an error instead of by its absence, so without this
+	// an expiry passes them silently and is then reported against a later step
+	// than the one that actually ran out.
+	rejected := func(err error) bool { return errors.Is(err, auth.ErrPasswordInvalid) }
 
 	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
 	if err != nil {
@@ -100,7 +143,7 @@ func TestCloudPassword2FA(t *testing.T) {
 	// later calls reconnect with the persisted (already-authorized) key.
 	primary := &session.StorageMemory{}
 	primaryFlow := auth.NewFlow(auth.Constant(phone, "", codeAuth), auth.SendCodeOptions{})
-	withPrimary := func(t *testing.T, fn func(ctx context.Context, c *telegram.Client) error) {
+	withPrimary := func(t *testing.T, step string, fn func(ctx context.Context, c *telegram.Client) error) {
 		t.Helper()
 		client := newClient(primary)
 		if err := client.Run(ctx, func(ctx context.Context) error {
@@ -109,16 +152,16 @@ func TestCloudPassword2FA(t *testing.T) {
 			}
 			return fn(ctx, client)
 		}); err != nil {
-			t.Fatalf("primary run: %v", err)
+			fail(t, step, err.Error())
 		}
 	}
 
 	// --- Phase 1: initial login (no password) + enable 2FA. ---
-	withPrimary(t, func(ctx context.Context, c *telegram.Client) error {
+	withPrimary(t, "phase 1: primary login and enable 2FA", func(ctx context.Context, c *telegram.Client) error {
 		return c.Auth().UpdatePassword(ctx, "pw1", auth.UpdatePasswordOptions{Hint: "hint1"})
 	})
 	if _, ok, err := st.PasswordByUser(ctx, mustUser(t, ctx, st, phone).ID); err != nil || !ok {
-		t.Fatalf("2FA not enabled: ok=%v err=%v", ok, err)
+		fail(t, "phase 1: read stored password", fmt.Sprintf("2FA not enabled: ok=%v err=%v", ok, err))
 	}
 
 	// --- Phase 2: a fresh login is now challenged for the password. ---
@@ -130,51 +173,51 @@ func TestCloudPassword2FA(t *testing.T) {
 		return noPwClient.Auth().IfNecessary(ctx, noPwFlow)
 	})
 	if !errors.Is(noPwErr, auth.ErrPasswordNotProvided) {
-		t.Fatalf("expected SESSION_PASSWORD_NEEDED (ErrPasswordNotProvided), got %v", noPwErr)
+		fail(t, "phase 2: code-only login", fmt.Sprintf("expected SESSION_PASSWORD_NEEDED (ErrPasswordNotProvided), got %v", noPwErr))
 	}
 	// Correct password authorizes.
 	if authed, err := flowLogin(t, "pw1"); err != nil || !authed {
-		t.Fatalf("login with correct password: authed=%v err=%v", authed, err)
+		fail(t, "phase 2: login with correct password", fmt.Sprintf("authed=%v err=%v", authed, err))
 	}
 	// Wrong password is rejected.
-	if authed, err := flowLogin(t, "wrongpw"); err == nil || authed {
-		t.Fatalf("login with wrong password should fail: authed=%v err=%v", authed, err)
+	if authed, err := flowLogin(t, "wrongpw"); authed || !rejected(err) {
+		fail(t, "phase 2: login with wrong password", fmt.Sprintf("want ErrPasswordInvalid: authed=%v err=%v", authed, err))
 	}
 
 	// --- Phase 3: change the password. ---
-	withPrimary(t, func(ctx context.Context, c *telegram.Client) error {
+	withPrimary(t, "phase 3: change password to pw2", func(ctx context.Context, c *telegram.Client) error {
 		return c.Auth().UpdatePassword(ctx, "pw2", auth.UpdatePasswordOptions{
 			Hint:     "hint2",
 			Password: func(context.Context) (string, error) { return "pw1", nil },
 		})
 	})
 	if authed, err := flowLogin(t, "pw2"); err != nil || !authed {
-		t.Fatalf("login with new password: authed=%v err=%v", authed, err)
+		fail(t, "phase 3: login with new password", fmt.Sprintf("authed=%v err=%v", authed, err))
 	}
-	if authed, err := flowLogin(t, "pw1"); err == nil || authed {
-		t.Fatalf("login with old password should fail: authed=%v err=%v", authed, err)
+	if authed, err := flowLogin(t, "pw1"); authed || !rejected(err) {
+		fail(t, "phase 3: login with old password", fmt.Sprintf("want ErrPasswordInvalid: authed=%v err=%v", authed, err))
 	}
 
 	// --- Phase 3b: an email-only update must NOT disable 2FA. ---
-	withPrimary(t, func(ctx context.Context, c *telegram.Client) error {
+	withPrimary(t, "phase 3b: email-only update", func(ctx context.Context, c *telegram.Client) error {
 		return emailOnlyUpdate(ctx, c.API(), "pw2")
 	})
 	if _, ok, err := st.PasswordByUser(ctx, mustUser(t, ctx, st, phone).ID); err != nil || !ok {
-		t.Fatalf("email-only update wiped 2FA: ok=%v err=%v", ok, err)
+		fail(t, "phase 3b: read stored password", fmt.Sprintf("email-only update wiped 2FA: ok=%v err=%v", ok, err))
 	}
 	if authed, err := flowLogin(t, "pw2"); err != nil || !authed {
-		t.Fatalf("login after email-only update: authed=%v err=%v", authed, err)
+		fail(t, "phase 3b: login after email-only update", fmt.Sprintf("authed=%v err=%v", authed, err))
 	}
 
 	// --- Phase 4: remove the password; fresh login no longer prompts. ---
-	withPrimary(t, func(ctx context.Context, c *telegram.Client) error {
+	withPrimary(t, "phase 4: remove password", func(ctx context.Context, c *telegram.Client) error {
 		return removePassword(ctx, c.API(), "pw2")
 	})
 	if _, ok, err := st.PasswordByUser(ctx, mustUser(t, ctx, st, phone).ID); err != nil || ok {
-		t.Fatalf("password not removed: ok=%v err=%v", ok, err)
+		fail(t, "phase 4: read stored password", fmt.Sprintf("password not removed: ok=%v err=%v", ok, err))
 	}
 	if authed, err := flowLogin(t, ""); err != nil || !authed {
-		t.Fatalf("login after removal should not prompt: authed=%v err=%v", authed, err)
+		fail(t, "phase 4: login after removal", fmt.Sprintf("should not prompt: authed=%v err=%v", authed, err))
 	}
 }
 
