@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/crypto"
@@ -16,7 +17,8 @@ import (
 // dispatches its contents. The connection's auth key must already be set to the
 // key matching the frame's auth key ID, and userID is the user bound to that key
 // (0 when unbound), resolved by the caller in the same lookup as the key.
-func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID int64) error {
+// clientAddr is the peer address of the socket the frame arrived on.
+func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID int64, clientAddr netip.Addr) error {
 	m := &crypto.EncryptedMessage{}
 	if err := m.DecodeWithoutCopy(b); err != nil {
 		return fmt.Errorf("decode encrypted message: %w", err)
@@ -38,12 +40,13 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID i
 	b.ResetTo(msg.Data())
 
 	return s.handle(c, &Request{
-		AuthKeyID: c.authKey.ID,
-		UserID:    userID,
-		SessionID: msg.SessionID,
-		MsgID:     msg.MessageID,
-		Buf:       b,
-		Ctx:       ctx,
+		AuthKeyID:  c.authKey.ID,
+		UserID:     userID,
+		ClientAddr: clientAddr,
+		SessionID:  msg.SessionID,
+		MsgID:      msg.MessageID,
+		Buf:        b,
+		Ctx:        ctx,
 	})
 }
 
@@ -103,12 +106,13 @@ func (s *Server) handle(c *Conn, req *Request) error {
 		for i := range container.Messages {
 			m := container.Messages[i]
 			errs = errors.Join(errs, s.handle(c, &Request{
-				AuthKeyID: req.AuthKeyID,
-				UserID:    req.UserID,
-				SessionID: req.SessionID,
-				MsgID:     m.ID,
-				Buf:       &bin.Buffer{Buf: m.Body},
-				Ctx:       req.Ctx,
+				AuthKeyID:  req.AuthKeyID,
+				UserID:     req.UserID,
+				ClientAddr: req.ClientAddr,
+				SessionID:  req.SessionID,
+				MsgID:      m.ID,
+				Buf:        &bin.Buffer{Buf: m.Body},
+				Ctx:        req.Ctx,
 			}))
 		}
 		return errs

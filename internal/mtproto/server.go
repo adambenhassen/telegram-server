@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -97,14 +98,14 @@ func (s *Server) Key() exchange.PublicKey {
 }
 
 // Serve accepts connections on l until ctx is cancelled or l is closed.
-func (s *Server) Serve(ctx context.Context, l transport.Listener) error {
+func (s *Server) Serve(ctx context.Context, l Listener) error {
 	grp := tdsync.NewCancellableGroup(ctx)
 	grp.Go(func(ctx context.Context) error {
 		// Unblock the sibling shutdown goroutine when the accept loop exits
 		// (e.g. listener closed while ctx is still live).
 		defer grp.Cancel()
 		for {
-			conn, err := l.Accept()
+			conn, addr, err := l.Accept()
 			if err != nil {
 				if errors.Is(err, net.ErrClosed) {
 					return nil
@@ -112,7 +113,7 @@ func (s *Server) Serve(ctx context.Context, l transport.Listener) error {
 				return errors.Join(errors.New("accept"), err)
 			}
 			grp.Go(func(ctx context.Context) error {
-				if err := s.serveConn(ctx, conn); err != nil && !isDisconnect(err) {
+				if err := s.serveConn(ctx, conn, addr); err != nil && !isDisconnect(err) {
 					s.log.Info("connection handler error", "err", err)
 				}
 				return nil
@@ -145,7 +146,11 @@ func isDisconnect(err error) bool {
 // serveConn reads frames from conn: zero auth key ID starts key exchange, a
 // known ID drives the RPC path, and an unknown non-zero ID gets an
 // AuthKeyNotFound protocol error.
-func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr error) {
+//
+// clientAddr is the peer address of this socket, captured at accept. It travels
+// with every request the connection produces and is never re-read from
+// anything the client sends.
+func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr netip.Addr) (rErr error) {
 	defer func() {
 		if err := tconn.Close(); err != nil && rErr == nil && !isDisconnect(err) {
 			rErr = err
@@ -260,7 +265,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn) (rErr erro
 		}
 
 		conn.setKey(key)
-		if err := s.rpcHandle(ctx, conn, b, userID); err != nil {
+		if err := s.rpcHandle(ctx, conn, b, userID, clientAddr); err != nil {
 			return err
 		}
 

@@ -5,6 +5,8 @@
 package db
 
 import (
+	"net/netip"
+
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -199,6 +201,19 @@ type SecretChat struct {
 	KeyFingerprint *int64
 	Date           pgtype.Timestamptz
 	RandomID       int64
+}
+
+type SendCodeIpCall struct {
+	IpKey       netip.Prefix
+	TokenCount  int32
+	WindowStart pgtype.Timestamptz
+	ExpiresAt   pgtype.Timestamptz
+}
+
+type SendCodeIpPhone struct {
+	IpKey     netip.Prefix
+	Phone     string
+	ExpiresAt pgtype.Timestamptz
 }
 
 type UpdateState struct {

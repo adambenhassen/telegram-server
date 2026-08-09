@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"sync"
 
 	"github.com/gotd/td/bin"
@@ -17,6 +18,14 @@ type Request struct {
 	// UserID is the user bound to the auth key, or 0 when unbound.
 	// Auth-key/user binding is wired in a later task; it stays 0 here.
 	UserID int64
+	// ClientAddr is the peer address of the connection this request arrived on,
+	// read off the socket at accept. It is the only address the server has, and
+	// it is never derived from anything the client sends: MTProto carries no
+	// client-supplied address, and a header on this protocol would be forgeable
+	// anyway. The zero value means the socket had no address the server could
+	// parse — a transport-layer fault a handler must decide about explicitly,
+	// never a bucket to group requests into.
+	ClientAddr netip.Addr
 	// SessionID is the MTProto session ID from the decrypted message.
 	SessionID int64
 	// MsgID is the message ID of the request, used as the RPC result target.

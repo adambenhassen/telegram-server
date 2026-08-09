@@ -15,7 +15,6 @@ import (
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
-	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -332,7 +331,7 @@ func bootServerWithSearchLimits(t *testing.T, ctx context.Context, key *rsa.Priv
 
 	srvCtx, srvCancel := context.WithCancel(ctx)
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(srvCtx, transport.Listen(ln)) }()
+	go func() { serveErr <- server.Serve(srvCtx, mtproto.Listen(ln)) }()
 
 	var once bool
 	return func() {
