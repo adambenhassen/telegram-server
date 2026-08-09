@@ -29,6 +29,7 @@ type Channel struct {
 	Date            pgtype.Timestamptz
 	PinnedMessageID *int32
 	Username        *string
+	TitleTsv        interface{}
 }
 
 type ChannelEvent struct {

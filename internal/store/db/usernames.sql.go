@@ -28,7 +28,7 @@ func (q *Queries) ClaimUsername(ctx context.Context, arg ClaimUsernameParams) (U
 }
 
 const getChannelByUsername = `-- name: GetChannelByUsername :one
-SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id, c.username FROM channels c
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id, c.username, c.title_tsv FROM channels c
 JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
 WHERE un.handle = lower($1)
 `
@@ -46,6 +46,7 @@ func (q *Queries) GetChannelByUsername(ctx context.Context, handle string) (Chan
 		&i.Date,
 		&i.PinnedMessageID,
 		&i.Username,
+		&i.TitleTsv,
 	)
 	return i, err
 }

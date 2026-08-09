@@ -356,6 +356,70 @@ func TestResolveChannelHit(t *testing.T) {
 	}
 }
 
+// TestResolveChannelUsernameIsAuthoritative proves resolveUsername reports the
+// handle off the usernames row rather than the denormalized channels.username
+// copy. The two are written in one transaction today, so the divergence is
+// forced here: contacts.search already reads the authoritative row, and the two
+// RPCs must not name the same channel differently if a future writer leaves the
+// copy behind.
+func TestResolveChannelUsernameIsAuthoritative(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+
+	caller, err := s.CreateUser(ctx, "15550009001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	creator, err := s.CreateUser(ctx, "15550009002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "Authoritative Channel", "About", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimChannelUsernameForTest(s, ch.ID, "realhandle"); err != nil {
+		t.Fatal(err)
+	}
+	// Only the copy goes stale; the usernames row keeps the real handle.
+	channelExec(t, ctx, dsn, `UPDATE channels SET username = $2 WHERE id = $1`, ch.ID, "stalehandle")
+
+	res, err := api.ResolveUsernameForTest(s, caller.ID, &tg.ContactsResolveUsernameRequest{Username: "realhandle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, ok := res.(*tg.ContactsResolvedPeer)
+	if !ok {
+		t.Fatalf("unexpected response type: %T", res)
+	}
+	resolved, ok := peer.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("chats[0] is not *tg.Channel: %T", peer.Chats[0])
+	}
+	if resolved.Username != "realhandle" {
+		t.Errorf("resolveUsername username = %q, want %q (the usernames row, not the copy)",
+			resolved.Username, "realhandle")
+	}
+
+	found, err := api.ContactsSearchForTest(s, caller.ID, &tg.ContactsSearchRequest{Q: "Authoritative", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contacts, ok := found.(*tg.ContactsFound)
+	if !ok {
+		t.Fatalf("unexpected search response type: %T", found)
+	}
+	searched, ok := contacts.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("search chats[0] is not *tg.Channel: %T", contacts.Chats[0])
+	}
+	if searched.Username != resolved.Username {
+		t.Errorf("contacts.search username = %q, resolveUsername username = %q, want the same handle",
+			searched.Username, resolved.Username)
+	}
+}
+
 func TestResolveChannelMiss(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
