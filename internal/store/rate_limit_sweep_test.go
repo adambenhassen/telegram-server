@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -54,6 +55,61 @@ func TestSweepRemovesExpiredRows(t *testing.T) {
 	}
 	if countAfter != 0 {
 		t.Fatalf("rate limits after sweep = %d, want 0", countAfter)
+	}
+}
+
+// TestSweepCannotChangeTheAnswer is the property the deadline has to carry:
+// the sweep is garbage collection, so whether it has run must never change what
+// the limiter decides.
+//
+// It bites when a window is enlarged. The row keeps the deadline it opened
+// with, the sweep collects it the moment that passes, and a limiter reading the
+// live config instead would still be counting against it — so the same call is
+// denied before the sweep and allowed after it, and a caller gets a fresh
+// budget for free by waiting for the sweeper.
+func TestSweepCannotChangeTheAnswer(t *testing.T) {
+	t.Parallel()
+	opened := store.RateLimitConfig{Limit: 1, Window: 50 * time.Millisecond}
+	enlarged := store.RateLimitConfig{Limit: 1, Window: time.Hour}
+
+	for _, swept := range []bool{false, true} {
+		t.Run(fmt.Sprintf("swept=%v", swept), func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			dsn := pgtest.DSN(t)
+			s, err := store.Open(ctx, dsn, pgtest.EncKey())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = s.Close() }() //nolint:errcheck // best-effort
+
+			const subject = 1100
+			const surface = "sweep_answer"
+
+			if result, err := s.CheckRateLimit(ctx, subject, surface, opened); err != nil || result != nil {
+				t.Fatalf("first request: result=%+v err=%v", result, err)
+			}
+			// The deadline this row opened with has now passed, which is exactly
+			// the condition the sweep collects on.
+			time.Sleep(100 * time.Millisecond)
+			if swept {
+				n, err := s.SweepExpiredRateLimits(ctx)
+				if err != nil {
+					t.Fatalf("sweep: %v", err)
+				}
+				if n != 1 {
+					t.Fatalf("sweep deleted %d rows, want the 1 counter row past its deadline", n)
+				}
+			}
+
+			result, err := s.CheckRateLimit(ctx, subject, surface, enlarged)
+			if err != nil {
+				t.Fatalf("post-enlarge: %v", err)
+			}
+			if result != nil {
+				t.Errorf("denied after the recorded window closed: wait %s — the answer depends on whether the sweep has run", result.Wait)
+			}
+		})
 	}
 }
 
