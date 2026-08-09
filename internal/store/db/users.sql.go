@@ -44,6 +44,7 @@ WHERE u.name_tsv @@ plainto_tsquery('simple', $1)
         AND d.peer_id = u.id
         AND d.peer_type = 1
   )
+ORDER BY u.id
 LIMIT $3::int
 `
 
@@ -73,6 +74,12 @@ type SearchContactsByNameRow struct {
 // path could delete the peer-owned row without deleting the caller-owned one,
 // making the second arm incorrectly permissive. It also costs ~618 ms vs 0.10 ms
 // (seq-scan vs index-only) at 200k users.
+//
+// ORDER BY u.id is what makes the page deterministic. MyResults unions this arm
+// with the caller's matching channels under ONE limit budget, so rows past the
+// budget are dropped; without a total order the set that survives truncation is
+// whatever the plan happened to emit, and two identical searches disagree. It
+// is the same order the channel arms use.
 func (q *Queries) SearchContactsByName(ctx context.Context, arg SearchContactsByNameParams) ([]SearchContactsByNameRow, error) {
 	rows, err := q.db.Query(ctx, searchContactsByName, arg.Query, arg.OwnerID, arg.Lim)
 	if err != nil {

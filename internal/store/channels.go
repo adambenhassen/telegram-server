@@ -674,6 +674,145 @@ func (s *Store) ChannelsForUser(ctx context.Context, userID int64) ([]Channel, e
 	return out, nil
 }
 
+// PublicChannelMatch is one channel matched by the public discovery arm, with
+// the participant count its public rendering puts on the wire. It carries no
+// membership: the arm is decided without reference to any caller, and nothing
+// downstream may read one off the result.
+type PublicChannelMatch struct {
+	Channel           Channel
+	ParticipantsCount int64
+}
+
+// MemberChannelMatch is one channel matched by the caller's own membership arm,
+// with the participant row that admitted it. It carries no participant count:
+// a member renders through channelToTL, which has no field for one, so the two
+// match types hold exactly what their own renderer reads and a count cannot be
+// added back for a caller that never asked for it.
+type MemberChannelMatch struct {
+	Channel Channel
+	Member  ChannelMember
+}
+
+// ChannelMembershipsOf reports which of channelIDs viewerID is an unbanned
+// member of, keyed by channel id. Channels the caller never joined, and ones
+// they are banned from, are simply absent.
+//
+// It exists so a caller-facing page can decide membership for every channel it
+// names in one query instead of one per row, and so the membership of a channel
+// found by a caller-independent search is answered separately from that search
+// rather than by adding a viewer to it.
+func (s *Store) ChannelMembershipsOf(
+	ctx context.Context, viewerID int64, channelIDs []int64,
+) (map[int64]ChannelMember, error) {
+	if len(channelIDs) == 0 {
+		return map[int64]ChannelMember{}, nil
+	}
+	rows, err := s.q.ChannelParticipantsForViewer(ctx, db.ChannelParticipantsForViewerParams{
+		ViewerID:   viewerID,
+		ChannelIds: channelIDs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("channel participants for viewer: %w", err)
+	}
+	now := time.Now()
+	out := make(map[int64]ChannelMember, len(rows))
+	for _, r := range rows {
+		m := channelMemberFromRow(r)
+		if m.Banned(now) {
+			continue
+		}
+		out[r.ChannelID] = m
+	}
+	return out, nil
+}
+
+// searchHandle reduces a search query to the handle it could be naming: the
+// same normalisation contacts.resolveUsername applies to its argument, so a
+// caller finds a channel by its @username on either RPC. A query that is not a
+// handle at all (spaces, punctuation) simply matches no row, since handles are
+// validated on claim.
+func searchHandle(query string) string {
+	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(query), "@"))
+}
+
+// SearchPublicChannels returns the channels discoverable by any account whose
+// title or handle matches the query, capped at limit.
+//
+// It takes no viewer: publicness is the only predicate, it lives in the SQL
+// WHERE, and it therefore applies before the LIMIT. A private channel matching
+// the query never occupies a row, so a caller cannot read one back as evidence
+// that it exists. See the query comment for why that position is the whole of
+// the property.
+func (s *Store) SearchPublicChannels(ctx context.Context, query string, limit int32) ([]PublicChannelMatch, error) {
+	rows, err := s.q.SearchPublicChannels(ctx, db.SearchPublicChannelsParams{
+		Query:  query,
+		Handle: searchHandle(query),
+		Lim:    limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search public channels: %w", err)
+	}
+	out := make([]PublicChannelMatch, len(rows))
+	for i, r := range rows {
+		out[i] = PublicChannelMatch{
+			Channel: Channel{
+				ID:              r.ID,
+				Title:           r.Title,
+				About:           r.About,
+				CreatorID:       r.CreatorID,
+				Megagroup:       r.Megagroup,
+				Version:         int(r.Version),
+				Date:            r.Date.Time,
+				PinnedMessageID: r.PinnedMessageID,
+				// The handle off the usernames row, not the denormalized copy:
+				// the username reported is the one that made the channel
+				// public in the first place.
+				Username: &r.Handle,
+			},
+			ParticipantsCount: r.ParticipantsCount,
+		}
+	}
+	return out, nil
+}
+
+// SearchMemberChannels returns the channels viewerID belongs to whose title or
+// handle matches the query, public and private alike, capped at limit. A
+// channel the caller never joined, or is banned from, is not returned.
+func (s *Store) SearchMemberChannels(
+	ctx context.Context, viewerID int64, query string, limit int32,
+) ([]MemberChannelMatch, error) {
+	rows, err := s.q.SearchMemberChannels(ctx, db.SearchMemberChannelsParams{
+		ViewerID: viewerID,
+		Query:    query,
+		Handle:   searchHandle(query),
+		Lim:      limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search member channels: %w", err)
+	}
+	out := make([]MemberChannelMatch, len(rows))
+	for i, r := range rows {
+		out[i] = MemberChannelMatch{
+			Channel: Channel{
+				ID:              r.ID,
+				Title:           r.Title,
+				About:           r.About,
+				CreatorID:       r.CreatorID,
+				Megagroup:       r.Megagroup,
+				Version:         int(r.Version),
+				Date:            r.Date.Time,
+				PinnedMessageID: r.PinnedMessageID,
+				Username:        r.Handle,
+			},
+			// The query already excluded banned rows, so BannedUntil is left
+			// nil rather than re-read: nothing downstream may treat this value
+			// as the ban record.
+			Member: ChannelMember{UserID: viewerID, Role: int(r.Role)},
+		}
+	}
+	return out, nil
+}
+
 // ChannelDialogRow carries one channel's dialog data: the channel itself, its
 // pts, and the newest non-deleted post (top message). Top is nil when the
 // channel has no posts or all posts are deleted.

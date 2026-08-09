@@ -145,7 +145,15 @@ func (s *Store) UsernameByHandle(ctx context.Context, handle string) (UsernameRe
 		if err != nil {
 			return UsernameResolution{}, false, fmt.Errorf("load channel: %w", err)
 		}
-		return UsernameResolution{Kind: UsernameKindChannel, Channel: channelFromRow(c)}, true, nil
+		ch := channelFromRow(c)
+		// The handle that resolved the channel, off the usernames row, replaces
+		// the denormalized channels.username copy the row carries. The two are
+		// written in one transaction today, but only this row is authoritative,
+		// and contacts.search already reports the handle from it — a writer that
+		// released the handle without clearing the copy must not make the two
+		// RPCs name the same channel differently.
+		ch.Username = &row.Handle
+		return UsernameResolution{Kind: UsernameKindChannel, Channel: ch}, true, nil
 	default:
 		return UsernameResolution{}, false, fmt.Errorf("unknown owner type: %s", row.OwnerType)
 	}
