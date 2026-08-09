@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/netip"
 	"slices"
-	"time"
 )
 
 // ListenProxyV2 accepts MTProto connections on ln, attributing each to the
@@ -45,7 +44,7 @@ func ListenProxyV2(ln net.Listener, allow []netip.Prefix, log *slog.Logger) List
 	}
 	// Cloned: the allowlist is the trust decision, and it must not change under
 	// the accept loop because a caller reused the slice it passed in.
-	return &listener{ln: ln, src: proxyV2Source{allow: slices.Clone(allow)}, log: log}
+	return newListener(ln, proxyV2Source{allow: slices.Clone(allow)}, log)
 }
 
 const (
@@ -70,12 +69,6 @@ const (
 	// Address block sizes: source and destination address, then both ports.
 	proxyV2INetLen  = 4 + 4 + 2 + 2
 	proxyV2INet6Len = 16 + 16 + 2 + 2
-
-	// proxyV2HeaderTimeout bounds the wait for the header. A balancer writes it
-	// the moment it opens the connection, so the only sender that takes longer
-	// is one that never intends to finish — and this read happens on the accept
-	// loop, where a wait with no bound holds up every connection behind it.
-	proxyV2HeaderTimeout = 10 * time.Second
 )
 
 // proxyV2Signature is the fixed 12 bytes every v2 header opens with. It is
@@ -97,6 +90,11 @@ type proxyV2Source struct {
 // transport codec header starts at. Nothing is buffered past it, which is what
 // keeps codec detection seeing the same first byte it would have seen without a
 // balancer in front.
+//
+// The read runs under the deadline listener.setup armed. That deadline covers
+// the codec sniff after this too, so it is not cleared here: a sender that
+// writes a valid header and then goes quiet must be bounded by the same clock as
+// one that writes nothing at all.
 func (s proxyV2Source) clientAddr(conn net.Conn) (netip.Addr, error) {
 	peer := peerAddr(conn.RemoteAddr())
 	if !s.allowed(peer) {
@@ -104,19 +102,7 @@ func (s proxyV2Source) clientAddr(conn net.Conn) (netip.Addr, error) {
 		// are never interpreted, as a header or as anything else.
 		return netip.Addr{}, fmt.Errorf("no PROXY header is accepted from %s: not an allowlisted balancer", peer)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(proxyV2HeaderTimeout)); err != nil {
-		return netip.Addr{}, fmt.Errorf("set PROXY header deadline: %w", err)
-	}
-	addr, err := readProxyV2(conn)
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	// Cleared before the connection is handed on, so the rest of its life keeps
-	// the deadlines the serve loop sets rather than this one.
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		return netip.Addr{}, fmt.Errorf("clear PROXY header deadline: %w", err)
-	}
-	return addr, nil
+	return readProxyV2(conn)
 }
 
 // allowed reports whether a header from peer may be believed. An address the
