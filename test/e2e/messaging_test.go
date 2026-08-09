@@ -198,6 +198,23 @@ func recvOr[T any](t *testing.T, ch chan T, what string) T {
 	}
 }
 
+// recvOrCtx is like recvOr but bounded by the provided context instead of a
+// fixed 10s deadline, so tests that already carry a generous outer timeout
+// (e.g. 120s) do not lose time to a sub-deadline that expired while the
+// harness was waiting for a shared resource (Postgres template lock, CPU
+// contention from other packages).
+func recvOrCtx[T any](t *testing.T, ctx context.Context, ch chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", what, ctx.Err())
+		var zero T
+		return zero
+	}
+}
+
 // bootServerWithDelivery boots a server plus its LISTEN/NOTIFY delivery listener,
 // wired to the server's session registry, and returns a stop function.
 func bootServerWithDelivery(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, dsn string, log *slog.Logger, ln net.Listener) func() {

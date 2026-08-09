@@ -426,9 +426,7 @@ func TestMediaInChatFanOut(t *testing.T) {
 		mc  *mediaClient
 		who string
 	}{{b, "B"}, {c, "C"}} {
-		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err := m.mc.coll.waitService(sCtx, &tg.MessageActionChatCreate{})
-		sCancel()
+		_, err := m.mc.coll.waitService(ctx, &tg.MessageActionChatCreate{})
 		if err != nil {
 			t.Fatalf("%s wait create service: %v", m.who, err)
 		}
@@ -445,7 +443,7 @@ func TestMediaInChatFanOut(t *testing.T) {
 		mc  *mediaClient
 		who string
 	}{{b, "B"}, {c, "C"}} {
-		msg := recvOr(t, m.mc.coll.newMsg, m.who+" chat media updateNewMessage")
+		msg := recvOrCtx(t, ctx, m.mc.coll.newMsg, m.who+" chat media updateNewMessage")
 		memberDoc := documentOf(t, msg)
 		assertSameDocument(t, memberDoc, doc, m.who)
 		if got := downloadDocument(t, m.mc, memberDoc); !bytes.Equal(got, payload) {
