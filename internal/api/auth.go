@@ -88,12 +88,16 @@ func (h *handlers) checkSendCodeIP(r *mtproto.Request, phone string) error {
 	res, err := h.store.CheckAndChargeSendCodeIP(r.Ctx, r.ClientAddr, phone, h.rateLimitSendCodeIP)
 	if err != nil {
 		if errors.Is(err, store.ErrNoClientAddr) {
-			// The socket had no address to attribute the call to, so the limit
-			// cannot hold for it. Refused rather than waved through: every TCP
-			// peer has an address, so this is a fault in the server's own
-			// transport path, and an attacker who could provoke it would
-			// otherwise have found the way around the limit.
-			h.log.Error("send code: connection carries no client address")
+			// The connection carries no address to attribute the call to, so the
+			// limit cannot hold for it, and it is refused rather than waved
+			// through: an attacker who could provoke this would otherwise have
+			// found the way around the limit.
+			//
+			// Not an error condition, though. In proxy-v2 mode a balancer states
+			// that a connection has no client address — its own health check
+			// does exactly that — so this is a request arriving on a connection
+			// that was never meant to carry one, not a fault in the server.
+			h.log.Info("send code: connection carries no client address")
 			return FloodWaitError(int(h.sendCodeIPRetry() / time.Second))
 		}
 		h.log.Error("send code: ip rate limit", "err", err)

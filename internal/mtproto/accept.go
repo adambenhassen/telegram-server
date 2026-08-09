@@ -2,6 +2,7 @@ package mtproto
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"syscall"
@@ -17,20 +18,44 @@ const (
 	maxAcceptBackoff = time.Second
 )
 
-// negotiate detects the transport codec of an accepted socket, bounded by the
-// handshake timeout. Shutdown is not its business: the caller closes the socket
-// on cancellation, which ends the read below wherever it has got to.
+// negotiate establishes the client address of an accepted socket and detects its
+// transport codec, bounded by the handshake timeout. Shutdown is not its
+// business: the caller closes the socket on cancellation, which ends whichever
+// of the two reads below it has got to.
 //
-// This runs per connection rather than in the accept loop on purpose: codec
-// detection reads client bytes, so performing it where the next socket is
-// accepted would let one peer decide when — or whether — anybody else gets
-// connected, and would report that peer's read error as a listener failure.
+// This runs per connection rather than in the accept loop on purpose: both steps
+// read client bytes, so performing them where the next socket is accepted would
+// let one peer decide when — or whether — anybody else gets connected, and would
+// report that peer's read error as a listener failure.
 //
-// The deadline is left set on the way out: gotd resets it from the context
-// before every frame it reads, so nothing here has to clear it.
-func (s *Server) negotiate(sock net.Conn) (transport.Conn, error) {
+// The address is established first and, in socket mode, before a single byte has
+// been read, so what every per-IP limit keys on cannot be a function of anything
+// the client wrote. In proxy-v2 mode the allowlist decides before any read too:
+// bytes from a sender that is not a configured balancer are never interpreted,
+// as a header or as anything else.
+//
+// One deadline covers the header read and the codec sniff together, and is left
+// set on the way out: gotd resets it from the context before every frame it
+// reads, so nothing here has to clear it.
+func (s *Server) negotiate(sock net.Conn) (transport.Conn, netip.Addr, error) {
+	addr := peerAddr(sock.RemoteAddr())
+	if s.proxyV2 != nil && !s.proxyV2.allowed(addr) {
+		return nil, netip.Addr{}, errors.Join(
+			fmt.Errorf("no PROXY header is accepted from %s: not an allowlisted balancer", addr), sock.Close())
+	}
 	if err := sock.SetReadDeadline(time.Now().Add(s.handshakeTimeout)); err != nil {
-		return nil, errors.Join(errors.New("set handshake deadline"), err, sock.Close())
+		return nil, netip.Addr{}, errors.Join(errors.New("set handshake deadline"), err, sock.Close())
+	}
+
+	// Before the codec sniff, never after: the sniff picks a codec from the
+	// first bytes of the stream, so a header still in it would be read as a
+	// codec tag and every later frame would decode as garbage.
+	if s.proxyV2 != nil {
+		client, err := readProxyV2(sock)
+		if err != nil {
+			return nil, netip.Addr{}, errors.Join(errors.New("read PROXY v2 header"), err, sock.Close())
+		}
+		addr = client
 	}
 
 	// Hand gotd this one socket to negotiate: its Accept owns the failure path
@@ -38,9 +63,9 @@ func (s *Server) negotiate(sock net.Conn) (transport.Conn, error) {
 	// the listener itself.
 	conn, err := transport.Listen(&singleConn{conn: sock}).Accept()
 	if err != nil {
-		return nil, errors.Join(errors.New("detect codec"), err)
+		return nil, netip.Addr{}, errors.Join(errors.New("detect codec"), err)
 	}
-	return conn, nil
+	return conn, addr, nil
 }
 
 // peerAddr parses the transport peer address of an accepted socket. An address
