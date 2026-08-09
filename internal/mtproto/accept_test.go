@@ -3,7 +3,10 @@ package mtproto_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
+	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -78,20 +81,91 @@ func TestServeClosesSilentConnection(t *testing.T) {
 	}
 }
 
-// TestServeSurvivesTemporaryAcceptError covers the listener-level half of the
-// invariant: an accept failure that is transient (the process is momentarily
-// out of file descriptors) belongs to no connection and clears on its own, so
-// it must not end serving.
-func TestServeSurvivesTemporaryAcceptError(t *testing.T) {
+// TestServeAcceptErrorClassification covers the listener-level half of the
+// invariant, in both directions. A transient failure belongs to no connection
+// and clears on its own, so serving must survive it; a permanent one is the
+// listener itself failing, and swallowing that would leave a process that
+// accepts nobody looking alive. Both halves are asserted here because a
+// predicate widened until it swallowed real faults would pass a suite that only
+// tested the first.
+func TestServeAcceptErrorClassification(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		err  error
+		// fatal says Serve must return the error rather than retry past it.
+		fatal bool
+	}{
+		{name: "process out of descriptors", err: syscall.EMFILE},
+		{name: "system out of descriptors", err: syscall.ENFILE},
+		{name: "peer aborted before accept", err: syscall.ECONNABORTED},
+		{name: "peer reset before accept", err: syscall.ECONNRESET},
+		{name: "accept deadline elapsed", err: os.ErrDeadlineExceeded},
+		{name: "listener rejects the call", err: syscall.EINVAL, fatal: true},
+		{name: "listener fault with no errno", err: errors.New("listener broken"), fatal: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			nl, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			// One fault is enough for the permanent case; the transient one is
+			// repeated so a retry that only survived once would still fail.
+			fl := &faultyListener{Listener: nl, err: tt.err, faults: 3}
+
+			srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
+			done := make(chan error, 1)
+			go func() { done <- srv.Serve(context.Background(), fl); close(done) }()
+			t.Cleanup(func() {
+				if cerr := fl.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+					t.Errorf("listener close: %v", cerr)
+				}
+				<-done
+			})
+
+			if tt.fatal {
+				select {
+				case err := <-done:
+					if !errors.Is(err, tt.err) {
+						t.Fatalf("Serve returned %v, want it to carry %v", err, tt.err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("Serve kept running after a permanent listener fault")
+				}
+				return
+			}
+
+			assertServes(t, nl.Addr().String(), transport.Abridged)
+
+			select {
+			case err := <-done:
+				t.Fatalf("Serve returned after a transient accept fault: %v", err)
+			default:
+			}
+		})
+	}
+}
+
+// TestServeEscalatesWhenAcceptStaysBroken covers the other half of surviving a
+// transient fault: a server that retries forever at Info is a server that
+// accepts nobody while reading as healthy. Once the retry interval has
+// saturated, the fault has outlived any blip and must be reported as such.
+func TestServeEscalatesWhenAcceptStaysBroken(t *testing.T) {
 	t.Parallel()
 
 	nl, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	fl := &faultyListener{Listener: nl, faults: 3}
+	// Enough consecutive faults to walk the backoff to its ceiling, then the
+	// listener recovers so the serve loop can be shut down normally.
+	fl := &faultyListener{Listener: nl, err: syscall.EMFILE, faults: 12}
 
-	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
+	sink := &warnSink{warned: make(chan struct{}, 1)}
+	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, slog.New(sink))
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(context.Background(), fl); close(done) }()
 	t.Cleanup(func() {
@@ -101,12 +175,62 @@ func TestServeSurvivesTemporaryAcceptError(t *testing.T) {
 		<-done
 	})
 
-	assertServes(t, nl.Addr().String(), transport.Abridged)
+	select {
+	case <-sink.warned:
+	case <-time.After(30 * time.Second):
+		t.Fatal("accept stuck at maximum backoff was never reported above Info")
+	}
+}
+
+// TestServeShutdownDoesNotAwaitNegotiation covers what cancellation reaches: a
+// socket sitting in transport negotiation is blocked on a read that takes no
+// context, so without the deadline being expired for it, stopping the server
+// would wait out the whole handshake bound — a deploy restart stalling on
+// whatever silent sockets happen to be mid-negotiation.
+func TestServeShutdownDoesNotAwaitNegotiation(t *testing.T) {
+	t.Parallel()
+
+	nl, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	accepted := make(chan struct{})
+	al := &acceptedListener{Listener: nl, accepted: accepted}
+
+	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
+	// The production bound, deliberately: the assertion below is that shutdown
+	// does not wait for it.
+	srv.SetHandshakeTimeout(30 * time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, al); close(done) }()
+
+	silent, err := dial(nl.Addr().String())
+	if err != nil {
+		cancel()
+		t.Fatalf("dial: %v", err)
+	}
+	defer silent.Close() //nolint:errcheck // the server owns this socket's close.
+
+	// Cancel only once the socket is in the server's hands and negotiating, so
+	// the wait below is the real thing rather than a shutdown with nothing
+	// pending.
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("server never accepted the connection")
+	}
+	cancel()
 
 	select {
 	case err := <-done:
-		t.Fatalf("Serve returned after a transient accept fault: %v", err)
-	default:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve waited on a connection still negotiating instead of shutting down")
 	}
 }
 
@@ -198,13 +322,49 @@ func assertServes(t *testing.T, addr string, protocol transport.Protocol) {
 	}
 }
 
-// faultyListener fails the first faults accepts with a transient
-// out-of-descriptors error before behaving normally, standing in for a burst of
-// connection opens exhausting the process's file descriptors.
+// faultyListener fails the first faults accepts with err, wrapped the way the
+// net package delivers an accept failure, before behaving normally.
 type faultyListener struct {
 	net.Listener
 
+	err    error
 	faults int
+}
+
+// warnSink signals the first record logged above Info, so a test can assert an
+// escalation without matching on message text.
+type warnSink struct {
+	once   sync.Once
+	warned chan struct{}
+}
+
+func (s *warnSink) Enabled(context.Context, slog.Level) bool { return true }
+func (s *warnSink) WithAttrs([]slog.Attr) slog.Handler       { return s }
+func (s *warnSink) WithGroup(string) slog.Handler            { return s }
+
+func (s *warnSink) Handle(_ context.Context, r slog.Record) error {
+	if r.Level > slog.LevelInfo {
+		s.once.Do(func() { close(s.warned) })
+	}
+	return nil
+}
+
+// acceptedListener reports the first socket it hands over, so a test can act at
+// the point where the server has one connection but has not finished
+// negotiating it.
+type acceptedListener struct {
+	net.Listener
+
+	once     sync.Once
+	accepted chan struct{}
+}
+
+func (l *acceptedListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.once.Do(func() { close(l.accepted) })
+	}
+	return conn, err
 }
 
 // dial opens a plain TCP connection to addr.
@@ -215,7 +375,7 @@ func dial(addr string) (net.Conn, error) {
 func (l *faultyListener) Accept() (net.Conn, error) {
 	if l.faults > 0 {
 		l.faults--
-		return nil, &net.OpError{Op: "accept", Net: "tcp", Err: syscall.EMFILE}
+		return nil, &net.OpError{Op: "accept", Net: "tcp", Err: l.err}
 	}
 	return l.Listener.Accept()
 }

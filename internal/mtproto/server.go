@@ -135,8 +135,15 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 				if isTransientAccept(err) {
 					// Wait for the condition to pass instead of spinning on it,
 					// and keep the listener open: it is still good.
-					s.log.Info("accept failed, retrying", "err", err)
 					backoff = nextAcceptBackoff(backoff)
+					// A fault still there once the retry interval has saturated
+					// is no longer a blip: the process is accepting nobody, and
+					// at Info a server that serves no one reads as healthy.
+					if backoff >= maxAcceptBackoff {
+						s.log.Warn("accept still failing at maximum backoff", "err", err)
+					} else {
+						s.log.Info("accept failed, retrying", "err", err)
+					}
 					select {
 					case <-ctx.Done():
 						return nil
@@ -173,7 +180,7 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
 	// of anything the client wrote.
 	addr := peerAddr(sock.RemoteAddr())
 
-	conn, err := s.negotiate(sock)
+	conn, err := s.negotiate(ctx, sock)
 	if err != nil {
 		if !isDisconnect(err) {
 			s.log.Info("transport negotiation error", "err", err)

@@ -1,6 +1,7 @@
 package mtproto
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/netip"
@@ -18,16 +19,31 @@ const (
 )
 
 // negotiate detects the transport codec of an accepted socket, bounded by the
-// handshake timeout.
+// handshake timeout and by ctx.
 //
 // This runs per connection rather than in the accept loop on purpose: codec
 // detection reads client bytes, so performing it where the next socket is
 // accepted would let one peer decide when — or whether — anybody else gets
 // connected, and would report that peer's read error as a listener failure.
-func (s *Server) negotiate(sock net.Conn) (transport.Conn, error) {
+//
+// The deadline is left set on the way out: gotd resets it from the context
+// before every frame it reads, so nothing here has to clear it.
+func (s *Server) negotiate(ctx context.Context, sock net.Conn) (transport.Conn, error) {
 	if err := sock.SetReadDeadline(time.Now().Add(s.handshakeTimeout)); err != nil {
 		return nil, errors.Join(errors.New("set handshake deadline"), err, sock.Close())
 	}
+
+	// Shutdown must not wait out the handshake bound. The read below belongs to
+	// gotd and takes no context, so cancellation is delivered the only way the
+	// socket understands: expiring its deadline, which ends the read at once.
+	// Whatever sockets happen to be mid-negotiation therefore cost a stopping
+	// process nothing, instead of up to handshakeTimeout each.
+	stop := context.AfterFunc(ctx, func() {
+		if err := sock.SetReadDeadline(time.Now()); err != nil {
+			s.log.Info("expire handshake deadline at shutdown", "err", err)
+		}
+	})
+	defer stop()
 
 	// Hand gotd this one socket to negotiate: its Accept owns the failure path
 	// and closes the socket if detection fails, exactly as it did when it held
@@ -35,12 +51,6 @@ func (s *Server) negotiate(sock net.Conn) (transport.Conn, error) {
 	conn, err := transport.Listen(&singleConn{conn: sock}).Accept()
 	if err != nil {
 		return nil, errors.Join(errors.New("detect codec"), err)
-	}
-
-	// Frame reads carry their own deadline, derived from the read timeout, so
-	// the handshake bound must not outlive the handshake.
-	if err := sock.SetReadDeadline(time.Time{}); err != nil {
-		return nil, errors.Join(errors.New("clear handshake deadline"), err, conn.Close())
 	}
 	return conn, nil
 }
@@ -90,12 +100,16 @@ func (l *singleConn) Addr() net.Addr {
 }
 
 // isTransientAccept reports whether an accept failure is a passing condition of
-// the process rather than a fault of the listener. Running out of file
-// descriptors is the one a burst of connection opens produces: it belongs to no
-// connection, it clears once open sockets are returned, and treating it as
-// fatal would let that burst stop the server.
+// the process, or of one pending connection, rather than a fault of the
+// listener. Running out of file descriptors is the one a burst of connection
+// opens produces: it belongs to no connection, it clears once open sockets are
+// returned, and treating it as fatal would let that burst stop the server. A
+// peer that resets or aborts between the SYN and the accept fails the same way
+// and is likewise nobody else's problem — Go's own net package counts both as
+// temporary.
 func isTransientAccept(err error) bool {
-	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || errors.Is(err, syscall.ECONNABORTED) {
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.ECONNRESET) {
 		return true
 	}
 	var nerr net.Error
