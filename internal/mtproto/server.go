@@ -180,7 +180,22 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
 	// of anything the client wrote.
 	addr := peerAddr(sock.RemoteAddr())
 
-	conn, err := s.negotiate(ctx, sock)
+	// Cancellation has to reach this socket wherever it happens to be, and the
+	// reads it blocks in take no context: gotd re-derives a read deadline from
+	// one per frame, so a deadline expired at cancel is undone by the very next
+	// read. Closing is the one signal that handoff cannot reset, and it covers
+	// every wait the connection has — negotiating, or idle between frames — so
+	// a stopping process never waits out a timeout on a peer that has gone
+	// quiet. Both sides then close: the loser gets ErrClosed, which is a
+	// disconnect like any other.
+	stop := context.AfterFunc(ctx, func() {
+		if err := sock.Close(); err != nil && !isDisconnect(err) {
+			s.log.Info("close connection at shutdown", "err", err)
+		}
+	})
+	defer stop()
+
+	conn, err := s.negotiate(sock)
 	if err != nil {
 		if !isDisconnect(err) {
 			s.log.Info("transport negotiation error", "err", err)
