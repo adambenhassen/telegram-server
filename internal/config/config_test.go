@@ -74,6 +74,18 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.RateLimits.CreateChannel.Window != 24*time.Hour {
 		t.Errorf("CreateChannel window = %v, want 24h", cfg.RateLimits.CreateChannel.Window)
 	}
+	if cfg.RateLimits.SearchMessages.Limit != 300 {
+		t.Errorf("SearchMessages limit = %d, want 300", cfg.RateLimits.SearchMessages.Limit)
+	}
+	if cfg.RateLimits.SearchMessages.Window != time.Hour {
+		t.Errorf("SearchMessages window = %v, want 1h", cfg.RateLimits.SearchMessages.Window)
+	}
+	if cfg.RateLimits.SearchContacts.Limit != 300 {
+		t.Errorf("SearchContacts limit = %d, want 300", cfg.RateLimits.SearchContacts.Limit)
+	}
+	if cfg.RateLimits.SearchContacts.Window != time.Hour {
+		t.Errorf("SearchContacts window = %v, want 1h", cfg.RateLimits.SearchContacts.Window)
+	}
 }
 
 func TestLoadBlobDir(t *testing.T) {
@@ -539,6 +551,30 @@ func TestLoadRateLimitEnv(t *testing.T) {
 	}
 	if cfg.RateLimits.CreateChannel.Window != 12*time.Hour {
 		t.Errorf("CreateChannel window = %v, want 12h", cfg.RateLimits.CreateChannel.Window)
+	}
+
+	// Override search limits and windows. Both surfaces are asserted with
+	// distinct values so a name typo or a value landing on the wrong surface
+	// fails here rather than shipping.
+	t.Setenv("TG_RATE_LIMIT_SEARCH_MESSAGES", "11")
+	t.Setenv("TG_RATE_LIMIT_SEARCH_MESSAGES_WINDOW", "30m")
+	t.Setenv("TG_RATE_LIMIT_SEARCH_CONTACTS", "13")
+	t.Setenv("TG_RATE_LIMIT_SEARCH_CONTACTS_WINDOW", "45m")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.SearchMessages.Limit != 11 {
+		t.Errorf("SearchMessages limit = %d, want 11", cfg.RateLimits.SearchMessages.Limit)
+	}
+	if cfg.RateLimits.SearchMessages.Window != 30*time.Minute {
+		t.Errorf("SearchMessages window = %v, want 30m", cfg.RateLimits.SearchMessages.Window)
+	}
+	if cfg.RateLimits.SearchContacts.Limit != 13 {
+		t.Errorf("SearchContacts limit = %d, want 13", cfg.RateLimits.SearchContacts.Limit)
+	}
+	if cfg.RateLimits.SearchContacts.Window != 45*time.Minute {
+		t.Errorf("SearchContacts window = %v, want 45m", cfg.RateLimits.SearchContacts.Window)
 	}
 
 	// Zero disables enforcement.

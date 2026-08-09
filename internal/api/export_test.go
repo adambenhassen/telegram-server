@@ -570,6 +570,18 @@ func ContactsSearchForTest(s *store.Store, userID int64, req *tg.ContactsSearchR
 	return testHandlers(s).handleContactsSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// ContactsSearchForTestWithLimits invokes handleContactsSearch for the caller
+// with a custom contacts search rate limit config.
+func ContactsSearchForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.ContactsSearchRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitSearchContacts = rateLimit
+	return h.handleContactsSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SearchForTest invokes handleSearch for the caller against the given request.
 func SearchForTest(s *store.Store, userID int64, req *tg.MessagesSearchRequest) (bin.Encoder, error) {
 	var buf bin.Buffer
@@ -577,6 +589,18 @@ func SearchForTest(s *store.Store, userID int64, req *tg.MessagesSearchRequest) 
 		return nil, err
 	}
 	return testHandlers(s).handleSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SearchForTestWithLimits invokes handleSearch for the caller with a custom
+// messages search rate limit config.
+func SearchForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSearchRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitSearchMessages = rateLimit
+	return h.handleSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // SetUserFirstNameForTest updates a user's first_name directly, so tests can
