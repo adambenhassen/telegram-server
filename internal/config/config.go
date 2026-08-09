@@ -73,6 +73,8 @@ type RateLimitsConfig struct {
 	CreateChat store.RateLimitConfig
 	// AddChatUser limits messages.addChatUser per account.
 	AddChatUser store.RateLimitConfig
+	// CreateChannel limits channels.createChannel per account.
+	CreateChannel store.RateLimitConfig
 }
 
 // MaxFileBytesLimit is the ceiling on TG_MAX_FILE_BYTES. It is a bound on the
@@ -145,11 +147,13 @@ func Load(log *slog.Logger) (Config, error) {
 		cfg.LogLoginCodes = on
 	}
 	// Rate-limit defaults: 60 sends per 60s, 20 chat creates per 24h, 120 member
-	// adds per 24h. Zero or unset disables enforcement for that surface.
+	// adds per 24h, 20 channel creates per 24h. Zero or unset disables enforcement
+	// for that surface.
 	cfg.RateLimits = RateLimitsConfig{
-		MessageSend: store.RateLimitConfig{Limit: 60, Window: 60 * time.Second},
-		CreateChat:  store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
-		AddChatUser: store.RateLimitConfig{Limit: 120, Window: 24 * time.Hour},
+		MessageSend:   store.RateLimitConfig{Limit: 60, Window: 60 * time.Second},
+		CreateChat:    store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
+		AddChatUser:   store.RateLimitConfig{Limit: 120, Window: 24 * time.Hour},
+		CreateChannel: store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
 	}
 	if v := os.Getenv("TG_RATE_LIMIT_SEND"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -192,6 +196,20 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_RATE_LIMIT_ADD_CHAT_USER_WINDOW must be a duration")
 		}
 		cfg.RateLimits.AddChatUser.Window = d
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_CREATE_CHANNEL"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_CREATE_CHANNEL must be an integer")
+		}
+		cfg.RateLimits.CreateChannel.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_CREATE_CHANNEL_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_CREATE_CHANNEL_WINDOW must be a duration")
+		}
+		cfg.RateLimits.CreateChannel.Window = d
 	}
 	advertiseHost, advertisePort, err := advertiseAddr(os.Getenv("TG_ADVERTISE_ADDR"), cfg.ListenAddr)
 	if err != nil {

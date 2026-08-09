@@ -55,6 +55,8 @@ type handlers struct {
 	rateLimitCreateChat store.RateLimitConfig
 	// rateLimitAddChatUser limits messages.addChatUser per account.
 	rateLimitAddChatUser store.RateLimitConfig
+	// rateLimitCreateChannel limits channels.createChannel per account.
+	rateLimitCreateChannel store.RateLimitConfig
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -105,20 +107,21 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		panic("api: nil peer hash deriver")
 	}
 	h := &handlers{
-		peers:                peers,
-		store:                s,
-		cfg:                  cfg,
-		dcID:                 dcID,
-		log:                  log,
-		srp:                  srp.NewChallengeStore(srp.DefaultTTL),
-		logLoginCodes:        logLoginCodes,
-		maxFileBytes:         maxFileBytes,
-		blobs:                blobs,
-		maxUserStorageBytes:  maxUserStorageBytes,
-		downloads:            map[int64]bool{},
-		rateLimitMessageSend: rateLimits.MessageSend,
-		rateLimitCreateChat:  rateLimits.CreateChat,
-		rateLimitAddChatUser: rateLimits.AddChatUser,
+		peers:                  peers,
+		store:                  s,
+		cfg:                    cfg,
+		dcID:                   dcID,
+		log:                    log,
+		srp:                    srp.NewChallengeStore(srp.DefaultTTL),
+		logLoginCodes:          logLoginCodes,
+		maxFileBytes:           maxFileBytes,
+		blobs:                  blobs,
+		maxUserStorageBytes:    maxUserStorageBytes,
+		downloads:              map[int64]bool{},
+		rateLimitMessageSend:   rateLimits.MessageSend,
+		rateLimitCreateChat:    rateLimits.CreateChat,
+		rateLimitAddChatUser:   rateLimits.AddChatUser,
+		rateLimitCreateChannel: rateLimits.CreateChannel,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
