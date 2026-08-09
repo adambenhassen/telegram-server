@@ -1220,3 +1220,254 @@ func mediaDocument(t *testing.T, m *tg.Message) *tg.Document {
 	}
 	return doc
 }
+
+func TestSearchMatchesInboundMessages(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a, err := s.CreateUser(ctx, "+15551295001")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551295002")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+
+	// A sends "hello world" to B.
+	if _, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
+		Peer:     api.InputPeerUser(a.ID, b.ID),
+		Message:  "hello world",
+		RandomID: 1,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// B searches for "hello" — should return the inbound message from A.
+	enc, err := api.SearchForTest(s, b.ID, &tg.MessagesSearchRequest{
+		Peer:   api.InputPeerUser(b.ID, a.ID),
+		Q:      "hello",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesMessages", enc)
+	}
+	if len(res.Messages) != 1 {
+		t.Fatalf("B search hello: got %d messages, want 1", len(res.Messages))
+	}
+	m, ok := res.Messages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("message type = %T, want *tg.Message", res.Messages[0])
+	}
+	if m.Message != "hello world" {
+		t.Fatalf("message text = %q, want %q", m.Message, "hello world")
+	}
+	if m.Out {
+		t.Error("inbound message should have out=false")
+	}
+}
+
+func TestSearchChatPeerReturnsBothDirections(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	users, chat := chatWith(t, s, "+15551295011", "+15551295012")
+
+	// A sends "quarterly report" to the chat.
+	if _, err := api.SendMessageForTest(s, users[0].ID, &tg.MessagesSendMessageRequest{
+		Peer:     &tg.InputPeerChat{ChatID: chat.ID},
+		Message:  "quarterly report",
+		RandomID: 1,
+	}); err != nil {
+		t.Fatalf("send A: %v", err)
+	}
+	// B sends "review quarterly" to the chat.
+	if _, err := api.SendMessageForTest(s, users[1].ID, &tg.MessagesSendMessageRequest{
+		Peer:     &tg.InputPeerChat{ChatID: chat.ID},
+		Message:  "review quarterly",
+		RandomID: 2,
+	}); err != nil {
+		t.Fatalf("send B: %v", err)
+	}
+
+	// B searches chat for "quarterly" — should return both messages.
+	enc, err := api.SearchForTest(s, users[1].ID, &tg.MessagesSearchRequest{
+		Peer:   &tg.InputPeerChat{ChatID: chat.ID},
+		Q:      "quarterly",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("result type = %T, want *tg.MessagesMessages", enc)
+	}
+	if len(res.Messages) != 2 {
+		t.Fatalf("B search chat quarterly: got %d messages, want 2", len(res.Messages))
+	}
+	// Newest-first: B's own "review quarterly" then A's "quarterly report".
+	got := make([]string, len(res.Messages))
+	for i, m := range res.Messages {
+		if msg, ok := m.(*tg.Message); ok {
+			got[i] = msg.Message
+		} else {
+			t.Fatalf("message %d type = %T", i, m)
+		}
+	}
+	if got[0] != "review quarterly" {
+		t.Errorf("search[0] = %q, want %q", got[0], "review quarterly")
+	}
+	if got[1] != "quarterly report" {
+		t.Errorf("search[1] = %q, want %q", got[1], "quarterly report")
+	}
+	// Chats should be populated for chat peers.
+	if len(res.Chats) != 1 {
+		t.Fatalf("chats = %d, want 1", len(res.Chats))
+	}
+	c, ok := res.Chats[0].(*tg.Chat)
+	if !ok {
+		t.Fatalf("chat type = %T, want *tg.Chat", res.Chats[0])
+	}
+	if c.ID != chat.ID {
+		t.Errorf("chat id = %d, want %d", c.ID, chat.ID)
+	}
+}
+
+func TestSearchChatPeerRejectsNonMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	_, chat := chatWith(t, s, "+15551295021", "+15551295022")
+	outsider, err := s.CreateUser(ctx, "+15551295023")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
+
+	_, err = api.SearchForTest(s, outsider.ID, &tg.MessagesSearchRequest{
+		Peer:   &tg.InputPeerChat{ChatID: chat.ID},
+		Q:      "hello",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	})
+	rpcError(t, err, "PEER_ID_INVALID")
+}
+
+// When a member searches a chat by a word from its title, the create service
+// row returned by search must carry the same participant list that getHistory
+// returns for that same row. Without the createUsers lookup in chatSearch, the
+// create action renders with an empty user list.
+func TestSearchChatByTitleListsParticipants(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	users, chat := chatWith(t, s, "+15551295041", "+15551295042", "+15551295043")
+	// CreateChat writes no message; fan the create row so each member has it.
+	if _, _, _, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: chat.ID, FromID: users[0].ID, Text: "Crew", Action: store.ChatActionCreate,
+	}); err != nil {
+		t.Fatalf("create row: %v", err)
+	}
+
+	// getHistory for a member must return the create row with participants.
+	histEnc, err := api.GetHistoryForTest(s, users[1].ID, &tg.MessagesGetHistoryRequest{
+		Peer: &tg.InputPeerChat{ChatID: chat.ID},
+	})
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	hist, ok := histEnc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("history type = %T, want *tg.MessagesMessages", histEnc)
+	}
+	if len(hist.Messages) != 1 {
+		t.Fatalf("history messages = %d, want 1", len(hist.Messages))
+	}
+	histSvc, ok := hist.Messages[0].(*tg.MessageService)
+	if !ok {
+		t.Fatalf("history message type = %T, want *tg.MessageService", hist.Messages[0])
+	}
+	histCreate, ok := histSvc.Action.(*tg.MessageActionChatCreate)
+	if !ok {
+		t.Fatalf("history action type = %T, want *tg.MessageActionChatCreate", histSvc.Action)
+	}
+
+	// Search by a word from the title — the create row's text is "Crew".
+	searchEnc, err := api.SearchForTest(s, users[1].ID, &tg.MessagesSearchRequest{
+		Peer:   &tg.InputPeerChat{ChatID: chat.ID},
+		Q:      "Crew",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	search, ok := searchEnc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("search type = %T, want *tg.MessagesMessages", searchEnc)
+	}
+	if len(search.Messages) != 1 {
+		t.Fatalf("search messages = %d, want 1", len(search.Messages))
+	}
+	searchSvc, ok := search.Messages[0].(*tg.MessageService)
+	if !ok {
+		t.Fatalf("search message type = %T, want *tg.MessageService", search.Messages[0])
+	}
+	searchCreate, ok := searchSvc.Action.(*tg.MessageActionChatCreate)
+	if !ok {
+		t.Fatalf("search action type = %T, want *tg.MessageActionChatCreate", searchSvc.Action)
+	}
+
+	// Both paths must return the same participant list.
+	if len(searchCreate.Users) != len(histCreate.Users) {
+		t.Fatalf("search create users = %d, history = %d", len(searchCreate.Users), len(histCreate.Users))
+	}
+	histUsers := make(map[int64]bool)
+	for _, id := range histCreate.Users {
+		histUsers[id] = true
+	}
+	searchUsers := make(map[int64]bool)
+	for _, id := range searchCreate.Users {
+		searchUsers[id] = true
+	}
+	for _, u := range users {
+		if !histUsers[u.ID] {
+			t.Errorf("history user list missing participant %d", u.ID)
+		}
+		if !searchUsers[u.ID] {
+			t.Errorf("search user list missing participant %d", u.ID)
+		}
+	}
+	// The action's user ids must also appear in the Users list so clients can
+	// resolve them to tg.User objects. Deleting the createUsers fan-out into
+	// authors keeps the action assertion green but leaves users unresolvable.
+	searchUserList := make(map[int64]bool, len(search.Users))
+	for _, u := range search.Users {
+		searchUserList[u.GetID()] = true
+	}
+	for _, u := range users {
+		if !searchUserList[u.ID] {
+			t.Errorf("search.Users missing participant %d", u.ID)
+		}
+	}
+}
+
+func TestSearchChannelPeerReturnsInvalid(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	u, err := s.CreateUser(context.Background(), "+15551295031")
+	if err != nil {
+		t.Fatalf("user: %v", err)
+	}
+
+	_, err = api.SearchForTest(s, u.ID, &tg.MessagesSearchRequest{
+		Peer: &tg.InputPeerChannel{
+			ChannelID:  1,
+			AccessHash: api.DeriveChannelHash(u.ID, 1),
+		},
+		Q:      "hello",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	})
+	rpcError(t, err, "PEER_ID_INVALID")
+}
