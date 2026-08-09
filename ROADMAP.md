@@ -379,16 +379,17 @@ Channels
 - Postgres-backed rate limiter: O(1) state per (subject, surface), constant row
   operations per check-and-consume, exact under concurrency (no cross-subject
   serialization), old state self-cleans without unbounded row growth. Limits are
-  env-configured per surface with documented defaults; a zero or unset limit
-  disables enforcement for that surface.
+  env-configured per surface with documented defaults; an explicit zero disables
+  enforcement for that surface.
 - Dynamic `FLOOD_WAIT_<seconds>` error contract (error 420) with the real remaining
-  wait (minimum 1 second), replacing any hardcoded constant. A denied request stores
+  wait (minimum 1 second) for all limiter-issued denials. A denied request stores
   nothing, advances no pts, delivers no update — no partial effect anywhere.
 - Per-account limits shipped with defaults (all env-overridable): message sends
   (all paths — 1:1, chat, channel, media — share one budget) 60/60s;
   `messages.createChat` 20/24h; `messages.addChatUser` 120/24h;
   `channels.createChannel` 20/24h; `messages.search` 300/hr;
-  `contacts.search` 300/hr; `upload.saveFilePart` 600/60s.
+  `contacts.search` 300/hr; `upload.saveFilePart` and `upload.saveBigFilePart`
+  600/60s on one shared budget.
 - Connection-layer client-address plumbing: the peer address is captured before
   any client bytes are interpreted and carried with the request. Two trust modes:
   `socket` — the connection's own peer address, the default — and PROXY-v2 — the
@@ -444,8 +445,10 @@ Runs in parallel with features; currently the weakest area for production.
 - **Packaging & deploy.** Dockerfile and a `docker-compose` (server + Postgres)
   are in the repo. Add k8s manifests (the design assumes horizontal replicas
   behind a load balancer).
-- **CI.** No pipeline yet. Add build + `go test ./...` + `golangci-lint` +
-  `atlas migrate validate` on every push.
+- **CI.** Pipeline runs on every push and pull request: build, `golangci-lint`,
+  `atlas migrate validate`, and `make test` (full suite including e2e); a `docker`
+  job builds the image and smoke-boots it against a migrated database; a `compose`
+  job proves the named volumes survive a stack restart.
 - **API layer target.** Pin and document a target Telegram API layer, and track
   the gotd schema version the server is validated against.
 - **Multi-DC.** Config advertises a single DC (self). Real Telegram clients expect
