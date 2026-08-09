@@ -1226,6 +1226,11 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 		}
 	}
 
+	// Rate limit: pre-charged, before the search query.
+	if err := h.checkRateLimit(r, "messages_search", h.rateLimitSearchMessages); err != nil {
+		return nil, err
+	}
+
 	limit := req.Limit
 	if limit <= 0 {
 		limit = defaultHistoryLimit
