@@ -81,21 +81,21 @@ func TestForward1to1(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -111,7 +111,7 @@ func TestForward1to1(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A send: %v", err)
 	}
-	recvOr(t, collB.newMsg, "B updateNewMessage")
+	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
 
 	// A forwards the message to B (same peer).
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -127,7 +127,7 @@ func TestForward1to1(t *testing.T) {
 	}
 
 	// B should receive the forwarded message with FwdFrom populated.
-	fwdMsg := recvOr(t, collB.newMsg, "B forwarded message")
+	fwdMsg := recvOrCtx(t, ctx, collB.newMsg, "B forwarded message")
 	if fwdMsg.FwdFrom.Zero() {
 		t.Fatalf("forwarded message has no FwdFrom")
 	}
@@ -224,8 +224,8 @@ func TestForwardToGroup(t *testing.T) {
 			case 2:
 				cUserID = id
 			}
-		case <-time.After(30 * time.Second):
-			t.Fatal("client login timeout")
+		case <-ctx.Done():
+			t.Fatalf("client login timeout: %v", ctx.Err())
 		}
 	}
 
@@ -233,8 +233,8 @@ func TestForwardToGroup(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -250,7 +250,7 @@ func TestForwardToGroup(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A send: %v", err)
 	}
-	recvOr(t, collB.newMsg, "B updateNewMessage")
+	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
 
 	// A creates a chat with B and C.
 	var chatID int64
@@ -294,7 +294,7 @@ func TestForwardToGroup(t *testing.T) {
 
 	// B and C should both receive the forwarded message with FwdFrom populated.
 	for _, coll := range []*updateCollector{collB, collC} {
-		fwdMsg := recvOr(t, coll.newMsg, "member forwarded message")
+		fwdMsg := recvOrCtx(t, ctx, coll.newMsg, "member forwarded message")
 		if fwdMsg.FwdFrom.Zero() {
 			t.Fatalf("forwarded message has no FwdFrom")
 		}
@@ -394,8 +394,8 @@ func TestForwardAuthRejection(t *testing.T) {
 			case 2:
 				cUserID = id
 			}
-		case <-time.After(30 * time.Second):
-			t.Fatal("client login timeout")
+		case <-ctx.Done():
+			t.Fatalf("client login timeout: %v", ctx.Err())
 		}
 	}
 
@@ -403,8 +403,8 @@ func TestForwardAuthRejection(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -420,7 +420,7 @@ func TestForwardAuthRejection(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A send: %v", err)
 	}
-	recvOr(t, collB.newMsg, "B updateNewMessage")
+	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
 
 	// C (a third user with no relation to the A-B message) tries to forward
 	// message id=1 from the A-B dialog. C does not own that message.
@@ -515,21 +515,21 @@ func TestForwardDedup(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -545,7 +545,7 @@ func TestForwardDedup(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A send: %v", err)
 	}
-	recvOr(t, collB.newMsg, "B updateNewMessage")
+	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
 
 	// A forwards with random_id X.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -559,7 +559,7 @@ func TestForwardDedup(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A forward: %v", err)
 	}
-	recvOr(t, collB.newMsg, "B forwarded message")
+	recvOrCtx(t, ctx, collB.newMsg, "B forwarded message")
 
 	// A forwards again with the same random_id X — should not create a new message.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -653,21 +653,21 @@ func TestForwardMultiID(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -685,7 +685,7 @@ func TestForwardMultiID(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("A send msg %d: %v", i+1, err)
 		}
-		recvOr(t, collB.newMsg, fmt.Sprintf("B updateNewMessage %d", i+1))
+		recvOrCtx(t, ctx, collB.newMsg, fmt.Sprintf("B updateNewMessage %d", i+1))
 	}
 
 	// A forwards both messages to B.
@@ -704,8 +704,8 @@ func TestForwardMultiID(t *testing.T) {
 	// B should receive two forwarded messages with sequential pts.
 	var lastPts int
 	for i := range 2 {
-		env := recvOr(t, collB.newMsg, fmt.Sprintf("B forwarded message %d", i+1))
-		p := recvOr(t, collB.points, fmt.Sprintf("B pts update %d", i+1))
+		env := recvOrCtx(t, ctx, collB.newMsg, fmt.Sprintf("B forwarded message %d", i+1))
+		p := recvOrCtx(t, ctx, collB.points, fmt.Sprintf("B pts update %d", i+1))
 		if p <= lastPts {
 			t.Fatalf("forwarded msg %d: pts %d not > previous %d (sequential gap)", i+1, p, lastPts)
 		}
@@ -787,21 +787,21 @@ func TestForwardFromChannel(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -853,7 +853,7 @@ func TestForwardFromChannel(t *testing.T) {
 	}
 
 	// B should receive the forwarded message with FwdFrom.FromID = PeerChannel.
-	fwdMsg := recvOr(t, collB.newMsg, "B forwarded channel message")
+	fwdMsg := recvOrCtx(t, ctx, collB.newMsg, "B forwarded channel message")
 	if fwdMsg.FwdFrom.Zero() {
 		t.Fatal("forwarded message has no FwdFrom")
 	}

@@ -68,7 +68,7 @@ func TestPinnedChat(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -79,8 +79,8 @@ func TestPinnedChat(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -112,8 +112,8 @@ func TestPinnedChat(t *testing.T) {
 		t.Fatalf("createChat: %v", err)
 	}
 	// Drain B and C service messages for create.
-	recvOr(t, collB.serviceMsg, "B create service")
-	recvOr(t, collC.serviceMsg, "C create service")
+	recvOrCtx(t, ctx, collB.serviceMsg, "B create service")
+	recvOrCtx(t, ctx, collC.serviceMsg, "C create service")
 
 	// 2. A sends a message to the chat.
 	var msgID int
@@ -142,8 +142,8 @@ func TestPinnedChat(t *testing.T) {
 		t.Fatalf("A send to chat: %v", err)
 	}
 	// Drain B and C new messages.
-	recvOr(t, collB.newMsg, "B updateNewMessage")
-	recvOr(t, collC.newMsg, "C updateNewMessage")
+	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
+	recvOrCtx(t, ctx, collC.newMsg, "C updateNewMessage")
 
 	// 3. A pins the message.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -157,7 +157,7 @@ func TestPinnedChat(t *testing.T) {
 	}
 
 	// 3b. B receives updatePinnedMessages.
-	pinB := recvOr(t, collB.pinnedMsg, "B updatePinnedMessages")
+	pinB := recvOrCtx(t, ctx, collB.pinnedMsg, "B updatePinnedMessages")
 	if !pinB.Pinned {
 		t.Fatal("B pin push: Pinned = false, want true")
 	}
@@ -170,7 +170,7 @@ func TestPinnedChat(t *testing.T) {
 	}
 
 	// 3c. C receives updatePinnedMessages.
-	pinC := recvOr(t, collC.pinnedMsg, "C updatePinnedMessages")
+	pinC := recvOrCtx(t, ctx, collC.pinnedMsg, "C updatePinnedMessages")
 	if !pinC.Pinned {
 		t.Fatal("C pin push: Pinned = false, want true")
 	}
@@ -227,7 +227,7 @@ func TestPinnedChat(t *testing.T) {
 	}
 
 	// 5b. B receives updatePinnedMessages with Pinned=false.
-	unpinB := recvOr(t, collB.pinnedMsg, "B updatePinnedMessages (unpin)")
+	unpinB := recvOrCtx(t, ctx, collB.pinnedMsg, "B updatePinnedMessages (unpin)")
 	if unpinB.Pinned {
 		t.Fatal("B unpin push: Pinned = true, want false")
 	}
@@ -236,7 +236,7 @@ func TestPinnedChat(t *testing.T) {
 	}
 
 	// 5c. C receives updatePinnedMessages with Pinned=false.
-	unpinC := recvOr(t, collC.pinnedMsg, "C updatePinnedMessages (unpin)")
+	unpinC := recvOrCtx(t, ctx, collC.pinnedMsg, "C updatePinnedMessages (unpin)")
 	if unpinC.Pinned {
 		t.Fatal("C unpin push: Pinned = true, want false")
 	}
@@ -254,7 +254,7 @@ func TestPinnedChat(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A pin (for zero-ID test): %v", err)
 	}
-	recvOr(t, collB.pinnedMsg, "B re-pin")
+	recvOrCtx(t, ctx, collB.pinnedMsg, "B re-pin")
 
 	// 7. A unpins with ID=0 (without Unpin=true).
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -266,7 +266,7 @@ func TestPinnedChat(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A unpin with ID=0: %v", err)
 	}
-	zeroUnpinB := recvOr(t, collB.pinnedMsg, "B updatePinnedMessages (zero-ID unpin)")
+	zeroUnpinB := recvOrCtx(t, ctx, collB.pinnedMsg, "B updatePinnedMessages (zero-ID unpin)")
 	if zeroUnpinB.Pinned {
 		t.Fatal("B zero-ID unpin push: Pinned = true, want false")
 	}
@@ -337,8 +337,8 @@ func TestPinnedChat(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A send delete-me: %v", err)
 	}
-	recvOr(t, collB.newMsg, "B updateNewMessage (delete-me)")
-	recvOr(t, collC.newMsg, "C updateNewMessage (delete-me)")
+	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage (delete-me)")
+	recvOrCtx(t, ctx, collC.newMsg, "C updateNewMessage (delete-me)")
 
 	// Delete the message.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -430,7 +430,7 @@ func TestPinnedChannel(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -441,8 +441,8 @@ func TestPinnedChannel(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -525,7 +525,7 @@ func TestPinnedChannel(t *testing.T) {
 		t.Fatalf("A post to channel: %v", err)
 	}
 	// Drain B's channel message.
-	recvOr(t, collB.newChannelMsg, "B newChannelMsg")
+	recvOrCtx(t, ctx, collB.newChannelMsg, "B newChannelMsg")
 
 	// 4. A pins the post.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -539,7 +539,7 @@ func TestPinnedChannel(t *testing.T) {
 	}
 
 	// 4b. B receives updatePinnedMessages.
-	pinB := recvOr(t, collB.pinnedMsg, "B updatePinnedMessages (channel)")
+	pinB := recvOrCtx(t, ctx, collB.pinnedMsg, "B updatePinnedMessages (channel)")
 	if !pinB.Pinned {
 		t.Fatal("B channel pin push: Pinned = false, want true")
 	}
@@ -587,7 +587,7 @@ func TestPinnedChannel(t *testing.T) {
 	}
 
 	// 6b. B receives updatePinnedMessages with Pinned=false.
-	unpinB := recvOr(t, collB.pinnedMsg, "B updatePinnedMessages (channel unpin)")
+	unpinB := recvOrCtx(t, ctx, collB.pinnedMsg, "B updatePinnedMessages (channel unpin)")
 	if unpinB.Pinned {
 		t.Fatal("B channel unpin push: Pinned = true, want false")
 	}
@@ -605,7 +605,7 @@ func TestPinnedChannel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A pin (for zero-ID test): %v", err)
 	}
-	recvOr(t, collB.pinnedMsg, "B re-pin (channel)")
+	recvOrCtx(t, ctx, collB.pinnedMsg, "B re-pin (channel)")
 
 	// 8. A unpins with ID=0 (without Unpin=true).
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -617,7 +617,7 @@ func TestPinnedChannel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A unpin with ID=0 (channel): %v", err)
 	}
-	zeroUnpinB := recvOr(t, collB.pinnedMsg, "B updatePinnedMessages (channel zero-ID unpin)")
+	zeroUnpinB := recvOrCtx(t, ctx, collB.pinnedMsg, "B updatePinnedMessages (channel zero-ID unpin)")
 	if zeroUnpinB.Pinned {
 		t.Fatal("B channel zero-ID unpin push: Pinned = true, want false")
 	}

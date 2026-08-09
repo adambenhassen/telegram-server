@@ -234,6 +234,63 @@ func TestServeShutdownDoesNotAwaitNegotiation(t *testing.T) {
 	}
 }
 
+// TestServeShutdownDoesNotAwaitFirstFrame covers the far side of the same
+// handoff. Expiring a deadline is a one-shot signal, and the read on the other
+// side of negotiation re-derives its own deadline from the context before it
+// blocks — a context whose cancellation it never consults. So cancellation that
+// lands once the transport marker has been consumed must still end the
+// connection, or shutdown waits out the frame read instead of the handshake.
+func TestServeShutdownDoesNotAwaitFirstFrame(t *testing.T) {
+	t.Parallel()
+
+	nl, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	reading := make(chan struct{})
+	fl := &frameReadListener{Listener: nl, reading: reading}
+
+	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
+	// Production-sized, both of them: the assertion is that neither bound is
+	// what shutdown waits for.
+	srv.SetHandshakeTimeout(30 * time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, fl); close(done) }()
+
+	c, err := dial(nl.Addr().String())
+	if err != nil {
+		cancel()
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close() //nolint:errcheck // the server owns this socket's close.
+
+	// The abridged marker and nothing more: codec detection completes, and the
+	// server goes on to wait for a frame that never arrives.
+	if _, err := c.Write([]byte{codec.AbridgedClientStart[0]}); err != nil {
+		cancel()
+		t.Fatalf("write transport marker: %v", err)
+	}
+
+	select {
+	case <-reading:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("server never reached the frame read")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve waited out the frame read instead of shutting down")
+	}
+}
+
 // TestServeNegotiatesEveryCodec pins the transports the server accepts: moving
 // codec detection off the accept loop must not narrow them.
 func TestServeNegotiatesEveryCodec(t *testing.T) {
@@ -347,6 +404,42 @@ func (s *warnSink) Handle(_ context.Context, r slog.Record) error {
 		s.once.Do(func() { close(s.warned) })
 	}
 	return nil
+}
+
+// frameReadListener hands over connections that report the read after the one
+// consuming the transport marker — that is, the first frame read, which is the
+// side of the negotiation handoff a cancelled deadline no longer covers.
+type frameReadListener struct {
+	net.Listener
+
+	reading chan struct{}
+}
+
+func (l *frameReadListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &frameReadConn{Conn: conn, reading: l.reading}, nil
+}
+
+// frameReadConn signals before the second read, at which point gotd has already
+// applied the frame deadline and is about to block on the socket. Only the
+// connection's own goroutine reads, so the counter needs no locking.
+type frameReadConn struct {
+	net.Conn
+
+	reads   int
+	once    sync.Once
+	reading chan struct{}
+}
+
+func (c *frameReadConn) Read(b []byte) (int, error) {
+	c.reads++
+	if c.reads > 1 {
+		c.once.Do(func() { close(c.reading) })
+	}
+	return c.Conn.Read(b)
 }
 
 // acceptedListener reports the first socket it hands over, so a test can act at

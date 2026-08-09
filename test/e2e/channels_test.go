@@ -36,28 +36,28 @@ func hasChannel(chats []tg.ChatClass, id int64) bool {
 // execChannel runs fn on cmds, failing the test on error. It is execChat
 // renamed for clarity in tests where a chat-specific name would be misleading,
 // but the mechanics are identical — execChat is defined in chats_test.go.
-func execChannel(t *testing.T, cmds chan command, fn func(ctx context.Context, c *tg.Client) error) {
+func execChannel(t *testing.T, ctx context.Context, cmds chan command, fn func(ctx context.Context, c *tg.Client) error) {
 	t.Helper()
-	execChat(t, cmds, fn)
+	execChat(t, ctx, cmds, fn)
 }
 
 // createBroadcastChannel creates a broadcast channel as the caller and
 // returns its id.
-func createBroadcastChannel(t *testing.T, cmds chan command, title string) int64 {
+func createBroadcastChannel(t *testing.T, ctx context.Context, cmds chan command, title string) int64 {
 	t.Helper()
-	return doCreateChannel(t, cmds, title, false)
+	return doCreateChannel(t, ctx, cmds, title, false)
 }
 
 // createMegagroup creates a megagroup channel as the caller and returns its id.
-func createMegagroup(t *testing.T, cmds chan command, title string) int64 {
+func createMegagroup(t *testing.T, ctx context.Context, cmds chan command, title string) int64 {
 	t.Helper()
-	return doCreateChannel(t, cmds, title, true)
+	return doCreateChannel(t, ctx, cmds, title, true)
 }
 
-func doCreateChannel(t *testing.T, cmds chan command, title string, megagroup bool) int64 {
+func doCreateChannel(t *testing.T, ctx context.Context, cmds chan command, title string, megagroup bool) int64 {
 	t.Helper()
 	var chID int64
-	execChannel(t, cmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, cmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
 			Title:     title,
 			About:     "",
@@ -83,10 +83,10 @@ func doCreateChannel(t *testing.T, cmds chan command, title string, megagroup bo
 }
 
 // exportChannelInvite exports an invite for chID and returns the bare hash.
-func exportChannelInvite(t *testing.T, viewerID int64, cmds chan command, chID int64) string {
+func exportChannelInvite(t *testing.T, ctx context.Context, viewerID int64, cmds chan command, chID int64) string {
 	t.Helper()
 	var hash string
-	execChannel(t, cmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, cmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesExportChatInvite(ctx, &tg.MessagesExportChatInviteRequest{
 			Peer: peerChannel(viewerID, chID),
 		})
@@ -104,10 +104,10 @@ func exportChannelInvite(t *testing.T, viewerID int64, cmds chan command, chID i
 }
 
 // importChannelInvite joins via hash and returns the joined channel id.
-func importChannelInvite(t *testing.T, cmds chan command, hash string) int64 {
+func importChannelInvite(t *testing.T, ctx context.Context, cmds chan command, hash string) int64 {
 	t.Helper()
 	var chID int64
-	execChannel(t, cmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, cmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesImportChatInvite(ctx, hash)
 		if err != nil {
 			return err
@@ -135,13 +135,13 @@ func importChannelInvite(t *testing.T, cmds chan command, hash string) int64 {
 // assertChannelRPCError calls fn on cmds and asserts the result is a tgerr
 // with the given message. It does not call t.Fatal on the fn error so the
 // expected rejection can be inspected.
-func assertChannelRPCError(t *testing.T, cmds chan command, want string, fn func(ctx context.Context, c *tg.Client) error) {
+func assertChannelRPCError(t *testing.T, ctx context.Context, cmds chan command, want string, fn func(ctx context.Context, c *tg.Client) error) {
 	t.Helper()
 	done := make(chan error, 1)
 	select {
 	case cmds <- command{fn: fn, done: done}:
-	case <-time.After(10 * time.Second):
-		t.Fatal("command enqueue timeout")
+	case <-ctx.Done():
+		t.Fatalf("command enqueue timeout: %v", ctx.Err())
 	}
 	err := <-done
 	if err == nil {
@@ -206,7 +206,7 @@ func TestChannelsLifecycle(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -215,14 +215,14 @@ func TestChannelsLifecycle(t *testing.T) {
 	bUserID := login(bID, "B")
 
 	// A creates a broadcast channel.
-	chID := createBroadcastChannel(t, aCmds, "Lifecycle")
+	chID := createBroadcastChannel(t, ctx, aCmds, "Lifecycle")
 
 	// A exports an invite; B imports it.
-	hash := exportChannelInvite(t, aUserID, aCmds, chID)
-	importChannelInvite(t, bCmds, hash)
+	hash := exportChannelInvite(t, ctx, aUserID, aCmds, chID)
+	importChannelInvite(t, ctx, bCmds, hash)
 
 	// B is a member: channels.getChannels returns a *tg.Channel for chID.
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.ChannelsGetChannels(ctx, []tg.InputChannelClass{
 			inputChannel(bUserID, chID),
 		})
@@ -240,7 +240,7 @@ func TestChannelsLifecycle(t *testing.T) {
 	})
 
 	// A posts a message.
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerChannel(aUserID, chID),
 			Message:  "hello channel",
@@ -265,8 +265,8 @@ func TestChannelsLifecycle(t *testing.T) {
 		if upd.Pts != 1 {
 			t.Fatalf("B UpdateNewChannelMessage Pts = %d, want 1", upd.Pts)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("B timed out waiting for channel message")
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for channel message: %v", ctx.Err())
 	}
 
 	// The sender receives UpdateNewChannelMessage in the RPC reply. Verify Pts=1.
@@ -276,7 +276,7 @@ func TestChannelsLifecycle(t *testing.T) {
 	// The sender-side UpdateNewChannelMessage is in the RPC reply, not pushed
 	// asynchronously, so it may already be in the buffer by now. A separate
 	// execChannel command reads back the channel pts to assert.
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
 			Channel: inputChannel(aUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
@@ -358,7 +358,7 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -367,12 +367,12 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 	bUserID := login(bID, "B")
 
 	// A creates broadcast channel, B joins.
-	chID := createBroadcastChannel(t, aCmds, "Broadcast")
-	hash := exportChannelInvite(t, aUserID, aCmds, chID)
-	importChannelInvite(t, bCmds, hash)
+	chID := createBroadcastChannel(t, ctx, aCmds, "Broadcast")
+	hash := exportChannelInvite(t, ctx, aUserID, aCmds, chID)
+	importChannelInvite(t, ctx, bCmds, hash)
 
 	// B (role 0) sends → PEER_ID_INVALID.
-	assertChannelRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertChannelRPCError(t, ctx, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerChannel(bUserID, chID),
 			Message:  "B send before promotion",
@@ -382,7 +382,7 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 	})
 
 	// A promotes B to admin.
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsEditAdmin(ctx, &tg.ChannelsEditAdminRequest{
 			Channel: inputChannel(aUserID, chID),
 			UserID:  inputUser(aUserID, bUserID),
@@ -395,7 +395,7 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 	})
 
 	// B sends after promotion → succeeds.
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerChannel(bUserID, chID),
 			Message:  "B send after promotion",
@@ -461,7 +461,7 @@ func TestChannelsMegagroup(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -470,12 +470,12 @@ func TestChannelsMegagroup(t *testing.T) {
 	bUserID := login(bID, "B")
 
 	// A creates megagroup, B joins.
-	chID := createMegagroup(t, aCmds, "Megagroup")
-	hash := exportChannelInvite(t, aUserID, aCmds, chID)
-	importChannelInvite(t, bCmds, hash)
+	chID := createMegagroup(t, ctx, aCmds, "Megagroup")
+	hash := exportChannelInvite(t, ctx, aUserID, aCmds, chID)
+	importChannelInvite(t, ctx, bCmds, hash)
 
 	// B (role 0) sends to megagroup → succeeds.
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerChannel(bUserID, chID),
 			Message:  "megagroup post by plain member",
@@ -542,7 +542,7 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -551,10 +551,10 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 	cUserID := login(cID, "C")
 
 	// A creates channel. C learns the id through the test variable — no invite.
-	chID := createBroadcastChannel(t, aCmds, "Private")
+	chID := createBroadcastChannel(t, ctx, aCmds, "Private")
 
 	// C: getHistory → PEER_ID_INVALID.
-	assertChannelRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertChannelRPCError(t, ctx, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:  peerChannel(cUserID, chID),
 			Limit: 10,
@@ -563,7 +563,7 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 	})
 
 	// C: channels.getMessages → PEER_ID_INVALID.
-	assertChannelRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertChannelRPCError(t, ctx, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
 			Channel: inputChannel(cUserID, chID),
 			ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: 1}},
@@ -572,7 +572,7 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 	})
 
 	// C: getChannelDifference → PEER_ID_INVALID.
-	assertChannelRPCError(t, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertChannelRPCError(t, ctx, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
 			Channel: inputChannel(cUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
@@ -905,7 +905,7 @@ func TestChannelsBan(t *testing.T) {
 		select {
 		case id := <-ch:
 			return id
-		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
 			t.Fatalf("%s login timeout", who)
 			return 0
 		}
@@ -914,12 +914,12 @@ func TestChannelsBan(t *testing.T) {
 	bUserID := login(bID, "B")
 
 	// A creates broadcast channel. B joins via invite.
-	chID := createBroadcastChannel(t, aCmds, "BanTest")
-	hash := exportChannelInvite(t, aUserID, aCmds, chID)
-	importChannelInvite(t, bCmds, hash)
+	chID := createBroadcastChannel(t, ctx, aCmds, "BanTest")
+	hash := exportChannelInvite(t, ctx, aUserID, aCmds, chID)
+	importChannelInvite(t, ctx, bCmds, hash)
 
 	// A posts "live 1"; B receives it to confirm live delivery works pre-ban.
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerChannel(aUserID, chID),
 			Message:  "live 1",
@@ -932,12 +932,12 @@ func TestChannelsBan(t *testing.T) {
 		if upd.Msg.Message != "live 1" {
 			t.Fatalf("B pre-ban msg = %q, want %q", upd.Msg.Message, "live 1")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("B timed out waiting for live 1")
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for live 1: %v", ctx.Err())
 	}
 
 	// A bans B permanently.
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
 			Channel:     inputChannel(aUserID, chID),
 			Participant: peerUser(aUserID, bUserID),
@@ -950,7 +950,7 @@ func TestChannelsBan(t *testing.T) {
 	})
 
 	// B: getHistory → PEER_ID_INVALID.
-	assertChannelRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertChannelRPCError(t, ctx, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:  peerChannel(bUserID, chID),
 			Limit: 10,
@@ -959,7 +959,7 @@ func TestChannelsBan(t *testing.T) {
 	})
 
 	// B: getChannelDifference → PEER_ID_INVALID.
-	assertChannelRPCError(t, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+	assertChannelRPCError(t, ctx, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
 			Channel: inputChannel(bUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
@@ -970,7 +970,7 @@ func TestChannelsBan(t *testing.T) {
 	})
 
 	// A posts "live 2"; B should NOT receive it (banned).
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerChannel(aUserID, chID),
 			Message:  "live 2",
@@ -978,7 +978,9 @@ func TestChannelsBan(t *testing.T) {
 		})
 		return err
 	})
-	noCtx, noCancel := context.WithTimeout(ctx, 3*time.Second)
+	// The window is the assertion, so it hangs off Background: derived from ctx
+	// an already-exhausted parent would return immediately and pass vacuously.
+	noCtx, noCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	select {
 	case <-collB.newChannelMsg:
 		t.Error("B should not receive channel message after ban")
@@ -987,7 +989,7 @@ func TestChannelsBan(t *testing.T) {
 	noCancel()
 
 	// A unbans B (zero BannedRights).
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
 			Channel:      inputChannel(aUserID, chID),
 			Participant:  peerUser(aUserID, bUserID),
@@ -997,7 +999,7 @@ func TestChannelsBan(t *testing.T) {
 	})
 
 	// B: getHistory → succeeds.
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:  peerChannel(bUserID, chID),
 			Limit: 10,
@@ -1017,7 +1019,7 @@ func TestChannelsBan(t *testing.T) {
 
 	// B: getChannelDifference → UpdatesChannelDifference with Final=true
 	// and the messages posted before/during the ban (access restored after unban).
-	execChannel(t, bCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
 			Channel: inputChannel(bUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
@@ -1038,7 +1040,7 @@ func TestChannelsBan(t *testing.T) {
 	})
 
 	// A posts "live 3"; B receives it (unban restored delivery).
-	execChannel(t, aCmds, func(ctx context.Context, c *tg.Client) error {
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerChannel(aUserID, chID),
 			Message:  "live 3",
@@ -1051,8 +1053,8 @@ func TestChannelsBan(t *testing.T) {
 		if upd.Msg.Message != "live 3" {
 			t.Fatalf("B post-unban msg = %q, want %q", upd.Msg.Message, "live 3")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("B timed out waiting for live 3 after unban")
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for live 3 after unban: %v", ctx.Err())
 	}
 
 	close(aCmds)
@@ -1110,8 +1112,8 @@ func TestChannelsCrossReplica(t *testing.T) {
 	}()
 	select {
 	case <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("B login timeout: %v", ctx.Err())
 	}
 
 	// A connects to server 1, creates channel, exports invite; B imports on server 2.
@@ -1171,7 +1173,7 @@ func TestChannelsCrossReplica(t *testing.T) {
 	}
 
 	// B imports invite on server 2.
-	importChannelInvite(t, bCmds, hashB)
+	importChannelInvite(t, ctx, bCmds, hashB)
 
 	// A reconnects to server 1, posts a message.
 	aClient2 := createClient(port1, key, dcID, newUpdateCollector(), sessA)
@@ -1192,8 +1194,8 @@ func TestChannelsCrossReplica(t *testing.T) {
 		if upd.Msg.Message != "cross replica channel" {
 			t.Fatalf("B received %q, want %q", upd.Msg.Message, "cross replica channel")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("B timed out waiting for cross-replica channel message")
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for cross-replica channel message: %v", ctx.Err())
 	}
 
 	close(bCmds)

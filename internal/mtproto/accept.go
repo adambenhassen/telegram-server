@@ -1,7 +1,6 @@
 package mtproto
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -20,7 +19,9 @@ const (
 )
 
 // negotiate establishes the client address of an accepted socket and detects its
-// transport codec, bounded by the handshake timeout and by ctx.
+// transport codec, bounded by the handshake timeout. Shutdown is not its
+// business: the caller closes the socket on cancellation, which ends whichever
+// of the two reads below it has got to.
 //
 // This runs per connection rather than in the accept loop on purpose: both steps
 // read client bytes, so performing them where the next socket is accepted would
@@ -33,10 +34,10 @@ const (
 // bytes from a sender that is not a configured balancer are never interpreted,
 // as a header or as anything else.
 //
-// One deadline covers the header read and the codec sniff together. It is left
+// One deadline covers the header read and the codec sniff together, and is left
 // set on the way out: gotd resets it from the context before every frame it
 // reads, so nothing here has to clear it.
-func (s *Server) negotiate(ctx context.Context, sock net.Conn) (transport.Conn, netip.Addr, error) {
+func (s *Server) negotiate(sock net.Conn) (transport.Conn, netip.Addr, error) {
 	addr := peerAddr(sock.RemoteAddr())
 	if s.proxyV2 != nil && !s.proxyV2.allowed(addr) {
 		return nil, netip.Addr{}, errors.Join(
@@ -45,18 +46,6 @@ func (s *Server) negotiate(ctx context.Context, sock net.Conn) (transport.Conn, 
 	if err := sock.SetReadDeadline(time.Now().Add(s.handshakeTimeout)); err != nil {
 		return nil, netip.Addr{}, errors.Join(errors.New("set handshake deadline"), err, sock.Close())
 	}
-
-	// Shutdown must not wait out the handshake bound. The read below belongs to
-	// gotd and takes no context, so cancellation is delivered the only way the
-	// socket understands: expiring its deadline, which ends the read at once.
-	// Whatever sockets happen to be mid-negotiation therefore cost a stopping
-	// process nothing, instead of up to handshakeTimeout each.
-	stop := context.AfterFunc(ctx, func() {
-		if err := sock.SetReadDeadline(time.Now()); err != nil {
-			s.log.Info("expire handshake deadline at shutdown", "err", err)
-		}
-	})
-	defer stop()
 
 	// Before the codec sniff, never after: the sniff picks a codec from the
 	// first bytes of the stream, so a header still in it would be read as a

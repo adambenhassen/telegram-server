@@ -82,21 +82,21 @@ func TestListenerReconnectResumesDelivery(t *testing.T) {
 	var aUserID, bUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client A login timeout: %v", ctx.Err())
 	}
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("client B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("client B login timeout: %v", ctx.Err())
 	}
 
 	exec := func(cmds chan command, fn func(ctx context.Context, c *tg.Client) error) error {
 		d := make(chan error, 1)
 		select {
 		case cmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -114,7 +114,7 @@ func TestListenerReconnectResumesDelivery(t *testing.T) {
 
 	// Baseline: push works before the connection is cut.
 	sendToB("before termination", 1)
-	if got := recvOr(t, collB.newMsg, "B updateNewMessage before termination"); got.Message != "before termination" {
+	if got := recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage before termination"); got.Message != "before termination" {
 		t.Fatalf("B received %q, want %q", got.Message, "before termination")
 	}
 
@@ -123,11 +123,10 @@ func TestListenerReconnectResumesDelivery(t *testing.T) {
 	// A notification emitted while the listener is reconnecting is dropped, so
 	// resend until one lands rather than asserting on a single send. Whichever
 	// message arrives, its arrival is the proof: push resumed with no restart.
-	deadline := time.Now().Add(60 * time.Second)
 	var delivered *tg.Message
 	for i := 2; delivered == nil; i++ {
-		if time.Now().After(deadline) {
-			t.Fatal("no live delivery after the listener backend was terminated")
+		if ctx.Err() != nil {
+			t.Fatalf("no live delivery after the listener backend was terminated: %v", ctx.Err())
 		}
 		sendToB("after termination "+strconv.Itoa(i), int64(i))
 		select {
