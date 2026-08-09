@@ -11,6 +11,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -30,9 +31,16 @@ type mediaClient struct {
 }
 
 // bootMediaEnv boots a server with delivery and logs in one client per phone.
-// The blob directory comes from bootServerWithDelivery, which already gives
-// each booted server its own t.TempDir(), so nothing here reads the
-// environment and t.Parallel() stays usable.
+// The blob directory comes from the boot helper, which already gives each
+// booted server its own t.TempDir(), so nothing here reads the environment and
+// t.Parallel() stays usable.
+//
+// Unlike the other e2e environments this one runs under the shipped rate-limit
+// defaults rather than with limits off, so the upload path here is wired the
+// way a real deployment wires it: the limit is on, keyed per account, and the
+// client is a real one. What that catches is a default left at zero-window or a
+// surface wired to the wrong budget — not the numbers themselves, which these
+// uploads stay far below. Where the bound actually sits is a handler test.
 func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaClient {
 	t.Helper()
 
@@ -55,7 +63,8 @@ func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaC
 	codes := newMultiCodeSink()
 	ln := mustListen(t, ctx, "127.0.0.1:0")
 	port := tcpPort(t, ln)
-	t.Cleanup(bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln))
+	_, stop := bootServerWithLimits(t, ctx, key, dcID, st, dsn, codes.Logger(), ln, config.DefaultRateLimits())
+	t.Cleanup(stop)
 
 	clients := make([]*mediaClient, 0, len(phones))
 	t.Cleanup(func() {
@@ -270,7 +279,8 @@ func fileNameOf(doc *tg.Document) string {
 }
 
 // TestMediaRoundTrip is the M5 gate: A uploads a multi-part payload, sends it to
-// B, and B downloads bytes identical to what A uploaded.
+// B, and B downloads bytes identical to what A uploaded, with the shipped
+// rate-limit defaults in force rather than switched off.
 func TestMediaRoundTrip(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)

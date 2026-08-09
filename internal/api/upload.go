@@ -67,8 +67,19 @@ func (h *handlers) handleSaveBigFilePart(r *mtproto.Request) (bin.Encoder, error
 	return &tg.BoolTrue{}, nil
 }
 
-// saveUploadPart is the store call and error mapping both save handlers share.
+// saveUploadPart is the rate limit, the store call and the error mapping both
+// save handlers share.
+//
+// The limit is checked here rather than in each handler so the two surfaces
+// cannot drift onto separate budgets — they write the same rows, and a budget
+// each would let an account double its part rate by alternating. It is checked
+// before the store call, so a denied part costs the parts table nothing: the
+// caps are enforced by writing first and reading the sums back, so reaching the
+// store at all is the write amplification this limit exists to bound.
 func (h *handlers) saveUploadPart(r *mtproto.Request, fileID int64, part int, payload []byte) error {
+	if err := h.checkRateLimit(r, "save_file_part", h.rateLimitSaveFilePart); err != nil {
+		return err
+	}
 	err := h.store.SaveUploadPart(r.Ctx, r.UserID, fileID, part, payload, h.maxFileBytes)
 	switch {
 	case err == nil:

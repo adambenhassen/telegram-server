@@ -112,10 +112,44 @@ type RateLimitsConfig struct {
 	SearchMessages store.RateLimitConfig
 	// SearchContacts limits contacts.search per account.
 	SearchContacts store.RateLimitConfig
+	// SaveFilePart limits upload.saveFilePart and upload.saveBigFilePart per
+	// account, on one shared budget: both write the same rows, so a budget each
+	// would let an account double its part rate by alternating between them.
+	SaveFilePart store.RateLimitConfig
 	// SendCodeIP limits auth.sendCode per client network. It is keyed on the
 	// connection's address rather than an account because the surface is
 	// unauthenticated: there is no account yet to hold a budget.
 	SendCodeIP store.SendCodeIPLimits
+}
+
+// DefaultRateLimits returns the shipped per-surface defaults: 60 sends per 60s,
+// 20 chat creates per 24h, 120 member adds per 24h, 20 channel creates per 24h,
+// 300 message searches per hour, 300 contacts searches per hour, 600 upload
+// parts per 60s, and per client network 10 sendCode calls per hour across at
+// most 20 distinct phone numbers per 24h. Zero disables enforcement for a
+// surface.
+//
+// The upload number is the one derived rather than chosen: at the 512 KiB
+// protocol part size it is roughly 300 MB/min, past any real client's upload
+// rate, and it is what bounds how often an account can drive the per-user cap
+// to rollover — the write amplification each rejected save still costs.
+//
+// Exported so a test can drive a surface at the numbers that actually ship
+// instead of at ones it invented.
+func DefaultRateLimits() RateLimitsConfig {
+	return RateLimitsConfig{
+		MessageSend:    store.RateLimitConfig{Limit: 60, Window: 60 * time.Second},
+		CreateChat:     store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
+		AddChatUser:    store.RateLimitConfig{Limit: 120, Window: 24 * time.Hour},
+		CreateChannel:  store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
+		SearchMessages: store.RateLimitConfig{Limit: 300, Window: time.Hour},
+		SearchContacts: store.RateLimitConfig{Limit: 300, Window: time.Hour},
+		SaveFilePart:   store.RateLimitConfig{Limit: 600, Window: 60 * time.Second},
+		SendCodeIP: store.SendCodeIPLimits{
+			Calls:  store.RateLimitConfig{Limit: 10, Window: time.Hour},
+			Phones: store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
+		},
+	}
 }
 
 // MaxFileBytesLimit is the ceiling on TG_MAX_FILE_BYTES. It is a bound on the
@@ -187,23 +221,9 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.LogLoginCodes = on
 	}
-	// Rate-limit defaults: 60 sends per 60s, 20 chat creates per 24h, 120 member
-	// adds per 24h, 20 channel creates per 24h, 300 message searches per hour,
-	// 300 contacts searches per hour, and per client network 10 sendCode calls
-	// per hour across at most 20 distinct phone numbers per 24h. Zero or unset
-	// disables enforcement for that surface.
-	cfg.RateLimits = RateLimitsConfig{
-		MessageSend:    store.RateLimitConfig{Limit: 60, Window: 60 * time.Second},
-		CreateChat:     store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
-		AddChatUser:    store.RateLimitConfig{Limit: 120, Window: 24 * time.Hour},
-		CreateChannel:  store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
-		SearchMessages: store.RateLimitConfig{Limit: 300, Window: time.Hour},
-		SearchContacts: store.RateLimitConfig{Limit: 300, Window: time.Hour},
-		SendCodeIP: store.SendCodeIPLimits{
-			Calls:  store.RateLimitConfig{Limit: 10, Window: time.Hour},
-			Phones: store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
-		},
-	}
+	// Zero or unset disables enforcement for a surface; the numbers and why they
+	// are those numbers are on DefaultRateLimits.
+	cfg.RateLimits = DefaultRateLimits()
 	if v := os.Getenv("TG_RATE_LIMIT_SEND"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -287,6 +307,20 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_RATE_LIMIT_SEARCH_CONTACTS_WINDOW must be a duration")
 		}
 		cfg.RateLimits.SearchContacts.Window = d
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_SAVE_FILE_PART"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SAVE_FILE_PART must be an integer")
+		}
+		cfg.RateLimits.SaveFilePart.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_SAVE_FILE_PART_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SAVE_FILE_PART_WINDOW must be a duration")
+		}
+		cfg.RateLimits.SaveFilePart.Window = d
 	}
 	if v := os.Getenv("TG_RATE_LIMIT_SEND_CODE_IP"); v != "" {
 		n, err := strconv.Atoi(v)

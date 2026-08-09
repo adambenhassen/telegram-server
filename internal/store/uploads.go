@@ -160,12 +160,60 @@ func (s *Store) DeleteUploadParts(ctx context.Context, userID, fileID int64) (in
 	return n, nil
 }
 
-// DeleteExpiredUploadParts drops parts older than cutoff, returning the row
-// count. This is the only delete in M5 that removes stored bytes, and it can
-// only ever remove parts no message references: a part row is deleted at
-// assembly, so anything left is an upload that was never sent.
-func (s *Store) DeleteExpiredUploadParts(ctx context.Context, cutoff time.Time) (int64, error) {
-	n, err := s.q.DeleteExpiredUploadParts(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
+// ExpiredPartSweepBatch is how many expired parts one sweep pass removes. It
+// bounds the statement, not the retention: SweepExpiredUploadParts repeats
+// passes until one comes back short, so a backlog still drains in one sweep, in
+// transactions whose lock and WAL footprint do not grow with it.
+const ExpiredPartSweepBatch = 1000
+
+// SweepExpiredUploadParts deletes every part stored before cutoff in passes of
+// at most batch rows, returning how many it removed.
+//
+// It terminates because each pass either comes back short — nothing more to
+// take under this cutoff — or removes exactly batch rows from a finite set the
+// sweep itself never adds to. cutoff is fixed for the whole drain rather than
+// recomputed per pass, so what a sweep retires is decided once, at its start,
+// and a part that expires mid-drain waits for the next one.
+//
+// A canceled context surfaces as an error from the pass it interrupts, with the
+// count of what earlier passes already retired: each pass commits on its own,
+// so an interrupted drain leaves less to do rather than nothing done.
+func (s *Store) SweepExpiredUploadParts(ctx context.Context, cutoff time.Time, batch int) (int64, error) {
+	var total int64
+	for {
+		n, err := s.deleteExpiredUploadParts(ctx, cutoff, batch)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n < int64(batch) {
+			return total, nil
+		}
+	}
+}
+
+// deleteExpiredUploadParts drops up to batch parts stored before cutoff, oldest
+// first, returning the row count. A pass returning batch means there is more to
+// take.
+//
+// cutoff is compared against when a part was first stored, not when it was last
+// written — re-saving a part does not extend its life, or an account could hold
+// an outstanding set forever by touching it.
+//
+// This is the only delete in M5 that removes stored bytes, and it can only ever
+// remove parts no message references: a part row is deleted at assembly, so
+// anything left is an upload that was never sent.
+func (s *Store) deleteExpiredUploadParts(ctx context.Context, cutoff time.Time, batch int) (int64, error) {
+	// Refused rather than read as "no bound": the unbounded DELETE is exactly
+	// what this parameter exists to prevent, and a caller that computed a zero
+	// batch has a bug that must not silently restore it.
+	if batch <= 0 || batch > math.MaxInt32 {
+		return 0, fmt.Errorf("delete expired upload parts: batch %d out of range", batch)
+	}
+	n, err := s.q.DeleteExpiredUploadParts(ctx, db.DeleteExpiredUploadPartsParams{
+		Date: pgtype.Timestamptz{Time: cutoff, Valid: true},
+		Lim:  int32(batch),
+	})
 	if err != nil {
 		return 0, fmt.Errorf("delete expired upload parts: %w", err)
 	}
