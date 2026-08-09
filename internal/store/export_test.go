@@ -261,6 +261,14 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 // connection independent of the Store's query layer.
 func StorePool(s *Store) *pgxpool.Pool { return s.pool }
 
+// DeleteExpiredUploadPartsPass runs ONE bounded sweep pass. The drain is the
+// shipped entry point and is tested through SweepExpiredUploadParts; this is
+// how the per-statement bound itself — "a pass takes at most batch rows" — is
+// asserted, which a drain hides by design.
+func DeleteExpiredUploadPartsPass(ctx context.Context, s *Store, cutoff time.Time, batch int) (int64, error) {
+	return s.deleteExpiredUploadParts(ctx, cutoff, batch)
+}
+
 // UploadPartDate returns one upload part's stored date — the column the TTL
 // sweep compares against. Tests read it back because "the re-save did not move
 // the expiry clock" is a statement about this column, and a wall-clock

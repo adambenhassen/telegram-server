@@ -36,10 +36,11 @@ type mediaClient struct {
 // t.Parallel() stays usable.
 //
 // Unlike the other e2e environments this one runs under the shipped rate-limit
-// defaults rather than with limits off. The upload surface is paced per part,
-// and a per-part limit is the one that a legitimate multi-part upload can trip:
-// the number that bounds an abusive client has to be proven not to stop an
-// ordinary one, and only a real client uploading real parts proves it.
+// defaults rather than with limits off, so the upload path here is wired the
+// way a real deployment wires it: the limit is on, keyed per account, and the
+// client is a real one. What that catches is a default left at zero-window or a
+// surface wired to the wrong budget — not the numbers themselves, which these
+// uploads stay far below. Where the bound actually sits is a handler test.
 func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaClient {
 	t.Helper()
 
@@ -278,9 +279,8 @@ func fileNameOf(doc *tg.Document) string {
 }
 
 // TestMediaRoundTrip is the M5 gate: A uploads a multi-part payload, sends it to
-// B, and B downloads bytes identical to what A uploaded — under the shipped
-// rate-limit defaults, which is what makes it also the proof that the
-// saveFilePart limit paces an abusive client without stopping a real one.
+// B, and B downloads bytes identical to what A uploaded, with the shipped
+// rate-limit defaults in force rather than switched off.
 func TestMediaRoundTrip(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
