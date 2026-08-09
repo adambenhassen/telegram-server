@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"syscall"
 	"testing"
 	"time"
 
@@ -174,6 +175,54 @@ func TestProxyV2RefusesUnallowlistedSender(t *testing.T) {
 			t.Fatalf("a sender outside the allowlist was accepted, keyed on %s", got.addr)
 		}
 	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// TestProxyV2RefusesUnsupportedFamilyOrTransport is the listener half of the
+// parser matrix, and it is written so that crediting the address would fail it.
+//
+// Each connection is complete — header then codec tag — so a build that read the
+// family without the transport would accept it and hand the handler the address
+// the header named. Nothing is accepted here, in either direction: not the
+// address, not the connection.
+func TestProxyV2RefusesUnsupportedFamilyOrTransport(t *testing.T) {
+	t.Parallel()
+
+	client := netip.MustParseAddr("198.51.100.9")
+	for _, tt := range []struct {
+		name     string
+		famProto byte
+	}{
+		{name: "inet over datagram", famProto: 0x12},
+		{name: "inet over unspec transport", famProto: 0x10},
+		{name: "inet6 over datagram", famProto: 0x22},
+		// AF_UNIX names a socket path rather than a network peer, and used to
+		// land in the no-address carve-out instead of being refused.
+		{name: "unix family", famProto: 0x31},
+		{name: "unknown family", famProto: 0x41},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+
+			nl := mustListenTCP(t, ctx, "127.0.0.1:0")
+			accepted := acceptLoop(t, mtproto.ListenProxyV2(nl, loopback, nil))
+
+			raw := dial(t, ctx, nl.Addr().String())
+			// Header plus the abridged codec tag: everything a served
+			// connection needs, so only the family and transport decide it.
+			mustWrite(t, raw, append(withFamilyProto(proxyV2Header(proxyCmdProxy, client), tt.famProto), 0xef))
+			assertClosed(t, raw)
+
+			select {
+			case got, ok := <-accepted:
+				if ok {
+					t.Fatalf("family/transport %#x was served, keyed on %s", tt.famProto, got.addr)
+				}
+			case <-time.After(500 * time.Millisecond):
+			}
+		})
 	}
 }
 
@@ -349,6 +398,14 @@ func proxyV2Header(cmd byte, client netip.Addr) []byte {
 	return append(h[:], body...)
 }
 
+// withFamilyProto rewrites a header's family-and-transport byte, to build the
+// combinations a correct balancer never emits.
+func withFamilyProto(header []byte, famProto byte) []byte {
+	out := slices.Clone(header)
+	out[13] = famProto
+	return out
+}
+
 // withVersion rewrites a header's version nibble, to build the versions this
 // mode does not accept without hand-assembling a second header.
 func withVersion(header []byte, version byte) []byte {
@@ -483,7 +540,10 @@ func closeWrite(t *testing.T, conn net.Conn) {
 	if !ok {
 		t.Fatalf("client conn type = %T, want *net.TCPConn", conn)
 	}
-	if err := tcp.CloseWrite(); err != nil {
+	// The server may already have refused this connection and closed it — a
+	// header it can reject outright needs no end-of-stream to do it — and that
+	// is the outcome the caller is about to assert, not a failure to half-close.
+	if err := tcp.CloseWrite(); err != nil && !isClosedConn(err) && !errors.Is(err, syscall.ENOTCONN) {
 		t.Fatalf("close write half: %v", err)
 	}
 }
