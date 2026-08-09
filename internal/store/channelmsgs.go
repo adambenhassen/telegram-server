@@ -41,7 +41,7 @@ type ChannelMessage struct {
 	FileID    *int64
 }
 
-// channelMsgFields is a layout-identical copy of the four sqlc channel-message
+// channelMsgFields is a layout-identical copy of the five sqlc channel-message
 // row types. Any of them converts to this type via a plain type conversion, so
 // the single channelMessageFromFields function below is the only place that maps
 // database columns to ChannelMessage fields.
@@ -341,6 +341,30 @@ func (s *Store) ChannelHistory(ctx context.Context, channelID int64, offsetID in
 	})
 	if err != nil {
 		return nil, fmt.Errorf("channel history page: %w", err)
+	}
+	msgs := make([]ChannelMessage, len(rows))
+	for i, r := range rows {
+		msgs[i] = channelMessageFromFields(channelMsgFields(r))
+	}
+	return msgs, nil
+}
+
+// SearchChannelPosts returns the channel's posts matching query, newest-first
+// and excluding deleted, paged by offsetID exactly as ChannelHistory pages.
+//
+// It takes no caller id on purpose. A channel post is one shared row rather
+// than a per-owner copy, so there is nothing here to scope to the reader:
+// whether this caller may read the channel at all is decided by the membership
+// check the handler runs before calling, and nothing below narrows it further.
+func (s *Store) SearchChannelPosts(ctx context.Context, channelID int64, query string, offsetID int64, limit int) ([]ChannelMessage, error) {
+	rows, err := s.q.SearchChannelPostsPage(ctx, db.SearchChannelPostsPageParams{
+		ChannelID: channelID,
+		Query:     query,
+		OffsetID:  offsetID,
+		Lim:       int32(limit), //nolint:gosec // limit is a small validated page size
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search channel posts page: %w", err)
 	}
 	msgs := make([]ChannelMessage, len(rows))
 	for i, r := range rows {

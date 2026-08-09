@@ -54,3 +54,17 @@ WHERE channel_id = sqlc.arg(channel_id) AND deleted = false
   AND (sqlc.arg(offset_id)::bigint = 0 OR local_id < sqlc.arg(offset_id)::bigint)
 ORDER BY local_id DESC
 LIMIT sqlc.arg(lim)::int;
+
+-- SearchChannelPostsPage is ChannelHistoryPage narrowed by a full-text match.
+-- It carries no caller predicate: a channel keeps one shared row per post
+-- rather than one copy per member, so there is no owner column to filter on and
+-- membership is the caller's whole gate, checked before this runs.
+-- message_tsv is index-backed (GIN), so the match is not a sequential scan.
+-- name: SearchChannelPostsPage :many
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages
+WHERE channel_id = sqlc.arg(channel_id) AND deleted = false
+  AND message_tsv @@ plainto_tsquery('simple', sqlc.arg(query))
+  AND (sqlc.arg(offset_id)::bigint = 0 OR local_id < sqlc.arg(offset_id)::bigint)
+ORDER BY local_id DESC
+LIMIT sqlc.arg(lim)::int;
