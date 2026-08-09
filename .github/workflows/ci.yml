@@ -117,7 +117,10 @@ jobs:
       #
       # A package prints (cached) here when $GOCACHE came back from the step
       # above carrying its result. Go decides that per package, so a package
-      # whose source changed still runs in full.
+      # whose source changed still runs in full. test/e2e is exempt: `make test`
+      # runs it in a second, -count=1 invocation so a green run always means the
+      # end-to-end suite executed on this head SHA rather than replaying an
+      # earlier one.
       - name: Test
         run: make test
 
