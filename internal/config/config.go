@@ -409,6 +409,15 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 			if err != nil {
 				return nil, fmt.Errorf("TG_CLIENT_ADDR_PROXY_CIDRS entry %q is not a CIDR", entry)
 			}
+			// A default route trusts every peer on the internet as a balancer,
+			// which hands any client the right to name any source address: to
+			// step out of its own bucket, or to pin an innocent address into
+			// flood wait. That is the spoofable identity the whole mode exists
+			// to prevent, and it is the one allowlist mistake that would
+			// otherwise start cleanly, so it fails the start like the rest.
+			if p.Bits() == 0 {
+				return nil, fmt.Errorf("TG_CLIENT_ADDR_PROXY_CIDRS entry %q trusts every address: name the balancers, not a default route", entry)
+			}
 			prefixes = append(prefixes, p)
 			continue
 		}

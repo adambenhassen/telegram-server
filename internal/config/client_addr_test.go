@@ -282,3 +282,41 @@ func TestWarnClientAddrTrustSilentInProxyV2(t *testing.T) {
 		t.Errorf("warned about socket keying in %s mode:\n%s", config.ClientAddrProxyV2, buf.String())
 	}
 }
+
+// TestLoadClientAddrProxyRejectsDefaultRoute is the third startup failure, and
+// the only allowlist mistake that would otherwise boot cleanly. A default route
+// makes every peer on the internet a trusted balancer, so any client may name
+// any source address: rotate it to leave its own bucket, or pin it to an
+// innocent address to hold that address in flood wait. Both families, because
+// an operator who writes one usually writes the other.
+func TestLoadClientAddrProxyRejectsDefaultRoute(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		cidrs string
+	}{
+		{name: "ipv4 default route", cidrs: "0.0.0.0/0"},
+		{name: "ipv6 default route", cidrs: "::/0"},
+		{name: "alongside a real balancer", cidrs: "10.0.0.0/8,0.0.0.0/0"},
+		{name: "both families", cidrs: "0.0.0.0/0,::/0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+			t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+			t.Setenv("TG_CLIENT_ADDR_TRUST", string(config.ClientAddrProxyV2))
+			t.Setenv("TG_CLIENT_ADDR_PROXY_CIDRS", tt.cidrs)
+
+			_, err := config.Load(discardLog())
+			if err == nil {
+				t.Fatal("a default route was accepted as a balancer allowlist: every client may now name any address")
+			}
+			if !strings.Contains(err.Error(), "TG_CLIENT_ADDR_PROXY_CIDRS") {
+				t.Errorf("error %q does not name the variable", err)
+			}
+			// The offending entry, not just the variable: an operator with a
+			// list of balancers needs to be told which one is the problem.
+			if !strings.Contains(err.Error(), "/0") {
+				t.Errorf("error %q does not name the offending entry", err)
+			}
+		})
+	}
+}
