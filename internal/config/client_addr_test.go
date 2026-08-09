@@ -113,10 +113,14 @@ func TestLoadClientAddrTrustEnvOverridesLimits(t *testing.T) {
 }
 
 // TestWarnClientAddrTrust proves the operational warning is emitted exactly once
-// per start, and only where it is true. Socket mode behind a proxy collapses
-// every client into one bucket and the per-IP cap becomes a global one; this
-// line is the whole of the mitigation until a balancer-aware source lands, so a
-// missing one is a real gap and not a cosmetic one.
+// per start, and only where it is true.
+//
+// Socket mode assumes one peer address is one client, and both ways that fails
+// have to be named: a proxy or L4 load balancer in front of the server, and a
+// carrier NAT in front of the clients. This line is the whole of the mitigation
+// until an address source that sees past them lands, so an omission is a real
+// gap and not a cosmetic one — an operator who is not told reads the resulting
+// flood waits as a bug in the limiter.
 func TestWarnClientAddrTrust(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
@@ -132,7 +136,7 @@ func TestWarnClientAddrTrust(t *testing.T) {
 	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
 		t.Fatalf("emitted %d warn lines, want exactly 1:\n%s", n, buf.String())
 	}
-	for _, want := range []string{"load balancer", "per-IP"} {
+	for _, want := range []string{"load balancer", "carrier NAT", "per-IP"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("warning does not mention %q:\n%s", want, buf.String())
 		}

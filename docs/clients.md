@@ -31,7 +31,7 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_RSA_KEY_PATH`   | `server_key.pem` | Path to the server's RSA private key        |
 | `TG_DC_ID`          | `2`              | DC id this server advertises as `ThisDC`    |
 | `TG_LOG_LOGIN_CODES`| `false`          | Write issued login codes to the log in cleartext. Off by default; with it off no code is delivered anywhere and sign-in cannot complete. A non-boolean value fails startup |
-| `TG_CLIENT_ADDR_TRUST`| `socket`       | Where the address a per-IP limit is keyed on comes from. `socket` — the connection's own peer address — is the only supported value; anything else fails startup by name. It assumes clients reach the server directly: behind a proxy or an L4 load balancer every peer address is the balancer's, so one bucket holds every client and the per-IP cap becomes a global one. The server warns about this once at startup while any per-IP limit is on |
+| `TG_CLIENT_ADDR_TRUST`| `socket`       | Where the address a per-IP limit is keyed on comes from. `socket` — the connection's own peer address — is the only supported value; anything else fails startup by name. It assumes one peer address is one client, which fails from either end: behind a proxy or an L4 load balancer every peer address is the balancer's, so one bucket holds every client and the per-IP cap becomes a global one; behind a carrier NAT one address covers thousands of mobile subscribers, who then spend each other's budget. The server warns about both once at startup while any per-IP limit is on |
 
 Postgres must already be reachable at `TG_POSTGRES_DSN`, and its schema must
 already be migrated with Atlas (`atlas migrate apply --env local`; see

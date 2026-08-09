@@ -345,21 +345,27 @@ func clientAddrTrust(raw string) (ClientAddrTrust, error) {
 // WarnClientAddrTrust states the operational assumption socket mode makes,
 // once, at startup.
 //
-// It is not decoration. Per-IP limits in socket mode assume clients connect to
-// this process directly. Behind a proxy or an L4 load balancer every peer
-// address is the balancer's, so one bucket holds every client on earth and the
-// per-IP cap becomes a global cap that locks everybody out at the same moment.
-// That is an accepted risk until a balancer-supplied address source lands, and
-// this line is the whole of its mitigation. Silent when no per-IP limit is
-// enabled, since nothing is then keyed on an address at all.
+// It is not decoration. Per-IP limits in socket mode assume one peer address is
+// one client, and the same collapse breaks that from either end. In front of
+// the server, a proxy or an L4 load balancer makes every peer address the
+// balancer's, so one bucket holds every client on earth and the per-IP cap
+// becomes a global cap that locks everybody out at the same moment. In front of
+// the clients, a carrier NAT puts thousands of mobile subscribers behind one
+// IPv4 address, so the whole carrier spends a single key's budget and the 21st
+// distinct number from it in a day is refused for up to a day.
+//
+// Both are accepted risks until an address source that can see past them lands,
+// and this line is the whole of the mitigation: it is what tells an operator
+// where the support tickets will come from before they arrive. Silent when no
+// per-IP limit is enabled, since nothing is then keyed on an address at all.
 func (c Config) WarnClientAddrTrust(log *slog.Logger) {
 	if c.ClientAddrTrust != ClientAddrSocket || !c.RateLimits.SendCodeIP.Enabled() {
 		return
 	}
 	log.Warn("per-IP limits are keyed on each connection's own peer address",
 		"trust", string(c.ClientAddrTrust),
-		"assumes", "clients connect directly",
-		"risk", "behind a proxy or L4 load balancer every client shares one bucket and the per-IP cap becomes a global one")
+		"assumes", "one peer address is one client, reaching this process directly",
+		"risk", "behind a proxy or L4 load balancer every client shares one bucket and the per-IP cap becomes a global one; behind a carrier NAT a whole mobile network shares one bucket and its subscribers are refused on each other's traffic")
 }
 
 // advertiseAddr resolves the address clients are told to dial. An explicit
