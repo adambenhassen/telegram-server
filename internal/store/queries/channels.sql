@@ -144,3 +144,57 @@ ORDER BY c.id;
 
 -- name: SetChannelUsername :execrows
 UPDATE channels SET username = $2 WHERE id = $1;
+
+-- SearchPublicChannels finds the channels any account may discover by title or
+-- by handle: exactly those owning a row in usernames.
+--
+-- The publicness predicate lives in the WHERE and therefore runs before LIMIT.
+-- That position is the whole security property. A private channel matching the
+-- tsquery must never occupy a row inside LIMIT that is then dropped in Go: the
+-- caller reads the shortfall in the returned row count as "a private channel
+-- matching my query exists", and probing LIMIT positions turns titles into an
+-- enumeration oracle over channels that are supposed to be invisible.
+--
+-- The query takes no viewer, deliberately. Results is public discovery and is
+-- identical for every caller, so nothing in it can vary with the caller's own
+-- membership or ban state and be read back as information.
+--
+-- Publicness is decided by the usernames row rather than the denormalized
+-- channels.username column. The two are written in one transaction today
+-- (ClaimChannelUsername), but only the usernames row is authoritative, and a
+-- future writer that releases a handle without clearing the copy must not leave
+-- the channel discoverable. The handle returned to the caller comes from the
+-- same row for the same reason: the username shown is the one that admitted the
+-- channel to this result, never the copy.
+-- name: SearchPublicChannels :many
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
+       c.pinned_message_id, un.handle,
+       (SELECT count(*) FROM channel_participants cp WHERE cp.channel_id = c.id) AS participants_count
+FROM channels c
+JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
+WHERE c.title_tsv @@ plainto_tsquery('simple', sqlc.arg(query))
+   OR un.handle = sqlc.arg(handle)
+ORDER BY c.id
+LIMIT sqlc.arg(lim)::int;
+
+-- SearchMemberChannels finds the channels the caller belongs to by title or by
+-- handle, public and private alike. Membership is the join, so a channel the
+-- caller never joined can never appear here whatever its title.
+--
+-- The ban predicate is written here rather than left to ChannelMember.Banned
+-- for the reason FileForDownload records: it decides the row set that LIMIT
+-- then cuts, so a retained participant row of a banned member would otherwise
+-- displace a channel the caller may actually see. It must stay spelled the same
+-- way as Banned — NULL is not banned, "may act" is banned_until IS NULL OR
+-- banned_until <= now().
+-- name: SearchMemberChannels :many
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
+       c.pinned_message_id, un.handle, p.role,
+       (SELECT count(*) FROM channel_participants cp WHERE cp.channel_id = c.id) AS participants_count
+FROM channels c
+JOIN channel_participants p ON p.channel_id = c.id AND p.user_id = sqlc.arg(viewer_id)::bigint
+LEFT JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
+WHERE (c.title_tsv @@ plainto_tsquery('simple', sqlc.arg(query)) OR un.handle = sqlc.arg(handle))
+  AND (p.banned_until IS NULL OR p.banned_until <= now())
+ORDER BY c.id
+LIMIT sqlc.arg(lim)::int;

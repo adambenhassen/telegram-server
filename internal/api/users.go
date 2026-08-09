@@ -126,34 +126,70 @@ func (h *handlers) handleResolveUsername(r *mtproto.Request) (bin.Encoder, error
 
 // channelToTLForResolve renders a channel for contacts.resolveUsername.
 // All callers see the same public view — membership is never checked.
-// Returns title, photo, participant count, and kind flags. No membership
-// details are included.
 func (h *handlers) channelToTLForResolve(ctx context.Context, c store.Channel, viewerID int64) (tg.ChatClass, error) {
-	a := h.peers.Derive(viewerID, peerhash.KindChannel, c.ID)
 	count, err := h.store.CountChannelParticipants(ctx, c.ID)
 	if err != nil {
 		return nil, fmt.Errorf("count participants: %w", err)
 	}
-	return &tg.Channel{
+	return h.channelToTLPublic(c, count, viewerID), nil
+}
+
+// channelToTLPublic is the public view of a channel: what an account that is
+// not a member may be told about one, on resolveUsername and on the discovery
+// arm of contacts.search alike. Title, photo, participant count, username and
+// kind flags; no membership details, and Left is set because the viewer is not
+// a member as far as this rendering knows.
+//
+// AccessHash is derived for (viewerID, c.ID). Handing it to a non-member is
+// what makes the result usable — the hash names a peer and authorizes nothing,
+// and every peer-taking RPC still runs its own membership check.
+//
+// The participant count is passed in rather than read here: the search arm
+// already has it from the query that matched, and a per-row count query on a
+// search page is the kind of extra work the M14 threat model asks this path not
+// to grow.
+func (h *handlers) channelToTLPublic(c store.Channel, participants int64, viewerID int64) *tg.Channel {
+	ch := &tg.Channel{
 		ID:                c.ID,
 		Title:             c.Title,
-		AccessHash:        a,
+		AccessHash:        h.peers.Derive(viewerID, peerhash.KindChannel, c.ID),
 		Date:              int(c.Date.Unix()),
 		Megagroup:         c.Megagroup,
 		Broadcast:         !c.Megagroup,
 		Left:              true,
 		Photo:             &tg.ChatPhotoEmpty{},
-		ParticipantsCount: int(count),
-	}, nil
+		ParticipantsCount: int(participants),
+	}
+	if c.Username != nil {
+		ch.Username = *c.Username
+	}
+	return ch
 }
 
-// handleContactsSearch serves contacts.search: find users by name substring,
-// restricted to the caller's existing dialog partners. Only authorized callers
-// may use it.
+// handleContactsSearch serves contacts.search: find users and channels by name.
+// Only authorized callers may use it.
 //
 // An empty query returns SEARCH_QUERY_EMPTY. The limit defaults to 10 when
-// zero and is capped at 50. Results are scoped to users with whom the caller
-// has an existing 1:1 dialog — no global search, no cross-dialog leak.
+// zero and is capped at 50; it bounds each arm of the search separately.
+//
+// Three arms, each with its own predicate and none relaxed to match another:
+//
+//   - MyResults users — users the caller has an existing 1:1 dialog with. No
+//     global user search, no cross-dialog leak.
+//   - MyResults channels — channels the caller is an unbanned member of,
+//     private ones included, since membership is what entitles them.
+//   - Results channels — channels holding a public username. This arm takes no
+//     viewer at all: public discovery is the same answer for every account, so
+//     nothing in it varies with the caller and can be read back. A channel
+//     without a username is filtered inside the SQL, before the LIMIT, so it
+//     never occupies a row that a caller could count as evidence it exists.
+//
+// A channel that is both public and the caller's own matches two arms and is
+// named in both peer vectors, but is rendered once in Chats, as the member view
+// — a client indexes Chats by id and cannot hold two renderings of one channel.
+//
+// The rate limit is charged once for the whole call, before any arm runs, so
+// one query costs one quota unit whatever it matches.
 func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.ContactsSearchRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -191,22 +227,52 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 		h.log.Error("contacts.search: store query", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	myChannels, err := h.store.SearchMemberChannels(r.Ctx, r.UserID, req.Q, limit)
+	if err != nil {
+		h.log.Error("contacts.search: member channels", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	publicChannels, err := h.store.SearchPublicChannels(r.Ctx, req.Q, limit)
+	if err != nil {
+		h.log.Error("contacts.search: public channels", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
 
-	if len(contacts) == 0 {
+	// Nothing matched anywhere: one empty response, the same one a query naming
+	// a private channel produces. "No match", "a private channel matched" and
+	// "no such channel" must not be three answers.
+	if len(contacts) == 0 && len(myChannels) == 0 && len(publicChannels) == 0 {
 		return &tg.ContactsFound{}, nil
 	}
 
-	myResults := make([]tg.PeerClass, len(contacts))
-	users := make([]tg.UserClass, len(contacts))
-	for i, c := range contacts {
-		myResults[i] = &tg.PeerUser{UserID: c.ID}
-		users[i] = h.userToTL(c, r.UserID, c.ID == r.UserID)
+	myResults := make([]tg.PeerClass, 0, len(contacts)+len(myChannels))
+	users := make([]tg.UserClass, 0, len(contacts))
+	for _, c := range contacts {
+		myResults = append(myResults, &tg.PeerUser{UserID: c.ID})
+		users = append(users, h.userToTL(c, r.UserID, c.ID == r.UserID))
+	}
+
+	chats := make([]tg.ChatClass, 0, len(myChannels)+len(publicChannels))
+	rendered := make(map[int64]bool, len(myChannels))
+	for _, m := range myChannels {
+		myResults = append(myResults, &tg.PeerChannel{ChannelID: m.Channel.ID})
+		chats = append(chats, h.channelToTL(m.Channel, m.Member, true, r.UserID))
+		rendered[m.Channel.ID] = true
+	}
+
+	results := make([]tg.PeerClass, 0, len(publicChannels))
+	for _, p := range publicChannels {
+		results = append(results, &tg.PeerChannel{ChannelID: p.Channel.ID})
+		if rendered[p.Channel.ID] {
+			continue
+		}
+		chats = append(chats, h.channelToTLPublic(p.Channel, p.ParticipantsCount, r.UserID))
 	}
 
 	return &tg.ContactsFound{
 		MyResults: myResults,
-		Results:   nil, // M13 has no global user search
-		Chats:     nil, // out of scope
+		Results:   results,
+		Chats:     chats,
 		Users:     users,
 	}, nil
 }

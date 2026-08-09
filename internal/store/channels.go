@@ -674,6 +674,106 @@ func (s *Store) ChannelsForUser(ctx context.Context, userID int64) ([]Channel, e
 	return out, nil
 }
 
+// ChannelSearchResult is one channel matched by a title or handle search,
+// alongside the participant count its public rendering carries. Member is the
+// caller's own participant row and is filled only by SearchMemberChannels,
+// where membership is what admitted the row; it stays zero on a public match,
+// which is decided without reference to any caller and where nothing may read
+// a membership off the result.
+type ChannelSearchResult struct {
+	Channel           Channel
+	ParticipantsCount int64
+	Member            ChannelMember
+}
+
+// searchHandle reduces a search query to the handle it could be naming: the
+// same normalisation contacts.resolveUsername applies to its argument, so a
+// caller finds a channel by its @username on either RPC. A query that is not a
+// handle at all (spaces, punctuation) simply matches no row, since handles are
+// validated on claim.
+func searchHandle(query string) string {
+	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(query), "@"))
+}
+
+// SearchPublicChannels returns the channels discoverable by any account whose
+// title or handle matches the query, capped at limit.
+//
+// It takes no viewer: publicness is the only predicate, it lives in the SQL
+// WHERE, and it therefore applies before the LIMIT. A private channel matching
+// the query never occupies a row, so a caller cannot read one back as evidence
+// that it exists. See the query comment for why that position is the whole of
+// the property.
+func (s *Store) SearchPublicChannels(ctx context.Context, query string, limit int32) ([]ChannelSearchResult, error) {
+	rows, err := s.q.SearchPublicChannels(ctx, db.SearchPublicChannelsParams{
+		Query:  query,
+		Handle: searchHandle(query),
+		Lim:    limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search public channels: %w", err)
+	}
+	out := make([]ChannelSearchResult, len(rows))
+	for i, r := range rows {
+		out[i] = ChannelSearchResult{
+			Channel: Channel{
+				ID:              r.ID,
+				Title:           r.Title,
+				About:           r.About,
+				CreatorID:       r.CreatorID,
+				Megagroup:       r.Megagroup,
+				Version:         int(r.Version),
+				Date:            r.Date.Time,
+				PinnedMessageID: r.PinnedMessageID,
+				// The handle off the usernames row, not the denormalized copy:
+				// the username reported is the one that made the channel
+				// public in the first place.
+				Username: &r.Handle,
+			},
+			ParticipantsCount: r.ParticipantsCount,
+		}
+	}
+	return out, nil
+}
+
+// SearchMemberChannels returns the channels viewerID belongs to whose title or
+// handle matches the query, public and private alike, capped at limit. A
+// channel the caller never joined, or is banned from, is not returned.
+func (s *Store) SearchMemberChannels(
+	ctx context.Context, viewerID int64, query string, limit int32,
+) ([]ChannelSearchResult, error) {
+	rows, err := s.q.SearchMemberChannels(ctx, db.SearchMemberChannelsParams{
+		ViewerID: viewerID,
+		Query:    query,
+		Handle:   searchHandle(query),
+		Lim:      limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search member channels: %w", err)
+	}
+	out := make([]ChannelSearchResult, len(rows))
+	for i, r := range rows {
+		out[i] = ChannelSearchResult{
+			Channel: Channel{
+				ID:              r.ID,
+				Title:           r.Title,
+				About:           r.About,
+				CreatorID:       r.CreatorID,
+				Megagroup:       r.Megagroup,
+				Version:         int(r.Version),
+				Date:            r.Date.Time,
+				PinnedMessageID: r.PinnedMessageID,
+				Username:        r.Handle,
+			},
+			ParticipantsCount: r.ParticipantsCount,
+			// The query already excluded banned rows, so BannedUntil is left
+			// nil rather than re-read: nothing downstream may treat this value
+			// as the ban record.
+			Member: ChannelMember{UserID: viewerID, Role: int(r.Role)},
+		}
+	}
+	return out, nil
+}
+
 // ChannelDialogRow carries one channel's dialog data: the channel itself, its
 // pts, and the newest non-deleted post (top message). Top is nil when the
 // channel has no posts or all posts are deleted.

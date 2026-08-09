@@ -12,7 +12,7 @@ import (
 )
 
 const channelByID = `-- name: ChannelByID :one
-SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username FROM channels WHERE id = $1
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv FROM channels WHERE id = $1
 `
 
 func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
@@ -28,6 +28,7 @@ func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
 		&i.Date,
 		&i.PinnedMessageID,
 		&i.Username,
+		&i.TitleTsv,
 	)
 	return i, err
 }
@@ -253,7 +254,7 @@ func (q *Queries) ChannelStateForUpdate(ctx context.Context, channelID int64) (C
 }
 
 const channelsForUser = `-- name: ChannelsForUser :many
-SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id, c.username FROM channels c
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id, c.username, c.title_tsv FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id
@@ -278,6 +279,7 @@ func (q *Queries) ChannelsForUser(ctx context.Context, userID int64) ([]Channel,
 			&i.Date,
 			&i.PinnedMessageID,
 			&i.Username,
+			&i.TitleTsv,
 		); err != nil {
 			return nil, err
 		}
@@ -344,7 +346,7 @@ func (q *Queries) GetChannelPinnedMessage(ctx context.Context, id int64) (*int32
 
 const insertChannel = `-- name: InsertChannel :one
 INSERT INTO channels (title, about, creator_id, megagroup) VALUES ($1, $2, $3, $4)
-RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username
+RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv
 `
 
 type InsertChannelParams struct {
@@ -372,6 +374,7 @@ func (q *Queries) InsertChannel(ctx context.Context, arg InsertChannelParams) (C
 		&i.Date,
 		&i.PinnedMessageID,
 		&i.Username,
+		&i.TitleTsv,
 	)
 	return i, err
 }
@@ -466,7 +469,7 @@ func (q *Queries) IsChannelMember(ctx context.Context, arg IsChannelMemberParams
 }
 
 const lockChannel = `-- name: LockChannel :one
-SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username FROM channels WHERE id = $1 FOR UPDATE
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv FROM channels WHERE id = $1 FOR UPDATE
 `
 
 // LockChannel takes the channels row lock that serialises the rights mutations:
@@ -486,6 +489,7 @@ func (q *Queries) LockChannel(ctx context.Context, id int64) (Channel, error) {
 		&i.Date,
 		&i.PinnedMessageID,
 		&i.Username,
+		&i.TitleTsv,
 	)
 	return i, err
 }
@@ -507,8 +511,172 @@ func (q *Queries) RevokeChannelInvite(ctx context.Context, arg RevokeChannelInvi
 	return result.RowsAffected(), nil
 }
 
+const searchMemberChannels = `-- name: SearchMemberChannels :many
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
+       c.pinned_message_id, un.handle, p.role,
+       (SELECT count(*) FROM channel_participants cp WHERE cp.channel_id = c.id) AS participants_count
+FROM channels c
+JOIN channel_participants p ON p.channel_id = c.id AND p.user_id = $1::bigint
+LEFT JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
+WHERE (c.title_tsv @@ plainto_tsquery('simple', $2) OR un.handle = $3)
+  AND (p.banned_until IS NULL OR p.banned_until <= now())
+ORDER BY c.id
+LIMIT $4::int
+`
+
+type SearchMemberChannelsParams struct {
+	ViewerID int64
+	Query    string
+	Handle   string
+	Lim      int32
+}
+
+type SearchMemberChannelsRow struct {
+	ID                int64
+	Title             string
+	About             string
+	CreatorID         int64
+	Megagroup         bool
+	Version           int32
+	Date              pgtype.Timestamptz
+	PinnedMessageID   *int32
+	Handle            *string
+	Role              int16
+	ParticipantsCount int64
+}
+
+// SearchMemberChannels finds the channels the caller belongs to by title or by
+// handle, public and private alike. Membership is the join, so a channel the
+// caller never joined can never appear here whatever its title.
+//
+// The ban predicate is written here rather than left to ChannelMember.Banned
+// for the reason FileForDownload records: it decides the row set that LIMIT
+// then cuts, so a retained participant row of a banned member would otherwise
+// displace a channel the caller may actually see. It must stay spelled the same
+// way as Banned — NULL is not banned, "may act" is banned_until IS NULL OR
+// banned_until <= now().
+func (q *Queries) SearchMemberChannels(ctx context.Context, arg SearchMemberChannelsParams) ([]SearchMemberChannelsRow, error) {
+	rows, err := q.db.Query(ctx, searchMemberChannels,
+		arg.ViewerID,
+		arg.Query,
+		arg.Handle,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SearchMemberChannelsRow
+	for rows.Next() {
+		var i SearchMemberChannelsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.About,
+			&i.CreatorID,
+			&i.Megagroup,
+			&i.Version,
+			&i.Date,
+			&i.PinnedMessageID,
+			&i.Handle,
+			&i.Role,
+			&i.ParticipantsCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const searchPublicChannels = `-- name: SearchPublicChannels :many
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
+       c.pinned_message_id, un.handle,
+       (SELECT count(*) FROM channel_participants cp WHERE cp.channel_id = c.id) AS participants_count
+FROM channels c
+JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
+WHERE c.title_tsv @@ plainto_tsquery('simple', $1)
+   OR un.handle = $2
+ORDER BY c.id
+LIMIT $3::int
+`
+
+type SearchPublicChannelsParams struct {
+	Query  string
+	Handle string
+	Lim    int32
+}
+
+type SearchPublicChannelsRow struct {
+	ID                int64
+	Title             string
+	About             string
+	CreatorID         int64
+	Megagroup         bool
+	Version           int32
+	Date              pgtype.Timestamptz
+	PinnedMessageID   *int32
+	Handle            string
+	ParticipantsCount int64
+}
+
+// SearchPublicChannels finds the channels any account may discover by title or
+// by handle: exactly those owning a row in usernames.
+//
+// The publicness predicate lives in the WHERE and therefore runs before LIMIT.
+// That position is the whole security property. A private channel matching the
+// tsquery must never occupy a row inside LIMIT that is then dropped in Go: the
+// caller reads the shortfall in the returned row count as "a private channel
+// matching my query exists", and probing LIMIT positions turns titles into an
+// enumeration oracle over channels that are supposed to be invisible.
+//
+// The query takes no viewer, deliberately. Results is public discovery and is
+// identical for every caller, so nothing in it can vary with the caller's own
+// membership or ban state and be read back as information.
+//
+// Publicness is decided by the usernames row rather than the denormalized
+// channels.username column. The two are written in one transaction today
+// (ClaimChannelUsername), but only the usernames row is authoritative, and a
+// future writer that releases a handle without clearing the copy must not leave
+// the channel discoverable. The handle returned to the caller comes from the
+// same row for the same reason: the username shown is the one that admitted the
+// channel to this result, never the copy.
+func (q *Queries) SearchPublicChannels(ctx context.Context, arg SearchPublicChannelsParams) ([]SearchPublicChannelsRow, error) {
+	rows, err := q.db.Query(ctx, searchPublicChannels, arg.Query, arg.Handle, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SearchPublicChannelsRow
+	for rows.Next() {
+		var i SearchPublicChannelsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.About,
+			&i.CreatorID,
+			&i.Megagroup,
+			&i.Version,
+			&i.Date,
+			&i.PinnedMessageID,
+			&i.Handle,
+			&i.ParticipantsCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setChannelPinnedMessage = `-- name: SetChannelPinnedMessage :one
-UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username
+UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv
 `
 
 type SetChannelPinnedMessageParams struct {
@@ -532,6 +700,7 @@ func (q *Queries) SetChannelPinnedMessage(ctx context.Context, arg SetChannelPin
 		&i.Date,
 		&i.PinnedMessageID,
 		&i.Username,
+		&i.TitleTsv,
 	)
 	return i, err
 }
