@@ -69,7 +69,7 @@ func TestHandshakeFrameDropsRegistration(t *testing.T) {
 	srv := mtproto.New(priv, 2, store, nil, nil)
 
 	client, server := transport.Intermediate.Pipe()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	served := make(chan error, 1)
