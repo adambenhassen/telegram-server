@@ -357,3 +357,72 @@ func (q *Queries) LockChannelState(ctx context.Context, channelID int64) (Channe
 	)
 	return i, err
 }
+
+const searchChannelPostsPage = `-- name: SearchChannelPostsPage :many
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+FROM channel_messages
+WHERE channel_id = $1 AND deleted = false
+  AND message_tsv @@ plainto_tsquery('simple', $2)
+  AND ($3::bigint = 0 OR local_id < $3::bigint)
+ORDER BY local_id DESC
+LIMIT $4::int
+`
+
+type SearchChannelPostsPageParams struct {
+	ChannelID int64
+	Query     string
+	OffsetID  int64
+	Lim       int32
+}
+
+type SearchChannelPostsPageRow struct {
+	ChannelID int64
+	LocalID   int64
+	FromID    int64
+	Date      pgtype.Timestamptz
+	Message   string
+	EditDate  pgtype.Timestamptz
+	Deleted   bool
+	RandomID  int64
+	FileID    *int64
+}
+
+// SearchChannelPostsPage is ChannelHistoryPage narrowed by a full-text match.
+// It carries no caller predicate: a channel keeps one shared row per post
+// rather than one copy per member, so there is no owner column to filter on and
+// membership is the caller's whole gate, checked before this runs.
+// message_tsv is index-backed (GIN), so the match is not a sequential scan.
+func (q *Queries) SearchChannelPostsPage(ctx context.Context, arg SearchChannelPostsPageParams) ([]SearchChannelPostsPageRow, error) {
+	rows, err := q.db.Query(ctx, searchChannelPostsPage,
+		arg.ChannelID,
+		arg.Query,
+		arg.OffsetID,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SearchChannelPostsPageRow
+	for rows.Next() {
+		var i SearchChannelPostsPageRow
+		if err := rows.Scan(
+			&i.ChannelID,
+			&i.LocalID,
+			&i.FromID,
+			&i.Date,
+			&i.Message,
+			&i.EditDate,
+			&i.Deleted,
+			&i.RandomID,
+			&i.FileID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

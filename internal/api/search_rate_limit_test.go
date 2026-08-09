@@ -636,3 +636,112 @@ func TestContactsSearchChargeIsUniform(t *testing.T) {
 		t.Fatal("empty query: expected SEARCH_QUERY_EMPTY, got FLOOD_WAIT")
 	}
 }
+
+// TestSearchMessagesChannelPeerSharesTheQuota proves that a channel-peer search
+// spends the same per-account quota as a 1:1 or chat search and gets the same
+// FLOOD_WAIT once it is exhausted. One quota covers messages.search whatever
+// peer it names, so a caller cannot double their search budget by pointing it
+// at a channel.
+func TestSearchMessagesChannelPeerSharesTheQuota(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	creator, err := s.CreateUser(ctx, "+15551296951")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551296952")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err := sendToChannel(t, s, creator.ID, ch.ID, "hello world", 9601); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	if _, err := api.SendMessageForTest(s, creator.ID, &tg.MessagesSendMessageRequest{
+		Peer:     api.InputPeerUser(creator.ID, bob.ID),
+		Message:  "hello world",
+		RandomID: 9602,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Limit of 2, spent one by a user peer and one by the channel peer.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	search := func(peer tg.InputPeerClass) (bin.Encoder, error) {
+		return api.SearchForTestWithLimits(s, creator.ID, cfg, &tg.MessagesSearchRequest{
+			Peer:   peer,
+			Q:      "hello",
+			Filter: &tg.InputMessagesFilterEmpty{},
+		})
+	}
+
+	if _, err := search(api.InputPeerUser(creator.ID, bob.ID)); err != nil {
+		t.Fatalf("user-peer search: %v", err)
+	}
+	enc, err := search(api.InputPeerChannel(creator.ID, ch.ID))
+	if err != nil {
+		t.Fatalf("channel-peer search: %v", err)
+	}
+	if ids := channelSearchIDs(t, enc); len(ids) != 1 {
+		t.Fatalf("channel-peer search ids = %v, want one hit", ids)
+	}
+
+	if _, err := search(api.InputPeerChannel(creator.ID, ch.ID)); !isFloodWait(err) {
+		t.Fatalf("third search: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestSearchMessagesChannelChargedBeforeMembershipCheck proves that a
+// channel-peer search by a non-member is charged: the membership probe is a
+// database query, so a charge behind it would let a non-member probe the dense
+// channels.id space at unbounded rate, and would make the quota a membership
+// oracle.
+func TestSearchMessagesChannelChargedBeforeMembershipCheck(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	creator, err := s.CreateUser(ctx, "+15551296961")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mallory, err := s.CreateUser(ctx, "+15551296962")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	// Limit of 1.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	probe := func() error {
+		_, err := api.SearchForTestWithLimits(s, mallory.ID, cfg, &tg.MessagesSearchRequest{
+			Peer:   api.InputPeerChannel(mallory.ID, ch.ID),
+			Q:      "hello",
+			Filter: &tg.InputMessagesFilterEmpty{},
+		})
+		return err
+	}
+
+	// First probe: refused as PEER_ID_INVALID, and charged.
+	err = probe()
+	if err == nil {
+		t.Fatal("probe 1: expected PEER_ID_INVALID, got nil")
+	}
+	if isFloodWait(err) {
+		t.Fatalf("probe 1: expected PEER_ID_INVALID, got %v", err)
+	}
+
+	// Second probe: the token was spent by the first, so the limiter answers
+	// before the membership query runs.
+	if err := probe(); !isFloodWait(err) {
+		t.Fatalf("probe 2: expected FLOOD_WAIT, got %v", err)
+	}
+}
