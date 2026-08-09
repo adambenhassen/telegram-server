@@ -16,7 +16,7 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    # The suite finishes in ~2m30s; this only catches a hang (a stalled image
+    # The suite finishes in ~4m; this only catches a hang (a stalled image
     # pull, a container that never reports ready) before it burns six hours.
     timeout-minutes: 20
 
