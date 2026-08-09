@@ -375,6 +375,54 @@ Channels
   boundary; `TestContactsSearch` proves dialog-scoped name matching and that
   non-dialog users are excluded.
 
+### M14 — Rate limiting and abuse controls
+- Postgres-backed rate limiter: O(1) state per (subject, surface), constant row
+  operations per check-and-consume, exact under concurrency (no cross-subject
+  serialization), old state self-cleans without unbounded row growth. Limits are
+  env-configured per surface with documented defaults; a zero or unset limit
+  disables enforcement for that surface.
+- Dynamic `FLOOD_WAIT_<seconds>` error contract (error 420) with the real remaining
+  wait (minimum 1 second), replacing any hardcoded constant. A denied request stores
+  nothing, advances no pts, delivers no update — no partial effect anywhere.
+- Per-account limits shipped with defaults (all env-overridable): message sends
+  (all paths — 1:1, chat, channel, media — share one budget) 60/60s;
+  `messages.createChat` 20/24h; `messages.addChatUser` 120/24h;
+  `channels.createChannel` 20/24h; `messages.search` 300/hr;
+  `contacts.search` 300/hr; `upload.saveFilePart` 600/60s.
+- Connection-layer client-address plumbing: the peer address is captured before
+  any client bytes are interpreted and carried with the request. Two trust modes:
+  `socket` — the connection's own peer address, the default — and PROXY-v2 — the
+  client address from a PROXY protocol v2 header, accepted only from configured
+  balancer CIDRs (an empty allowlist in PROXY mode is a startup failure). No
+  autodetection and no heuristics; any unsupported mode value is a startup failure.
+  Fail closed in both directions: an allowlisted source with no valid PROXY v2
+  header is refused; a PROXY header from any non-allowlisted source is never
+  honoured. In `socket` mode with per-IP limits enabled, the server logs once at
+  warn level that running behind a proxy without switching to PROXY mode collapses
+  every client into one bucket.
+- `auth.sendCode` per-IP limit: 10 calls per hour per IP key (IPv4 /32, IPv6 /64);
+  20 distinct phone numbers per IP key per 24h. The IP check runs before any
+  phone-dependent work; denial is uniform regardless of whether the phone is
+  registered or a code is already live, preserving the no-registration-oracle
+  property. Postgres-backed so the limit holds across replicas.
+- Upload-part TTL measured from insert time, not last-touch: re-saving a part no
+  longer resets its expiry. Expired-part sweep runs in bounded batches.
+- Deliberately not in M14: `upload.getFile` rate number (still needs measured
+  per-replica read throughput under concurrent download; the M14 limiter makes it
+  cheap to add once measured); escalating penalties for repeated denials; per-IP
+  coverage beyond `auth.sendCode` — unauthenticated key exchange (RSA/DH CPU an
+  attacker can burn before ever calling sendCode) and per-IP concurrent-connection
+  cap, both needing throughput measurement rather than judgment, and both cheap to
+  add with the M14 plumbing in place; coarser /48 grouping against IPv6 address
+  rotation; `messages.getDialogs` limiting and pagination; metrics on limit hits
+  (observability milestone; structured logs on denial are available). Accepted
+  residual: `socket` mode behind a load balancer without PROXY mode configured gives
+  one global bucket instead of per-client ones — mitigated by a startup warning,
+  deliberately not by autodetection.
+- E2E gates prove: over-limit message send returns `FLOOD_WAIT_<n>` to a real gotd
+  client, a different account is unaffected, and the limited account succeeds after
+  the window; the full login flow completes under default per-IP limits.
+
 ## Planned — feature track
 
 ### M11 — Message features
@@ -393,9 +441,9 @@ Four stages in sequence:
 
 Runs in parallel with features; currently the weakest area for production.
 
-- **Packaging & deploy.** No Dockerfile, compose, or k8s manifests yet. Add a
-  container image, a local `docker-compose` (server + Postgres), and k8s
-  manifests (the design assumes horizontal replicas behind a load balancer).
+- **Packaging & deploy.** Dockerfile and a `docker-compose` (server + Postgres)
+  are in the repo. Add k8s manifests (the design assumes horizontal replicas
+  behind a load balancer).
 - **CI.** No pipeline yet. Add build + `go test ./...` + `golangci-lint` +
   `atlas migrate validate` on every push.
 - **API layer target.** Pin and document a target Telegram API layer, and track
@@ -404,19 +452,16 @@ Runs in parallel with features; currently the weakest area for production.
   a DC list and migration; needs a DC registry and `PHONE_MIGRATE`/`NETWORK_MIGRATE`.
 - **Observability.** Structured logs exist; add metrics (connections, pts lag,
   push latency, NOTIFY throughput) and tracing.
-- **Rate limiting & abuse.** Per-account/per-IP limits beyond the login-code
-  cooldown; flood-wait on messaging RPCs, `messages.createChat`, and
-  `messages.addChatUser`. The 200-member cap bounds one transaction but is not a
-  rate control: one account can create a 200-member chat and send in a loop,
-  each send holding up to 200 advisory locks and serialising against 200
-  uninvolved accounts' 1:1 sends. Additionally, `messages.getDialogs` does not
-  paginate the chat list, so an account in many chats makes each dialog call
-  expensive independently — a cost input for sizing the flood-wait limit. Media
-  adds two more surfaces: `upload.getFile` is authenticated resource consumption
-  sized by disk read and egress (M5 ships one in-flight download per account;
-  the rate number belongs here and cannot be chosen without measured per-replica
-  read throughput under concurrent `getFile`), and `upload.saveFilePart` is
-  bounded by the byte and row caps but not rate-limited.
+- **Rate limiting & abuse.** M14 shipped per-account flood-wait on message sends,
+  `messages.createChat`, `messages.addChatUser`, `channels.createChannel`,
+  `messages.search`, `contacts.search`, and `upload.saveFilePart`; per-IP limits
+  on `auth.sendCode`; and connection-layer client-address plumbing with `socket`
+  and PROXY-v2 trust modes. Remaining open items: `upload.getFile` rate number
+  (needs measured per-replica read throughput under concurrent download);
+  escalating penalties for repeated denials; per-IP coverage beyond
+  `auth.sendCode` (unauthenticated key exchange and per-IP concurrent-connection
+  cap); coarser /48 grouping against IPv6 address rotation; `messages.getDialogs`
+  limiting and pagination; and metrics on limit hits (observability milestone).
 - **Backups & retention.** Postgres backup story; `message_events` retention.
 
 ## Known deferrals & tech debt
@@ -504,9 +549,10 @@ Tracked so shortcuts don't rot into "later means never".
   deterministically and ignored entirely on input. Half-validating it would make
   it an oracle, which is why it is ignored rather than partially checked. — M5
 - **No rate limit on `upload.getFile`.** One in-flight download per account is the
-  bound M5 ships. The rate belongs with the flood-wait work on the operational
-  track, and the number cannot be chosen without measured per-replica read
-  throughput under concurrent `getFile`. — M5
+  bound M5 ships. M14 explicitly deferred the rate number: it cannot be chosen
+  without measured per-replica read throughput under concurrent `getFile`; the
+  M14 limiter infrastructure makes it cheap to add once that measurement exists.
+  — M5, M14
 - **No content scanning of any kind** — no malware detection, no format validation,
   no sniffing. An explicit non-goal: the server stores and returns opaque bytes. — M5
 - **A removed member retains access to media posted while they were a member.**
