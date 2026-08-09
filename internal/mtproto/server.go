@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -56,6 +57,15 @@ type Server struct {
 	// socket, before any frame exists to apply readTimeout to.
 	handshakeTimeout time.Duration
 
+	// proxyV2 is the balancer allowlist when client addresses come from PROXY
+	// protocol v2 headers, and nil when they come from the socket itself.
+	// Written once before Serve and only read after, so the accept path needs
+	// no synchronisation to see it.
+	proxyV2 *proxyV2Source
+	// negotiationLog thins the per-connection negotiation failure line, which
+	// anyone who can reach the port can provoke.
+	negotiationLog logSampler
+
 	// onStatusChange fires when a user's connection count transitions between
 	// zero and non-zero. Called after the registry has been updated, so a
 	// callback that reads the registry does not race the bind. userID is the
@@ -70,6 +80,19 @@ type Server struct {
 // transitions between zero and non-zero.
 func (s *Server) OnStatusChange(fn func(ctx context.Context, userID int64, online bool)) {
 	s.onStatusChange = fn
+}
+
+// TrustProxyV2Headers makes the server take each client address from a PROXY
+// protocol v2 header instead of the socket it arrived on, honoured only from a
+// source in allow. Call it before Serve.
+//
+// This is the mode for running behind an L4 load balancer, where every socket's
+// peer address is the balancer's and socket keying puts every client on earth in
+// one bucket. See proxyV2Source for what the allowlist is load-bearing for.
+func (s *Server) TrustProxyV2Headers(allow []netip.Prefix) {
+	// Cloned: the allowlist is the trust decision, and it must not change under
+	// the server because a caller reused the slice it passed in.
+	s.proxyV2 = &proxyV2Source{allow: slices.Clone(allow)}
 }
 
 // New creates a Server that answers on dcID using key for the handshake, keys to
@@ -115,10 +138,14 @@ func (s *Server) Key() exchange.PublicKey {
 // fails permanently, and for no other reason.
 //
 // l is a plain net.Listener because the socket, not a negotiated connection, is
-// what the accept path hands over: the peer address is read from it and the
-// codec detected from it, both per connection. An address source other than the
-// socket — a load balancer's, say — arrives as a listener whose connections
-// report it as their RemoteAddr, leaving everything here unchanged.
+// what the accept path hands over: the client address is established from it and
+// the codec detected from it, both per connection, in negotiate.
+//
+// An address source other than the socket belongs there too, and not in a
+// listener wrapping l. TrustProxyV2Headers is the one that exists, and it reads
+// its header inside negotiate for a reason worth keeping: a listener that read
+// it at Accept would be reading client bytes on the accept path, which is the
+// stall this structure exists to remove.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	grp := tdsync.NewCancellableGroup(ctx)
 	grp.Go(func(ctx context.Context) error {
@@ -175,11 +202,6 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 // sent a transport nobody speaks, or sent nothing at all — so it ends that
 // connection and is reported no further.
 func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
-	// Read the peer address before negotiation consumes the first client
-	// bytes, so the address every per-IP limit is keyed on cannot be a function
-	// of anything the client wrote.
-	addr := peerAddr(sock.RemoteAddr())
-
 	// Cancellation has to reach this socket wherever it happens to be, and the
 	// reads it blocks in take no context: gotd re-derives a read deadline from
 	// one per frame, so a deadline expired at cancel is undone by the very next
@@ -195,10 +217,17 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
 	})
 	defer stop()
 
-	conn, err := s.negotiate(sock)
+	conn, addr, err := s.negotiate(sock)
 	if err != nil {
+		// Sampled: a refused or malformed connection is driven by whoever can
+		// reach the port, unauthenticated, so a line each is a log an attacker
+		// writes as fast as it can open sockets. The line that does come out
+		// says how many it stands for, or the bound would turn a flood into
+		// silence.
 		if !isDisconnect(err) {
-			s.log.Info("transport negotiation error", "err", err)
+			if dropped, ok := s.negotiationLog.allow(time.Now(), negotiationLogInterval); ok {
+				s.log.Info("transport negotiation error", "err", err, "suppressed", dropped)
+			}
 		}
 		return
 	}
