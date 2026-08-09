@@ -19,6 +19,18 @@ func CreateChannelForTest(s *store.Store, userID int64, req *tg.ChannelsCreateCh
 	return testHandlers(s).handleCreateChannel(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// CreateChannelForTestWithLimits encodes req and invokes handleCreateChannel with a
+// custom create channel rate limit config.
+func CreateChannelForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.ChannelsCreateChannelRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitCreateChannel = rateLimit
+	return h.handleCreateChannel(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // GetChannelsForTest encodes req and invokes handleGetChannels for the caller.
 func GetChannelsForTest(s *store.Store, userID int64, req *tg.ChannelsGetChannelsRequest) (bin.Encoder, error) {
 	var buf bin.Buffer

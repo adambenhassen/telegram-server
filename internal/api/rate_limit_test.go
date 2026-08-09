@@ -1126,3 +1126,90 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 		t.Fatalf("notify count after retry = %d, want 2 (retry fired notify)", notifyCount.Load())
 	}
 }
+
+// TestCreateChannelRateLimit proves that N+1 creates within the window are
+// denied with FLOOD_WAIT and have no side effects (no channel row, no
+// participant row, no pts advance).
+func TestCreateChannelRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551295001")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2 creates per 10s.
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+
+	// Creates 1-2 should pass.
+	for i := range 2 {
+		_, err := api.CreateChannelForTestWithLimits(s, alice.ID, cfg, &tg.ChannelsCreateChannelRequest{
+			Title: "Channel " + string(rune('A'+i)), About: "", Broadcast: true,
+		})
+		if err != nil {
+			t.Fatalf("create %d: %v", i+1, err)
+		}
+	}
+
+	// Record state before the denied create.
+	aliceState, err := s.State(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ptsBefore := aliceState.Pts
+	channelsBefore, err := s.ChannelsForUser(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create 3 should be denied.
+	_, err = api.CreateChannelForTestWithLimits(s, alice.ID, cfg, &tg.ChannelsCreateChannelRequest{
+		Title: "Blocked", About: "", Broadcast: true,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("create 3: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// No side effects: no new channel row, pts unchanged.
+	channelsAfter, err := s.ChannelsForUser(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(channelsAfter) != len(channelsBefore) {
+		t.Fatalf("channel count = %d, want %d (denied create wrote channel row)", len(channelsAfter), len(channelsBefore))
+	}
+	aliceStateAfter, err := s.State(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliceStateAfter.Pts != ptsBefore {
+		t.Fatalf("pts = %d, want %d (denied create advanced pts)", aliceStateAfter.Pts, ptsBefore)
+	}
+}
+
+// TestCreateChannelRateLimitDisabled proves that a zero limit disables
+// enforcement for the create_channel surface.
+func TestCreateChannelRateLimitDisabled(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551295101")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero limit = disabled.
+	cfg := store.RateLimitConfig{}
+
+	for i := range 5 {
+		_, err := api.CreateChannelForTestWithLimits(s, alice.ID, cfg, &tg.ChannelsCreateChannelRequest{
+			Title: "Channel " + string(rune('A'+i)), About: "", Broadcast: true,
+		})
+		if err != nil {
+			t.Fatalf("create %d: %v", i+1, err)
+		}
+	}
+}
