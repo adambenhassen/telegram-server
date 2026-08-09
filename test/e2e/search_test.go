@@ -658,46 +658,9 @@ func TestSearchChatPeer(t *testing.T) {
 		t.Errorf("client D run: %v", err)
 	}
 
-	// 4. Channel peer returns PEER_ID_INVALID.
-	// Create a real channel so the access hash is valid and the request reaches
-	// the channel-specific branch of messagesSearch.
-	var chID int64
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
-		res, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
-			Title:     "test channel",
-			Broadcast: true,
-		})
-		if err != nil {
-			return err
-		}
-		ups, ok := res.(*tg.Updates)
-		if !ok {
-			return errors.New("createChannel: unexpected updates type")
-		}
-		for _, ch := range ups.Chats {
-			if channel, ok := ch.(*tg.Channel); ok {
-				chID = channel.ID
-				return nil
-			}
-		}
-		return errors.New("createChannel: no channel in response")
-	}); err != nil {
-		t.Fatalf("create channel: %v", err)
-	}
-	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
-		_, err := c.MessagesSearch(ctx, &tg.MessagesSearchRequest{
-			Peer:   peerChannel(aUserID, chID),
-			Q:      "hello",
-			Filter: &tg.InputMessagesFilterEmpty{},
-		})
-		return err
-	}); err == nil {
-		t.Fatal("A search channel peer: expected error, got nil")
-	} else if !errors.As(err, &rpcErr) {
-		t.Fatalf("A search channel peer: expected RPC error, got %T: %v", err, err)
-	} else if rpcErr.Code != 400 || rpcErr.Message != "PEER_ID_INVALID" {
-		t.Fatalf("A search channel peer: got %d %s, want 400 PEER_ID_INVALID", rpcErr.Code, rpcErr.Message)
-	}
+	// Channel peers are TestSearchChannelPosts below: they read shared post rows
+	// rather than the caller's own copies, so they answer with a different reply
+	// type and need a channel a member has actually joined.
 
 	close(aCmds)
 	close(bCmds)
@@ -710,5 +673,186 @@ func TestSearchChatPeer(t *testing.T) {
 	}
 	if err := <-errC; err != nil && !errors.Is(err, context.Canceled) {
 		t.Errorf("client C run: %v", err)
+	}
+}
+
+// TestSearchChannelPosts drives channel search through a real gotd client: a
+// member searching a channel gets the matching posts back, including one posted
+// before they joined, and a non-member and a banned member are refused with the
+// same error getHistory gives them.
+func TestSearchChannelPosts(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := st.Close(); cerr != nil {
+			t.Errorf("store close: %v", cerr)
+		}
+	})
+
+	const dcID = 2
+	codes := newMultiCodeSink()
+	ln := mustListen(t, ctx, "127.0.0.1:0")
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr type = %T", ln.Addr())
+	}
+	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	t.Cleanup(stop)
+
+	const phoneA, phoneB, phoneC = "+15551287001", "+15551287002", "+15551287003"
+	aCmds, bCmds, cCmds := make(chan command), make(chan command), make(chan command)
+	aID, bID, cID := make(chan int64, 1), make(chan int64, 1), make(chan int64, 1)
+	errA, errB, errC := make(chan error, 1), make(chan error, 1), make(chan error, 1)
+	go func() {
+		errA <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneA, codes), aID, aCmds)
+	}()
+	go func() {
+		errB <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneB, codes), bID, bCmds)
+	}()
+	go func() {
+		errC <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneC, codes), cID, cCmds)
+	}()
+
+	login := func(ch chan int64, who string) int64 {
+		select {
+		case id := <-ch:
+			return id
+		case <-ctx.Done():
+			t.Fatalf("%s login timeout", who)
+			return 0
+		}
+	}
+	aUserID := login(aID, "A")
+	bUserID := login(bID, "B")
+	cUserID := login(cID, "C")
+
+	chID := createBroadcastChannel(t, ctx, aCmds, "SearchChannel")
+
+	post := func(text string, randomID int64) {
+		t.Helper()
+		execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+			_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+				Peer:     peerChannel(aUserID, chID),
+				Message:  text,
+				RandomID: randomID,
+			})
+			return err
+		})
+	}
+
+	// Posts 1 and 2 land before B joins, so post 1 is the pre-join hit.
+	post("quarterly budget review", 6001)
+	post("unrelated chatter", 6002)
+
+	hash := exportChannelInvite(t, ctx, aUserID, aCmds, chID)
+	importChannelInvite(t, ctx, bCmds, hash)
+
+	post("budget approved", 6003)
+
+	// B searches: both budget posts come back newest-first, the pre-join one
+	// included, and the post matching nothing stays out.
+	var found *tg.MessagesChannelMessages
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+			Peer:   peerChannel(bUserID, chID),
+			Q:      "budget",
+			Filter: &tg.InputMessagesFilterEmpty{},
+			Limit:  10,
+		})
+		if err != nil {
+			return err
+		}
+		msgs, isChannel := res.(*tg.MessagesChannelMessages)
+		if !isChannel {
+			return errors.New("search: reply is not messages.channelMessages")
+		}
+		found = msgs
+		return nil
+	})
+	if len(found.Messages) != 2 {
+		t.Fatalf("B search budget: got %d messages, want 2", len(found.Messages))
+	}
+	newest, okMsg := found.Messages[0].(*tg.Message)
+	if !okMsg || newest.Message != "budget approved" {
+		t.Errorf("B search[0] = %+v, want %q", found.Messages[0], "budget approved")
+	}
+	oldest, okMsg := found.Messages[1].(*tg.Message)
+	if !okMsg || oldest.Message != "quarterly budget review" {
+		t.Errorf("B search[1] = %+v, want the pre-join post %q", found.Messages[1], "quarterly budget review")
+	}
+	if !hasChannel(found.Chats, chID) {
+		t.Errorf("B search: channel %d missing from Chats", chID)
+	}
+
+	// C never joined: refused, and refused the same way getHistory refuses.
+	for _, call := range []struct {
+		name string
+		fn   func(ctx context.Context, c *tg.Client) error
+	}{
+		{"search", func(ctx context.Context, c *tg.Client) error {
+			_, err := c.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+				Peer:   peerChannel(cUserID, chID),
+				Q:      "budget",
+				Filter: &tg.InputMessagesFilterEmpty{},
+				Limit:  10,
+			})
+			return err
+		}},
+		{"getHistory", func(ctx context.Context, c *tg.Client) error {
+			_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+				Peer:  peerChannel(cUserID, chID),
+				Limit: 10,
+			})
+			return err
+		}},
+	} {
+		t.Run("non-member "+call.name, func(t *testing.T) {
+			assertChannelRPCError(t, ctx, cCmds, "PEER_ID_INVALID", call.fn)
+		})
+	}
+
+	// A bans B: the search that worked a moment ago is now the same refusal.
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.ChannelsEditBanned(ctx, &tg.ChannelsEditBannedRequest{
+			Channel:     inputChannel(aUserID, chID),
+			Participant: peerUser(aUserID, bUserID),
+			BannedRights: tg.ChatBannedRights{
+				ViewMessages: true,
+				UntilDate:    0,
+			},
+		})
+		return err
+	})
+	assertChannelRPCError(t, ctx, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+			Peer:   peerChannel(bUserID, chID),
+			Q:      "budget",
+			Filter: &tg.InputMessagesFilterEmpty{},
+			Limit:  10,
+		})
+		return err
+	})
+
+	close(aCmds)
+	close(bCmds)
+	close(cCmds)
+	for _, e := range []struct {
+		who string
+		ch  chan error
+	}{{"A", errA}, {"B", errB}, {"C", errC}} {
+		if err := <-e.ch; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("client %s run: %v", e.who, err)
+		}
 	}
 }

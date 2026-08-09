@@ -1192,7 +1192,8 @@ func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, pe
 // handleSearch serves messages.search: keyword search within a dialog.
 // Only InputMessagesFilterEmpty is accepted; other filters return INPUT_FILTER_INVALID.
 // Results are the caller's messages (both directions) in the named peer, ordered
-// newest-first. Channel peers return PEER_ID_INVALID.
+// newest-first. A channel peer searches the channel's shared posts instead and
+// is gated on membership, not ownership.
 func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesSearchRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -1214,10 +1215,6 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	peerType, peerID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
 		return nil, err
-	}
-	// Channel search is a separate ticket.
-	if peerType == store.PeerTypeChannel {
-		return nil, errPeerIDInvalid
 	}
 	// Rate limit before any lookup: the membership probe below is a database
 	// query, so charging after it would leave a non-member's chat-peer probe
@@ -1242,6 +1239,17 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	if limit > maxHistoryLimit {
 		limit = maxHistoryLimit
+	}
+
+	// A channel keeps one shared row per post rather than one per member, so it
+	// searches its own rows and returns its own reply type, the same split
+	// getHistory makes. store.SearchMessages reads the caller's own message rows
+	// and has nothing to return for a channel peer.
+	if peerType == store.PeerTypeChannel {
+		if _, err = h.requireChannelMember(r.Ctx, peerID, r.UserID); err != nil {
+			return nil, err
+		}
+		return h.channelSearch(r, peerID, req.Q, int64(req.OffsetID), limit)
 	}
 
 	msgs, err := h.store.SearchMessages(r.Ctx, r.UserID, peerType, peerID, req.Q, req.OffsetID, limit)

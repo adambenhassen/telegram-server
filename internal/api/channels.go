@@ -498,8 +498,27 @@ func (h *handlers) channelHistory(r *mtproto.Request, channelID int64, req *tg.M
 	return h.channelMessages(r, channelID, msgs)
 }
 
+// channelSearch renders one page of a channel's keyword search for the caller,
+// whom requireChannelMember has already established is an unbanned member.
+//
+// The whole history is searchable, posts from before the caller joined
+// included, for the same reason channelHistory serves them: join_pts bounds the
+// difference path's replay as a cost control and is never a confidentiality one
+// (threat model G5). Search reaches no further than getHistory already does.
+//
+// Membership is re-established by the caller on every page rather than carried
+// in offset_id, so a ban landing between two pages stops the next one.
+func (h *handlers) channelSearch(r *mtproto.Request, channelID int64, query string, offsetID int64, limit int) (bin.Encoder, error) {
+	msgs, err := h.store.SearchChannelPosts(r.Ctx, channelID, query, offsetID, limit)
+	if err != nil {
+		h.log.Error("channel search", "user_id", r.UserID, "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	return h.channelMessages(r, channelID, msgs)
+}
+
 // channelMessages renders a batch of one channel's posts into the wire reply
-// both channel read paths return. It is messages.channelMessages and not
+// every channel read path returns. It is messages.channelMessages and not
 // messages.messagesSlice: a client needs the channel's pts to know where the
 // batch sits in that channel's own update stream.
 func (h *handlers) channelMessages(r *mtproto.Request, channelID int64, msgs []store.ChannelMessage) (bin.Encoder, error) {

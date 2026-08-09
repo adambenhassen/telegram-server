@@ -704,3 +704,67 @@ func TestChannelPostsFullTextIndexUsesGINIndex(t *testing.T) {
 		t.Fatalf("message_tsv = %q, want 'is':4 'quarterly':2 'ready':5 'report':3 'the':1", tsv.String)
 	}
 }
+
+// SearchChannelPosts is scoped to one channel, excludes deleted rows and pages
+// by offsetID exactly as ChannelHistory does. The channel scoping is the part
+// worth pinning: the query carries no owner predicate, so the channel_id
+// condition is the only thing keeping one channel's posts out of another's
+// results.
+func TestSearchChannelPostsScopedToOneChannel(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	author := mustUser(t, s, "+15551260031")
+	ch := mustChannel(t, s, author.ID, "news").ID
+	other := mustChannel(t, s, author.ID, "other").ID
+
+	post(t, s, ch, author.ID, "quarterly budget review", 31)
+	post(t, s, ch, author.ID, "unrelated chatter", 32)
+	post(t, s, ch, author.ID, "budget approved", 33)
+	post(t, s, ch, author.ID, "budget draft", 34)
+	post(t, s, other, author.ID, "budget of the other channel", 35)
+
+	if err := store.SetChannelPostDeleted(ctx, s, ch, 4); err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
+
+	hits, err := s.SearchChannelPosts(ctx, ch, "budget", 0, 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 2 || hits[0].LocalID != 3 || hits[1].LocalID != 1 {
+		t.Fatalf("hits = %+v, want local_ids 3 and 1 newest-first", hits)
+	}
+	for _, m := range hits {
+		if m.ChannelID != ch {
+			t.Errorf("hit from channel %d, want %d", m.ChannelID, ch)
+		}
+	}
+
+	// offsetID pages strictly older.
+	hits, err = s.SearchChannelPosts(ctx, ch, "budget", 3, 10)
+	if err != nil {
+		t.Fatalf("search page: %v", err)
+	}
+	if len(hits) != 1 || hits[0].LocalID != 1 {
+		t.Fatalf("page = %+v, want local_id 1 only", hits)
+	}
+
+	// limit bounds the page.
+	hits, err = s.SearchChannelPosts(ctx, ch, "budget", 0, 1)
+	if err != nil {
+		t.Fatalf("search limited: %v", err)
+	}
+	if len(hits) != 1 || hits[0].LocalID != 3 {
+		t.Fatalf("limited = %+v, want local_id 3 only", hits)
+	}
+
+	// A word no post carries is an empty result, not an error.
+	hits, err = s.SearchChannelPosts(ctx, ch, "zzzznothingmatchesthis", 0, 10)
+	if err != nil {
+		t.Fatalf("search miss: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("miss = %+v, want none", hits)
+	}
+}
