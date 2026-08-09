@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/gotd/td/bin"
@@ -295,9 +296,7 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 		h.log.Error("contacts.search: memberships", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	for id, m := range extra {
-		memberOf[id] = m
-	}
+	maps.Copy(memberOf, extra)
 
 	budget := max(int(limit)-len(contacts), 0)
 	namedChannels := myChannels
