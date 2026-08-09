@@ -26,6 +26,13 @@ func NewTestConn(tconn transport.Conn, key crypto.AuthKey) *Conn {
 	return c
 }
 
+// SetHandshakeTimeout shortens the bound on transport negotiation so a test
+// need not wait the production timeout to observe a silent socket being closed.
+// Call it before Serve: the accept loop reads the value on every connection.
+func (s *Server) SetHandshakeTimeout(d time.Duration) {
+	s.handshakeTimeout = d
+}
+
 // ServeConn exposes the per-connection serve loop so tests can drive it with a
 // scripted transport instead of a real client handshake. The connection carries
 // no peer address: a scripted transport is not a socket, and the zero address is

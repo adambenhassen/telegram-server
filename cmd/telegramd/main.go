@@ -142,7 +142,7 @@ func run(log *slog.Logger) error {
 	advertise := net.JoinHostPort(cfg.AdvertiseHost, strconv.Itoa(cfg.AdvertisePort))
 	log.Info("listening", "addr", cfg.ListenAddr, "advertise", advertise, "dc", cfg.DCID)
 
-	return server.Serve(ctx, mtproto.Listen(ln))
+	return server.Serve(ctx, ln)
 }
 
 // sweepExpiredCodes periodically deletes expired login codes until ctx is
