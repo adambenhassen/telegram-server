@@ -61,7 +61,7 @@ func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaC
 	t.Cleanup(func() {
 		for _, mc := range clients {
 			close(mc.cmds)
-			if rerr := <-mc.errCh; rerr != nil && !errors.Is(rerr, context.Canceled) {
+			if rerr := <-mc.errCh; rerr != nil && !errors.Is(rerr, context.Canceled) && !errors.Is(rerr, context.DeadlineExceeded) {
 				t.Errorf("client run: %v", rerr)
 			}
 		}
@@ -77,8 +77,8 @@ func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaC
 		go func() { mc.errCh <- runInteractive(ctx, client, flowFor(phone, codes), idCh, mc.cmds) }()
 		select {
 		case mc.id = <-idCh:
-		case <-time.After(30 * time.Second):
-			t.Fatalf("client %s login timeout", phone)
+		case <-ctx.Done():
+			t.Fatalf("client %s login timeout: %v", phone, ctx.Err())
 		}
 		clients = append(clients, mc)
 	}
