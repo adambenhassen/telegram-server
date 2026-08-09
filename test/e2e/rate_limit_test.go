@@ -107,8 +107,8 @@ func TestRateLimitE2E(t *testing.T) {
 	var aUserID int64
 	select {
 	case aUserID = <-aID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("A login timeout")
+	case <-ctx.Done():
+		t.Fatalf("A login timeout: %v", ctx.Err())
 	case err := <-aErr:
 		t.Fatalf("A interactive: %v", err)
 	}
@@ -123,8 +123,8 @@ func TestRateLimitE2E(t *testing.T) {
 	var bUserID int64
 	select {
 	case bUserID = <-bID:
-	case <-time.After(30 * time.Second):
-		t.Fatal("B login timeout")
+	case <-ctx.Done():
+		t.Fatalf("B login timeout: %v", ctx.Err())
 	case err := <-bErr:
 		t.Fatalf("B interactive: %v", err)
 	}
@@ -133,8 +133,8 @@ func TestRateLimitE2E(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case aCmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("A command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("A command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
@@ -143,8 +143,8 @@ func TestRateLimitE2E(t *testing.T) {
 		d := make(chan error, 1)
 		select {
 		case bCmds <- command{fn: fn, done: d}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("B command enqueue timeout")
+		case <-ctx.Done():
+			t.Fatalf("B command enqueue timeout: %v", ctx.Err())
 		}
 		return <-d
 	}
