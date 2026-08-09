@@ -138,10 +138,14 @@ func (s *Server) Key() exchange.PublicKey {
 // fails permanently, and for no other reason.
 //
 // l is a plain net.Listener because the socket, not a negotiated connection, is
-// what the accept path hands over: the peer address is read from it and the
-// codec detected from it, both per connection. An address source other than the
-// socket — a load balancer's, say — arrives as a listener whose connections
-// report it as their RemoteAddr, leaving everything here unchanged.
+// what the accept path hands over: the client address is established from it and
+// the codec detected from it, both per connection, in negotiate.
+//
+// An address source other than the socket belongs there too, and not in a
+// listener wrapping l. TrustProxyV2Headers is the one that exists, and it reads
+// its header inside negotiate for a reason worth keeping: a listener that read
+// it at Accept would be reading client bytes on the accept path, which is the
+// stall this structure exists to remove.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	grp := tdsync.NewCancellableGroup(ctx)
 	grp.Go(func(ctx context.Context) error {
