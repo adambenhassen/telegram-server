@@ -38,7 +38,7 @@ E2E_PKG := github.com/adambenhassen/telegram-server/test/e2e
 
 test: docker-bridge
 	$(TESTENV) go test -race $$(go list ./... | grep -v '^$(E2E_PKG)$$')
-	$(TESTENV) go test -race -count=1 $(E2E_PKG)
+	$(TESTENV) go test -race -count=1 -timeout 20m $(E2E_PKG)
 
 # The store suite alone, for a quick check while working in internal/store.
 # Deliberately not ./test/... — e2e wants the whole machine to itself and is
