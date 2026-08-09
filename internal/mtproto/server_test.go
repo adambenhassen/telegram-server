@@ -18,16 +18,15 @@ func TestServeReturnsOnListenerClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	l := mtproto.Listen(nl)
 
 	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
 
 	done := make(chan error, 1)
-	go func() { done <- srv.Serve(context.Background(), l) }()
+	go func() { done <- srv.Serve(context.Background(), nl) }()
 
 	// Give Serve a moment to start, then close the listener with ctx still live.
 	time.Sleep(20 * time.Millisecond)
-	if err := l.Close(); err != nil {
+	if err := nl.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
