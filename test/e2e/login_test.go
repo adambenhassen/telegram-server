@@ -16,7 +16,6 @@ import (
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
-	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -72,7 +71,7 @@ func TestClientLogin(t *testing.T) {
 
 	srvCtx, srvCancel := context.WithCancel(ctx)
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(srvCtx, transport.Listen(ln)) }()
+	go func() { serveErr <- server.Serve(srvCtx, ln) }()
 	t.Cleanup(func() {
 		srvCancel()
 		if serr := <-serveErr; serr != nil && !errors.Is(serr, context.Canceled) {

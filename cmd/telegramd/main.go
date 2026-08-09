@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gotd/td/exchange"
-	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -139,7 +138,7 @@ func run(log *slog.Logger) error {
 	advertise := net.JoinHostPort(cfg.AdvertiseHost, strconv.Itoa(cfg.AdvertisePort))
 	log.Info("listening", "addr", cfg.ListenAddr, "advertise", advertise, "dc", cfg.DCID)
 
-	return server.Serve(ctx, transport.Listen(ln))
+	return server.Serve(ctx, ln)
 }
 
 // sweepExpiredCodes periodically deletes expired login codes until ctx is
