@@ -505,9 +505,7 @@ func TestSearchChatPeer(t *testing.T) {
 	// Wait for B and C to receive the create service message.
 	waitSvc := func(coll *updateCollector, who string) {
 		t.Helper()
-		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer sCancel()
-		_, err := coll.waitService(sCtx, &tg.MessageActionChatCreate{})
+		_, err := coll.waitService(ctx, &tg.MessageActionChatCreate{})
 		if err != nil {
 			t.Fatalf("%s wait create service: %v", who, err)
 		}

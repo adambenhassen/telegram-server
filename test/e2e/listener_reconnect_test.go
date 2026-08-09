@@ -123,11 +123,10 @@ func TestListenerReconnectResumesDelivery(t *testing.T) {
 	// A notification emitted while the listener is reconnecting is dropped, so
 	// resend until one lands rather than asserting on a single send. Whichever
 	// message arrives, its arrival is the proof: push resumed with no restart.
-	deadline := time.Now().Add(60 * time.Second)
 	var delivered *tg.Message
 	for i := 2; delivered == nil; i++ {
-		if time.Now().After(deadline) {
-			t.Fatal("no live delivery after the listener backend was terminated")
+		if ctx.Err() != nil {
+			t.Fatalf("no live delivery after the listener backend was terminated: %v", ctx.Err())
 		}
 		sendToB("after termination "+strconv.Itoa(i), int64(i))
 		select {

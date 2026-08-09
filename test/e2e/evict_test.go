@@ -19,6 +19,10 @@ import (
 )
 
 // waitNoConn waits for replica's registry to hold no connection for userID.
+// within stays a fixed duration and is deliberately not the test context: the
+// server closes an idle socket on its own 30s read timeout, so a bound wider
+// than that empties the bucket with or without the evict path and the assertion
+// stops meaning anything. The duration is the assertion here.
 func waitNoConn(t *testing.T, reg *mtproto.SessionRegistry, userID int64, within time.Duration, what string) {
 	t.Helper()
 	deadline := time.Now().Add(within)
@@ -114,7 +118,7 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 	// Baseline: replica 1 really holds A's socket, so a later empty bucket is the
 	// evict and not a socket that was never registered.
 	registered := false
-	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+	for ctx.Err() == nil {
 		if len(reg1.Conns(aUserID)) > 0 {
 			registered = true
 			break
@@ -122,7 +126,7 @@ func TestEvictRevokedSessionAcrossReplicas(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !registered {
-		t.Fatal("replica 1 never registered A's connection")
+		t.Fatalf("replica 1 never registered A's connection: %v", ctx.Err())
 	}
 
 	keys, err := st.AuthKeysByUser(ctx, aUserID)
@@ -385,7 +389,10 @@ func TestLogOutEvictsOnlyBoundKeys(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("logout on an unbound key: %v", err)
 	}
-	quietCtx, quietCancel := context.WithTimeout(ctx, 2*time.Second)
+	// The quiet window is the assertion, so it hangs off Background: derived from
+	// ctx an already-exhausted parent would report DeadlineExceeded straight away
+	// and pass vacuously.
+	quietCtx, quietCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer quietCancel()
 	if n, err := lconn.WaitForNotification(quietCtx); err == nil {
 		t.Fatalf("unbound logout emitted an evict: %q", n.Payload)
@@ -427,9 +434,7 @@ func TestLogOutEvictsOnlyBoundKeys(t *testing.T) {
 		t.Fatalf("login+logout: %v", err)
 	}
 
-	evictCtx, evictCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer evictCancel()
-	n, err := lconn.WaitForNotification(evictCtx)
+	n, err := lconn.WaitForNotification(ctx)
 	if err != nil {
 		t.Fatalf("authorized logout emitted no evict: %v", err)
 	}

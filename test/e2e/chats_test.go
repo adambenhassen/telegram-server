@@ -209,9 +209,7 @@ func TestChatsRealtime(t *testing.T) {
 	// 2. B and C receive create service message.
 	waitSvc := func(coll *updateCollector, who string) {
 		t.Helper()
-		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer sCancel()
-		env, err := coll.waitService(sCtx, &tg.MessageActionChatCreate{})
+		env, err := coll.waitService(ctx, &tg.MessageActionChatCreate{})
 		if err != nil {
 			t.Fatalf("%s wait create service: %v", who, err)
 		}
@@ -280,9 +278,7 @@ func TestChatsRealtime(t *testing.T) {
 	})
 	waitEditTitle := func(coll *updateCollector, who string) {
 		t.Helper()
-		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer sCancel()
-		env, err := coll.waitService(sCtx, &tg.MessageActionChatEditTitle{})
+		env, err := coll.waitService(ctx, &tg.MessageActionChatEditTitle{})
 		if err != nil {
 			t.Fatalf("%s wait edit title service: %v", who, err)
 		}
@@ -308,9 +304,7 @@ func TestChatsRealtime(t *testing.T) {
 	})
 	waitAddUser := func(coll *updateCollector, who string) {
 		t.Helper()
-		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer sCancel()
-		env, err := coll.waitService(sCtx, &tg.MessageActionChatAddUser{})
+		env, err := coll.waitService(ctx, &tg.MessageActionChatAddUser{})
 		if err != nil {
 			t.Fatalf("%s wait add user service: %v", who, err)
 		}
@@ -360,9 +354,7 @@ func TestChatsRealtime(t *testing.T) {
 	})
 	waitDeleteUser := func(coll *updateCollector, who string) {
 		t.Helper()
-		sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer sCancel()
-		env, err := coll.waitService(sCtx, &tg.MessageActionChatDeleteUser{})
+		env, err := coll.waitService(ctx, &tg.MessageActionChatDeleteUser{})
 		if err != nil {
 			t.Fatalf("%s wait delete user service: %v", who, err)
 		}
@@ -387,7 +379,9 @@ func TestChatsRealtime(t *testing.T) {
 	})
 	recvMsg(collB, "B", "after C left", aUserID)
 	recvMsg(collD, "D", "after C left", aUserID)
-	noCtx, noCancel := context.WithTimeout(ctx, 3*time.Second)
+	// The window is the assertion, so it hangs off Background: derived from ctx
+	// an already-exhausted parent would return immediately and pass vacuously.
+	noCtx, noCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	if err := collC.waitNoNewMsg(noCtx); err != nil {
 		t.Errorf("C should not receive message after removal: %v", err)
 	}
@@ -518,10 +512,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 		return err
 	})
 	// Wait for C to receive the removal.
-	sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
-	_, err = collC.waitService(sCtx, &tg.MessageActionChatDeleteUser{})
-	sCancel()
-	if err != nil {
+	if _, err = collC.waitService(ctx, &tg.MessageActionChatDeleteUser{}); err != nil {
 		t.Fatalf("C wait delete: %v", err)
 	}
 
@@ -545,8 +536,10 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	} else {
 		t.Fatalf("edit error type = %T, want *tgerr.Error", editErr)
 	}
-	// A should not receive edit update.
-	noCtx, noCancel := context.WithTimeout(ctx, 2*time.Second)
+	// A should not receive edit update. The window is the assertion, so it hangs
+	// off Background: derived from ctx an already-exhausted parent would return
+	// immediately and pass vacuously.
+	noCtx, noCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	select {
 	case <-collA.editMsg:
 		t.Error("A should not receive edit from removed member")
@@ -572,7 +565,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 		t.Fatalf("delete error type = %T, want *tgerr.Error", delErr)
 	}
 	// A should not receive a delete update either.
-	noDelCtx, noDelCancel := context.WithTimeout(ctx, 2*time.Second)
+	noDelCtx, noDelCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	select {
 	case <-collA.delMsg:
 		t.Error("A should not receive delete from removed member")
@@ -619,7 +612,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 		})
 		return err
 	})
-	noTitleCtx, noTitleCancel := context.WithTimeout(ctx, 3*time.Second)
+	noTitleCtx, noTitleCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	if err := collC.waitNoService(noTitleCtx, &tg.MessageActionChatEditTitle{}); err != nil {
 		t.Errorf("C should not receive title change after removal: %v", err)
 	}

@@ -186,11 +186,12 @@ func send[T any](ch chan T, v T) {
 	}
 }
 
-// recvOrCtx is like recvOr but bounded by the provided context instead of a
-// fixed 10s deadline, so tests that already carry a generous outer timeout
-// (e.g. 120s) do not lose time to a sub-deadline that expired while the
-// harness was waiting for a shared resource (Postgres template lock, CPU
-// contention from other packages).
+// recvOrCtx receives one value from ch, bounded only by the test's own context,
+// and fails naming what it was waiting for. The bound is deliberately the whole
+// test budget and never a sub-deadline: under full parallelism a wait can sit
+// runnable but unscheduled for tens of seconds (Postgres template lock, CPU
+// contention from other packages), and a fixed constant turns that into a
+// failure of whichever wait the scheduler starved rather than of the code.
 func recvOrCtx[T any](t *testing.T, ctx context.Context, ch chan T, what string) T {
 	t.Helper()
 	select {

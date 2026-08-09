@@ -978,7 +978,9 @@ func TestChannelsBan(t *testing.T) {
 		})
 		return err
 	})
-	noCtx, noCancel := context.WithTimeout(ctx, 3*time.Second)
+	// The window is the assertion, so it hangs off Background: derived from ctx
+	// an already-exhausted parent would return immediately and pass vacuously.
+	noCtx, noCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	select {
 	case <-collB.newChannelMsg:
 		t.Error("B should not receive channel message after ban")
