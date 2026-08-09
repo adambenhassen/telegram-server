@@ -62,9 +62,16 @@ const (
 	proxyV2CmdLocal = 0x0
 	proxyV2CmdProxy = 0x1
 
-	// Address families, in the header's high nibble.
-	proxyV2AFINet  = 0x1
-	proxyV2AFINet6 = 0x2
+	// Address families, in the family byte's high nibble.
+	proxyV2AFUnspec = 0x0
+	proxyV2AFINet   = 0x1
+	proxyV2AFINet6  = 0x2
+
+	// Transport protocols, in its low nibble. Only STREAM carries an address
+	// this server may key on: it is the one a TCP balancer reports, and MTProto
+	// arrives over nothing else.
+	proxyV2ProtoUnspec = 0x0
+	proxyV2ProtoStream = 0x1
 
 	// Address block sizes: source and destination address, then both ports.
 	proxyV2INetLen  = 4 + 4 + 2 + 2
@@ -152,23 +159,36 @@ func readProxyV2(r io.Reader) (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("unknown PROXY v2 command %#x", cmd)
 	}
 
+	// The family and the transport are one decision, not two. Reading the
+	// family alone would credit an address to a combination no TCP balancer can
+	// produce — AF_INET over DGRAM names a UDP peer, AF_INET over UNSPEC names
+	// nothing at all — and an address this server cannot vouch for is exactly
+	// what it must not key a limit on. So the supported combinations are listed,
+	// the no-address ones are listed, and anything else is refused rather than
+	// falling through to either.
+	//
 	// Anything past the addresses is TLV extensions, which this server does not
 	// read: the source address is the whole of what it needs.
-	switch family := fixed[13] >> 4; family {
-	case proxyV2AFINet:
+	family, proto := fixed[13]>>4, fixed[13]&0x0f
+	switch {
+	case family == proxyV2AFINet && proto == proxyV2ProtoStream:
 		if len(block) < proxyV2INetLen {
 			return netip.Addr{}, fmt.Errorf("PROXY v2 IPv4 address block is %d bytes, want at least %d", len(block), proxyV2INetLen)
 		}
 		return netip.AddrFrom4([4]byte(block[:4])), nil
-	case proxyV2AFINet6:
+	case family == proxyV2AFINet6 && proto == proxyV2ProtoStream:
 		if len(block) < proxyV2INet6Len {
 			return netip.Addr{}, fmt.Errorf("PROXY v2 IPv6 address block is %d bytes, want at least %d", len(block), proxyV2INet6Len)
 		}
 		// Unmapped for the same reason a socket address is: one host must not
 		// get a second bucket by being written in the other family's form.
 		return netip.AddrFrom16([16]byte(block[:16])).Unmap(), nil
-	default:
-		// AF_UNSPEC and AF_UNIX name no address this server can key on.
+	case family == proxyV2AFUnspec && proto == proxyV2ProtoUnspec:
+		// The sender says it cannot report the original endpoints. It names no
+		// client, which is served with no address rather than refused, for the
+		// same reason the LOCAL command is.
 		return netip.Addr{}, nil
+	default:
+		return netip.Addr{}, fmt.Errorf("unsupported PROXY v2 address family %#x and transport %#x", family, proto)
 	}
 }
