@@ -674,16 +674,23 @@ func (s *Store) ChannelsForUser(ctx context.Context, userID int64) ([]Channel, e
 	return out, nil
 }
 
-// ChannelSearchResult is one channel matched by a title or handle search,
-// alongside the participant count its public rendering carries. Member is the
-// caller's own participant row and is filled only by SearchMemberChannels,
-// where membership is what admitted the row; it stays zero on a public match,
-// which is decided without reference to any caller and where nothing may read
-// a membership off the result.
-type ChannelSearchResult struct {
+// PublicChannelMatch is one channel matched by the public discovery arm, with
+// the participant count its public rendering puts on the wire. It carries no
+// membership: the arm is decided without reference to any caller, and nothing
+// downstream may read one off the result.
+type PublicChannelMatch struct {
 	Channel           Channel
 	ParticipantsCount int64
-	Member            ChannelMember
+}
+
+// MemberChannelMatch is one channel matched by the caller's own membership arm,
+// with the participant row that admitted it. It carries no participant count:
+// a member renders through channelToTL, which has no field for one, so the two
+// match types hold exactly what their own renderer reads and a count cannot be
+// added back for a caller that never asked for it.
+type MemberChannelMatch struct {
+	Channel Channel
+	Member  ChannelMember
 }
 
 // searchHandle reduces a search query to the handle it could be naming: the
@@ -703,7 +710,7 @@ func searchHandle(query string) string {
 // the query never occupies a row, so a caller cannot read one back as evidence
 // that it exists. See the query comment for why that position is the whole of
 // the property.
-func (s *Store) SearchPublicChannels(ctx context.Context, query string, limit int32) ([]ChannelSearchResult, error) {
+func (s *Store) SearchPublicChannels(ctx context.Context, query string, limit int32) ([]PublicChannelMatch, error) {
 	rows, err := s.q.SearchPublicChannels(ctx, db.SearchPublicChannelsParams{
 		Query:  query,
 		Handle: searchHandle(query),
@@ -712,9 +719,9 @@ func (s *Store) SearchPublicChannels(ctx context.Context, query string, limit in
 	if err != nil {
 		return nil, fmt.Errorf("search public channels: %w", err)
 	}
-	out := make([]ChannelSearchResult, len(rows))
+	out := make([]PublicChannelMatch, len(rows))
 	for i, r := range rows {
-		out[i] = ChannelSearchResult{
+		out[i] = PublicChannelMatch{
 			Channel: Channel{
 				ID:              r.ID,
 				Title:           r.Title,
@@ -740,7 +747,7 @@ func (s *Store) SearchPublicChannels(ctx context.Context, query string, limit in
 // channel the caller never joined, or is banned from, is not returned.
 func (s *Store) SearchMemberChannels(
 	ctx context.Context, viewerID int64, query string, limit int32,
-) ([]ChannelSearchResult, error) {
+) ([]MemberChannelMatch, error) {
 	rows, err := s.q.SearchMemberChannels(ctx, db.SearchMemberChannelsParams{
 		ViewerID: viewerID,
 		Query:    query,
@@ -750,9 +757,9 @@ func (s *Store) SearchMemberChannels(
 	if err != nil {
 		return nil, fmt.Errorf("search member channels: %w", err)
 	}
-	out := make([]ChannelSearchResult, len(rows))
+	out := make([]MemberChannelMatch, len(rows))
 	for i, r := range rows {
-		out[i] = ChannelSearchResult{
+		out[i] = MemberChannelMatch{
 			Channel: Channel{
 				ID:              r.ID,
 				Title:           r.Title,
@@ -764,7 +771,6 @@ func (s *Store) SearchMemberChannels(
 				PinnedMessageID: r.PinnedMessageID,
 				Username:        r.Handle,
 			},
-			ParticipantsCount: r.ParticipantsCount,
 			// The query already excluded banned rows, so BannedUntil is left
 			// nil rather than re-read: nothing downstream may treat this value
 			// as the ban record.

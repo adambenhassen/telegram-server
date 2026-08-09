@@ -513,8 +513,7 @@ func (q *Queries) RevokeChannelInvite(ctx context.Context, arg RevokeChannelInvi
 
 const searchMemberChannels = `-- name: SearchMemberChannels :many
 SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
-       c.pinned_message_id, un.handle, p.role,
-       (SELECT count(*) FROM channel_participants cp WHERE cp.channel_id = c.id) AS participants_count
+       c.pinned_message_id, un.handle, p.role
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id AND p.user_id = $1::bigint
 LEFT JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
@@ -536,17 +535,16 @@ type SearchMemberChannelsParams struct {
 }
 
 type SearchMemberChannelsRow struct {
-	ID                int64
-	Title             string
-	About             string
-	CreatorID         int64
-	Megagroup         bool
-	Version           int32
-	Date              pgtype.Timestamptz
-	PinnedMessageID   *int32
-	Handle            *string
-	Role              int16
-	ParticipantsCount int64
+	ID              int64
+	Title           string
+	About           string
+	CreatorID       int64
+	Megagroup       bool
+	Version         int32
+	Date            pgtype.Timestamptz
+	PinnedMessageID *int32
+	Handle          *string
+	Role            int16
 }
 
 // SearchMemberChannels finds the channels the caller belongs to by title or by
@@ -564,6 +562,10 @@ type SearchMemberChannelsRow struct {
 // uses, for the same planner reason. This arm is already bounded by the caller's
 // own membership rows and was cheap either way, but two spellings of one
 // predicate is how the two drift.
+//
+// No participant count here, unlike the public arm: a member is rendered by
+// channelToTL, which carries no participants_count field, so counting would be
+// a per-row aggregate over channel_participants whose result is discarded.
 func (q *Queries) SearchMemberChannels(ctx context.Context, arg SearchMemberChannelsParams) ([]SearchMemberChannelsRow, error) {
 	rows, err := q.db.Query(ctx, searchMemberChannels,
 		arg.ViewerID,
@@ -589,7 +591,6 @@ func (q *Queries) SearchMemberChannels(ctx context.Context, arg SearchMemberChan
 			&i.PinnedMessageID,
 			&i.Handle,
 			&i.Role,
-			&i.ParticipantsCount,
 		); err != nil {
 			return nil, err
 		}

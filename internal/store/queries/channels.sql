@@ -206,10 +206,13 @@ LIMIT sqlc.arg(lim)::int;
 -- uses, for the same planner reason. This arm is already bounded by the caller's
 -- own membership rows and was cheap either way, but two spellings of one
 -- predicate is how the two drift.
+--
+-- No participant count here, unlike the public arm: a member is rendered by
+-- channelToTL, which carries no participants_count field, so counting would be
+-- a per-row aggregate over channel_participants whose result is discarded.
 -- name: SearchMemberChannels :many
 SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
-       c.pinned_message_id, un.handle, p.role,
-       (SELECT count(*) FROM channel_participants cp WHERE cp.channel_id = c.id) AS participants_count
+       c.pinned_message_id, un.handle, p.role
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id AND p.user_id = sqlc.arg(viewer_id)::bigint
 LEFT JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
