@@ -1,13 +1,36 @@
+-- Every query that loads a user reads the handle from the usernames row, never
+-- from the denormalized users.username column. The two are written in one
+-- transaction today, but only the usernames row is authoritative: it is what
+-- admits an account to resolveUsername, and a writer that released a handle
+-- without clearing the copy must not leave any RPC still reporting it. The join
+-- is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
+-- user lookup against 200k handles, so the hot per-peer read pays an index
+-- probe rather than the copy's zero.
+
 -- name: CreateUser :one
-INSERT INTO users (phone) VALUES ($1)
-ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
-RETURNING *;
+WITH upserted AS (
+    INSERT INTO users (phone) VALUES ($1)
+    ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
+    RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at
+)
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM upserted u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id;
 
 -- name: UserByPhone :one
-SELECT * FROM users WHERE phone = $1;
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM users u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
+WHERE u.phone = $1;
 
 -- name: UserByID :one
-SELECT * FROM users WHERE id = $1;
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM users u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
+WHERE u.id = $1;
 
 -- name: SetUserStatus :execrows
 UPDATE users SET is_online = $2, last_seen_at = now() WHERE id = $1;
@@ -31,8 +54,10 @@ UPDATE users SET username = $2 WHERE id = $1;
 -- budget are dropped; without a total order the set that survives truncation is
 -- whatever the plan happened to emit, and two identical searches disagree. It
 -- is the same order the channel arms use.
-SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at, u.username
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
 FROM users u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 WHERE u.name_tsv @@ plainto_tsquery('simple', sqlc.arg(query))
   AND EXISTS (
       SELECT 1 FROM dialogs d
