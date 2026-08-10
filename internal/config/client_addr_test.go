@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -140,19 +141,66 @@ func TestWarnClientAddrTrust(t *testing.T) {
 	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
 		t.Fatalf("emitted %d warn lines, want exactly 1:\n%s", n, buf.String())
 	}
-	for _, want := range []string{"load balancer", "carrier NAT", "per-IP"} {
+	for _, want := range []string{"load balancer", "carrier NAT", "per-IP", "handshakes"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("warning does not mention %q:\n%s", want, buf.String())
 		}
 	}
 
-	// Nothing is keyed on an address when both counters are off, so there is no
-	// assumption left to warn about.
+	// The pre-auth connection cap is keyed on an address too, and it is the
+	// harsher one to collapse: sendCode limits sharing a bucket refuse code
+	// requests, a pre-auth cap sharing one refuses handshakes server-wide. So
+	// turning the sendCode counters off leaves the assumption in place, and the
+	// warning with it.
 	buf.Reset()
 	cfg.RateLimits.SendCodeIP = store.SendCodeIPLimits{}
 	cfg.WarnClientAddrTrust(log)
+	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
+		t.Fatalf("emitted %d warn lines with only the pre-auth per-IP cap on, want exactly 1:\n%s", n, buf.String())
+	}
+
+	// Nothing is keyed on an address once every per-IP limit is off, so there is
+	// no assumption left to warn about.
+	buf.Reset()
+	cfg.PreAuth.MaxConnsPerNet = 0
+	cfg.WarnClientAddrTrust(log)
 	if buf.Len() != 0 {
-		t.Errorf("warned with the per-IP limits disabled:\n%s", buf.String())
+		t.Errorf("warned with every per-IP limit disabled:\n%s", buf.String())
+	}
+}
+
+// TestWarnPreAuthLifetime covers the one pre-auth value that is accepted and
+// still worth saying something about. A ceiling under the handshake's own read
+// timeout expires while a client is legitimately waiting inside key exchange, so
+// slow clients fail intermittently and it reads as a network fault rather than
+// as the number the operator just set. Zero is the ceiling turned off, which is
+// supported, and must not be warned about as if it were too small.
+func TestWarnPreAuthLifetime(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+
+	for name, tc := range map[string]struct {
+		lifetime time.Duration
+		wantWarn bool
+	}{
+		"default":             {lifetime: mtproto.DefaultPreAuthLimits().Lifetime},
+		"at the read timeout": {lifetime: time.Minute},
+		"under it":            {lifetime: 30 * time.Second, wantWarn: true},
+		"off":                 {lifetime: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := config.Load(discardLog())
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			cfg.PreAuth.Lifetime = tc.lifetime
+
+			var buf bytes.Buffer
+			cfg.WarnPreAuthLifetime(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			if warned := strings.Contains(buf.String(), "level=WARN"); warned != tc.wantWarn {
+				t.Errorf("lifetime %v warned = %v, want %v:\n%s", tc.lifetime, warned, tc.wantWarn, buf.String())
+			}
+		})
 	}
 }
 
