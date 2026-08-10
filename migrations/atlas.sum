@@ -1,4 +1,4 @@
-h1:0CC5NhmLPJ78vTk3e4odRzbfn+g2cy6AQjMlC78Mc6g=
+h1:GqnpZJUwwsMT0xjcI6pjKsrDRkR2tBdOi5LpSIsssiQ=
 20260721000001_baseline.sql h1:cnO6K1z0Uv3goEvecgJixKSio6ziaB1rF7cQLoCWOxs=
 20260721000002_auth_keys.sql h1:+vNabm6vdEAgu3H5ZGw2Wr8D/Y6i4ikAAUO3JbfZQeE=
 20260721000003_code_hardening.sql h1:8pbAqUpqcwOONUfac+qC51QjfC1JnObNCcXa1HC/dr0=
@@ -26,4 +26,4 @@ h1:0CC5NhmLPJ78vTk3e4odRzbfn+g2cy6AQjMlC78Mc6g=
 20260815000022_rate_limits.sql h1:/a+Zd8wftckuCP33FJdZbuAgBs94LWaNi67yNQPDSbo=
 20260816000023_send_code_ip_limits.sql h1:M5vZQbo+N1dFVq/1Qx7QCPVa/xy2XUJ+3nDVfYHjRF0=
 20260817000024_channel_title_fulltext.sql h1:cY1ccQnQDMvv3aoSrlxPJZvgS+NDFBHjR8TUivn2KpE=
-20260818000025_channel_id_random.sql h1:h2WOE5WIux53QRxpuwIPH42sMqXb2BVEiYl2Vxkg7TA=
+20260819000026_channel_id_random.sql h1:dqHQDhS3fR0b6LFmw1clUYnSqC3EYL3VCgHRTecKJsk=
