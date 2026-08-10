@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -49,6 +50,13 @@ type Store struct {
 	// key read and the body read, the window a delete or a ban lands in. Scoped
 	// to the Store for the reason deniedHook is.
 	searchPageHook func()
+
+	// now reads the clock the client-visible rate-limit wait is measured
+	// against. Production always holds time.Now; it is a field so a test can
+	// pin the remainder of an open window to an exact sub-second value instead
+	// of racing a real one, which on a loaded host closes before the assertion
+	// runs. Scoped to the Store for the reason deniedHook is.
+	now func() time.Time
 }
 
 // Sentinel errors returned by the login-code methods.
@@ -123,6 +131,7 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 		maxChannelsPerUser:     defaultMaxChannelsPerUser,
 		newChannelID:           randomChannelID,
 		log:                    slog.Default(),
+		now:                    time.Now,
 	}
 	for _, opt := range opts {
 		opt(s)
