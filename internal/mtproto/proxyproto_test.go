@@ -332,13 +332,14 @@ func withVersion(header []byte, version byte) []byte {
 }
 
 // serveClients runs a server on ln and reports the client address of every
-// request that reaches a handler. A non-nil allow puts it in proxy-v2 mode.
+// request that reaches a handler. A non-nil allow puts it in proxy-v2 mode, and
+// each opt configures the server before it starts serving.
 //
 // The address is asserted here, at the handler, rather than at the accept path:
 // that is where every per-IP limit reads it, and between the two sit the header
 // read, the codec sniff and the serve loop — each a place it could be lost or
 // replaced.
-func serveClients(t *testing.T, ctx context.Context, ln net.Listener, allow []netip.Prefix, log *slog.Logger) (<-chan netip.Addr, crypto.AuthKey) {
+func serveClients(t *testing.T, ctx context.Context, ln net.Listener, allow []netip.Prefix, log *slog.Logger, opts ...func(*mtproto.Server)) (<-chan netip.Addr, crypto.AuthKey) {
 	t.Helper()
 	key := rebindTestKey()
 	keys := mtproto.NewMemoryAuthKeyStore()
@@ -358,6 +359,9 @@ func serveClients(t *testing.T, ctx context.Context, ln net.Listener, allow []ne
 	srv := mtproto.New(exchange.PrivateKey{}, 2, keys, handler, log)
 	if allow != nil {
 		srv.TrustProxyV2Headers(allow)
+	}
+	for _, opt := range opts {
+		opt(srv)
 	}
 	srvCtx, stop := context.WithCancel(ctx)
 	served := make(chan error, 1)

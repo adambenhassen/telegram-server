@@ -65,6 +65,12 @@ type Server struct {
 	// negotiationLog thins the per-connection negotiation failure line, which
 	// anyone who can reach the port can provoke.
 	negotiationLog logSampler
+	// preAuth bounds what connections that have not authenticated may hold.
+	// Written once before Serve and only read after, like proxyV2.
+	preAuth *preAuthLimiter
+	// preAuthLog thins the refusal line those bounds produce, which is provoked
+	// by the same peers and at the same rate as the negotiation one.
+	preAuthLog logSampler
 
 	// onStatusChange fires when a user's connection count transitions between
 	// zero and non-zero. Called after the registry has been updated, so a
@@ -95,6 +101,15 @@ func (s *Server) TrustProxyV2Headers(allow []netip.Prefix) {
 	s.proxyV2 = &proxyV2Source{allow: slices.Clone(allow)}
 }
 
+// SetPreAuthLimits replaces the bounds on what connections that have not
+// authenticated may hold. Call it before Serve.
+//
+// Every field is taken as given, a zero one included: the defaults are
+// DefaultPreAuthLimits, and an operator turning a bound off has to be able to.
+func (s *Server) SetPreAuthLimits(l PreAuthLimits) {
+	s.preAuth = newPreAuthLimiter(l)
+}
+
 // New creates a Server that answers on dcID using key for the handshake, keys to
 // persist auth keys, and handler for RPC requests.
 func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, log *slog.Logger) *Server {
@@ -114,6 +129,7 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 		readTimeout:      defaultReadTimeout,
 		writeTimeout:     defaultWriteTimeout,
 		handshakeTimeout: defaultHandshakeTimeout,
+		preAuth:          newPreAuthLimiter(DefaultPreAuthLimits()),
 		log:              log,
 	}
 }
@@ -139,13 +155,19 @@ func (s *Server) Key() exchange.PublicKey {
 //
 // l is a plain net.Listener because the socket, not a negotiated connection, is
 // what the accept path hands over: the client address is established from it and
-// the codec detected from it, both per connection, in negotiate.
+// the codec detected from it, both per connection, in clientAddr and
+// detectCodec.
 //
 // An address source other than the socket belongs there too, and not in a
 // listener wrapping l. TrustProxyV2Headers is the one that exists, and it reads
-// its header inside negotiate for a reason worth keeping: a listener that read
+// its header inside clientAddr for a reason worth keeping: a listener that read
 // it at Accept would be reading client bytes on the accept path, which is the
 // stall this structure exists to remove.
+//
+// One decision is the accept loop's own, and it is the global pre-auth cap: it
+// is the only bound that can be applied to a socket nobody has read a byte from,
+// and applying it anywhere later would mean paying for the connection in order
+// to decide it was not wanted.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	grp := tdsync.NewCancellableGroup(ctx)
 	grp.Go(func(ctx context.Context) error {
@@ -181,8 +203,23 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 				return errors.Join(errors.New("accept"), err)
 			}
 			backoff = 0
+			// The global pre-auth cap is applied here, on the accept loop, and
+			// nowhere later: past it the socket is closed having cost a goroutine
+			// none, a deadline none and a read none, which is what makes shedding
+			// load cheaper than carrying it. Everything the connection would need
+			// to be judged more precisely — its client address above all — has to
+			// be read from it first, and reading is the cost being refused.
+			slot, ok := s.preAuth.admit()
+			if !ok {
+				s.dropRefused(sock)
+				if dropped, allow := s.preAuthLog.allow(time.Now(), preAuthLogInterval); allow {
+					s.log.Info("connection refused at the pre-auth cap",
+						"cap", s.preAuth.limits.MaxConns, "suppressed", dropped)
+				}
+				continue
+			}
 			grp.Go(func(ctx context.Context) error {
-				s.serveSocket(ctx, sock)
+				s.serveSocket(ctx, sock, slot)
 				return nil
 			})
 		}
@@ -201,7 +238,13 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 // it. Every failure here is one connection's own — a peer that closed early,
 // sent a transport nobody speaks, or sent nothing at all — so it ends that
 // connection and is reported no further.
-func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
+//
+// slot is the connection's place in the pre-auth bounds, taken by the accept
+// loop. It is given back here whatever ends the connection, and given back early
+// by the frame that authenticates it.
+func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSlot) {
+	defer slot.clear()
+
 	// Cancellation has to reach this socket wherever it happens to be, and the
 	// reads it blocks in take no context: gotd re-derives a read deadline from
 	// one per frame, so a deadline expired at cancel is undone by the very next
@@ -217,22 +260,68 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn) {
 	})
 	defer stop()
 
-	conn, addr, err := s.negotiate(sock)
+	// The lifetime ceiling, armed before the first read of the connection and
+	// disarmed by the frame that authenticates it. It closes the socket for the
+	// same reason cancellation does, and it is the only bound that reaches a
+	// peer staying inside every deadline: each read the server does resets its
+	// own, so activity alone never ends a connection.
+	slot.armLifetime(func() {
+		if err := sock.Close(); err != nil && !isDisconnect(err) {
+			s.log.Info("close connection at the pre-auth ceiling", "err", err)
+		}
+		if dropped, ok := s.preAuthLog.allow(time.Now(), preAuthLogInterval); ok {
+			s.log.Info("connection closed at the pre-auth lifetime ceiling",
+				"lifetime", s.preAuth.limits.Lifetime, "suppressed", dropped)
+		}
+	})
+
+	addr, err := s.clientAddr(sock)
 	if err != nil {
-		// Sampled: a refused or malformed connection is driven by whoever can
-		// reach the port, unauthenticated, so a line each is a log an attacker
-		// writes as fast as it can open sockets. The line that does come out
-		// says how many it stands for, or the bound would turn a flood into
-		// silence.
-		if !isDisconnect(err) {
-			if dropped, ok := s.negotiationLog.allow(time.Now(), negotiationLogInterval); ok {
-				s.log.Info("transport negotiation error", "err", err, "suppressed", dropped)
-			}
+		s.logNegotiation(err)
+		return
+	}
+	// Before codec detection, which is the next thing that reads from this
+	// peer: a bound that only applied once negotiation was done would leave the
+	// negotiating population unbounded per address, which is the population a
+	// flood consists of.
+	if !slot.keyAddr(addr) {
+		s.dropRefused(sock)
+		if dropped, ok := s.preAuthLog.allow(time.Now(), preAuthLogInterval); ok {
+			s.log.Info("connection refused at the per-address pre-auth cap",
+				"client_addr", addr, "cap", s.preAuth.limits.MaxConnsPerAddr, "suppressed", dropped)
 		}
 		return
 	}
-	if err := s.serveConn(ctx, conn, addr); err != nil && !isDisconnect(err) {
+	conn, err := s.detectCodec(sock)
+	if err != nil {
+		s.logNegotiation(err)
+		return
+	}
+	if err := s.serveConn(ctx, conn, addr, slot); err != nil && !isDisconnect(err) {
 		s.log.Info("connection handler error", "err", err)
+	}
+}
+
+// logNegotiation reports a connection that never became one, sampled: a refused
+// or malformed connection is driven by whoever can reach the port,
+// unauthenticated, so a line each is a log an attacker writes as fast as it can
+// open sockets. The line that does come out says how many it stands for, or the
+// bound would turn a flood into silence.
+func (s *Server) logNegotiation(err error) {
+	if isDisconnect(err) {
+		return
+	}
+	if dropped, ok := s.negotiationLog.allow(time.Now(), negotiationLogInterval); ok {
+		s.log.Info("transport negotiation error", "err", err, "suppressed", dropped)
+	}
+}
+
+// dropRefused closes a socket refused by a pre-auth bound. Closing is the whole
+// of a refusal: nothing is written back, because a peer past a cap is not owed
+// an answer and writing one is work the refusal exists to avoid.
+func (s *Server) dropRefused(sock net.Conn) {
+	if err := sock.Close(); err != nil && !isDisconnect(err) {
+		s.log.Info("close refused connection", "err", err)
 	}
 }
 
@@ -256,7 +345,11 @@ func isDisconnect(err error) bool {
 // clientAddr is the peer address of this socket, captured at accept. It travels
 // with every request the connection produces and is never re-read from
 // anything the client sends.
-func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr netip.Addr) (rErr error) {
+//
+// slot is the connection's place in the pre-auth bounds, cleared by the first
+// frame that decrypts under a key this server issued. It is nil for a connection
+// that was never accepted through a listener.
+func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr netip.Addr, slot *preAuthSlot) (rErr error) {
 	defer func() {
 		if err := tconn.Close(); err != nil && rErr == nil && !isDisconnect(err) {
 			rErr = err
@@ -374,6 +467,15 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		if err := s.rpcHandle(ctx, conn, b, userID, clientAddr); err != nil {
 			return err
 		}
+		// The frame decrypted and its MAC verified under a key this server
+		// issued, which is where the connection stops being one of the anonymous
+		// ones the pre-auth bounds hold back: it gives its slot back and comes
+		// out from under the lifetime ceiling. Here rather than at the registry
+		// bind below, because a client between key exchange and sign-in has no
+		// user to bind to and is waiting on a human reading a code — it has
+		// already paid for a key exchange, and closing it mid-login would be the
+		// bound taking legitimate sessions rather than anonymous holds.
+		slot.clear()
 
 		// Keep the conn in step with the key's current binding, which s.keys.Get
 		// re-reads every frame: an auth.signIn on this key rebinds it to whoever

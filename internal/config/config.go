@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -70,6 +71,10 @@ type Config struct {
 	// header is honoured from. It is the whole of the trust decision in
 	// ClientAddrProxyV2 mode and is empty in every other mode.
 	ClientAddrProxies []netip.Prefix
+	// PreAuth bounds what connections that have not authenticated may hold:
+	// concurrently in the process, concurrently per client address, and for how
+	// long. Zero disables a bound, as it does for a rate limit.
+	PreAuth mtproto.PreAuthLimits
 }
 
 // ClientAddrTrust names the source a client address is taken from.
@@ -369,6 +374,11 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.RateLimits.SendCodeIP.Phones.Window = d
 	}
+	preAuth, err := preAuthLimits()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PreAuth = preAuth
 	trust, err := clientAddrTrust(os.Getenv("TG_CLIENT_ADDR_TRUST"))
 	if err != nil {
 		return Config{}, err
@@ -393,6 +403,49 @@ func Load(log *slog.Logger) (Config, error) {
 	}
 	cfg.AuthKeyEncKey = encKey
 	return cfg, nil
+}
+
+// preAuthLimits resolves the bounds on what an unauthenticated connection may
+// hold, starting from the shipped defaults.
+//
+// Zero is accepted and means the bound is off, matching every rate-limit
+// surface: an operator taking one out has to be able to say so. Negative is not
+// the same statement — it is a typo or a unit mistake — and a bound that silently
+// became "off" because of one is the failure this whole surface exists to
+// prevent, so it fails the start by name.
+func preAuthLimits() (mtproto.PreAuthLimits, error) {
+	limits := mtproto.DefaultPreAuthLimits()
+	if v := os.Getenv("TG_MAX_PREAUTH_CONNS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return mtproto.PreAuthLimits{}, errors.New("TG_MAX_PREAUTH_CONNS must be an integer")
+		}
+		if n < 0 {
+			return mtproto.PreAuthLimits{}, errors.New("TG_MAX_PREAUTH_CONNS must not be negative; 0 disables the cap")
+		}
+		limits.MaxConns = n
+	}
+	if v := os.Getenv("TG_MAX_PREAUTH_CONNS_PER_IP"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return mtproto.PreAuthLimits{}, errors.New("TG_MAX_PREAUTH_CONNS_PER_IP must be an integer")
+		}
+		if n < 0 {
+			return mtproto.PreAuthLimits{}, errors.New("TG_MAX_PREAUTH_CONNS_PER_IP must not be negative; 0 disables the cap")
+		}
+		limits.MaxConnsPerAddr = n
+	}
+	if v := os.Getenv("TG_PREAUTH_LIFETIME"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return mtproto.PreAuthLimits{}, errors.New("TG_PREAUTH_LIFETIME must be a duration")
+		}
+		if d < 0 {
+			return mtproto.PreAuthLimits{}, errors.New("TG_PREAUTH_LIFETIME must not be negative; 0 disables the ceiling")
+		}
+		limits.Lifetime = d
+	}
+	return limits, nil
 }
 
 // clientAddrTrust resolves the client-address source. An unset value is the

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
 
 // validEncKey is 64 hex chars = 32 bytes, the required master-key length.
@@ -225,6 +226,76 @@ func TestLoadUploadPartTTL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoadPreAuthLimits covers the three bounds on an unauthenticated
+// connection, and the one thing about them that is not like the other tunables:
+// zero is a real setting here, and it turns a bound off. So a value that is not
+// a number, and a negative one, have to fail the start by name — a bound quietly
+// reading as "off" because of a typo is the outcome the bounds exist to prevent.
+func TestLoadPreAuthLimits(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+
+	defaults := mtproto.DefaultPreAuthLimits()
+	tests := map[string]struct {
+		env     string
+		raw     string
+		want    mtproto.PreAuthLimits
+		wantErr bool
+	}{
+		"defaults":            {want: defaults},
+		"conns override":      {env: "TG_MAX_PREAUTH_CONNS", raw: "16", want: withMaxConns(defaults, 16)},
+		"conns off":           {env: "TG_MAX_PREAUTH_CONNS", raw: "0", want: withMaxConns(defaults, 0)},
+		"conns not integer":   {env: "TG_MAX_PREAUTH_CONNS", raw: "many", wantErr: true},
+		"conns negative":      {env: "TG_MAX_PREAUTH_CONNS", raw: "-1", wantErr: true},
+		"per ip override":     {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "4", want: withMaxPerAddr(defaults, 4)},
+		"per ip off":          {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "0", want: withMaxPerAddr(defaults, 0)},
+		"per ip not integer":  {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "lots", wantErr: true},
+		"per ip negative":     {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "-1", wantErr: true},
+		"lifetime override":   {env: "TG_PREAUTH_LIFETIME", raw: "45s", want: withLifetime(defaults, 45*time.Second)},
+		"lifetime off":        {env: "TG_PREAUTH_LIFETIME", raw: "0s", want: withLifetime(defaults, 0)},
+		"lifetime not durat.": {env: "TG_PREAUTH_LIFETIME", raw: "soon", wantErr: true},
+		"lifetime negative":   {env: "TG_PREAUTH_LIFETIME", raw: "-1m", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv(tc.env, tc.raw)
+			}
+			cfg, err := config.Load(discardLog())
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %s=%q, got PreAuth = %+v", tc.env, tc.raw, cfg.PreAuth)
+				}
+				if !strings.Contains(err.Error(), tc.env) {
+					t.Errorf("error %q does not name %s", err, tc.env)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.PreAuth != tc.want {
+				t.Errorf("PreAuth = %+v, want %+v", cfg.PreAuth, tc.want)
+			}
+		})
+	}
+}
+
+func withMaxConns(l mtproto.PreAuthLimits, n int) mtproto.PreAuthLimits {
+	l.MaxConns = n
+	return l
+}
+
+func withMaxPerAddr(l mtproto.PreAuthLimits, n int) mtproto.PreAuthLimits {
+	l.MaxConnsPerAddr = n
+	return l
+}
+
+func withLifetime(l mtproto.PreAuthLimits, d time.Duration) mtproto.PreAuthLimits {
+	l.Lifetime = d
+	return l
 }
 
 func TestLoadRequiresDSN(t *testing.T) {
