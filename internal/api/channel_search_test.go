@@ -172,7 +172,7 @@ func TestSearchChannelServesPostsFromBeforeTheMemberJoined(t *testing.T) {
 // Every caller who may not read the channel gets the identical error search and
 // getHistory already give for the same channel: banned, departed, never a
 // member, and no such channel are one answer, so search does not become a way
-// to tell them apart or to probe the dense channels.id space.
+// to tell them apart or to probe which channel ids exist.
 func TestSearchChannelRejectionsMatchGetHistory(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -1,0 +1,41 @@
+-- Channel ids stop coming from channels_id_seq. A newly created channel now
+-- gets a uniform crypto/rand draw over [2^31, 10^12 - 2^31] (randomChannelID,
+-- internal/store/channels.go), because a dense id set discloses in aggregate:
+-- the public channels a discovery surface hands out fix where the gaps are, and
+-- every gap is a private channel plus its position in creation order.
+--
+-- No schema change and no data change. Existing rows keep their ids, the column
+-- keeps its type, and the sequence is neither reset nor re-pointed. What this
+-- migration adds is the record: the rule now lives in Go, and without the column
+-- comment below nothing in the schema would say so to whoever reads the table
+-- next.
+--
+-- It also carries the correction the M7 migration cannot: 20260729000008_channels.sql
+-- is applied, therefore hashed, therefore unamendable. Two of its statements are
+-- now false.
+--
+--   * "channels.id is dense BIGSERIAL" — dense only below 2^31, for the rows
+--     created before this migration.
+--   * "the peer access_hash placeholder is access_hash == id" — that placeholder
+--     was retired. The access hash is a per-viewer keyed derivation
+--     (internal/peerhash) and it remains the only admission gate.
+--
+-- What that migration says next is unchanged and stays true: a channel id is
+-- never an admission or authorization input, and there is no join-by-channel-id
+-- path. Sparseness raises the cost of guessing an id; it decides nothing, and
+-- nothing about the new range licenses relaxing that rule.
+--
+-- Two disclosures are accepted permanently, from the cutover itself: an id below
+-- 2^31 is identifiable as pre-cutover, and the largest legacy id discloses the
+-- channel count at cutover.
+--
+-- Deliberately NOT done here: dropping the column default. Making an insert that
+-- omits the id fail loudly is worth having, but it breaks any server still
+-- running the previous code the moment it applies, so it belongs in its own
+-- migration once this code is deployed everywhere.
+--
+-- Reversible: nothing to undo, and ids drawn while it is in force stay valid
+-- either way, since the sequence was never advanced past them.
+
+COMMENT ON COLUMN channels.id IS
+    'Random, not sequential. New ids are a uniform crypto/rand draw over [2^31, 10^12 - 2^31] (internal/store/channels.go); ids below 2^31 predate that and came from channels_id_seq. Never reset or re-point the sequence, and never treat the id as an authorization input.';
