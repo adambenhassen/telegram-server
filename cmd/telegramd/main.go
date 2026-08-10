@@ -50,7 +50,7 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("server RSA key", "fingerprint", rsakey.Fingerprint(&key.PublicKey), "path", cfg.RSAKeyPath)
 
-	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey)
+	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log))
 	if err != nil {
 		return err
 	}

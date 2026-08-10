@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -119,22 +120,31 @@ func TestContactsSearchChannelDiscovery(t *testing.T) {
 		return found
 	}
 
-	// A creates two public channels and one private one, in that interleaved
-	// order: the private channel's id sits between the two public ones, so a
-	// page of two public rows can only be served if the private row was
-	// filtered before the LIMIT rather than dropped after it.
+	// A creates two public channels and one private one, all matching the same
+	// title token. Channel ids are random draws, so creation order fixes nothing
+	// about where the private channel lands relative to the public two. What
+	// this case proves end to end is that the private channel is never named in
+	// the results — not that it never shortens the page: three candidates
+	// against a limit of ten come back whole either way, so filtering after the
+	// LIMIT would look identical here. That claim belongs to
+	// TestContactsSearchPrivateChannelDoesNotConsumeLimit at the handler level,
+	// where the private row's id is seeded inside the page deliberately.
 	publicID := createBroadcastChannel(t, ctx, aCmds, "Kayaking Club")
 	setUsername(publicID, "kayakclub")
 	privateID := createBroadcastChannel(t, ctx, aCmds, "Kayaking Private Crew")
 	secondPublicID := createBroadcastChannel(t, ctx, aCmds, "Kayaking Digest")
 	setUsername(secondPublicID, "kayakdigest")
 
+	// Results page in id order, which creation order no longer predicts.
+	wantPublic := []int64{publicID, secondPublicID}
+	slices.Sort(wantPublic)
+
 	// B is a member of nothing. Searching the shared title token returns both
 	// public channels and neither names the private one.
 	found := search(bCmds, "B", "Kayaking", 10)
 	got := searchChannelIDs(found.Results)
-	if len(got) != 2 || got[0] != publicID || got[1] != secondPublicID {
-		t.Fatalf("B Results channels = %v, want [%d %d]", got, publicID, secondPublicID)
+	if !slices.Equal(got, wantPublic) {
+		t.Fatalf("B Results channels = %v, want %v", got, wantPublic)
 	}
 	if ids := searchChannelIDs(found.MyResults); len(ids) != 0 {
 		t.Fatalf("B MyResults channels = %v, want none (B is a member of nothing)", ids)
@@ -162,7 +172,13 @@ func TestContactsSearchChannelDiscovery(t *testing.T) {
 
 	// A private channel matching the query must not shorten the page: with
 	// limit=2 both public matches still come back, so nothing in the row count
-	// says a third channel matched.
+	// says a third channel matched. This discriminates only when the private
+	// channel's id is one of the two lowest of the three, which random ids make
+	// roughly two runs in three rather than a guarantee — on the other runs the
+	// private row is outside the page regardless of when it was filtered. The
+	// deterministic version of the claim is
+	// TestContactsSearchPrivateChannelDoesNotConsumeLimit at the handler level,
+	// which seeds the private id inside the page.
 	limited := search(bCmds, "B", "Kayaking", 2)
 	if ids := searchChannelIDs(limited.Results); len(ids) != 2 {
 		t.Fatalf("B Results with limit=2 = %v (%d rows), want 2 — a private match consumed a row", ids, len(ids))
