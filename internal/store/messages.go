@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -173,7 +174,7 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 			if e2 != nil {
 				return Message{}, 0, 0, false, e2
 			}
-			rPts, e2 := mirrorPts(ctx, qtx, existing, toID)
+			rPts, e2 := mirrorPts(ctx, qtx, s.log, existing, toID)
 			if e2 != nil {
 				return Message{}, 0, 0, false, e2
 			}
@@ -637,14 +638,26 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 // reusing one random_id across peers arrives here holding a row that is not this
 // send's pair at all. That row has no counterpart on toID's side to name a pts
 // from, and the recipient reports its current pts exactly as it did before —
-// nothing this function can return reaches a client, since only the sender's
-// value is answered to a caller on the dedup path.
-func mirrorPts(ctx context.Context, q *db.Queries, existing db.Message, toID int64) (int, error) {
+// nothing this function can return reaches a client today, since only the
+// sender's value is answered to a caller on the dedup path. That is a property
+// of the callers, not of this branch, and a comment is the only thing holding
+// it: the record is what keeps the branch observable if a caller ever starts
+// reading the value.
+func mirrorPts(ctx context.Context, q *db.Queries, log *slog.Logger, existing db.Message, toID int64) (int, error) {
 	if PeerType(existing.PeerType) != PeerTypeUser || existing.PeerID != toID || existing.PeerLocalID == 0 {
 		st, err := q.GetState(ctx, toID)
 		if err != nil {
 			return 0, fmt.Errorf("recipient state: %w", err)
 		}
+		log.Warn("dedup pts fallback",
+			"path", "1:1 mirror",
+			"from_id", existing.OwnerID,
+			"to_id", toID,
+			"random_id", existing.RandomID,
+			"stored_local_id", existing.LocalID,
+			"stored_peer_type", existing.PeerType,
+			"stored_peer_id", existing.PeerID,
+		)
 		return int(st.Pts), nil
 	}
 	return newMessagePts(ctx, q, toID, existing.PeerLocalID)
