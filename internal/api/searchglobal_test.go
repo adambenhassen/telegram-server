@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -720,6 +721,21 @@ func TestSearchGlobalHidesTheRosterFromARemovedMember(t *testing.T) {
 		if u.GetID() == carol.ID {
 			t.Error("a removed member was served a user who joined after they left")
 		}
+	}
+}
+
+// Contention reaches the client as a retryable failure. The store proves it
+// gives up with that signal rather than an empty page
+// (TestSearchGlobalRefillCapReportsContentionNotExhaustion); this pins the other
+// half, that the handler forwards it as retryable instead of folding it into the
+// 500 every other store failure becomes.
+func TestSearchGlobalReportsContentionAsRetryable(t *testing.T) {
+	t.Parallel()
+	if err := api.SearchGlobalErrorForTest(store.ErrSearchContended); !isFloodWait(err) {
+		t.Fatalf("contended page: err = %v, want a retryable FLOOD_WAIT", err)
+	}
+	if err := api.SearchGlobalErrorForTest(errors.New("boom")); isFloodWait(err) {
+		t.Fatal("an ordinary store failure must not be reported as retryable")
 	}
 }
 

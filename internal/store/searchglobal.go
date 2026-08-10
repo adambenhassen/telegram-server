@@ -12,11 +12,34 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
-// GlobalSearchCursor is the keyset one cross-dialog search page resumes from.
-// It is the tuple the page query orders by, and every field of it must come
-// from a row the caller was actually served: a cursor computed over the
-// unfiltered union would let a caller paging one row at a time count messages
-// in peers they cannot read.
+// ErrSearchContended reports that a search page kept selecting rows that were
+// gone by the time their bodies were read, and gave up rather than answer with
+// the empty page a client reads as exhaustion. It is transient by construction:
+// the caller retries and the next attempt sees the settled state.
+var ErrSearchContended = errors.New("search page contended")
+
+// GlobalSearchCursor is a cross-dialog search cursor as the wire carries it.
+// resolveCursor turns it into the keyset the page query actually orders by,
+// which is searchGlobalBound. Every field must come from a row the caller was
+// served: a cursor computed over the unfiltered union would let a caller paging
+// one row at a time count messages in peers they cannot read.
+//
+// Rate is the served row's date in whole seconds, the finest offset_rate can
+// carry. It is not what positions the scan — the cursor row's own stored
+// timestamp is, read back server-side — and is used as a bound only when the
+// cursor names a row that does not exist.
+//
+// What that ordering does and does not promise, since the difference is a
+// wire contract: `date` defaults to now(), which Postgres evaluates at
+// transaction start, so a row whose transaction opened before a sequence
+// started and committed during it becomes visible with a date behind the
+// cursor and may be served mid-sequence. Exactly-once binds over the rows
+// committed when the sequence started: those are each served once, never
+// duplicated, never skipped, and never displaced. A row committing late is
+// served at most once, and perturbs none of them. Closing that last gap needs a
+// commit-ordered sequence this schema does not have — per-owner local_id spaces
+// and the shared channel post-id space are not comparable — so it is a
+// migration, and deliberately not this ticket.
 type GlobalSearchCursor struct {
 	// Rate is the message date truncated to whole seconds — the value the wire
 	// carries as offset_rate.
@@ -97,8 +120,15 @@ func (s *Store) SearchGlobal(ctx context.Context, userID int64, query string, cu
 		// Nothing survived hydration. A short key page means the scan already
 		// reached the end of what the caller can read, so there is nothing behind
 		// it and the sequence really is over.
-		if len(keys) < limit || attempt+1 >= maxSearchGlobalRefills {
+		if len(keys) < limit {
 			return nil, nil
+		}
+		// A full key page that hydrated to nothing means authorized matches are
+		// still behind it, so running out of refills may not answer the way true
+		// exhaustion does. An empty page ends the client's sequence; this
+		// condition is transient, so it has to be a retryable failure instead.
+		if attempt+1 >= maxSearchGlobalRefills {
+			return nil, ErrSearchContended
 		}
 		// Resume from the last key. Its timestamp came out of the page query, so
 		// the refill needs no lookup to place it exactly.

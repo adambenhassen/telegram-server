@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -221,6 +222,152 @@ func TestSearchGlobalRefillsAPageEmptiedBetweenReads(t *testing.T) {
 	}
 	if got := hitText(t, hits[0]); got != "deadline two" {
 		t.Fatalf("refilled page = %q, want %q", got, "deadline two")
+	}
+}
+
+// Running out of refills must not answer the way true exhaustion does. A client
+// stops on an empty page, so returning one here would abandon the authorized
+// matches still behind the cursor; the condition is transient, so it has to
+// surface as a retryable failure.
+func TestSearchGlobalRefillCapReportsContentionNotExhaustion(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	alice := mustUser(t, s, "+15551320041")
+	bob := mustUser(t, s, "+15551320042")
+
+	// Four authorized hits, paged one at a time, with every selected row deleted
+	// in the window between the key read and the body read. The cap is reached
+	// with hits still behind the cursor.
+	for i := range 4 {
+		send(t, s, bob, alice, "deadline", int64(9401+i))
+	}
+	store.SetSearchPageHook(s, func() {
+		if _, err := store.StorePool(s).Exec(ctx,
+			`UPDATE messages SET deleted = true
+			   WHERE owner_id = $1 AND deleted = false
+			     AND local_id = (SELECT max(local_id) FROM messages
+			                      WHERE owner_id = $1 AND deleted = false)`,
+			alice.ID); err != nil {
+			t.Errorf("delete selected row: %v", err)
+		}
+	})
+	defer store.SetSearchPageHook(s, nil)
+
+	_, err := s.SearchGlobal(ctx, alice.ID, "deadline", nil, 1)
+	if !errors.Is(err, store.ErrSearchContended) {
+		t.Fatalf("cap reached: err = %v, want ErrSearchContended rather than an empty page", err)
+	}
+
+	// With the contention gone the same call answers normally again, so the
+	// failure really was transient rather than a dead end.
+	store.SetSearchPageHook(s, nil)
+	hits, err := s.SearchGlobal(ctx, alice.ID, "deadline", nil, 1)
+	if err != nil {
+		t.Fatalf("after contention: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("after contention: %d hits, want the row still behind the cursor", len(hits))
+	}
+}
+
+// A row whose transaction opened before a page sequence started and committed
+// during it becomes visible with a date behind the cursor, because `date`
+// defaults to now() and Postgres evaluates that at transaction start. The
+// accepted contract is that it may be served at most once and must perturb
+// nothing: every row committed at sequence start is still served exactly once,
+// in order.
+func TestSearchGlobalLateCommitPerturbsNoSnapshotRow(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	alice := mustUser(t, s, "+15551320051")
+	bob := mustUser(t, s, "+15551320052")
+
+	for i := range 3 {
+		send(t, s, bob, alice, "deadline snapshot", int64(9501+i))
+	}
+	snapshot := searchGlobal(t, s, alice.ID, "deadline", nil, 10)
+	if len(snapshot) != 3 {
+		t.Fatalf("snapshot = %d hits, want 3", len(snapshot))
+	}
+	// Behind the newest row, so the keyset admits it once it is visible.
+	behind := snapshot[1].Rate
+
+	tx, err := store.StorePool(s).Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err = tx.Exec(ctx,
+		`INSERT INTO messages (owner_id, local_id, peer_type, peer_id, from_id, message, out, date)
+		 VALUES ($1, $2, 1, $3, $3, 'deadline late commit', false, to_timestamp($4))`,
+		alice.ID, int64(9000), bob.ID, behind); err != nil {
+		t.Fatalf("insert late row: %v", err)
+	}
+
+	// Page 1 runs while that row is still uncommitted, so it is not in the
+	// sequence's snapshot.
+	page := searchGlobal(t, s, alice.ID, "deadline", nil, 1)
+	if len(page) != 1 {
+		t.Fatalf("page 1 = %d hits, want 1", len(page))
+	}
+	cursor := &store.GlobalSearchCursor{
+		Rate: page[0].Rate, PeerType: page[0].PeerType, PeerID: page[0].PeerID, MsgID: hitID(page[0]),
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatalf("commit late row: %v", err)
+	}
+
+	seen := map[globalKey]int{}
+	order := []store.GlobalSearchHit{page[0]}
+	for range 10 {
+		next := searchGlobal(t, s, alice.ID, "deadline", cursor, 1)
+		if len(next) == 0 {
+			break
+		}
+		order = append(order, next[0])
+		cursor = &store.GlobalSearchCursor{
+			Rate: next[0].Rate, PeerType: next[0].PeerType, PeerID: next[0].PeerID, MsgID: hitID(next[0]),
+		}
+	}
+	for _, h := range order {
+		seen[globalKey{peerType: h.PeerType, peerID: h.PeerID, msgID: hitID(h)}]++
+	}
+
+	// Every row that existed when the sequence started is served exactly once.
+	for i, want := range keysOf(snapshot) {
+		if seen[want] != 1 {
+			t.Errorf("snapshot row %d (%+v) served %d times, want exactly once", i, want, seen[want])
+		}
+	}
+	// The late row is delivered, once. Its date puts it behind the cursor, so it
+	// is admitted the moment it commits — that is the anomaly, and asserting it
+	// is served exactly once is what keeps this test honest: it proves the case
+	// really occurs rather than quietly never arising, and that the accepted
+	// bound on it holds.
+	late := 0
+	for _, h := range order {
+		if hitText(t, h) == "deadline late commit" {
+			late++
+		}
+	}
+	if late != 1 {
+		t.Errorf("late row served %d times, want exactly once (delivered, never duplicated)", late)
+	}
+	// And the snapshot rows keep their order among themselves.
+	var got []globalKey
+	for _, h := range order {
+		k := globalKey{peerType: h.PeerType, peerID: h.PeerID, msgID: hitID(h)}
+		for _, s := range keysOf(snapshot) {
+			if k == s {
+				got = append(got, k)
+			}
+		}
+	}
+	for i, want := range keysOf(snapshot) {
+		if i >= len(got) || got[i] != want {
+			t.Fatalf("snapshot order changed: got %+v, want %+v", got, keysOf(snapshot))
+		}
 	}
 }
 

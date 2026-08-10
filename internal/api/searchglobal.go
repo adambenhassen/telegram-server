@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"unicode/utf8"
 
 	"github.com/gotd/td/bin"
@@ -96,10 +97,21 @@ func (h *handlers) handleSearchGlobal(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	hits, err := h.store.SearchGlobal(r.Ctx, r.UserID, req.Q, cursor, limit)
 	if err != nil {
-		h.log.Error("search global", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, h.searchGlobalError(r.UserID, err)
 	}
 	return h.globalSearchSlice(r, hits)
+}
+
+// searchGlobalError maps a failed search onto the wire. Contention is the one
+// case that must not become an empty page: a client reads that as exhaustion and
+// stops, abandoning the authorized matches still behind its cursor, so the
+// transient condition is reported as a transient failure instead.
+func (h *handlers) searchGlobalError(userID int64, err error) error {
+	if errors.Is(err, store.ErrSearchContended) {
+		return errSearchRetry
+	}
+	h.log.Error("search global", "user_id", userID, "err", err)
+	return errInternal
 }
 
 // globalCursorPeer classifies the offset_peer of a searchGlobal request. An

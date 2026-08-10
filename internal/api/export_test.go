@@ -651,6 +651,13 @@ func SearchForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateL
 	return h.handleSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SearchGlobalErrorForTest exposes how a failed search reaches the wire. The
+// store hook that produces real contention lives in the store package's own test
+// build, out of reach here, so the mapping is asserted directly.
+func SearchGlobalErrorForTest(err error) error {
+	return testHandlers(nil).searchGlobalError(0, err)
+}
+
 // SearchGlobalForTest invokes handleSearchGlobal for the caller against the
 // given request.
 func SearchGlobalForTest(s *store.Store, userID int64, req *tg.MessagesSearchGlobalRequest) (bin.Encoder, error) {
