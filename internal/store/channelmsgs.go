@@ -99,6 +99,26 @@ func (s *Store) ChannelState(ctx context.Context, channelID int64) (int, error) 
 	return int(row.Pts), nil
 }
 
+// newChannelPostPts returns the pts at which the channel's localID entered the
+// log. Same contract as newMessagePts, including ErrPtsUnknown.
+func newChannelPostPts(ctx context.Context, q *db.Queries, channelID, localID int64) (int, error) {
+	pts, err := q.NewChannelPostPts(ctx, db.NewChannelPostPtsParams{ChannelID: channelID, LocalID: localID})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, fmt.Errorf("%w: channel %d post %d", ErrPtsUnknown, channelID, localID)
+	case err != nil:
+		return 0, fmt.Errorf("new channel post pts: %w", err)
+	}
+	return int(pts), nil
+}
+
+// ChannelPostPts returns the pts at which localID entered the channel's log —
+// the only pts a resend of that post may report. ErrPtsUnknown when the log has
+// no such event.
+func (s *Store) ChannelPostPts(ctx context.Context, channelID, localID int64) (int, error) {
+	return newChannelPostPts(ctx, s.q, channelID, localID)
+}
+
 // PostChannelMessage appends one post to the channel: the channel_state bump
 // that allocates its local_id and pts, the channel_messages row and the
 // channel_events row, all in one transaction. Keeping the event and the bump in
@@ -175,8 +195,7 @@ func (s *Store) postChannelMessage(
 	if err = qtx.EnsureChannelState(ctx, channelID); err != nil {
 		return ChannelMessage{}, 0, false, fmt.Errorf("ensure channel state: %w", err)
 	}
-	st, err := qtx.LockChannelState(ctx, channelID)
-	if err != nil {
+	if _, err = qtx.LockChannelState(ctx, channelID); err != nil {
 		return ChannelMessage{}, 0, false, fmt.Errorf("lock channel state: %w", err)
 	}
 
@@ -193,13 +212,21 @@ func (s *Store) postChannelMessage(
 	// Idempotency: a resend with the same random_id returns the original post,
 	// with no row, no event and no pts movement — same rule as the chat and 1:1
 	// send paths, read under the row lock so two concurrent resends agree.
+	//
+	// The pts reported is the one that post occupies, not the channel's current
+	// pts: a subscriber applies updateNewChannelMessage by pts, so naming a
+	// newer slot for an old post is how it skips whatever really sits there.
 	if randomID != 0 {
 		existing, e := qtx.ChannelMessageByRandomID(ctx, db.ChannelMessageByRandomIDParams{
 			ChannelID: channelID, RandomID: randomID,
 		})
 		switch {
 		case e == nil:
-			return channelMessageFromFields(channelMsgFields(existing)), int(st.Pts), true, nil
+			pts, e2 := newChannelPostPts(ctx, qtx, channelID, existing.LocalID)
+			if e2 != nil {
+				return ChannelMessage{}, 0, false, e2
+			}
+			return channelMessageFromFields(channelMsgFields(existing)), pts, true, nil
 		case !errors.Is(e, pgx.ErrNoRows):
 			return ChannelMessage{}, 0, false, fmt.Errorf("random_id lookup: %w", e)
 		}

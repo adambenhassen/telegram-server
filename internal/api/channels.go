@@ -274,10 +274,12 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 	// Check for a transport retry before the rate limit.
 	if req.RandomID != 0 {
 		if existing, ok, err := h.store.ChannelMessageByRandomID(r.Ctx, channelID, req.RandomID); err == nil && ok {
-			// Retry: return the stored post without rate-limiting.
-			channelState, err := h.store.ChannelState(r.Ctx, channelID)
+			// Retry: return the stored post, at the pts it occupies, without
+			// rate-limiting. Never the channel's current pts — see
+			// store.ErrPtsUnknown for what a subscriber loses to that.
+			pts, err := h.store.ChannelPostPts(r.Ctx, channelID, existing.LocalID)
 			if err != nil {
-				h.log.Error("read channel pts on retry", "channel_id", channelID, "err", err)
+				h.log.Error("read stored post pts on retry", "channel_id", channelID, "err", err)
 				return nil, errInternal
 			}
 			channels, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
@@ -293,7 +295,7 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 			return &tg.Updates{
 				Updates: []tg.UpdateClass{
 					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
-					&tg.UpdateNewChannelMessage{Message: channelMessageToTL(existing, r.UserID, nil), Pts: channelState, PtsCount: 1},
+					&tg.UpdateNewChannelMessage{Message: channelMessageToTL(existing, r.UserID, nil), Pts: pts, PtsCount: 1},
 				},
 				Users: users,
 				Chats: channels,
