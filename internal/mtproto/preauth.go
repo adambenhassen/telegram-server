@@ -36,7 +36,7 @@ const preAuthLogInterval = 10 * time.Second
 // none of the three hold. That is the intended line — a client between key
 // exchange and sign-in is waiting on a human reading a code and must not be cut
 // — and bounding what one such key may hold is a separate bound on separate
-// state, not a number that belongs here.
+// state: it is DefaultMaxConnsPerUnboundKey's, not a number that belongs here.
 //
 // They are policy constants, not adaptive logic: nothing here reacts to load,
 // keeps a reputation, or rate-limits opens. A connection is inside the bounds or

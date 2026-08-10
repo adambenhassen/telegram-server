@@ -283,6 +283,50 @@ func TestLoadPreAuthLimits(t *testing.T) {
 	}
 }
 
+// TestLoadMaxConnsPerUnboundKey covers the bound that picks up where the
+// pre-auth ones stop: what a key nobody has signed in on may hold. Zero is a
+// real setting here too and turns it off, so a typo that would read as "off"
+// has to fail the start by name.
+func TestLoadMaxConnsPerUnboundKey(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+
+	tests := map[string]struct {
+		raw     string
+		want    int
+		wantErr bool
+	}{
+		"default":     {want: mtproto.DefaultMaxConnsPerUnboundKey},
+		"override":    {raw: "3", want: 3},
+		"off":         {raw: "0", want: 0},
+		"not integer": {raw: "a few", wantErr: true},
+		"negative":    {raw: "-1", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if tc.raw != "" {
+				t.Setenv("TG_MAX_CONNS_PER_UNBOUND_KEY", tc.raw)
+			}
+			cfg, err := config.Load(discardLog())
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got MaxConnsPerUnboundKey = %d", tc.raw, cfg.MaxConnsPerUnboundKey)
+				}
+				if !strings.Contains(err.Error(), "TG_MAX_CONNS_PER_UNBOUND_KEY") {
+					t.Errorf("error %q does not name TG_MAX_CONNS_PER_UNBOUND_KEY", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.MaxConnsPerUnboundKey != tc.want {
+				t.Errorf("MaxConnsPerUnboundKey = %d, want %d", cfg.MaxConnsPerUnboundKey, tc.want)
+			}
+		})
+	}
+}
+
 func withMaxConns(l mtproto.PreAuthLimits, n int) mtproto.PreAuthLimits {
 	l.MaxConns = n
 	return l
