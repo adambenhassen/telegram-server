@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -119,22 +120,30 @@ func TestContactsSearchChannelDiscovery(t *testing.T) {
 		return found
 	}
 
-	// A creates two public channels and one private one, in that interleaved
-	// order: the private channel's id sits between the two public ones, so a
-	// page of two public rows can only be served if the private row was
-	// filtered before the LIMIT rather than dropped after it.
+	// A creates two public channels and one private one, all matching the same
+	// title token. Channel ids are random draws, so creation order fixes nothing
+	// about where the private channel lands relative to the public two; what
+	// this case still proves end to end is that the private channel is never
+	// named and never shortens the page. The id-ordered version of that claim —
+	// a private row placed deliberately inside the page — is asserted at the
+	// handler level in TestContactsSearchPrivateChannelDoesNotConsumeLimit,
+	// where the id can be seeded.
 	publicID := createBroadcastChannel(t, ctx, aCmds, "Kayaking Club")
 	setUsername(publicID, "kayakclub")
 	privateID := createBroadcastChannel(t, ctx, aCmds, "Kayaking Private Crew")
 	secondPublicID := createBroadcastChannel(t, ctx, aCmds, "Kayaking Digest")
 	setUsername(secondPublicID, "kayakdigest")
 
+	// Results page in id order, which creation order no longer predicts.
+	wantPublic := []int64{publicID, secondPublicID}
+	slices.Sort(wantPublic)
+
 	// B is a member of nothing. Searching the shared title token returns both
 	// public channels and neither names the private one.
 	found := search(bCmds, "B", "Kayaking", 10)
 	got := searchChannelIDs(found.Results)
-	if len(got) != 2 || got[0] != publicID || got[1] != secondPublicID {
-		t.Fatalf("B Results channels = %v, want [%d %d]", got, publicID, secondPublicID)
+	if !slices.Equal(got, wantPublic) {
+		t.Fatalf("B Results channels = %v, want %v", got, wantPublic)
 	}
 	if ids := searchChannelIDs(found.MyResults); len(ids) != 0 {
 		t.Fatalf("B MyResults channels = %v, want none (B is a member of nothing)", ids)

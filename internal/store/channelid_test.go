@@ -38,9 +38,12 @@ func TestCreateChannelDrawsSparseIDs(t *testing.T) {
 		ids[i] = ch.ID
 	}
 
-	// Two consecutive creations are not consecutive integers.
+	// Two consecutive creations are not consecutive integers. The distance is
+	// taken absolute rather than as previous+1: a descending counter is just as
+	// much a creation-order oracle as an ascending one, and it would satisfy the
+	// monotonicity check below.
 	for i := 1; i < len(ids); i++ {
-		if ids[i] == ids[i-1]+1 {
+		if diff := ids[i] - ids[i-1]; diff == 1 || diff == -1 {
 			t.Errorf("creations %d and %d got adjacent ids %d, %d", i-1, i, ids[i-1], ids[i])
 		}
 	}
@@ -131,7 +134,8 @@ func TestCreateChannelFailsClosedOnEntropyError(t *testing.T) {
 // TestCreateChannelFailsAfterRepeatedCollisions covers the other end of the
 // retry: a source that never yields a free id is broken, not unlucky, so the
 // redraw is bounded and the creation fails rather than spinning or reaching for
-// the sequence.
+// the sequence. The draw count is asserted exactly, so the documented bound
+// cannot drift — an unbounded loop and a bound of 800 both fail here.
 func TestCreateChannelFailsAfterRepeatedCollisions(t *testing.T) {
 	t.Parallel()
 	s := open(t)
@@ -139,10 +143,17 @@ func TestCreateChannelFailsAfterRepeatedCollisions(t *testing.T) {
 	u := mustUser(t, s, "+15551292004")
 
 	taken := mustChannel(t, s, u.ID, "First")
-	store.SetChannelIDSource(s, func() (int64, error) { return taken.ID, nil })
+	draws := 0
+	store.SetChannelIDSource(s, func() (int64, error) {
+		draws++
+		return taken.ID, nil
+	})
 
 	if _, err := s.CreateChannel(ctx, u.ID, "Second", "", false); err == nil {
 		t.Fatal("create with an always-colliding draw succeeded, want an error")
+	}
+	if draws != store.ChannelIDAttempts {
+		t.Errorf("took %d draws, want exactly %d (the documented bound)", draws, store.ChannelIDAttempts)
 	}
 	channels, err := s.ChannelsForUser(ctx, u.ID)
 	if err != nil {

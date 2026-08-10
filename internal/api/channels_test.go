@@ -518,7 +518,9 @@ func TestHandleCreateChannelDrawsSparseIDs(t *testing.T) {
 			t.Errorf("channel %q id %d does not resolve in the store: ok=%v err=%v", ch.Title, ch.ID, ok, err)
 		}
 	}
-	if second.ID == first.ID+1 {
+	// Absolute distance, not second == first+1: a descending counter is as much
+	// a creation-order oracle as an ascending one.
+	if diff := second.ID - first.ID; diff == 1 || diff == -1 {
 		t.Errorf("consecutive creations got adjacent ids %d, %d", first.ID, second.ID)
 	}
 }

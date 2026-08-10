@@ -301,40 +301,52 @@ func TestContactsSearchTruncatedMemberStillRendersAsMember(t *testing.T) {
 func TestContactsSearchMemberBeyondMemberArmPageRendersAsMember(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	caller, err := s.CreateUser(ctx, "15550016001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Eleven private matches sort ahead of the public one, filling the member
-	// arm's page of ten so the public channel falls outside it.
+	// Eleven private matches must fill the member arm's page of ten, which only
+	// puts the public channel outside that page while the public channel sorts
+	// last. Channel ids are random draws, so its id is placed above every
+	// private one rather than inherited from creation order.
+	privateIDs := make([]int64, 0, 11)
 	for i := range 11 {
-		if _, err := s.CreateChannel(ctx, caller.ID, fmt.Sprintf("Beyondpage Private %d", i), "About", false); err != nil {
-			t.Fatalf("create private channel %d: %v", i, err)
+		ch, cerr := s.CreateChannel(ctx, caller.ID, fmt.Sprintf("Beyondpage Private %d", i), "About", false)
+		if cerr != nil {
+			t.Fatalf("create private channel %d: %v", i, cerr)
 		}
+		privateIDs = append(privateIDs, ch.ID)
 	}
-	pub, err := s.CreateChannel(ctx, caller.ID, "Beyondpage Public", "About", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := api.ClaimChannelUsernameForTest(s, pub.ID, "beyondpagepublic"); err != nil {
+	pubID := slices.Max(privateIDs) + 1
+	channelExec(t, ctx, dsn, `
+		WITH pub AS (
+			INSERT INTO channels (id, title, creator_id) VALUES ($1, 'Beyondpage Public', $2)
+			RETURNING id
+		),
+		state AS (
+			INSERT INTO channel_state (channel_id) SELECT id FROM pub
+		)
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
+		SELECT id, $2, 2, 0 FROM pub`, pubID, caller.ID)
+	if err := api.ClaimChannelUsernameForTest(s, pubID, "beyondpagepublic"); err != nil {
 		t.Fatal(err)
 	}
 
 	found := searchChannels(t, s, caller.ID, "Beyondpage", 10)
 
-	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != pub.ID {
-		t.Fatalf("Results channels = %v, want [%d]", got, pub.ID)
+	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != pubID {
+		t.Fatalf("Results channels = %v, want [%d]", got, pubID)
 	}
 	var rendered *tg.Channel
 	for _, c := range found.Chats {
-		if channel, ok := c.(*tg.Channel); ok && channel.ID == pub.ID {
+		if channel, ok := c.(*tg.Channel); ok && channel.ID == pubID {
 			rendered = channel
 		}
 	}
 	if rendered == nil {
-		t.Fatalf("channel %d missing from Chats", pub.ID)
+		t.Fatalf("channel %d missing from Chats", pubID)
 	}
 	if rendered.Left || !rendered.Creator {
 		t.Errorf("Chats for the caller's own channel = Left %v Creator %v, want Left false Creator true",

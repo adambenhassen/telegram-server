@@ -222,7 +222,13 @@ func (s *Store) insertChannel(ctx context.Context, tx pgx.Tx, p db.InsertChannel
 			}
 			return row, nil
 		}
-		_ = sp.Rollback(ctx) //nolint:errcheck // the savepoint is being discarded
+		// A failed ROLLBACK TO SAVEPOINT leaves the enclosing transaction in a
+		// state this loop cannot reason about, so it is returned rather than
+		// dropped: retrying on top of it would write the channel under a
+		// connection that is already broken.
+		if rbErr := sp.Rollback(ctx); rbErr != nil {
+			return db.Channel{}, fmt.Errorf("insert channel: %w; discarding the id savepoint: %w", err, rbErr)
+		}
 
 		var pgErr *pgconn.PgError
 		if !errors.As(err, &pgErr) || pgErr.Code != "23505" || pgErr.ConstraintName != "channels_pkey" {

@@ -137,6 +137,9 @@ func SetChannelCaps(s *Store, participants, perUser int) {
 const (
 	ChannelIDMin = minChannelID
 	ChannelIDMax = maxChannelID
+	// ChannelIDAttempts is the redraw bound, exported so the exhaustion test
+	// asserts the shipped number instead of a copy of it that can drift.
+	ChannelIDAttempts = channelIDAttempts
 )
 
 // SetChannelIDSource replaces one Store's channel-id draw. Both branches it
