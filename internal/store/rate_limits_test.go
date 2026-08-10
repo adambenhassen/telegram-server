@@ -69,8 +69,9 @@ func TestRateLimitWindowExpiry(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
 
-	// Use a very short window so we can test expiry without sleeping.
-	cfg := store.RateLimitConfig{Limit: 2, Window: 1 * time.Second}
+	// Long window, aged past its deadline below rather than slept through: see
+	// store.AgeRateLimitWindow.
+	cfg := store.RateLimitConfig{Limit: 2, Window: time.Hour}
 	ctx := context.Background()
 	const subject = 200
 	const surface = "expiry"
@@ -92,8 +93,10 @@ func TestRateLimitWindowExpiry(t *testing.T) {
 		t.Fatal("pre-expiry: expected denial, got allowed")
 	}
 
-	// Wait for window to expire.
-	time.Sleep(1100 * time.Millisecond)
+	// Age the window past its deadline.
+	if err := store.AgeRateLimitWindow(ctx, s, subject, surface, cfg.Window+time.Minute); err != nil {
+		t.Fatalf("age window: %v", err)
+	}
 
 	// Should be allowed again.
 	result, err = s.CheckRateLimit(ctx, subject, surface, cfg)
@@ -385,8 +388,14 @@ func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
 
-	// Very short window — but wait should still be >= 1s.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 100 * time.Millisecond}
+	// The rule under test is the floor on a sub-second remainder, so the window
+	// has to still be open when the second request lands and the remainder has
+	// to be under a second. A real sub-second window cannot give both on a
+	// loaded host: it closes between the two requests and the denial never
+	// happens. So the window is long enough that no scheduler delay can close
+	// it, and the sub-second remainder comes from pinning the clock the wait is
+	// measured against 100ms short of the row's own deadline.
+	cfg := store.RateLimitConfig{Limit: 1, Window: time.Hour}
 	ctx := context.Background()
 	const subject = 800
 	const surface = "minwait"
@@ -396,8 +405,11 @@ func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
 		t.Fatalf("first request: %v", err)
 	}
 
-	// Wait for the window to almost expire.
-	time.Sleep(50 * time.Millisecond)
+	expiresAt, err := store.RateLimitExpiresAt(ctx, s, subject, surface)
+	if err != nil {
+		t.Fatalf("read expires_at: %v", err)
+	}
+	store.SetNowFunc(s, func() time.Time { return expiresAt.Add(-100 * time.Millisecond) })
 
 	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
 	if err != nil {
@@ -429,6 +441,18 @@ func TestRateLimitWaitRoundsUp(t *testing.T) {
 	if _, err := s.CheckRateLimit(ctx, subject, surface, cfg); err != nil {
 		t.Fatalf("first request: %v", err)
 	}
+
+	// The remainder has to be a known fraction of a second for a ceil to be
+	// assertable at all. Left to real time it is however much of the window the
+	// round trip to the denial has already spent, which on a loaded host is
+	// seconds, and the test then measures the host rather than the rounding. So
+	// the clock the wait is measured against is pinned 9.99s short of the row's
+	// own deadline.
+	expiresAt, err := store.RateLimitExpiresAt(ctx, s, subject, surface)
+	if err != nil {
+		t.Fatalf("read expires_at: %v", err)
+	}
+	store.SetNowFunc(s, func() time.Time { return expiresAt.Add(-9990 * time.Millisecond) })
 
 	// Denial should round up to whole seconds: 9.99s rounds to 10s.
 	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)

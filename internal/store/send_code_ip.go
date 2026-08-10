@@ -157,7 +157,7 @@ func chargeSendCodeIPCall(ctx context.Context, q *db.Queries, key netip.Prefix, 
 	if err != nil {
 		return nil, fmt.Errorf("send code ip call expiry: %w", err)
 	}
-	return &RateLimitResult{Wait: waitUntil(expiresAt.Time)}, nil
+	return &RateLimitResult{Wait: waitUntil(time.Now(), expiresAt.Time)}, nil
 }
 
 // chargeSendCodeIPPhone charges one distinct phone number to the key, returning
@@ -187,7 +187,7 @@ func chargeSendCodeIPPhone(ctx context.Context, q *db.Queries, key netip.Prefix,
 		if err != nil {
 			return nil, fmt.Errorf("send code ip phone expiry: %w", err)
 		}
-		return &RateLimitResult{Wait: waitUntil(next.Time)}, nil
+		return &RateLimitResult{Wait: waitUntil(time.Now(), next.Time)}, nil
 	}
 	if err := q.InsertSendCodeIPPhone(ctx, db.InsertSendCodeIPPhoneParams{
 		IpKey:   key,
@@ -216,11 +216,12 @@ func (s *Store) SweepExpiredSendCodeIPLimits(ctx context.Context) (int64, error)
 }
 
 // waitUntil is the client-visible wait for a deadline: whole seconds, rounded
-// up, never below one. time.Until reads the Go clock against a Postgres
-// timestamp; the error is bounded by the app/DB clock offset, negligible on a
-// single host.
-func waitUntil(deadline time.Time) time.Duration {
-	wait := time.Until(deadline)
+// up, never below one. now is the Go clock read against a Postgres timestamp;
+// the error is bounded by the app/DB clock offset, negligible on a single host.
+// It is a parameter rather than a time.Now call inside so a test can name the
+// remainder it is asserting on.
+func waitUntil(now, deadline time.Time) time.Duration {
+	wait := deadline.Sub(now)
 	secs := int(wait / time.Second)
 	if wait%time.Second > 0 {
 		secs++
