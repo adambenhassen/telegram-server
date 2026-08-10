@@ -702,9 +702,8 @@ func TestSearchMessagesChannelPeerSharesTheQuota(t *testing.T) {
 
 // TestSearchMessagesChannelChargedBeforeMembershipCheck proves that a
 // channel-peer search by a non-member is charged: the membership probe is a
-// database query, so a charge behind it would let a non-member probe the dense
-// channels.id space at unbounded rate, and would make the quota a membership
-// oracle.
+// database query, so a charge behind it would let a non-member probe channel
+// ids at unbounded rate, and would make the quota a membership oracle.
 func TestSearchMessagesChannelChargedBeforeMembershipCheck(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

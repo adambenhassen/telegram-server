@@ -18,7 +18,12 @@ import (
 // key matching the frame's auth key ID, and userID is the user bound to that key
 // (0 when unbound), resolved by the caller in the same lookup as the key.
 // clientAddr is the peer address of the socket the frame arrived on.
-func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID int64, clientAddr netip.Addr) error {
+//
+// slot is the connection's place in the pre-auth bounds, cleared here and
+// nowhere else. Clearing is idempotent, so every frame after the first passes a
+// slot already given back; it is nil for a connection that was never accepted
+// through a listener.
+func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID int64, clientAddr netip.Addr, slot *preAuthSlot) error {
 	m := &crypto.EncryptedMessage{}
 	if err := m.DecodeWithoutCopy(b); err != nil {
 		return fmt.Errorf("decode encrypted message: %w", err)
@@ -28,6 +33,13 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID i
 	if err != nil {
 		return fmt.Errorf("decrypt message: %w", err)
 	}
+	// The moment the connection stops being one of the anonymous ones the
+	// pre-auth bounds hold back: the frame's MAC verified under a key this
+	// server issued. Here rather than after the dispatch below, because
+	// everything after this line is work done on behalf of a proven key —
+	// including a handler slow enough to cross what remains of the ceiling,
+	// which would otherwise close a connection that had already authenticated.
+	slot.clear()
 	c.setSession(msg.SessionID)
 
 	if !c.markCreated(msg.SessionID) {

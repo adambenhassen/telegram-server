@@ -152,6 +152,24 @@ func SetChannelCaps(s *Store, participants, perUser int) {
 	s.maxChannelsPerUser = perUser
 }
 
+// ChannelIDMin and ChannelIDMax expose the documented channel-id range, so the
+// allocation tests assert against the constants the draw is taken from rather
+// than a second transcription of the numbers.
+const (
+	ChannelIDMin = minChannelID
+	ChannelIDMax = maxChannelID
+	// ChannelIDAttempts is the redraw bound, exported so the exhaustion test
+	// asserts the shipped number instead of a copy of it that can drift.
+	ChannelIDAttempts = channelIDAttempts
+)
+
+// SetChannelIDSource replaces one Store's channel-id draw. Both branches it
+// reaches — the redraw after a collision and the fail-closed path when the draw
+// errors — are unreachable through crypto/rand at any test's scale. Scoped to
+// this Store on purpose: a package-level override would leak into every other
+// test in a parallel run.
+func SetChannelIDSource(s *Store, fn func() (int64, error)) { s.newChannelID = fn }
+
 // SetChannelPts forces a channel's pts, so the join path can be asserted
 // against a non-zero sequence without a message-send path that does not exist
 // until the next ticket.

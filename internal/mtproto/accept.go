@@ -18,54 +18,63 @@ const (
 	maxAcceptBackoff = time.Second
 )
 
-// negotiate establishes the client address of an accepted socket and detects its
-// transport codec, bounded by the handshake timeout. Shutdown is not its
-// business: the caller closes the socket on cancellation, which ends whichever
-// of the two reads below it has got to.
+// Negotiating an accepted socket is two steps — establishing the client address
+// and detecting the transport codec — and they are two functions because a bound
+// keyed on the address belongs between them. Both read client bytes, and both
+// run in the connection's own goroutine rather than in the accept loop, so that
+// one peer cannot decide when — or whether — anybody else gets connected, and so
+// that its read error is never reported as a listener failure.
 //
-// This runs per connection rather than in the accept loop on purpose: both steps
-// read client bytes, so performing them where the next socket is accepted would
-// let one peer decide when — or whether — anybody else gets connected, and would
-// report that peer's read error as a listener failure.
+// Shutdown is neither one's business: the caller closes the socket on
+// cancellation, which ends whichever read it has got to.
+
+// clientAddr establishes the address of an accepted socket, from the socket
+// itself or from a PROXY v2 header, and sets the deadline that bounds the whole
+// negotiation.
 //
-// The address is established first and, in socket mode, before a single byte has
-// been read, so what every per-IP limit keys on cannot be a function of anything
-// the client wrote. In proxy-v2 mode the allowlist decides before any read too:
+// The address comes first and, in socket mode, before a single byte has been
+// read, so what every per-IP limit keys on cannot be a function of anything the
+// client wrote. In proxy-v2 mode the allowlist decides before any read too:
 // bytes from a sender that is not a configured balancer are never interpreted,
 // as a header or as anything else.
 //
-// One deadline covers the header read and the codec sniff together, and is left
-// set on the way out: gotd resets it from the context before every frame it
+// One deadline covers the header read and the codec sniff that follows, and is
+// left set on the way out: gotd resets it from the context before every frame it
 // reads, so nothing here has to clear it.
-func (s *Server) negotiate(sock net.Conn) (transport.Conn, netip.Addr, error) {
+func (s *Server) clientAddr(sock net.Conn) (netip.Addr, error) {
 	addr := peerAddr(sock.RemoteAddr())
 	if s.proxyV2 != nil && !s.proxyV2.allowed(addr) {
-		return nil, netip.Addr{}, errors.Join(
+		return netip.Addr{}, errors.Join(
 			fmt.Errorf("no PROXY header is accepted from %s: not an allowlisted balancer", addr), sock.Close())
 	}
 	if err := sock.SetReadDeadline(time.Now().Add(s.handshakeTimeout)); err != nil {
-		return nil, netip.Addr{}, errors.Join(errors.New("set handshake deadline"), err, sock.Close())
+		return netip.Addr{}, errors.Join(errors.New("set handshake deadline"), err, sock.Close())
+	}
+	if s.proxyV2 == nil {
+		return addr, nil
 	}
 
 	// Before the codec sniff, never after: the sniff picks a codec from the
 	// first bytes of the stream, so a header still in it would be read as a
 	// codec tag and every later frame would decode as garbage.
-	if s.proxyV2 != nil {
-		client, err := readProxyV2(sock)
-		if err != nil {
-			return nil, netip.Addr{}, errors.Join(errors.New("read PROXY v2 header"), err, sock.Close())
-		}
-		addr = client
+	client, err := readProxyV2(sock)
+	if err != nil {
+		return netip.Addr{}, errors.Join(errors.New("read PROXY v2 header"), err, sock.Close())
 	}
+	return client, nil
+}
 
+// detectCodec negotiates the transport of a socket whose address has already
+// been established.
+func (s *Server) detectCodec(sock net.Conn) (transport.Conn, error) {
 	// Hand gotd this one socket to negotiate: its Accept owns the failure path
 	// and closes the socket if detection fails, exactly as it did when it held
 	// the listener itself.
 	conn, err := transport.Listen(&singleConn{conn: sock}).Accept()
 	if err != nil {
-		return nil, netip.Addr{}, errors.Join(errors.New("detect codec"), err)
+		return nil, errors.Join(errors.New("detect codec"), err)
 	}
-	return conn, addr, nil
+	return conn, nil
 }
 
 // peerAddr parses the transport peer address of an accepted socket. An address
