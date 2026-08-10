@@ -12,7 +12,11 @@ DELETE FROM usernames WHERE handle = lower(sqlc.arg(handle)) AND owner_type = sq
 DELETE FROM usernames WHERE owner_type = sqlc.arg(owner_type) AND owner_id = sqlc.arg(owner_id);
 
 -- name: GetUserByUsername :one
-SELECT u.* FROM users u
+-- The handle reported back is the joined usernames row — the one that admitted
+-- the account to this result — not the denormalized users.username copy.
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM users u
 JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 WHERE un.handle = lower(sqlc.arg(handle));
 

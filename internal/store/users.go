@@ -71,7 +71,7 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 	if err := tx.Commit(ctx); err != nil {
 		return User{}, fmt.Errorf("commit: %w", err)
 	}
-	return UserFromDB(u), nil
+	return UserFromDB(db.UserByIDRow(u)), nil
 }
 
 // UserByID returns the user for id, ok=false when absent.
@@ -95,11 +95,18 @@ func (s *Store) UserByPhone(ctx context.Context, phone string) (User, bool, erro
 	case err != nil:
 		return User{}, false, fmt.Errorf("user by phone: %w", err)
 	}
-	return UserFromDB(u), true, nil
+	return UserFromDB(db.UserByIDRow(u)), true, nil
 }
 
-// UserFromDB converts a sqlc-generated User model to the store's User type.
-func UserFromDB(u db.User) User {
+// UserFromDB converts a user row to the store's User type. Every query that
+// loads a user selects the same columns, so sqlc emits one identically shaped
+// struct per query and Go converts between them: one converter here is what
+// keeps a new query from mapping a user through a second, divergent path.
+//
+// Username is the handle off the joined usernames row, which is what makes the
+// value authoritative. Nil means the account holds no handle, whatever the
+// denormalized users.username copy still says.
+func UserFromDB(u db.UserByIDRow) User {
 	var lastSeen *time.Time
 	if u.LastSeenAt.Valid {
 		t := u.LastSeenAt.Time
@@ -281,20 +288,7 @@ func (s *Store) SearchContacts(ctx context.Context, ownerID int64, query string,
 	}
 	out := make([]User, len(rows))
 	for i, r := range rows {
-		var lastSeen *time.Time
-		if r.LastSeenAt.Valid {
-			t := r.LastSeenAt.Time
-			lastSeen = &t
-		}
-		out[i] = User{
-			ID:         r.ID,
-			Phone:      r.Phone,
-			FirstName:  r.FirstName,
-			LastName:   r.LastName,
-			IsOnline:   r.IsOnline,
-			LastSeenAt: lastSeen,
-			Username:   r.Username,
-		}
+		out[i] = UserFromDB(db.UserByIDRow(r))
 	}
 	return out, nil
 }
