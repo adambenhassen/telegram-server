@@ -608,6 +608,31 @@ func (c Config) WarnClientAddrTrust(log *slog.Logger) {
 		"risk", "behind a proxy or L4 load balancer every client shares one bucket: the per-IP cap becomes a global one, and the pre-auth connection cap becomes a server-wide ceiling on concurrent handshakes that refuses every client past it; behind a carrier NAT a whole mobile network shares one bucket and its subscribers are refused on each other's traffic")
 }
 
+// handshakeReadTimeout is the timeout gotd applies to each read inside key
+// exchange (its DefaultTimeout). It is not this server's number to set, and it
+// is the floor a pre-auth lifetime ceiling has to clear: a ceiling under it
+// expires while a handshake is still legitimately waiting on one read.
+const handshakeReadTimeout = 60 * time.Second
+
+// WarnPreAuthLifetime states, once at startup, that the configured pre-auth
+// ceiling is short enough to cut handshakes rather than holds.
+//
+// It is a warning and not a startup failure because the value is legitimate
+// under load shedding, and because zero — the ceiling off entirely — is a
+// supported setting that this must not appear to forbid. What it prevents is the
+// silent case: an operator tuning the ceiling down to shed a flood, and getting
+// intermittent handshake failures from slow clients that look like a network
+// fault rather than the number they just set.
+func (c Config) WarnPreAuthLifetime(log *slog.Logger) {
+	if c.PreAuth.Lifetime <= 0 || c.PreAuth.Lifetime >= handshakeReadTimeout {
+		return
+	}
+	log.Warn("TG_PREAUTH_LIFETIME is below the handshake's own read timeout",
+		"lifetime", c.PreAuth.Lifetime,
+		"handshake_read_timeout", handshakeReadTimeout,
+		"risk", "a client still inside key exchange can be closed for being slow rather than for holding the connection, which reads as an intermittent connection failure")
+}
+
 // advertiseAddr resolves the address clients are told to dial. An explicit
 // TG_ADVERTISE_ADDR is used verbatim and must parse, since a wrong one is only
 // visible as clients failing to reconnect; an empty one is derived from the

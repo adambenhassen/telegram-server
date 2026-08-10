@@ -13,6 +13,7 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/crypto"
+	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/proto/codec"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/transport"
@@ -42,7 +43,7 @@ func TestPreAuthGlobalCapRefusesBeforeNegotiating(t *testing.T) {
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
 	tap := &tapListener{Listener: nl}
 	// Two slots, no other bound: the cap alone decides every outcome below.
-	serveClients(t, ctx, tap, nil, nil, withPreAuthLimits(mtproto.PreAuthLimits{MaxConns: 2}))
+	serveClients(t, ctx, tap, nil, nil, withPreAuthLimits(t, mtproto.PreAuthLimits{MaxConns: 2}))
 	addr := nl.Addr().String()
 
 	holds := make([]net.Conn, 2)
@@ -78,7 +79,7 @@ func TestPreAuthPerAddrCapKeysOnTheBalancerAddress(t *testing.T) {
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
 	// One slot per client address and no global bound, so nothing but the
 	// per-address cap can refuse anything here.
-	serveClients(t, ctx, nl, loopback, nil, withPreAuthLimits(mtproto.PreAuthLimits{MaxConnsPerNet: 1}))
+	serveClients(t, ctx, nl, loopback, nil, withPreAuthLimits(t, mtproto.PreAuthLimits{MaxConnsPerNet: 1}))
 	addr := nl.Addr().String()
 
 	flooder := netip.MustParseAddr("203.0.113.9")
@@ -118,7 +119,7 @@ func TestPreAuthPerNetCapBucketsIPv6ByPrefix(t *testing.T) {
 	defer cancel()
 
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
-	serveClients(t, ctx, nl, loopback, nil, withPreAuthLimits(mtproto.PreAuthLimits{MaxConnsPerNet: 1}))
+	serveClients(t, ctx, nl, loopback, nil, withPreAuthLimits(t, mtproto.PreAuthLimits{MaxConnsPerNet: 1}))
 	addr := nl.Addr().String()
 
 	holdPreAuth(t, ctx, addr, proxyV2Header(proxyCmdProxy, netip.MustParseAddr("2001:db8:1:1::1")))
@@ -144,6 +145,81 @@ func TestPreAuthPerNetCapBucketsIPv6ByPrefix(t *testing.T) {
 	}
 }
 
+// TestPreAuthNoClientAddressIsChargedToNoNetwork pins the exemption in the
+// per-network cap, because an exemption nobody has written down is a hole
+// somebody finds. A header that names no client — the LOCAL command a balancer's
+// health check sends, or AF_UNSPEC — is charged to no bucket at all, so those
+// connections are bounded by the global cap and the ceiling alone.
+//
+// It is the right call for health checks and the wrong list to be generous with:
+// everything inside the allowlisted CIDRs can send such a header, so the
+// allowlist should name the balancers rather than a whole network. That is what
+// the docs entry says, and this is the behaviour it describes.
+func TestPreAuthNoClientAddressIsChargedToNoNetwork(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
+	serveClients(t, ctx, nl, loopback, nil, withPreAuthLimits(t, mtproto.PreAuthLimits{MaxConnsPerNet: 1}))
+	addr := nl.Addr().String()
+
+	// One held connection per header that names no client, both well past a cap
+	// of one, and neither refused.
+	local := proxyV2Header(proxyCmdLocal, netip.MustParseAddr("203.0.113.9"))
+	unspec := proxyV2Header(proxyCmdProxy, netip.Addr{})
+	holdPreAuth(t, ctx, addr, local)
+	for _, prelude := range [][]byte{local, unspec} {
+		served, err := probeServed(ctx, addr, prelude)
+		if err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+		if !served {
+			t.Error("a connection carrying no client address was refused at the per-network cap: it is charged to no bucket, so it cannot fill one")
+		}
+	}
+
+	// The exemption is the address, not the cap: a header that does name a
+	// client is still counted.
+	client := netip.MustParseAddr("198.51.100.7")
+	holdPreAuth(t, ctx, addr, proxyV2Header(proxyCmdProxy, client))
+	served, err := probeServed(ctx, addr, proxyV2Header(proxyCmdProxy, client))
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if served {
+		t.Errorf("a second connection from %s was served past a cap of 1", client)
+	}
+}
+
+// TestSetPreAuthLimitsRefusesNegativeBounds covers the difference between the
+// two ways of writing "no bound": zero is a decision and is honoured, negative
+// is a typo or a unit mistake and is refused. Read as equal, a negative would
+// disable the bound it was meant to set, which is silent and is the failure
+// every layer of this surface is written to avoid.
+func TestSetPreAuthLimitsRefusesNegativeBounds(t *testing.T) {
+	t.Parallel()
+
+	for name, limits := range map[string]mtproto.PreAuthLimits{
+		"negative global cap":  {MaxConns: -1},
+		"negative network cap": {MaxConnsPerNet: -1},
+		"negative lifetime":    {Lifetime: -time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
+			if err := srv.SetPreAuthLimits(limits); err == nil {
+				t.Errorf("SetPreAuthLimits(%+v) accepted a negative bound, which turns it off", limits)
+			}
+		})
+	}
+
+	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
+	if err := srv.SetPreAuthLimits(mtproto.PreAuthLimits{}); err != nil {
+		t.Errorf("SetPreAuthLimits refused every bound turned off: %v", err)
+	}
+}
+
 // TestPreAuthLifetimeClosesAFrameDripHold covers the third bound against the
 // hold that no deadline catches. Every read the server does re-derives its own
 // deadline, so a peer that sends one small frame just inside each of them keeps
@@ -156,7 +232,7 @@ func TestPreAuthLifetimeClosesAFrameDripHold(t *testing.T) {
 
 	const lifetime = 750 * time.Millisecond
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
-	serveClients(t, ctx, nl, nil, nil, withPreAuthLimits(mtproto.PreAuthLimits{Lifetime: lifetime}))
+	serveClients(t, ctx, nl, nil, nil, withPreAuthLimits(t, mtproto.PreAuthLimits{Lifetime: lifetime}))
 
 	raw := dialClient(t, ctx, nl.Addr().String())
 	conn, err := transport.Abridged.Handshake(raw)
@@ -195,7 +271,7 @@ func TestPreAuthAuthenticatedConnectionOutlivesTheCeiling(t *testing.T) {
 	// the first frame, short enough that the sleep below is well past it.
 	const lifetime = 2 * time.Second
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
-	seen, key := serveClients(t, ctx, nl, nil, nil, withPreAuthLimits(mtproto.PreAuthLimits{
+	seen, key := serveClients(t, ctx, nl, nil, nil, withPreAuthLimits(t, mtproto.PreAuthLimits{
 		MaxConns:       1,
 		MaxConnsPerNet: 1,
 		Lifetime:       lifetime,
@@ -236,7 +312,7 @@ func TestPreAuthCeilingEndsAtTheProvenKeyNotAtTheHandler(t *testing.T) {
 	// The handler outlasts the ceiling several times over, so a build that
 	// cleared the slot after the dispatch instead of before it loses this
 	// connection while the handler is still in it.
-	seen, key := serveBlocking(t, ctx, nl, 4*lifetime, withPreAuthLimits(mtproto.PreAuthLimits{Lifetime: lifetime}))
+	seen, key := serveBlocking(t, ctx, nl, 4*lifetime, withPreAuthLimits(t, mtproto.PreAuthLimits{Lifetime: lifetime}))
 
 	raw := dialClient(t, ctx, nl.Addr().String())
 	conn, err := transport.Abridged.Handshake(raw)
@@ -308,8 +384,13 @@ func holdPreAuth(t *testing.T, ctx context.Context, addr string, prelude []byte)
 // withPreAuthLimits configures a test server's pre-auth bounds. Every field is
 // set explicitly by the caller, defaults included, so a test states the whole
 // policy it is asserting against.
-func withPreAuthLimits(l mtproto.PreAuthLimits) func(*mtproto.Server) {
-	return func(s *mtproto.Server) { s.SetPreAuthLimits(l) }
+func withPreAuthLimits(t *testing.T, l mtproto.PreAuthLimits) func(*mtproto.Server) {
+	t.Helper()
+	return func(s *mtproto.Server) {
+		if err := s.SetPreAuthLimits(l); err != nil {
+			t.Fatalf("set pre-auth limits: %v", err)
+		}
+	}
 }
 
 // sendFrame writes one encrypted request under key, which is what an

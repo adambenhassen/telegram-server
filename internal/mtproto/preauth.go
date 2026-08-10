@@ -26,6 +26,18 @@ const preAuthLogInterval = 10 * time.Second
 // goroutines, each for at most Lifetime. One network alone holds at most
 // MaxConnsPerNet of each.
 //
+// Two exemptions are part of the formula rather than holes in it, and both are
+// deliberate. A connection carrying no address the server may key on — a
+// balancer's own health check, a peer the transport could not report — is
+// charged to no network, so that population is bounded by MaxConns and Lifetime
+// alone; keeping the allowlist to balancer addresses is what keeps it small.
+// And these are pre-auth bounds: they end at the first frame that decrypts under
+// a key this server issued, so one completed key exchange buys connections that
+// none of the three hold. That is the intended line — a client between key
+// exchange and sign-in is waiting on a human reading a code and must not be cut
+// — and bounding what one such key may hold is a separate bound on separate
+// state, not a number that belongs here.
+//
 // They are policy constants, not adaptive logic: nothing here reacts to load,
 // keeps a reputation, or rate-limits opens. A connection is inside the bounds or
 // it is closed.

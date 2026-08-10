@@ -111,7 +111,10 @@ func run(log *slog.Logger) error {
 	if err := trustClientAddr(server, cfg, log); err != nil {
 		return err
 	}
-	server.SetPreAuthLimits(cfg.PreAuth)
+	if err := server.SetPreAuthLimits(cfg.PreAuth); err != nil {
+		return err
+	}
+	cfg.WarnPreAuthLifetime(log)
 
 	// Connection lifecycle callback: when a session binds or closes, record the
 	// status change and notify other replicas.

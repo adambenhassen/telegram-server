@@ -7,6 +7,7 @@ package mtproto
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -68,9 +69,14 @@ type Server struct {
 	// preAuth bounds what connections that have not authenticated may hold.
 	// Written once before Serve and only read after, like proxyV2.
 	preAuth *preAuthLimiter
-	// preAuthLog thins the refusal line those bounds produce, which is provoked
-	// by the same peers and at the same rate as the negotiation one.
-	preAuthLog logSampler
+	// One sampler per pre-auth event, never one shared between them: each is
+	// provoked by whoever can reach the port, and a flood against one bound
+	// would otherwise spend the shared window and silence the others — leaving
+	// the operator with the one line that says which bound is firing suppressed
+	// by the flood it describes.
+	globalCapLog logSampler
+	netCapLog    logSampler
+	ceilingLog   logSampler
 
 	// onStatusChange fires when a user's connection count transitions between
 	// zero and non-zero. Called after the registry has been updated, so a
@@ -104,10 +110,24 @@ func (s *Server) TrustProxyV2Headers(allow []netip.Prefix) {
 // SetPreAuthLimits replaces the bounds on what connections that have not
 // authenticated may hold. Call it before Serve.
 //
-// Every field is taken as given, a zero one included: the defaults are
+// A zero field is taken as given and turns its bound off: the defaults are
 // DefaultPreAuthLimits, and an operator turning a bound off has to be able to.
-func (s *Server) SetPreAuthLimits(l PreAuthLimits) {
+// A negative one is refused rather than read as zero, because those two say
+// opposite things — one is a decision, the other is a typo or a unit mistake,
+// and the failure they share is a bound that is silently not there. The config
+// loader refuses them by name one layer up; this is the same rule at the API,
+// for every other caller.
+func (s *Server) SetPreAuthLimits(l PreAuthLimits) error {
+	switch {
+	case l.MaxConns < 0:
+		return fmt.Errorf("pre-auth MaxConns is %d: must not be negative, and 0 disables the cap", l.MaxConns)
+	case l.MaxConnsPerNet < 0:
+		return fmt.Errorf("pre-auth MaxConnsPerNet is %d: must not be negative, and 0 disables the cap", l.MaxConnsPerNet)
+	case l.Lifetime < 0:
+		return fmt.Errorf("pre-auth Lifetime is %s: must not be negative, and 0 disables the ceiling", l.Lifetime)
+	}
 	s.preAuth = newPreAuthLimiter(l)
+	return nil
 }
 
 // New creates a Server that answers on dcID using key for the handshake, keys to
@@ -212,7 +232,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 			slot, ok := s.preAuth.admit()
 			if !ok {
 				s.dropRefused(sock)
-				if dropped, allow := s.preAuthLog.allow(time.Now(), preAuthLogInterval); allow {
+				if dropped, allow := s.globalCapLog.allow(time.Now(), preAuthLogInterval); allow {
 					s.log.Info("connection refused at the pre-auth cap",
 						"cap", s.preAuth.limits.MaxConns, "suppressed", dropped)
 				}
@@ -269,7 +289,7 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 		if err := sock.Close(); err != nil && !isDisconnect(err) {
 			s.log.Info("close connection at the pre-auth ceiling", "err", err)
 		}
-		if dropped, ok := s.preAuthLog.allow(time.Now(), preAuthLogInterval); ok {
+		if dropped, ok := s.ceilingLog.allow(time.Now(), preAuthLogInterval); ok {
 			s.log.Info("connection closed at the pre-auth lifetime ceiling",
 				"lifetime", s.preAuth.limits.Lifetime, "suppressed", dropped)
 		}
@@ -286,7 +306,7 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 	// flood consists of.
 	if !slot.keyAddr(addr) {
 		s.dropRefused(sock)
-		if dropped, ok := s.preAuthLog.allow(time.Now(), preAuthLogInterval); ok {
+		if dropped, ok := s.netCapLog.allow(time.Now(), preAuthLogInterval); ok {
 			s.log.Info("connection refused at the per-network pre-auth cap",
 				"client_addr", addr, "cap", s.preAuth.limits.MaxConnsPerNet, "suppressed", dropped)
 		}
