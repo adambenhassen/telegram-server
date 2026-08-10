@@ -439,6 +439,18 @@ func TestRateLimitWaitRoundsUp(t *testing.T) {
 		t.Fatalf("first request: %v", err)
 	}
 
+	// The remainder has to be a known fraction of a second for a ceil to be
+	// assertable at all. Left to real time it is however much of the window the
+	// round trip to the denial has already spent, which on a loaded host is
+	// seconds, and the test then measures the host rather than the rounding. So
+	// the clock the wait is measured against is pinned 9.99s short of the row's
+	// own deadline.
+	expiresAt, err := store.RateLimitExpiresAt(ctx, s, subject, surface)
+	if err != nil {
+		t.Fatalf("read expires_at: %v", err)
+	}
+	store.SetNowFunc(s, func() time.Time { return expiresAt.Add(-9990 * time.Millisecond) })
+
 	// Denial should round up to whole seconds: 9.99s rounds to 10s.
 	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
 	if err != nil {
