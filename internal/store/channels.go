@@ -873,14 +873,30 @@ func (s *Store) SearchPublicChannels(ctx context.Context, query string, limit in
 // SearchMemberChannels returns the channels viewerID belongs to whose title or
 // handle matches the query, public and private alike, capped at limit. A
 // channel the caller never joined, or is banned from, is not returned.
+//
+// The caller's own channel ids are read first and handed to the query as the
+// scope its title match runs inside, the same two-step SearchGlobal uses. It is
+// a scope and not the authorization — the participant join inside the query
+// still decides who sees what, and re-checks the ban — and it is what keeps the
+// cost of this arm on the caller's own memberships rather than on every channel
+// on the server whose title happens to match. See the query comment for why
+// that bound has to be written down rather than left to the planner.
 func (s *Store) SearchMemberChannels(
 	ctx context.Context, viewerID int64, query string, limit int32,
 ) ([]MemberChannelMatch, error) {
+	channelIDs, err := s.q.MemberChannelIDs(ctx, viewerID)
+	if err != nil {
+		return nil, fmt.Errorf("member channel ids: %w", err)
+	}
+	if channelIDs == nil {
+		channelIDs = []int64{}
+	}
 	rows, err := s.q.SearchMemberChannels(ctx, db.SearchMemberChannelsParams{
-		ViewerID: viewerID,
-		Query:    query,
-		Handle:   searchHandle(query),
-		Lim:      limit,
+		ViewerID:   viewerID,
+		ChannelIds: channelIDs,
+		Query:      query,
+		Handle:     searchHandle(query),
+		Lim:        limit,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("search member channels: %w", err)
