@@ -366,7 +366,7 @@ Channels
   stemming, exact-token match across all locales).
 - `messages.search` — full-text keyword search over the caller's own outbound
   messages within a named 1:1 dialog (`out = true`). Non-user peers and
-  inbound-message search are out of scope (see Known deferrals). Authorization
+  inbound-message search are out of scope (extended in M15). Authorization
   boundary: results are bounded to rows the caller owns and sent — a received
   message is never returned even if the caller can read it via `getHistory`.
 - `contacts.search` — full-text search over display names (first name + last
@@ -426,12 +426,49 @@ Channels
   the window; the full login flow completes under default per-IP limits.
 
 ### M15 — Extended search surface
-- Schema additions: `message_tsv` tsvector column on `channel_messages` (GIN index, `'simple'` dictionary) covering post text; `name_tsv` tsvector column on `channels` (GIN index, `'simple'` dictionary) covering channel titles.
-- `messages.search` extended to three peer types. User-peer search now matches both inbound and outbound messages — the M13 `out = true` restriction is lifted. Chat-peer search (membership-gated) searches the caller's own message rows for that chat. Channel-peer search (membership-gated) searches `channel_messages`, returning `MessagesChannelMessages`, the same split `getHistory` makes for channels.
-- `contacts.search` extended beyond M13's dialog-scoped user-name matching to include public channel discovery by title. A private channel whose title matches is indistinguishable from no match — the filter runs in SQL before the result limit, not as a post-filter. The two result arms (dialog users, channels) share one result budget; users page first; both arms order by id.
-- `messages.searchGlobal` — cross-dialog keyword search over every peer type the caller participates in (user, chat, and channel) in one reply. The result set is the union of two authorized sets — owned rows for user and chat peers, membership-gated shared rows for channel peers — and widens neither. `folder_id`, `min_date`/`max_date`, and the per-class filter flags are accepted and silently dropped, returning a superset of what the client filtered for, never more than the caller may read. A page that loses rows to a concurrent delete signals retryably rather than reading as exhausted.
-- Search authorization invariants established (rules a future milestone must not silently undo): each peer type's existing read predicate is reused and never widened — ownership for user and chat rows, current membership for channel rows; channel members search the full post history because `join_pts` is a cost control, not a confidentiality boundary; a non-member keyword query against a private channel returns the same error as a query against a non-existent channel (no existence oracle); the `'simple'` dictionary applies to all search surfaces with no stemming.
-- E2E gates prove: keyword search over user peers including inbound matches (`TestSearchMessages`); chat-peer search and the non-member gate (`TestSearchChatPeer`); channel-peer post search (`TestSearchChannelPosts`); public channel discovery by title including private-channel invisibility and shared result budget (`TestContactsSearchChannelDiscovery`); cross-dialog search across all three peer types (`TestSearchGlobalAcrossDialogs`).
+- Schema additions: `message_tsv` tsvector column on `channel_messages`
+  (GIN index, `'simple'` dictionary) covering post text; `title_tsv` tsvector
+  column on `channels` (GIN index, `'simple'` dictionary) covering channel
+  titles.
+- `messages.search` extended to three peer types. User-peer search now matches
+  both inbound and outbound messages — the M13 `out = true` restriction is
+  lifted. Chat-peer search (membership-gated) searches the caller's own message
+  rows for that chat. Channel-peer search (membership-gated) searches
+  `channel_messages`, returning `MessagesChannelMessages`, the same split
+  `getHistory` makes for channels.
+- `contacts.search` extended beyond M13's dialog-scoped user-name matching.
+  The reply carries two vectors: `MyResults` holds dialog-peer users plus
+  channels the caller belongs to (including private ones) under one shared
+  budget — users fill first, channels take what remains, both ordered by id;
+  `Results` holds public channels discovered by title under its own separate
+  limit, so the caller's memberships cannot shrink caller-independent
+  discovery. A non-member's query against a private channel returns no match
+  and no existence signal — the visibility filter runs in SQL before the result
+  limit, not as a post-filter.
+- `messages.searchGlobal` — cross-dialog keyword search over every peer type
+  the caller participates in (user, chat, and channel) in one reply. The
+  result set is the union of two authorized sets — owned rows for user and
+  chat peers, membership-gated shared rows for channel peers — and widens
+  neither. `folder_id`, `min_date`/`max_date`, and the broadcasts/groups/
+  users-only booleans are accepted and silently dropped; any non-empty
+  `Filter` value is rejected with the same error `messages.search` uses. A
+  page that loses rows to a concurrent delete signals retryably rather than
+  reading as exhausted.
+- Search authorization invariants established (rules a future milestone must
+  not silently undo): each peer type's existing read predicate is reused and
+  never widened — ownership for user and chat rows, current membership for
+  channel rows; channel members search the full post history because
+  `join_pts` is a cost control, not a confidentiality boundary; a non-member
+  keyword query against a private channel returns the same error as a query
+  against a non-existent channel (no existence oracle); the `'simple'`
+  dictionary applies to all search surfaces with no stemming.
+- E2E gates prove: keyword search over user peers including inbound matches
+  (`TestSearchMessages`); chat-peer search and non-member rejection
+  (`TestSearchChatPeer`); channel-peer post search (`TestSearchChannelPosts`);
+  public channel discovery by title, private-channel invisibility to
+  non-members, and the two-vector result structure
+  (`TestContactsSearchChannelDiscovery`); cross-dialog search across all three
+  peer types (`TestSearchGlobalAcrossDialogs`).
 
 ## Planned — feature track
 
@@ -637,7 +674,13 @@ Tracked so shortcuts don't rot into "later means never".
   should revisit whether a higher cap or a per-joiner rate limit is warranted once join-by-username
   traffic is observable. — M12
 
-- **Media filename indexing rejected.** `message_tsv` covers message text; document file names are not indexed and will not be added to the current index. `InputMessagesFilter*` variants are wholly unimplemented, and a filename match folded into a plain-text query would pollute results unpredictably — a result that matches because its file name contains the keyword is indistinguishable from a message-text match. Revisit when a filter surface exists that lets the client and server separate the two match types. — M13
+- **Media filename indexing rejected.** `message_tsv` covers message text;
+  document file names are not indexed and will not be added to the current
+  index. `InputMessagesFilter*` variants are wholly unimplemented: a filename
+  match folded into a plain-text query would pollute results unpredictably —
+  a result that matches because its file name contains the keyword is
+  indistinguishable from a message-text match. Revisit when a filter surface
+  exists that lets the client and server separate the two match types. — M13
 - **Secret-chat messages are permanently non-indexable.** The server stores encrypted blobs
   without inspecting plaintext, so full-text indexing of secret-chat content is not possible by
   design and will not be added. — M13
