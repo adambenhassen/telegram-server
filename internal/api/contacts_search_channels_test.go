@@ -594,9 +594,19 @@ func TestContactsSearchPrivateChannelInvisible(t *testing.T) {
 // not occupy a row inside the limit that is then dropped, because the caller
 // would read the missing row as proof the private channel exists.
 //
-// The private channel is given an id below every public match, so it sorts ahead
-// of them in the query's id order and would land inside the page under a Go
-// post-filter.
+// Both private channels are given ids below every public match, so they sort
+// ahead of them in the query's id order and would land inside the page under a
+// Go post-filter. Channel ids are random draws, so creating them first no longer
+// places them there and the ids are set explicitly instead.
+//
+// There are two of them because the M16 discoverability marker narrows the
+// candidate set: an ordinary private channel is now excluded before the join
+// runs, and a mutation that moved the authoritative drop after LIMIT would no
+// longer be caught by it. The second one carries publicly_discoverable without a
+// usernames row — the permissive drift the marker is allowed to have — so a
+// private match still reaches the join, and moving that drop into Go still costs
+// the caller a row it should have been served. The marker is the cost gate; this
+// is the test that keeps the join the disclosure gate.
 func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -625,9 +635,6 @@ func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 	}
 	slices.Sort(want)
 
-	// The private channel only tests anything from inside the page, which means
-	// below every public match. Channel ids are random draws, so creating it
-	// first no longer places it there and the id is set explicitly instead.
 	channelExec(t, ctx, dsn, `
 		WITH private AS (
 			INSERT INTO channels (id, title, creator_id) VALUES ($1, 'Kayaking Private', $2)
@@ -638,6 +645,20 @@ func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 		)
 		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
 		SELECT id, $2, 2, 0 FROM private`, want[0]-1, creator.ID)
+
+	// Marked discoverable, and owning no handle: the join is the only thing
+	// standing between this row and the page.
+	channelExec(t, ctx, dsn, `
+		WITH marked AS (
+			INSERT INTO channels (id, title, creator_id, publicly_discoverable)
+			VALUES ($1, 'Kayaking Marked', $2, true)
+			RETURNING id
+		),
+		state AS (
+			INSERT INTO channel_state (channel_id) SELECT id FROM marked
+		)
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
+		SELECT id, $2, 2, 0 FROM marked`, want[0]-2, creator.ID)
 
 	found := searchChannels(t, s, caller.ID, "Kayaking", limit)
 
@@ -837,5 +858,61 @@ func TestContactsSearchUsersAndChannels(t *testing.T) {
 	}
 	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != ch.ID {
 		t.Errorf("Results channels = %v, want [%d]", got, ch.ID)
+	}
+}
+
+// TestContactsSearchFollowsUsernameLifecycle proves title discovery tracks the
+// handle in both directions, through the RPC that changes it.
+//
+// The public arm now costs what it costs because its candidate set is narrowed
+// by a persisted marker rather than by the join alone, and a marker is a copy:
+// a channel that claims a handle and does not get marked is public but
+// unfindable by title, and one that releases a handle and stays marked keeps
+// paying for a candidate row it can never return. Neither is visible in the
+// stored username the other username tests assert on, so this asserts on what
+// a stranger can actually find.
+func TestContactsSearchFollowsUsernameLifecycle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	stranger, err := s.CreateUser(ctx, "15550011001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	creator, err := s.CreateUser(ctx, "15550011002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "Birdwatching Weekly", "About", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := channelPeerIDs(searchChannels(t, s, stranger.ID, "Birdwatching", 10).Results); len(got) != 0 {
+		t.Fatalf("private channel found by title before any handle: %v", got)
+	}
+
+	if _, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
+		Channel:  api.InputChannel(creator.ID, ch.ID),
+		Username: "birdweekly",
+	}); err != nil {
+		t.Fatalf("set username: %v", err)
+	}
+	if got := channelPeerIDs(searchChannels(t, s, stranger.ID, "Birdwatching", 10).Results); len(got) != 1 || got[0] != ch.ID {
+		t.Fatalf("after claiming a handle, title search Results = %v, want [%d]", got, ch.ID)
+	}
+
+	if _, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
+		Channel:  api.InputChannel(creator.ID, ch.ID),
+		Username: "",
+	}); err != nil {
+		t.Fatalf("clear username: %v", err)
+	}
+	if got := channelPeerIDs(searchChannels(t, s, stranger.ID, "Birdwatching", 10).Results); len(got) != 0 {
+		t.Fatalf("after releasing the handle, title search Results = %v, want none", got)
+	}
+	if got := channelPeerIDs(searchChannels(t, s, stranger.ID, "birdweekly", 10).Results); len(got) != 0 {
+		t.Fatalf("after releasing the handle, handle search Results = %v, want none", got)
 	}
 }
