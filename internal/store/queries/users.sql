@@ -78,9 +78,13 @@ UPDATE users SET username = $2 WHERE id = $1;
 -- What that costs is the early exit, the same trade the channel arms made. A
 -- token nearly every user carries is now answered from the whole candidate set
 -- rather than from the first rows of the id scan, so a caller holding a dialog
--- with every user goes 0.31 ms -> 413 ms on one. It falls on the same callers
--- the fence rescues and only on the densest tokens: a caller with 1k partners
--- searching a token a tenth of the corpus carries moves 6.95 ms -> 16.6 ms.
+-- with every user goes 0.31 ms -> 413 ms on one. It is not confined to the
+-- callers the fence rescues, and not to the densest tokens either: a caller
+-- with 1k partners, who was never on the walk and so had nothing rescued, pays
+-- it from 1% match density upward — 5.14 -> 5.32 ms at 1%, 6.95 -> 16.6 ms at
+-- 10%, 0.39 -> 8.63 ms at 100% — bounded around 17 ms there, and that is where
+-- a latency report would come from. Smaller dialog sets stay flat: at 50
+-- partners every density measured lands under 1.6 ms.
 WITH matched AS MATERIALIZED (
     SELECT tu.id
     FROM users tu
