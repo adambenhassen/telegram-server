@@ -810,3 +810,109 @@ func TestContactsSearchUsersAndChannels(t *testing.T) {
 		t.Errorf("Results channels = %v, want [%d]", got, ch.ID)
 	}
 }
+
+// TestContactsSearchFollowsUsernameLifecycle proves title discovery tracks the
+// handle in both directions, through the RPC that changes it.
+//
+// The public arm now costs what it costs because its candidate set is narrowed
+// by a persisted marker rather than by the join alone, and a marker is a copy:
+// a channel that claims a handle and does not get marked is public but
+// unfindable by title, and one that releases a handle and stays marked keeps
+// paying for a candidate row it can never return. Neither is visible in the
+// stored username the other username tests assert on, so this asserts on what
+// a stranger can actually find.
+func TestContactsSearchFollowsUsernameLifecycle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	stranger, err := s.CreateUser(ctx, "15550011001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	creator, err := s.CreateUser(ctx, "15550011002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "Birdwatching Weekly", "About", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := channelPeerIDs(searchChannels(t, s, stranger.ID, "Birdwatching", 10).Results); len(got) != 0 {
+		t.Fatalf("private channel found by title before any handle: %v", got)
+	}
+
+	if _, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
+		Channel:  api.InputChannel(creator.ID, ch.ID),
+		Username: "birdweekly",
+	}); err != nil {
+		t.Fatalf("set username: %v", err)
+	}
+	if got := channelPeerIDs(searchChannels(t, s, stranger.ID, "Birdwatching", 10).Results); len(got) != 1 || got[0] != ch.ID {
+		t.Fatalf("after claiming a handle, title search Results = %v, want [%d]", got, ch.ID)
+	}
+
+	if _, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
+		Channel:  api.InputChannel(creator.ID, ch.ID),
+		Username: "",
+	}); err != nil {
+		t.Fatalf("clear username: %v", err)
+	}
+	if got := channelPeerIDs(searchChannels(t, s, stranger.ID, "Birdwatching", 10).Results); len(got) != 0 {
+		t.Fatalf("after releasing the handle, title search Results = %v, want none", got)
+	}
+	if got := channelPeerIDs(searchChannels(t, s, stranger.ID, "birdweekly", 10).Results); len(got) != 0 {
+		t.Fatalf("after releasing the handle, handle search Results = %v, want none", got)
+	}
+}
+
+// TestContactsSearchStaleDiscoverableMarkerDisclosesNothing pins the direction
+// the discoverability marker is allowed to be wrong in.
+//
+// The marker narrows the public arm's candidate set and nothing else; the join
+// against usernames still decides what the query returns, and it still runs
+// before LIMIT. So a channel left marked public after its handle is gone —
+// which is what a writer that touches usernames without going through
+// SetChannelUsername would leave behind — costs a candidate row and discloses
+// nothing: it does not appear, and it does not displace a row that should.
+func TestContactsSearchStaleDiscoverableMarkerDisclosesNothing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+
+	stranger, err := s.CreateUser(ctx, "15550012001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	creator, err := s.CreateUser(ctx, "15550012002")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Created first, so it sorts ahead of the public match in id order and
+	// would take the single page slot if the marker were deciding anything.
+	stale, err := s.CreateChannel(ctx, creator.ID, "Orienteering Alpha", "About", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimChannelUsernameForTest(s, stale.ID, "orienteeringalpha"); err != nil {
+		t.Fatal(err)
+	}
+	public, err := s.CreateChannel(ctx, creator.ID, "Orienteering Beta", "About", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimChannelUsernameForTest(s, public.ID, "orienteeringbeta"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drop the authoritative row behind the marker's back, leaving the copy and
+	// the marker both claiming the channel is public.
+	channelExec(t, ctx, dsn, `DELETE FROM usernames WHERE owner_type = 'channel' AND owner_id = $1`, stale.ID)
+
+	found := searchChannels(t, s, stranger.ID, "Orienteering", 1)
+	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != public.ID {
+		t.Fatalf("Results = %v, want [%d] — the stale marker must cost a candidate, not a row", got, public.ID)
+	}
+}

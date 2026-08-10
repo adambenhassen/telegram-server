@@ -20,16 +20,17 @@ type AuthKey struct {
 }
 
 type Channel struct {
-	ID              int64
-	Title           string
-	About           string
-	CreatorID       int64
-	Megagroup       bool
-	Version         int32
-	Date            pgtype.Timestamptz
-	PinnedMessageID *int32
-	Username        *string
-	TitleTsv        interface{}
+	ID                   int64
+	Title                string
+	About                string
+	CreatorID            int64
+	Megagroup            bool
+	Version              int32
+	Date                 pgtype.Timestamptz
+	PinnedMessageID      *int32
+	Username             *string
+	TitleTsv             interface{}
+	PubliclyDiscoverable bool
 }
 
 type ChannelEvent struct {
