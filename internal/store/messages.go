@@ -161,12 +161,19 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 		return Message{}, 0, 0, false, fmt.Errorf("ensure recipient state: %w", err)
 	}
 
-	// Idempotency: a resend with the same random_id returns the original.
+	// Idempotency: a resend with the same random_id returns the original, at the
+	// pts each side's stored copy occupies rather than that side's current pts.
+	// The client applies updateNewMessage by pts, so an old message carrying a
+	// current pts lands in a newer update's slot and silently displaces it.
 	if randomID != 0 {
 		existing, e := qtx.MessageByRandomID(ctx, db.MessageByRandomIDParams{OwnerID: fromID, RandomID: randomID})
 		switch {
 		case e == nil:
-			sPts, rPts, e2 := currentPts(ctx, qtx, fromID, toID)
+			sPts, e2 := newMessagePts(ctx, qtx, fromID, existing.LocalID)
+			if e2 != nil {
+				return Message{}, 0, 0, false, e2
+			}
+			rPts, e2 := mirrorPts(ctx, qtx, existing, toID)
 			if e2 != nil {
 				return Message{}, 0, 0, false, e2
 			}
@@ -623,6 +630,26 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 	return perOwner, nil
 }
 
+// mirrorPts returns the recipient's pts for the stored counterpart of a deduped
+// 1:1 send: the pts toID's inbox copy occupies.
+//
+// The dedup key is (sender, random_id) with no destination in it, so a sender
+// reusing one random_id across peers arrives here holding a row that is not this
+// send's pair at all. That row has no counterpart on toID's side to name a pts
+// from, and the recipient reports its current pts exactly as it did before —
+// nothing this function can return reaches a client, since only the sender's
+// value is answered to a caller on the dedup path.
+func mirrorPts(ctx context.Context, q *db.Queries, existing db.Message, toID int64) (int, error) {
+	if PeerType(existing.PeerType) != PeerTypeUser || existing.PeerID != toID || existing.PeerLocalID == 0 {
+		st, err := q.GetState(ctx, toID)
+		if err != nil {
+			return 0, fmt.Errorf("recipient state: %w", err)
+		}
+		return int(st.Pts), nil
+	}
+	return newMessagePts(ctx, q, toID, existing.PeerLocalID)
+}
+
 // currentPts returns both owners' current pts without advancing them.
 func currentPts(ctx context.Context, q *db.Queries, aID, bID int64) (int, int, error) {
 	as, err := q.GetState(ctx, aID)
@@ -787,12 +814,14 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 			})
 			switch {
 			case e == nil:
-				// Already forwarded — return the existing message with current pts.
-				st, e2 := qtx.GetState(ctx, fromID)
+				// Already forwarded — return the existing message at the pts it
+				// occupies, never the sender's current one, for the reason
+				// SendMessage's dedup branch records.
+				pts, e2 := newMessagePts(ctx, qtx, fromID, existing.LocalID)
 				if e2 != nil {
-					return nil, nil, fmt.Errorf("get state for dedup: %w", e2)
+					return nil, nil, e2
 				}
-				sentMsgs = append(sentMsgs, ForwardedMessage{Message: messageFromRow(existing), Pts: int(st.Pts)})
+				sentMsgs = append(sentMsgs, ForwardedMessage{Message: messageFromRow(existing), Pts: pts})
 				continue
 			case !errors.Is(e, pgx.ErrNoRows):
 				return nil, nil, fmt.Errorf("random_id lookup: %w", e)

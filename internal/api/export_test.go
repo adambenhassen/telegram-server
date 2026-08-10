@@ -410,6 +410,16 @@ func SendMediaForTestWithLimits(
 	return h.handleSendMedia(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// ForwardMessagesForTest encodes req and invokes handleForwardMessages for the
+// caller.
+func ForwardMessagesForTest(s *store.Store, userID int64, req *tg.MessagesForwardMessagesRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleForwardMessages(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // ForwardMessagesForTestWithLimits encodes req and invokes handleForwardMessages
 // with a custom message send rate limit config.
 func ForwardMessagesForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesForwardMessagesRequest) (bin.Encoder, error) {

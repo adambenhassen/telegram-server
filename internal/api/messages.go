@@ -168,11 +168,12 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	// limit so that a resend returns the stored message, never FLOOD_WAIT.
 	if req.RandomID != 0 {
 		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok {
-			// Retry of a delivered message: return the sender's row with
-			// the current pts without writing or rate-limiting.
-			senderState, err := h.store.State(r.Ctx, r.UserID)
+			// Retry of a delivered message: return the sender's row at the pts
+			// it occupies, without writing or rate-limiting. Never the sender's
+			// current pts — see store.ErrPtsUnknown for what that costs.
+			pts, err := h.store.MessagePts(r.Ctx, r.UserID, existing.LocalID)
 			if err != nil {
-				h.log.Error("read sender pts on retry", "user_id", r.UserID, "err", err)
+				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
 				return nil, errInternal
 			}
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
@@ -183,7 +184,7 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 			return &tg.Updates{
 				Updates: []tg.UpdateClass{
 					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
-					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: senderState.Pts, PtsCount: 1},
+					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: pts, PtsCount: 1},
 				},
 				Users: users,
 				Date:  int(existing.Date.Unix()),
@@ -254,10 +255,11 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 	// Check for a transport retry before the rate limit.
 	if req.RandomID != 0 {
 		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok {
-			// Retry: return the stored message without rate-limiting.
-			senderState, err := h.store.State(r.Ctx, r.UserID)
+			// Retry: return the stored message, at the pts it occupies, without
+			// rate-limiting.
+			pts, err := h.store.MessagePts(r.Ctx, r.UserID, existing.LocalID)
 			if err != nil {
-				h.log.Error("read sender pts on retry", "user_id", r.UserID, "err", err)
+				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
 				return nil, errInternal
 			}
 			chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
@@ -273,7 +275,7 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 			return &tg.Updates{
 				Updates: []tg.UpdateClass{
 					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
-					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: senderState.Pts, PtsCount: 1},
+					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: pts, PtsCount: 1},
 				},
 				Users: users,
 				Chats: chats,
@@ -632,18 +634,20 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		dupMsgs = append(dupMsgs, existing)
 	}
 	if allDup {
-		// Full retry: return stored messages without rate-limiting.
-		senderState, err := h.store.State(r.Ctx, r.UserID)
-		if err != nil {
-			h.log.Error("read sender pts on retry", "user_id", r.UserID, "err", err)
-			return nil, errInternal
-		}
+		// Full retry: return stored messages without rate-limiting. Each one
+		// carries the pts it occupies; a batch spans several, so one shared
+		// current pts would put every message but the last in a wrong slot.
 		perOwner := make(map[int64]int)
 		sentMsgs := make([]store.ForwardedMessage, 0, len(dupMsgs))
 		for _, m := range dupMsgs {
-			sentMsgs = append(sentMsgs, store.ForwardedMessage{Message: m, Pts: senderState.Pts})
+			pts, err := h.store.MessagePts(r.Ctx, r.UserID, m.LocalID)
+			if err != nil {
+				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
+				return nil, errInternal
+			}
+			sentMsgs = append(sentMsgs, store.ForwardedMessage{Message: m, Pts: pts})
 			if m.PeerType == store.PeerTypeChat {
-				perOwner[m.OwnerID] = senderState.Pts
+				perOwner[m.OwnerID] = pts
 			}
 		}
 		destPeerType, destPeerID, err := h.inputPeer(req.ToPeer, r.UserID)

@@ -358,6 +358,26 @@ func (q *Queries) LockChannelState(ctx context.Context, channelID int64) (Channe
 	return i, err
 }
 
+const newChannelPostPts = `-- name: NewChannelPostPts :one
+SELECT pts FROM channel_events
+WHERE channel_id = $1 AND local_id = $2 AND type = 1
+`
+
+type NewChannelPostPtsParams struct {
+	ChannelID int64
+	LocalID   int64
+}
+
+// NewChannelPostPts is NewMessagePts for a channel's log, and carries the same
+// contract: one row per post, type = 1 spelled as a literal for the partial
+// index.
+func (q *Queries) NewChannelPostPts(ctx context.Context, arg NewChannelPostPtsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, newChannelPostPts, arg.ChannelID, arg.LocalID)
+	var pts int64
+	err := row.Scan(&pts)
+	return pts, err
+}
+
 const searchChannelPostsPage = `-- name: SearchChannelPostsPage :many
 SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
 FROM channel_messages

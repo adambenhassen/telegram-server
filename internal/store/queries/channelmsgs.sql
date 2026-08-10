@@ -27,6 +27,13 @@ WHERE channel_id = sqlc.arg(channel_id) AND pts > sqlc.arg(from_pts) AND pts <= 
 ORDER BY pts
 LIMIT sqlc.arg(lim)::int;
 
+-- NewChannelPostPts is NewMessagePts for a channel's log, and carries the same
+-- contract: one row per post, type = 1 spelled as a literal for the partial
+-- index.
+-- name: NewChannelPostPts :one
+SELECT pts FROM channel_events
+WHERE channel_id = $1 AND local_id = $2 AND type = 1;
+
 -- name: InsertChannelEvent :exec
 INSERT INTO channel_events (channel_id, pts, type, local_id) VALUES ($1, $2, $3, $4);
 
