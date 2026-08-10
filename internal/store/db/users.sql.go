@@ -60,25 +60,30 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (CreateUserRow, 
 }
 
 const searchContactsByName = `-- name: SearchContactsByName :many
+WITH matched AS MATERIALIZED (
+    SELECT tu.id
+    FROM users tu
+    WHERE tu.name_tsv @@ plainto_tsquery('simple', $2)
+      AND EXISTS (
+          SELECT 1 FROM dialogs d
+          WHERE d.owner_id = $3::bigint
+            AND d.peer_id = tu.id
+            AND d.peer_type = 1
+      )
+)
 SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
        un.handle AS username
 FROM users u
 LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
-WHERE u.name_tsv @@ plainto_tsquery('simple', $1)
-  AND EXISTS (
-      SELECT 1 FROM dialogs d
-      WHERE d.owner_id = $2::bigint
-        AND d.peer_id = u.id
-        AND d.peer_type = 1
-  )
+WHERE u.id IN (SELECT id FROM matched)
 ORDER BY u.id
-LIMIT $3::int
+LIMIT $1::int
 `
 
 type SearchContactsByNameParams struct {
+	Lim     int32
 	Query   string
 	OwnerID int64
-	Lim     int32
 }
 
 type SearchContactsByNameRow struct {
@@ -107,8 +112,29 @@ type SearchContactsByNameRow struct {
 // budget are dropped; without a total order the set that survives truncation is
 // whatever the plan happened to emit, and two identical searches disagree. It
 // is the same order the channel arms use.
+//
+// The candidate set is computed in a MATERIALIZED CTE, and the fence is the
+// whole shape rather than a formatting choice. With both predicates in the
+// WHERE clause, ORDER BY u.id LIMIT lets the planner walk users in id order and
+// apply the tsquery as a filter, betting the page fills early. The bet loses on
+// every query that does not match most of the caller's dialog partners: the
+// walk reaches the end of the table, so a token nobody carries costs the whole
+// user set (52.7 ms at 200k users, against 0.28 ms here) and any authenticated
+// account picks that worst case for free by sending a nonsense token. Writing
+// the match as u.id IN (SELECT ...) the way the channel arms do is not enough
+// on its own — the planner flattens that subquery into a semi-join and takes
+// the same ordered scan (52.9 ms, measured) — so the set is fenced with AS
+// MATERIALIZED, which no plan can flatten. Both predicates sit inside the fence
+// so the planner still drives from whichever side is cheaper: the caller's
+// dialog index when the dialog set is small, users_name_tsv_idx when it is not.
+//
+// What that costs is the early exit, the same trade the channel arms made. A
+// token nearly every user carries is now answered from the whole candidate set
+// rather than from the first rows of the id scan, so a caller holding a dialog
+// with every user goes 0.31 ms -> 413 ms on one. That case needs a token the
+// corpus shares; the case it replaces needed only a token nobody has.
 func (q *Queries) SearchContactsByName(ctx context.Context, arg SearchContactsByNameParams) ([]SearchContactsByNameRow, error) {
-	rows, err := q.db.Query(ctx, searchContactsByName, arg.Query, arg.OwnerID, arg.Lim)
+	rows, err := q.db.Query(ctx, searchContactsByName, arg.Lim, arg.Query, arg.OwnerID)
 	if err != nil {
 		return nil, err
 	}
