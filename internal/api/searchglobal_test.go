@@ -384,7 +384,7 @@ func TestSearchGlobalRejectsATamperedCursorPeer(t *testing.T) {
 	}
 
 	// A channel id that exists and one that does not are the same refusal, so a
-	// cursor is not a way to probe the dense channels.id space.
+	// cursor is not a way to probe which channel ids exist.
 	if _, err = page(mallory.ID, api.InputPeerChannel(mallory.ID, d.channel.ID+9999)); err == nil {
 		t.Fatal("nonexistent channel cursor: expected PEER_ID_INVALID, got nil")
 	} else {

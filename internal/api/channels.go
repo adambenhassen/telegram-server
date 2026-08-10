@@ -215,9 +215,9 @@ func (h *handlers) handleLeaveChannel(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 	// No participant row and no channel at all are one error on purpose, the way
-	// the chat path collapses them (internal/api/chatusers.go:35): channel ids are
-	// a dense BIGSERIAL space, so a distinguishable not-found would make every
-	// channel on the server enumerable by a caller who is in none of them.
+	// the chat path collapses them (internal/api/chatusers.go:35): a
+	// distinguishable not-found answers "does this channel exist" for every id a
+	// caller can name, and the id is never what admits anyone.
 	if !left {
 		return nil, errPeerIDInvalid
 	}
@@ -242,8 +242,8 @@ const maxChannelMessagesPerCall = 100
 // requireChannelMember is the read gate for a client-supplied channel id: the
 // caller must hold a participant row that is not banned as of now. An unknown
 // channel, a channel the caller never joined and a banned member all report
-// errPeerIDInvalid, so a caller cannot probe which channel ids exist over a
-// dense id space, and a ban is not merely cosmetic.
+// errPeerIDInvalid, so the error cannot be read as an answer to "does this
+// channel exist", and a ban is not merely cosmetic.
 //
 // Unlike the post path, whose authoritative check lives inside the store's
 // write transaction under the channel_state row lock, a read has no write to
@@ -564,7 +564,8 @@ func (h *handlers) channelMessages(r *mtproto.Request, channelID int64, msgs []s
 
 // inviteLinkPrefix is what a hash is rendered behind. The link is the whole
 // credential, so nothing but the hash may appear after it — an id in the link
-// would put the dense channels.id space back on the wire.
+// hands a real channel id to everyone the link travels through, and the hash
+// alone is what admits.
 const inviteLinkPrefix = "https://t.me/+"
 
 // revokeExportedChatInviteTypeID is the constructor id of
@@ -600,11 +601,10 @@ func (r *revokeExportedChatInviteRequest) Decode(b *bin.Buffer) error {
 // handleExportChatInvite serves messages.exportChatInvite for a channel.
 //
 // Every rejection returns errPeerIDInvalid: no channel row, no participant row,
-// role 0, or a live ban. They are ONE error deliberately. channels.id is dense
-// BIGSERIAL and the peer access hash is the placeholder access_hash == id, so a
-// distinguishable "not a member" would confirm to any account that a channel
-// with that id exists, and the invite hash is the only thing standing between an
-// account and admission.
+// role 0, or a live ban. They are ONE error deliberately: a distinguishable
+// "not a member" would confirm to any account that a channel with that id
+// exists, and the invite hash is the only thing standing between an account and
+// admission.
 //
 // Role 1 is the floor because an invite is a bearer credential for the whole
 // channel: a role-0 member able to mint one would put every member in charge of
@@ -668,9 +668,8 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 //
 // Every rejection returns errPeerIDInvalid: no channel row, no participant row,
 // role 0, a live ban, or a hash that the channel never minted. They are ONE
-// error deliberately — channels.id is dense BIGSERIAL and the peer access hash
-// is the placeholder access_hash == id, so a distinguishable "hash not found"
-// would let an account walk the invite space.
+// error deliberately — a distinguishable "hash not found" would let an account
+// walk the invite space.
 //
 // Role 1 is the floor for the same reason export requires it: a role-0 member
 // able to revoke would be able to confirm which hashes belong to the channel.
@@ -1010,8 +1009,8 @@ func (h *handlers) handleImportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 // before the store is reached.
 //
 // Every rejection — private channel, unknown channel, banned caller — returns
-// errPeerIDInvalid. channels.id is dense BIGSERIAL; a distinguishable rejection
-// lets an attacker walk the full channel list.
+// errPeerIDInvalid. A distinguishable rejection turns the refusal into an
+// existence oracle for every id an attacker can name.
 func (h *handlers) handleJoinChannel(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.ChannelsJoinChannelRequest
 	if err := req.Decode(r.Buf); err != nil {
