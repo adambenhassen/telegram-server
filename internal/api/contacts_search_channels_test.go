@@ -594,9 +594,19 @@ func TestContactsSearchPrivateChannelInvisible(t *testing.T) {
 // not occupy a row inside the limit that is then dropped, because the caller
 // would read the missing row as proof the private channel exists.
 //
-// The private channel is given an id below every public match, so it sorts ahead
-// of them in the query's id order and would land inside the page under a Go
-// post-filter.
+// Both private channels are given ids below every public match, so they sort
+// ahead of them in the query's id order and would land inside the page under a
+// Go post-filter. Channel ids are random draws, so creating them first no longer
+// places them there and the ids are set explicitly instead.
+//
+// There are two of them because the M16 discoverability marker narrows the
+// candidate set: an ordinary private channel is now excluded before the join
+// runs, and a mutation that moved the authoritative drop after LIMIT would no
+// longer be caught by it. The second one carries publicly_discoverable without a
+// usernames row — the permissive drift the marker is allowed to have — so a
+// private match still reaches the join, and moving that drop into Go still costs
+// the caller a row it should have been served. The marker is the cost gate; this
+// is the test that keeps the join the disclosure gate.
 func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -625,9 +635,6 @@ func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 	}
 	slices.Sort(want)
 
-	// The private channel only tests anything from inside the page, which means
-	// below every public match. Channel ids are random draws, so creating it
-	// first no longer places it there and the id is set explicitly instead.
 	channelExec(t, ctx, dsn, `
 		WITH private AS (
 			INSERT INTO channels (id, title, creator_id) VALUES ($1, 'Kayaking Private', $2)
@@ -638,6 +645,20 @@ func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 		)
 		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
 		SELECT id, $2, 2, 0 FROM private`, want[0]-1, creator.ID)
+
+	// Marked discoverable, and owning no handle: the join is the only thing
+	// standing between this row and the page.
+	channelExec(t, ctx, dsn, `
+		WITH marked AS (
+			INSERT INTO channels (id, title, creator_id, publicly_discoverable)
+			VALUES ($1, 'Kayaking Marked', $2, true)
+			RETURNING id
+		),
+		state AS (
+			INSERT INTO channel_state (channel_id) SELECT id FROM marked
+		)
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
+		SELECT id, $2, 2, 0 FROM marked`, want[0]-2, creator.ID)
 
 	found := searchChannels(t, s, caller.ID, "Kayaking", limit)
 
@@ -893,54 +914,5 @@ func TestContactsSearchFollowsUsernameLifecycle(t *testing.T) {
 	}
 	if got := channelPeerIDs(searchChannels(t, s, stranger.ID, "birdweekly", 10).Results); len(got) != 0 {
 		t.Fatalf("after releasing the handle, handle search Results = %v, want none", got)
-	}
-}
-
-// TestContactsSearchStaleDiscoverableMarkerDisclosesNothing pins the direction
-// the discoverability marker is allowed to be wrong in.
-//
-// The marker narrows the public arm's candidate set and nothing else; the join
-// against usernames still decides what the query returns, and it still runs
-// before LIMIT. So a channel left marked public after its handle is gone —
-// which is what a writer that touches usernames without going through
-// SetChannelUsername would leave behind — costs a candidate row and discloses
-// nothing: it does not appear, and it does not displace a row that should.
-func TestContactsSearchStaleDiscoverableMarkerDisclosesNothing(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	s, dsn := openStoreDSN(t)
-
-	stranger, err := s.CreateUser(ctx, "15550012001")
-	if err != nil {
-		t.Fatal(err)
-	}
-	creator, err := s.CreateUser(ctx, "15550012002")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	public, err := s.CreateChannel(ctx, creator.ID, "Orienteering Beta", "About", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := api.ClaimChannelUsernameForTest(s, public.ID, "orienteeringbeta"); err != nil {
-		t.Fatal(err)
-	}
-
-	// The stale channel proves something only from inside the page, so its id is
-	// set explicitly below the public match rather than left to a random draw:
-	// it takes the single page slot if the marker is deciding anything.
-	staleID := public.ID - 1
-	channelExec(t, ctx, dsn, `
-		WITH stale AS (
-			INSERT INTO channels (id, title, creator_id, username, publicly_discoverable)
-			VALUES ($1, 'Orienteering Alpha', $2, 'orienteeringalpha', true)
-			RETURNING id
-		)
-		INSERT INTO channel_state (channel_id) SELECT id FROM stale`, staleID, creator.ID)
-
-	found := searchChannels(t, s, stranger.ID, "Orienteering", 1)
-	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != public.ID {
-		t.Fatalf("Results = %v, want [%d] — the stale marker must cost a candidate, not a row", got, public.ID)
 	}
 }
