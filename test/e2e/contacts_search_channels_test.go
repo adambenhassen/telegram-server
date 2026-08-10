@@ -172,7 +172,13 @@ func TestContactsSearchChannelDiscovery(t *testing.T) {
 
 	// A private channel matching the query must not shorten the page: with
 	// limit=2 both public matches still come back, so nothing in the row count
-	// says a third channel matched.
+	// says a third channel matched. This discriminates only when the private
+	// channel's id is one of the two lowest of the three, which random ids make
+	// roughly two runs in three rather than a guarantee — on the other runs the
+	// private row is outside the page regardless of when it was filtered. The
+	// deterministic version of the claim is
+	// TestContactsSearchPrivateChannelDoesNotConsumeLimit at the handler level,
+	// which seeds the private id inside the page.
 	limited := search(bCmds, "B", "Kayaking", 2)
 	if ids := searchChannelIDs(limited.Results); len(ids) != 2 {
 		t.Fatalf("B Results with limit=2 = %v (%d rows), want 2 — a private match consumed a row", ids, len(ids))
