@@ -150,10 +150,11 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	// Check for a transport retry before any expensive work.
 	if req.RandomID != 0 {
 		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok {
-			// Retry: return the stored message without rate-limiting or file assembly.
-			senderState, err := h.store.State(r.Ctx, r.UserID)
+			// Retry: return the stored message, at the pts it occupies, without
+			// rate-limiting or file assembly.
+			pts, err := h.store.MessagePts(r.Ctx, r.UserID, existing.LocalID)
 			if err != nil {
-				h.log.Error("read sender pts on retry", "user_id", r.UserID, "err", err)
+				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
 				return nil, errInternal
 			}
 			if peerType == store.PeerTypeChat {
@@ -175,7 +176,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 				return &tg.Updates{
 					Updates: []tg.UpdateClass{
 						&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
-						&tg.UpdateNewMessage{Message: messageToTL(existing, nil, files, nil, nil), Pts: senderState.Pts, PtsCount: 1},
+						&tg.UpdateNewMessage{Message: messageToTL(existing, nil, files, nil, nil), Pts: pts, PtsCount: 1},
 					},
 					Users: users,
 					Chats: chats,
@@ -195,7 +196,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 			return &tg.Updates{
 				Updates: []tg.UpdateClass{
 					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
-					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, files, nil, nil), Pts: senderState.Pts, PtsCount: 1},
+					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, files, nil, nil), Pts: pts, PtsCount: 1},
 				},
 				Users: users,
 				Date:  int(existing.Date.Unix()),

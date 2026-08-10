@@ -172,3 +172,28 @@ func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) error 
 	)
 	return err
 }
+
+const newMessagePts = `-- name: NewMessagePts :one
+SELECT pts FROM message_events
+WHERE owner_id = $1 AND local_id = $2 AND type = 1
+`
+
+type NewMessagePtsParams struct {
+	OwnerID int64
+	LocalID int64
+}
+
+// NewMessagePts returns the pts at which owner's local_id entered the log, for
+// a resend that has to name the pts its stored message already occupies rather
+// than the owner's current one. Exactly one row can match: a message is written
+// with its new-message event in one transaction and neither is ever rewritten.
+//
+// type = 1 (new message) is a literal, not a parameter, because the partial
+// index serving this read is predicated on it and a parameter cannot be proven
+// against that predicate.
+func (q *Queries) NewMessagePts(ctx context.Context, arg NewMessagePtsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, newMessagePts, arg.OwnerID, arg.LocalID)
+	var pts int64
+	err := row.Scan(&pts)
+	return pts, err
+}

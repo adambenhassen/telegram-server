@@ -193,12 +193,14 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 
 	// Idempotency: a resend with the same random_id returns the original. The
 	// token lives on the sender's copy only, so the 1:1 contract carries over
-	// unchanged — no new rows, no new events, no pts movement.
+	// unchanged — no new rows, no new events, no pts movement, and each owner
+	// hears the pts its own copy occupies rather than where its log has since
+	// moved to.
 	if f.RandomID != 0 {
 		existing, e := qtx.MessageByRandomID(ctx, db.MessageByRandomIDParams{OwnerID: f.FromID, RandomID: f.RandomID})
 		switch {
 		case e == nil:
-			pts, e2 := ptsFor(ctx, qtx, owners)
+			pts, e2 := fanoutPts(ctx, qtx, existing, owners)
 			if e2 != nil {
 				return Message{}, nil, false, e2
 			}
@@ -274,6 +276,33 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 		sender = messageFromRow(stored)
 	}
 	return sender, perOwner, false, nil
+}
+
+// fanoutPts returns, for a resend the dedup caught, the pts each copy of the
+// already-stored chat message occupies. Keyed on the copy owners rather than the
+// current member set: a copy is what carries a pts, and a member who has since
+// left still holds theirs.
+//
+// The dedup key carries no destination, so a sender reusing a random_id from a
+// 1:1 send arrives holding a row with no fan-out to walk. There are no copies to
+// read a pts from and every owner keeps its current pts, exactly as before.
+func fanoutPts(ctx context.Context, qtx *db.Queries, existing db.Message, owners []int64) (map[int64]int, error) {
+	if existing.FanoutID == 0 {
+		return ptsFor(ctx, qtx, owners)
+	}
+	copies, err := qtx.MessagesByFanout(ctx, existing.FanoutID)
+	if err != nil {
+		return nil, fmt.Errorf("fanout copies: %w", err)
+	}
+	out := make(map[int64]int, len(copies))
+	for _, c := range copies {
+		pts, e := newMessagePts(ctx, qtx, c.OwnerID, c.LocalID)
+		if e != nil {
+			return nil, e
+		}
+		out[c.OwnerID] = pts
+	}
+	return out, nil
 }
 
 // ptsFor reads each owner's current pts without advancing it.
