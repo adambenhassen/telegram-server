@@ -282,13 +282,13 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 	}
 	// Before codec detection, which is the next thing that reads from this
 	// peer: a bound that only applied once negotiation was done would leave the
-	// negotiating population unbounded per address, which is the population a
+	// negotiating population unbounded per network, which is the population a
 	// flood consists of.
 	if !slot.keyAddr(addr) {
 		s.dropRefused(sock)
 		if dropped, ok := s.preAuthLog.allow(time.Now(), preAuthLogInterval); ok {
-			s.log.Info("connection refused at the per-address pre-auth cap",
-				"client_addr", addr, "cap", s.preAuth.limits.MaxConnsPerAddr, "suppressed", dropped)
+			s.log.Info("connection refused at the per-network pre-auth cap",
+				"client_addr", addr, "cap", s.preAuth.limits.MaxConnsPerNet, "suppressed", dropped)
 		}
 		return
 	}
@@ -464,18 +464,15 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		}
 
 		conn.setKey(key)
-		if err := s.rpcHandle(ctx, conn, b, userID, clientAddr); err != nil {
+		// The slot is handed to rpcHandle, which clears it the instant the
+		// frame's MAC verifies, and not at the registry bind below: a client
+		// between key exchange and sign-in has no user to bind to and is waiting
+		// on a human reading a code — it has already paid for a key exchange, and
+		// closing it mid-login would be the bound taking legitimate sessions
+		// rather than anonymous holds.
+		if err := s.rpcHandle(ctx, conn, b, userID, clientAddr, slot); err != nil {
 			return err
 		}
-		// The frame decrypted and its MAC verified under a key this server
-		// issued, which is where the connection stops being one of the anonymous
-		// ones the pre-auth bounds hold back: it gives its slot back and comes
-		// out from under the lifetime ceiling. Here rather than at the registry
-		// bind below, because a client between key exchange and sign-in has no
-		// user to bind to and is waiting on a human reading a code — it has
-		// already paid for a key exchange, and closing it mid-login would be the
-		// bound taking legitimate sessions rather than anonymous holds.
-		slot.clear()
 
 		// Keep the conn in step with the key's current binding, which s.keys.Get
 		// re-reads every frame: an auth.signIn on this key rebinds it to whoever

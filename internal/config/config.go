@@ -72,7 +72,7 @@ type Config struct {
 	// ClientAddrProxyV2 mode and is empty in every other mode.
 	ClientAddrProxies []netip.Prefix
 	// PreAuth bounds what connections that have not authenticated may hold:
-	// concurrently in the process, concurrently per client address, and for how
+	// concurrently in the process, concurrently per client network, and for how
 	// long. Zero disables a bound, as it does for a rate limit.
 	PreAuth mtproto.PreAuthLimits
 }
@@ -433,7 +433,7 @@ func preAuthLimits() (mtproto.PreAuthLimits, error) {
 		if n < 0 {
 			return mtproto.PreAuthLimits{}, errors.New("TG_MAX_PREAUTH_CONNS_PER_IP must not be negative; 0 disables the cap")
 		}
-		limits.MaxConnsPerAddr = n
+		limits.MaxConnsPerNet = n
 	}
 	if v := os.Getenv("TG_PREAUTH_LIFETIME"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -590,14 +590,22 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 // Silent in proxy-v2 mode, where the assumption it names is not the one being
 // made, and silent when no per-IP limit is enabled, since nothing is then keyed
 // on an address at all.
+//
+// Every limit keyed on a client address has to be in the condition below, or an
+// operator turns one off and stops being warned about the other. The pre-auth
+// connection cap is the harsher of the two to get wrong: the sendCode limits
+// collapsing into one bucket refuses code requests, while a pre-auth cap
+// collapsing into one bucket refuses handshakes server-wide, which is every
+// client at once and looks like an outage rather than a limit.
 func (c Config) WarnClientAddrTrust(log *slog.Logger) {
-	if c.ClientAddrTrust != ClientAddrSocket || !c.RateLimits.SendCodeIP.Enabled() {
+	perIPLimits := c.RateLimits.SendCodeIP.Enabled() || c.PreAuth.MaxConnsPerNet > 0
+	if c.ClientAddrTrust != ClientAddrSocket || !perIPLimits {
 		return
 	}
 	log.Warn("per-IP limits are keyed on each connection's own peer address",
 		"trust", string(c.ClientAddrTrust),
 		"assumes", "one peer address is one client, reaching this process directly",
-		"risk", "behind a proxy or L4 load balancer every client shares one bucket and the per-IP cap becomes a global one; behind a carrier NAT a whole mobile network shares one bucket and its subscribers are refused on each other's traffic")
+		"risk", "behind a proxy or L4 load balancer every client shares one bucket: the per-IP cap becomes a global one, and the pre-auth connection cap becomes a server-wide ceiling on concurrent handshakes that refuses every client past it; behind a carrier NAT a whole mobile network shares one bucket and its subscribers are refused on each other's traffic")
 }
 
 // advertiseAddr resolves the address clients are told to dial. An explicit

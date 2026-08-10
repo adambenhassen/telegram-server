@@ -4,6 +4,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 // preAuthLogInterval bounds how often a pre-auth refusal is logged. Refusals are
@@ -19,10 +21,10 @@ const preAuthLogInterval = 10 * time.Second
 //
 // The three bounds are layered so that each one holds if the others are
 // misconfigured, and together they make the worst case a formula rather than a
-// hope: an unauthenticated population spread over k client addresses holds at
-// most min(MaxConns, k*MaxConnsPerAddr) descriptors and the same number of
-// goroutines, each for at most Lifetime. One address alone holds at most
-// MaxConnsPerAddr of each.
+// hope: an unauthenticated population spread over k client networks holds at
+// most min(MaxConns, k*MaxConnsPerNet) descriptors and the same number of
+// goroutines, each for at most Lifetime. One network alone holds at most
+// MaxConnsPerNet of each.
 //
 // They are policy constants, not adaptive logic: nothing here reacts to load,
 // keeps a reputation, or rate-limits opens. A connection is inside the bounds or
@@ -36,13 +38,19 @@ type PreAuthLimits struct {
 	// checked on the accept loop, before the connection costs a goroutine, a
 	// deadline or a read, so that refusing stays cheaper than accepting.
 	MaxConns int
-	// MaxConnsPerAddr caps them per client address, so that one peer cannot
-	// spend the global cap on its own and lock everybody else out. It is checked
-	// once the connection layer has established the client address — the one a
-	// PROXY v2 header reports when the server runs behind a balancer, never the
-	// socket peer, which behind a balancer is the same for every client on
-	// earth.
-	MaxConnsPerAddr int
+	// MaxConnsPerNet caps them per client network, so that one peer cannot spend
+	// the global cap on its own and lock everybody else out. It is checked once
+	// the connection layer has established the client address — the one a PROXY
+	// v2 header reports when the server runs behind a balancer, never the socket
+	// peer, which behind a balancer is the same for every client on earth.
+	//
+	// Network, not address, and the distinction is the whole bound for IPv6:
+	// store.IPBucketKey is what the per-IP rate limits already key on, an
+	// address for IPv4 and a /64 for IPv6, because a host on a normal v6
+	// allocation mints fresh addresses inside its own /64 for free. Keyed on the
+	// address, this cap would not bind for such a host at all, and it is the
+	// only thing standing between one peer and the whole of MaxConns.
+	MaxConnsPerNet int
 	// Lifetime is the hard ceiling on the pre-auth state, measured from accept.
 	// A connection that has not authenticated within it is closed whatever it is
 	// doing, which is what ends the hold no deadline catches: every read the
@@ -58,13 +66,13 @@ type PreAuthLimits struct {
 }
 
 // DefaultPreAuthLimits returns the shipped bounds: 1024 concurrent pre-auth
-// connections in the process, 64 from any one client address, and 120s before an
+// connections in the process, 64 from any one client network, and 120s before an
 // unauthenticated connection is closed regardless of what it is sending.
 //
-// The per-address number is the one that has to be argued rather than chosen. It
+// The per-network number is the one that has to be argued rather than chosen. It
 // is a concurrency cap, not a rate: a client completes a handshake in
 // milliseconds, so 64 in flight at once is hundreds of new sessions a second
-// from a single address — far above a real client and, importantly, above a
+// from a single network — far above a real client and, importantly, above a
 // carrier NAT or a corporate egress, where thousands of subscribers share the
 // address the server sees. The global number sits well under any descriptor
 // ceiling worth running with, so the process keeps descriptors for the
@@ -74,14 +82,14 @@ type PreAuthLimits struct {
 // invented.
 func DefaultPreAuthLimits() PreAuthLimits {
 	return PreAuthLimits{
-		MaxConns:        1024,
-		MaxConnsPerAddr: 64,
-		Lifetime:        120 * time.Second,
+		MaxConns:       1024,
+		MaxConnsPerNet: 64,
+		Lifetime:       120 * time.Second,
 	}
 }
 
 // preAuthLimiter counts the connections that have not authenticated yet, in
-// total and per client address.
+// total and per client network.
 //
 // Lock ordering: mu is a leaf. It is taken for a counter update and released
 // before anything else happens — no callback runs under it, no socket is closed
@@ -91,13 +99,13 @@ func DefaultPreAuthLimits() PreAuthLimits {
 type preAuthLimiter struct {
 	limits PreAuthLimits
 
-	mu      sync.Mutex
-	conns   int
-	perAddr map[netip.Addr]int
+	mu     sync.Mutex
+	conns  int
+	perNet map[netip.Prefix]int
 }
 
 func newPreAuthLimiter(limits PreAuthLimits) *preAuthLimiter {
-	return &preAuthLimiter{limits: limits, perAddr: map[netip.Addr]int{}}
+	return &preAuthLimiter{limits: limits, perNet: map[netip.Prefix]int{}}
 }
 
 // admit takes the global slot for a freshly accepted socket and reports whether
@@ -113,38 +121,38 @@ func (l *preAuthLimiter) admit() (*preAuthSlot, bool) {
 	return &preAuthSlot{lim: l}, true
 }
 
-// acquireAddr takes the slot for one client address, reporting whether one was
+// acquireNet takes the slot for one client network, reporting whether one was
 // free.
-func (l *preAuthLimiter) acquireAddr(addr netip.Addr) bool {
+func (l *preAuthLimiter) acquireNet(bucket netip.Prefix) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.limits.MaxConnsPerAddr > 0 && l.perAddr[addr] >= l.limits.MaxConnsPerAddr {
+	if l.limits.MaxConnsPerNet > 0 && l.perNet[bucket] >= l.limits.MaxConnsPerNet {
 		return false
 	}
-	l.perAddr[addr]++
+	l.perNet[bucket]++
 	return true
 }
 
 // release gives back the global slot and, when the connection was charged to
-// one, the address slot. The map holds an entry only while an address has live
+// one, the network slot. The map holds an entry only while a network has live
 // pre-auth connections, so it is bounded by the caps above rather than by how
-// many addresses have ever connected.
-func (l *preAuthLimiter) release(addr netip.Addr) {
+// many networks have ever connected.
+func (l *preAuthLimiter) release(bucket netip.Prefix) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.conns--
-	if !addr.IsValid() {
+	if !bucket.IsValid() {
 		return
 	}
-	if n := l.perAddr[addr] - 1; n > 0 {
-		l.perAddr[addr] = n
+	if n := l.perNet[bucket] - 1; n > 0 {
+		l.perNet[bucket] = n
 	} else {
-		delete(l.perAddr, addr)
+		delete(l.perNet, bucket)
 	}
 }
 
 // preAuthSlot is one connection's place in the pre-auth bounds: the global slot
-// it took at accept, the address slot it takes once its client address is known,
+// it took at accept, the network slot it takes once its client address is known,
 // and the timer holding it to the lifetime ceiling.
 //
 // One goroutine owns a slot — the one serving its connection — from the moment
@@ -154,15 +162,21 @@ func (l *preAuthLimiter) release(addr netip.Addr) {
 // connection.
 type preAuthSlot struct {
 	lim *preAuthLimiter
-	// addr is the client address this slot is charged to, invalid when the
+	// bucket is the client network this slot is charged to, invalid when the
 	// connection carries no address the server may key on.
-	addr  netip.Addr
-	timer *time.Timer
-	once  sync.Once
+	bucket netip.Prefix
+	timer  *time.Timer
+	once   sync.Once
 }
 
-// keyAddr charges the slot to the client address the connection layer
-// established, reporting whether the address had a slot free.
+// keyAddr charges the slot to the network of the client address the connection
+// layer established, reporting whether that network had a slot free.
+//
+// The network is store.IPBucketKey's, so this cap and the per-IP rate limits
+// count the same peer as the same peer: an address for IPv4, a /64 for IPv6.
+// Anything narrower than the /64 is not a bound at all — a host on a routed v6
+// allocation mints addresses inside its own /64 for free, and would otherwise
+// spend the whole of MaxConns from one machine.
 //
 // A connection with no address the server may key on — a socket whose peer the
 // transport could not report, or a PROXY header that names no client, which is
@@ -172,13 +186,14 @@ type preAuthSlot struct {
 // bucket with every transport fault. Those connections stay bounded by the
 // global cap and the lifetime ceiling.
 func (s *preAuthSlot) keyAddr(addr netip.Addr) bool {
-	if !addr.IsValid() {
+	bucket, ok := store.IPBucketKey(addr)
+	if !ok {
 		return true
 	}
-	if !s.lim.acquireAddr(addr) {
+	if !s.lim.acquireNet(bucket) {
 		return false
 	}
-	s.addr = addr
+	s.bucket = bucket
 	return true
 }
 
@@ -214,6 +229,6 @@ func (s *preAuthSlot) clear() {
 		if s.timer != nil {
 			s.timer.Stop()
 		}
-		s.lim.release(s.addr)
+		s.lim.release(s.bucket)
 	})
 }

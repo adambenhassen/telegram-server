@@ -140,19 +140,31 @@ func TestWarnClientAddrTrust(t *testing.T) {
 	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
 		t.Fatalf("emitted %d warn lines, want exactly 1:\n%s", n, buf.String())
 	}
-	for _, want := range []string{"load balancer", "carrier NAT", "per-IP"} {
+	for _, want := range []string{"load balancer", "carrier NAT", "per-IP", "handshakes"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("warning does not mention %q:\n%s", want, buf.String())
 		}
 	}
 
-	// Nothing is keyed on an address when both counters are off, so there is no
-	// assumption left to warn about.
+	// The pre-auth connection cap is keyed on an address too, and it is the
+	// harsher one to collapse: sendCode limits sharing a bucket refuse code
+	// requests, a pre-auth cap sharing one refuses handshakes server-wide. So
+	// turning the sendCode counters off leaves the assumption in place, and the
+	// warning with it.
 	buf.Reset()
 	cfg.RateLimits.SendCodeIP = store.SendCodeIPLimits{}
 	cfg.WarnClientAddrTrust(log)
+	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
+		t.Fatalf("emitted %d warn lines with only the pre-auth per-IP cap on, want exactly 1:\n%s", n, buf.String())
+	}
+
+	// Nothing is keyed on an address once every per-IP limit is off, so there is
+	// no assumption left to warn about.
+	buf.Reset()
+	cfg.PreAuth.MaxConnsPerNet = 0
+	cfg.WarnClientAddrTrust(log)
 	if buf.Len() != 0 {
-		t.Errorf("warned with the per-IP limits disabled:\n%s", buf.String())
+		t.Errorf("warned with every per-IP limit disabled:\n%s", buf.String())
 	}
 }
 

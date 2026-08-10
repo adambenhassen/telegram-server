@@ -249,8 +249,8 @@ func TestLoadPreAuthLimits(t *testing.T) {
 		"conns off":           {env: "TG_MAX_PREAUTH_CONNS", raw: "0", want: withMaxConns(defaults, 0)},
 		"conns not integer":   {env: "TG_MAX_PREAUTH_CONNS", raw: "many", wantErr: true},
 		"conns negative":      {env: "TG_MAX_PREAUTH_CONNS", raw: "-1", wantErr: true},
-		"per ip override":     {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "4", want: withMaxPerAddr(defaults, 4)},
-		"per ip off":          {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "0", want: withMaxPerAddr(defaults, 0)},
+		"per ip override":     {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "4", want: withMaxPerNet(defaults, 4)},
+		"per ip off":          {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "0", want: withMaxPerNet(defaults, 0)},
 		"per ip not integer":  {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "lots", wantErr: true},
 		"per ip negative":     {env: "TG_MAX_PREAUTH_CONNS_PER_IP", raw: "-1", wantErr: true},
 		"lifetime override":   {env: "TG_PREAUTH_LIFETIME", raw: "45s", want: withLifetime(defaults, 45*time.Second)},
@@ -288,8 +288,8 @@ func withMaxConns(l mtproto.PreAuthLimits, n int) mtproto.PreAuthLimits {
 	return l
 }
 
-func withMaxPerAddr(l mtproto.PreAuthLimits, n int) mtproto.PreAuthLimits {
-	l.MaxConnsPerAddr = n
+func withMaxPerNet(l mtproto.PreAuthLimits, n int) mtproto.PreAuthLimits {
+	l.MaxConnsPerNet = n
 	return l
 }
 

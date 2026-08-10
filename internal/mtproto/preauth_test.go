@@ -78,7 +78,7 @@ func TestPreAuthPerAddrCapKeysOnTheBalancerAddress(t *testing.T) {
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
 	// One slot per client address and no global bound, so nothing but the
 	// per-address cap can refuse anything here.
-	serveClients(t, ctx, nl, loopback, nil, withPreAuthLimits(mtproto.PreAuthLimits{MaxConnsPerAddr: 1}))
+	serveClients(t, ctx, nl, loopback, nil, withPreAuthLimits(mtproto.PreAuthLimits{MaxConnsPerNet: 1}))
 	addr := nl.Addr().String()
 
 	flooder := netip.MustParseAddr("203.0.113.9")
@@ -102,6 +102,45 @@ func TestPreAuthPerAddrCapKeysOnTheBalancerAddress(t *testing.T) {
 	}
 	if !served {
 		t.Errorf("a second client behind the same balancer was refused: the cap is keyed on the socket peer, not on %s", other)
+	}
+}
+
+// TestPreAuthPerNetCapBucketsIPv6ByPrefix covers what "one client" means for
+// IPv6, and it is not one address. A host on a routed allocation mints fresh
+// addresses inside its own /64 for free, so a cap keyed on the address does not
+// bind for it at all: it would open one connection from each of 1024 addresses
+// and fill the global cap alone, after which every other client is refused on
+// the accept loop. The per-IP rate limits already key on the /64 for this
+// reason, and this cap has to count the same peer as the same peer.
+func TestPreAuthPerNetCapBucketsIPv6ByPrefix(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
+	serveClients(t, ctx, nl, loopback, nil, withPreAuthLimits(mtproto.PreAuthLimits{MaxConnsPerNet: 1}))
+	addr := nl.Addr().String()
+
+	holdPreAuth(t, ctx, addr, proxyV2Header(proxyCmdProxy, netip.MustParseAddr("2001:db8:1:1::1")))
+
+	// A different address, the same /64: the same host, and refused.
+	sameNet := netip.MustParseAddr("2001:db8:1:1::2")
+	served, err := probeServed(ctx, addr, proxyV2Header(proxyCmdProxy, sameNet))
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if served {
+		t.Errorf("%s was served past a cap of 1 already held inside its own /64: the cap is keyed on the address, which an IPv6 host mints for free", sameNet)
+	}
+
+	// A different /64 is a different peer, and is served.
+	otherNet := netip.MustParseAddr("2001:db8:1:2::1")
+	served, err = probeServed(ctx, addr, proxyV2Header(proxyCmdProxy, otherNet))
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if !served {
+		t.Errorf("%s was refused although no connection is held in its /64", otherNet)
 	}
 }
 
@@ -157,9 +196,9 @@ func TestPreAuthAuthenticatedConnectionOutlivesTheCeiling(t *testing.T) {
 	const lifetime = 2 * time.Second
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
 	seen, key := serveClients(t, ctx, nl, nil, nil, withPreAuthLimits(mtproto.PreAuthLimits{
-		MaxConns:        1,
-		MaxConnsPerAddr: 1,
-		Lifetime:        lifetime,
+		MaxConns:       1,
+		MaxConnsPerNet: 1,
+		Lifetime:       lifetime,
 	}))
 
 	raw := dialClient(t, ctx, nl.Addr().String())
@@ -180,6 +219,65 @@ func TestPreAuthAuthenticatedConnectionOutlivesTheCeiling(t *testing.T) {
 	}
 
 	waitServed(t, ctx, nl.Addr().String(), nil)
+}
+
+// TestPreAuthCeilingEndsAtTheProvenKeyNotAtTheHandler pins where the pre-auth
+// state ends inside a frame: at the MAC verifying, not at the dispatch it leads
+// to. A handler slower than what is left of the ceiling would otherwise have its
+// connection closed underneath it — a socket that had already proved a
+// server-issued key, killed by a bound on the sockets that have not.
+func TestPreAuthCeilingEndsAtTheProvenKeyNotAtTheHandler(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	const lifetime = 500 * time.Millisecond
+	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
+	// The handler outlasts the ceiling several times over, so a build that
+	// cleared the slot after the dispatch instead of before it loses this
+	// connection while the handler is still in it.
+	seen, key := serveBlocking(t, ctx, nl, 4*lifetime, withPreAuthLimits(mtproto.PreAuthLimits{Lifetime: lifetime}))
+
+	raw := dialClient(t, ctx, nl.Addr().String())
+	conn, err := transport.Abridged.Handshake(raw)
+	if err != nil {
+		t.Fatalf("transport handshake: %v", err)
+	}
+	const session = int64(11)
+	sendFrame(t, ctx, conn, key, session, int64(1)<<32)
+	wantHandled(t, seen, "the slow handler's own frame")
+
+	// The connection outlived its own handler: a second frame is still served.
+	sendFrame(t, ctx, conn, key, session, int64(2)<<32)
+	wantHandled(t, seen, "a frame after the slow handler returned")
+}
+
+// serveBlocking runs a server whose handler sleeps for block before recording
+// the request, so a test can hold a connection inside a dispatch for longer than
+// a bound allows.
+func serveBlocking(t *testing.T, ctx context.Context, ln net.Listener, block time.Duration, opts ...func(*mtproto.Server)) (<-chan netip.Addr, crypto.AuthKey) {
+	t.Helper()
+	seen := make(chan netip.Addr, 8)
+	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
+		time.Sleep(block)
+		select {
+		case seen <- req.ClientAddr:
+		default:
+		}
+		return nil
+	})
+	return seen, serveHandler(t, ctx, ln, nil, nil, handler, opts...)
+}
+
+// wantHandled waits for one request to reach the handler, bounded so a
+// connection the server dropped fails the test rather than running it out.
+func wantHandled(t *testing.T, seen <-chan netip.Addr, what string) {
+	t.Helper()
+	select {
+	case <-seen:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("%s never reached the handler", what)
+	}
 }
 
 // holdPreAuth opens a connection that holds its pre-auth slot and keeps holding
