@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -70,6 +71,10 @@ type Config struct {
 	// header is honoured from. It is the whole of the trust decision in
 	// ClientAddrProxyV2 mode and is empty in every other mode.
 	ClientAddrProxies []netip.Prefix
+	// PreAuth bounds what connections that have not authenticated may hold:
+	// concurrently in the process, concurrently per client network, and for how
+	// long. Zero disables a bound, as it does for a rate limit.
+	PreAuth mtproto.PreAuthLimits
 }
 
 // ClientAddrTrust names the source a client address is taken from.
@@ -369,6 +374,11 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.RateLimits.SendCodeIP.Phones.Window = d
 	}
+	preAuth, err := preAuthLimits()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PreAuth = preAuth
 	trust, err := clientAddrTrust(os.Getenv("TG_CLIENT_ADDR_TRUST"))
 	if err != nil {
 		return Config{}, err
@@ -393,6 +403,49 @@ func Load(log *slog.Logger) (Config, error) {
 	}
 	cfg.AuthKeyEncKey = encKey
 	return cfg, nil
+}
+
+// preAuthLimits resolves the bounds on what an unauthenticated connection may
+// hold, starting from the shipped defaults.
+//
+// Zero is accepted and means the bound is off, matching every rate-limit
+// surface: an operator taking one out has to be able to say so. Negative is not
+// the same statement — it is a typo or a unit mistake — and a bound that silently
+// became "off" because of one is the failure this whole surface exists to
+// prevent, so it fails the start by name.
+func preAuthLimits() (mtproto.PreAuthLimits, error) {
+	limits := mtproto.DefaultPreAuthLimits()
+	if v := os.Getenv("TG_MAX_PREAUTH_CONNS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return mtproto.PreAuthLimits{}, errors.New("TG_MAX_PREAUTH_CONNS must be an integer")
+		}
+		if n < 0 {
+			return mtproto.PreAuthLimits{}, errors.New("TG_MAX_PREAUTH_CONNS must not be negative; 0 disables the cap")
+		}
+		limits.MaxConns = n
+	}
+	if v := os.Getenv("TG_MAX_PREAUTH_CONNS_PER_IP"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return mtproto.PreAuthLimits{}, errors.New("TG_MAX_PREAUTH_CONNS_PER_IP must be an integer")
+		}
+		if n < 0 {
+			return mtproto.PreAuthLimits{}, errors.New("TG_MAX_PREAUTH_CONNS_PER_IP must not be negative; 0 disables the cap")
+		}
+		limits.MaxConnsPerNet = n
+	}
+	if v := os.Getenv("TG_PREAUTH_LIFETIME"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return mtproto.PreAuthLimits{}, errors.New("TG_PREAUTH_LIFETIME must be a duration")
+		}
+		if d < 0 {
+			return mtproto.PreAuthLimits{}, errors.New("TG_PREAUTH_LIFETIME must not be negative; 0 disables the ceiling")
+		}
+		limits.Lifetime = d
+	}
+	return limits, nil
 }
 
 // clientAddrTrust resolves the client-address source. An unset value is the
@@ -537,14 +590,47 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 // Silent in proxy-v2 mode, where the assumption it names is not the one being
 // made, and silent when no per-IP limit is enabled, since nothing is then keyed
 // on an address at all.
+//
+// Every limit keyed on a client address has to be in the condition below, or an
+// operator turns one off and stops being warned about the other. The pre-auth
+// connection cap is the harsher of the two to get wrong: the sendCode limits
+// collapsing into one bucket refuses code requests, while a pre-auth cap
+// collapsing into one bucket refuses handshakes server-wide, which is every
+// client at once and looks like an outage rather than a limit.
 func (c Config) WarnClientAddrTrust(log *slog.Logger) {
-	if c.ClientAddrTrust != ClientAddrSocket || !c.RateLimits.SendCodeIP.Enabled() {
+	perIPLimits := c.RateLimits.SendCodeIP.Enabled() || c.PreAuth.MaxConnsPerNet > 0
+	if c.ClientAddrTrust != ClientAddrSocket || !perIPLimits {
 		return
 	}
 	log.Warn("per-IP limits are keyed on each connection's own peer address",
 		"trust", string(c.ClientAddrTrust),
 		"assumes", "one peer address is one client, reaching this process directly",
-		"risk", "behind a proxy or L4 load balancer every client shares one bucket and the per-IP cap becomes a global one; behind a carrier NAT a whole mobile network shares one bucket and its subscribers are refused on each other's traffic")
+		"risk", "behind a proxy or L4 load balancer every client shares one bucket: the per-IP cap becomes a global one, and the pre-auth connection cap becomes a server-wide ceiling on concurrent handshakes that refuses every client past it; behind a carrier NAT a whole mobile network shares one bucket and its subscribers are refused on each other's traffic")
+}
+
+// handshakeReadTimeout is the timeout gotd applies to each read inside key
+// exchange (its DefaultTimeout). It is not this server's number to set, and it
+// is the floor a pre-auth lifetime ceiling has to clear: a ceiling under it
+// expires while a handshake is still legitimately waiting on one read.
+const handshakeReadTimeout = 60 * time.Second
+
+// WarnPreAuthLifetime states, once at startup, that the configured pre-auth
+// ceiling is short enough to cut handshakes rather than holds.
+//
+// It is a warning and not a startup failure because the value is legitimate
+// under load shedding, and because zero — the ceiling off entirely — is a
+// supported setting that this must not appear to forbid. What it prevents is the
+// silent case: an operator tuning the ceiling down to shed a flood, and getting
+// intermittent handshake failures from slow clients that look like a network
+// fault rather than the number they just set.
+func (c Config) WarnPreAuthLifetime(log *slog.Logger) {
+	if c.PreAuth.Lifetime <= 0 || c.PreAuth.Lifetime >= handshakeReadTimeout {
+		return
+	}
+	log.Warn("TG_PREAUTH_LIFETIME is below the handshake's own read timeout",
+		"lifetime", c.PreAuth.Lifetime,
+		"handshake_read_timeout", handshakeReadTimeout,
+		"risk", "a client still inside key exchange can be closed for being slow rather than for holding the connection, which reads as an intermittent connection failure")
 }
 
 // advertiseAddr resolves the address clients are told to dial. An explicit
