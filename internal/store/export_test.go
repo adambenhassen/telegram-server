@@ -42,6 +42,31 @@ func RateLimitExpiresAt(ctx context.Context, s *Store, subjectID int64, surface 
 	return at, err
 }
 
+// AgeRateLimitWindow rewinds one rate-limit row's window by d, leaving the row
+// exactly as it would look had d of wall clock passed since the window opened.
+// It is how a test crosses a window boundary: sleeping through a real window
+// means the window has to be short, and a short window also closes early under
+// host load, so the denial the test asserts on before the boundary stops
+// happening. Rewinding lets the window be long enough that only this call can
+// close it.
+func AgeRateLimitWindow(ctx context.Context, s *Store, subjectID int64, surface string, d time.Duration) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE rate_limits
+		    SET window_start = window_start - $3::INTERVAL,
+		        expires_at   = expires_at   - $3::INTERVAL
+		  WHERE subject_id = $1 AND surface = $2`,
+		subjectID, surface, pgtype.Interval{Microseconds: d.Microseconds(), Valid: true})
+	if err != nil {
+		return err
+	}
+	// A surface typo would otherwise leave the window untouched and the test
+	// asserting nothing.
+	if n := tag.RowsAffected(); n != 1 {
+		return fmt.Errorf("age rate limit window: %d rows for subject %d surface %q, want 1", n, subjectID, surface)
+	}
+	return nil
+}
+
 // SetSearchPageHook installs a callback that fires in SearchGlobal between the
 // key read and the body read. Tests use it to delete the rows the page named and
 // exercise the refill branch. Scoped to the Store so parallel tests each own

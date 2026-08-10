@@ -178,7 +178,7 @@ func TestSearchMessagesRateLimitDisabled(t *testing.T) {
 func TestSearchMessagesRateLimitWindowExpiry(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	alice, err := s.CreateUser(ctx, "+15551296301")
 	if err != nil {
@@ -198,8 +198,9 @@ func TestSearchMessagesRateLimitWindowExpiry(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	// Very short window: 1 search per 500ms.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 500 * time.Millisecond}
+	// Long window, aged past its deadline below rather than slept through: see
+	// AgeRateLimitWindowForTest.
+	cfg := store.RateLimitConfig{Limit: 1, Window: time.Hour}
 	peerBob := api.InputPeerUser(alice.ID, bob.ID)
 
 	// Exhaust the limit.
@@ -222,8 +223,10 @@ func TestSearchMessagesRateLimitWindowExpiry(t *testing.T) {
 		t.Fatalf("expected FLOOD_WAIT, got %v", err)
 	}
 
-	// Wait for window to expire.
-	time.Sleep(600 * time.Millisecond)
+	// Age the window past its deadline.
+	if err := api.AgeRateLimitWindowForTest(dsn, alice.ID, "messages_search", cfg.Window+time.Minute); err != nil {
+		t.Fatalf("age window: %v", err)
+	}
 
 	// Should be allowed again.
 	_, err = api.SearchForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSearchRequest{

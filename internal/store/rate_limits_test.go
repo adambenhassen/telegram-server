@@ -69,8 +69,9 @@ func TestRateLimitWindowExpiry(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
 
-	// Use a very short window so we can test expiry without sleeping.
-	cfg := store.RateLimitConfig{Limit: 2, Window: 1 * time.Second}
+	// Long window, aged past its deadline below rather than slept through: see
+	// store.AgeRateLimitWindow.
+	cfg := store.RateLimitConfig{Limit: 2, Window: time.Hour}
 	ctx := context.Background()
 	const subject = 200
 	const surface = "expiry"
@@ -92,8 +93,10 @@ func TestRateLimitWindowExpiry(t *testing.T) {
 		t.Fatal("pre-expiry: expected denial, got allowed")
 	}
 
-	// Wait for window to expire.
-	time.Sleep(1100 * time.Millisecond)
+	// Age the window past its deadline.
+	if err := store.AgeRateLimitWindow(ctx, s, subject, surface, cfg.Window+time.Minute); err != nil {
+		t.Fatalf("age window: %v", err)
+	}
 
 	// Should be allowed again.
 	result, err = s.CheckRateLimit(ctx, subject, surface, cfg)
