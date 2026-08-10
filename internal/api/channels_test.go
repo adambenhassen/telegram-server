@@ -1,8 +1,10 @@
 package api_test
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -2351,7 +2353,10 @@ func TestGetDialogsMultiChannel(t *testing.T) {
 		t.Fatalf("dialogs = %d, want 3", len(res.Dialogs))
 	}
 
-	// First two are channels, prepended.
+	// First two are channels, prepended. The dialog list is ordered by channel
+	// id, which channel ids being random draws no longer makes the same thing as
+	// creation order — the expectation is sorted rather than assumed.
+	slices.SortFunc(channels, func(a, b store.Channel) int { return cmp.Compare(a.ID, b.ID) })
 	channelIDs := make(map[int64]bool)
 	for i, ch := range channels {
 		dlg, ok := res.Dialogs[i].(*tg.Dialog)
