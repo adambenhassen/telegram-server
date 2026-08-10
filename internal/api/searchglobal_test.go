@@ -414,6 +414,73 @@ func TestSearchGlobalRejectsATamperedCursorPeer(t *testing.T) {
 	}
 }
 
+// A chat-create service row is reachable from a keyword search — createChat
+// writes it with the title as its text — and it has to arrive with the member
+// list its wire action carries, the way messages.search serves the same row.
+// Rendering it with an empty Users is the defect this pins.
+func TestSearchGlobalHydratesChatCreateServiceRows(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	alice, err := s.CreateUser(ctx, "+15551321071")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551321072")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The title is the service row's text, so this word is what matches it.
+	if _, err = api.CreateChatForTest(s, alice.ID, &tg.MessagesCreateChatRequest{
+		Title: "Falcon crew",
+		Users: []tg.InputUserClass{api.InputUser(alice.ID, bob.ID)},
+	}); err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+
+	enc, err := searchGlobal(s, alice.ID, "falcon", 10)
+	if err != nil {
+		t.Fatalf("search global: %v", err)
+	}
+	res := globalSlice(t, enc)
+	if len(res.Messages) != 1 {
+		t.Fatalf("hits = %d, want the create service row", len(res.Messages))
+	}
+	svc, ok := res.Messages[0].(*tg.MessageService)
+	if !ok {
+		t.Fatalf("hit = %T, want *tg.MessageService", res.Messages[0])
+	}
+	action, ok := svc.Action.(*tg.MessageActionChatCreate)
+	if !ok {
+		t.Fatalf("action = %T, want *tg.MessageActionChatCreate", svc.Action)
+	}
+	if action.Title != "Falcon crew" {
+		t.Errorf("action title = %q, want %q", action.Title, "Falcon crew")
+	}
+	// Both members, the same list messages.search returns for this row.
+	if len(action.Users) != 2 {
+		t.Fatalf("action users = %v, want both members", action.Users)
+	}
+	for _, want := range []int64{alice.ID, bob.ID} {
+		var found bool
+		for _, id := range action.Users {
+			found = found || id == want
+		}
+		if !found {
+			t.Errorf("action users = %v, missing %d", action.Users, want)
+		}
+	}
+	// A client renders none of those ids without the user rows behind them.
+	hydrated := map[int64]bool{}
+	for _, u := range res.Users {
+		hydrated[u.GetID()] = true
+	}
+	if !hydrated[alice.ID] || !hydrated[bob.ID] {
+		t.Errorf("users = %v, want every member the action names", hydrated)
+	}
+}
+
 // The two input rejections messages.search makes, made the same way here.
 func TestSearchGlobalRejectsEmptyQueryAndUnsupportedFilters(t *testing.T) {
 	t.Parallel()

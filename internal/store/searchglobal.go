@@ -48,7 +48,50 @@ type GlobalSearchHit struct {
 // page — nothing about authorization is carried in the cursor.
 //
 // A caller in no dialogs gets an empty page, not an error.
+//
+// A page whose every key vanishes between the key read and the body read is
+// refilled rather than returned empty: an empty page ends the client's sequence,
+// so returning one there would silently drop every match behind it. The refill
+// resumes from the last key read, which never reaches the wire — the cursor a
+// client is handed still comes only from a row it was served.
 func (s *Store) SearchGlobal(ctx context.Context, userID int64, query string, cursor *GlobalSearchCursor, limit int) ([]GlobalSearchHit, error) {
+	for attempt := 0; ; attempt++ {
+		keys, err := s.searchGlobalKeys(ctx, userID, query, cursor, limit)
+		if err != nil {
+			return nil, err
+		}
+		if len(keys) == 0 {
+			return nil, nil
+		}
+		hits, err := s.hydrateKeys(ctx, userID, keys)
+		if err != nil {
+			return nil, err
+		}
+		if len(hits) > 0 {
+			return hits, nil
+		}
+		// Nothing survived hydration. A short key page means the scan already
+		// reached the end of what the caller can read, so there is nothing behind
+		// it and the sequence really is over.
+		if len(keys) < limit || attempt+1 >= maxSearchGlobalRefills {
+			return nil, nil
+		}
+		last := keys[len(keys)-1]
+		cursor = &GlobalSearchCursor{
+			Rate: last.Rate, PeerType: PeerType(last.PeerType), PeerID: last.PeerID, MsgID: last.MsgID,
+		}
+	}
+}
+
+// maxSearchGlobalRefills caps how many key reads one call may make. Each refill
+// costs a bounded page query, and the case it covers is a race, so a small cap
+// keeps the cost of one RPC bounded while still surviving a page that a delete
+// or a ban emptied.
+const maxSearchGlobalRefills = 3
+
+// searchGlobalKeys reads one ordered page of keys: which peer each hit belongs
+// to and its id there. This is where both arms' predicates and the keyset live.
+func (s *Store) searchGlobalKeys(ctx context.Context, userID int64, query string, cursor *GlobalSearchCursor, limit int) ([]db.SearchGlobalPageRow, error) {
 	params := db.SearchGlobalPageParams{
 		OwnerID: userID,
 		Query:   query,
@@ -65,10 +108,21 @@ func (s *Store) SearchGlobal(ctx context.Context, userID int64, query string, cu
 	if err != nil {
 		return nil, fmt.Errorf("search global page: %w", err)
 	}
-	if len(keys) == 0 {
-		return nil, nil
-	}
+	return keys, nil
+}
 
+// hydrateKeys reads the bodies behind a page of keys, each arm through its own
+// query and its own gate, and rebuilds the page in the order the key read fixed.
+//
+// A key whose row is gone by now — deleted, or in a channel this caller was just
+// banned from — simply drops out: the page is short, never padded with a row the
+// second read did not authorize.
+func (s *Store) hydrateKeys(ctx context.Context, userID int64, keys []db.SearchGlobalPageRow) ([]GlobalSearchHit, error) {
+	// Test hook: fires between the key read and the body read, where a delete or
+	// a ban would land.
+	if s.searchPageHook != nil {
+		s.searchPageHook()
+	}
 	owned, err := s.ownedHits(ctx, userID, keys)
 	if err != nil {
 		return nil, err
@@ -77,11 +131,6 @@ func (s *Store) SearchGlobal(ctx context.Context, userID int64, query string, cu
 	if err != nil {
 		return nil, err
 	}
-
-	// Rebuild the page in the order the page query fixed. A key whose row is
-	// gone by now — deleted, or in a channel this caller was just banned from —
-	// simply drops out: the page is short, never padded with a row the second
-	// read did not authorize.
 	hits := make([]GlobalSearchHit, 0, len(keys))
 	for _, k := range keys {
 		hit := GlobalSearchHit{Rate: k.Rate, PeerType: PeerType(k.PeerType), PeerID: k.PeerID}

@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -173,6 +174,53 @@ func TestSearchGlobalGatesChannelPostsOnUnbannedMembership(t *testing.T) {
 	hits := searchGlobal(t, s, member.ID, "deadline", nil, 20)
 	if len(hits) != 1 || hits[0].PeerType != store.PeerTypeUser {
 		t.Fatalf("banned member hits = %+v, want only the dm", keysOf(hits))
+	}
+}
+
+// A page whose every row is deleted between the key read and the body read is
+// refilled from the rows behind it, not returned empty. An empty page ends the
+// client's page sequence, so answering one here would silently drop every match
+// older than the page that lost its rows.
+func TestSearchGlobalRefillsAPageEmptiedBetweenReads(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	alice := mustUser(t, s, "+15551320031")
+	bob := mustUser(t, s, "+15551320032")
+
+	send(t, s, bob, alice, "deadline one", 9301)
+	send(t, s, bob, alice, "deadline two", 9302)
+	send(t, s, bob, alice, "deadline three", 9303)
+
+	// The newest row is what a limit=1 page names; delete it in the window
+	// between the two reads, once, so the first attempt hydrates nothing.
+	newest, err := s.SearchGlobal(ctx, alice.ID, "deadline", nil, 1)
+	if err != nil || len(newest) != 1 {
+		t.Fatalf("baseline page: %d hits, err %v", len(newest), err)
+	}
+	if hitText(t, newest[0]) != "deadline three" {
+		t.Fatalf("baseline page = %q, want the newest row", hitText(t, newest[0]))
+	}
+	newestID := hitID(newest[0])
+
+	var once sync.Once
+	store.SetSearchPageHook(s, func() {
+		once.Do(func() {
+			if _, err := store.StorePool(s).Exec(ctx,
+				`UPDATE messages SET deleted = true WHERE owner_id = $1 AND local_id = $2`,
+				alice.ID, newestID); err != nil {
+				t.Errorf("delete newest: %v", err)
+			}
+		})
+	})
+	defer store.SetSearchPageHook(s, nil)
+
+	hits := searchGlobal(t, s, alice.ID, "deadline", nil, 1)
+	if len(hits) != 1 {
+		t.Fatalf("refilled page = %d hits, want the row behind the deleted one", len(hits))
+	}
+	if got := hitText(t, hits[0]); got != "deadline two" {
+		t.Fatalf("refilled page = %q, want %q", got, "deadline two")
 	}
 }
 

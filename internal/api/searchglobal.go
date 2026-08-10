@@ -121,6 +121,37 @@ func (h *handlers) globalCursorPeer(peer tg.InputPeerClass, viewerID int64) (sto
 	return peerType, peerID, true, nil
 }
 
+// searchCreateUsers loads the member list every chat-create service row on the
+// page renders with, keyed by chat.
+//
+// A create row is reachable from a keyword search: createChat writes it with the
+// chat title as its text (chats.go), so a query matching the title matches the
+// row, and tg.MessageActionChatCreate carries the members. Without them the
+// same row a client gets from messages.search with its participant list arrives
+// here with an empty one. chatSearch takes the identical lookup for the identical
+// reason; only the batching differs, because a global page spans chats.
+func (h *handlers) searchCreateUsers(r *mtproto.Request, hits []store.GlobalSearchHit) (map[int64][]int64, error) {
+	out := map[int64][]int64{}
+	for _, hit := range hits {
+		if hit.Owned == nil || hit.Owned.Action != store.ChatActionCreate {
+			continue
+		}
+		if _, done := out[hit.PeerID]; done {
+			continue
+		}
+		parts, err := h.store.Participants(r.Ctx, hit.PeerID)
+		if err != nil {
+			return nil, err
+		}
+		ids := make([]int64, len(parts))
+		for i, p := range parts {
+			ids[i] = p.UserID
+		}
+		out[hit.PeerID] = ids
+	}
+	return out, nil
+}
+
 // globalSearchSlice renders a cross-dialog page into messages.messagesSlice: the
 // only reply shape that can carry hits from several peers at once plus the
 // next_rate a client pages on.
@@ -152,6 +183,11 @@ func (h *handlers) globalSearchSlice(r *mtproto.Request, hits []store.GlobalSear
 		h.log.Error("search global post files", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	createUsers, err := h.searchCreateUsers(r, hits)
+	if err != nil {
+		h.log.Error("search global participants", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
 
 	msgs := make([]tg.MessageClass, 0, len(hits))
 	users := map[int64]bool{r.UserID: true}
@@ -164,8 +200,18 @@ func (h *handlers) globalSearchSlice(r *mtproto.Request, hits []store.GlobalSear
 			users[hit.Post.FromID] = true
 			channelIDs[hit.PeerID] = true
 		case hit.Owned != nil:
-			msgs = append(msgs, messageToTL(*hit.Owned, nil, ownedFiles, nil, nil))
+			msgs = append(msgs, messageToTL(*hit.Owned, createUsers[hit.PeerID], ownedFiles, nil, nil))
 			users[hit.Owned.FromID] = true
+			// A service row names people the row itself does not author, and a
+			// client renders none of them from an id alone.
+			switch hit.Owned.Action {
+			case store.ChatActionAddUser, store.ChatActionDeleteUser:
+				users[hit.Owned.ActionUserID] = true
+			case store.ChatActionCreate:
+				for _, id := range createUsers[hit.PeerID] {
+					users[id] = true
+				}
+			}
 			if hit.PeerType == store.PeerTypeChat {
 				chatIDs[hit.PeerID] = true
 			} else {

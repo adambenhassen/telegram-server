@@ -20,8 +20,15 @@
 -- local_id breaks the rest. The keyset is one row comparison against that whole
 -- tuple, so a page resumes exactly where the previous one stopped.
 --
--- Each arm carries the page limit of its own, so total work is bounded by
--- 2 * lim rows regardless of how many messages match.
+-- Each arm carries a limit of its own, so at most 2 * lim rows reach the merge
+-- and the hydration behind it. That bounds the reply and everything downstream
+-- of this query — it does not bound the match. The sort key is computed, so
+-- neither arm has an index that returns rows already ordered and each one
+-- top-N sorts every row its predicate matches; the posts arm's predicate is the
+-- membership EXISTS, which the planner may apply either before or after the GIN
+-- match. Both arms are index-backed rather than sequential, which is the same
+-- cost the per-channel search accepted, and what bounds an account's total
+-- spend here is the per-account quota on the RPC, not this statement.
 -- name: SearchGlobalPage :many
 WITH owned AS (
     SELECT FLOOR(EXTRACT(EPOCH FROM date))::bigint AS rate,
