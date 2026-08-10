@@ -129,8 +129,16 @@ func (h *handlers) globalCursorPeer(peer tg.InputPeerClass, viewerID int64) (sto
 // chat title as its text (chats.go), so a query matching the title matches the
 // row, and tg.MessageActionChatCreate carries the members. Without them the
 // same row a client gets from messages.search with its participant list arrives
-// here with an empty one. chatSearch takes the identical lookup for the identical
-// reason; only the batching differs, because a global page spans chats.
+// here with an empty one. Only the batching is new here, because a global page
+// spans chats.
+//
+// The lookup goes through createUsersForDialog rather than reading participants
+// directly, and that is the whole authorization on it. The row is the caller's
+// retained copy, which they keep after leaving a chat by accepted design, but
+// the roster is read live: served ungated it would hand a removed member the
+// chat's current membership — people who joined after they left, with a peer
+// access hash derived for them. Ownership of the row does not extend to it, and
+// getDialogs settled the same question the same way for the same event.
 func (h *handlers) searchCreateUsers(r *mtproto.Request, hits []store.GlobalSearchHit) (map[int64][]int64, error) {
 	out := map[int64][]int64{}
 	for _, hit := range hits {
@@ -140,13 +148,9 @@ func (h *handlers) searchCreateUsers(r *mtproto.Request, hits []store.GlobalSear
 		if _, done := out[hit.PeerID]; done {
 			continue
 		}
-		parts, err := h.store.Participants(r.Ctx, hit.PeerID)
+		ids, err := h.createUsersForDialog(r.Ctx, hit.PeerID, r.UserID)
 		if err != nil {
 			return nil, err
-		}
-		ids := make([]int64, len(parts))
-		for i, p := range parts {
-			ids[i] = p.UserID
 		}
 		out[hit.PeerID] = ids
 	}

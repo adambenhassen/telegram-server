@@ -648,6 +648,81 @@ func TestSearchGlobalHydratesChatCreateServiceRows(t *testing.T) {
 	}
 }
 
+// A removed member keeps their copy of the create row and loses the roster it
+// names. The row is theirs by accepted design; the participant list is read
+// live, so serving it ungated would hand them the chat's membership as it stands
+// now — including people who joined after they left, with a peer access hash
+// derived for them.
+func TestSearchGlobalHidesTheRosterFromARemovedMember(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	alice, err := s.CreateUser(ctx, "+15551321101")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551321102")
+	if err != nil {
+		t.Fatal(err)
+	}
+	carol, err := s.CreateUser(ctx, "+15551321103")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = api.CreateChatForTest(s, alice.ID, &tg.MessagesCreateChatRequest{
+		Title: "Falcon crew",
+		Users: []tg.InputUserClass{api.InputUser(alice.ID, bob.ID)},
+	}); err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	chats, err := s.ChatsForUser(ctx, alice.ID)
+	if err != nil || len(chats) != 1 {
+		t.Fatalf("locate chat: %d chats, err %v", len(chats), err)
+	}
+	chatID := chats[0].ID
+
+	// Bob leaves the picture, Carol joins after him: Bob and Carol never shared
+	// a peer, so Carol is exactly what must not reach him.
+	if _, _, _, err = s.RemoveChatUser(ctx, chatID, bob.ID, alice.ID); err != nil {
+		t.Fatalf("remove bob: %v", err)
+	}
+	if _, _, _, err = s.AddChatUser(ctx, chatID, carol.ID, alice.ID); err != nil {
+		t.Fatalf("add carol: %v", err)
+	}
+
+	enc, err := searchGlobal(s, bob.ID, "falcon", 10)
+	if err != nil {
+		t.Fatalf("search global: %v", err)
+	}
+	res := globalSlice(t, enc)
+	// The retained copy is still served — this must not over-correct into
+	// dropping the hit, which is the accepted design for the row itself.
+	if len(res.Messages) != 1 {
+		t.Fatalf("hits = %d, want the retained create row", len(res.Messages))
+	}
+	svc, ok := res.Messages[0].(*tg.MessageService)
+	if !ok {
+		t.Fatalf("hit = %T, want *tg.MessageService", res.Messages[0])
+	}
+	action, ok := svc.Action.(*tg.MessageActionChatCreate)
+	if !ok {
+		t.Fatalf("action = %T, want *tg.MessageActionChatCreate", svc.Action)
+	}
+	if len(action.Users) != 0 {
+		t.Errorf("action users = %v, want none for a removed member", action.Users)
+	}
+	// Alice may still appear: she authored the row Bob owns, so the fan-out
+	// already decided he may see her, the same reasoning that leaves the
+	// add/delete branch's ActionUserID ungated. Carol is the disclosure — she
+	// joined after Bob left and reaches him only through the live roster.
+	for _, u := range res.Users {
+		if u.GetID() == carol.ID {
+			t.Error("a removed member was served a user who joined after they left")
+		}
+	}
+}
+
 // The two input rejections messages.search makes, made the same way here.
 func TestSearchGlobalRejectsEmptyQueryAndUnsupportedFilters(t *testing.T) {
 	t.Parallel()
