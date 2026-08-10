@@ -122,12 +122,13 @@ func TestContactsSearchChannelDiscovery(t *testing.T) {
 
 	// A creates two public channels and one private one, all matching the same
 	// title token. Channel ids are random draws, so creation order fixes nothing
-	// about where the private channel lands relative to the public two; what
-	// this case still proves end to end is that the private channel is never
-	// named and never shortens the page. The id-ordered version of that claim —
-	// a private row placed deliberately inside the page — is asserted at the
-	// handler level in TestContactsSearchPrivateChannelDoesNotConsumeLimit,
-	// where the id can be seeded.
+	// about where the private channel lands relative to the public two. What
+	// this case proves end to end is that the private channel is never named in
+	// the results — not that it never shortens the page: three candidates
+	// against a limit of ten come back whole either way, so filtering after the
+	// LIMIT would look identical here. That claim belongs to
+	// TestContactsSearchPrivateChannelDoesNotConsumeLimit at the handler level,
+	// where the private row's id is seeded inside the page deliberately.
 	publicID := createBroadcastChannel(t, ctx, aCmds, "Kayaking Club")
 	setUsername(publicID, "kayakclub")
 	privateID := createBroadcastChannel(t, ctx, aCmds, "Kayaking Private Crew")

@@ -134,8 +134,11 @@ func TestCreateChannelFailsClosedOnEntropyError(t *testing.T) {
 // TestCreateChannelFailsAfterRepeatedCollisions covers the other end of the
 // retry: a source that never yields a free id is broken, not unlucky, so the
 // redraw is bounded and the creation fails rather than spinning or reaching for
-// the sequence. The draw count is asserted exactly, so the documented bound
-// cannot drift — an unbounded loop and a bound of 800 both fail here.
+// the sequence. The draw count is compared against the shipped
+// store.ChannelIDAttempts, so what it verifies is that the loop exhausts that
+// bound exactly — an unbounded loop, or one that gives up early, fails here.
+// It cannot catch the constant and the loop being changed together, which is
+// the price of comparing against the constant rather than a copy of its value.
 func TestCreateChannelFailsAfterRepeatedCollisions(t *testing.T) {
 	t.Parallel()
 	s := open(t)
