@@ -86,6 +86,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.RateLimits.SearchContacts.Window != time.Hour {
 		t.Errorf("SearchContacts window = %v, want 1h", cfg.RateLimits.SearchContacts.Window)
 	}
+	if cfg.RateLimits.SearchGlobal.Limit != 300 {
+		t.Errorf("SearchGlobal limit = %d, want 300", cfg.RateLimits.SearchGlobal.Limit)
+	}
+	if cfg.RateLimits.SearchGlobal.Window != time.Hour {
+		t.Errorf("SearchGlobal window = %v, want 1h", cfg.RateLimits.SearchGlobal.Window)
+	}
 	if cfg.RateLimits.SaveFilePart.Limit != 600 {
 		t.Errorf("SaveFilePart limit = %d, want 600", cfg.RateLimits.SaveFilePart.Limit)
 	}
@@ -559,13 +565,15 @@ func TestLoadRateLimitEnv(t *testing.T) {
 		t.Errorf("CreateChannel window = %v, want 12h", cfg.RateLimits.CreateChannel.Window)
 	}
 
-	// Override search limits and windows. Both surfaces are asserted with
+	// Override search limits and windows. Every surface is asserted with
 	// distinct values so a name typo or a value landing on the wrong surface
 	// fails here rather than shipping.
 	t.Setenv("TG_RATE_LIMIT_SEARCH_MESSAGES", "11")
 	t.Setenv("TG_RATE_LIMIT_SEARCH_MESSAGES_WINDOW", "30m")
 	t.Setenv("TG_RATE_LIMIT_SEARCH_CONTACTS", "13")
 	t.Setenv("TG_RATE_LIMIT_SEARCH_CONTACTS_WINDOW", "45m")
+	t.Setenv("TG_RATE_LIMIT_SEARCH_GLOBAL", "19")
+	t.Setenv("TG_RATE_LIMIT_SEARCH_GLOBAL_WINDOW", "20m")
 	cfg, err = config.Load(discardLog())
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -581,6 +589,12 @@ func TestLoadRateLimitEnv(t *testing.T) {
 	}
 	if cfg.RateLimits.SearchContacts.Window != 45*time.Minute {
 		t.Errorf("SearchContacts window = %v, want 45m", cfg.RateLimits.SearchContacts.Window)
+	}
+	if cfg.RateLimits.SearchGlobal.Limit != 19 {
+		t.Errorf("SearchGlobal limit = %d, want 19", cfg.RateLimits.SearchGlobal.Limit)
+	}
+	if cfg.RateLimits.SearchGlobal.Window != 20*time.Minute {
+		t.Errorf("SearchGlobal window = %v, want 20m", cfg.RateLimits.SearchGlobal.Window)
 	}
 
 	// Override the upload part limit and window.

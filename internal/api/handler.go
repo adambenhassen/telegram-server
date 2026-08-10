@@ -61,6 +61,11 @@ type handlers struct {
 	rateLimitSearchMessages store.RateLimitConfig
 	// rateLimitSearchContacts limits contacts.search per account.
 	rateLimitSearchContacts store.RateLimitConfig
+	// rateLimitSearchGlobal limits messages.searchGlobal per account. It is a
+	// budget of its own rather than a share of the messages.search one: a global
+	// search reads every dialog the caller is in, so one call is not the same
+	// unit of work as a search inside a named peer.
+	rateLimitSearchGlobal store.RateLimitConfig
 	// rateLimitSaveFilePart limits upload.saveFilePart and upload.saveBigFilePart
 	// to one shared budget per account: both write the same parts table.
 	rateLimitSaveFilePart store.RateLimitConfig
@@ -135,6 +140,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitCreateChannel:  rateLimits.CreateChannel,
 		rateLimitSearchMessages: rateLimits.SearchMessages,
 		rateLimitSearchContacts: rateLimits.SearchContacts,
+		rateLimitSearchGlobal:   rateLimits.SearchGlobal,
 		rateLimitSaveFilePart:   rateLimits.SaveFilePart,
 		rateLimitSendCodeIP:     rateLimits.SendCodeIP,
 	}
@@ -195,6 +201,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesSendEncryptedRequestTypeID, h.handleSendEncryptedMessage)
 	register(d, tg.MessagesReceivedQueueRequestTypeID, h.handleReceivedQueue)
 	register(d, tg.MessagesSearchRequestTypeID, h.handleSearch)
+	register(d, tg.MessagesSearchGlobalRequestTypeID, h.handleSearchGlobal)
 	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		id, err := req.Buf.PeekID()
 		if err != nil {
