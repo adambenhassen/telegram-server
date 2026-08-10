@@ -7,7 +7,81 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const channelPostDate = `-- name: ChannelPostDate :one
+SELECT date FROM channel_messages WHERE channel_id = $1 AND local_id = $2
+`
+
+type ChannelPostDateParams struct {
+	ChannelID int64
+	LocalID   int64
+}
+
+// ChannelPostDate is OwnedMessageDate for a channel cursor. The caller's right
+// to hold this cursor is settled before it runs — a channel cursor is refused
+// unless the caller is an unbanned member — so this reads no more than the
+// search itself would serve.
+func (q *Queries) ChannelPostDate(ctx context.Context, arg ChannelPostDateParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, channelPostDate, arg.ChannelID, arg.LocalID)
+	var date pgtype.Timestamptz
+	err := row.Scan(&date)
+	return date, err
+}
+
+const memberChannelIDs = `-- name: MemberChannelIDs :many
+SELECT channel_id FROM channel_participants
+WHERE user_id = $1
+  AND (banned_until IS NULL OR banned_until <= now())
+ORDER BY channel_id
+`
+
+// MemberChannelIDs lists the channels the caller is currently an unbanned member
+// of. It backs the scope in SearchGlobalPage and nothing else may treat it as an
+// authorization: it is read outside the search statement, so a membership can
+// end between this and the page query, which is exactly why the page query
+// re-checks membership itself.
+func (q *Queries) MemberChannelIDs(ctx context.Context, userID int64) ([]int64, error) {
+	rows, err := q.db.Query(ctx, memberChannelIDs, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var channel_id int64
+		if err := rows.Scan(&channel_id); err != nil {
+			return nil, err
+		}
+		items = append(items, channel_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const ownedMessageDate = `-- name: OwnedMessageDate :one
+SELECT date FROM messages WHERE owner_id = $1 AND local_id = $2
+`
+
+type OwnedMessageDateParams struct {
+	OwnerID int64
+	LocalID int64
+}
+
+// OwnedMessageDate reads the timestamp of one of the caller's own rows, deleted
+// rows included: this resolves a pagination cursor, and a sequence whose last
+// served row was deleted mid-sequence must still resume exactly where it left
+// off rather than fall back to a whole-second window.
+func (q *Queries) OwnedMessageDate(ctx context.Context, arg OwnedMessageDateParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, ownedMessageDate, arg.OwnerID, arg.LocalID)
+	var date pgtype.Timestamptz
+	err := row.Scan(&date)
+	return date, err
+}
 
 const ownedMessagesByLocalIDs = `-- name: OwnedMessagesByLocalIDs :many
 SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post, message_tsv FROM messages
@@ -70,28 +144,31 @@ func (q *Queries) OwnedMessagesByLocalIDs(ctx context.Context, arg OwnedMessages
 
 const searchGlobalPage = `-- name: SearchGlobalPage :many
 WITH owned AS (
-    SELECT FLOOR(EXTRACT(EPOCH FROM date))::bigint AS rate,
-           peer_type                               AS peer_type,
-           peer_id                                 AS peer_id,
-           local_id                                AS msg_id
+    SELECT date      AS date,
+           peer_type AS peer_type,
+           peer_id   AS peer_id,
+           local_id  AS msg_id
     FROM messages
     WHERE owner_id = $2
       AND peer_type IN (1, 2)
       AND deleted = false
       AND message_tsv @@ plainto_tsquery('simple', $3)
       AND ($4::bool = false
-           OR (FLOOR(EXTRACT(EPOCH FROM date))::bigint, peer_type, peer_id, local_id)
-              < ($5::bigint, $6::smallint,
-                 $7::bigint, $8::bigint))
-    ORDER BY rate DESC, peer_type DESC, peer_id DESC, msg_id DESC
+           OR date < $5::timestamptz
+           OR (date <= $6::timestamptz
+               AND (peer_type, peer_id, local_id)
+                   < ($7::smallint, $8::bigint,
+                      $9::bigint)))
+    ORDER BY date DESC, peer_type DESC, peer_id DESC, msg_id DESC
     LIMIT $1::int
 ), posts AS (
-    SELECT FLOOR(EXTRACT(EPOCH FROM cm.date))::bigint AS rate,
-           3::smallint                                AS peer_type,
-           cm.channel_id                              AS peer_id,
-           cm.local_id                                AS msg_id
+    SELECT cm.date        AS date,
+           3::smallint    AS peer_type,
+           cm.channel_id  AS peer_id,
+           cm.local_id    AS msg_id
     FROM channel_messages cm
-    WHERE cm.deleted = false
+    WHERE cm.channel_id = ANY($10::bigint[])
+      AND cm.deleted = false
       AND cm.message_tsv @@ plainto_tsquery('simple', $3)
       AND EXISTS (
           SELECT 1 FROM channel_participants cp
@@ -100,15 +177,17 @@ WITH owned AS (
             AND (cp.banned_until IS NULL OR cp.banned_until <= now())
       )
       AND ($4::bool = false
-           OR (FLOOR(EXTRACT(EPOCH FROM cm.date))::bigint, 3::smallint, cm.channel_id, cm.local_id)
-              < ($5::bigint, $6::smallint,
-                 $7::bigint, $8::bigint))
-    ORDER BY rate DESC, peer_type DESC, peer_id DESC, msg_id DESC
+           OR cm.date < $5::timestamptz
+           OR (cm.date <= $6::timestamptz
+               AND (3::smallint, cm.channel_id, cm.local_id)
+                   < ($7::smallint, $8::bigint,
+                      $9::bigint)))
+    ORDER BY date DESC, peer_type DESC, peer_id DESC, msg_id DESC
     LIMIT $1::int
 )
-SELECT rate, peer_type, peer_id, msg_id
-FROM (SELECT rate, peer_type, peer_id, msg_id FROM owned UNION ALL SELECT rate, peer_type, peer_id, msg_id FROM posts) hits
-ORDER BY rate DESC, peer_type DESC, peer_id DESC, msg_id DESC
+SELECT date, peer_type, peer_id, msg_id
+FROM (SELECT date, peer_type, peer_id, msg_id FROM owned UNION ALL SELECT date, peer_type, peer_id, msg_id FROM posts) hits
+ORDER BY date DESC, peer_type DESC, peer_id DESC, msg_id DESC
 LIMIT $1::int
 `
 
@@ -117,23 +196,25 @@ type SearchGlobalPageParams struct {
 	OwnerID        int64
 	Query          string
 	HasCursor      bool
-	OffsetRate     int64
+	TieLo          pgtype.Timestamptz
+	TieHi          pgtype.Timestamptz
 	OffsetPeerType int16
 	OffsetPeerID   int64
 	OffsetID       int64
+	ChannelIds     []int64
 }
 
 type SearchGlobalPageRow struct {
-	Rate     int64
+	Date     pgtype.Timestamptz
 	PeerType int16
 	PeerID   int64
 	MsgID    int64
 }
 
 // SearchGlobalPage returns one ordered page of cross-dialog search keys: which
-// peer each hit belongs to and its id in that peer's id space. It names rows
-// rather than returning them because the two arms read tables with different
-// shapes; the callers hydrate each arm through its own query.
+// peer each hit belongs to, its id in that peer's id space, and its date. It
+// names rows rather than returning them because the two arms read tables with
+// different shapes; the callers hydrate each arm through its own query.
 //
 // The two arms are the two authorization predicates, and neither may be relaxed
 // to make the composition uniform. Owned rows (peer_type 1 = user, 2 = chat) are
@@ -143,34 +224,50 @@ type SearchGlobalPageRow struct {
 // channel_participants including the banned_until clause — a plain join on
 // membership would keep serving posts to a banned member.
 //
-// Ordering is newest-first by (rate, peer, id), where rate is the message date
-// truncated to whole seconds — the same value offset_rate carries on the wire.
-// Truncating in the sort key rather than only in the emitted cursor is what
-// makes paging exact: a sub-second ordering the cursor cannot express would skip
-// every row that shares its second with the last row of a page. peer_type and
-// peer_id break ties across peers, whose local_id spaces are not comparable, and
-// local_id breaks the rest. The keyset is one row comparison against that whole
-// tuple, so a page resumes exactly where the previous one stopped.
+// channel_ids is a scope, never the authorization. It carries the caller's own
+// unbanned channel ids, read separately off the index on channel_participants
+// (user_id), and exists so the planner cannot choose a plan that reads the whole
+// channel_messages table: with only the EXISTS to go on it may satisfy the
+// semi-join after the fact, and at a frequent term — plainto_tsquery('simple')
+// strips no stopwords, so the caller picks the frequency — that plan is a
+// parallel sequential scan of every post on the server. The EXISTS stays and
+// stays authoritative: a stale or wrong id list can only narrow this arm, never
+// widen it past the membership the EXISTS re-checks in the same statement.
+//
+// Ordering is newest-first by (date, peer, id), on the full stored timestamp
+// rather than on the whole second offset_rate carries. That is what keeps a page
+// sequence stable: a message arriving after the sequence started always has a
+// date past the cursor row's, so it can only surface at the newest end of a
+// fresh search, never slip in mid-sequence with a lower peer tuple in the same
+// second. peer_type and peer_id break ties across peers, whose local_id spaces
+// are not comparable, and local_id breaks the rest.
+//
+// The keyset arrives as a tie window rather than a single value: rows older than
+// tie_lo are strictly behind the cursor, rows within [tie_lo, tie_hi] are ties
+// broken by the peer tuple, rows past tie_hi are ahead of it. The caller sets
+// both ends to the cursor row's own timestamp when it can read that row, which
+// is the exact keyset; when the cursor names a row that does not exist it widens
+// the window to the whole second offset_rate names, which is all a made-up
+// cursor can be resolved to.
 //
 // Each arm carries a limit of its own, so at most 2 * lim rows reach the merge
 // and the hydration behind it. That bounds the reply and everything downstream
-// of this query — it does not bound the match. The sort key is computed, so
-// neither arm has an index that returns rows already ordered and each one
-// top-N sorts every row its predicate matches; the posts arm's predicate is the
-// membership EXISTS, which the planner may apply either before or after the GIN
-// match. Both arms are index-backed rather than sequential, which is the same
-// cost the per-channel search accepted, and what bounds an account's total
-// spend here is the per-account quota on the RPC, not this statement.
+// of this query. It does not bound the match: each arm still top-N sorts every
+// row its predicate matches, so the worst case is the caller's own corpus —
+// their messages, and the posts of the channels they belong to — and never the
+// whole server's.
 func (q *Queries) SearchGlobalPage(ctx context.Context, arg SearchGlobalPageParams) ([]SearchGlobalPageRow, error) {
 	rows, err := q.db.Query(ctx, searchGlobalPage,
 		arg.Lim,
 		arg.OwnerID,
 		arg.Query,
 		arg.HasCursor,
-		arg.OffsetRate,
+		arg.TieLo,
+		arg.TieHi,
 		arg.OffsetPeerType,
 		arg.OffsetPeerID,
 		arg.OffsetID,
+		arg.ChannelIds,
 	)
 	if err != nil {
 		return nil, err
@@ -180,7 +277,7 @@ func (q *Queries) SearchGlobalPage(ctx context.Context, arg SearchGlobalPagePara
 	for rows.Next() {
 		var i SearchGlobalPageRow
 		if err := rows.Scan(
-			&i.Rate,
+			&i.Date,
 			&i.PeerType,
 			&i.PeerID,
 			&i.MsgID,

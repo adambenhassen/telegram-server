@@ -58,21 +58,22 @@ func (h *handlers) handleSearchGlobal(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	// A cursor is re-authorized on every page rather than trusted because the
 	// server issued it: membership can end between two pages, and the peer in
-	// the cursor is client-supplied whatever its provenance.
-	if hasCursor {
-		switch cursorPeerType {
-		case store.PeerTypeChat:
-			if err = h.requireMember(r.Ctx, cursorPeerID, r.UserID); err != nil {
-				return nil, err
-			}
-		case store.PeerTypeChannel:
-			if _, err = h.requireChannelMember(r.Ctx, cursorPeerID, r.UserID); err != nil {
-				return nil, err
-			}
-		case store.PeerTypeUser:
-			// A user peer names no shared row: every row the owned arm can
-			// return is already the caller's own, so there is nothing further to
-			// authorize here.
+	// the cursor is client-supplied whatever its provenance. The predicate it is
+	// re-authorized against is the one the arm that served the row uses, and
+	// only that one.
+	//
+	// Channel posts are shared rows gated on membership, so a channel cursor is
+	// refused the moment that membership ends. User and chat cursors name rows
+	// the owned arm reaches through owner_id alone, and that arm's predicate
+	// cannot be failed by a peer id: a peer the caller has nothing in only moves
+	// the keyset within the caller's own rows. Gating a chat cursor on
+	// requireMember instead would authorize nothing and would dead-end paging for
+	// a caller who left the chat — page 1 serves their retained copy by design,
+	// and page 2 would refuse the cursor derived from it, stranding every older
+	// match in every other peer.
+	if hasCursor && cursorPeerType == store.PeerTypeChannel {
+		if _, err = h.requireChannelMember(r.Ctx, cursorPeerID, r.UserID); err != nil {
+			return nil, err
 		}
 	}
 

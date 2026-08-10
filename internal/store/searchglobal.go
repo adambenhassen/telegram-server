@@ -2,8 +2,12 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -55,8 +59,28 @@ type GlobalSearchHit struct {
 // resumes from the last key read, which never reaches the wire — the cursor a
 // client is handed still comes only from a row it was served.
 func (s *Store) SearchGlobal(ctx context.Context, userID int64, query string, cursor *GlobalSearchCursor, limit int) ([]GlobalSearchHit, error) {
+	// The caller's own channels, read once per call off the index on
+	// channel_participants (user_id). It scopes the posts arm; the membership
+	// EXISTS inside the page query is what authorizes it.
+	channelIDs, err := s.q.MemberChannelIDs(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("member channel ids: %w", err)
+	}
+	if channelIDs == nil {
+		channelIDs = []int64{}
+	}
+
+	var bound *searchGlobalBound
+	if cursor != nil {
+		b, err := s.resolveCursor(ctx, userID, *cursor)
+		if err != nil {
+			return nil, err
+		}
+		bound = &b
+	}
+
 	for attempt := 0; ; attempt++ {
-		keys, err := s.searchGlobalKeys(ctx, userID, query, cursor, limit)
+		keys, err := s.searchGlobalKeys(ctx, userID, query, channelIDs, bound, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -76,11 +100,91 @@ func (s *Store) SearchGlobal(ctx context.Context, userID int64, query string, cu
 		if len(keys) < limit || attempt+1 >= maxSearchGlobalRefills {
 			return nil, nil
 		}
+		// Resume from the last key. Its timestamp came out of the page query, so
+		// the refill needs no lookup to place it exactly.
 		last := keys[len(keys)-1]
-		cursor = &GlobalSearchCursor{
-			Rate: last.Rate, PeerType: PeerType(last.PeerType), PeerID: last.PeerID, MsgID: last.MsgID,
+		bound = &searchGlobalBound{
+			tieLo:    last.Date,
+			tieHi:    last.Date,
+			peerType: last.PeerType,
+			peerID:   last.PeerID,
+			msgID:    last.MsgID,
 		}
 	}
+}
+
+// searchGlobalBound is a wire cursor resolved into the keyset the page query
+// takes: a tie window on the stored timestamp plus the peer tuple that breaks
+// ties inside it.
+type searchGlobalBound struct {
+	tieLo, tieHi pgtype.Timestamptz
+	peerType     int16
+	peerID       int64
+	msgID        int64
+}
+
+// resolveCursor turns the client's (offset_rate, offset_peer, offset_id) into
+// that keyset by reading the cursor row's own timestamp.
+//
+// Resolving it server-side rather than trusting offset_rate is what makes a page
+// sequence stable. offset_rate is whole seconds, the finest the wire carries, and
+// a whole-second bound admits a message that arrived after the sequence started
+// as long as it lands in that second with a lower peer tuple. The row's stored
+// timestamp has no such slack: anything created later sorts strictly ahead of it
+// and can only appear at the newest end of a fresh search.
+//
+// The lookup reads deleted rows too, so a sequence whose last served row is
+// deleted mid-sequence still resumes exactly. Only a cursor naming a row that
+// never existed falls back to the whole second offset_rate names — there is no
+// sequence for an invented cursor to stay consistent with, and the fallback can
+// reach no row the keyset could not already reach.
+func (s *Store) resolveCursor(ctx context.Context, userID int64, cursor GlobalSearchCursor) (searchGlobalBound, error) {
+	b := searchGlobalBound{
+		peerType: int16(cursor.PeerType),
+		peerID:   cursor.PeerID,
+		msgID:    cursor.MsgID,
+	}
+	exact, found, err := s.cursorDate(ctx, userID, cursor)
+	if err != nil {
+		return searchGlobalBound{}, err
+	}
+	if found {
+		b.tieLo, b.tieHi = exact, exact
+		return b, nil
+	}
+	start := time.Unix(cursor.Rate, 0)
+	b.tieLo = pgtype.Timestamptz{Time: start, Valid: true}
+	b.tieHi = pgtype.Timestamptz{Time: start.Add(time.Second - time.Microsecond), Valid: true}
+	return b, nil
+}
+
+// cursorDate reads the timestamp of the row a cursor names, from the table that
+// peer kind stores its rows in. Each read carries the predicate that arm is
+// gated on, so a cursor can resolve nothing the search itself would not serve:
+// an owned row only within the caller's own rows, a channel post only for a
+// channel the handler has already established the caller is an unbanned member
+// of.
+func (s *Store) cursorDate(ctx context.Context, userID int64, cursor GlobalSearchCursor) (pgtype.Timestamptz, bool, error) {
+	var (
+		at  pgtype.Timestamptz
+		err error
+	)
+	if cursor.PeerType == PeerTypeChannel {
+		at, err = s.q.ChannelPostDate(ctx, db.ChannelPostDateParams{
+			ChannelID: cursor.PeerID, LocalID: cursor.MsgID,
+		})
+	} else {
+		at, err = s.q.OwnedMessageDate(ctx, db.OwnedMessageDateParams{
+			OwnerID: userID, LocalID: cursor.MsgID,
+		})
+	}
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return pgtype.Timestamptz{}, false, nil
+	case err != nil:
+		return pgtype.Timestamptz{}, false, fmt.Errorf("search global cursor date: %w", err)
+	}
+	return at, at.Valid, nil
 }
 
 // maxSearchGlobalRefills caps how many key reads one call may make. Each refill
@@ -91,18 +195,20 @@ const maxSearchGlobalRefills = 3
 
 // searchGlobalKeys reads one ordered page of keys: which peer each hit belongs
 // to and its id there. This is where both arms' predicates and the keyset live.
-func (s *Store) searchGlobalKeys(ctx context.Context, userID int64, query string, cursor *GlobalSearchCursor, limit int) ([]db.SearchGlobalPageRow, error) {
+func (s *Store) searchGlobalKeys(ctx context.Context, userID int64, query string, channelIDs []int64, bound *searchGlobalBound, limit int) ([]db.SearchGlobalPageRow, error) {
 	params := db.SearchGlobalPageParams{
-		OwnerID: userID,
-		Query:   query,
-		Lim:     int32(limit), //nolint:gosec // limit is a small validated page size
+		OwnerID:    userID,
+		Query:      query,
+		ChannelIds: channelIDs,
+		Lim:        int32(limit), //nolint:gosec // limit is a small validated page size
 	}
-	if cursor != nil {
+	if bound != nil {
 		params.HasCursor = true
-		params.OffsetRate = cursor.Rate
-		params.OffsetPeerType = int16(cursor.PeerType)
-		params.OffsetPeerID = cursor.PeerID
-		params.OffsetID = cursor.MsgID
+		params.TieLo = bound.tieLo
+		params.TieHi = bound.tieHi
+		params.OffsetPeerType = bound.peerType
+		params.OffsetPeerID = bound.peerID
+		params.OffsetID = bound.msgID
 	}
 	keys, err := s.q.SearchGlobalPage(ctx, params)
 	if err != nil {
@@ -133,7 +239,9 @@ func (s *Store) hydrateKeys(ctx context.Context, userID int64, keys []db.SearchG
 	}
 	hits := make([]GlobalSearchHit, 0, len(keys))
 	for _, k := range keys {
-		hit := GlobalSearchHit{Rate: k.Rate, PeerType: PeerType(k.PeerType), PeerID: k.PeerID}
+		// Rate is the wire form of the row's date: whole seconds, the value
+		// offset_rate carries back on the next page.
+		hit := GlobalSearchHit{Rate: k.Date.Time.Unix(), PeerType: PeerType(k.PeerType), PeerID: k.PeerID}
 		if PeerType(k.PeerType) == PeerTypeChannel {
 			m, ok := posts[channelPostKey{channelID: k.PeerID, localID: k.MsgID}]
 			if !ok {

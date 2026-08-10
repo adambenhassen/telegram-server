@@ -390,11 +390,19 @@ func TestSearchGlobalRejectsATamperedCursorPeer(t *testing.T) {
 		rpcError(t, err, "PEER_ID_INVALID")
 	}
 
-	// A chat peer carries no hash at all, so membership is the whole gate.
-	if _, err = page(mallory.ID, api.InputPeerChat(mallory.ID, d.chat.ID)); err == nil {
-		t.Fatal("non-member chat cursor: expected PEER_ID_INVALID, got nil")
-	} else {
-		rpcError(t, err, "PEER_ID_INVALID")
+	// A chat cursor is re-authorized against the predicate that served the row,
+	// and the owned arm's is owner_id. A chat the caller has nothing in is
+	// therefore accepted and moves the keyset, not refused: refusing it would
+	// gate one arm's cursor on another arm's predicate and dead-end paging for a
+	// caller who left a chat. It reaches nothing — the arm only ever reads rows
+	// this caller owns — so the page comes back empty rather than carrying the
+	// chat.
+	enc, err := page(mallory.ID, api.InputPeerChat(mallory.ID, d.chat.ID))
+	if err != nil {
+		t.Fatalf("foreign chat cursor: %v", err)
+	}
+	if res := globalSlice(t, enc); len(res.Messages) != 0 {
+		t.Fatalf("foreign chat cursor served %v", globalTexts(t, res))
 	}
 
 	// A member's own cursor works until the membership ends, and then stops the
@@ -411,6 +419,165 @@ func TestSearchGlobalRejectsATamperedCursorPeer(t *testing.T) {
 		t.Fatal("cursor after ban: expected PEER_ID_INVALID, got nil")
 	} else {
 		rpcError(t, err, "PEER_ID_INVALID")
+	}
+}
+
+// A caller removed from a chat keeps searching their retained copies, by
+// accepted design, so the sequence that serves one has to be able to continue
+// past it. Gating the chat cursor on membership dead-ends that sequence and
+// strands every older match in every other peer.
+func TestSearchGlobalPaginatesPastAChatTheCallerLeft(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	d := seedDialogSet(t, s, "+15551321081", "+15551321082")
+
+	// The chat hit is newer than the 1:1 one, so a limit of 1 serves the chat
+	// copy first and the dm is what the next page has to reach.
+	full := globalSlice(t, mustSearchGlobal(t, s, d.caller.ID, "deadline"))
+	texts := globalTexts(t, full)
+	if len(texts) != 3 {
+		t.Fatalf("baseline hits = %v, want 3", texts)
+	}
+
+	if _, _, _, err := s.RemoveChatUser(ctx, d.chat.ID, d.caller.ID, d.caller.ID); err != nil {
+		t.Fatalf("remove from chat: %v", err)
+	}
+
+	// Page one row at a time through the whole sequence; the removal must not
+	// stop it, and the retained chat copy is still the caller's own row.
+	var paged []string
+	req := &tg.MessagesSearchGlobalRequest{
+		Q:          "deadline",
+		Filter:     &tg.InputMessagesFilterEmpty{},
+		OffsetPeer: &tg.InputPeerEmpty{},
+		Limit:      1,
+	}
+	for range len(texts) + 1 {
+		enc, err := api.SearchGlobalForTest(s, d.caller.ID, req)
+		if err != nil {
+			t.Fatalf("page after removal: %v", err)
+		}
+		page := globalSlice(t, enc)
+		if len(page.Messages) == 0 {
+			break
+		}
+		paged = append(paged, globalTexts(t, page)...)
+		last, ok := page.Messages[len(page.Messages)-1].(*tg.Message)
+		if !ok {
+			t.Fatalf("last message = %T, want *tg.Message", page.Messages[len(page.Messages)-1])
+		}
+		rate, ok := page.GetNextRate()
+		if !ok {
+			t.Fatal("non-empty page carries no next_rate")
+		}
+		req = &tg.MessagesSearchGlobalRequest{
+			Q:          "deadline",
+			Filter:     &tg.InputMessagesFilterEmpty{},
+			OffsetRate: rate,
+			OffsetPeer: inputPeerFor(t, d.caller.ID, last.PeerID),
+			OffsetID:   last.ID,
+			Limit:      1,
+		}
+	}
+	if len(paged) != len(texts) {
+		t.Fatalf("paged %v after removal, want the same %d hits: %v", paged, len(texts), texts)
+	}
+	for i := range texts {
+		if paged[i] != texts[i] {
+			t.Fatalf("page sequence diverges at %d: got %q, want %q", i, paged[i], texts[i])
+		}
+	}
+}
+
+// A message arriving after a page sequence started may show up at the newest end
+// of a fresh search and nowhere else. The wire cursor is whole seconds, so the
+// case that catches a second-granularity keyset is an arrival inside the cursor
+// row's own second whose peer tuple sorts below it.
+func TestSearchGlobalKeepsASequenceStableAgainstSameSecondArrivals(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	d := seedDialogSet(t, s, "+15551321091", "+15551321092")
+
+	// Pin the seed instead of racing the clock: the channel post at a whole
+	// second, the owned rows well behind it. The collision this case turns on is
+	// then constructed rather than hoped for.
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	channelExec(t, ctx, dsn,
+		`UPDATE channel_messages SET date = $1 WHERE channel_id = $2`, base, d.channel.ID)
+	channelExec(t, ctx, dsn,
+		`UPDATE messages SET date = $1 WHERE owner_id = $2`, base.Add(-time.Minute), d.caller.ID)
+
+	// Page 1 ends on the channel hit, the highest peer tuple in this second.
+	first, err := api.SearchGlobalForTest(s, d.caller.ID, &tg.MessagesSearchGlobalRequest{
+		Q:          "deadline",
+		Filter:     &tg.InputMessagesFilterEmpty{},
+		OffsetPeer: &tg.InputPeerEmpty{},
+		Limit:      1,
+	})
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	page1 := globalSlice(t, first)
+	if len(page1.Messages) != 1 {
+		t.Fatalf("page 1 = %v, want one hit", globalTexts(t, page1))
+	}
+	last, ok := page1.Messages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("hit = %T, want *tg.Message", page1.Messages[0])
+	}
+	if _, isChannel := last.PeerID.(*tg.PeerChannel); !isChannel {
+		t.Fatalf("page 1 peer = %T, want the channel hit this case needs", last.PeerID)
+	}
+	rate, ok := page1.GetNextRate()
+	if !ok {
+		t.Fatal("page 1 carries no next_rate")
+	}
+
+	// A new 1:1 message lands mid-sequence: a microsecond after the cursor row,
+	// so inside its second, and with a lower peer tuple. A whole-second keyset
+	// admits it on page 2; the row's own timestamp does not.
+	if _, err = api.SendMessageForTest(s, d.other.ID, &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerUser(d.other.ID, d.caller.ID), Message: "deadline arrived late", RandomID: 8901,
+	}); err != nil {
+		t.Fatalf("late send: %v", err)
+	}
+	channelExec(t, ctx, dsn,
+		`UPDATE messages SET date = $1 WHERE owner_id = $2 AND message = $3`,
+		base.Add(time.Microsecond), d.caller.ID, "deadline arrived late")
+
+	// A fresh search is where the arrival belongs: newest-first, at the top.
+	fresh := globalSlice(t, mustSearchGlobal(t, s, d.caller.ID, "deadline"))
+	newest, ok := fresh.Messages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("newest hit = %T, want *tg.Message", fresh.Messages[0])
+	}
+	if newest.Message != "deadline arrived late" {
+		t.Fatalf("fresh search newest = %q, want the late arrival", newest.Message)
+	}
+	if newest.Date != rate {
+		t.Fatalf("late arrival at %d is not in the cursor row's second %d — the seed no longer builds the case",
+			newest.Date, rate)
+	}
+
+	rest, err := api.SearchGlobalForTest(s, d.caller.ID, &tg.MessagesSearchGlobalRequest{
+		Q:          "deadline",
+		Filter:     &tg.InputMessagesFilterEmpty{},
+		OffsetRate: rate,
+		OffsetPeer: inputPeerFor(t, d.caller.ID, last.PeerID),
+		OffsetID:   last.ID,
+		Limit:      10,
+	})
+	if err != nil {
+		t.Fatalf("page 2: %v", err)
+	}
+	// The in-progress sequence must not carry it — it is not lost, the fresh
+	// search above is where it belongs.
+	for _, text := range globalTexts(t, globalSlice(t, rest)) {
+		if text == "deadline arrived late" {
+			t.Fatal("a message that arrived after the sequence started was admitted mid-sequence")
+		}
 	}
 }
 
