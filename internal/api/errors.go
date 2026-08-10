@@ -101,6 +101,12 @@ var (
 	// FLOOD_WAIT is the right signal: the condition clears on its own as soon as
 	// the in-flight request finishes.
 	errDownloadBusy = rpcErr(420, "FLOOD_WAIT_1")
+	// errSearchRetry rejects a searchGlobal page that kept losing every row it
+	// selected to a concurrent delete or ban. FLOOD_WAIT for the same reason
+	// errDownloadBusy uses it: the condition is transient and clears on its own.
+	// It must not be an empty page — a client reads that as exhaustion and stops,
+	// abandoning the authorized matches still behind the cursor.
+	errSearchRetry = rpcErr(420, "FLOOD_WAIT_1")
 	// errLookupFloodWait rejects a contacts.resolvePhone that would take the
 	// caller past their per-account lookup quota.
 	errLookupFloodWait = rpcErr(420, "FLOOD_WAIT_86400")

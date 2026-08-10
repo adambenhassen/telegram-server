@@ -745,3 +745,93 @@ func TestSearchMessagesChannelChargedBeforeMembershipCheck(t *testing.T) {
 		t.Fatalf("probe 2: expected FLOOD_WAIT, got %v", err)
 	}
 }
+
+// TestSearchGlobalRateLimit proves that N+1 global searches within the window
+// are denied with FLOOD_WAIT: a cross-dialog search reaches every dialog the
+// caller is in, so it may not be the one search surface that ships unthrottled.
+func TestSearchGlobalRateLimit(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	d := seedDialogSet(t, s, "+15551321051", "+15551321052")
+
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	search := func() (bin.Encoder, error) {
+		return api.SearchGlobalForTestWithLimits(s, d.caller.ID, cfg, &tg.MessagesSearchGlobalRequest{
+			Q:          "deadline",
+			Filter:     &tg.InputMessagesFilterEmpty{},
+			OffsetPeer: &tg.InputPeerEmpty{},
+			Limit:      10,
+		})
+	}
+
+	for i := range 2 {
+		enc, err := search()
+		if err != nil {
+			t.Fatalf("search %d: %v", i+1, err)
+		}
+		if res := globalSlice(t, enc); len(res.Messages) != 3 {
+			t.Fatalf("search %d: got %d hits, want 3", i+1, len(res.Messages))
+		}
+	}
+	if _, err := search(); !isFloodWait(err) {
+		t.Fatalf("search 3: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+// TestSearchGlobalQuotaIsUniformAndItsOwn proves the two properties the quota
+// has to hold to be safe on this surface: every call costs the same token
+// whatever it matches, so an exhausted budget answers no question about what
+// exists, and the budget is not shared with messages.search, so exhausting one
+// surface does not silently disable the other.
+func TestSearchGlobalQuotaIsUniformAndItsOwn(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	d := seedDialogSet(t, s, "+15551321061", "+15551321062")
+	outsider, err := s.CreateUser(ctx, "+15551321063")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	search := func(userID int64) (bin.Encoder, error) {
+		return api.SearchGlobalForTestWithLimits(s, userID, cfg, &tg.MessagesSearchGlobalRequest{
+			Q:          "deadline",
+			Filter:     &tg.InputMessagesFilterEmpty{},
+			OffsetPeer: &tg.InputPeerEmpty{},
+			Limit:      10,
+		})
+	}
+
+	// A caller in no dialogs matches nothing and is charged all the same.
+	enc, err := search(outsider.ID)
+	if err != nil {
+		t.Fatalf("outsider search 1: %v", err)
+	}
+	if res := globalSlice(t, enc); len(res.Messages) != 0 {
+		t.Fatalf("outsider hits = %d, want none", len(res.Messages))
+	}
+	if _, err = search(outsider.ID); !isFloodWait(err) {
+		t.Fatalf("outsider search 2: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// A per-peer search exhausting its own budget leaves the global one intact.
+	perPeer := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	if _, err = api.SearchForTestWithLimits(s, d.caller.ID, perPeer, &tg.MessagesSearchRequest{
+		Peer:   api.InputPeerUser(d.caller.ID, d.other.ID),
+		Q:      "deadline",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	}); err != nil {
+		t.Fatalf("per-peer search: %v", err)
+	}
+	if _, err = api.SearchForTestWithLimits(s, d.caller.ID, perPeer, &tg.MessagesSearchRequest{
+		Peer:   api.InputPeerUser(d.caller.ID, d.other.ID),
+		Q:      "deadline",
+		Filter: &tg.InputMessagesFilterEmpty{},
+	}); !isFloodWait(err) {
+		t.Fatalf("per-peer search 2: expected FLOOD_WAIT, got %v", err)
+	}
+	if _, err = search(d.caller.ID); err != nil {
+		t.Fatalf("global search after the per-peer budget ran out: %v", err)
+	}
+}

@@ -21,6 +21,12 @@ func NextBackoff(prev, uptime time.Duration) time.Duration { return nextBackoff(
 // each own their own hook without racing.
 func SetDeniedHook(s *Store, fn func()) { s.deniedHook = fn }
 
+// SetSearchPageHook installs a callback that fires in SearchGlobal between the
+// key read and the body read. Tests use it to delete the rows the page named and
+// exercise the refill branch. Scoped to the Store so parallel tests each own
+// their own hook without racing.
+func SetSearchPageHook(s *Store, fn func()) { s.searchPageHook = fn }
+
 const (
 	ListenerBackoffMin = listenerBackoffMin
 	ListenerBackoffMax = listenerBackoffMax
