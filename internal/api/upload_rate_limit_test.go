@@ -60,7 +60,7 @@ func TestSaveFilePartRateLimit(t *testing.T) {
 func TestSaveFilePartRateLimitWindowExpiry(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	u, err := s.CreateUser(ctx, "+15551298002")
 	if err != nil {
@@ -68,7 +68,9 @@ func TestSaveFilePartRateLimitWindowExpiry(t *testing.T) {
 	}
 
 	const fileID = 4002
-	cfg := store.RateLimitConfig{Limit: 1, Window: 500 * time.Millisecond}
+	// Long window, aged past its deadline below rather than slept through: see
+	// AgeRateLimitWindowForTest.
+	cfg := store.RateLimitConfig{Limit: 1, Window: time.Hour}
 	if _, err := api.SaveFilePartForTestWithLimits(s, u.ID, cfg, &tg.UploadSaveFilePartRequest{
 		FileID: fileID, FilePart: 0, Bytes: []byte("part"),
 	}); err != nil {
@@ -80,7 +82,9 @@ func TestSaveFilePartRateLimitWindowExpiry(t *testing.T) {
 		t.Fatalf("part 1: expected FLOOD_WAIT, got %v", err)
 	}
 
-	time.Sleep(600 * time.Millisecond)
+	if err := api.AgeRateLimitWindowForTest(dsn, u.ID, "save_file_part", cfg.Window+time.Minute); err != nil {
+		t.Fatalf("age window: %v", err)
+	}
 
 	if _, err := api.SaveFilePartForTestWithLimits(s, u.ID, cfg, &tg.UploadSaveFilePartRequest{
 		FileID: fileID, FilePart: 1, Bytes: []byte("part"),

@@ -86,7 +86,7 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 		return nil, fmt.Errorf("get rate limit: %w", err)
 	}
 
-	return &RateLimitResult{Wait: waitUntil(expiresAt.Time)}, nil
+	return &RateLimitResult{Wait: waitUntil(s.now(), expiresAt.Time)}, nil
 }
 
 // SweepExpiredRateLimits deletes rate-limit rows whose per-row expiry deadline
