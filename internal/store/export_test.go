@@ -21,6 +21,27 @@ func NextBackoff(prev, uptime time.Duration) time.Duration { return nextBackoff(
 // each own their own hook without racing.
 func SetDeniedHook(s *Store, fn func()) { s.deniedHook = fn }
 
+// SetNowFunc pins the clock CheckRateLimit measures the client-visible wait
+// against. It exists because the minimum-wait rule only fires on a remainder
+// under one second, and a real sub-second window closes under host load before
+// the second request lands — the test then sees an allowed request instead of
+// the denial it is asserting on. Pinning the clock lets the window stay long
+// enough that no scheduler delay can close it while the remainder under test
+// stays exact. Scoped to the Store so parallel tests each own their own clock
+// without racing.
+func SetNowFunc(s *Store, fn func() time.Time) { s.now = fn }
+
+// RateLimitExpiresAt reads a rate-limit row's stored deadline — the value the
+// wait is computed from, and the one a test has to know to name a remainder
+// relative to it.
+func RateLimitExpiresAt(ctx context.Context, s *Store, subjectID int64, surface string) (time.Time, error) {
+	var at time.Time
+	err := s.pool.QueryRow(ctx,
+		"SELECT expires_at FROM rate_limits WHERE subject_id = $1 AND surface = $2",
+		subjectID, surface).Scan(&at)
+	return at, err
+}
+
 // SetSearchPageHook installs a callback that fires in SearchGlobal between the
 // key read and the body read. Tests use it to delete the rows the page named and
 // exercise the refill branch. Scoped to the Store so parallel tests each own

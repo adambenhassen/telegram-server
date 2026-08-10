@@ -394,8 +394,10 @@ func TestContactsSearchRateLimitWindowExpiry(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	// Very short window: 1 search per 500ms.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 500 * time.Millisecond}
+	// Long window: only the explicit rewind below closes it. A window short
+	// enough to sleep through also closes on its own under host load, and the
+	// denial this test asserts on then never happens.
+	cfg := store.RateLimitConfig{Limit: 1, Window: time.Hour}
 
 	// Exhaust the limit.
 	enc, err := api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{
@@ -416,8 +418,10 @@ func TestContactsSearchRateLimitWindowExpiry(t *testing.T) {
 		t.Fatalf("expected FLOOD_WAIT, got %v", err)
 	}
 
-	// Wait for window to expire.
-	time.Sleep(600 * time.Millisecond)
+	// Age the window past its deadline.
+	if err := api.AgeRateLimitWindowForTest(dsn, alice.ID, "contacts_search", cfg.Window+time.Minute); err != nil {
+		t.Fatalf("age window: %v", err)
+	}
 
 	// Should be allowed again, and still return the match.
 	enc, err = api.ContactsSearchForTestWithLimits(s, alice.ID, cfg, &tg.ContactsSearchRequest{

@@ -2,13 +2,16 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
 	"net/netip"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -688,6 +691,36 @@ func SearchGlobalForTestWithLimits(s *store.Store, userID int64, rateLimit store
 	h := testHandlers(s)
 	h.rateLimitSearchGlobal = rateLimit
 	return h.handleSearchGlobal(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// AgeRateLimitWindowForTest rewinds one rate-limit row's window by d, leaving
+// the row exactly as it would look had d of wall clock passed since the window
+// opened. It is how a test crosses a window boundary: sleeping through a real
+// window means the window has to be short, and a short window also closes
+// early under host load, so the denial the test asserts on before the boundary
+// stops happening. Rewinding lets the window be long enough that only this call
+// can close it. dsn is the database connection string.
+func AgeRateLimitWindowForTest(dsn string, subjectID int64, surface string, d time.Duration) error {
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	tag, err := pool.Exec(context.Background(),
+		`UPDATE rate_limits
+		    SET window_start = window_start - $3::INTERVAL,
+		        expires_at   = expires_at   - $3::INTERVAL
+		  WHERE subject_id = $1 AND surface = $2`,
+		subjectID, surface, pgtype.Interval{Microseconds: d.Microseconds(), Valid: true})
+	if err != nil {
+		return err
+	}
+	// A surface typo would otherwise leave the window untouched and the test
+	// asserting nothing.
+	if n := tag.RowsAffected(); n != 1 {
+		return fmt.Errorf("age rate limit window: %d rows for subject %d surface %q, want 1", n, subjectID, surface)
+	}
+	return nil
 }
 
 // SetUserFirstNameForTest updates a user's first_name directly, so tests can
