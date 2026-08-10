@@ -651,6 +651,35 @@ func SearchForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateL
 	return h.handleSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SearchGlobalErrorForTest exposes how a failed search reaches the wire. The
+// store hook that produces real contention lives in the store package's own test
+// build, out of reach here, so the mapping is asserted directly.
+func SearchGlobalErrorForTest(err error) error {
+	return testHandlers(nil).searchGlobalError(0, err)
+}
+
+// SearchGlobalForTest invokes handleSearchGlobal for the caller against the
+// given request.
+func SearchGlobalForTest(s *store.Store, userID int64, req *tg.MessagesSearchGlobalRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleSearchGlobal(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SearchGlobalForTestWithLimits invokes handleSearchGlobal for the caller with a
+// custom global search rate limit config.
+func SearchGlobalForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSearchGlobalRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitSearchGlobal = rateLimit
+	return h.handleSearchGlobal(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SetUserFirstNameForTest updates a user's first_name directly, so tests can
 // seed searchable names. The name_tsv column is GENERATED ALWAYS, so Postgres
 // recomputes it automatically. dsn is the database connection string.

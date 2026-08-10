@@ -30,6 +30,11 @@ type Store struct {
 	// INSERT denial and before the GET. Scoped to the Store so parallel tests
 	// each own their own hook without racing.
 	deniedHook func()
+
+	// searchPageHook is a test-only callback fired in SearchGlobal between the
+	// key read and the body read, the window a delete or a ban lands in. Scoped
+	// to the Store for the reason deniedHook is.
+	searchPageHook func()
 }
 
 // Sentinel errors returned by the login-code methods.

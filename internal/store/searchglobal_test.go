@@ -1,0 +1,453 @@
+package store_test
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/adambenhassen/telegram-server/internal/store"
+)
+
+// globalKey identifies one hit the way the cursor does, so a page sequence can
+// be compared against a single-page read without depending on row contents.
+type globalKey struct {
+	peerType store.PeerType
+	peerID   int64
+	msgID    int64
+}
+
+func keysOf(hits []store.GlobalSearchHit) []globalKey {
+	out := make([]globalKey, len(hits))
+	for i, h := range hits {
+		out[i] = globalKey{peerType: h.PeerType, peerID: h.PeerID, msgID: hitID(h)}
+	}
+	return out
+}
+
+func hitID(h store.GlobalSearchHit) int64 {
+	if h.Post != nil {
+		return h.Post.LocalID
+	}
+	return h.Owned.LocalID
+}
+
+func hitText(t *testing.T, h store.GlobalSearchHit) string {
+	t.Helper()
+	switch {
+	case h.Post != nil:
+		return h.Post.Message
+	case h.Owned != nil:
+		return h.Owned.Text
+	default:
+		t.Fatalf("hit %+v carries neither an owned row nor a post", h)
+		return ""
+	}
+}
+
+func searchGlobal(t *testing.T, s *store.Store, userID int64, q string, cursor *store.GlobalSearchCursor, limit int) []store.GlobalSearchHit {
+	t.Helper()
+	hits, err := s.SearchGlobal(context.Background(), userID, q, cursor, limit)
+	if err != nil {
+		t.Fatalf("search global: %v", err)
+	}
+	return hits
+}
+
+// dateOwned pins an owned row's date so a test can assert an order that does not
+// depend on how fast the seed ran. Both search arms sort on whole seconds, so a
+// seed that lands every row in one second only ever exercises the tie-breakers.
+func dateOwned(t *testing.T, s *store.Store, ownerID, localID int64, at time.Time) {
+	t.Helper()
+	if _, err := store.StorePool(s).Exec(context.Background(),
+		`UPDATE messages SET date = $1 WHERE owner_id = $2 AND local_id = $3`, at, ownerID, localID); err != nil {
+		t.Fatalf("set owned date: %v", err)
+	}
+}
+
+func datePost(t *testing.T, s *store.Store, channelID, localID int64, at time.Time) {
+	t.Helper()
+	if _, err := store.StorePool(s).Exec(context.Background(),
+		`UPDATE channel_messages SET date = $1 WHERE channel_id = $2 AND local_id = $3`, at, channelID, localID); err != nil {
+		t.Fatalf("set post date: %v", err)
+	}
+}
+
+// A caller in a 1:1, a chat and a channel gets hits from all three in one page,
+// newest-first, each carrying the peer it belongs to.
+func TestSearchGlobalUnionsEveryPeerKind(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	alice := mustUser(t, s, "+15551320001")
+	bob := mustUser(t, s, "+15551320002")
+
+	dm := send(t, s, bob, alice, "the deadline is monday", 9001)
+	chat, err := s.CreateChat(ctx, alice.ID, "Team", []int64{bob.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	chatMsg, _, _, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: chat.ID, FromID: bob.ID, Text: "chat deadline moved", RandomID: 9002,
+	})
+	if err != nil {
+		t.Fatalf("send chat message: %v", err)
+	}
+	ch := mustChannel(t, s, alice.ID, "News")
+	notice, _ := post(t, s, ch.ID, alice.ID, "channel deadline notice", 9003)
+	// A post nobody searched for, so a match is never just "everything".
+	post(t, s, ch.ID, alice.ID, "unrelated chatter", 9004)
+
+	// alice's own copy of the fan-out carries her local_id, not the sender's.
+	aliceChatCopy, err := s.SearchMessages(ctx, alice.ID, store.PeerTypeChat, chat.ID, "deadline", 0, 10)
+	if err != nil || len(aliceChatCopy) != 1 {
+		t.Fatalf("locate alice's chat copy: %d rows, err %v", len(aliceChatCopy), err)
+	}
+	if aliceChatCopy[0].Text != chatMsg.Text {
+		t.Fatalf("chat copy = %q, want %q", aliceChatCopy[0].Text, chatMsg.Text)
+	}
+
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	datePost(t, s, ch.ID, notice.LocalID, base)
+	dateOwned(t, s, alice.ID, aliceChatCopy[0].LocalID, base.Add(time.Second))
+	dateOwned(t, s, alice.ID, dm.PeerLocalID, base.Add(2*time.Second))
+
+	hits := searchGlobal(t, s, alice.ID, "deadline", nil, 20)
+	if len(hits) != 3 {
+		t.Fatalf("hits = %d, want 3: %+v", len(hits), keysOf(hits))
+	}
+	want := []struct {
+		peerType store.PeerType
+		peerID   int64
+		text     string
+	}{
+		{store.PeerTypeUser, bob.ID, "the deadline is monday"},
+		{store.PeerTypeChat, chat.ID, "chat deadline moved"},
+		{store.PeerTypeChannel, ch.ID, "channel deadline notice"},
+	}
+	for i, w := range want {
+		if hits[i].PeerType != w.peerType || hits[i].PeerID != w.peerID || hitText(t, hits[i]) != w.text {
+			t.Errorf("hit %d = %v/%d %q, want %v/%d %q",
+				i, hits[i].PeerType, hits[i].PeerID, hitText(t, hits[i]), w.peerType, w.peerID, w.text)
+		}
+	}
+	if hits[2].Post == nil || hits[0].Owned == nil || hits[1].Owned == nil {
+		t.Errorf("arms mixed up: %+v", hits)
+	}
+}
+
+// The channel arm is membership-gated, not merely peer-scoped: a non-member and
+// a banned member get the same empty channel result, and a caller in no dialogs
+// at all gets an empty page rather than an error.
+func TestSearchGlobalGatesChannelPostsOnUnbannedMembership(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551320011")
+	member := mustUser(t, s, "+15551320012")
+	outsider := mustUser(t, s, "+15551320013")
+
+	ch := mustChannel(t, s, owner.ID, "Ops")
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if _, _, err = s.JoinChannelByInvite(ctx, hash, member.ID); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	post(t, s, ch.ID, owner.ID, "deadline for the migration", 9101)
+	// The member also has a 1:1 hit, so a lost channel arm is visible as the
+	// channel row disappearing rather than as an empty response.
+	send(t, s, member, owner, "deadline in dm", 9102)
+
+	if hits := searchGlobal(t, s, member.ID, "deadline", nil, 20); len(hits) != 2 {
+		t.Fatalf("member hits = %d, want 2 (channel post + dm): %+v", len(hits), keysOf(hits))
+	}
+	if hits := searchGlobal(t, s, outsider.ID, "deadline", nil, 20); len(hits) != 0 {
+		t.Fatalf("outsider hits = %+v, want none", keysOf(hits))
+	}
+
+	until := time.Now().Add(time.Hour)
+	if err = store.SetChannelBan(ctx, s, ch.ID, member.ID, &until); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+	hits := searchGlobal(t, s, member.ID, "deadline", nil, 20)
+	if len(hits) != 1 || hits[0].PeerType != store.PeerTypeUser {
+		t.Fatalf("banned member hits = %+v, want only the dm", keysOf(hits))
+	}
+}
+
+// A page whose every row is deleted between the key read and the body read is
+// refilled from the rows behind it, not returned empty. An empty page ends the
+// client's page sequence, so answering one here would silently drop every match
+// older than the page that lost its rows.
+func TestSearchGlobalRefillsAPageEmptiedBetweenReads(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	alice := mustUser(t, s, "+15551320031")
+	bob := mustUser(t, s, "+15551320032")
+
+	send(t, s, bob, alice, "deadline one", 9301)
+	send(t, s, bob, alice, "deadline two", 9302)
+	send(t, s, bob, alice, "deadline three", 9303)
+
+	// The newest row is what a limit=1 page names; delete it in the window
+	// between the two reads, once, so the first attempt hydrates nothing.
+	newest, err := s.SearchGlobal(ctx, alice.ID, "deadline", nil, 1)
+	if err != nil || len(newest) != 1 {
+		t.Fatalf("baseline page: %d hits, err %v", len(newest), err)
+	}
+	if hitText(t, newest[0]) != "deadline three" {
+		t.Fatalf("baseline page = %q, want the newest row", hitText(t, newest[0]))
+	}
+	newestID := hitID(newest[0])
+
+	var once sync.Once
+	store.SetSearchPageHook(s, func() {
+		once.Do(func() {
+			if _, err := store.StorePool(s).Exec(ctx,
+				`UPDATE messages SET deleted = true WHERE owner_id = $1 AND local_id = $2`,
+				alice.ID, newestID); err != nil {
+				t.Errorf("delete newest: %v", err)
+			}
+		})
+	})
+	defer store.SetSearchPageHook(s, nil)
+
+	hits := searchGlobal(t, s, alice.ID, "deadline", nil, 1)
+	if len(hits) != 1 {
+		t.Fatalf("refilled page = %d hits, want the row behind the deleted one", len(hits))
+	}
+	if got := hitText(t, hits[0]); got != "deadline two" {
+		t.Fatalf("refilled page = %q, want %q", got, "deadline two")
+	}
+}
+
+// Running out of refills must not answer the way true exhaustion does. A client
+// stops on an empty page, so returning one here would abandon the authorized
+// matches still behind the cursor; the condition is transient, so it has to
+// surface as a retryable failure.
+func TestSearchGlobalRefillCapReportsContentionNotExhaustion(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	alice := mustUser(t, s, "+15551320041")
+	bob := mustUser(t, s, "+15551320042")
+
+	// Four authorized hits, paged one at a time, with every selected row deleted
+	// in the window between the key read and the body read. The cap is reached
+	// with hits still behind the cursor.
+	for i := range 4 {
+		send(t, s, bob, alice, "deadline", int64(9401+i))
+	}
+	store.SetSearchPageHook(s, func() {
+		if _, err := store.StorePool(s).Exec(ctx,
+			`UPDATE messages SET deleted = true
+			   WHERE owner_id = $1 AND deleted = false
+			     AND local_id = (SELECT max(local_id) FROM messages
+			                      WHERE owner_id = $1 AND deleted = false)`,
+			alice.ID); err != nil {
+			t.Errorf("delete selected row: %v", err)
+		}
+	})
+	defer store.SetSearchPageHook(s, nil)
+
+	_, err := s.SearchGlobal(ctx, alice.ID, "deadline", nil, 1)
+	if !errors.Is(err, store.ErrSearchContended) {
+		t.Fatalf("cap reached: err = %v, want ErrSearchContended rather than an empty page", err)
+	}
+
+	// With the contention gone the same call answers normally again, so the
+	// failure really was transient rather than a dead end.
+	store.SetSearchPageHook(s, nil)
+	hits, err := s.SearchGlobal(ctx, alice.ID, "deadline", nil, 1)
+	if err != nil {
+		t.Fatalf("after contention: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("after contention: %d hits, want the row still behind the cursor", len(hits))
+	}
+}
+
+// A row whose transaction opened before a page sequence started and committed
+// during it becomes visible with a date behind the cursor, because `date`
+// defaults to now() and Postgres evaluates that at transaction start. The
+// accepted contract is that it may be served at most once and must perturb
+// nothing: every row committed at sequence start is still served exactly once,
+// in order.
+func TestSearchGlobalLateCommitPerturbsNoSnapshotRow(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	alice := mustUser(t, s, "+15551320051")
+	bob := mustUser(t, s, "+15551320052")
+
+	for i := range 3 {
+		send(t, s, bob, alice, "deadline snapshot", int64(9501+i))
+	}
+	snapshot := searchGlobal(t, s, alice.ID, "deadline", nil, 10)
+	if len(snapshot) != 3 {
+		t.Fatalf("snapshot = %d hits, want 3", len(snapshot))
+	}
+	// Behind the newest row, so the keyset admits it once it is visible.
+	behind := snapshot[1].Rate
+
+	tx, err := store.StorePool(s).Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err = tx.Exec(ctx,
+		`INSERT INTO messages (owner_id, local_id, peer_type, peer_id, from_id, message, out, date)
+		 VALUES ($1, $2, 1, $3, $3, 'deadline late commit', false, to_timestamp($4))`,
+		alice.ID, int64(9000), bob.ID, behind); err != nil {
+		t.Fatalf("insert late row: %v", err)
+	}
+
+	// Page 1 runs while that row is still uncommitted, so it is not in the
+	// sequence's snapshot.
+	page := searchGlobal(t, s, alice.ID, "deadline", nil, 1)
+	if len(page) != 1 {
+		t.Fatalf("page 1 = %d hits, want 1", len(page))
+	}
+	cursor := &store.GlobalSearchCursor{
+		Rate: page[0].Rate, PeerType: page[0].PeerType, PeerID: page[0].PeerID, MsgID: hitID(page[0]),
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatalf("commit late row: %v", err)
+	}
+
+	seen := map[globalKey]int{}
+	order := []store.GlobalSearchHit{page[0]}
+	for range 10 {
+		next := searchGlobal(t, s, alice.ID, "deadline", cursor, 1)
+		if len(next) == 0 {
+			break
+		}
+		order = append(order, next[0])
+		cursor = &store.GlobalSearchCursor{
+			Rate: next[0].Rate, PeerType: next[0].PeerType, PeerID: next[0].PeerID, MsgID: hitID(next[0]),
+		}
+	}
+	for _, h := range order {
+		seen[globalKey{peerType: h.PeerType, peerID: h.PeerID, msgID: hitID(h)}]++
+	}
+
+	// Every row that existed when the sequence started is served exactly once.
+	for i, want := range keysOf(snapshot) {
+		if seen[want] != 1 {
+			t.Errorf("snapshot row %d (%+v) served %d times, want exactly once", i, want, seen[want])
+		}
+	}
+	// The late row is delivered, once. Its date puts it behind the cursor, so it
+	// is admitted the moment it commits — that is the anomaly, and asserting it
+	// is served exactly once is what keeps this test honest: it proves the case
+	// really occurs rather than quietly never arising, and that the accepted
+	// bound on it holds.
+	late := 0
+	for _, h := range order {
+		if hitText(t, h) == "deadline late commit" {
+			late++
+		}
+	}
+	if late != 1 {
+		t.Errorf("late row served %d times, want exactly once (delivered, never duplicated)", late)
+	}
+	// And the snapshot rows keep their order among themselves.
+	var got []globalKey
+	for _, h := range order {
+		k := globalKey{peerType: h.PeerType, peerID: h.PeerID, msgID: hitID(h)}
+		for _, s := range keysOf(snapshot) {
+			if k == s {
+				got = append(got, k)
+			}
+		}
+	}
+	for i, want := range keysOf(snapshot) {
+		if i >= len(got) || got[i] != want {
+			t.Fatalf("snapshot order changed: got %+v, want %+v", got, keysOf(snapshot))
+		}
+	}
+}
+
+// Paging to exhaustion one row at a time yields exactly the rows a single large
+// page yields, in the same order: no duplicate, no skip, across three peer kinds
+// whose id spaces are not comparable and whose dates collide.
+func TestSearchGlobalCursorPagesEachHitExactlyOnce(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	alice := mustUser(t, s, "+15551320021")
+	bob := mustUser(t, s, "+15551320022")
+
+	for i := range 3 {
+		send(t, s, bob, alice, "deadline dm", int64(9200+i))
+	}
+	chat, err := s.CreateChat(ctx, alice.ID, "Team", []int64{bob.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	for i := range 3 {
+		if _, _, _, err = s.SendChatMessage(ctx, store.FanOut{
+			ChatID: chat.ID, FromID: bob.ID, Text: "deadline chat", RandomID: int64(9210 + i),
+		}); err != nil {
+			t.Fatalf("send chat message: %v", err)
+		}
+	}
+	first := mustChannel(t, s, alice.ID, "First")
+	second := mustChannel(t, s, alice.ID, "Second")
+	for i := range 3 {
+		post(t, s, first.ID, alice.ID, "deadline post", int64(9220+i))
+		post(t, s, second.ID, alice.ID, "deadline post", int64(9230+i))
+	}
+	// Half the rows share one second, so the tie-breakers carry the ordering for
+	// them; the other half are spread out so date ordering carries it.
+	tie := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if _, err = store.StorePool(s).Exec(ctx,
+		`UPDATE messages SET date = $1 WHERE owner_id = $2 AND local_id % 2 = 0`, tie, alice.ID); err != nil {
+		t.Fatalf("collide owned dates: %v", err)
+	}
+	if _, err = store.StorePool(s).Exec(ctx,
+		`UPDATE channel_messages SET date = $1 WHERE channel_id = $2`, tie, first.ID); err != nil {
+		t.Fatalf("collide post dates: %v", err)
+	}
+
+	full := searchGlobal(t, s, alice.ID, "deadline", nil, 100)
+	if len(full) != 12 {
+		t.Fatalf("single page = %d hits, want 12: %+v", len(full), keysOf(full))
+	}
+
+	var paged []store.GlobalSearchHit
+	var cursor *store.GlobalSearchCursor
+	for range len(full) + 1 {
+		page := searchGlobal(t, s, alice.ID, "deadline", cursor, 1)
+		if len(page) == 0 {
+			break
+		}
+		if len(page) != 1 {
+			t.Fatalf("limit=1 page returned %d hits", len(page))
+		}
+		paged = append(paged, page[0])
+		cursor = &store.GlobalSearchCursor{
+			Rate: page[0].Rate, PeerType: page[0].PeerType, PeerID: page[0].PeerID, MsgID: hitID(page[0]),
+		}
+	}
+
+	wantKeys, gotKeys := keysOf(full), keysOf(paged)
+	if len(gotKeys) != len(wantKeys) {
+		t.Fatalf("paged %d hits, want %d\npaged: %+v\nfull:  %+v", len(gotKeys), len(wantKeys), gotKeys, wantKeys)
+	}
+	for i := range wantKeys {
+		if gotKeys[i] != wantKeys[i] {
+			t.Fatalf("page sequence diverges at %d: got %+v, want %+v", i, gotKeys[i], wantKeys[i])
+		}
+	}
+	seen := map[globalKey]bool{}
+	for _, k := range gotKeys {
+		if seen[k] {
+			t.Fatalf("key %+v served twice", k)
+		}
+		seen[k] = true
+	}
+}
