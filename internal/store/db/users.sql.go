@@ -12,14 +12,40 @@ import (
 )
 
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (phone) VALUES ($1)
-ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
-RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at, username, name_tsv
+
+WITH upserted AS (
+    INSERT INTO users (phone) VALUES ($1)
+    ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
+    RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at
+)
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM upserted u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 `
 
-func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
+type CreateUserRow struct {
+	ID         int64
+	Phone      string
+	FirstName  string
+	LastName   string
+	CreatedAt  pgtype.Timestamptz
+	IsOnline   bool
+	LastSeenAt pgtype.Timestamptz
+	Username   *string
+}
+
+// Every query that loads a user reads the handle from the usernames row, never
+// from the denormalized users.username column. The two are written in one
+// transaction today, but only the usernames row is authoritative: it is what
+// admits an account to resolveUsername, and a writer that released a handle
+// without clearing the copy must not leave any RPC still reporting it. The join
+// is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
+// user lookup against 200k handles, so the hot per-peer read pays an index
+// probe rather than the copy's zero.
+func (q *Queries) CreateUser(ctx context.Context, phone string) (CreateUserRow, error) {
 	row := q.db.QueryRow(ctx, createUser, phone)
-	var i User
+	var i CreateUserRow
 	err := row.Scan(
 		&i.ID,
 		&i.Phone,
@@ -29,14 +55,15 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (User, error) {
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
-		&i.NameTsv,
 	)
 	return i, err
 }
 
 const searchContactsByName = `-- name: SearchContactsByName :many
-SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at, u.username
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
 FROM users u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 WHERE u.name_tsv @@ plainto_tsquery('simple', $1)
   AND EXISTS (
       SELECT 1 FROM dialogs d
@@ -144,12 +171,27 @@ func (q *Queries) SetUsername(ctx context.Context, arg SetUsernameParams) (int64
 }
 
 const userByID = `-- name: UserByID :one
-SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username, name_tsv FROM users WHERE id = $1
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM users u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
+WHERE u.id = $1
 `
 
-func (q *Queries) UserByID(ctx context.Context, id int64) (User, error) {
+type UserByIDRow struct {
+	ID         int64
+	Phone      string
+	FirstName  string
+	LastName   string
+	CreatedAt  pgtype.Timestamptz
+	IsOnline   bool
+	LastSeenAt pgtype.Timestamptz
+	Username   *string
+}
+
+func (q *Queries) UserByID(ctx context.Context, id int64) (UserByIDRow, error) {
 	row := q.db.QueryRow(ctx, userByID, id)
-	var i User
+	var i UserByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.Phone,
@@ -159,18 +201,32 @@ func (q *Queries) UserByID(ctx context.Context, id int64) (User, error) {
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
-		&i.NameTsv,
 	)
 	return i, err
 }
 
 const userByPhone = `-- name: UserByPhone :one
-SELECT id, phone, first_name, last_name, created_at, is_online, last_seen_at, username, name_tsv FROM users WHERE phone = $1
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM users u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
+WHERE u.phone = $1
 `
 
-func (q *Queries) UserByPhone(ctx context.Context, phone string) (User, error) {
+type UserByPhoneRow struct {
+	ID         int64
+	Phone      string
+	FirstName  string
+	LastName   string
+	CreatedAt  pgtype.Timestamptz
+	IsOnline   bool
+	LastSeenAt pgtype.Timestamptz
+	Username   *string
+}
+
+func (q *Queries) UserByPhone(ctx context.Context, phone string) (UserByPhoneRow, error) {
 	row := q.db.QueryRow(ctx, userByPhone, phone)
-	var i User
+	var i UserByPhoneRow
 	err := row.Scan(
 		&i.ID,
 		&i.Phone,
@@ -180,7 +236,6 @@ func (q *Queries) UserByPhone(ctx context.Context, phone string) (User, error) {
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
-		&i.NameTsv,
 	)
 	return i, err
 }
