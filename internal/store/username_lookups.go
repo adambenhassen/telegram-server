@@ -139,7 +139,21 @@ func (s *Store) UsernameByHandle(ctx context.Context, handle string) (UsernameRe
 		if err != nil {
 			return UsernameResolution{}, false, fmt.Errorf("load user: %w", err)
 		}
-		return UsernameResolution{Kind: UsernameKindUser, User: UserFromDB(u)}, true, nil
+		// Username comes off the joined usernames row — the handle that admitted
+		// this account to the result — for the same reason the channel arm below
+		// takes it off the row: the denormalized users.username copy is not
+		// authoritative, and a writer that released the handle without clearing
+		// the copy must not make two RPCs name the same account differently.
+		return UsernameResolution{Kind: UsernameKindUser, User: UserFromDB(db.UserByIDRow{
+			ID:         u.ID,
+			Phone:      u.Phone,
+			FirstName:  u.FirstName,
+			LastName:   u.LastName,
+			CreatedAt:  u.CreatedAt,
+			IsOnline:   u.IsOnline,
+			LastSeenAt: u.LastSeenAt,
+			Username:   &u.Username,
+		})}, true, nil
 	case "channel":
 		c, err := s.q.GetChannelByUsername(ctx, handle)
 		if err != nil {
