@@ -39,6 +39,38 @@ type Event struct {
 	LocalID int64
 }
 
+// ErrPtsUnknown reports that the pts a stored message occupies cannot be
+// recovered, because its new-message event is missing from the log.
+//
+// No caller can reach it through normal operation: every send writes the message
+// row and its event in one transaction, and nothing deletes from either log. It
+// stays an error rather than degrading to the owner's current pts because that
+// value is the single outcome a resend must never report — a client one update
+// behind would apply the old message into the newer update's pts slot, count
+// itself caught up, and lose that update with no gap left for getDifference to
+// find. Failing the call leaves the client's pts where it was, which is a state
+// the next poll repairs.
+var ErrPtsUnknown = errors.New("message pts unknown")
+
+// newMessagePts returns the pts at which owner's local_id entered the log.
+func newMessagePts(ctx context.Context, q *db.Queries, ownerID, localID int64) (int, error) {
+	pts, err := q.NewMessagePts(ctx, db.NewMessagePtsParams{OwnerID: ownerID, LocalID: localID})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, fmt.Errorf("%w: owner %d message %d", ErrPtsUnknown, ownerID, localID)
+	case err != nil:
+		return 0, fmt.Errorf("new message pts: %w", err)
+	}
+	return int(pts), nil
+}
+
+// MessagePts returns the pts at which the owner's copy of localID entered the
+// log — the pts a client would have been told the first time, and so the only
+// pts a resend of it may report. ErrPtsUnknown when the log has no such event.
+func (s *Store) MessagePts(ctx context.Context, ownerID, localID int64) (int, error) {
+	return newMessagePts(ctx, s.q, ownerID, localID)
+}
+
 // EnsureUpdateState creates the user's update_state row if absent (idempotent).
 func (s *Store) EnsureUpdateState(ctx context.Context, userID int64) error {
 	if err := s.q.EnsureUpdateState(ctx, userID); err != nil {

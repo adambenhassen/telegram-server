@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -75,7 +76,7 @@ func (s *Store) SendChatMessage(ctx context.Context, f FanOut) (sender Message, 
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 
-	sender, perOwner, dup, err = fanOut(ctx, tx, s.q.WithTx(tx), f)
+	sender, perOwner, dup, err = fanOut(ctx, tx, s.q.WithTx(tx), s.log, f)
 	if err != nil {
 		return Message{}, nil, false, err
 	}
@@ -116,7 +117,7 @@ func (s *Store) SendChatMessage(ctx context.Context, f FanOut) (sender Message, 
 // Action rather than on a RequireSenderMember field means no caller can open the
 // hole by forgetting to ask for it, at the cost of every future non-text action
 // owing its own in-transaction check.
-func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender Message, perOwner map[int64]int, dup bool, err error) {
+func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, log *slog.Logger, f FanOut) (sender Message, perOwner map[int64]int, dup bool, err error) {
 	if f.ChatID == 0 || f.FromID == 0 {
 		return Message{}, nil, false, ErrMessageInvalid
 	}
@@ -193,12 +194,14 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 
 	// Idempotency: a resend with the same random_id returns the original. The
 	// token lives on the sender's copy only, so the 1:1 contract carries over
-	// unchanged — no new rows, no new events, no pts movement.
+	// unchanged — no new rows, no new events, no pts movement, and each owner
+	// hears the pts its own copy occupies rather than where its log has since
+	// moved to.
 	if f.RandomID != 0 {
 		existing, e := qtx.MessageByRandomID(ctx, db.MessageByRandomIDParams{OwnerID: f.FromID, RandomID: f.RandomID})
 		switch {
 		case e == nil:
-			pts, e2 := ptsFor(ctx, qtx, owners)
+			pts, e2 := fanoutPts(ctx, qtx, log, f, existing, owners)
 			if e2 != nil {
 				return Message{}, nil, false, e2
 			}
@@ -274,6 +277,51 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, f FanOut) (sender M
 		sender = messageFromRow(stored)
 	}
 	return sender, perOwner, false, nil
+}
+
+// fanoutPts returns, for a resend the dedup caught, the pts each copy of the
+// already-stored chat message occupies. Keyed on the copy owners rather than the
+// current member set: a copy is what carries a pts, and a member who has since
+// left still holds theirs.
+//
+// The dedup key carries no destination, so a sender reusing a random_id from a
+// 1:1 send arrives holding a row with no fan-out to walk. There are no copies to
+// read a pts from and every owner keeps its current pts, exactly as before — the
+// one value a resend is otherwise never allowed to report. The reused id can
+// carry a legitimate send, so the answer stands rather than failing the call;
+// what does not stand is answering it quietly, hence the record. It names the
+// dedup key that reached here and both destinations, which is what an
+// investigation needs to tell a client bug from the id-space collision.
+func fanoutPts(ctx context.Context, qtx *db.Queries, log *slog.Logger, f FanOut, existing db.Message, owners []int64) (map[int64]int, error) {
+	if existing.FanoutID == 0 {
+		pts, err := ptsFor(ctx, qtx, owners)
+		if err != nil {
+			return nil, err
+		}
+		log.Warn("dedup pts fallback",
+			"path", "chat fanout",
+			"chat_id", f.ChatID,
+			"from_id", f.FromID,
+			"random_id", f.RandomID,
+			"stored_local_id", existing.LocalID,
+			"stored_peer_type", existing.PeerType,
+			"stored_peer_id", existing.PeerID,
+		)
+		return pts, nil
+	}
+	copies, err := qtx.MessagesByFanout(ctx, existing.FanoutID)
+	if err != nil {
+		return nil, fmt.Errorf("fanout copies: %w", err)
+	}
+	out := make(map[int64]int, len(copies))
+	for _, c := range copies {
+		pts, e := newMessagePts(ctx, qtx, c.OwnerID, c.LocalID)
+		if e != nil {
+			return nil, e
+		}
+		out[c.OwnerID] = pts
+	}
+	return out, nil
 }
 
 // ptsFor reads each owner's current pts without advancing it.

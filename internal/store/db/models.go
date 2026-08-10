@@ -20,6 +20,7 @@ type AuthKey struct {
 }
 
 type Channel struct {
+	// Random, not sequential. New ids are a uniform crypto/rand draw over [2^31, 10^12 - 2^31] (internal/store/channels.go); ids below 2^31 predate that and came from channels_id_seq. Never reset or re-point the sequence, and never treat the id as an authorization input.
 	ID                   int64
 	Title                string
 	About                string

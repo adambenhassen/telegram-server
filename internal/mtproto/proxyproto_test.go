@@ -332,19 +332,15 @@ func withVersion(header []byte, version byte) []byte {
 }
 
 // serveClients runs a server on ln and reports the client address of every
-// request that reaches a handler. A non-nil allow puts it in proxy-v2 mode.
+// request that reaches a handler. A non-nil allow puts it in proxy-v2 mode, and
+// each opt configures the server before it starts serving.
 //
 // The address is asserted here, at the handler, rather than at the accept path:
 // that is where every per-IP limit reads it, and between the two sit the header
 // read, the codec sniff and the serve loop — each a place it could be lost or
 // replaced.
-func serveClients(t *testing.T, ctx context.Context, ln net.Listener, allow []netip.Prefix, log *slog.Logger) (<-chan netip.Addr, crypto.AuthKey) {
+func serveClients(t *testing.T, ctx context.Context, ln net.Listener, allow []netip.Prefix, log *slog.Logger, opts ...func(*mtproto.Server)) (<-chan netip.Addr, crypto.AuthKey) {
 	t.Helper()
-	key := rebindTestKey()
-	keys := mtproto.NewMemoryAuthKeyStore()
-	if err := keys.Save(ctx, key); err != nil {
-		t.Fatalf("save key: %v", err)
-	}
 	seen := make(chan netip.Addr, 8)
 	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		select {
@@ -353,11 +349,28 @@ func serveClients(t *testing.T, ctx context.Context, ln net.Listener, allow []ne
 		}
 		return nil
 	})
+	return seen, serveHandler(t, ctx, ln, allow, log, handler, opts...)
+}
+
+// serveHandler runs a server on ln with the given handler and returns the auth
+// key its store already holds, so a test can drive a client that authenticates
+// without a key exchange. It is serveClients with the handler left to the
+// caller, for the tests that need one doing something other than recording.
+func serveHandler(t *testing.T, ctx context.Context, ln net.Listener, allow []netip.Prefix, log *slog.Logger, handler mtproto.Handler, opts ...func(*mtproto.Server)) crypto.AuthKey {
+	t.Helper()
+	key := rebindTestKey()
+	keys := mtproto.NewMemoryAuthKeyStore()
+	if err := keys.Save(ctx, key); err != nil {
+		t.Fatalf("save key: %v", err)
+	}
 	// No key exchange runs here: the client sends an encrypted frame under a key
 	// the store already holds, so the server needs no private key of its own.
 	srv := mtproto.New(exchange.PrivateKey{}, 2, keys, handler, log)
 	if allow != nil {
 		srv.TrustProxyV2Headers(allow)
+	}
+	for _, opt := range opts {
+		opt(srv)
 	}
 	srvCtx, stop := context.WithCancel(ctx)
 	served := make(chan error, 1)
@@ -368,7 +381,7 @@ func serveClients(t *testing.T, ctx context.Context, ln net.Listener, allow []ne
 			t.Errorf("serve: %v", err)
 		}
 	})
-	return seen, key
+	return key
 }
 
 // speak completes a connection the way a client does: the prelude a balancer

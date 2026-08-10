@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -114,6 +115,9 @@ func TestContactsSearchMyResultsSharedLimitDefault(t *testing.T) {
 	}
 	// The four channels kept are the four lowest ids, not an arbitrary four:
 	// both arms page in id order, which is what fixes who survives truncation.
+	// Sorted rather than taken in creation order — channel ids are random draws,
+	// so the two orders coincide only by accident.
+	slices.Sort(wantChannels)
 	gotChannels := channelPeerIDs(found.MyResults)
 	if len(gotChannels) != 4 {
 		t.Fatalf("MyResults channel peers = %v, want 4 (the remaining budget)", gotChannels)
@@ -297,40 +301,52 @@ func TestContactsSearchTruncatedMemberStillRendersAsMember(t *testing.T) {
 func TestContactsSearchMemberBeyondMemberArmPageRendersAsMember(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	caller, err := s.CreateUser(ctx, "15550016001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Eleven private matches sort ahead of the public one, filling the member
-	// arm's page of ten so the public channel falls outside it.
+	// Eleven private matches must fill the member arm's page of ten, which only
+	// puts the public channel outside that page while the public channel sorts
+	// last. Channel ids are random draws, so its id is placed above every
+	// private one rather than inherited from creation order.
+	privateIDs := make([]int64, 0, 11)
 	for i := range 11 {
-		if _, err := s.CreateChannel(ctx, caller.ID, fmt.Sprintf("Beyondpage Private %d", i), "About", false); err != nil {
-			t.Fatalf("create private channel %d: %v", i, err)
+		ch, cerr := s.CreateChannel(ctx, caller.ID, fmt.Sprintf("Beyondpage Private %d", i), "About", false)
+		if cerr != nil {
+			t.Fatalf("create private channel %d: %v", i, cerr)
 		}
+		privateIDs = append(privateIDs, ch.ID)
 	}
-	pub, err := s.CreateChannel(ctx, caller.ID, "Beyondpage Public", "About", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := api.ClaimChannelUsernameForTest(s, pub.ID, "beyondpagepublic"); err != nil {
+	pubID := slices.Max(privateIDs) + 1
+	channelExec(t, ctx, dsn, `
+		WITH pub AS (
+			INSERT INTO channels (id, title, creator_id) VALUES ($1, 'Beyondpage Public', $2)
+			RETURNING id
+		),
+		state AS (
+			INSERT INTO channel_state (channel_id) SELECT id FROM pub
+		)
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
+		SELECT id, $2, 2, 0 FROM pub`, pubID, caller.ID)
+	if err := api.ClaimChannelUsernameForTest(s, pubID, "beyondpagepublic"); err != nil {
 		t.Fatal(err)
 	}
 
 	found := searchChannels(t, s, caller.ID, "Beyondpage", 10)
 
-	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != pub.ID {
-		t.Fatalf("Results channels = %v, want [%d]", got, pub.ID)
+	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != pubID {
+		t.Fatalf("Results channels = %v, want [%d]", got, pubID)
 	}
 	var rendered *tg.Channel
 	for _, c := range found.Chats {
-		if channel, ok := c.(*tg.Channel); ok && channel.ID == pub.ID {
+		if channel, ok := c.(*tg.Channel); ok && channel.ID == pubID {
 			rendered = channel
 		}
 	}
 	if rendered == nil {
-		t.Fatalf("channel %d missing from Chats", pub.ID)
+		t.Fatalf("channel %d missing from Chats", pubID)
 	}
 	if rendered.Left || !rendered.Creator {
 		t.Errorf("Chats for the caller's own channel = Left %v Creator %v, want Left false Creator true",
@@ -578,12 +594,13 @@ func TestContactsSearchPrivateChannelInvisible(t *testing.T) {
 // not occupy a row inside the limit that is then dropped, because the caller
 // would read the missing row as proof the private channel exists.
 //
-// The private channel is created first, so it sorts ahead of every public match
-// in the query's id order and would land inside the page under a Go post-filter.
+// The private channel is given an id below every public match, so it sorts ahead
+// of them in the query's id order and would land inside the page under a Go
+// post-filter.
 func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	caller, err := s.CreateUser(ctx, "15550004001")
 	if err != nil {
@@ -594,9 +611,6 @@ func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.CreateChannel(ctx, creator.ID, "Kayaking Private", "About", false); err != nil {
-		t.Fatal(err)
-	}
 	const limit = 3
 	want := make([]int64, 0, limit)
 	for i := range limit {
@@ -609,6 +623,21 @@ func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 		}
 		want = append(want, ch.ID)
 	}
+	slices.Sort(want)
+
+	// The private channel only tests anything from inside the page, which means
+	// below every public match. Channel ids are random draws, so creating it
+	// first no longer places it there and the id is set explicitly instead.
+	channelExec(t, ctx, dsn, `
+		WITH private AS (
+			INSERT INTO channels (id, title, creator_id) VALUES ($1, 'Kayaking Private', $2)
+			RETURNING id
+		),
+		state AS (
+			INSERT INTO channel_state (channel_id) SELECT id FROM private
+		)
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
+		SELECT id, $2, 2, 0 FROM private`, want[0]-1, creator.ID)
 
 	found := searchChannels(t, s, caller.ID, "Kayaking", limit)
 
@@ -890,15 +919,6 @@ func TestContactsSearchStaleDiscoverableMarkerDisclosesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Created first, so it sorts ahead of the public match in id order and
-	// would take the single page slot if the marker were deciding anything.
-	stale, err := s.CreateChannel(ctx, creator.ID, "Orienteering Alpha", "About", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := api.ClaimChannelUsernameForTest(s, stale.ID, "orienteeringalpha"); err != nil {
-		t.Fatal(err)
-	}
 	public, err := s.CreateChannel(ctx, creator.ID, "Orienteering Beta", "About", false)
 	if err != nil {
 		t.Fatal(err)
@@ -907,9 +927,17 @@ func TestContactsSearchStaleDiscoverableMarkerDisclosesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Drop the authoritative row behind the marker's back, leaving the copy and
-	// the marker both claiming the channel is public.
-	channelExec(t, ctx, dsn, `DELETE FROM usernames WHERE owner_type = 'channel' AND owner_id = $1`, stale.ID)
+	// The stale channel proves something only from inside the page, so its id is
+	// set explicitly below the public match rather than left to a random draw:
+	// it takes the single page slot if the marker is deciding anything.
+	staleID := public.ID - 1
+	channelExec(t, ctx, dsn, `
+		WITH stale AS (
+			INSERT INTO channels (id, title, creator_id, username, publicly_discoverable)
+			VALUES ($1, 'Orienteering Alpha', $2, 'orienteeringalpha', true)
+			RETURNING id
+		)
+		INSERT INTO channel_state (channel_id) SELECT id FROM stale`, staleID, creator.ID)
 
 	found := searchChannels(t, s, stranger.ID, "Orienteering", 1)
 	if got := channelPeerIDs(found.Results); len(got) != 1 || got[0] != public.ID {

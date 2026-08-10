@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -18,6 +19,12 @@ type Store struct {
 	q      *db.Queries
 	cipher *keycrypt.Cipher
 
+	// log carries the store's own diagnostics: the states a write reaches that
+	// no return value reports. Never nil — Open defaults it to slog.Default(),
+	// so a caller that passes no logger still gets those records somewhere
+	// rather than silence.
+	log *slog.Logger
+
 	// Channel bounds, seeded from the defaults in channels.go. They are fields
 	// rather than constants only so a test can exercise the cap branches without
 	// writing 10 000 rows; a test lowering them on its own Store cannot disturb
@@ -25,6 +32,13 @@ type Store struct {
 	// t.Parallel().
 	maxChannelParticipants int
 	maxChannelsPerUser     int
+
+	// newChannelID draws a new channel's id, seeded with randomChannelID. It is
+	// a field for the reason the bounds above are: the collision retry and the
+	// fail-closed branch are unreachable through crypto/rand at any test's
+	// scale, and a test substituting a draw on its own Store leaves every other
+	// Store in a parallel run alone.
+	newChannelID func() (int64, error)
 
 	// deniedHook is a test-only callback fired in CheckRateLimit after the
 	// INSERT denial and before the GET. Scoped to the Store so parallel tests
@@ -69,11 +83,26 @@ var (
 	ErrInviteInvalid = errors.New("channel invite invalid")
 )
 
+// Option configures a Store at Open time.
+type Option func(*Store)
+
+// WithLogger routes the store's diagnostics to log instead of slog.Default().
+// It is per-Store rather than a package-level setting so that two Stores in one
+// process — every parallel test in this package — cannot write into each
+// other's handler.
+func WithLogger(log *slog.Logger) Option {
+	return func(s *Store) {
+		if log != nil {
+			s.log = log
+		}
+	}
+}
+
 // Open connects to Postgres and verifies the schema is migrated. encKey is the
 // 32-byte master key used to encrypt auth keys at rest. The schema is owned by
 // the Atlas migrations; Open does not apply them, but fails fast if the target
 // database has not been migrated.
-func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
+func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Store, error) {
 	cipher, err := keycrypt.New(encKey)
 	if err != nil {
 		return nil, err
@@ -92,6 +121,11 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 		cipher:                 cipher,
 		maxChannelParticipants: defaultMaxChannelParticipants,
 		maxChannelsPerUser:     defaultMaxChannelsPerUser,
+		newChannelID:           randomChannelID,
+		log:                    slog.Default(),
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	if err := s.checkSchema(ctx); err != nil {
 		pool.Close()

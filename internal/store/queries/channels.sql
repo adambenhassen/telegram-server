@@ -1,5 +1,11 @@
+-- InsertChannel takes the id from the caller rather than from channels_id_seq.
+-- A new channel's id is a random draw over a sparse range (newChannelID in
+-- channels.go): a dense id set discloses, through its gaps, how many private
+-- channels exist and where in creation order each one sits. A repeated draw
+-- arrives here as a channels_pkey unique violation, which the caller answers by
+-- redrawing — never by letting the sequence supply the id.
 -- name: InsertChannel :one
-INSERT INTO channels (title, about, creator_id, megagroup) VALUES ($1, $2, $3, $4)
+INSERT INTO channels (id, title, about, creator_id, megagroup) VALUES ($1, $2, $3, $4, $5)
 RETURNING *;
 
 -- name: InsertChannelState :exec
@@ -77,11 +83,10 @@ DELETE FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
 INSERT INTO channel_invites (hash, channel_id, creator_id) VALUES ($1, $2, $3);
 
 -- ChannelInviteByHash is the ONLY way into a channel. It is keyed on the hash
--- alone and takes no channel id, so the dense channels.id space is not an
--- admission input and cannot be walked. An unknown hash and an unusable one are
--- one rejection upstream — see JoinChannelByInvite. Revoked invites are
--- excluded: a revoked hash must refuse admission the same way an unknown one
--- does.
+-- alone and takes no channel id, so a channel id is not an admission input. An
+-- unknown hash and an unusable one are one rejection upstream — see
+-- JoinChannelByInvite. Revoked invites are excluded: a revoked hash must refuse
+-- admission the same way an unknown one does.
 -- name: ChannelInviteByHash :one
 SELECT * FROM channel_invites WHERE hash = $1 AND revoked_at IS NULL;
 
