@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -17,6 +18,12 @@ type Store struct {
 	pool   *pgxpool.Pool
 	q      *db.Queries
 	cipher *keycrypt.Cipher
+
+	// log carries the store's own diagnostics: the states a write reaches that
+	// no return value reports. Never nil — Open defaults it to slog.Default(),
+	// so a caller that passes no logger still gets those records somewhere
+	// rather than silence.
+	log *slog.Logger
 
 	// Channel bounds, seeded from the defaults in channels.go. They are fields
 	// rather than constants only so a test can exercise the cap branches without
@@ -69,11 +76,26 @@ var (
 	ErrInviteInvalid = errors.New("channel invite invalid")
 )
 
+// Option configures a Store at Open time.
+type Option func(*Store)
+
+// WithLogger routes the store's diagnostics to log instead of slog.Default().
+// It is per-Store rather than a package-level setting so that two Stores in one
+// process — every parallel test in this package — cannot write into each
+// other's handler.
+func WithLogger(log *slog.Logger) Option {
+	return func(s *Store) {
+		if log != nil {
+			s.log = log
+		}
+	}
+}
+
 // Open connects to Postgres and verifies the schema is migrated. encKey is the
 // 32-byte master key used to encrypt auth keys at rest. The schema is owned by
 // the Atlas migrations; Open does not apply them, but fails fast if the target
 // database has not been migrated.
-func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
+func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Store, error) {
 	cipher, err := keycrypt.New(encKey)
 	if err != nil {
 		return nil, err
@@ -92,6 +114,10 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 		cipher:                 cipher,
 		maxChannelParticipants: defaultMaxChannelParticipants,
 		maxChannelsPerUser:     defaultMaxChannelsPerUser,
+		log:                    slog.Default(),
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	if err := s.checkSchema(ctx); err != nil {
 		pool.Close()

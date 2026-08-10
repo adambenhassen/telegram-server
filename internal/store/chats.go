@@ -323,7 +323,7 @@ func (s *Store) AddChatUser(ctx context.Context, chatID, target, callerID int64)
 
 	// target is in the member set by now, so their copy comes for free — and that
 	// copy is what puts the chat in their dialog list.
-	sender, perOwner, _, err = fanOut(ctx, m.tx, m.qtx, FanOut{
+	sender, perOwner, _, err = fanOut(ctx, m.tx, m.qtx, s.log, FanOut{
 		ChatID: chatID, FromID: callerID, Action: ChatActionAddUser, ActionUserID: target,
 	})
 	if err != nil {
@@ -365,7 +365,7 @@ func (s *Store) RemoveChatUser(ctx context.Context, chatID, target, callerID int
 
 	// Extra carries the announcement to target, who is out of the member set by
 	// now — without it the removed client shows the chat forever.
-	sender, perOwner, _, err = fanOut(ctx, m.tx, m.qtx, FanOut{
+	sender, perOwner, _, err = fanOut(ctx, m.tx, m.qtx, s.log, FanOut{
 		ChatID: chatID, FromID: callerID, Action: ChatActionDeleteUser,
 		ActionUserID: target, Extra: []int64{target},
 	})
@@ -390,7 +390,7 @@ func (s *Store) SetChatTitle(ctx context.Context, chatID, callerID int64, title 
 	if err != nil {
 		return Chat{}, Message{}, nil, fmt.Errorf("set title: %w", err)
 	}
-	sender, perOwner, _, err = fanOut(ctx, m.tx, m.qtx, FanOut{
+	sender, perOwner, _, err = fanOut(ctx, m.tx, m.qtx, s.log, FanOut{
 		ChatID: chatID, FromID: callerID, Text: title, Action: ChatActionEditTitle,
 	})
 	if err != nil {
