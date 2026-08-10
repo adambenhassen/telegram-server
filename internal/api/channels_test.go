@@ -468,7 +468,7 @@ func TestHandleGetChannelsDropsUnknownIDs(t *testing.T) {
 	ch := createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "News"})
 
 	// An id with no channel row is dropped, not reported: a distinguishable
-	// not-found would make the dense BIGSERIAL id space enumerable.
+	// not-found would answer "does this channel exist" for any id submitted.
 	res, err := api.GetChannelsForTest(s, owner.ID, &tg.ChannelsGetChannelsRequest{
 		ID: inputChannels(owner.ID, ch.ID, ch.ID+100000),
 	})
@@ -488,11 +488,50 @@ func TestHandleGetChannelsDropsUnknownIDs(t *testing.T) {
 	}
 }
 
+// TestHandleCreateChannelDrawsSparseIDs is the wire half of the sparse-id draw:
+// the id the handler hands the client is the drawn one, whole and unadjacent.
+// The store's own tests cover the draw; what only shows up here is a truncation
+// on the encode path, because the range sits well past int32 and a truncated id
+// would read as a plausible small one.
+func TestHandleCreateChannelDrawsSparseIDs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	u, err := s.CreateUser(ctx, "+15551294017")
+	if err != nil {
+		t.Fatalf("user: %v", err)
+	}
+
+	first := createChannel(t, s, u.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "First"})
+	second := createChannel(t, s, u.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "Second"})
+
+	// The floor of the documented range (internal/store/channels.go). Anything
+	// below it came from the sequence, or arrived here truncated.
+	const idFloor = int64(1) << 31
+	for _, ch := range []*tg.Channel{first, second} {
+		if ch.ID < idFloor {
+			t.Errorf("channel %q id = %d, below the range floor %d", ch.Title, ch.ID, idFloor)
+		}
+		if _, ok, err := s.ChannelByID(ctx, ch.ID); err != nil || !ok {
+			t.Errorf("channel %q id %d does not resolve in the store: ok=%v err=%v", ch.Title, ch.ID, ok, err)
+		}
+	}
+	if second.ID == first.ID+1 {
+		t.Errorf("consecutive creations got adjacent ids %d, %d", first.ID, second.ID)
+	}
+}
+
 // TestGetChannelsEnumerationClosed verifies that submitting channel ids with
-// guessed hashes (M1 placeholder: access_hash == channel_id) returns the same
-// PEER_ID_INVALID for both live and non-existent channels. This is the AC
-// requirement: "Submitting 100 sequential channel ids with guessed hashes yields
-// the same response for live channels and non-existent ones."
+// guessed access hashes returns the same PEER_ID_INVALID for both live and
+// non-existent channels. This is the AC requirement: "Submitting 100 channel ids
+// with guessed hashes yields the same response for live channels and
+// non-existent ones."
+//
+// The live channels have to stay in the probe set. A live id paired with a wrong
+// hash is the only probe that separates "the hash gate refused" from "no such
+// channel" — a sweep that lands on nothing live proves only the second, whatever
+// its length. access_hash == channel_id is the guess: it was the M1 placeholder,
+// and it is now simply a hash the per-viewer derivation never produces.
 func TestGetChannelsEnumerationClosed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -503,15 +542,18 @@ func TestGetChannelsEnumerationClosed(t *testing.T) {
 	}
 	// Create a few live channels.
 	ch1 := createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "A"})
-	_ = createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "B"})
+	ch2 := createChannel(t, s, owner.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "B"})
 
-	// Build a batch of 100 sequential ids with M1 placeholder hashes.
-	// Includes the live channels plus non-existent ones.
-	ids := make([]tg.InputChannelClass, 100)
-	baseID := ch1.ID
-	for i := range 100 {
-		id := baseID + int64(i)
-		ids[i] = &tg.InputChannel{ChannelID: id, AccessHash: id}
+	// 100 ids: both live channels, then a walk from one of them. Channel ids are
+	// random draws, so the walk is all misses and the two live ids are placed
+	// deliberately rather than swept into the batch by adjacency.
+	ids := make([]tg.InputChannelClass, 0, 100)
+	for _, id := range []int64{ch1.ID, ch2.ID} {
+		ids = append(ids, &tg.InputChannel{ChannelID: id, AccessHash: id})
+	}
+	for i := range 98 {
+		id := ch1.ID + int64(i) + 1
+		ids = append(ids, &tg.InputChannel{ChannelID: id, AccessHash: id})
 	}
 
 	res, err := api.GetChannelsForTest(s, owner.ID, &tg.ChannelsGetChannelsRequest{ID: ids})
@@ -1298,8 +1340,8 @@ func TestBannedMemberSeesForbiddenChannel(t *testing.T) {
 
 // TestInviteFailuresAreIndistinguishable pins the whole point of the admission
 // boundary: a wrong hash on check and on import, and an export against a channel
-// that does not exist, must all be the same wire error. Anything finer turns the
-// dense channels.id space or the invite space into an existence oracle.
+// that does not exist, must all be the same wire error. Anything finer turns a
+// channel id or the invite space into an existence oracle.
 func TestInviteFailuresAreIndistinguishable(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)

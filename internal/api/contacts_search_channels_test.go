@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -114,6 +115,9 @@ func TestContactsSearchMyResultsSharedLimitDefault(t *testing.T) {
 	}
 	// The four channels kept are the four lowest ids, not an arbitrary four:
 	// both arms page in id order, which is what fixes who survives truncation.
+	// Sorted rather than taken in creation order — channel ids are random draws,
+	// so the two orders coincide only by accident.
+	slices.Sort(wantChannels)
 	gotChannels := channelPeerIDs(found.MyResults)
 	if len(gotChannels) != 4 {
 		t.Fatalf("MyResults channel peers = %v, want 4 (the remaining budget)", gotChannels)
@@ -578,12 +582,13 @@ func TestContactsSearchPrivateChannelInvisible(t *testing.T) {
 // not occupy a row inside the limit that is then dropped, because the caller
 // would read the missing row as proof the private channel exists.
 //
-// The private channel is created first, so it sorts ahead of every public match
-// in the query's id order and would land inside the page under a Go post-filter.
+// The private channel is given an id below every public match, so it sorts ahead
+// of them in the query's id order and would land inside the page under a Go
+// post-filter.
 func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	caller, err := s.CreateUser(ctx, "15550004001")
 	if err != nil {
@@ -594,9 +599,6 @@ func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.CreateChannel(ctx, creator.ID, "Kayaking Private", "About", false); err != nil {
-		t.Fatal(err)
-	}
 	const limit = 3
 	want := make([]int64, 0, limit)
 	for i := range limit {
@@ -609,6 +611,21 @@ func TestContactsSearchPrivateChannelDoesNotConsumeLimit(t *testing.T) {
 		}
 		want = append(want, ch.ID)
 	}
+	slices.Sort(want)
+
+	// The private channel only tests anything from inside the page, which means
+	// below every public match. Channel ids are random draws, so creating it
+	// first no longer places it there and the id is set explicitly instead.
+	channelExec(t, ctx, dsn, `
+		WITH private AS (
+			INSERT INTO channels (id, title, creator_id) VALUES ($1, 'Kayaking Private', $2)
+			RETURNING id
+		),
+		state AS (
+			INSERT INTO channel_state (channel_id) SELECT id FROM private
+		)
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
+		SELECT id, $2, 2, 0 FROM private`, want[0]-1, creator.ID)
 
 	found := searchChannels(t, s, caller.ID, "Kayaking", limit)
 

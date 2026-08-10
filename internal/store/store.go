@@ -26,6 +26,13 @@ type Store struct {
 	maxChannelParticipants int
 	maxChannelsPerUser     int
 
+	// newChannelID draws a new channel's id, seeded with randomChannelID. It is
+	// a field for the reason the bounds above are: the collision retry and the
+	// fail-closed branch are unreachable through crypto/rand at any test's
+	// scale, and a test substituting a draw on its own Store leaves every other
+	// Store in a parallel run alone.
+	newChannelID func() (int64, error)
+
 	// deniedHook is a test-only callback fired in CheckRateLimit after the
 	// INSERT denial and before the GET. Scoped to the Store so parallel tests
 	// each own their own hook without racing.
@@ -92,6 +99,7 @@ func Open(ctx context.Context, dsn string, encKey []byte) (*Store, error) {
 		cipher:                 cipher,
 		maxChannelParticipants: defaultMaxChannelParticipants,
 		maxChannelsPerUser:     defaultMaxChannelsPerUser,
+		newChannelID:           randomChannelID,
 	}
 	if err := s.checkSchema(ctx); err != nil {
 		pool.Close()

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -59,6 +60,41 @@ const (
 // inviteHashBytes is the entropy behind one invite. 128 bits is what makes the
 // hash space unwalkable, which is the whole of the admission boundary.
 const inviteHashBytes = 16
+
+// The channel-id range. A new channel's id is a uniform draw from crypto/rand
+// over [minChannelID, maxChannelID]; channels_id_seq keeps the rows it already
+// issued and feeds nothing further. Dense ids disclose in aggregate: the public
+// channels a discovery surface hands out fix where the gaps are, and every gap
+// is a private channel plus its position in creation order.
+//
+// The bounds are constants, and documented here, because they are wire-visible
+// for the life of every id drawn between them:
+//
+//   - the floor is 2^31, above anything channels_id_seq plausibly reaches, so a
+//     drawn id can never collide with a legacy one — and, deliberately, so an id
+//     below the floor is recognisable as pre-cutover;
+//   - the ceiling is 10^12 - 2^31, the largest value a bot-API-style packed peer
+//     id can carry, so a future real client is not foreclosed;
+//   - the span is ~9.96e11 values, past the 2^39 minimum the design fixed. At a
+//     million channels that puts a colliding draw near one creation in a
+//     million, which is a retry rather than a design input.
+//
+// The floor also makes a zero id unreachable without a separate check for it.
+//
+// Sparseness is not an access control and licenses no relaxation of one: a
+// channel id is still never an admission or authorization input. Admission is
+// the invite hash, and naming a channel still requires the per-viewer access
+// hash derived in internal/peerhash.
+const (
+	minChannelID  = 1 << 31      // 2147483648
+	maxChannelID  = 997852516352 // 10^12 - 2^31
+	channelIDSpan = maxChannelID - minChannelID + 1
+)
+
+// channelIDAttempts bounds the redraws behind one creation. At the collision
+// rate above, a source that loses this many draws in a row is broken rather
+// than unlucky, and a broken source must surface as an error — see insertChannel.
+const channelIDAttempts = 8
 
 // Channel is a broadcast peer.
 type Channel struct {
@@ -144,6 +180,59 @@ func channelMemberFromRow(r db.ChannelParticipant) ChannelMember {
 	return m
 }
 
+// randomChannelID draws one id uniformly from [minChannelID, maxChannelID]. It
+// fails closed: a crypto/rand error is returned, never swallowed and never
+// replaced with a fallback draw from channels_id_seq or anything else derivable,
+// because a guessable id is exactly what the range exists to prevent — and the
+// moment entropy is broken is the moment a fallback would be guessable.
+func randomChannelID() (int64, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(channelIDSpan))
+	if err != nil {
+		return 0, fmt.Errorf("channel id: %w", err)
+	}
+	return minChannelID + n.Int64(), nil
+}
+
+// insertChannel writes the channels row under a freshly drawn id, redrawing when
+// the id is already taken.
+//
+// Each attempt runs in its own savepoint (a nested pgx transaction): a unique
+// violation aborts the enclosing transaction otherwise, and the per-account cap
+// read above this must not be redone under a second snapshot. Only a
+// channels_pkey violation is a collision — any other unique violation is a real
+// error and is returned, not retried. Exhausting channelIDAttempts is likewise
+// an error: the sequence is never the answer to a draw that will not land.
+func (s *Store) insertChannel(ctx context.Context, tx pgx.Tx, p db.InsertChannelParams) (db.Channel, error) {
+	var last error
+	for range channelIDAttempts {
+		id, err := s.newChannelID()
+		if err != nil {
+			return db.Channel{}, err
+		}
+		p.ID = id
+
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return db.Channel{}, fmt.Errorf("channel id savepoint: %w", err)
+		}
+		row, err := s.q.WithTx(sp).InsertChannel(ctx, p)
+		if err == nil {
+			if err = sp.Commit(ctx); err != nil {
+				return db.Channel{}, fmt.Errorf("release channel id savepoint: %w", err)
+			}
+			return row, nil
+		}
+		_ = sp.Rollback(ctx) //nolint:errcheck // the savepoint is being discarded
+
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23505" || pgErr.ConstraintName != "channels_pkey" {
+			return db.Channel{}, fmt.Errorf("insert channel: %w", err)
+		}
+		last = err
+	}
+	return db.Channel{}, fmt.Errorf("insert channel: %d colliding ids: %w", channelIDAttempts, last)
+}
+
 // CreateChannel creates a channel owned by creatorID, in one transaction: the
 // channels row, its channel_state row, and the creator's participant row at
 // role 2 with join_pts 0 — a creator sees the channel's whole history because
@@ -171,11 +260,11 @@ func (s *Store) CreateChannel(ctx context.Context, creatorID int64, title, about
 		return Channel{}, ErrTooManyChannels
 	}
 
-	row, err := qtx.InsertChannel(ctx, db.InsertChannelParams{
+	row, err := s.insertChannel(ctx, tx, db.InsertChannelParams{
 		Title: title, About: about, CreatorID: creatorID, Megagroup: megagroup,
 	})
 	if err != nil {
-		return Channel{}, fmt.Errorf("insert channel: %w", err)
+		return Channel{}, err
 	}
 	if err = qtx.InsertChannelState(ctx, row.ID); err != nil {
 		return Channel{}, fmt.Errorf("insert channel state: %w", err)
@@ -304,11 +393,11 @@ func (s *Store) RevokeChannelInvite(ctx context.Context, hash string, channelID 
 
 // JoinChannelByInvite admits userID to the channel the invite hash names. The
 // hash is the ONLY input that selects a channel: there is deliberately no
-// join-by-channel-id method, because channels.id is dense BIGSERIAL and the peer
-// access-hash placeholder is access_hash == id, so an id-keyed join would let any
-// account walk 1..N, write its own participant row and read every channel on the
-// server. The participant row is an authorization boundary only while the sole
-// way to get one is a secret the server issued.
+// join-by-channel-id method, because an id-keyed join would let any account that
+// comes by an id write its own participant row and read the channel behind it.
+// The participant row is an authorization boundary only while the sole way to get
+// one is a secret the server issued. Ids are drawn from a sparse range now (see
+// minChannelID), which raises the cost of guessing one and decides nothing.
 //
 // Locking: the invite row is taken first (ChannelInviteByHashForUpdate), then
 // the channel's channel_state row (ChannelStateForUpdate). Both are held to
@@ -523,8 +612,8 @@ func (s *Store) beginChannelMutation(
 //     role.
 //
 // Every rejection — no such channel, caller not a member, target not a member,
-// insufficient rights — is the SAME error, ErrNotMember. Channel ids are dense
-// BIGSERIAL; a distinct not-found makes them enumerable. See
+// insufficient rights — is the SAME error, ErrNotMember. A distinct not-found
+// answers "does this channel exist" for every id a caller can name. See
 // internal/api/chatusers.go:35 for the reasoning and the pattern.
 
 // SetChannelRole sets targetID's role in the channel, under the G3 rule set
@@ -1022,8 +1111,8 @@ const ChannelUsernameChangeWindow = 24 * time.Hour
 // re-read returns the banned row.
 //
 // Every rejection — private channel, unknown channel id, banned caller —
-// collapses to ErrNotMember. channels.id is dense BIGSERIAL; a distinguishable
-// rejection lets an attacker walk the full channel list.
+// collapses to ErrNotMember. A distinguishable rejection turns the refusal into
+// an existence oracle for every id an attacker can name.
 func (s *Store) JoinChannelByUsername(ctx context.Context, channelID, userID int64) (Channel, ChannelMember, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
