@@ -271,9 +271,8 @@ func TestUnboundKeyCapZeroDisablesIt(t *testing.T) {
 //  2. Connection B's frame binds the key mid-dispatch. Cap is full at charge,
 //     but the re-read sees the bound user and B survives.
 //  3. Assert B stays open.
-//  4. Assert a third connection is admitted (B's charge never acquired a slot,
-//     so A still holds it — the third is refused, which is correct: the cap
-//     bounds what one unbound key holds, and A is still unbound).
+//  4. Assert A still holds the slot: B never acquired one (it signed in,
+//     releasing its pre-dispatch reserve), so A's slot remains occupied.
 func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
