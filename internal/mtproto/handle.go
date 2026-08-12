@@ -114,10 +114,9 @@ func (s *Server) handle(c *Conn, req *Request) error {
 		if err := container.Decode(in); err != nil {
 			return fmt.Errorf("container: %w", err)
 		}
-		var errs error
 		for i := range container.Messages {
 			m := container.Messages[i]
-			errs = errors.Join(errs, s.handle(c, &Request{
+			if err := s.handle(c, &Request{
 				AuthKeyID:  req.AuthKeyID,
 				UserID:     req.UserID,
 				ClientAddr: req.ClientAddr,
@@ -125,9 +124,11 @@ func (s *Server) handle(c *Conn, req *Request) error {
 				MsgID:      m.ID,
 				Buf:        &bin.Buffer{Buf: m.Body},
 				Ctx:        req.Ctx,
-			}))
+			}); err != nil {
+				return err
+			}
 		}
-		return errs
+		return nil
 	}
 
 	if err := s.handler.OnMessage(c, req); err != nil {
