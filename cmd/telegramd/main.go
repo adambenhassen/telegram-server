@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/gotd/td/exchange"
 
+	"github.com/adambenhassen/telegram-server/internal/admin"
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/config"
@@ -141,6 +143,35 @@ func run(log *slog.Logger) error {
 			log.Error("listener stop", "err", cerr)
 		}
 	}()
+
+	// Start the admin HTTP server on a separate listener. It serves read-only
+	// operational metrics at GET /admin/metrics. Auth middleware can wrap the
+	// handler without changing its shape.
+	if cfg.AdminListenAddr != "" {
+		adminMux := http.NewServeMux()
+		adminMux.HandleFunc("/admin/metrics", admin.Handler(server.Registry(), st))
+		adminSrv := &http.Server{
+			Addr:              cfg.AdminListenAddr,
+			Handler:           adminMux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		var adminLC net.ListenConfig
+		adminLn, err := adminLC.Listen(ctx, "tcp", cfg.AdminListenAddr)
+		if err != nil {
+			return fmt.Errorf("admin listen: %w", err)
+		}
+		log.Info("admin server listening", "addr", cfg.AdminListenAddr)
+		go func() {
+			if err := adminSrv.Serve(adminLn); err != nil && err != http.ErrServerClosed {
+				log.Error("admin server", "err", err)
+			}
+		}()
+		defer func() {
+			if err := adminSrv.Shutdown(context.Background()); err != nil {
+				log.Error("admin server shutdown", "err", err)
+			}
+		}()
+	}
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)
