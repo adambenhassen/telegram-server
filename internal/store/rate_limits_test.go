@@ -317,6 +317,17 @@ func TestRateLimitConcurrentBoundary(t *testing.T) {
 	}
 }
 
+// TestRateLimitWaitAccuracy pins what the wait on a denial means to the client:
+// it is the time left in the window the row records, and it shrinks as that
+// window ages.
+//
+// Neither leg is read off a wall clock. The window is an hour, so nothing but
+// this test closes it; the clock the wait is measured against is pinned to the
+// instant the window opened, so the remainder is an exact number of seconds
+// rather than however much of a short window the round trip already spent; and
+// the window ages by rewinding the row instead of by sleeping through it. A
+// host that stalls this test for a second therefore moves none of the numbers
+// below, which is what an elapsed-time measurement could not promise.
 func TestRateLimitWaitAccuracy(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
@@ -326,7 +337,7 @@ func TestRateLimitWaitAccuracy(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
 
-	cfg := store.RateLimitConfig{Limit: 1, Window: 5 * time.Second}
+	cfg := store.RateLimitConfig{Limit: 1, Window: time.Hour}
 	ctx := context.Background()
 	const subject = 700
 	const surface = "wait"
@@ -336,7 +347,14 @@ func TestRateLimitWaitAccuracy(t *testing.T) {
 		t.Fatalf("first request: %v", err)
 	}
 
-	// Denied — wait should be close to the full window.
+	expiresAt, err := store.RateLimitExpiresAt(ctx, s, subject, surface)
+	if err != nil {
+		t.Fatalf("read expires_at: %v", err)
+	}
+	opened := expiresAt.Add(-cfg.Window)
+	store.SetNowFunc(s, func() time.Time { return opened })
+
+	// Denied at the instant the window opened: the whole window is left.
 	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
 	if err != nil {
 		t.Fatalf("denial: %v", err)
@@ -344,41 +362,41 @@ func TestRateLimitWaitAccuracy(t *testing.T) {
 	if result == nil {
 		t.Fatal("expected denial, got allowed")
 	}
-
-	// Wait should be at least 4 seconds (window is 5s, we just consumed).
-	if result.Wait < 4*time.Second {
-		t.Errorf("wait = %v, want >= 4s", result.Wait)
-	}
-	// Wait should not exceed the window.
-	if result.Wait > cfg.Window {
-		t.Errorf("wait = %v, want <= %v", result.Wait, cfg.Window)
+	if result.Wait != cfg.Window {
+		t.Errorf("wait at window start = %v, want %v (the whole window)", result.Wait, cfg.Window)
 	}
 
-	// Wait after sleeping should decrease.
-	time.Sleep(2 * time.Second)
+	// Age the row a quarter of the way through the window. The pinned clock has
+	// not moved, so the row is now that much further into its own window.
+	const aged = 15 * time.Minute
+	if err := store.AgeRateLimitWindow(ctx, s, subject, surface, aged); err != nil {
+		t.Fatalf("age window: %v", err)
+	}
+
 	result2, err := s.CheckRateLimit(ctx, subject, surface, cfg)
 	if err != nil {
-		t.Fatalf("post-sleep denial: %v", err)
+		t.Fatalf("post-ageing denial: %v", err)
 	}
 	if result2 == nil {
-		t.Fatal("post-sleep: expected denial, got allowed")
+		t.Fatal("post-ageing: expected denial, got allowed")
+	}
+	if want := cfg.Window - aged; result2.Wait != want {
+		t.Errorf("wait after ageing the window %v = %v, want %v (the remainder)", aged, result2.Wait, want)
 	}
 	if result2.Wait >= result.Wait {
-		t.Errorf("wait after sleep = %v, want < %v", result2.Wait, result.Wait)
-	}
-
-	// After full window, should be allowed.
-	remaining := cfg.Window - 2*time.Second
-	time.Sleep(remaining + 100*time.Millisecond)
-	result3, err := s.CheckRateLimit(ctx, subject, surface, cfg)
-	if err != nil {
-		t.Fatalf("post-window: %v", err)
-	}
-	if result3 != nil {
-		t.Fatalf("post-window: expected allowed, got denial: %+v", result3)
+		t.Errorf("wait did not shrink as the window aged: %v, then %v", result.Wait, result2.Wait)
 	}
 }
 
+// TestRateLimitWaitMinimumOneSecond guards the one-second floor in waitUntil,
+// and only the floor. Every remainder above zero already reaches a second
+// through the round-up, so a case naming one — 100ms, say — passes with the
+// floor deleted and proves nothing; TestRateLimitWaitRoundsUp owns that rule.
+// The cases here are the two where the round-up yields zero: the clock level
+// with the row's deadline, and past it. Both are reachable in production, where
+// the wait is a Go clock read against a Postgres timestamp and only Postgres
+// decides whether the window is still open — an offset between the two puts the
+// app past a deadline the row has not reached.
 func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
@@ -388,38 +406,47 @@ func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
 
-	// The rule under test is the floor on a sub-second remainder, so the window
-	// has to still be open when the second request lands and the remainder has
-	// to be under a second. A real sub-second window cannot give both on a
-	// loaded host: it closes between the two requests and the denial never
-	// happens. So the window is long enough that no scheduler delay can close
-	// it, and the sub-second remainder comes from pinning the clock the wait is
-	// measured against 100ms short of the row's own deadline.
+	// An hour of window so the row stays open however long the host takes, and
+	// the remainder under test is the pinned clock's alone.
 	cfg := store.RateLimitConfig{Limit: 1, Window: time.Hour}
 	ctx := context.Background()
-	const subject = 800
 	const surface = "minwait"
 
-	// Consume the token.
-	if _, err := s.CheckRateLimit(ctx, subject, surface, cfg); err != nil {
-		t.Fatalf("first request: %v", err)
+	// Offset of the pinned clock from the row's stored deadline.
+	cases := []struct {
+		name    string
+		subject int64
+		offset  time.Duration
+	}{
+		{"clock level with the deadline", 800, 0},
+		{"clock past the deadline", 801, 250 * time.Millisecond},
 	}
+	for _, tc := range cases {
+		// Sequential on purpose: the pinned clock is per-Store state, and these
+		// cases share one Store.
+		t.Run(tc.name, func(t *testing.T) {
+			// Consume the token.
+			if _, err := s.CheckRateLimit(ctx, tc.subject, surface, cfg); err != nil {
+				t.Fatalf("first request: %v", err)
+			}
 
-	expiresAt, err := store.RateLimitExpiresAt(ctx, s, subject, surface)
-	if err != nil {
-		t.Fatalf("read expires_at: %v", err)
-	}
-	store.SetNowFunc(s, func() time.Time { return expiresAt.Add(-100 * time.Millisecond) })
+			expiresAt, err := store.RateLimitExpiresAt(ctx, s, tc.subject, surface)
+			if err != nil {
+				t.Fatalf("read expires_at: %v", err)
+			}
+			store.SetNowFunc(s, func() time.Time { return expiresAt.Add(tc.offset) })
 
-	result, err := s.CheckRateLimit(ctx, subject, surface, cfg)
-	if err != nil {
-		t.Fatalf("denial: %v", err)
-	}
-	if result == nil {
-		t.Fatal("expected denial, got allowed")
-	}
-	if result.Wait < time.Second {
-		t.Errorf("wait = %v, want >= 1s (minimum)", result.Wait)
+			result, err := s.CheckRateLimit(ctx, tc.subject, surface, cfg)
+			if err != nil {
+				t.Fatalf("denial: %v", err)
+			}
+			if result == nil {
+				t.Fatal("expected denial, got allowed")
+			}
+			if result.Wait != time.Second {
+				t.Errorf("wait = %v, want exactly 1s (the floor)", result.Wait)
+			}
+		})
 	}
 }
 
