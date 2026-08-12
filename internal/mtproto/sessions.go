@@ -62,3 +62,22 @@ func (r *SessionRegistry) Conns(userID int64) []*Conn {
 	copy(out, conns)
 	return out
 }
+
+// TotalConns returns the total number of live connections across all users.
+func (r *SessionRegistry) TotalConns() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var n int
+	for _, conns := range r.m {
+		n += len(conns)
+	}
+	return n
+}
+
+// TotalSessions returns the number of distinct users with at least one live
+// connection — i.e. authenticated sessions currently attached.
+func (r *SessionRegistry) TotalSessions() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.m)
+}

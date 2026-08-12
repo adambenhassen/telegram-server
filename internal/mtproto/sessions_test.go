@@ -1,88 +1,97 @@
 package mtproto_test
 
 import (
-	"sync"
-	"testing"
-
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"testing"
 )
 
-func TestSessionRegistryAddRemove(t *testing.T) {
-	t.Parallel()
+func TestSessionRegistry_TotalConns(t *testing.T) {
 	r := mtproto.NewSessionRegistry()
-	c1, c2 := &mtproto.Conn{}, &mtproto.Conn{}
 
-	r.Add(7, c1)
-	r.Add(7, c2)
-	if got := r.Conns(7); len(got) != 2 {
-		t.Fatalf("Conns(7) = %d, want 2", len(got))
-	}
-	if got := r.Conns(9); len(got) != 0 {
-		t.Fatalf("Conns(9) = %d, want 0", len(got))
+	if got := r.TotalConns(); got != 0 {
+		t.Errorf("empty registry: expected 0, got %d", got)
 	}
 
-	r.Remove(7, c1)
-	got := r.Conns(7)
-	if len(got) != 1 || got[0] != c2 {
-		t.Fatalf("after remove, Conns(7) = %+v, want [c2]", got)
+	c1 := &mtproto.Conn{}
+	c2 := &mtproto.Conn{}
+	c3 := &mtproto.Conn{}
+
+	// One user with one conn.
+	r.Add(1, c1)
+	if got := r.TotalConns(); got != 1 {
+		t.Errorf("one conn: expected 1, got %d", got)
 	}
 
-	r.Remove(7, c2)
-	if got := r.Conns(7); len(got) != 0 {
-		t.Fatalf("after remove all, Conns(7) = %d, want 0", len(got))
+	// Two users with one conn each.
+	r.Add(2, c2)
+	if got := r.TotalConns(); got != 2 {
+		t.Errorf("two conns: expected 2, got %d", got)
+	}
+
+	// One user with two conns.
+	r.Add(1, c3)
+	if got := r.TotalConns(); got != 3 {
+		t.Errorf("three conns: expected 3, got %d", got)
+	}
+
+	// Remove one conn.
+	r.Remove(1, c1)
+	if got := r.TotalConns(); got != 2 {
+		t.Errorf("after remove: expected 2, got %d", got)
+	}
+
+	// Remove all conns for user 1.
+	r.Remove(1, c3)
+	if got := r.TotalConns(); got != 1 {
+		t.Errorf("after second remove: expected 1, got %d", got)
+	}
+
+	// Remove last conn.
+	r.Remove(2, c2)
+	if got := r.TotalConns(); got != 0 {
+		t.Errorf("empty: expected 0, got %d", got)
 	}
 }
 
-// TestSessionRegistryCap covers the per-user connection cap: past it a new
-// connection is refused and no live one is evicted, and a slot freed by a
-// departing connection is reusable.
-func TestSessionRegistryCap(t *testing.T) {
-	t.Parallel()
+func TestSessionRegistry_TotalSessions(t *testing.T) {
 	r := mtproto.NewSessionRegistry()
-	conns := make([]*mtproto.Conn, mtproto.MaxUserConns)
-	for i := range conns {
-		conns[i] = &mtproto.Conn{}
-		if !r.Add(3, conns[i]) {
-			t.Fatalf("Add %d of %d refused under the cap", i+1, mtproto.MaxUserConns)
-		}
+
+	if got := r.TotalSessions(); got != 0 {
+		t.Errorf("empty registry: expected 0, got %d", got)
 	}
 
-	extra := &mtproto.Conn{}
-	if r.Add(3, extra) {
-		t.Fatal("Add past the cap must be refused")
-	}
-	got := r.Conns(3)
-	if len(got) != mtproto.MaxUserConns {
-		t.Fatalf("Conns(3) = %d, want %d", len(got), mtproto.MaxUserConns)
-	}
-	if got[0] != conns[0] {
-		t.Fatal("the oldest connection was evicted; the cap must refuse, never evict")
-	}
-	// A different user is unaffected by another's cap.
-	if !r.Add(4, extra) {
-		t.Fatal("another user's Add refused by user 3's cap")
+	c1 := &mtproto.Conn{}
+	c2 := &mtproto.Conn{}
+	c3 := &mtproto.Conn{}
+
+	// One user with one conn = one session.
+	r.Add(1, c1)
+	if got := r.TotalSessions(); got != 1 {
+		t.Errorf("one session: expected 1, got %d", got)
 	}
 
-	r.Remove(3, conns[0])
-	if !r.Add(3, extra) {
-		t.Fatal("Add refused after a connection freed a slot")
+	// Same user with two conns = still one session.
+	r.Add(1, c2)
+	if got := r.TotalSessions(); got != 1 {
+		t.Errorf("same user, two conns: expected 1, got %d", got)
 	}
-}
 
-func TestSessionRegistryConcurrent(t *testing.T) {
-	t.Parallel()
-	r := mtproto.NewSessionRegistry()
-	var wg sync.WaitGroup
-	for range 50 {
-		c := &mtproto.Conn{}
-		wg.Go(func() {
-			r.Add(1, c)
-			_ = r.Conns(1)
-			r.Remove(1, c)
-		})
+	// Two users = two sessions.
+	r.Add(2, c3)
+	if got := r.TotalSessions(); got != 2 {
+		t.Errorf("two sessions: expected 2, got %d", got)
 	}
-	wg.Wait()
-	if got := r.Conns(1); len(got) != 0 {
-		t.Fatalf("residual conns after concurrent churn: %d", len(got))
+
+	// Remove one user's conns.
+	r.Remove(1, c1)
+	r.Remove(1, c2)
+	if got := r.TotalSessions(); got != 1 {
+		t.Errorf("after removing user 1: expected 1, got %d", got)
+	}
+
+	// Remove last user.
+	r.Remove(2, c3)
+	if got := r.TotalSessions(); got != 0 {
+		t.Errorf("empty: expected 0, got %d", got)
 	}
 }
