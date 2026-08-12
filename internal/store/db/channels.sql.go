@@ -12,7 +12,7 @@ import (
 )
 
 const channelByID = `-- name: ChannelByID :one
-SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv FROM channels WHERE id = $1
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable FROM channels WHERE id = $1
 `
 
 func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
@@ -29,6 +29,7 @@ func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
 		&i.PinnedMessageID,
 		&i.Username,
 		&i.TitleTsv,
+		&i.PubliclyDiscoverable,
 	)
 	return i, err
 }
@@ -296,7 +297,7 @@ func (q *Queries) ChannelStateForUpdate(ctx context.Context, channelID int64) (C
 }
 
 const channelsForUser = `-- name: ChannelsForUser :many
-SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id, c.username, c.title_tsv FROM channels c
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id, c.username, c.title_tsv, c.publicly_discoverable FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id
@@ -322,6 +323,7 @@ func (q *Queries) ChannelsForUser(ctx context.Context, userID int64) ([]Channel,
 			&i.PinnedMessageID,
 			&i.Username,
 			&i.TitleTsv,
+			&i.PubliclyDiscoverable,
 		); err != nil {
 			return nil, err
 		}
@@ -388,7 +390,7 @@ func (q *Queries) GetChannelPinnedMessage(ctx context.Context, id int64) (*int32
 
 const insertChannel = `-- name: InsertChannel :one
 INSERT INTO channels (id, title, about, creator_id, megagroup) VALUES ($1, $2, $3, $4, $5)
-RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv
+RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable
 `
 
 type InsertChannelParams struct {
@@ -425,6 +427,7 @@ func (q *Queries) InsertChannel(ctx context.Context, arg InsertChannelParams) (C
 		&i.PinnedMessageID,
 		&i.Username,
 		&i.TitleTsv,
+		&i.PubliclyDiscoverable,
 	)
 	return i, err
 }
@@ -519,7 +522,7 @@ func (q *Queries) IsChannelMember(ctx context.Context, arg IsChannelMemberParams
 }
 
 const lockChannel = `-- name: LockChannel :one
-SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv FROM channels WHERE id = $1 FOR UPDATE
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable FROM channels WHERE id = $1 FOR UPDATE
 `
 
 // LockChannel takes the channels row lock that serialises the rights mutations:
@@ -540,6 +543,7 @@ func (q *Queries) LockChannel(ctx context.Context, id int64) (Channel, error) {
 		&i.PinnedMessageID,
 		&i.Username,
 		&i.TitleTsv,
+		&i.PubliclyDiscoverable,
 	)
 	return i, err
 }
@@ -568,20 +572,23 @@ FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id AND p.user_id = $1::bigint
 LEFT JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
 WHERE c.id IN (
-    SELECT tc.id FROM channels tc WHERE tc.title_tsv @@ plainto_tsquery('simple', $2)
+    SELECT tc.id FROM channels tc
+    WHERE tc.id = ANY($2::bigint[])
+      AND tc.title_tsv @@ plainto_tsquery('simple', $3)
     UNION
-    SELECT hu.owner_id FROM usernames hu WHERE hu.owner_type = 'channel' AND hu.handle = $3
+    SELECT hu.owner_id FROM usernames hu WHERE hu.owner_type = 'channel' AND hu.handle = $4
 )
   AND (p.banned_until IS NULL OR p.banned_until <= now())
 ORDER BY c.id
-LIMIT $4::int
+LIMIT $5::int
 `
 
 type SearchMemberChannelsParams struct {
-	ViewerID int64
-	Query    string
-	Handle   string
-	Lim      int32
+	ViewerID   int64
+	ChannelIds []int64
+	Query      string
+	Handle     string
+	Lim        int32
 }
 
 type SearchMemberChannelsRow struct {
@@ -609,9 +616,36 @@ type SearchMemberChannelsRow struct {
 // banned_until <= now().
 //
 // The match is the same union of single-relation subqueries SearchPublicChannels
-// uses, for the same planner reason. This arm is already bounded by the caller's
-// own membership rows and was cheap either way, but two spellings of one
-// predicate is how the two drift.
+// uses, for the same planner reason, but the title disjunct here is scoped by
+// channel_ids instead of by publicness. This arm cannot take the publicness
+// marker — a member has to be able to find their own private channel by title,
+// which is the whole point of the arm — so the bound it gets instead is the
+// caller's own membership, spelled inside the statement.
+//
+// channel_ids is a scope, never the authorization, exactly as in
+// SearchGlobalPage: it carries the caller's own unbanned channel ids, read
+// separately off the index on channel_participants (user_id), and the join to
+// channel_participants above is what decides who may see what. A stale or wrong
+// id list can only narrow this arm, never widen it past the membership the join
+// re-checks in the same statement.
+//
+// It is written as an explicit id set rather than left to the planner because
+// the bound has to be structural. Without it the candidate set is every channel
+// whose title matches, private ones included, filtered down to the caller's
+// afterwards — so the cost of an empty answer counts the private channels
+// sharing the token, which is the oracle M16 closed. A plan that avoids that by
+// preference rather than by construction is one statistics change away from
+// returning to it, and "index-driven" does not rule it out: a bitmap scan of a
+// whole-table title index followed by a membership filter is index-driven and
+// is precisely the leaking shape. With the id set in the predicate, and no
+// index over every title left to scan, the plan is a primary-key scan over at
+// most the per-account channel cap (channels.go, defaultMaxChannelsPerUser),
+// whatever the corpus behind it looks like.
+//
+// The handle disjunct stays unscoped, and needs no scope: it is a primary-key
+// lookup on usernames yielding at most one row, so it costs the same whatever
+// the corpus holds, and a private channel has no row there to find. A channel
+// it names that the caller does not belong to is dropped by the join above.
 //
 // No participant count here, unlike the public arm: a member is rendered by
 // channelToTL, which carries no participants_count field, so counting would be
@@ -619,6 +653,7 @@ type SearchMemberChannelsRow struct {
 func (q *Queries) SearchMemberChannels(ctx context.Context, arg SearchMemberChannelsParams) ([]SearchMemberChannelsRow, error) {
 	rows, err := q.db.Query(ctx, searchMemberChannels,
 		arg.ViewerID,
+		arg.ChannelIds,
 		arg.Query,
 		arg.Handle,
 		arg.Lim,
@@ -659,7 +694,9 @@ SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
 FROM channels c
 JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
 WHERE c.id IN (
-    SELECT tc.id FROM channels tc WHERE tc.title_tsv @@ plainto_tsquery('simple', $1)
+    SELECT tc.id FROM channels tc
+    WHERE tc.publicly_discoverable
+      AND tc.title_tsv @@ plainto_tsquery('simple', $1)
     UNION
     SELECT hu.owner_id FROM usernames hu WHERE hu.owner_type = 'channel' AND hu.handle = $2
 )
@@ -708,6 +745,16 @@ type SearchPublicChannelsRow struct {
 // same row for the same reason: the username shown is the one that admitted the
 // channel to this result, never the copy.
 //
+// publicly_discoverable in the title disjunct is not a second publicness test
+// and must never be read as one. The join above stays the only thing deciding
+// what this query returns; the marker decides what it costs. It is there so the
+// candidate set holds public channels only: a private title matching the token
+// was previously scanned, probed against usernames and discarded, so the time
+// an empty answer took counted the private channels sharing a guessed word.
+// With the marker in the predicate the partial index over public titles is the
+// only index that can answer it, so the cost of this arm tracks the public
+// matches — which the response discloses anyway — and nothing else.
+//
 // The match is a union of two single-relation subqueries rather than one OR
 // spanning channels and usernames, and that shape is load-bearing rather than
 // stylistic. An OR across two relations cannot be answered from either index:
@@ -716,8 +763,8 @@ type SearchPublicChannelsRow struct {
 // table (162.8 ms at 200k channels, against 1.99 ms here) and an authenticated
 // account picks that worst case for free by sending a nonsense token. Each
 // disjunct here restricts on its own relation, so the title arm is a bitmap
-// scan of channels_title_tsv_idx and the handle arm a lookup on the usernames
-// primary key.
+// scan of channels_public_title_tsv_idx and the handle arm a lookup on the
+// usernames primary key.
 func (q *Queries) SearchPublicChannels(ctx context.Context, arg SearchPublicChannelsParams) ([]SearchPublicChannelsRow, error) {
 	rows, err := q.db.Query(ctx, searchPublicChannels, arg.Query, arg.Handle, arg.Lim)
 	if err != nil {
@@ -750,7 +797,7 @@ func (q *Queries) SearchPublicChannels(ctx context.Context, arg SearchPublicChan
 }
 
 const setChannelPinnedMessage = `-- name: SetChannelPinnedMessage :one
-UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv
+UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable
 `
 
 type SetChannelPinnedMessageParams struct {
@@ -775,21 +822,46 @@ func (q *Queries) SetChannelPinnedMessage(ctx context.Context, arg SetChannelPin
 		&i.PinnedMessageID,
 		&i.Username,
 		&i.TitleTsv,
+		&i.PubliclyDiscoverable,
 	)
 	return i, err
 }
 
 const setChannelUsername = `-- name: SetChannelUsername :execrows
-UPDATE channels SET username = $2 WHERE id = $1
+UPDATE channels c
+SET username = $1,
+    publicly_discoverable = EXISTS (
+        SELECT 1 FROM usernames un
+        WHERE un.owner_type = 'channel' AND un.owner_id = c.id
+    )
+WHERE c.id = $2
 `
 
 type SetChannelUsernameParams struct {
-	ID       int64
 	Username *string
+	ID       int64
 }
 
+// SetChannelUsername writes the denormalized handle copy and, with it,
+// recomputes publicly_discoverable from the usernames table.
+//
+// The two live in one statement because there is one moment at which both are
+// true: every writer of a channel handle — SetChannelUsername and
+// ClaimChannelUsername, claim path and release path alike — mutates the
+// usernames row and then calls this, inside the transaction that does both. A
+// marker maintained at each of those call sites instead would be four places to
+// keep in step; here there is one, and it reads the authoritative table rather
+// than the argument, so it is a recomputation and not a second copy of the same
+// assertion.
+//
+// A future writer that changes usernames without coming through here leaves the
+// marker stale, and that is survivable by construction rather than by luck:
+// publicly_discoverable decides cost only, the pre-LIMIT JOIN usernames in
+// SearchPublicChannels decides disclosure, and a stale marker in the permissive
+// direction costs a wasted candidate row that the join drops. See the migration
+// header for the full asymmetry.
 func (q *Queries) SetChannelUsername(ctx context.Context, arg SetChannelUsernameParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setChannelUsername, arg.ID, arg.Username)
+	result, err := q.db.Exec(ctx, setChannelUsername, arg.Username, arg.ID)
 	if err != nil {
 		return 0, err
 	}
