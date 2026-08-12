@@ -274,9 +274,19 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
 	keys := newSignInStore()
 	seen := make(chan struct{}, 64)
+
+	// Handler binds on the second request only — the first fills the cap,
+	// the second arrives at a full cap and binds during its own dispatch.
+	var reqCount int
+	mu := sync.Mutex{}
 	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, _ *mtproto.Request) error {
-		// Bind the key during dispatch — the handler acts as auth.signIn.
-		keys.bind(7)
+		mu.Lock()
+		reqCount++
+		if reqCount == 2 {
+			// Second request: bind the key during dispatch.
+			keys.bind(7)
+		}
+		mu.Unlock()
 		select {
 		case seen <- struct{}{}:
 		default:
@@ -286,32 +296,37 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	serveKeysWithHandler(t, ctx, nl, keys, maxHeld, handler, seen)
 	addr := nl.Addr().String()
 
-	// The first connection takes the key's only slot while nobody has signed in.
-	raw1, conn1 := keyClient(t, ctx, addr, keys.key, 1)
+	// Fill the cap: one unbound connection holds the only slot.
+	rawFill, connFill := keyClient(t, ctx, addr, keys.key, 100)
 	wantRequests(t, seen, 1)
 
-	// The handler bound the key to user 7 during dispatch. The connection stays
-	// open (the re-read saw userID=7 and released the slot) rather than closed
-	// at the cap (which would happen if charge used the pre-dispatch userID=0).
-	if closedByServer(t, raw1, 2*time.Second) {
+	// Second connection: the handler binds the key during its dispatch. At this
+	// point the cap is full (one unbound slot held). Without the re-read,
+	// charge sees userID=0 (pre-dispatch) and closes this connection.
+	// With the re-read, charge sees userID=7 (post-dispatch) and admits it.
+	rawBind, connBind := keyClient(t, ctx, addr, keys.key, 200)
+	wantRequests(t, seen, 1)
+
+	// The binding connection stays open (re-read saw userID=7).
+	if closedByServer(t, rawBind, 2*time.Second) {
 		t.Fatal("connection whose key bound during dispatch was closed at the cap")
 	}
 
-	// The slot was released by the bind, so a second connection on the same key
-	// is now admitted — proving the first one's charge was cleared.
-	raw2, _ := keyClient(t, ctx, addr, keys.key, 2)
-	wantRequests(t, seen, 1)
-	if closedByServer(t, raw2, 2*time.Second) {
-		t.Fatal("second connection refused: the slot was not released by the bind")
+	// The fill connection was closed by the cap: the binding connection's
+	// charge acquired the slot (re-read saw userID=7, so charge released the
+	// hold and admitted it), but the fill connection's charge remains — wait.
+	// Actually: charge for the binding connection sees userID=7 → signedIn=true
+	// → release() → returns true. The fill connection's slot is unaffected.
+	// Both connections survive.
+	if closedByServer(t, rawFill, 2*time.Second) {
+		t.Fatal("fill connection was closed (should hold the slot)")
 	}
 
-	// Both connections survive: the first one is signed-in (outside the cap),
-	// the second is unbound and holds the freed slot.
-	sendFrame(t, ctx, conn1, keys.key, 1, int64(2)<<32)
+	// Both connections serve further frames.
+	sendFrame(t, ctx, connFill, keys.key, 100, int64(2)<<32)
 	wantRequests(t, seen, 1)
-	if closedByServer(t, raw1, time.Second) {
-		t.Fatal("signed-in connection closed after bind")
-	}
+	sendFrame(t, ctx, connBind, keys.key, 200, int64(2)<<32)
+	wantRequests(t, seen, 1)
 }
 
 // TestSetMaxConnsPerUnboundKeyRefusesANegativeCap covers the difference between
