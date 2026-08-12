@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // MetricsSnapshot holds the database-side values needed for the admin metrics
@@ -105,30 +107,33 @@ func (s *Store) Metrics(ctx context.Context) (MetricsSnapshot, error) {
 	}
 
 	// Approximate row counts for storage monitoring. Users, channels, and chats
-	// were already counted above; reuse those values. The remaining tables are
-	// queried fresh.
+	// were already counted above; reuse those values. The remaining tables use
+	// pg_class.reltuples — an estimate maintained by autovacuum — so the query
+	// never triggers a sequential scan on a large table.
 	var sr StorageRows
 	sr.Users = snap.TotalUsers
 	sr.Channels = snap.TotalChannels
 	sr.Chats = snap.TotalChats
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM messages`).Scan(&sr.Messages); err != nil {
-		return snap, fmt.Errorf("count messages rows: %w", err)
-	}
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM message_events`).Scan(&sr.Events); err != nil {
-		return snap, fmt.Errorf("count events rows: %w", err)
-	}
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM channel_messages`).Scan(&sr.ChannelMessages); err != nil {
-		return snap, fmt.Errorf("count channel messages rows: %w", err)
-	}
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM files`).Scan(&sr.Files); err != nil {
-		return snap, fmt.Errorf("count files rows: %w", err)
-	}
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM auth_keys`).Scan(&sr.AuthKeys); err != nil {
-		return snap, fmt.Errorf("count auth_keys rows: %w", err)
-	}
+	sr.Messages = estimatedRows(ctx, s.pool, "messages")
+	sr.Events = estimatedRows(ctx, s.pool, "message_events")
+	sr.ChannelMessages = estimatedRows(ctx, s.pool, "channel_messages")
+	sr.Files = estimatedRows(ctx, s.pool, "files")
+	sr.AuthKeys = estimatedRows(ctx, s.pool, "auth_keys")
 
 	snap.StorageRows = sr
 	return snap, nil
+}
+
+// estimatedRows returns pg_class.reltuples for relation name as an int64.
+// It is an estimate maintained by autovacuum and avoids a sequential scan.
+func estimatedRows(ctx context.Context, pool *pgxpool.Pool, tableName string) int64 {
+	var rows int64
+	if err := pool.QueryRow(ctx,
+		`SELECT reltuples::int8 FROM pg_class WHERE relname = $1`, tableName,
+	).Scan(&rows); err != nil {
+		return 0
+	}
+	return rows
 }
 
 // MaxPtsGap returns the maximum pts gap across all authenticated sessions.

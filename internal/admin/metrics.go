@@ -7,8 +7,10 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
@@ -87,54 +89,89 @@ type StorageRows struct {
 	AuthKeys        int64 `json:"auth_keys"`
 }
 
+// cacheRefresh is the minimum interval between metric refreshes. It prevents
+// N dashboard tabs from costing N full query sets against the DB.
+const cacheRefresh = 10 * time.Second
+
+// metricsCache holds a stale snapshot and its collection time.
+type metricsCache struct {
+	mu   sync.Mutex
+	last time.Time
+	resp MetricsResponse
+}
+
+// refresh re-reads metrics from the store and registry if enough time has
+// elapsed since the last refresh.
+func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if time.Since(c.last) < cacheRefresh {
+		return
+	}
+
+	snap, err := st.Metrics(ctx)
+	if err != nil {
+		return
+	}
+
+	var maxGap int64
+	if gap, err := st.MaxPtsGap(ctx); err == nil {
+		maxGap = gap
+	}
+
+	c.resp = MetricsResponse{
+		Timestamp:       time.Now(),
+		Connections:     reg.TotalConns(),
+		Sessions:        reg.TotalSessions(),
+		TotalUsers:      snap.TotalUsers,
+		ActiveUsers1H:   snap.ActiveUsers1H,
+		ActiveUsers24H:  snap.ActiveUsers24H,
+		Messages1H:      snap.Messages1H,
+		Messages24H:     snap.Messages24H,
+		TotalChannels:   snap.TotalChannels,
+		TotalChats:      snap.TotalChats,
+		MaxPtsGap:       maxGap,
+		NotifyCount:     0, // not yet instrumented
+		PushLatencyP50:  0, // not yet instrumented
+		PushLatencyP95:  0, // not yet instrumented
+		RateLimitActive: snap.RateLimitHits1H,
+		StorageRows: StorageRows{
+			Users:           snap.StorageRows.Users,
+			Messages:        snap.StorageRows.Messages,
+			Events:          snap.StorageRows.Events,
+			Channels:        snap.StorageRows.Channels,
+			ChannelMessages: snap.StorageRows.ChannelMessages,
+			Chats:           snap.StorageRows.Chats,
+			Files:           snap.StorageRows.Files,
+			AuthKeys:        snap.StorageRows.AuthKeys,
+		},
+	}
+	c.last = time.Now()
+}
+
+// get returns the cached metrics response.
+func (c *metricsCache) get() MetricsResponse {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.resp
+}
+
 // Handler returns an http.HandlerFunc that serves operational metrics as JSON.
-// The handler reads from the provided registry and store on each request and
-// does not persist any state or start background goroutines.
+// The handler reads from the provided registry and store on each request, but
+// caches results for at least cacheRefresh (10 s) to prevent N dashboard tabs
+// from costing N full query sets. No background goroutines are started.
 func Handler(registry *mtproto.SessionRegistry, st *store.Store) http.HandlerFunc {
+	var cache metricsCache
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		snap, err := st.Metrics(r.Context())
-		if err != nil {
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		resp := MetricsResponse{
-			Timestamp:       time.Now(),
-			Connections:     registry.TotalConns(),
-			Sessions:        registry.TotalSessions(),
-			TotalUsers:      snap.TotalUsers,
-			ActiveUsers1H:   snap.ActiveUsers1H,
-			ActiveUsers24H:  snap.ActiveUsers24H,
-			Messages1H:      snap.Messages1H,
-			Messages24H:     snap.Messages24H,
-			TotalChannels:   snap.TotalChannels,
-			TotalChats:      snap.TotalChats,
-			NotifyCount:     0, // not yet instrumented
-			PushLatencyP50:  0, // not yet instrumented
-			PushLatencyP95:  0, // not yet instrumented
-			RateLimitActive: snap.RateLimitHits1H,
-			StorageRows: StorageRows{
-				Users:           snap.StorageRows.Users,
-				Messages:        snap.StorageRows.Messages,
-				Events:          snap.StorageRows.Events,
-				Channels:        snap.StorageRows.Channels,
-				ChannelMessages: snap.StorageRows.ChannelMessages,
-				Chats:           snap.StorageRows.Chats,
-				Files:           snap.StorageRows.Files,
-				AuthKeys:        snap.StorageRows.AuthKeys,
-			},
-		}
-
-		// Best-effort pts gap: if the query fails, report 0 rather than error
-		// the whole response.
-		if gap, err := st.MaxPtsGap(r.Context()); err == nil {
-			resp.MaxPtsGap = gap
-		}
+		cache.refresh(r.Context(), registry, st)
+		resp := cache.get()
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
