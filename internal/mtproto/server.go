@@ -531,7 +531,21 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		// per-user cap below: the frame in hand is answered normally, and a
 		// socket past the bound closes on the way out, so a peer opening sockets
 		// in a loop is refused the new one instead of losing a working one.
-		if !hold.charge(authKeyID, userID) {
+		//
+		// Re-read the binding after dispatch: rpcHandle can change it
+		// (auth.signIn binds the key to a user), and charging with the
+		// pre-dispatch value would close a session that just signed in.
+		_, chargeUser, ok, err := s.keys.Get(ctx, authKeyID)
+		if err != nil {
+			return errors.Join(errors.New("get auth key"), err)
+		}
+		if !ok {
+			// Key was revoked between dispatch and re-read; fall back to the
+			// pre-dispatch binding for the charge. The frame already decrypted
+			// under this key, so the connection is valid for this frame.
+			chargeUser = userID
+		}
+		if !hold.charge(authKeyID, chargeUser) {
 			// The key is not named: it identifies a client's session, no line
 			// elsewhere writes one, and what the operator needs from this line
 			// is which bound is firing and how hard.

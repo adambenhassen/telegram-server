@@ -52,7 +52,8 @@ count. `TG_MAX_CONNS_PER_UNBOUND_KEY` is what counts those, so the worst case
 extends rather than stopping there. A peer holding m keys nobody has signed in
 on holds at most `m × TG_MAX_CONNS_PER_UNBOUND_KEY` connections beyond the
 pre-auth population above, and each of those m keys costs its own key exchange,
-which had to pass the pre-auth bounds to happen at all. Once someone does sign
+which had to pass the pre-auth bounds to happen at all. The number m itself is
+unbounded until MAIN-252 ships a rate limit on key exchanges. Once someone does sign
 in on a key, what its connections may hold is the per-user connection cap's to
 decide and this bound lets them go for good — including if the key is unbound
 again afterwards, as the 2FA path does.

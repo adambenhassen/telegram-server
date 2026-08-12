@@ -152,6 +152,114 @@ func TestUnboundKeyCapReleasesASignedInConnectionForGood(t *testing.T) {
 	}
 }
 
+// TestUnboundKeyCapCountsTwoKeysIndependently proves the cap is per key,
+// not per process: two different keys, each at the cap, hold twice the cap
+// in total.
+func TestUnboundKeyCapCountsTwoKeysIndependently(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	const maxHeld = 2
+	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
+	keys := newTwoKeyStore()
+	seen := serveKeys(t, ctx, nl, keys, maxHeld)
+	addr := nl.Addr().String()
+
+	// Open maxHeld connections on key A and maxHeld on key B.
+	rawsA := make([]net.Conn, maxHeld)
+	connsA := make([]transport.Conn, maxHeld)
+	for i := range rawsA {
+		rawsA[i], connsA[i] = keyClient(t, ctx, addr, keys.keyA, int64(1+i))
+	}
+	wantRequests(t, seen, maxHeld)
+
+	rawsB := make([]net.Conn, maxHeld)
+	connsB := make([]transport.Conn, maxHeld)
+	for i := range rawsB {
+		rawsB[i], connsB[i] = keyClient(t, ctx, addr, keys.keyB, int64(10+i))
+	}
+	wantRequests(t, seen, maxHeld)
+
+	// Both keys hold maxHeld connections — 2×maxHeld in total.
+	liveA := 0
+	for _, raw := range rawsA {
+		if !closedByServer(t, raw, 2*time.Second) {
+			liveA++
+		}
+	}
+	liveB := 0
+	for _, raw := range rawsB {
+		if !closedByServer(t, raw, 2*time.Second) {
+			liveB++
+		}
+	}
+	if liveA != maxHeld {
+		t.Fatalf("key A: %d connections held, want %d", liveA, maxHeld)
+	}
+	if liveB != maxHeld {
+		t.Fatalf("key B: %d connections held, want %d", liveB, maxHeld)
+	}
+
+	// A third connection on key A is refused; one on key B is also refused.
+	// (They are each at cap.)
+	refusedA, _ := keyClient(t, ctx, addr, keys.keyA, 100)
+	wantRequests(t, seen, 1)
+	if !closedByServer(t, refusedA, 2*time.Second) {
+		t.Fatal("key A: cap did not refuse the N+1th connection")
+	}
+	refusedB, _ := keyClient(t, ctx, addr, keys.keyB, 110)
+	wantRequests(t, seen, 1)
+	if !closedByServer(t, refusedB, 2*time.Second) {
+		t.Fatal("key B: cap did not refuse the N+1th connection")
+	}
+
+	// Survivors keep being served.
+	for _, c := range connsA[:liveA] {
+		sendFrame(t, ctx, c, keys.keyA, 1, 999<<32)
+	}
+	for _, c := range connsB[:liveB] {
+		sendFrame(t, ctx, c, keys.keyB, 10, 999<<32)
+	}
+	wantRequests(t, seen, liveA+liveB)
+}
+
+// TestUnboundKeyCapZeroDisablesIt proves zero is "cap off": connections on the
+// same never-signed-in key are not refused, matching the pre-auth bounds where
+// zero disables the bound.
+func TestUnboundKeyCapZeroDisablesIt(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	const opened = 8
+	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
+	keys := newSignInStore()
+	seen := serveKeys(t, ctx, nl, keys, 0)
+	addr := nl.Addr().String()
+
+	raws := make([]net.Conn, opened)
+	conns := make([]transport.Conn, opened)
+	for i := range raws {
+		raws[i], conns[i] = keyClient(t, ctx, addr, keys.key, int64(1+i))
+	}
+	wantRequests(t, seen, opened)
+
+	// With cap=0, nothing is refused: send a second frame on each connection
+	// and confirm the handler receives them all.
+	for i := range conns {
+		sendFrame(t, ctx, conns[i], keys.key, int64(1+i), int64(2)<<32)
+	}
+	wantRequests(t, seen, opened)
+
+	// Then verify each one is still open.
+	for i, raw := range raws {
+		if closedByServer(t, raw, 2*time.Second) {
+			t.Fatalf("connection %d closed at cap=0 (cap should be disabled)", i)
+		}
+	}
+}
+
 // TestSetMaxConnsPerUnboundKeyRefusesANegativeCap covers the difference between
 // the two ways of writing "no bound", the same way the pre-auth bounds do: zero
 // is a decision and is honoured, negative is a typo or a unit mistake and is
@@ -195,6 +303,40 @@ func (s *signInStore) Get(context.Context, [8]byte) (crypto.AuthKey, int64, bool
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.key, s.userID, true, nil
+}
+
+// twoKeyStore is an AuthKeyStore holding two distinct keys, neither bound to
+// a user. It resolves by auth key ID so each key is looked up independently.
+type twoKeyStore struct {
+	keyA crypto.AuthKey
+	keyB crypto.AuthKey
+}
+
+func newTwoKeyStore() *twoKeyStore {
+	return &twoKeyStore{keyA: rebindTestKey(), keyB: makeTestKey(0xAA)}
+}
+
+func (s *twoKeyStore) Save(_ context.Context, _ crypto.AuthKey) error { return nil }
+func (s *twoKeyStore) Touch(_ context.Context, _ [8]byte) error       { return nil }
+
+func (s *twoKeyStore) Get(_ context.Context, id [8]byte) (crypto.AuthKey, int64, bool, error) {
+	if id == s.keyA.ID {
+		return s.keyA, 0, true, nil
+	}
+	if id == s.keyB.ID {
+		return s.keyB, 0, true, nil
+	}
+	return crypto.AuthKey{}, 0, false, nil
+}
+
+// makeTestKey returns a deterministic auth key with all bytes set to b,
+// distinct from rebindTestKey.
+func makeTestKey(b byte) crypto.AuthKey {
+	var raw crypto.Key
+	for i := range raw {
+		raw[i] = b
+	}
+	return raw.WithID()
 }
 
 // serveKeys runs a server on ln whose auth keys come from keys and whose
