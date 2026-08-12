@@ -106,7 +106,7 @@ func TestSendMessageRateLimit(t *testing.T) {
 func TestSendMessageRateLimitWindowExpiry(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	alice, err := s.CreateUser(ctx, "+15551293101")
 	if err != nil {
@@ -117,8 +117,9 @@ func TestSendMessageRateLimitWindowExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Very short window: 2 sends per 500ms.
-	cfg := store.RateLimitConfig{Limit: 2, Window: 500 * time.Millisecond}
+	// Long window, aged past its deadline below rather than slept through: see
+	// AgeRateLimitWindowForTest.
+	cfg := store.RateLimitConfig{Limit: 2, Window: time.Hour}
 	peerBob := api.InputPeerUser(alice.ID, bob.ID)
 
 	// Exhaust the limit.
@@ -139,8 +140,10 @@ func TestSendMessageRateLimitWindowExpiry(t *testing.T) {
 		t.Fatalf("expected FLOOD_WAIT, got %v", err)
 	}
 
-	// Wait for window to expire.
-	time.Sleep(600 * time.Millisecond)
+	// Age the window past its deadline.
+	if err := api.AgeRateLimitWindowForTest(dsn, alice.ID, "message_send", cfg.Window+time.Minute); err != nil {
+		t.Fatalf("age window: %v", err)
+	}
 
 	// Should be allowed again.
 	_, err = api.SendMessageForTestWithLimits(s, alice.ID, cfg, &tg.MessagesSendMessageRequest{
@@ -1219,15 +1222,17 @@ func TestCreateChannelRateLimitDisabled(t *testing.T) {
 func TestCreateChannelRateLimitWindowExpiry(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	alice, err := s.CreateUser(ctx, "+15551295201")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Very short window: 1 create per 500ms.
-	cfg := store.RateLimitConfig{Limit: 1, Window: 500 * time.Millisecond}
+	// Long window: only the explicit rewind below closes it. A window short
+	// enough to sleep through also closes on its own under host load, and the
+	// denial this test asserts on then never happens.
+	cfg := store.RateLimitConfig{Limit: 1, Window: time.Hour}
 
 	// Exhaust the limit.
 	_, err = api.CreateChannelForTestWithLimits(s, alice.ID, cfg, &tg.ChannelsCreateChannelRequest{
@@ -1245,8 +1250,10 @@ func TestCreateChannelRateLimitWindowExpiry(t *testing.T) {
 		t.Fatalf("expected FLOOD_WAIT, got %v", err)
 	}
 
-	// Wait for window to expire.
-	time.Sleep(600 * time.Millisecond)
+	// Age the window past its deadline.
+	if err := api.AgeRateLimitWindowForTest(dsn, alice.ID, "create_channel", cfg.Window+time.Minute); err != nil {
+		t.Fatalf("age window: %v", err)
+	}
 
 	// Should be allowed again.
 	_, err = api.CreateChannelForTestWithLimits(s, alice.ID, cfg, &tg.ChannelsCreateChannelRequest{
