@@ -229,10 +229,15 @@ Channels
   channel the way `update_state` + `message_events` are keyed by user. This is
   the second update stream the architecture now holds.
 - Admission is by invite hash alone; there is no join-by-channel-id path.
-  `channels.id` is dense BIGSERIAL and the peer `access_hash` placeholder was
-  `access_hash == id` at M7, so a join keyed on the id would let any account
+  At M7, `channels.id` was dense BIGSERIAL and the peer `access_hash` placeholder
+  was `access_hash == id`, so a join keyed on the id would let any account
   enumerate and join every channel on the server. The invite hash was the
-  secret; the channel id was never an input to the join path.
+  secret; the channel id was never an input to the join path. That rule is
+  unchanged: rows created before the MAIN-246 cutover remain dense, new ids are
+  sparse random draws from `randomChannelID`, and density is no longer the
+  premise — the per-viewer HMAC `access_hash` (see M8) is the guard.
+  `20260729000008_channels.sql` is hashed and cannot be amended; the corrected
+  rationale is in `20260819000026_channel_id_random.sql`.
 - Coarse `role` + `banned_until` rights model: 0 = member, 1 = admin,
   2 = creator. `ChatAdminRights` and `ChatBannedRights` flag sets are accepted
   and collapsed to a single bit. An admin may post in a broadcast channel; a
