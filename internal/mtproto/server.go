@@ -77,6 +77,14 @@ type Server struct {
 	globalCapLog logSampler
 	netCapLog    logSampler
 	ceilingLog   logSampler
+	// unboundKeys bounds what one auth key with nobody signed in on it may
+	// hold, which is what the pre-auth bounds stop counting and the per-user cap
+	// never starts. Written once before Serve and only read after, like proxyV2.
+	unboundKeys *unboundKeyLimiter
+	// Its own sampler, for the reason the three above have theirs: the refusals
+	// are driven by a peer reusing one key, and a flood against this bound must
+	// not spend the window that says which other bound is firing.
+	unboundKeyLog logSampler
 
 	// onStatusChange fires when a user's connection count transitions between
 	// zero and non-zero. Called after the registry has been updated, so a
@@ -130,6 +138,20 @@ func (s *Server) SetPreAuthLimits(l PreAuthLimits) error {
 	return nil
 }
 
+// SetMaxConnsPerUnboundKey replaces the bound on the concurrent connections one
+// auth key with no signed-in user may hold. Call it before Serve.
+//
+// Zero turns the bound off and negative is refused, for the reason
+// SetPreAuthLimits gives: the two say opposite things, and reading a typo as
+// "off" is the failure a bound cannot afford.
+func (s *Server) SetMaxConnsPerUnboundKey(n int) error {
+	if n < 0 {
+		return fmt.Errorf("max conns per unbound auth key is %d: must not be negative, and 0 disables the cap", n)
+	}
+	s.unboundKeys = newUnboundKeyLimiter(n)
+	return nil
+}
+
 // New creates a Server that answers on dcID using key for the handshake, keys to
 // persist auth keys, and handler for RPC requests.
 func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, log *slog.Logger) *Server {
@@ -150,6 +172,7 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 		writeTimeout:     defaultWriteTimeout,
 		handshakeTimeout: defaultHandshakeTimeout,
 		preAuth:          newPreAuthLimiter(DefaultPreAuthLimits()),
+		unboundKeys:      newUnboundKeyLimiter(DefaultMaxConnsPerUnboundKey),
 		log:              log,
 	}
 }
@@ -430,6 +453,13 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 	// The registry only holds live sockets, and a delivery already holding this
 	// conn in a snapshot writes nothing to it on the way out.
 	defer bind(0)
+	// Where the pre-auth slot ends, this begins: the connection is out from
+	// under the bounds on anonymous sockets the moment it proves a key, and
+	// under the per-user cap only once someone signs in on that key. The hold is
+	// what counts it in between, and it is given back whatever ends the
+	// connection.
+	hold := &unboundKeyHold{lim: s.unboundKeys}
+	defer hold.release()
 	for {
 		if err := s.read(ctx, tconn, b); err != nil {
 			return err
@@ -492,6 +522,48 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		// rather than anonymous holds.
 		if err := s.rpcHandle(ctx, conn, b, userID, clientAddr, slot); err != nil {
 			return err
+		}
+
+		// The frame decrypted, so this connection has proved the key rather than
+		// merely named it, and the population it now belongs to — connections
+		// under a key this server issued that nobody has signed in on — is
+		// bounded here. After the dispatch rather than before it, like the
+		// per-user cap below: the frame in hand is answered normally, and a
+		// socket past the bound closes on the way out, so a peer opening sockets
+		// in a loop is refused the new one instead of losing a working one.
+		//
+		// Re-read the binding after dispatch only for the one path it helps:
+		// an unbound session (userID == 0) that has not already proven signed-in
+		// (hold.signedIn). On every signed-in session's frames the second query
+		// is discarded — charge short-circuits on signedIn — so the gate drops
+		// the extra AuthKeyByID query for nearly all frames.
+		var chargeUser = userID
+		if userID == 0 && !hold.signedIn {
+			// rpcHandle can change the binding (auth.signIn binds the key to a
+			// user), and charging with the pre-dispatch value would close a
+			// session that just signed in.
+			var ok bool
+			var err error
+			_, chargeUser, ok, err = s.keys.Get(ctx, authKeyID)
+			if err != nil {
+				return errors.Join(errors.New("get auth key"), err)
+			}
+			if !ok {
+				// Key was revoked between dispatch and re-read; fall back to the
+				// pre-dispatch binding for the charge. The frame already decrypted
+				// under this key, so the connection is valid for this frame.
+				chargeUser = userID
+			}
+		}
+		if !hold.charge(authKeyID, chargeUser) {
+			// The key is not named: it identifies a client's session, no line
+			// elsewhere writes one, and what the operator needs from this line
+			// is which bound is firing and how hard.
+			if dropped, ok := s.unboundKeyLog.allow(time.Now(), preAuthLogInterval); ok {
+				s.log.Info("connection closed at the cap on one unbound auth key",
+					"cap", s.unboundKeys.max, "suppressed", dropped)
+			}
+			return nil
 		}
 
 		// Keep the conn in step with the key's current binding, which s.keys.Get

@@ -78,6 +78,11 @@ type Config struct {
 	// concurrently in the process, concurrently per client network, and for how
 	// long. Zero disables a bound, as it does for a rate limit.
 	PreAuth mtproto.PreAuthLimits
+	// MaxConnsPerUnboundKey bounds the concurrent connections one auth key with
+	// nobody signed in on it may hold. It picks up where PreAuth stops counting
+	// — at the first frame that decrypts under a server-issued key — and hands
+	// over to the per-user connection cap at sign-in. Zero disables it.
+	MaxConnsPerUnboundKey int
 }
 
 // ClientAddrTrust names the source a client address is taken from.
@@ -187,6 +192,8 @@ func Load(log *slog.Logger) (Config, error) {
 		MaxFileBytes:        100 << 20,
 		MaxUserStorageBytes: 2 << 30,
 		UploadPartTTL:       6 * time.Hour,
+
+		MaxConnsPerUnboundKey: mtproto.DefaultMaxConnsPerUnboundKey,
 	}
 	if v := os.Getenv("TG_DC_ID"); v != "" {
 		id, err := strconv.Atoi(v)
@@ -383,6 +390,16 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.PreAuth = preAuth
+	if v := os.Getenv("TG_MAX_CONNS_PER_UNBOUND_KEY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MAX_CONNS_PER_UNBOUND_KEY must be an integer")
+		}
+		if n < 0 {
+			return Config{}, errors.New("TG_MAX_CONNS_PER_UNBOUND_KEY must not be negative; 0 disables the cap")
+		}
+		cfg.MaxConnsPerUnboundKey = n
+	}
 	trust, err := clientAddrTrust(os.Getenv("TG_CLIENT_ADDR_TRUST"))
 	if err != nil {
 		return Config{}, err
