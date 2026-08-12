@@ -5,9 +5,9 @@ import "sync"
 // DefaultMaxConnsPerUnboundKey is the shipped bound on what one auth key with
 // no signed-in user may hold: 8 concurrent connections.
 //
-// It is the analogue, for keys nobody has signed in on, of maxUserConns, and it
+// It is the analogue, for keys nobody has signed in on, of MaxUserConns, and it
 // closes the gap between that cap and the pre-auth bounds. Those bounds end at
-// the first frame that decrypts under a key this server issued, and maxUserConns
+// the first frame that decrypts under a key this server issued, and MaxUserConns
 // counts only signed-in sessions, so a key that completed one exchange and never
 // signed in was counted by neither: one exchange, ever, bought a peer unlimited
 // concurrent connections from any number of addresses.
@@ -99,7 +99,7 @@ type unboundKeyHold struct {
 //
 // userID is the user the key resolves to, 0 when it has none, and a key that
 // has one takes the connection out from under this bound for good. What a
-// signed-in client may hold is maxUserConns' to decide, and this bound must
+// signed-in client may hold is MaxUserConns' to decide, and this bound must
 // never be able to refuse or close a session that has already signed in. That
 // is the same one-way transition the pre-auth bounds make, for the same reason,
 // and it holds through everything that comes after: a key unbound again by the
