@@ -260,6 +260,60 @@ func TestUnboundKeyCapZeroDisablesIt(t *testing.T) {
 	}
 }
 
+// TestUnboundKeyCapBindDuringDispatchAtFullCap proves the post-dispatch re-read
+// closes the same-frame-bind gap: a connection whose key binds during its own
+// candidate frame stays open and its unbound slot is released, even when the
+// key is already at cap. Without the re-read, charge would see the pre-dispatch
+// userID of 0 and close the connection that just signed in.
+func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	const maxHeld = 1
+	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
+	keys := newSignInStore()
+	seen := make(chan struct{}, 64)
+	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, _ *mtproto.Request) error {
+		// Bind the key during dispatch — the handler acts as auth.signIn.
+		keys.bind(7)
+		select {
+		case seen <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	serveKeysWithHandler(t, ctx, nl, keys, maxHeld, handler, seen)
+	addr := nl.Addr().String()
+
+	// The first connection takes the key's only slot while nobody has signed in.
+	raw1, conn1 := keyClient(t, ctx, addr, keys.key, 1)
+	wantRequests(t, seen, 1)
+
+	// The handler bound the key to user 7 during dispatch. The connection stays
+	// open (the re-read saw userID=7 and released the slot) rather than closed
+	// at the cap (which would happen if charge used the pre-dispatch userID=0).
+	if closedByServer(t, raw1, 2*time.Second) {
+		t.Fatal("connection whose key bound during dispatch was closed at the cap")
+	}
+
+	// The slot was released by the bind, so a second connection on the same key
+	// is now admitted — proving the first one's charge was cleared.
+	raw2, _ := keyClient(t, ctx, addr, keys.key, 2)
+	wantRequests(t, seen, 1)
+	if closedByServer(t, raw2, 2*time.Second) {
+		t.Fatal("second connection refused: the slot was not released by the bind")
+	}
+
+	// Both connections survive: the first one is signed-in (outside the cap),
+	// the second is unbound and holds the freed slot.
+	sendFrame(t, ctx, conn1, keys.key, 1, int64(2)<<32)
+	wantRequests(t, seen, 1)
+	if closedByServer(t, raw1, time.Second) {
+		t.Fatal("signed-in connection closed after bind")
+	}
+}
+
 // TestSetMaxConnsPerUnboundKeyRefusesANegativeCap covers the difference between
 // the two ways of writing "no bound", the same way the pre-auth bounds do: zero
 // is a decision and is honoured, negative is a typo or a unit mistake and is
@@ -367,6 +421,26 @@ func serveKeys(t *testing.T, ctx context.Context, ln net.Listener, keys mtproto.
 		}
 	})
 	return seen
+}
+
+// serveKeysWithHandler is serveKeys with a custom handler and external seen
+// channel, for tests that mutate the store during dispatch (e.g. binding the
+// key as auth.signIn does).
+func serveKeysWithHandler(t *testing.T, ctx context.Context, ln net.Listener, keys mtproto.AuthKeyStore, maxConns int, handler mtproto.Handler, seen chan struct{}) {
+	t.Helper()
+	srv := mtproto.New(exchange.PrivateKey{}, 2, keys, handler, nil)
+	if err := srv.SetMaxConnsPerUnboundKey(maxConns); err != nil {
+		t.Fatalf("set unbound-key cap: %v", err)
+	}
+	srvCtx, stop := context.WithCancel(ctx)
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(srvCtx, ln) }()
+	t.Cleanup(func() {
+		stop()
+		if err := <-served; err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	})
 }
 
 // keyClient opens a connection and uses a key the server already holds, which

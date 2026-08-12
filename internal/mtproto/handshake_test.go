@@ -120,8 +120,8 @@ func TestHandshakeFrameDropsRegistration(t *testing.T) {
 		}
 	}
 
-	if got := store.lookups(); got != 2 {
-		t.Fatalf("keys.Get called %d times, want 2: the handshake path does not re-validate the key (the two calls are the encrypted frame and its post-dispatch re-read), which is why the conn must be dropped rather than re-checked", got)
+	if got := store.lookups(); got != 1 {
+		t.Fatalf("keys.Get called %d times, want 1: the handshake path does not re-validate the key (the re-read is gated on userID==0, so a signed-in session only calls once), which is why the conn must be dropped rather than re-checked", got)
 	}
 	// Leaving the bucket is not enough on its own: a delivery holding the conn
 	// from an earlier snapshot must find it disowned too.
