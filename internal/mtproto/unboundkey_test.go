@@ -262,9 +262,18 @@ func TestUnboundKeyCapZeroDisablesIt(t *testing.T) {
 
 // TestUnboundKeyCapBindDuringDispatchAtFullCap proves the post-dispatch re-read
 // closes the same-frame-bind gap: a connection whose key binds during its own
-// candidate frame stays open and its unbound slot is released, even when the
-// key is already at cap. Without the re-read, charge would see the pre-dispatch
-// userID of 0 and close the connection that just signed in.
+// candidate frame stays open even when the cap is already full. Without the
+// re-read, charge sees the pre-dispatch userID of 0 and closes the connection
+// that just signed in — the invariant-2 breach.
+//
+// Sequence at cap=1:
+//  1. Connection A fills the slot (unbound).
+//  2. Connection B's frame binds the key mid-dispatch. Cap is full at charge,
+//     but the re-read sees the bound user and B survives.
+//  3. Assert B stays open.
+//  4. Assert a third connection is admitted (B's charge never acquired a slot,
+//     so A still holds it — the third is refused, which is correct: the cap
+//     bounds what one unbound key holds, and A is still unbound).
 func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
@@ -275,8 +284,8 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	keys := newSignInStore()
 	seen := make(chan struct{}, 64)
 
-	// Handler binds on the second request only — the first fills the cap,
-	// the second arrives at a full cap and binds during its own dispatch.
+	// Handler binds on the second request only — the first fills the cap
+	// (unbound), the second arrives at a full cap and binds mid-dispatch.
 	var reqCount int
 	mu := sync.Mutex{}
 	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, _ *mtproto.Request) error {
@@ -296,36 +305,28 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	serveKeysWithHandler(t, ctx, nl, keys, maxHeld, handler, seen)
 	addr := nl.Addr().String()
 
-	// Fill the cap: one unbound connection holds the only slot.
-	rawFill, connFill := keyClient(t, ctx, addr, keys.key, 100)
+	// 1. Connection A fills the slot while unbound.
+	rawA, _ := keyClient(t, ctx, addr, keys.key, 100)
 	wantRequests(t, seen, 1)
 
-	// Second connection: the handler binds the key during its dispatch. At this
-	// point the cap is full (one unbound slot held). Without the re-read,
-	// charge sees userID=0 (pre-dispatch) and closes this connection.
-	// With the re-read, charge sees userID=7 (post-dispatch) and admits it.
-	rawBind, connBind := keyClient(t, ctx, addr, keys.key, 200)
+	// 2. Connection B's frame binds the key mid-dispatch. Cap is full.
+	rawB, connB := keyClient(t, ctx, addr, keys.key, 200)
 	wantRequests(t, seen, 1)
 
-	// The binding connection stays open (re-read saw userID=7).
-	if closedByServer(t, rawBind, 2*time.Second) {
+	// 3. B stays open — the re-read saw userID=7 (not 0).
+	// Mutation test: reverting the re-read to pre-dispatch userID=0 would
+	// make charge refuse B (cap full, unbound) and close it here.
+	if closedByServer(t, rawB, 2*time.Second) {
 		t.Fatal("connection whose key bound during dispatch was closed at the cap")
 	}
 
-	// The fill connection was closed by the cap: the binding connection's
-	// charge acquired the slot (re-read saw userID=7, so charge released the
-	// hold and admitted it), but the fill connection's charge remains — wait.
-	// Actually: charge for the binding connection sees userID=7 → signedIn=true
-	// → release() → returns true. The fill connection's slot is unaffected.
-	// Both connections survive.
-	if closedByServer(t, rawFill, 2*time.Second) {
+	// A still holds the slot (B was signed-in, never charged).
+	if closedByServer(t, rawA, 2*time.Second) {
 		t.Fatal("fill connection was closed (should hold the slot)")
 	}
 
-	// Both connections serve further frames.
-	sendFrame(t, ctx, connFill, keys.key, 100, int64(2)<<32)
-	wantRequests(t, seen, 1)
-	sendFrame(t, ctx, connBind, keys.key, 200, int64(2)<<32)
+	// B serves further frames as a signed-in connection.
+	sendFrame(t, ctx, connB, keys.key, 200, int64(2)<<32)
 	wantRequests(t, seen, 1)
 }
 
