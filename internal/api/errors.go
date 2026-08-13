@@ -166,6 +166,9 @@ var (
 	// errUsernameLookupFloodWait rejects a contacts.resolveUsername that would
 	// take the caller past their per-account username lookup quota.
 	errUsernameLookupFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
+	// errUsernameNotModified rejects a username change for a login_mode='username'
+	// account — the handle is the credential, not changeable.
+	errUsernameNotModified = rpcErr(400, "USERNAME_NOT_MODIFIED")
 	// errSearchQueryEmpty rejects a search RPC with an empty query string.
 	errSearchQueryEmpty = rpcErr(400, "SEARCH_QUERY_EMPTY")
 	// errSearchQueryTooLong rejects a contacts.search query over 256 bytes.
