@@ -204,7 +204,7 @@ func TestSignInFailRateLimitWindowExpiry(t *testing.T) {
 	}
 
 	// After window expiry, a wrong guess is allowed again (PHONE_CODE_INVALID,
-	// not FLOOD_WAIT).
+	// not FLOOD_WAIT) — proving the new window is charged.
 	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, cfg, &tg.AuthSignInRequest{
 		PhoneNumber:   phone,
 		PhoneCodeHash: hash,
@@ -212,6 +212,16 @@ func TestSignInFailRateLimitWindowExpiry(t *testing.T) {
 	})
 	if !isPhoneCodeInvalid(err) {
 		t.Fatalf("after window expiry: expected PHONE_CODE_INVALID (access restored), got %v", err)
+	}
+
+	// The new window is now exhausted — next attempt should be denied again.
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, cfg, &tg.AuthSignInRequest{
+		PhoneNumber:   phone,
+		PhoneCodeHash: hash,
+		PhoneCode:     "00000",
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("after recovery: expected FLOOD_WAIT (new window exhausted), got %v", err)
 	}
 }
 
@@ -280,14 +290,14 @@ func TestSignInFailCorrectCodeDifferentAddress(t *testing.T) {
 		t.Fatalf("attacker wrong guess: expected PHONE_CODE_INVALID, got %v", err)
 	}
 
-	// Attacker is now blocked.
+	// Attacker is now blocked — even with the correct code.
 	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, attackerAddr, cfg, &tg.AuthSignInRequest{
 		PhoneNumber:   phone,
 		PhoneCodeHash: hash,
-		PhoneCode:     "00000",
+		PhoneCode:     code,
 	})
 	if !isFloodWait(err) {
-		t.Fatalf("attacker second guess: expected FLOOD_WAIT, got %v", err)
+		t.Fatalf("attacker with correct code: expected FLOOD_WAIT, got %v", err)
 	}
 
 	// Legitimate user from a different IP with the correct code succeeds.
@@ -338,5 +348,12 @@ func TestSignInFailIPAndSendCodeIndependent(t *testing.T) {
 	})
 	if !isFloodWait(err) {
 		t.Fatalf("second wrong guess: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// sendCode for a different phone should still work — the signIn-fail limit
+	// does not block it. A separate phone avoids the IssueCode resend cooldown.
+	_, err = api.SendCodeForTest(s, addr, store.SendCodeIPLimits{}, "+15551296502")
+	if isFloodWait(err) {
+		t.Fatalf("sendCode after signIn-fail exhaustion: unexpected FLOOD_WAIT, got %v", err)
 	}
 }

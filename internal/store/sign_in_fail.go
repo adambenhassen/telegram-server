@@ -13,26 +13,15 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
-const (
-	// signInFailLockClass namespaces this limiter's advisory locks. Distinct from
-	// sendCodeIPLockClass so concurrent sendCode and failed-signIn checks from
-	// the same IP do not unnecessarily serialize against each other.
-	signInFailLockClass = 0x73696746 // "sigF"
-)
-
-// CheckAndChargeSignInFailIP checks and charges the per-IP signIn-failure
-// counter for a failed auth.signIn attempt arriving from addr.
+// CheckSignInFailIP reads the per-IP signIn-failure counter for addr and
+// returns a RateLimitResult when the budget is exhausted. It writes nothing
+// and is called before VerifyCode so that even correct codes are blocked when
+// the IP has burned its failure budget.
 //
-// It returns nil when the attempt is allowed (failure counter not exhausted),
-// and a RateLimitResult carrying the remaining wait when the IP has exhausted
-// its failure budget. A denied attempt has written nothing: the counter is
-// charged inside a transaction, so a denial rolls back the token.
-//
-// The subject is the network the connection came from (IPv4 /32 or IPv6 /64),
-// not the identifier being targeted. This ensures only the attacker's own
-// network budget is consumed — a per-identifier key would let an attacker
-// spend the victim's failure budget.
-func (s *Store) CheckAndChargeSignInFailIP(ctx context.Context, addr netip.Addr, cfg RateLimitConfig) (*RateLimitResult, error) {
+// Returns nil (no error, no result) when the budget is not exhausted or the
+// config is disabled. Returns ErrNoClientAddr when the connection carries no
+// address to attribute.
+func (s *Store) CheckSignInFailIP(ctx context.Context, addr netip.Addr, cfg RateLimitConfig) (*RateLimitResult, error) {
 	if !cfg.enabled() {
 		return nil, nil //nolint:nilnil // disabled config is not an error
 	}
@@ -41,41 +30,39 @@ func (s *Store) CheckAndChargeSignInFailIP(ctx context.Context, addr netip.Addr,
 		return nil, ErrNoClientAddr
 	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
-
-	if _, err := tx.Exec(ctx,
-		"SELECT pg_advisory_xact_lock($1, hashtext($2))",
-		signInFailLockClass, key.String(),
-	); err != nil {
-		return nil, fmt.Errorf("advisory lock: %w", err)
-	}
-	qtx := s.q.WithTx(tx)
-
-	_, err = qtx.TryConsumeSignInFailCall(ctx, db.TryConsumeSignInFailCallParams{
-		IpKey:      key,
-		Column2:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
-		TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
-	})
-	if err == nil {
-		// Allowed — token was consumed.
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("commit: %w", err)
+	row, err := s.q.CheckSignInFailBudget(ctx, key)
+	switch {
+	case err == nil:
+		// Row exists — check if at or over the limit.
+		if int(row.TokenCount) >= cfg.Limit && row.ExpiresAt.Time.After(time.Now()) {
+			return &RateLimitResult{Wait: waitUntil(time.Now(), row.ExpiresAt.Time)}, nil
 		}
-		return nil, nil //nolint:nilnil // allowed is not an error
+		return nil, nil //nolint:nilnil // under limit or expired
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, nil //nolint:nilnil // no row = no failures yet
+	default:
+		return nil, fmt.Errorf("check sign in fail budget: %w", err)
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("consume sign in fail call: %w", err)
+}
+
+// ChargeSignInFailIP adds one token to the per-IP signIn-failure counter.
+// Called only after VerifyCode returns an error. Upserts the row if it does
+// not exist. Not a check — does not reject based on limit.
+//
+// No-op when the config is disabled.
+func (s *Store) ChargeSignInFailIP(ctx context.Context, addr netip.Addr, cfg RateLimitConfig) error {
+	if !cfg.enabled() {
+		return nil
 	}
-	// Denied — read expires_at while the advisory lock is still held.
-	expiresAt, err := qtx.GetSignInFailCallExpiry(ctx, key)
-	if err != nil {
-		return nil, fmt.Errorf("sign in fail call expiry: %w", err)
+	key, ok := IPBucketKey(addr)
+	if !ok {
+		return ErrNoClientAddr
 	}
-	return &RateLimitResult{Wait: waitUntil(time.Now(), expiresAt.Time)}, nil
+
+	return s.q.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{
+		IpKey:   key,
+		Column2: pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
+	})
 }
 
 // SweepExpiredSignInFailCalls deletes per-IP signIn-failure rows past their

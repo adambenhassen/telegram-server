@@ -12,6 +12,57 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const chargeSignInFailCall = `-- name: ChargeSignInFailCall :exec
+INSERT INTO sign_in_fail_calls (ip_key, token_count, window_start, expires_at)
+VALUES ($1, 1, now(), now() + $2::INTERVAL)
+ON CONFLICT (ip_key) DO UPDATE SET
+    token_count = CASE
+        WHEN sign_in_fail_calls.expires_at <= now() THEN 1
+        ELSE sign_in_fail_calls.token_count + 1
+    END,
+    window_start = CASE
+        WHEN sign_in_fail_calls.expires_at <= now() THEN now()
+        ELSE sign_in_fail_calls.window_start
+    END,
+    expires_at = CASE
+        WHEN sign_in_fail_calls.expires_at <= now() THEN now() + $2::INTERVAL
+        ELSE sign_in_fail_calls.expires_at
+    END
+`
+
+type ChargeSignInFailCallParams struct {
+	IpKey   netip.Prefix
+	Column2 pgtype.Interval
+}
+
+// Charge-only: add one token to the counter. Called only after a failed
+// VerifyCode. Upserts the row if it doesn't exist.
+func (q *Queries) ChargeSignInFailCall(ctx context.Context, arg ChargeSignInFailCallParams) error {
+	_, err := q.db.Exec(ctx, chargeSignInFailCall, arg.IpKey, arg.Column2)
+	return err
+}
+
+const checkSignInFailBudget = `-- name: CheckSignInFailBudget :one
+SELECT token_count, expires_at
+FROM sign_in_fail_calls
+WHERE ip_key = $1
+`
+
+type CheckSignInFailBudgetRow struct {
+	TokenCount int32
+	ExpiresAt  pgtype.Timestamptz
+}
+
+// Read-only check: returns the current token_count and expires_at for an IP
+// key. Used before VerifyCode to gate the attempt without writing anything.
+// Returns pgx.ErrNoRows when no row exists (budget not exhausted).
+func (q *Queries) CheckSignInFailBudget(ctx context.Context, ipKey netip.Prefix) (CheckSignInFailBudgetRow, error) {
+	row := q.db.QueryRow(ctx, checkSignInFailBudget, ipKey)
+	var i CheckSignInFailBudgetRow
+	err := row.Scan(&i.TokenCount, &i.ExpiresAt)
+	return i, err
+}
+
 const getSignInFailCallExpiry = `-- name: GetSignInFailCallExpiry :one
 SELECT expires_at
 FROM sign_in_fail_calls

@@ -168,20 +168,29 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
+
+	// Check the per-IP failure budget before VerifyCode: if the network has
+	// already burned its quota, refuse without reading or validating anything.
+	if err := h.checkSignInFailBudget(r); err != nil {
+		return nil, err
+	}
+
 	code, _ := req.GetPhoneCode()
 	if err := h.store.VerifyCode(r.Ctx, req.PhoneNumber, req.PhoneCodeHash, code); err != nil {
-		if rpc := verifyToRPC(err); rpc != errInternal {
+		rpc := verifyToRPC(err)
+		if rpc != errInternal {
 			// A failed verification charges the per-IP failure counter so an
 			// attacker cannot use multiple source addresses to get multiple
 			// budgets of guesses against the same identifier.
-			if rateErr := h.checkSignInFailIP(r); rateErr != nil {
-				return nil, rateErr
+			if chargeErr := h.chargeSignInFailIP(r); chargeErr != nil {
+				h.log.Error("sign in fail: charge counter", "err", chargeErr)
 			}
 			return nil, rpc
 		}
 		h.log.Error("verify code", "err", err)
 		return nil, errInternal
 	}
+
 	user, err := h.store.CreateUser(r.Ctx, req.PhoneNumber)
 	if err != nil {
 		h.log.Error("create user", "err", err)
@@ -248,25 +257,29 @@ func (h *handlers) handleLogOut(r *mtproto.Request) (bin.Encoder, func(), error)
 	}, nil
 }
 
-// checkSignInFailIP charges the per-IP failure counter for a failed
-// auth.signIn attempt. It returns nil when the IP still has budget,
-// or a FLOOD_WAIT error when exhausted.
-//
-// Only the requesting network's budget is consumed — keying on IP prevents an
-// attacker from spending a victim's failure counter against another address.
-func (h *handlers) checkSignInFailIP(r *mtproto.Request) error {
-	res, err := h.store.CheckAndChargeSignInFailIP(r.Ctx, r.ClientAddr, h.rateLimitSignInFailIP)
+// checkSignInFailBudget reads the per-IP failure counter and returns a
+// FLOOD_WAIT error when the IP has exhausted its budget. Called before
+// VerifyCode so that even correct codes are blocked when the budget is gone.
+// Writes nothing.
+func (h *handlers) checkSignInFailBudget(r *mtproto.Request) error {
+	res, err := h.store.CheckSignInFailIP(r.Ctx, r.ClientAddr, h.rateLimitSignInFailIP)
 	if err != nil {
 		if errors.Is(err, store.ErrNoClientAddr) {
-			// No address to attribute to: refuse rather than wave through.
 			h.log.Info("sign in: connection carries no client address")
 			return FloodWaitError(1)
 		}
-		h.log.Error("sign in fail: ip rate limit", "err", err)
+		h.log.Error("sign in fail: check budget", "err", err)
 		return errInternal
 	}
 	if res != nil {
 		return FloodWaitError(int(res.Wait / time.Second))
 	}
 	return nil
+}
+
+// chargeSignInFailIP adds one token to the per-IP failure counter after a
+// failed VerifyCode. Errors are logged but not surfaced — the caller already
+// has a verified error to return.
+func (h *handlers) chargeSignInFailIP(r *mtproto.Request) error {
+	return h.store.ChargeSignInFailIP(r.Ctx, r.ClientAddr, h.rateLimitSignInFailIP)
 }
