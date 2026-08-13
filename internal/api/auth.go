@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -13,13 +14,20 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
-var phoneRE = regexp.MustCompile(`^\+?[0-9]{5,15}$`)
+var (
+	phoneRE    = regexp.MustCompile(`^\+?[0-9]{5,15}$`)
+	usernameRE = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{4,31}$`)
+)
 
 func validatePhone(phone string) error {
 	if !phoneRE.MatchString(phone) {
 		return errPhoneInvalid
 	}
 	return nil
+}
+
+func validateUsername(username string) bool {
+	return usernameRE.MatchString(username)
 }
 
 func newSentCode(hash string) *tg.AuthSentCode {
@@ -51,24 +59,47 @@ func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
-	if err := validatePhone(req.PhoneNumber); err != nil {
+
+	// Classify the input: phone, username, or invalid.
+	input := req.PhoneNumber
+	isUsername := false
+	switch {
+	case validatePhone(input) == nil:
+		// Phone path.
+	case validateUsername(input):
+		// Username path — normalise to lowercase.
+		input = strings.ToLower(input)
+		isUsername = true
+	default:
+		return nil, errPhoneInvalid
+	}
+
+	// The per-IP limits run before any identifier-dependent work: nothing is
+	// read or written about the account, so a denial cannot vary with whether
+	// the identifier is registered or already holds a live code.
+	if err := h.checkSendCodeIP(r, input); err != nil {
 		return nil, err
 	}
-	// The per-IP limits run before the phone is touched at all: nothing is read
-	// or written about the account, so a denial cannot vary with whether the
-	// number is registered or already holds a live code.
-	if err := h.checkSendCodeIP(r, req.PhoneNumber); err != nil {
-		return nil, err
-	}
-	hash, code, err := h.store.IssueCode(r.Ctx, req.PhoneNumber)
-	if err != nil {
-		if errors.Is(err, store.ErrResendTooSoon) {
-			return nil, errFloodWait
+
+	var hash, code string
+	var err error
+	if isUsername {
+		hash, code, err = h.store.IssueCodeForUsername(r.Ctx, input)
+	} else {
+		hash, code, err = h.store.IssueCode(r.Ctx, input)
+		if err != nil {
+			if errors.Is(err, store.ErrResendTooSoon) {
+				return nil, errFloodWait
+			}
+			h.log.Error("issue code", "err", err)
+			return nil, errInternal
 		}
+	}
+	if err != nil {
 		h.log.Error("issue code", "err", err)
 		return nil, errInternal
 	}
-	h.logIssuedCode(req.PhoneNumber, code)
+	h.logIssuedCode(input, code)
 	return newSentCode(hash), nil
 }
 
