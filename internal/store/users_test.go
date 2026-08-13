@@ -443,7 +443,7 @@ func TestCreateUsernameUserReturnsUsernameMode(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 
-	u, err := s.CreateUsernameUser(ctx, "Alice", "Smith")
+	u, err := s.CreateUsernameUser(ctx, "alice1", "Alice", "Smith")
 	if err != nil {
 		t.Fatalf("create username user: %v", err)
 	}
@@ -477,11 +477,11 @@ func TestCreateUsernameUserNoPhoneConflict(t *testing.T) {
 	ctx := context.Background()
 
 	// Create two username-mode users — neither has a phone, so no conflict.
-	u1, err := s.CreateUsernameUser(ctx, "Alice", "Smith")
+	u1, err := s.CreateUsernameUser(ctx, "alice2", "Alice", "Smith")
 	if err != nil {
 		t.Fatalf("create first: %v", err)
 	}
-	u2, err := s.CreateUsernameUser(ctx, "Bob", "Jones")
+	u2, err := s.CreateUsernameUser(ctx, "bob2", "Bob", "Jones")
 	if err != nil {
 		t.Fatalf("create second: %v", err)
 	}
@@ -495,7 +495,7 @@ func TestCreateUsernameUserProvisionsUpdateState(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 
-	u, err := s.CreateUsernameUser(ctx, "Carol", "White")
+	u, err := s.CreateUsernameUser(ctx, "carol2", "Carol", "White")
 	if err != nil {
 		t.Fatalf("create username user: %v", err)
 	}

@@ -78,8 +78,15 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 // CreateUsernameUser inserts a username-mode user with no phone. It provisions
 // update_state in the same transaction. Returns the new user. Does NOT claim
 // the username in the usernames table — the calling handler does that atomically
-// with the auth key binding.
-func (s *Store) CreateUsernameUser(ctx context.Context, firstName, lastName string) (User, error) {
+// with the auth key binding. The handle parameter is accepted for validation
+// but not stored; the usernames table claim is the handler's responsibility.
+func (s *Store) CreateUsernameUser(ctx context.Context, handle, firstName, lastName string) (User, error) {
+	// Validate the handle is present — the handler must not call this without
+	// a normalized handle, and the store is the last line of defense before
+	// creating an account with no way to be resolved.
+	if handle == "" {
+		return User{}, errors.New("CreateUsernameUser: handle required")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return User{}, fmt.Errorf("begin: %w", err)

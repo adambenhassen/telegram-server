@@ -215,7 +215,7 @@ func TestAuthKeyProvisionalUsernameModeNoVerifier(t *testing.T) {
 	ctx := context.Background()
 	const id = int64(0x4003)
 
-	u, err := s.CreateUsernameUser(ctx, "Alice", "Smith")
+	u, err := s.CreateUsernameUser(ctx, "alice1", "Alice", "Smith")
 	if err != nil {
 		t.Fatalf("create username user: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestAuthKeyProvisionalClearedAfterVerifier(t *testing.T) {
 	ctx := context.Background()
 	const id = int64(0x4004)
 
-	u, err := s.CreateUsernameUser(ctx, "Bob", "Jones")
+	u, err := s.CreateUsernameUser(ctx, "bob1", "Bob", "Jones")
 	if err != nil {
 		t.Fatalf("create username user: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestAuthKeyProvisionalPendingUser(t *testing.T) {
 	ctx := context.Background()
 	const id = int64(0x4005)
 
-	u, err := s.CreateUsernameUser(ctx, "Carol", "White")
+	u, err := s.CreateUsernameUser(ctx, "carol1", "Carol", "White")
 	if err != nil {
 		t.Fatalf("create username user: %v", err)
 	}
