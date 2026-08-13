@@ -163,3 +163,146 @@ func TestDeleteAuthKey(t *testing.T) {
 		t.Error("key still present after delete")
 	}
 }
+
+// --- Provisional state tests ---
+
+func TestAuthKeyProvisionalUnbound(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const id = int64(0x4001)
+
+	if err := s.SaveAuthKey(ctx, id, []byte("k")); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, ok, err := s.AuthKeyByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if got.Provisional {
+		t.Error("unbound key should not be provisional")
+	}
+}
+
+func TestAuthKeyProvisionalPhoneMode(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const id = int64(0x4002)
+
+	u, err := s.CreateUser(ctx, "+15551270001")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := s.SaveAuthKey(ctx, id, []byte("k")); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := s.BindAuthKeyUser(ctx, id, u.ID); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	got, ok, err := s.AuthKeyByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if got.Provisional {
+		t.Error("phone-mode key should not be provisional")
+	}
+}
+
+func TestAuthKeyProvisionalUsernameModeNoVerifier(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const id = int64(0x4003)
+
+	u, err := s.CreateUsernameUser(ctx, "Alice", "Smith")
+	if err != nil {
+		t.Fatalf("create username user: %v", err)
+	}
+	if err := s.SaveAuthKey(ctx, id, []byte("k")); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := s.BindAuthKeyUser(ctx, id, u.ID); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	got, ok, err := s.AuthKeyByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if !got.Provisional {
+		t.Error("username-mode key with no verifier should be provisional")
+	}
+}
+
+func TestAuthKeyProvisionalClearedAfterVerifier(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const id = int64(0x4004)
+
+	u, err := s.CreateUsernameUser(ctx, "Bob", "Jones")
+	if err != nil {
+		t.Fatalf("create username user: %v", err)
+	}
+	if err := s.SaveAuthKey(ctx, id, []byte("k")); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := s.BindAuthKeyUser(ctx, id, u.ID); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	// Before verifier: provisional.
+	got, ok, err := s.AuthKeyByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if !got.Provisional {
+		t.Error("should be provisional before verifier")
+	}
+
+	// Store a verifier (simulates checkPassword completing SRP proof).
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   u.ID,
+		Salt1:    []byte("salt1"),
+		Salt2:    []byte("salt2"),
+		Verifier: []byte{0x01, 0x02},
+	}); err != nil {
+		t.Fatalf("upsert password: %v", err)
+	}
+
+	// After verifier: no longer provisional.
+	got, ok, err = s.AuthKeyByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if got.Provisional {
+		t.Error("should not be provisional after verifier")
+	}
+}
+
+func TestAuthKeyProvisionalPendingUser(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const id = int64(0x4005)
+
+	u, err := s.CreateUsernameUser(ctx, "Carol", "White")
+	if err != nil {
+		t.Fatalf("create username user: %v", err)
+	}
+	if err := s.SaveAuthKey(ctx, id, []byte("k")); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	// Set pending (user_id cleared, pending_user_id set).
+	if err := s.SetPendingUser(ctx, id, u.ID); err != nil {
+		t.Fatalf("set pending: %v", err)
+	}
+	got, ok, err := s.AuthKeyByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	// Pending key has user_id = NULL, so Provisional must be false
+	// (unbound keys are not provisional).
+	if got.Provisional {
+		t.Error("pending key should not be provisional (user_id is NULL)")
+	}
+}

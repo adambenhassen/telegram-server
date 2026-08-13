@@ -61,7 +61,8 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
-	u, err := qtx.CreateUser(ctx, NormalizePhone(phone))
+	normalized := NormalizePhone(phone)
+	u, err := qtx.CreateUser(ctx, &normalized)
 	if err != nil {
 		return User{}, fmt.Errorf("create user: %w", err)
 	}
@@ -72,6 +73,34 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 		return User{}, fmt.Errorf("commit: %w", err)
 	}
 	return UserFromDB(db.UserByIDRow(u)), nil
+}
+
+// CreateUsernameUser inserts a username-mode user with no phone. It provisions
+// update_state in the same transaction. Returns the new user. Does NOT claim
+// the username in the usernames table — the calling handler does that atomically
+// with the auth key binding.
+func (s *Store) CreateUsernameUser(ctx context.Context, firstName, lastName string) (User, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return User{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	u, err := qtx.CreateUsernameUser(ctx, db.CreateUsernameUserParams{
+		FirstName: firstName,
+		LastName:  lastName,
+	})
+	if err != nil {
+		return User{}, fmt.Errorf("create username user: %w", err)
+	}
+	if err := qtx.EnsureUpdateState(ctx, u.ID); err != nil {
+		return User{}, fmt.Errorf("ensure update state: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return User{}, fmt.Errorf("commit: %w", err)
+	}
+	return UserFromCreateUsernameUser(u), nil
 }
 
 // UserByID returns the user for id, ok=false when absent.
@@ -88,7 +117,8 @@ func (s *Store) UserByID(ctx context.Context, id int64) (User, bool, error) {
 
 // UserByPhone returns the user for phone, ok=false when absent.
 func (s *Store) UserByPhone(ctx context.Context, phone string) (User, bool, error) {
-	u, err := s.q.UserByPhone(ctx, NormalizePhone(phone))
+	normalized := NormalizePhone(phone)
+	u, err := s.q.UserByPhone(ctx, &normalized)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return User{}, false, nil
@@ -112,14 +142,31 @@ func UserFromDB(u db.UserByIDRow) User {
 		t := u.LastSeenAt.Time
 		lastSeen = &t
 	}
+	var phone string
+	if u.Phone != nil {
+		phone = *u.Phone
+	}
 	return User{
 		ID:         u.ID,
-		Phone:      u.Phone,
+		Phone:      phone,
 		FirstName:  u.FirstName,
 		LastName:   u.LastName,
 		IsOnline:   u.IsOnline,
 		LastSeenAt: lastSeen,
 		Username:   u.Username,
+	}
+}
+
+// UserFromCreateUsernameUser converts the CreateUsernameUserRow (which does not
+// join usernames) to the store's User type. Phone is empty, Username is nil.
+func UserFromCreateUsernameUser(u db.CreateUsernameUserRow) User {
+	return User{
+		ID:         u.ID,
+		Phone:      "",
+		FirstName:  u.FirstName,
+		LastName:   u.LastName,
+		IsOnline:   u.IsOnline,
+		LastSeenAt: nil,
 	}
 }
 

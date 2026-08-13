@@ -22,8 +22,12 @@ type AuthKey struct {
 	// account; it is 0 unless a password challenge is outstanding and never
 	// grants access on its own.
 	PendingUserID int64
-	CreatedAt     time.Time
-	LastSeenAt    time.Time
+	// Provisional is true when the bound user is username-mode and has not
+	// yet completed sign-in (no verifier stored). It is derived from the
+	// login_mode column and the absence of a user_passwords row, never stored.
+	Provisional bool
+	CreatedAt   time.Time
+	LastSeenAt  time.Time
 }
 
 // SaveAuthKey stores value under id, idempotently. The key value is encrypted at
@@ -41,15 +45,17 @@ func (s *Store) SaveAuthKey(ctx context.Context, id int64, value []byte) error {
 }
 
 // AuthKeyByID returns the auth key for id, ok=false when absent.
+// The Provisional field is derived: true when the bound user has
+// login_mode='username' and no user_passwords row.
 func (s *Store) AuthKeyByID(ctx context.Context, id int64) (AuthKey, bool, error) {
-	k, err := s.q.AuthKeyByID(ctx, id)
+	row, err := s.q.AuthKeyByID(ctx, id)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return AuthKey{}, false, nil
 	case err != nil:
 		return AuthKey{}, false, fmt.Errorf("auth key by id: %w", err)
 	}
-	key, err := s.authKeyFromDB(k)
+	key, err := s.authKeyFromDB(row)
 	if err != nil {
 		return AuthKey{}, false, err
 	}
@@ -123,7 +129,8 @@ func (s *Store) DeleteAuthKey(ctx context.Context, id int64) error {
 	return nil
 }
 
-// AuthKeysByUser returns every auth key bound to userID.
+// AuthKeysByUser returns every auth key bound to userID. The Provisional field
+// is not populated (the query does not join users/passwords).
 func (s *Store) AuthKeysByUser(ctx context.Context, userID int64) ([]AuthKey, error) {
 	rows, err := s.q.AuthKeysByUser(ctx, &userID)
 	if err != nil {
@@ -131,7 +138,7 @@ func (s *Store) AuthKeysByUser(ctx context.Context, userID int64) ([]AuthKey, er
 	}
 	keys := make([]AuthKey, len(rows))
 	for i, r := range rows {
-		key, err := s.authKeyFromDB(r)
+		key, err := s.authKeyFromDBBasic(r)
 		if err != nil {
 			return nil, err
 		}
@@ -140,10 +147,11 @@ func (s *Store) AuthKeysByUser(ctx context.Context, userID int64) ([]AuthKey, er
 	return keys, nil
 }
 
-// authKeyFromDB maps a generated row to the domain type, decrypting the stored
-// key value and collapsing a NULL user_id to UserID 0. A decrypt failure (wrong
-// master key or corrupt/tampered row) is returned, never silently swallowed.
-func (s *Store) authKeyFromDB(k db.AuthKey) (AuthKey, error) {
+// authKeyFromDBBasic maps the basic db.AuthKey struct (used by AuthKeysByUser)
+// to the domain type, decrypting the stored key value and collapsing NULL
+// user_id to UserID 0. Provisional is always false — the query does not join
+// users/passwords.
+func (s *Store) authKeyFromDBBasic(k db.AuthKey) (AuthKey, error) {
 	value, err := s.cipher.Open(k.KeyValue)
 	if err != nil {
 		return AuthKey{}, fmt.Errorf("decrypt auth key %d: %w", k.ID, err)
@@ -161,6 +169,42 @@ func (s *Store) authKeyFromDB(k db.AuthKey) (AuthKey, error) {
 		Value:         value,
 		UserID:        userID,
 		PendingUserID: pendingUserID,
+		CreatedAt:     k.CreatedAt.Time,
+		LastSeenAt:    k.LastSeenAt.Time,
+	}, nil
+}
+
+// authKeyFromDB maps an AuthKeyByIDRow to the domain type, decrypting the stored
+// key value and collapsing a NULL user_id to UserID 0. A decrypt failure (wrong
+// master key or corrupt/tampered row) is returned, never silently swallowed.
+// Provisional is derived: true when the bound user has login_mode='username'
+// and no user_passwords row (HasPassword is false). Unbound keys (user_id NULL)
+// are always non-provisional.
+func (s *Store) authKeyFromDB(k db.AuthKeyByIDRow) (AuthKey, error) {
+	value, err := s.cipher.Open(k.KeyValue)
+	if err != nil {
+		return AuthKey{}, fmt.Errorf("decrypt auth key %d: %w", k.ID, err)
+	}
+	var userID int64
+	if k.UserID != nil {
+		userID = *k.UserID
+	}
+	var pendingUserID int64
+	if k.PendingUserID != nil {
+		pendingUserID = *k.PendingUserID
+	}
+	provisional := false
+	if k.UserID != nil && k.LoginMode != nil && *k.LoginMode == "username" {
+		if hasPw, ok := k.HasPassword.(bool); ok && !hasPw {
+			provisional = true
+		}
+	}
+	return AuthKey{
+		ID:            k.ID,
+		Value:         value,
+		UserID:        userID,
+		PendingUserID: pendingUserID,
+		Provisional:   provisional,
 		CreatedAt:     k.CreatedAt.Time,
 		LastSeenAt:    k.LastSeenAt.Time,
 	}, nil

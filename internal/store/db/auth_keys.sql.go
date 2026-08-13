@@ -7,15 +7,34 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const authKeyByID = `-- name: AuthKeyByID :one
-SELECT id, key_value, user_id, created_at, last_seen_at, pending_user_id FROM auth_keys WHERE id = $1
+SELECT ak.id, ak.key_value, ak.user_id, ak.created_at, ak.last_seen_at, ak.pending_user_id,
+       u.login_mode,
+       up.user_id IS NOT NULL AS has_password
+FROM auth_keys ak
+LEFT JOIN users u ON u.id = ak.user_id
+LEFT JOIN user_passwords up ON up.user_id = ak.user_id
+WHERE ak.id = $1
 `
 
-func (q *Queries) AuthKeyByID(ctx context.Context, id int64) (AuthKey, error) {
+type AuthKeyByIDRow struct {
+	ID            int64
+	KeyValue      []byte
+	UserID        *int64
+	CreatedAt     pgtype.Timestamptz
+	LastSeenAt    pgtype.Timestamptz
+	PendingUserID *int64
+	LoginMode     *string
+	HasPassword   interface{}
+}
+
+func (q *Queries) AuthKeyByID(ctx context.Context, id int64) (AuthKeyByIDRow, error) {
 	row := q.db.QueryRow(ctx, authKeyByID, id)
-	var i AuthKey
+	var i AuthKeyByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.KeyValue,
@@ -23,6 +42,8 @@ func (q *Queries) AuthKeyByID(ctx context.Context, id int64) (AuthKey, error) {
 		&i.CreatedAt,
 		&i.LastSeenAt,
 		&i.PendingUserID,
+		&i.LoginMode,
+		&i.HasPassword,
 	)
 	return i, err
 }
