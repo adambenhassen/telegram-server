@@ -31,10 +31,10 @@ type bindingKeyStore struct {
 func (s *bindingKeyStore) Save(context.Context, crypto.AuthKey) error { return nil }
 func (s *bindingKeyStore) Touch(context.Context, [8]byte) error       { return nil }
 
-func (s *bindingKeyStore) Get(context.Context, [8]byte) (crypto.AuthKey, int64, bool, error) {
+func (s *bindingKeyStore) Get(context.Context, [8]byte) (crypto.AuthKey, int64, bool, bool, error) {
 	userID := s.users[min(s.n, len(s.users)-1)]
 	s.n++
-	return s.key, userID, true, nil
+	return s.key, userID, false, true, nil
 }
 
 // frameConn replays pre-built client frames, calling before with the number of

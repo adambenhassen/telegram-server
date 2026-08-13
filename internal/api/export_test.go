@@ -795,3 +795,33 @@ func AgeSignInFailWindowForTest(dsn string, addr netip.Addr, d time.Duration) er
 	}
 	return nil
 }
+
+// GetPasswordForTest encodes req and invokes handleGetPassword for the caller.
+func GetPasswordForTest(s *store.Store, userID int64, req *mtproto.Request) (bin.Encoder, error) {
+	h := testHandlers(s)
+	return h.handleGetPassword(req)
+}
+
+// UpdatePasswordSettingsForTest invokes handleUpdatePasswordSettings with a
+// pre-encoded request buffer for the caller.
+func UpdatePasswordSettingsForTest(s *store.Store, userID int64, buf *bin.Buffer) (bin.Encoder, error) {
+	h := testHandlers(s)
+	return h.handleUpdatePasswordSettings(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: buf})
+}
+
+// ProvisionalAllowList exposes the allow-list for tests to verify method IDs.
+var ProvisionalAllowList = provisionalAllowList
+
+// ErrAuthKeyUnreg exposes the AUTH_KEY_UNREGISTERED error for test assertions.
+var ErrAuthKeyUnreg = errAuthKeyUnreg
+
+// ProvisionalGateBlocked returns the error the register wrapper returns when
+// the provisional gate fires, for a given type ID and request. Returns nil
+// when the gate does not block (unauthenticated or allow-listed method).
+// This is the exact logic the register wrapper applies, extracted for testing.
+func ProvisionalGateBlocked(id uint32, req *mtproto.Request) error {
+	if req.UserID != 0 && req.Provisional && !provisionalAllowList[id] {
+		return errAuthKeyUnreg
+	}
+	return nil
+}

@@ -32,14 +32,14 @@ type revokedKeyStore struct {
 func (s *revokedKeyStore) Save(context.Context, crypto.AuthKey) error { return nil }
 func (s *revokedKeyStore) Touch(context.Context, [8]byte) error       { return nil }
 
-func (s *revokedKeyStore) Get(context.Context, [8]byte) (crypto.AuthKey, int64, bool, error) {
+func (s *revokedKeyStore) Get(context.Context, [8]byte) (crypto.AuthKey, int64, bool, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gets++
 	if s.gets > 1 {
-		return crypto.AuthKey{}, 0, false, nil
+		return crypto.AuthKey{}, 0, false, false, nil
 	}
-	return s.key, s.userID, true, nil
+	return s.key, s.userID, false, true, nil
 }
 
 func (s *revokedKeyStore) lookups() int {

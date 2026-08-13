@@ -488,7 +488,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			continue
 		}
 
-		key, userID, ok, err := s.keys.Get(ctx, authKeyID)
+		key, userID, provisional, ok, err := s.keys.Get(ctx, authKeyID)
 		if err != nil {
 			return errors.Join(errors.New("get auth key"), err)
 		}
@@ -520,7 +520,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		// on a human reading a code — it has already paid for a key exchange, and
 		// closing it mid-login would be the bound taking legitimate sessions
 		// rather than anonymous holds.
-		if err := s.rpcHandle(ctx, conn, b, userID, clientAddr, slot); err != nil {
+		if err := s.rpcHandle(ctx, conn, b, userID, provisional, clientAddr, slot); err != nil {
 			return err
 		}
 
@@ -544,7 +544,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			// session that just signed in.
 			var ok bool
 			var err error
-			_, chargeUser, ok, err = s.keys.Get(ctx, authKeyID)
+			_, chargeUser, _, ok, err = s.keys.Get(ctx, authKeyID)
 			if err != nil {
 				return errors.Join(errors.New("get auth key"), err)
 			}

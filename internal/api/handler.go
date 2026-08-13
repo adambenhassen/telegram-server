@@ -206,7 +206,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesReceivedQueueRequestTypeID, h.handleReceivedQueue)
 	register(d, tg.MessagesSearchRequestTypeID, h.handleSearch)
 	register(d, tg.MessagesSearchGlobalRequestTypeID, h.handleSearchGlobal)
-	d.Fallback(mtproto.HandlerFunc(h.handleUnknown))
+	d.Fallback(mtproto.HandlerFunc(h.handleUnknownGated))
 	return mtproto.UnpackInvoke(d)
 }
 
@@ -224,6 +224,16 @@ func (h *handlers) checkRateLimit(r *mtproto.Request, surface string, cfg store.
 	return nil
 }
 
+// provisionalAllowList holds the method IDs that a provisional session may call.
+// A provisional session is a username-mode account with no verifier: it can set
+// its password, check password state, or log out — but nothing else.
+var provisionalAllowList = map[uint32]bool{
+	tg.HelpGetConfigRequestTypeID:                 true,
+	tg.AccountGetPasswordRequestTypeID:            true,
+	tg.AccountUpdatePasswordSettingsRequestTypeID: true,
+	tg.AuthLogOutRequestTypeID:                    true,
+}
+
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
 	registerRevoke(d, id, func(req *mtproto.Request) (bin.Encoder, func(), error) {
 		res, err := fn(req)
@@ -234,8 +244,16 @@ func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
 // registerRevoke registers fn and runs its afterReply hook once the reply write
 // has been attempted, whether or not that write succeeded: the revocation it
 // announces has already committed, so it must propagate either way.
+// The provisional gate is applied here so it covers both register and
+// registerRevoke callers (including auth.logOut and account.resetAuthorization).
 func registerRevoke(d *mtproto.Dispatcher, id uint32, fn revokeFunc) {
 	d.HandleFunc(id, func(c *mtproto.Conn, req *mtproto.Request) error {
+		// Provisional gate: blocks all authorized RPCs except the allow-list.
+		// Does not apply when UserID == 0 (unauthenticated keys already
+		// handled per-method).
+		if req.UserID != 0 && req.Provisional && !provisionalAllowList[id] {
+			return c.SendErr(req, errAuthKeyUnreg)
+		}
 		res, afterReply, err := fn(req)
 		if err != nil {
 			var rpc *tgerr.Error
