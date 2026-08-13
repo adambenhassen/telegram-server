@@ -13,6 +13,13 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
+const (
+	// signInFailLockClass namespaces this limiter's advisory locks. Distinct from
+	// sendCodeIPLockClass so concurrent sendCode and failed-signIn checks from
+	// the same IP do not unnecessarily serialize against each other.
+	signInFailLockClass = 0x73696746 // "sigF"
+)
+
 // CheckAndChargeSignInFailIP checks and charges the per-IP signIn-failure
 // counter for a failed auth.signIn attempt arriving from addr.
 //
@@ -42,7 +49,7 @@ func (s *Store) CheckAndChargeSignInFailIP(ctx context.Context, addr netip.Addr,
 
 	if _, err := tx.Exec(ctx,
 		"SELECT pg_advisory_xact_lock($1, hashtext($2))",
-		sendCodeIPLockClass, key.String(),
+		signInFailLockClass, key.String(),
 	); err != nil {
 		return nil, fmt.Errorf("advisory lock: %w", err)
 	}

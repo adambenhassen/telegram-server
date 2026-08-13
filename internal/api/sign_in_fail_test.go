@@ -160,11 +160,12 @@ func TestSignInFailSameIPDifferentPhones(t *testing.T) {
 }
 
 // TestSignInFailRateLimitWindowExpiry proves that after the failure budget
-// window expires, the IP can attempt signIn again.
+// window expires, the IP can attempt signIn again — verifying recovery, not
+// just denial.
 func TestSignInFailRateLimitWindowExpiry(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 
 	phone := "+15551296301"
 	hash, _, err := s.IssueCode(ctx, phone)
@@ -197,10 +198,21 @@ func TestSignInFailRateLimitWindowExpiry(t *testing.T) {
 		t.Fatalf("expected FLOOD_WAIT, got %v", err)
 	}
 
-	// The sign-in fail counter uses a dedicated table (sign_in_fail_calls)
-	// keyed on the IP bucket (CIDR). We can't use AgeRateLimitWindowForTest
-	// (which targets rate_limits table), so we verify the denial happened and
-	// trust the window expiry mechanism matches the sendCode IP pattern.
+	// Age the window past expiry so the IP can try again.
+	if err := api.AgeSignInFailWindowForTest(dsn, addr, time.Hour+time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// After window expiry, a wrong guess is allowed again (PHONE_CODE_INVALID,
+	// not FLOOD_WAIT).
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, cfg, &tg.AuthSignInRequest{
+		PhoneNumber:   phone,
+		PhoneCodeHash: hash,
+		PhoneCode:     "00000",
+	})
+	if !isPhoneCodeInvalid(err) {
+		t.Fatalf("after window expiry: expected PHONE_CODE_INVALID (access restored), got %v", err)
+	}
 }
 
 // TestSignInFailDisabled proves that a zero limit disables enforcement.
@@ -230,6 +242,62 @@ func TestSignInFailDisabled(t *testing.T) {
 		if isFloodWait(err) {
 			t.Fatalf("wrong guess %d: unexpected FLOOD_WAIT with disabled limit", i+1)
 		}
+	}
+}
+
+// TestSignInFailCorrectCodeDifferentAddress proves the acceptance criterion:
+// a correct code from a different address succeeds even after the attacker's
+// IP budget is exhausted.
+func TestSignInFailCorrectCodeDifferentAddress(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	phone := "+15551296601"
+	hash, code, err := s.IssueCode(ctx, phone)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Save the auth key so BindAuthKeyUser succeeds on a correct sign-in.
+	if err := s.SaveAuthKey(ctx, int64(0x1), make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+
+	attackerAddr := netip.MustParseAddr("10.0.0.100")
+	legitAddr := netip.MustParseAddr("10.0.0.200")
+
+	// Limit of 1 failure per 10s.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+
+	// Attacker exhausts their IP budget with one wrong guess.
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, attackerAddr, cfg, &tg.AuthSignInRequest{
+		PhoneNumber:   phone,
+		PhoneCodeHash: hash,
+		PhoneCode:     "00000",
+	})
+	if !isPhoneCodeInvalid(err) {
+		t.Fatalf("attacker wrong guess: expected PHONE_CODE_INVALID, got %v", err)
+	}
+
+	// Attacker is now blocked.
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, attackerAddr, cfg, &tg.AuthSignInRequest{
+		PhoneNumber:   phone,
+		PhoneCodeHash: hash,
+		PhoneCode:     "00000",
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("attacker second guess: expected FLOOD_WAIT, got %v", err)
+	}
+
+	// Legitimate user from a different IP with the correct code succeeds.
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, legitAddr, cfg, &tg.AuthSignInRequest{
+		PhoneNumber:   phone,
+		PhoneCodeHash: hash,
+		PhoneCode:     code,
+	})
+	if err != nil {
+		t.Fatalf("legit user with correct code from different IP: expected success, got %v", err)
 	}
 }
 

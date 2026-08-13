@@ -625,7 +625,7 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 // collapsing into one bucket refuses handshakes server-wide, which is every
 // client at once and looks like an outage rather than a limit.
 func (c Config) WarnClientAddrTrust(log *slog.Logger) {
-	perIPLimits := c.RateLimits.SendCodeIP.Enabled() || c.PreAuth.MaxConnsPerNet > 0
+	perIPLimits := c.RateLimits.SendCodeIP.Enabled() || c.RateLimits.SignInFailIP.Enabled() || c.PreAuth.MaxConnsPerNet > 0
 	if c.ClientAddrTrust != ClientAddrSocket || !perIPLimits {
 		return
 	}

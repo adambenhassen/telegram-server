@@ -80,6 +80,9 @@ func run(log *slog.Logger) error {
 	sweepWG.Go(func() {
 		sweepExpiredSendCodeIPLimits(sweepCtx, st, log)
 	})
+	sweepWG.Go(func() {
+		sweepExpiredSignInFailLimits(sweepCtx, st, log)
+	})
 	defer func() {
 		cancelSweep()
 		sweepWG.Wait()
@@ -303,6 +306,27 @@ func sweepExpiredSendCodeIPLimits(ctx context.Context, st *store.Store, log *slo
 				continue
 			}
 			log.Info("swept expired send code ip limits", "deleted", n)
+		}
+	}
+}
+
+// sweepExpiredSignInFailLimits periodically deletes per-IP signIn-failure rows
+// past their deadline. Unlike sendCode IP limits there is no prune-on-write
+// (signIn is not idempotent), so the sweep is the sole cleanup path.
+func sweepExpiredSignInFailLimits(ctx context.Context, st *store.Store, log *slog.Logger) {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := st.SweepExpiredSignInFailCalls(ctx)
+			if err != nil {
+				log.Error("sweep expired sign in fail limits", "err", err)
+				continue
+			}
+			log.Info("swept expired sign in fail limits", "deleted", n)
 		}
 	}
 }

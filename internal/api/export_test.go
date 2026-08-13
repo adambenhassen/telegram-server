@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -757,4 +758,32 @@ func SetUserFirstNameForTest(dsn string, userID int64, firstName string) error {
 	_, err = pool.Exec(context.Background(),
 		"UPDATE users SET first_name = $1 WHERE id = $2", firstName, userID)
 	return err
+}
+
+// AgeSignInFailWindowForTest rewinds one sign_in_fail_calls row's window by d,
+// targeting the CIDR ip_key of addr. It is how a test crosses the window
+// boundary without sleeping: the row is aged exactly d past its deadline.
+func AgeSignInFailWindowForTest(dsn string, addr netip.Addr, d time.Duration) error {
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	key, ok := store.IPBucketKey(addr)
+	if !ok {
+		return errors.New("invalid address")
+	}
+	tag, err := pool.Exec(context.Background(),
+		`UPDATE sign_in_fail_calls
+		    SET window_start = window_start - $2::INTERVAL,
+		        expires_at   = expires_at   - $2::INTERVAL
+		  WHERE ip_key = $1::CIDR`,
+		key.String(), pgtype.Interval{Microseconds: d.Microseconds(), Valid: true})
+	if err != nil {
+		return err
+	}
+	if n := tag.RowsAffected(); n != 1 {
+		return fmt.Errorf("age sign in fail window: %d rows for ip_key %q, want 1", n, key.String())
+	}
+	return nil
 }
