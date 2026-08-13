@@ -73,6 +73,9 @@ type handlers struct {
 	// one limit here that is not keyed on an account: sendCode is
 	// unauthenticated, so the connection's address is the only subject there is.
 	rateLimitSendCodeIP store.SendCodeIPLimits
+	// rateLimitSignInFailIP limits failed auth.signIn attempts per client
+	// network. Keyed on the connection's address, not the identifier.
+	rateLimitSignInFailIP store.RateLimitConfig
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -143,6 +146,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitSearchGlobal:   rateLimits.SearchGlobal,
 		rateLimitSaveFilePart:   rateLimits.SaveFilePart,
 		rateLimitSendCodeIP:     rateLimits.SendCodeIP,
+		rateLimitSignInFailIP:   rateLimits.SignInFailIP,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)

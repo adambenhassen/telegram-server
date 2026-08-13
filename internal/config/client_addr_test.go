@@ -159,10 +159,18 @@ func TestWarnClientAddrTrust(t *testing.T) {
 		t.Fatalf("emitted %d warn lines with only the pre-auth per-IP cap on, want exactly 1:\n%s", n, buf.String())
 	}
 
+	// SignInFailIP alone also warns — it is a per-IP limit too.
+	buf.Reset()
+	cfg.PreAuth.MaxConnsPerNet = 0
+	cfg.WarnClientAddrTrust(log)
+	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
+		t.Fatalf("emitted %d warn lines with only SignInFailIP on, want exactly 1:\n%s", n, buf.String())
+	}
+
 	// Nothing is keyed on an address once every per-IP limit is off, so there is
 	// no assumption left to warn about.
 	buf.Reset()
-	cfg.PreAuth.MaxConnsPerNet = 0
+	cfg.RateLimits.SignInFailIP = store.RateLimitConfig{}
 	cfg.WarnClientAddrTrust(log)
 	if buf.Len() != 0 {
 		t.Errorf("warned with every per-IP limit disabled:\n%s", buf.String())

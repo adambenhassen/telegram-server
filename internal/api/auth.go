@@ -168,14 +168,25 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
+
 	code, _ := req.GetPhoneCode()
-	if err := h.store.VerifyCode(r.Ctx, req.PhoneNumber, req.PhoneCodeHash, code); err != nil {
-		if rpc := verifyToRPC(err); rpc != errInternal {
-			return nil, rpc
-		}
-		h.log.Error("verify code", "err", err)
-		return nil, errInternal
+
+	// AttemptSignIn atomically checks the per-IP failure budget, verifies the
+	// code, and charges on failure — all within a single Postgres transaction
+	// protected by an advisory lock. Correct codes never touch the counter.
+	rateLimited, err := h.store.AttemptSignIn(r.Ctx, r.ClientAddr, req.PhoneNumber, req.PhoneCodeHash, code, h.rateLimitSignInFailIP)
+	if rateLimited != nil {
+		return nil, FloodWaitError(int(rateLimited.Wait / time.Second))
 	}
+	if err != nil {
+		rpc := verifyToRPC(err)
+		if rpc == errInternal {
+			h.log.Error("sign in attempt", "err", err)
+			return nil, errInternal
+		}
+		return nil, rpc
+	}
+
 	user, err := h.store.CreateUser(r.Ctx, req.PhoneNumber)
 	if err != nil {
 		h.log.Error("create user", "err", err)

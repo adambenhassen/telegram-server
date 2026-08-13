@@ -153,7 +153,7 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 // chat_participants, messages.fanout_id and message_events from the ones
 // before it; update them when a migration adds new schema.
 func (s *Store) checkSchema(ctx context.Context) error {
-	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasLoginMode bool
+	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
@@ -173,13 +173,14 @@ func (s *Store) checkSchema(ctx context.Context) error {
 		              WHERE table_name = 'users' AND column_name = 'name_tsv'),
 		       to_regclass('public.rate_limits') IS NOT NULL,
 		       to_regclass('public.send_code_ip_calls') IS NOT NULL,
+		       to_regclass('public.sign_in_fail_calls') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
 		              WHERE table_name = 'users' AND column_name = 'login_mode')`,
-	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasLoginMode)
+	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasLoginMode {
+	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil

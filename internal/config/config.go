@@ -137,13 +137,18 @@ type RateLimitsConfig struct {
 	// connection's address rather than an account because the surface is
 	// unauthenticated: there is no account yet to hold a budget.
 	SendCodeIP store.SendCodeIPLimits
+	// SignInFailIP limits failed auth.signIn attempts per client network.
+	// Keyed on the connection's address, not the identifier: only the
+	// attacker's own IP budget is consumed, never the victim's.
+	SignInFailIP store.RateLimitConfig
 }
 
 // DefaultRateLimits returns the shipped per-surface defaults: 60 sends per 60s,
 // 20 chat creates per 24h, 120 member adds per 24h, 20 channel creates per 24h,
 // 300 message searches per hour, 300 contacts searches per hour, 300 global
-// searches per hour, 600 upload parts per 60s, and per client network 10
-// sendCode calls per hour across at most 20 distinct phone numbers per 24h.
+// searches per hour, 600 upload parts per 60s, per client network 10 sendCode
+// calls per hour across at most 20 distinct phone numbers per 24h, and 10
+// failed signIn attempts per hour per client network.
 // Zero disables enforcement for a surface.
 //
 // The upload number is the one derived rather than chosen: at the 512 KiB
@@ -167,6 +172,7 @@ func DefaultRateLimits() RateLimitsConfig {
 			Calls:  store.RateLimitConfig{Limit: 10, Window: time.Hour},
 			Phones: store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
 		},
+		SignInFailIP: store.RateLimitConfig{Limit: 10, Window: time.Hour},
 	}
 }
 
@@ -619,7 +625,7 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 // collapsing into one bucket refuses handshakes server-wide, which is every
 // client at once and looks like an outage rather than a limit.
 func (c Config) WarnClientAddrTrust(log *slog.Logger) {
-	perIPLimits := c.RateLimits.SendCodeIP.Enabled() || c.PreAuth.MaxConnsPerNet > 0
+	perIPLimits := c.RateLimits.SendCodeIP.Enabled() || c.RateLimits.SignInFailIP.Enabled() || c.PreAuth.MaxConnsPerNet > 0
 	if c.ClientAddrTrust != ClientAddrSocket || !perIPLimits {
 		return
 	}

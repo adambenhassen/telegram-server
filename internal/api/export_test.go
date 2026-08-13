@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -42,6 +43,19 @@ func SendCodeForTest(s *store.Store, addr netip.Addr, limits store.SendCodeIPLim
 	h := testHandlers(s)
 	h.rateLimitSendCodeIP = limits
 	return h.handleSendCode(&mtproto.Request{Ctx: context.Background(), ClientAddr: addr, Buf: &buf})
+}
+
+// SignInForTestWithLimits invokes handleSignIn for a request arriving from
+// addr, against the per-IP failure rate limit given. The authKeyID is required
+// so the handler can bind the key on success.
+func SignInForTestWithLimits(s *store.Store, authKeyID [8]byte, addr netip.Addr, rateLimit store.RateLimitConfig, req *tg.AuthSignInRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitSignInFailIP = rateLimit
+	return h.handleSignIn(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
 }
 
 // LogIssuedCodeForTest drives the gated login-code log line for the external
@@ -744,4 +758,32 @@ func SetUserFirstNameForTest(dsn string, userID int64, firstName string) error {
 	_, err = pool.Exec(context.Background(),
 		"UPDATE users SET first_name = $1 WHERE id = $2", firstName, userID)
 	return err
+}
+
+// AgeSignInFailWindowForTest rewinds one sign_in_fail_calls row's window by d,
+// targeting the CIDR ip_key of addr. It is how a test crosses the window
+// boundary without sleeping: the row is aged exactly d past its deadline.
+func AgeSignInFailWindowForTest(dsn string, addr netip.Addr, d time.Duration) error {
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	key, ok := store.IPBucketKey(addr)
+	if !ok {
+		return errors.New("invalid address")
+	}
+	tag, err := pool.Exec(context.Background(),
+		`UPDATE sign_in_fail_calls
+		    SET window_start = window_start - $2::INTERVAL,
+		        expires_at   = expires_at   - $2::INTERVAL
+		  WHERE ip_key = $1::CIDR`,
+		key.String(), pgtype.Interval{Microseconds: d.Microseconds(), Valid: true})
+	if err != nil {
+		return err
+	}
+	if n := tag.RowsAffected(); n != 1 {
+		return fmt.Errorf("age sign in fail window: %d rows for ip_key %q, want 1", n, key.String())
+	}
+	return nil
 }

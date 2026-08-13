@@ -220,6 +220,13 @@ type SendCodeIpPhone struct {
 	ExpiresAt pgtype.Timestamptz
 }
 
+type SignInFailCall struct {
+	IpKey       netip.Prefix
+	TokenCount  int32
+	WindowStart pgtype.Timestamptz
+	ExpiresAt   pgtype.Timestamptz
+}
+
 type UpdateState struct {
 	UserID      int64
 	Pts         int64
