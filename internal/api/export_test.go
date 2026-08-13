@@ -44,6 +44,19 @@ func SendCodeForTest(s *store.Store, addr netip.Addr, limits store.SendCodeIPLim
 	return h.handleSendCode(&mtproto.Request{Ctx: context.Background(), ClientAddr: addr, Buf: &buf})
 }
 
+// SignInForTestWithLimits invokes handleSignIn for a request arriving from
+// addr, against the per-IP failure rate limit given. The authKeyID is required
+// so the handler can bind the key on success.
+func SignInForTestWithLimits(s *store.Store, authKeyID [8]byte, addr netip.Addr, rateLimit store.RateLimitConfig, req *tg.AuthSignInRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitSignInFailIP = rateLimit
+	return h.handleSignIn(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+}
+
 // LogIssuedCodeForTest drives the gated login-code log line for the external
 // api_test package, without needing a store or a database.
 func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code string) {

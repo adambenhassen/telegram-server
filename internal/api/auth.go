@@ -171,6 +171,12 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 	code, _ := req.GetPhoneCode()
 	if err := h.store.VerifyCode(r.Ctx, req.PhoneNumber, req.PhoneCodeHash, code); err != nil {
 		if rpc := verifyToRPC(err); rpc != errInternal {
+			// A failed verification charges the per-IP failure counter so an
+			// attacker cannot use multiple source addresses to get multiple
+			// budgets of guesses against the same identifier.
+			if rateErr := h.checkSignInFailIP(r); rateErr != nil {
+				return nil, rateErr
+			}
 			return nil, rpc
 		}
 		h.log.Error("verify code", "err", err)
@@ -240,4 +246,27 @@ func (h *handlers) handleLogOut(r *mtproto.Request) (bin.Encoder, func(), error)
 	return &tg.AuthLoggedOut{}, func() {
 		h.notifyEvict(r.Ctx, key.UserID, keyID)
 	}, nil
+}
+
+// checkSignInFailIP charges the per-IP failure counter for a failed
+// auth.signIn attempt. It returns nil when the IP still has budget,
+// or a FLOOD_WAIT error when exhausted.
+//
+// Only the requesting network's budget is consumed — keying on IP prevents an
+// attacker from spending a victim's failure counter against another address.
+func (h *handlers) checkSignInFailIP(r *mtproto.Request) error {
+	res, err := h.store.CheckAndChargeSignInFailIP(r.Ctx, r.ClientAddr, h.rateLimitSignInFailIP)
+	if err != nil {
+		if errors.Is(err, store.ErrNoClientAddr) {
+			// No address to attribute to: refuse rather than wave through.
+			h.log.Info("sign in: connection carries no client address")
+			return FloodWaitError(1)
+		}
+		h.log.Error("sign in fail: ip rate limit", "err", err)
+		return errInternal
+	}
+	if res != nil {
+		return FloodWaitError(int(res.Wait / time.Second))
+	}
+	return nil
 }
