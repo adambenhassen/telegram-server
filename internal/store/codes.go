@@ -28,8 +28,9 @@ const (
 // a TTL. It returns ErrResendTooSoon if an unconsumed prior code was issued
 // within resendCooldown. Each call inserts a new row keyed by code_hash, so
 // attempt counters are isolated between callers. The cooldown check and insert
-// run inside a single transaction with a row lock on the latest code row,
-// preventing TOCTTOU between concurrent callers for the same phone.
+// run inside a single transaction: pg_advisory_xact_lock hashes the normalized
+// identifier so concurrent callers for the same phone are serialized regardless
+// of whether a row exists yet.
 func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, error) {
 	phone = NormalizePhone(phone)
 	tx, err := s.pool.Begin(ctx)
@@ -39,7 +40,14 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
-	existing, err := qtx.GetLatestCodeForUpdate(ctx, phone)
+	// Advisory lock on the normalized identifier serializes concurrent IssueCode
+	// calls for the same phone, preventing TOCTTOU on the cooldown check. The
+	// lock is transaction-scoped (xact) so it is released on commit or rollback.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, phone); err != nil {
+		return "", "", fmt.Errorf("issue code: %w", err)
+	}
+
+	existing, err := qtx.GetLatestCode(ctx, phone)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		// No prior code: nothing blocks a fresh issue.

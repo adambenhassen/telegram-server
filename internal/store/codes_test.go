@@ -313,3 +313,54 @@ func TestVerifyCodeIdentifierBinding(t *testing.T) {
 		t.Fatalf("attacker self-verify: %v", err)
 	}
 }
+
+// TestIssueCodeConcurrentCooldown verifies that concurrent IssueCode calls
+// for the same phone are serialized by the advisory lock: exactly one succeeds
+// and every other caller gets ErrResendTooSoon.
+func TestIssueCodeConcurrentCooldown(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const phone = "+15551250010"
+
+	const n = 10
+	type result struct {
+		err error
+	}
+	var ch = make(chan result, n)
+	ready := make(chan struct{}, n)
+	start := make(chan struct{})
+
+	for range n {
+		go func() {
+			ready <- struct{}{}
+			<-start
+			_, _, e := s.IssueCode(ctx, phone)
+			ch <- result{err: e}
+		}()
+	}
+	// Wait for all goroutines to be ready, then release the barrier.
+	for range n {
+		<-ready
+	}
+	close(start)
+
+	var successes, cooldowns int
+	for range n {
+		r := <-ch
+		switch {
+		case r.err == nil:
+			successes++
+		case errors.Is(r.err, store.ErrResendTooSoon):
+			cooldowns++
+		default:
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("expected 1 success, got %d (cooldowns=%d)", successes, cooldowns)
+	}
+	if cooldowns != n-1 {
+		t.Fatalf("expected %d cooldowns, got %d (successes=%d)", n-1, cooldowns, successes)
+	}
+}

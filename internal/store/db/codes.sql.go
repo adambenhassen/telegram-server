@@ -106,33 +106,6 @@ func (q *Queries) GetLatestCode(ctx context.Context, phone string) (PhoneCode, e
 	return i, err
 }
 
-const getLatestCodeForUpdate = `-- name: GetLatestCodeForUpdate :one
-SELECT phone, code_hash, code, expires_at, attempts, consumed_at, created_at, id FROM phone_codes
-WHERE phone = $1
-ORDER BY created_at DESC
-LIMIT 1
-FOR UPDATE
-`
-
-// Like GetLatestCode but acquires a row lock (SELECT ... FOR UPDATE) so
-// concurrent IssueCode calls for the same phone are serialized. Used inside
-// a transaction with InsertCode to prevent TOCTTOU on the cooldown check.
-func (q *Queries) GetLatestCodeForUpdate(ctx context.Context, phone string) (PhoneCode, error) {
-	row := q.db.QueryRow(ctx, getLatestCodeForUpdate, phone)
-	var i PhoneCode
-	err := row.Scan(
-		&i.Phone,
-		&i.CodeHash,
-		&i.Code,
-		&i.ExpiresAt,
-		&i.Attempts,
-		&i.ConsumedAt,
-		&i.CreatedAt,
-		&i.ID,
-	)
-	return i, err
-}
-
 const incrementCodeAttempts = `-- name: IncrementCodeAttempts :exec
 UPDATE phone_codes SET attempts = attempts + 1
 WHERE code_hash = $1
