@@ -250,6 +250,11 @@ func (h *handlers) handleSignInUsername(r *mtproto.Request, username, phoneCodeH
 	// the hash is validated.
 	if err := h.store.CheckCodeHash(r.Ctx, username, phoneCodeHash); err != nil {
 		rpc := verifyToRPC(err)
+		if rpc == errCodeExpired {
+			// Username path must return PHONE_CODE_INVALID for both missing and
+			// expired hashes — the acceptance criteria do not distinguish them.
+			rpc = errCodeInvalid
+		}
 		if rpc == errInternal {
 			h.log.Error("sign in: check code hash", "err", err)
 			return nil, errInternal

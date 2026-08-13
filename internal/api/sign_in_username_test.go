@@ -236,6 +236,9 @@ func TestSignInUsernameExpiredHash(t *testing.T) {
 	if rpc.Code != 400 {
 		t.Errorf("got code %d, want 400", rpc.Code)
 	}
+	if rpc.Message != "PHONE_CODE_INVALID" {
+		t.Errorf("got message %q, want PHONE_CODE_INVALID", rpc.Message)
+	}
 }
 
 func TestSignInUsernamePhonePathUnchanged(t *testing.T) {
