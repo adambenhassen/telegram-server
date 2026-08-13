@@ -56,3 +56,33 @@ WHERE subject_id = $1
 -- to know per-surface window durations. The return value reports rows affected.
 DELETE FROM rate_limits
 WHERE expires_at < now();
+
+-- name: CheckRateLimitBudget :one
+-- Read-only check of the current budget for a subject/surface pair.
+-- Returns the current token count and expiry deadline so the caller can decide
+-- whether to proceed without consuming a token.
+-- Returns pgx.ErrNoRows when no row exists (budget not yet exhausted).
+SELECT token_count, expires_at
+FROM rate_limits
+WHERE subject_id = $1
+  AND surface = $2;
+
+-- name: ChargeRateLimit :exec
+-- Charge a rate-limit counter after a failed attempt. Uses the same
+-- INSERT ... ON CONFLICT pattern as TryConsumeRateLimit but is called only
+-- after a failure, so it always increments (or seeds at 1).
+INSERT INTO rate_limits (subject_id, surface, token_count, window_start, expires_at)
+VALUES ($1, $2, 1, now(), now() + $3::INTERVAL)
+ON CONFLICT (subject_id, surface) DO UPDATE SET
+    token_count = CASE
+        WHEN rate_limits.expires_at <= now() THEN 1
+        ELSE rate_limits.token_count + 1
+    END,
+    window_start = CASE
+        WHEN rate_limits.expires_at <= now() THEN now()
+        ELSE rate_limits.window_start
+    END,
+    expires_at = CASE
+        WHEN rate_limits.expires_at <= now() THEN now() + $3::INTERVAL
+        ELSE rate_limits.expires_at
+    END;

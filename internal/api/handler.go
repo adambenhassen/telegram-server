@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"log/slog"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -76,6 +77,20 @@ type handlers struct {
 	// rateLimitSignInFailIP limits failed auth.signIn attempts per client
 	// network. Keyed on the connection's address, not the identifier.
 	rateLimitSignInFailIP store.RateLimitConfig
+	// rateLimitCheckPassword limits failed auth.checkPassword attempts per
+	// account. Charged only on failed SRP proofs.
+	rateLimitCheckPassword store.RateLimitConfig
+	// rateLimitCheckPasswordIP limits failed auth.checkPassword attempts per
+	// client network. Keyed on the connection's address. Charged only on failures.
+	rateLimitCheckPasswordIP store.RateLimitConfig
+	// rateLimitGetPasswordIP limits account.getPassword calls per client network,
+	// but only for unauthenticated callers (pending state).
+	rateLimitGetPasswordIP store.RateLimitConfig
+	// rateLimitSignUpIP limits auth.signUp calls per client network. Applied
+	// only when TG_REGISTRATION=open.
+	rateLimitSignUpIP store.RateLimitConfig
+	// registrationMode controls whether auth.signUp is available.
+	registrationMode config.RegistrationMode
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -121,32 +136,37 @@ func selfRevocation(r *mtproto.Request, keyID int64) bool {
 // peers derives the per-viewer peer access hashes. It is required, and a nil one
 // is a programming error rather than a runtime condition, so it stops the server
 // at startup instead of surfacing as a nil dereference on the first peer emitted.
-func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver, rateLimits config.RateLimitsConfig) mtproto.Handler {
+func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver, rateLimits config.RateLimitsConfig, registrationMode config.RegistrationMode) mtproto.Handler {
 	if peers == nil {
 		panic("api: nil peer hash deriver")
 	}
 	h := &handlers{
-		peers:                   peers,
-		store:                   s,
-		cfg:                     cfg,
-		dcID:                    dcID,
-		log:                     log,
-		srp:                     srp.NewChallengeStore(srp.DefaultTTL),
-		logLoginCodes:           logLoginCodes,
-		maxFileBytes:            maxFileBytes,
-		blobs:                   blobs,
-		maxUserStorageBytes:     maxUserStorageBytes,
-		downloads:               map[int64]bool{},
-		rateLimitMessageSend:    rateLimits.MessageSend,
-		rateLimitCreateChat:     rateLimits.CreateChat,
-		rateLimitAddChatUser:    rateLimits.AddChatUser,
-		rateLimitCreateChannel:  rateLimits.CreateChannel,
-		rateLimitSearchMessages: rateLimits.SearchMessages,
-		rateLimitSearchContacts: rateLimits.SearchContacts,
-		rateLimitSearchGlobal:   rateLimits.SearchGlobal,
-		rateLimitSaveFilePart:   rateLimits.SaveFilePart,
-		rateLimitSendCodeIP:     rateLimits.SendCodeIP,
-		rateLimitSignInFailIP:   rateLimits.SignInFailIP,
+		peers:                    peers,
+		store:                    s,
+		cfg:                      cfg,
+		dcID:                     dcID,
+		log:                      log,
+		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
+		logLoginCodes:            logLoginCodes,
+		maxFileBytes:             maxFileBytes,
+		blobs:                    blobs,
+		maxUserStorageBytes:      maxUserStorageBytes,
+		downloads:                map[int64]bool{},
+		rateLimitMessageSend:     rateLimits.MessageSend,
+		rateLimitCreateChat:      rateLimits.CreateChat,
+		rateLimitAddChatUser:     rateLimits.AddChatUser,
+		rateLimitCreateChannel:   rateLimits.CreateChannel,
+		rateLimitSearchMessages:  rateLimits.SearchMessages,
+		rateLimitSearchContacts:  rateLimits.SearchContacts,
+		rateLimitSearchGlobal:    rateLimits.SearchGlobal,
+		rateLimitSaveFilePart:    rateLimits.SaveFilePart,
+		rateLimitSendCodeIP:      rateLimits.SendCodeIP,
+		rateLimitSignInFailIP:    rateLimits.SignInFailIP,
+		rateLimitCheckPassword:   rateLimits.CheckPassword,
+		rateLimitCheckPasswordIP: rateLimits.CheckPasswordIP,
+		rateLimitGetPasswordIP:   rateLimits.GetPasswordIP,
+		rateLimitSignUpIP:        rateLimits.SignUpIP,
+		registrationMode:         registrationMode,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
@@ -224,6 +244,51 @@ func (h *handlers) checkRateLimit(r *mtproto.Request, surface string, cfg store.
 	return nil
 }
 
+// checkRateLimitIPBudget checks the per-IP rate limit budget for the given
+// surface without consuming a token. Returns a RateLimitResult when denied,
+// nil when allowed, or an error (FLOOD_WAIT for no client address, or wrapped
+// for storage errors).
+func (h *handlers) checkRateLimitIPBudget(r *mtproto.Request, surface string, cfg store.RateLimitConfig) (*store.RateLimitResult, error) {
+	if !cfg.Enabled() {
+		return nil, nil //nolint:nilnil // disabled config is not an error
+	}
+	key, ok := store.IPBucketKey(r.ClientAddr)
+	if !ok {
+		// No valid address: refuse rather than wave through.
+		return nil, FloodWaitError(int(cfg.Window / time.Second))
+	}
+	subjectID, err := keyToSubjectID(key)
+	if err != nil {
+		h.log.Error("rate limit: convert IP to subject", "err", err)
+		return nil, errInternal
+	}
+	result, err := h.store.CheckRateLimitBudget(r.Ctx, subjectID, surface, cfg)
+	if err != nil {
+		h.log.Error("rate limit: IP budget check", "err", err)
+		return nil, errInternal
+	}
+	return result, nil
+}
+
+// chargeRateLimitIP charges the per-IP rate limit counter for the given
+// surface. It is the write half of the check-then-charge pattern: called only
+// after a failure, so it always increments (or seeds at 1).
+func (h *handlers) chargeRateLimitIP(r *mtproto.Request, surface string, cfg store.RateLimitConfig) error {
+	if !cfg.Enabled() {
+		return nil
+	}
+	key, ok := store.IPBucketKey(r.ClientAddr)
+	if !ok {
+		return nil
+	}
+	subjectID, err := keyToSubjectID(key)
+	if err != nil {
+		h.log.Error("rate limit: convert IP to subject", "err", err)
+		return err
+	}
+	return h.store.ChargeRateLimit(r.Ctx, subjectID, surface, cfg)
+}
+
 // provisionalAllowList holds the method IDs that a provisional session may call.
 // A provisional session is a username-mode account with no verifier: it can set
 // its password, check password state, or log out — but nothing else.
@@ -239,6 +304,29 @@ var provisionalAllowList = map[uint32]bool{
 // predicate used by both registerRevoke and handleUnknownGated.
 func provisionalBlocked(id uint32, req *mtproto.Request) bool {
 	return req.UserID != 0 && req.Provisional && !provisionalAllowList[id]
+}
+
+// keyToSubjectID derives a deterministic int64 subject ID from an IP bucket
+// prefix, so per-IP rate limits can use the same CheckRateLimit surface as
+// per-account limits.
+func keyToSubjectID(key netip.Prefix) (int64, error) {
+	h := fnv1a64(key.String())
+	return int64(h), nil //nolint:gosec // only used as a rate-limit subject ID
+}
+
+// fnv1a64 computes the FNV-1a 64-bit hash of s.
+func fnv1a64(s string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := range len(s) {
+		h ^= uint64(s[i])
+		h *= prime64
+	}
+	return h
+}
 }
 
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {

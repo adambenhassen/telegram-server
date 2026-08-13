@@ -101,3 +101,50 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 func (s *Store) SweepExpiredRateLimits(ctx context.Context) (int64, error) {
 	return s.q.SweepExpiredRateLimits(ctx)
 }
+
+// CheckRateLimitBudget reads the current budget for a subject/surface pair
+// without consuming a token. Returns nil when no row exists (budget not yet
+// exhausted) or when the window has expired. Returns a RateLimitResult when
+// the budget is exhausted and the window is still open.
+//
+// This is the read-only half of the check-then-charge pattern used by
+// auth.checkPassword: the limit is checked first, SRP verification runs second,
+// and a failure charge follows only on bad proofs.
+func (s *Store) CheckRateLimitBudget(ctx context.Context, subjectID int64, surface string, cfg RateLimitConfig) (*RateLimitResult, error) {
+	if !cfg.enabled() {
+		return nil, nil //nolint:nilnil // disabled config is not an error
+	}
+
+	row, err := s.q.CheckRateLimitBudget(ctx, db.CheckRateLimitBudgetParams{
+		SubjectID: subjectID,
+		Surface:   surface,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// No row — budget not exhausted.
+		return nil, nil //nolint:nilnil
+	case err != nil:
+		return nil, fmt.Errorf("check rate limit budget: %w", err)
+	}
+
+	// Row exists — check if budget is exhausted.
+	if row.ExpiresAt.Time.After(s.now()) && row.TokenCount >= int32(cfg.Limit) { //nolint:gosec // rate limits are small positive ints
+		return &RateLimitResult{Wait: waitUntil(s.now(), row.ExpiresAt.Time)}, nil
+	}
+	// Window expired or under limit — proceed.
+	return nil, nil //nolint:nilnil
+}
+
+// ChargeRateLimit charges a rate-limit counter after a failed attempt.
+// It is the write half of the check-then-charge pattern: called only after
+// a failure, so it always increments (or seeds at 1).
+func (s *Store) ChargeRateLimit(ctx context.Context, subjectID int64, surface string, cfg RateLimitConfig) error {
+	if !cfg.enabled() {
+		return nil
+	}
+	return s.q.ChargeRateLimit(ctx, db.ChargeRateLimitParams{
+		SubjectID: subjectID,
+		Surface:   surface,
+		Column3:   pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
+	})
+}

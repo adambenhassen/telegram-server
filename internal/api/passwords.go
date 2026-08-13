@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -55,10 +56,24 @@ func userTL(u store.User) *tg.User {
 // authorized (setting/changing a password), otherwise the half-authorized
 // pending user mid-login. It always includes new_algo so a client can set a new
 // password, and adds current_algo + srp_B + srp_id only when a password exists.
+//
+// For unauthenticated callers (pending state), a per-IP rate limit applies:
+// the server runs a 2048-bit modexp on every call, and unlimited calls from
+// one sendCode+signIn sequence are an unmetered CPU sink. Fully authorized
+// callers are not subject to this limit.
 func (h *handlers) handleGetPassword(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AccountGetPasswordRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
+	}
+
+	// Per-IP rate limit for unauthenticated callers only.
+	if r.UserID == 0 {
+		if rl, err := h.checkRateLimitIPBudget(r, "get_password_ip", h.rateLimitGetPasswordIP); err != nil {
+			return nil, err
+		} else if rl != nil {
+			return nil, FloodWaitError(int(rl.Wait / time.Second))
+		}
 	}
 
 	target, rpc := h.resolvePasswordUser(r)
@@ -127,6 +142,11 @@ func (h *handlers) resolvePasswordUser(r *mtproto.Request) (int64, *tgerr.Error)
 // handleCheckPassword serves auth.checkPassword: the SRP password step of a 2FA
 // login. On a valid proof it promotes the key's pending user to a full binding
 // (the authorization signIn deferred) and returns auth.Authorization.
+//
+// Rate limits are checked before SRP verification so the (N+1)th guess is
+// blocked without the cost of evaluating the proof. Both per-account and
+// per-IP limits are charged only on failed attempts — a valid proof is never
+// charged.
 func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthCheckPasswordRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -136,8 +156,39 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 	if !ok {
 		return nil, errPasswordHashInvalid
 	}
+
+	// Resolve the pending user so rate limits can key on the user id.
+	pendingUserID, rpc := h.resolvePendingUserID(r)
+	if rpc != nil {
+		return nil, rpc
+	}
+
+	// Rate limits run before SRP verification. Budget is checked (read-only)
+	// first; if over limit, FLOOD_WAIT is returned without evaluating the proof.
+	// On a failed proof, the counter is charged. On success, nothing is charged.
+	if rl, err := h.store.CheckRateLimitBudget(r.Ctx, pendingUserID, "check_password", h.rateLimitCheckPassword); err != nil {
+		h.log.Error("check password: rate limit budget", "err", err)
+		return nil, errInternal
+	} else if rl != nil {
+		return nil, FloodWaitError(int(rl.Wait / time.Second))
+	}
+	if rl, err := h.checkRateLimitIPBudget(r, "check_password_ip", h.rateLimitCheckPasswordIP); err != nil {
+		return nil, err
+	} else if rl != nil {
+		return nil, FloodWaitError(int(rl.Wait / time.Second))
+	}
+
 	userID, rpc := h.consumeAndVerify(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), proof)
 	if rpc != nil {
+		// Failed proof: charge the rate limit counters. Errors are logged but
+		// not surfaced: the client already received the password error, and a
+		// failed charge is a storage issue that does not change the outcome.
+		if err := h.store.ChargeRateLimit(r.Ctx, pendingUserID, "check_password", h.rateLimitCheckPassword); err != nil {
+			h.log.Error("check password: charge rate limit", "err", err)
+		}
+		if err := h.chargeRateLimitIP(r, "check_password_ip", h.rateLimitCheckPasswordIP); err != nil {
+			h.log.Error("check password: charge IP rate limit", "err", err)
+		}
 		return nil, rpc
 	}
 
@@ -165,6 +216,23 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 		return nil, errInternal
 	}
 	return &tg.AuthAuthorization{User: userTL(user)}, nil
+}
+
+// resolvePendingUserID resolves the user id from the pending state of the
+// auth key. Returns AUTH_KEY_UNREGISTERED when the key is not in pending state.
+func (h *handlers) resolvePendingUserID(r *mtproto.Request) (int64, *tgerr.Error) {
+	if r.UserID != 0 {
+		return r.UserID, nil
+	}
+	key, ok, err := h.store.AuthKeyByID(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID))
+	if err != nil {
+		h.log.Error("check password: lookup key", "err", err)
+		return 0, errInternal
+	}
+	if !ok || key.PendingUserID == 0 {
+		return 0, errAuthKeyUnreg
+	}
+	return key.PendingUserID, nil
 }
 
 // consumeAndVerify consumes the SRP challenge named by proof.SRPID and checks

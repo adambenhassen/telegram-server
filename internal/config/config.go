@@ -21,6 +21,14 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
+// RegistrationMode controls whether new accounts can be created via auth.signUp.
+type RegistrationMode string
+
+const (
+	RegistrationClosed RegistrationMode = "closed"
+	RegistrationOpen   RegistrationMode = "open"
+)
+
 // Config holds server configuration.
 type Config struct {
 	ListenAddr string
@@ -29,9 +37,11 @@ type Config struct {
 	AdminListenAddr string
 	// AdminTokenHash is the hex-encoded SHA-256 digest of the operator token.
 	// Only set when AdminListenAddr is non-empty.
-	AdminTokenHash string
-	PostgresDSN    string
-	RSAKeyPath     string
+	AdminTokenHash   string
+	PostgresDSN      string
+	RSAKeyPath       string
+	// RegistrationMode controls whether auth.signUp is available.
+	RegistrationMode RegistrationMode
 	// AuthKeyEncKey is the 32-byte master key that encrypts auth keys at rest.
 	//
 	// Changing it is a total re-auth event: no stored auth key opens under a new
@@ -145,14 +155,31 @@ type RateLimitsConfig struct {
 	// Keyed on the connection's address, not the identifier: only the
 	// attacker's own IP budget is consumed, never the victim's.
 	SignInFailIP store.RateLimitConfig
+	// CheckPassword limits failed auth.checkPassword attempts per account.
+	// Charged only on failed SRP proofs; a valid proof is never charged.
+	CheckPassword store.RateLimitConfig
+	// CheckPasswordIP limits failed auth.checkPassword attempts per client
+	// network. Keyed on the connection's address. Charged only on failures.
+	CheckPasswordIP store.RateLimitConfig
+	// GetPasswordIP limits account.getPassword calls per client network, but
+	// only for unauthenticated callers (pending state). A fully authorized
+	// caller is not subject to this limit. The per-call 2048-bit modexp is
+	// the cost being bounded.
+	GetPasswordIP store.RateLimitConfig
+	// SignUpIP limits auth.signUp calls per client network. Applied only when
+	// TG_REGISTRATION=open; no-op in closed mode.
+	SignUpIP store.RateLimitConfig
 }
 
 // DefaultRateLimits returns the shipped per-surface defaults: 60 sends per 60s,
 // 20 chat creates per 24h, 120 member adds per 24h, 20 channel creates per 24h,
 // 300 message searches per hour, 300 contacts searches per hour, 300 global
 // searches per hour, 600 upload parts per 60s, per client network 10 sendCode
-// calls per hour across at most 20 distinct phone numbers per 24h, and 10
-// failed signIn attempts per hour per client network.
+// calls per hour across at most 20 distinct phone numbers per 24h, 10 failed
+// signIn attempts per hour per client network, 5 failed checkPassword attempts
+// per 10 min per account, 10 failed checkPassword attempts per hour per client
+// network, 20 getPassword calls per hour per client network (unauthenticated
+// callers only), and 5 signUp calls per hour per client network.
 // Zero disables enforcement for a surface.
 //
 // The upload number is the one derived rather than chosen: at the 512 KiB
@@ -176,7 +203,11 @@ func DefaultRateLimits() RateLimitsConfig {
 			Calls:  store.RateLimitConfig{Limit: 10, Window: time.Hour},
 			Phones: store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
 		},
-		SignInFailIP: store.RateLimitConfig{Limit: 10, Window: time.Hour},
+		SignInFailIP:    store.RateLimitConfig{Limit: 10, Window: time.Hour},
+		CheckPassword:   store.RateLimitConfig{Limit: 5, Window: 10 * time.Minute},
+		CheckPasswordIP: store.RateLimitConfig{Limit: 10, Window: time.Hour},
+		GetPasswordIP:   store.RateLimitConfig{Limit: 20, Window: time.Hour},
+		SignUpIP:        store.RateLimitConfig{Limit: 5, Window: time.Hour},
 	}
 }
 
@@ -204,6 +235,8 @@ func Load(log *slog.Logger) (Config, error) {
 		UploadPartTTL:       6 * time.Hour,
 
 		MaxConnsPerUnboundKey: mtproto.DefaultMaxConnsPerUnboundKey,
+
+		RegistrationMode: RegistrationClosed,
 	}
 	if v := os.Getenv("TG_DC_ID"); v != "" {
 		id, err := strconv.Atoi(v)
@@ -252,6 +285,8 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.LogLoginCodes = on
 	}
+	// TG_REGISTRATION resolves the registration mode.
+	cfg.RegistrationMode = registrationMode(os.Getenv("TG_REGISTRATION"))
 	// Zero or unset disables enforcement for a surface; the numbers and why they
 	// are those numbers are on DefaultRateLimits.
 	cfg.RateLimits = DefaultRateLimits()
@@ -394,6 +429,66 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_RATE_LIMIT_SEND_CODE_IP_PHONES_WINDOW must be a duration")
 		}
 		cfg.RateLimits.SendCodeIP.Phones.Window = d
+	}
+	// CheckPassword per-account rate limit.
+	if v := os.Getenv("TG_RATE_LIMIT_CHECK_PASSWORD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_CHECK_PASSWORD must be an integer")
+		}
+		cfg.RateLimits.CheckPassword.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_CHECK_PASSWORD_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_CHECK_PASSWORD_WINDOW must be a duration")
+		}
+		cfg.RateLimits.CheckPassword.Window = d
+	}
+	// CheckPassword per-IP rate limit.
+	if v := os.Getenv("TG_RATE_LIMIT_CHECK_PASSWORD_IP"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_CHECK_PASSWORD_IP must be an integer")
+		}
+		cfg.RateLimits.CheckPasswordIP.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_CHECK_PASSWORD_IP_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_CHECK_PASSWORD_IP_WINDOW must be a duration")
+		}
+		cfg.RateLimits.CheckPasswordIP.Window = d
+	}
+	// GetPassword per-IP rate limit (unauthenticated callers only).
+	if v := os.Getenv("TG_RATE_LIMIT_GET_PASSWORD_IP"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_PASSWORD_IP must be an integer")
+		}
+		cfg.RateLimits.GetPasswordIP.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_PASSWORD_IP_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_PASSWORD_IP_WINDOW must be a duration")
+		}
+		cfg.RateLimits.GetPasswordIP.Window = d
+	}
+	// SignUp per-IP rate limit (open mode only).
+	if v := os.Getenv("TG_RATE_LIMIT_SIGN_UP_IP"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SIGN_UP_IP must be an integer")
+		}
+		cfg.RateLimits.SignUpIP.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_SIGN_UP_IP_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_SIGN_UP_IP_WINDOW must be a duration")
+		}
+		cfg.RateLimits.SignUpIP.Window = d
 	}
 	preAuth, err := preAuthLimits()
 	if err != nil {
@@ -637,7 +732,9 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 // collapsing into one bucket refuses handshakes server-wide, which is every
 // client at once and looks like an outage rather than a limit.
 func (c Config) WarnClientAddrTrust(log *slog.Logger) {
-	perIPLimits := c.RateLimits.SendCodeIP.Enabled() || c.RateLimits.SignInFailIP.Enabled() || c.PreAuth.MaxConnsPerNet > 0
+	perIPLimits := c.RateLimits.SendCodeIP.Enabled() || c.RateLimits.SignInFailIP.Enabled() ||
+		c.RateLimits.CheckPasswordIP.Enabled() || c.RateLimits.GetPasswordIP.Enabled() ||
+		c.RateLimits.SignUpIP.Enabled() || c.PreAuth.MaxConnsPerNet > 0
 	if c.ClientAddrTrust != ClientAddrSocket || !perIPLimits {
 		return
 	}
@@ -891,4 +988,30 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// registrationMode resolves the registration mode from the env var. Unset or
+// empty string produces the closed mode, so registration stays disabled by
+// default until the operator opts in with a recognized value.
+func registrationMode(raw string) RegistrationMode {
+	switch {
+	case raw == "":
+		return RegistrationClosed
+	case RegistrationMode(raw) == RegistrationClosed:
+		return RegistrationClosed
+	case RegistrationMode(raw) == RegistrationOpen:
+		return RegistrationOpen
+	}
+	return RegistrationMode(raw)
+}
+
+// ValidateRegistrationMode checks that the registration mode is one of the
+// recognized values. It is called after Load to fail the start when an
+// operator names a mode this build does not implement.
+func (c Config) ValidateRegistrationMode() error {
+	switch c.RegistrationMode {
+	case RegistrationClosed, RegistrationOpen:
+		return nil
+	}
+	return fmt.Errorf("TG_REGISTRATION must be unset, %q, or %q; got %q", RegistrationClosed, RegistrationOpen, c.RegistrationMode)
 }
