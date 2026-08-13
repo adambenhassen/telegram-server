@@ -43,6 +43,9 @@ UPDATE users SET is_online = $2, last_seen_at = now() WHERE id = $1;
 -- name: SetUsername :execrows
 UPDATE users SET username = $2 WHERE id = $1;
 
+-- name: GetUserLoginMode :one
+SELECT login_mode FROM users WHERE id = sqlc.arg(id);
+
 -- name: SearchContactsByName :many
 -- Search users by name within the caller's existing dialogs.
 -- Only users with whom the caller has exchanged messages (has a dialog row) are returned.

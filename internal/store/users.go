@@ -23,6 +23,10 @@ var ErrUsernameOccupied = errors.New("username occupied")
 // username change rate limit.
 var ErrUsernameFloodWait = errors.New("username change flood wait")
 
+// ErrUsernameIsLoginCredential is returned when the caller's handle is their
+// login credential (login_mode='username'), so it cannot be changed or released.
+var ErrUsernameIsLoginCredential = errors.New("username is login credential")
+
 // UsernameChangeWindow is the rolling window for the per-account username
 // change rate limit.
 const UsernameChangeWindow = 24 * time.Hour
@@ -249,6 +253,17 @@ func (s *Store) UpdateUsername(ctx context.Context, userID int64, username strin
 	}
 
 	qtx := s.q.WithTx(tx)
+
+	// Block username changes for accounts whose handle is the login credential.
+	// This guard lives in the store, not the handler, so M16 and any future
+	// caller cannot bypass it.
+	loginMode, err := qtx.GetUserLoginMode(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("get login mode: %w", err)
+	}
+	if loginMode == "username" {
+		return ErrUsernameIsLoginCredential
+	}
 
 	// Prune expired rows before counting.
 	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-UsernameChangeWindow), Valid: true}
