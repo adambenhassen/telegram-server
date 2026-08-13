@@ -187,3 +187,28 @@ type UsernameResolution struct {
 	User    User
 	Channel Channel
 }
+
+// UserByUsernameWithLoginModeResult carries the fields needed to decide the
+// username-mode signIn path: user identity and login_mode.
+type UserByUsernameWithLoginModeResult struct {
+	ID        int64
+	FirstName string
+	LastName  string
+	LoginMode string
+}
+
+func (s *Store) UserByUsernameWithLoginMode(ctx context.Context, handle string) (UserByUsernameWithLoginModeResult, bool, error) {
+	row, err := s.q.GetUserByUsernameWithLoginMode(ctx, handle)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return UserByUsernameWithLoginModeResult{}, false, nil
+	case err != nil:
+		return UserByUsernameWithLoginModeResult{}, false, fmt.Errorf("user by username with login mode: %w", err)
+	}
+	return UserByUsernameWithLoginModeResult{
+		ID:        row.ID,
+		FirstName: row.FirstName,
+		LastName:  row.LastName,
+		LoginMode: row.LoginMode,
+	}, true, nil
+}

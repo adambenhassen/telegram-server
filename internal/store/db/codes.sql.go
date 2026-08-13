@@ -80,6 +80,41 @@ func (q *Queries) GetCodeByHash(ctx context.Context, codeHash string) (PhoneCode
 	return i, err
 }
 
+const getCodeByHashAndPhone = `-- name: GetCodeByHashAndPhone :one
+SELECT code_hash, phone, consumed_at, expires_at, attempts FROM phone_codes
+WHERE code_hash = $1 AND phone = $2
+`
+
+type GetCodeByHashAndPhoneParams struct {
+	CodeHash string
+	Phone    string
+}
+
+type GetCodeByHashAndPhoneRow struct {
+	CodeHash   string
+	Phone      string
+	ConsumedAt pgtype.Timestamptz
+	ExpiresAt  pgtype.Timestamptz
+	Attempts   int32
+}
+
+// Looks up a code row by hash AND phone binding. Used by username-mode signIn
+// to validate the hash alone (without the code value) while confirming the hash
+// was issued for the expected identifier. Returns only the columns needed for
+// the hash validity check.
+func (q *Queries) GetCodeByHashAndPhone(ctx context.Context, arg GetCodeByHashAndPhoneParams) (GetCodeByHashAndPhoneRow, error) {
+	row := q.db.QueryRow(ctx, getCodeByHashAndPhone, arg.CodeHash, arg.Phone)
+	var i GetCodeByHashAndPhoneRow
+	err := row.Scan(
+		&i.CodeHash,
+		&i.Phone,
+		&i.ConsumedAt,
+		&i.ExpiresAt,
+		&i.Attempts,
+	)
+	return i, err
+}
+
 const getLatestCode = `-- name: GetLatestCode :one
 SELECT phone, code_hash, code, expires_at, attempts, consumed_at, created_at, id FROM phone_codes
 WHERE phone = $1
