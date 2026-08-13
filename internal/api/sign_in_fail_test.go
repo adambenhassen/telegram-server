@@ -356,4 +356,35 @@ func TestSignInFailIPAndSendCodeIndependent(t *testing.T) {
 	if isFloodWait(err) {
 		t.Fatalf("sendCode after signIn-fail exhaustion: unexpected FLOOD_WAIT, got %v", err)
 	}
+
+	// Reverse direction: exhaust sendCode budget with a one-call limit, then
+	// prove signIn still works (the sendCode budget does not spend signIn budget).
+	sendCodeCfg := store.SendCodeIPLimits{
+		Calls: store.RateLimitConfig{Limit: 1, Window: 10 * time.Second},
+	}
+	_, err = api.SendCodeForTest(s, addr, sendCodeCfg, "+15551296503")
+	if isFloodWait(err) {
+		t.Fatalf("first sendCode: unexpected FLOOD_WAIT, got %v", err)
+	}
+	_, err = api.SendCodeForTest(s, addr, sendCodeCfg, "+15551296504")
+	if !isFloodWait(err) {
+		t.Fatalf("second sendCode: expected FLOOD_WAIT (sendCode budget exhausted), got %v", err)
+	}
+
+	// signIn from the same IP should still work — sendCode exhaustion is
+	// independent of signIn-fail budget. Use a fresh config with a higher limit
+	// so the signIn-fail budget is not exhausted by the earlier wrong guess.
+	freshCfg := store.RateLimitConfig{Limit: 10, Window: 10 * time.Second}
+	hash2, _, err := s.IssueCode(ctx, "+15551296505")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, freshCfg, &tg.AuthSignInRequest{
+		PhoneNumber:   "+15551296505",
+		PhoneCodeHash: hash2,
+		PhoneCode:     "00000",
+	})
+	if isFloodWait(err) {
+		t.Fatalf("signIn after sendCode exhaustion: unexpected FLOOD_WAIT, got %v", err)
+	}
 }

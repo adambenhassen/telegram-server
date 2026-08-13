@@ -181,9 +181,11 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 		if rpc != errInternal {
 			// A failed verification charges the per-IP failure counter so an
 			// attacker cannot use multiple source addresses to get multiple
-			// budgets of guesses against the same identifier.
+			// budgets of guesses against the same identifier. Fail closed if
+			// the charge fails: an unmetered guess reopens the brute-force gate.
 			if chargeErr := h.chargeSignInFailIP(r); chargeErr != nil {
 				h.log.Error("sign in fail: charge counter", "err", chargeErr)
+				return nil, errInternal
 			}
 			return nil, rpc
 		}
