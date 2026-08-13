@@ -28,13 +28,6 @@ ON CONFLICT (ip_key) DO UPDATE SET
 WHERE sign_in_fail_calls.expires_at <= now()
    OR sign_in_fail_calls.token_count < $3;
 
--- name: GetSignInFailCallExpiry :one
--- Read the expiry deadline of a key's current window, for the wait a denied
--- attempt is told to observe.
-SELECT expires_at
-FROM sign_in_fail_calls
-WHERE ip_key = $1;
-
 -- name: SweepExpiredSignInFailCalls :execrows
 -- Delete counter rows whose window has closed.
 DELETE FROM sign_in_fail_calls

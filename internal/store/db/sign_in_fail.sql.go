@@ -67,21 +67,6 @@ func (q *Queries) CheckSignInFailBudget(ctx context.Context, ipKey netip.Prefix)
 	return i, err
 }
 
-const getSignInFailCallExpiry = `-- name: GetSignInFailCallExpiry :one
-SELECT expires_at
-FROM sign_in_fail_calls
-WHERE ip_key = $1
-`
-
-// Read the expiry deadline of a key's current window, for the wait a denied
-// attempt is told to observe.
-func (q *Queries) GetSignInFailCallExpiry(ctx context.Context, ipKey netip.Prefix) (pgtype.Timestamptz, error) {
-	row := q.db.QueryRow(ctx, getSignInFailCallExpiry, ipKey)
-	var expires_at pgtype.Timestamptz
-	err := row.Scan(&expires_at)
-	return expires_at, err
-}
-
 const sweepExpiredSignInFailCalls = `-- name: SweepExpiredSignInFailCalls :execrows
 DELETE FROM sign_in_fail_calls
 WHERE expires_at <= now()
