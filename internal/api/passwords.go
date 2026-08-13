@@ -213,7 +213,11 @@ func (h *handlers) handleUpdatePasswordSettings(r *mtproto.Request) (bin.Encoder
 	ns := req.NewSettings
 	// Check for removal early: for username-mode accounts, removing the verifier
 	// is irreversible lockout, so we reject before requiring any SRP proof.
-	if _, isRemoval := ns.NewAlgo.(*tg.PasswordKdfAlgoUnknown); isRemoval && hasCur {
+	// This check runs unconditionally — even when hasCur is false (provisional
+	// accounts that haven't set a password yet), because PasswordKdfAlgoUnknown
+	// from a provisional account would otherwise reach the switch and call
+	// DeletePassword on a non-existent row (a no-op but wrong semantics).
+	if _, isRemoval := ns.NewAlgo.(*tg.PasswordKdfAlgoUnknown); isRemoval {
 		loginMode, err := h.store.UserLoginMode(r.Ctx, r.UserID)
 		if err != nil {
 			h.log.Error("update password: lookup login mode", "user_id", r.UserID, "err", err)

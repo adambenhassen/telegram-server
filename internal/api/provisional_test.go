@@ -472,3 +472,100 @@ func TestUsernameModeLoginModeCheckBeforeSRPProof(t *testing.T) {
 		t.Error("password should still exist after rejected removal")
 	}
 }
+
+func TestProvisionalGateBlocksResetAuthorization(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	// Create a username-mode user without a verifier (provisional).
+	user, err := s.CreateUsernameUser(ctx, "resetuser", "Reset", "User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimUsernameForTest(s, user.ID, "resetuser"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save and bind the auth key.
+	if err := s.SaveAuthKey(ctx, int64(0x8), make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindAuthKeyUser(ctx, int64(0x8), user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// resetAuthorization is registered via registerRevoke, not register.
+	// The gate must still apply because registerRevoke now includes the gate.
+	req := &mtproto.Request{
+		Ctx:         ctx,
+		UserID:      user.ID,
+		Provisional: true,
+		AuthKeyID:   [8]byte{8},
+	}
+	err = api.ProvisionalGateBlocked(uint32(tg.AccountResetAuthorizationRequestTypeID), req)
+	if err == nil {
+		t.Fatal("gate did not block resetAuthorization for provisional session")
+	}
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) {
+		t.Fatalf("expected RPC error, got %v", err)
+	}
+	if rpc.Code != 401 || rpc.Message != "AUTH_KEY_UNREGISTERED" {
+		t.Fatalf("got %d %s, want 401 AUTH_KEY_UNREGISTERED", rpc.Code, rpc.Message)
+	}
+}
+
+func TestProvisionalAccountCannotRemovePassword(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	// Create a username-mode user WITHOUT a verifier (provisional).
+	user, err := s.CreateUsernameUser(ctx, "provremove", "Prov", "Remove")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimUsernameForTest(s, user.ID, "provremove"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the session is provisional.
+	if err := s.SaveAuthKey(ctx, int64(0x9), make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindAuthKeyUser(ctx, int64(0x9), user.ID); err != nil {
+		t.Fatal(err)
+	}
+	key, ok, err := s.AuthKeyByID(ctx, int64(0x9))
+	if err != nil || !ok {
+		t.Fatalf("AuthKeyByID: ok=%v err=%v", ok, err)
+	}
+	if !key.Provisional {
+		t.Fatal("expected provisional session")
+	}
+
+	// A provisional account sending PasswordKdfAlgoUnknown must be rejected
+	// even though hasCur is false (no password to remove).
+	var buf bin.Buffer
+	req := &tg.AccountUpdatePasswordSettingsRequest{
+		Password: &tg.InputCheckPasswordEmpty{},
+		NewSettings: tg.AccountPasswordInputSettings{
+			NewAlgo: &tg.PasswordKdfAlgoUnknown{},
+		},
+	}
+	if err := req.Encode(&buf); err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.UpdatePasswordSettingsForTest(s, user.ID, &buf)
+	if err == nil {
+		t.Fatal("expected error when provisional account attempts password removal")
+	}
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) {
+		t.Fatalf("expected RPC error, got %v", err)
+	}
+	if rpc.Code != 400 {
+		t.Errorf("expected 400 error, got %d", rpc.Code)
+	}
+}

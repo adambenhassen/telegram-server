@@ -45,3 +45,14 @@ func (h *handlers) handleUnknown(_ *mtproto.Conn, req *mtproto.Request) error {
 	)
 	return errMethodNotImpl
 }
+
+// handleUnknownGated is the fallback handler that applies the provisional gate
+// before delegating to handleUnknown. Unregistered methods are not in the
+// allow-list by definition, so a provisional session gets AUTH_KEY_UNREGISTERED
+// instead of INPUT_METHOD_INVALID.
+func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) error {
+	if req.UserID != 0 && req.Provisional {
+		return c.SendErr(req, errAuthKeyUnreg)
+	}
+	return h.handleUnknown(c, req)
+}
