@@ -436,6 +436,64 @@ func TestUpdateUsernameRollbackOnFloodWait(t *testing.T) {
 	}
 }
 
+func TestUpdateUsernameRejectsLoginCredential(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	u, err := s.CreateUsernameUser(ctx, "creduser1", "Cred", "User")
+	if err != nil {
+		t.Fatalf("create username user: %v", err)
+	}
+
+	// Seed the initial username directly (bypassing the guard so the test can
+	// start with a valid handle already claimed).
+	if _, err := store.StorePool(s).Exec(ctx,
+		"INSERT INTO usernames (handle, owner_type, owner_id) VALUES ($1, $2, $3)",
+		"creduser1", "user", u.ID); err != nil {
+		t.Fatalf("seed username: %v", err)
+	}
+
+	// Attempt to change the username — should be rejected.
+	err = s.UpdateUsername(ctx, u.ID, "newhandle")
+	if !errors.Is(err, store.ErrUsernameIsLoginCredential) {
+		t.Fatalf("expected ErrUsernameIsLoginCredential, got %v", err)
+	}
+
+	// Attempt to clear the username — also rejected.
+	err = s.UpdateUsername(ctx, u.ID, "")
+	if !errors.Is(err, store.ErrUsernameIsLoginCredential) {
+		t.Fatalf("expected ErrUsernameIsLoginCredential on clear, got %v", err)
+	}
+
+	// Username should still be "creduser1".
+	usr, ok, err := s.UserByID(ctx, u.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok=%v err=%v", ok, err)
+	}
+	if usr.Username == nil || *usr.Username != "creduser1" {
+		t.Fatalf("username = %v, want creduser1", usr.Username)
+	}
+}
+
+func TestUpdateUsernameAllowsPhoneMode(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	u1 := mustUser(t, s, "+15551260161")
+	u2 := mustUser(t, s, "+15551260162")
+
+	// Phone-mode user can change username freely.
+	if err := s.UpdateUsername(ctx, u1.ID, "phoneuser1"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// Use a second user to avoid rate limit.
+	if err := s.UpdateUsername(ctx, u2.ID, "phoneuser2"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+}
+
 // --- CreateUsernameUser tests ---
 
 func TestCreateUsernameUserReturnsUsernameMode(t *testing.T) {

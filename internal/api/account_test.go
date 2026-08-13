@@ -654,3 +654,40 @@ func TestUpdateUsernameReservedAll(t *testing.T) {
 		}
 	}
 }
+
+// TestUpdateUsernameLoginCredentialReject proves a login_mode='username' account
+// cannot change or clear its handle — the RPC returns USERNAME_NOT_MODIFIED.
+func TestUpdateUsernameLoginCredentialReject(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+
+	u, err := s.CreateUsernameUser(ctx, "creduser", "Cred", "User")
+	if err != nil {
+		t.Fatalf("create username user: %v", err)
+	}
+
+	// Seed the initial username directly (bypassing the guard so the test can
+	// start with a valid handle already claimed).
+	execDB(t, dsn, `INSERT INTO usernames (handle, owner_type, owner_id) VALUES ($1, $2, $3)`,
+		"creduser", "user", u.ID)
+
+	// Attempt to change — should be rejected with USERNAME_NOT_MODIFIED.
+	_, err = api.UpdateUsernameForTest(s, u.ID, "newhandle")
+	if err == nil {
+		t.Fatal("expected error for login credential change")
+	}
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) || rpc.Message != "USERNAME_NOT_MODIFIED" {
+		t.Fatalf("error = %v, want USERNAME_NOT_MODIFIED", err)
+	}
+
+	// Attempt to clear — also rejected.
+	_, err = api.UpdateUsernameForTest(s, u.ID, "")
+	if err == nil {
+		t.Fatal("expected error for login credential clear")
+	}
+	if !errors.As(err, &rpc) || rpc.Message != "USERNAME_NOT_MODIFIED" {
+		t.Fatalf("error = %v, want USERNAME_NOT_MODIFIED", err)
+	}
+}

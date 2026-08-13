@@ -95,6 +95,17 @@ func (q *Queries) CreateUsernameUser(ctx context.Context, arg CreateUsernameUser
 	return i, err
 }
 
+const getUserLoginMode = `-- name: GetUserLoginMode :one
+SELECT login_mode FROM users WHERE id = $1
+`
+
+func (q *Queries) GetUserLoginMode(ctx context.Context, id int64) (string, error) {
+	row := q.db.QueryRow(ctx, getUserLoginMode, id)
+	var login_mode string
+	err := row.Scan(&login_mode)
+	return login_mode, err
+}
+
 const searchContactsByName = `-- name: SearchContactsByName :many
 WITH matched AS MATERIALIZED (
     SELECT tu.id
