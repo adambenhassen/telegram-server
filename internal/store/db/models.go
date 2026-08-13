@@ -238,7 +238,7 @@ type UploadPart struct {
 
 type User struct {
 	ID         int64
-	Phone      string
+	Phone      *string
 	FirstName  string
 	LastName   string
 	CreatedAt  pgtype.Timestamptz
@@ -246,6 +246,7 @@ type User struct {
 	LastSeenAt pgtype.Timestamptz
 	Username   *string
 	NameTsv    interface{}
+	LoginMode  string
 }
 
 type UserPassword struct {

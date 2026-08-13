@@ -15,7 +15,7 @@ const createUser = `-- name: CreateUser :one
 
 WITH upserted AS (
     INSERT INTO users (phone) VALUES ($1)
-    ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
+    ON CONFLICT (phone) WHERE phone IS NOT NULL DO UPDATE SET phone = EXCLUDED.phone
     RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at
 )
 SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
@@ -26,7 +26,7 @@ LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 
 type CreateUserRow struct {
 	ID         int64
-	Phone      string
+	Phone      *string
 	FirstName  string
 	LastName   string
 	CreatedAt  pgtype.Timestamptz
@@ -43,7 +43,7 @@ type CreateUserRow struct {
 // is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
 // user lookup against 200k handles, so the hot per-peer read pays an index
 // probe rather than the copy's zero.
-func (q *Queries) CreateUser(ctx context.Context, phone string) (CreateUserRow, error) {
+func (q *Queries) CreateUser(ctx context.Context, phone *string) (CreateUserRow, error) {
 	row := q.db.QueryRow(ctx, createUser, phone)
 	var i CreateUserRow
 	err := row.Scan(
@@ -55,6 +55,42 @@ func (q *Queries) CreateUser(ctx context.Context, phone string) (CreateUserRow, 
 		&i.IsOnline,
 		&i.LastSeenAt,
 		&i.Username,
+	)
+	return i, err
+}
+
+const createUsernameUser = `-- name: CreateUsernameUser :one
+INSERT INTO users (phone, login_mode, first_name, last_name)
+VALUES (NULL, 'username', $1, $2)
+RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at
+`
+
+type CreateUsernameUserParams struct {
+	FirstName string
+	LastName  string
+}
+
+type CreateUsernameUserRow struct {
+	ID         int64
+	Phone      *string
+	FirstName  string
+	LastName   string
+	CreatedAt  pgtype.Timestamptz
+	IsOnline   bool
+	LastSeenAt pgtype.Timestamptz
+}
+
+func (q *Queries) CreateUsernameUser(ctx context.Context, arg CreateUsernameUserParams) (CreateUsernameUserRow, error) {
+	row := q.db.QueryRow(ctx, createUsernameUser, arg.FirstName, arg.LastName)
+	var i CreateUsernameUserRow
+	err := row.Scan(
+		&i.ID,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.CreatedAt,
+		&i.IsOnline,
+		&i.LastSeenAt,
 	)
 	return i, err
 }
@@ -88,7 +124,7 @@ type SearchContactsByNameParams struct {
 
 type SearchContactsByNameRow struct {
 	ID         int64
-	Phone      string
+	Phone      *string
 	FirstName  string
 	LastName   string
 	CreatedAt  pgtype.Timestamptz
@@ -216,7 +252,7 @@ WHERE u.id = $1
 
 type UserByIDRow struct {
 	ID         int64
-	Phone      string
+	Phone      *string
 	FirstName  string
 	LastName   string
 	CreatedAt  pgtype.Timestamptz
@@ -251,7 +287,7 @@ WHERE u.phone = $1
 
 type UserByPhoneRow struct {
 	ID         int64
-	Phone      string
+	Phone      *string
 	FirstName  string
 	LastName   string
 	CreatedAt  pgtype.Timestamptz
@@ -260,7 +296,7 @@ type UserByPhoneRow struct {
 	Username   *string
 }
 
-func (q *Queries) UserByPhone(ctx context.Context, phone string) (UserByPhoneRow, error) {
+func (q *Queries) UserByPhone(ctx context.Context, phone *string) (UserByPhoneRow, error) {
 	row := q.db.QueryRow(ctx, userByPhone, phone)
 	var i UserByPhoneRow
 	err := row.Scan(

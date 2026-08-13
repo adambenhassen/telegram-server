@@ -10,13 +10,18 @@
 -- name: CreateUser :one
 WITH upserted AS (
     INSERT INTO users (phone) VALUES ($1)
-    ON CONFLICT (phone) DO UPDATE SET phone = EXCLUDED.phone
+    ON CONFLICT (phone) WHERE phone IS NOT NULL DO UPDATE SET phone = EXCLUDED.phone
     RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at
 )
 SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
        un.handle AS username
 FROM upserted u
 LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id;
+
+-- name: CreateUsernameUser :one
+INSERT INTO users (phone, login_mode, first_name, last_name)
+VALUES (NULL, 'username', $1, $2)
+RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at;
 
 -- name: UserByPhone :one
 SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
