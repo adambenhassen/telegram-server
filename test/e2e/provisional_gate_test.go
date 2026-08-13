@@ -168,6 +168,17 @@ func TestProvisionalGateProbe(t *testing.T) {
 		default:
 			t.Log("account.resetAuthorization blocked as expected")
 		}
+
+		// help.getNearestDc — not registered on the server (handled by fallback).
+		// The handleUnknownGated fallback must still apply the gate and return
+		// AUTH_KEY_UNREGISTERED rather than INPUT_METHOD_INVALID.
+		if _, err := raw.HelpGetNearestDC(ctx); err == nil {
+			t.Error("help.getNearestDc: expected gate to reject, got success")
+		} else if !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
+			t.Errorf("help.getNearestDc: err = %v, want AUTH_KEY_UNREGISTERED", err)
+		} else {
+			t.Log("help.getNearestDc blocked as expected")
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("run: %v", err)

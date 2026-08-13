@@ -84,25 +84,17 @@ func TestProvisionalGateBlocksNonAllowListedMethod(t *testing.T) {
 		t.Fatal("expected provisional session")
 	}
 
-	// Test the gate logic end-to-end: the register wrapper returns
-	// errAuthKeyUnreg when UserID != 0 && Provisional && !allowList[id].
-	// This is the exact condition the register function checks.
+	// The gate predicate is the same function called by registerRevoke and
+	// handleUnknownGated — not a copy. If the gate is removed from either
+	// site, this test still asserts the predicate that both sites call.
 	req := &mtproto.Request{
 		Ctx:         ctx,
 		UserID:      user.ID,
 		Provisional: true,
 		AuthKeyID:   [8]byte{1},
 	}
-	err = api.ProvisionalGateBlocked(uint32(tg.MessagesSendMessageRequestTypeID), req)
-	if err == nil {
+	if !api.ProvisionalBlocked(uint32(tg.MessagesSendMessageRequestTypeID), req) {
 		t.Fatal("gate did not block sendMessage for provisional session")
-	}
-	var rpc *tgerr.Error
-	if !errors.As(err, &rpc) {
-		t.Fatalf("expected RPC error, got %v", err)
-	}
-	if rpc.Code != 401 || rpc.Message != "AUTH_KEY_UNREGISTERED" {
-		t.Fatalf("got %d %s, want 401 AUTH_KEY_UNREGISTERED", rpc.Code, rpc.Message)
 	}
 }
 
@@ -135,7 +127,7 @@ func TestProvisionalGateAllowsAllowListedMethods(t *testing.T) {
 		AuthKeyID:   [8]byte{2},
 	}
 
-	// All four allow-listed methods must not be blocked.
+	// All four allow-listed methods must not be blocked by the gate predicate.
 	allowed := []uint32{
 		uint32(tg.HelpGetConfigRequestTypeID),
 		uint32(tg.AccountGetPasswordRequestTypeID),
@@ -143,8 +135,8 @@ func TestProvisionalGateAllowsAllowListedMethods(t *testing.T) {
 		uint32(tg.AuthLogOutRequestTypeID),
 	}
 	for _, id := range allowed {
-		if err := api.ProvisionalGateBlocked(id, req); err != nil {
-			t.Errorf("gate blocked allow-listed method %#x: %v", id, err)
+		if api.ProvisionalBlocked(id, req) {
+			t.Errorf("gate blocked allow-listed method %#x", id)
 		}
 	}
 }
@@ -157,9 +149,8 @@ func TestProvisionalGateDoesNotApplyToUnauthenticated(t *testing.T) {
 		UserID:      0,
 		Provisional: true,
 	}
-	err := api.ProvisionalGateBlocked(uint32(tg.MessagesSendMessageRequestTypeID), req)
-	if err != nil {
-		t.Fatalf("gate blocked unauthenticated request: %v", err)
+	if api.ProvisionalBlocked(uint32(tg.MessagesSendMessageRequestTypeID), req) {
+		t.Fatal("gate blocked unauthenticated request")
 	}
 }
 
@@ -334,8 +325,8 @@ func TestProvisionalGateLiftsAfterSettingVerifier(t *testing.T) {
 		Provisional: false,
 		AuthKeyID:   [8]byte{5},
 	}
-	if err := api.ProvisionalGateBlocked(uint32(tg.MessagesSendMessageRequestTypeID), reqAfter); err != nil {
-		t.Fatalf("sendMessage after setting verifier: gate still blocks: %v", err)
+	if api.ProvisionalBlocked(uint32(tg.MessagesSendMessageRequestTypeID), reqAfter) {
+		t.Fatal("sendMessage after setting verifier: gate still blocks")
 	}
 }
 
@@ -499,23 +490,15 @@ func TestProvisionalGateBlocksResetAuthorization(t *testing.T) {
 	}
 
 	// resetAuthorization is registered via registerRevoke, not register.
-	// The gate must still apply because registerRevoke now includes the gate.
+	// The gate must still apply because registerRevoke calls provisionalBlocked.
 	req := &mtproto.Request{
 		Ctx:         ctx,
 		UserID:      user.ID,
 		Provisional: true,
 		AuthKeyID:   [8]byte{8},
 	}
-	err = api.ProvisionalGateBlocked(uint32(tg.AccountResetAuthorizationRequestTypeID), req)
-	if err == nil {
+	if !api.ProvisionalBlocked(uint32(tg.AccountResetAuthorizationRequestTypeID), req) {
 		t.Fatal("gate did not block resetAuthorization for provisional session")
-	}
-	var rpc *tgerr.Error
-	if !errors.As(err, &rpc) {
-		t.Fatalf("expected RPC error, got %v", err)
-	}
-	if rpc.Code != 401 || rpc.Message != "AUTH_KEY_UNREGISTERED" {
-		t.Fatalf("got %d %s, want 401 AUTH_KEY_UNREGISTERED", rpc.Code, rpc.Message)
 	}
 }
 
@@ -570,5 +553,42 @@ func TestProvisionalAccountCannotRemovePassword(t *testing.T) {
 	}
 	if rpc.Code != 400 {
 		t.Errorf("expected 400 error, got %d", rpc.Code)
+	}
+}
+
+func TestProvisionalGateBlocksUnimplementedMethod(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	// Create a username-mode user without a verifier (provisional).
+	user, err := s.CreateUsernameUser(ctx, "unimpluser", "Unimpl", "User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimUsernameForTest(s, user.ID, "unimpluser"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save and bind the auth key.
+	if err := s.SaveAuthKey(ctx, int64(0xa), make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindAuthKeyUser(ctx, int64(0xa), user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// handleUnknownGated is the fallback for unimplemented methods.
+	// It applies the gate for all provisional sessions (unimplemented methods
+	// are never in the allow-list). The predicate is the same function called
+	// by both registerRevoke and handleUnknownGated.
+	req := &mtproto.Request{
+		Ctx:         ctx,
+		UserID:      user.ID,
+		Provisional: true,
+		AuthKeyID:   [8]byte{10},
+	}
+	if !api.ProvisionalBlocked(tg.HelpGetNearestDCRequestTypeID, req) {
+		t.Fatal("gate did not block unimplemented method for provisional session")
 	}
 }
