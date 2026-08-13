@@ -10,10 +10,11 @@
 -- Rollback: atlas migrate down 1 drops the index, removes the code_hash
 --   uniqueness constraint, and removes the id column. Restoring the phone
 --   primary key is NOT lossless: the new schema allows multiple rows per
---   phone, and the old schema does not. Assume duplicates exist as soon as
---   the migration is deployed. To roll back safely, either wait for the
---   expiry sweep to empty the table (codes expire in 5 min) or manually
---   reconcile duplicate-phone rows before restoring the phone primary key.
+--   phone, and the old schema does not. Assume duplicate-phone rows exist
+--   as soon as the migration has been deployed for any duration. To roll
+--   back, wait for the expiry sweep to empty the phone_codes table, or
+--   manually reconcile rows sharing the same phone before restoring the
+--   phone primary key.
 
 -- Add a surrogate key for future use (sqlc models need a stable PK).
 ALTER TABLE phone_codes ADD COLUMN id BIGSERIAL;

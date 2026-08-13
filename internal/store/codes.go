@@ -22,6 +22,10 @@ const (
 	// resendCooldown is the minimum interval between issuing codes for a phone
 	// while a prior code is still active.
 	resendCooldown = 60 * time.Second
+	// issueCodeLockClass namespaces this limiter's advisory locks. Two-argument
+	// advisory locks occupy a space of their own, disjoint from the
+	// single-argument ones used elsewhere in the store.
+	issueCodeLockClass = 0x7467434f // "tgCO" (code)
 )
 
 // IssueCode generates a 5-digit login code and hash for phone, storing it with
@@ -43,7 +47,12 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	// Advisory lock on the normalized identifier serializes concurrent IssueCode
 	// calls for the same phone, preventing TOCTTOU on the cooldown check. The
 	// lock is transaction-scoped (xact) so it is released on commit or rollback.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, phone); err != nil {
+	// Two-argument form with a class constant keeps this keyspace disjoint from
+	// single-argument advisory locks used elsewhere in the store.
+	if _, err := tx.Exec(ctx,
+		"SELECT pg_advisory_xact_lock($1, hashtext($2))",
+		issueCodeLockClass, phone,
+	); err != nil {
 		return "", "", fmt.Errorf("issue code: %w", err)
 	}
 
