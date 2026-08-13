@@ -134,8 +134,8 @@ func TestVerifyCodeExpired(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	if _, err := conn.Exec(ctx,
-		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE phone = $1`,
-		store.NormalizePhone(phone),
+		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE code_hash = $1`,
+		hash,
 	); err != nil {
 		t.Fatalf("expire code: %v", err)
 	}
@@ -176,12 +176,15 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	const expiredPhone = "+15551250005"
 	const freshPhone = "+15551250006"
 
-	if _, _, err := s.IssueCode(ctx, expiredPhone); err != nil {
+	expiredHash, _, err := s.IssueCode(ctx, expiredPhone)
+	if err != nil {
 		t.Fatalf("issue expired: %v", err)
 	}
-	if _, _, err := s.IssueCode(ctx, freshPhone); err != nil {
+	freshHash, _, err := s.IssueCode(ctx, freshPhone)
+	if err != nil {
 		t.Fatalf("issue fresh: %v", err)
 	}
+	_ = freshHash
 
 	// Force the first code past its TTL via a direct connection to the same DB.
 	conn, err := pgx.Connect(ctx, dsn)
@@ -190,8 +193,8 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	if _, err := conn.Exec(ctx,
-		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE phone = $1`,
-		store.NormalizePhone(expiredPhone),
+		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE code_hash = $1`,
+		expiredHash,
 	); err != nil {
 		t.Fatalf("expire code: %v", err)
 	}
@@ -220,5 +223,144 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("fresh row should remain: count=%d", count)
+	}
+}
+
+// TestIssueCodeForUsernameIndependentRows verifies that two concurrent
+// IssueCodeForUsername calls for the same identifier return independent rows:
+// exhausting one's attempt counter via wrong codes does not affect the other.
+// The two issuances fire behind a sync barrier so they are genuinely concurrent.
+func TestIssueCodeForUsernameIndependentRows(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const username = "alice"
+
+	type result struct {
+		hash string
+		code string
+		err  error
+	}
+	var ch = make(chan result, 2)
+	ready := make(chan struct{}, 2)
+	start := make(chan struct{})
+
+	for range 2 {
+		go func() {
+			ready <- struct{}{} // signal ready
+			<-start             // wait for barrier
+			h, c, e := s.IssueCodeForUsername(ctx, username)
+			ch <- result{hash: h, code: c, err: e}
+		}()
+	}
+	// Wait for both goroutines to be ready, then release the barrier.
+	<-ready
+	<-ready
+	close(start)
+
+	rA := <-ch
+	rB := <-ch
+	if rA.err != nil {
+		t.Fatalf("issue A: %v", rA.err)
+	}
+	if rB.err != nil {
+		t.Fatalf("issue B: %v", rB.err)
+	}
+	if rA.hash == rB.hash {
+		t.Fatal("two issuances produced the same hash")
+	}
+
+	// Exhaust A's attempt counter with wrong codes.
+	badA := wrongCode(rA.code)
+	for i := range 3 {
+		if err := s.VerifyCode(ctx, username, rA.hash, badA); !errors.Is(err, store.ErrCodeInvalid) {
+			t.Fatalf("A wrong attempt %d: got %v, want ErrCodeInvalid", i+1, err)
+		}
+	}
+	// A is now exhausted.
+	if err := s.VerifyCode(ctx, username, rA.hash, rA.code); !errors.Is(err, store.ErrCodeExhausted) {
+		t.Fatalf("A post-exhaustion: got %v, want ErrCodeExhausted", err)
+	}
+
+	// B's code must still verify correctly — its attempt counter was not touched.
+	if err := s.VerifyCode(ctx, username, rB.hash, rB.code); err != nil {
+		t.Fatalf("B verify after A exhausted: %v", err)
+	}
+}
+
+// TestVerifyCodeIdentifierBinding verifies that a code_hash issued for one
+// identifier cannot be verified under a different one. Without this check,
+// an attacker who obtains a valid code for their own number can use it to
+// impersonate any victim (two RPCs, no race).
+func TestVerifyCodeIdentifierBinding(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	// Attacker issues a code for a number they control.
+	attackerHash, attackerCode, err := s.IssueCodeForUsername(ctx, "attacker")
+	if err != nil {
+		t.Fatalf("issue for attacker: %v", err)
+	}
+
+	// Attacker tries to verify under a victim's identifier.
+	if err := s.VerifyCode(ctx, "victim", attackerHash, attackerCode); !errors.Is(err, store.ErrCodeInvalid) {
+		t.Fatalf("cross-identifier verify: got %v, want ErrCodeInvalid", err)
+	}
+
+	// The attacker's code must still verify correctly under their own identifier.
+	if err := s.VerifyCode(ctx, "attacker", attackerHash, attackerCode); err != nil {
+		t.Fatalf("attacker self-verify: %v", err)
+	}
+}
+
+// TestIssueCodeConcurrentCooldown verifies that concurrent IssueCode calls
+// for the same phone are serialized by the advisory lock: exactly one succeeds
+// and every other caller gets ErrResendTooSoon.
+func TestIssueCodeConcurrentCooldown(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const phone = "+15551250010"
+
+	const n = 10
+	type result struct {
+		err error
+	}
+	var ch = make(chan result, n)
+	ready := make(chan struct{}, n)
+	start := make(chan struct{})
+
+	for range n {
+		go func() {
+			ready <- struct{}{}
+			<-start
+			_, _, e := s.IssueCode(ctx, phone)
+			ch <- result{err: e}
+		}()
+	}
+	// Wait for all goroutines to be ready, then release the barrier.
+	for range n {
+		<-ready
+	}
+	close(start)
+
+	var successes, cooldowns int
+	for range n {
+		r := <-ch
+		switch {
+		case r.err == nil:
+			successes++
+		case errors.Is(r.err, store.ErrResendTooSoon):
+			cooldowns++
+		default:
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("expected 1 success, got %d (cooldowns=%d)", successes, cooldowns)
+	}
+	if cooldowns != n-1 {
+		t.Fatalf("expected %d cooldowns, got %d (successes=%d)", n-1, cooldowns, successes)
 	}
 }
