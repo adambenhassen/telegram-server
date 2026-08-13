@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const chargeSignInFailCall = `-- name: ChargeSignInFailCall :exec
+const chargeSignInFailCall = `-- name: ChargeSignInFailCall :one
 INSERT INTO sign_in_fail_calls (ip_key, token_count, window_start, expires_at)
 VALUES ($1, 1, now(), now() + $2::INTERVAL)
 ON CONFLICT (ip_key) DO UPDATE SET
@@ -28,18 +28,31 @@ ON CONFLICT (ip_key) DO UPDATE SET
         WHEN sign_in_fail_calls.expires_at <= now() THEN now() + $2::INTERVAL
         ELSE sign_in_fail_calls.expires_at
     END
+WHERE sign_in_fail_calls.expires_at <= now()
+   OR sign_in_fail_calls.token_count < $3
+RETURNING token_count, expires_at
 `
 
 type ChargeSignInFailCallParams struct {
-	IpKey   netip.Prefix
-	Column2 pgtype.Interval
+	IpKey      netip.Prefix
+	Column2    pgtype.Interval
+	TokenCount int32
 }
 
-// Charge-only: add one token to the counter. Called only after a failed
-// VerifyCode. Upserts the row if it doesn't exist.
-func (q *Queries) ChargeSignInFailCall(ctx context.Context, arg ChargeSignInFailCallParams) error {
-	_, err := q.db.Exec(ctx, chargeSignInFailCall, arg.IpKey, arg.Column2)
-	return err
+type ChargeSignInFailCallRow struct {
+	TokenCount int32
+	ExpiresAt  pgtype.Timestamptz
+}
+
+// Conditional charge: add one token to the counter only if the budget is not
+// exhausted. Called after a failed VerifyCode. Returns pgx.ErrNoRows when the
+// window is open and at the limit — the racing request that already consumed
+// the last token wins, and the others get an error the handler fails closed on.
+func (q *Queries) ChargeSignInFailCall(ctx context.Context, arg ChargeSignInFailCallParams) (ChargeSignInFailCallRow, error) {
+	row := q.db.QueryRow(ctx, chargeSignInFailCall, arg.IpKey, arg.Column2, arg.TokenCount)
+	var i ChargeSignInFailCallRow
+	err := row.Scan(&i.TokenCount, &i.ExpiresAt)
+	return i, err
 }
 
 const checkSignInFailBudget = `-- name: CheckSignInFailBudget :one

@@ -13,22 +13,18 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
-// signInFailLockClass namespaces the advisory lock that serializes the
-// check/verify/charge sequence for a single IP. Without it, concurrent same-IP
-// requests can all pass the budget check before any charge commits, exceeding
-// the configured guess limit.
-const signInFailLockClass = 0x73696746 // "sigF"
+// ErrSignInFailBudgetExhausted is returned by ChargeSignInFailIP when the
+// conditional upsert finds the budget already at the limit. This happens when
+// concurrent requests pass the budget check simultaneously and race to charge
+// — only one wins, the rest get this error. The handler fails closed on it.
+var ErrSignInFailBudgetExhausted = errors.New("sign in fail budget exhausted")
 
 // CheckSignInFailIP reads the per-IP signIn-failure counter for addr and
-// returns a RateLimitResult when the budget is exhausted. It acquires a
-// transaction-scoped advisory lock so that concurrent same-IP requests cannot
-// race the budget check and collectively exceed the configured limit. Called
-// before VerifyCode so that even correct codes are blocked when the IP has
-// burned its failure budget.
-//
-// The advisory lock must also be acquired before VerifyCode, meaning this call
-// returns two callbacks: acquire() grabs the lock for the handler, and
-// chargeLocked charges only while holding it (to preserve per-guess exclusivity).
+// returns a RateLimitResult when the budget is exhausted. Read-only, no lock
+// acquired — the race between check and charge is handled by ChargeSignInFailIP
+// using a conditional upsert that returns pgx.ErrNoRows when the budget is
+// already at the limit. Called before VerifyCode so that even correct codes
+// are blocked when the IP has burned its failure budget.
 //
 // Returns nil (no error, no result) when the budget is not exhausted or the
 // config is disabled. Returns ErrNoClientAddr when the connection carries no
@@ -42,40 +38,15 @@ func (s *Store) CheckSignInFailIP(ctx context.Context, addr netip.Addr, cfg Rate
 		return nil, ErrNoClientAddr
 	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
-
-	if _, err := tx.Exec(ctx,
-		"SELECT pg_advisory_xact_lock($1, hashtext($2))",
-		signInFailLockClass, key.String(),
-	); err != nil {
-		return nil, fmt.Errorf("advisory lock: %w", err)
-	}
-	qtx := s.q.WithTx(tx)
-
-	row, err := qtx.CheckSignInFailBudget(ctx, key)
+	row, err := s.q.CheckSignInFailBudget(ctx, key)
 	switch {
 	case err == nil:
 		// Row exists — check if at or over the limit.
 		if int(row.TokenCount) >= cfg.Limit && row.ExpiresAt.Time.After(time.Now()) {
-			if err := tx.Commit(ctx); err != nil {
-				return nil, fmt.Errorf("commit: %w", err)
-			}
 			return &RateLimitResult{Wait: waitUntil(time.Now(), row.ExpiresAt.Time)}, nil
-		}
-		// Under limit — commit the lock transaction so the lock is released.
-		// The handler will re-acquire it via ChargeSignInFailIP.
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("commit: %w", err)
 		}
 		return nil, nil //nolint:nilnil // under limit or expired
 	case errors.Is(err, pgx.ErrNoRows):
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("commit: %w", err)
-		}
 		return nil, nil //nolint:nilnil // no row = no failures yet
 	default:
 		return nil, fmt.Errorf("check sign in fail budget: %w", err)
@@ -83,12 +54,14 @@ func (s *Store) CheckSignInFailIP(ctx context.Context, addr netip.Addr, cfg Rate
 }
 
 // ChargeSignInFailIP adds one token to the per-IP signIn-failure counter.
-// Called only after VerifyCode returns an error. Upserts the row if it does
-// not exist. Acquires the same advisory lock as CheckSignInFailIP so that
-// the charge is serialized with the budget check across concurrent same-IP
-// requests.
+// Called only after VerifyCode returns an error. Uses a conditional upsert
+// that returns pgx.ErrNoRows when the budget is already at the limit — this
+// is what prevents the race: if N concurrent requests pass the check and
+// all try to charge, only one succeeds and the rest get pgx.ErrNoRows,
+// which the handler fails closed on (INTERNAL instead of PHONE_CODE_INVALID).
 //
-// No-op when the config is disabled.
+// No-op when the config is disabled. Returns an error when the budget is
+// already exhausted (race case) or the connection has no client address.
 func (s *Store) ChargeSignInFailIP(ctx context.Context, addr netip.Addr, cfg RateLimitConfig) error {
 	if !cfg.enabled() {
 		return nil
@@ -98,28 +71,18 @@ func (s *Store) ChargeSignInFailIP(ctx context.Context, addr netip.Addr, cfg Rat
 		return ErrNoClientAddr
 	}
 
-	tx, err := s.pool.Begin(ctx)
+	_, err := s.q.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{
+		IpKey:      key,
+		Column2:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
+		TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrSignInFailBudgetExhausted
+	}
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
-
-	if _, err := tx.Exec(ctx,
-		"SELECT pg_advisory_xact_lock($1, hashtext($2))",
-		signInFailLockClass, key.String(),
-	); err != nil {
-		return fmt.Errorf("advisory lock: %w", err)
-	}
-	qtx := s.q.WithTx(tx)
-
-	if err := qtx.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{
-		IpKey:   key,
-		Column2: pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
-	}); err != nil {
 		return fmt.Errorf("charge sign in fail call: %w", err)
 	}
-
-	return tx.Commit(ctx)
+	return nil
 }
 
 // SweepExpiredSignInFailCalls deletes per-IP signIn-failure rows past their
