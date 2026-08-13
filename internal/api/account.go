@@ -166,6 +166,8 @@ func (h *handlers) handleUpdateUsername(r *mtproto.Request) (bin.Encoder, error)
 			return nil, errUsernameOccupied
 		case errors.Is(err, store.ErrUsernameFloodWait):
 			return nil, errUsernameFloodWait
+		case errors.Is(err, store.ErrUsernameIsLoginCredential):
+			return nil, errUsernameNotModified
 		default:
 			h.log.Error("update username", "user_id", r.UserID, "username", username, "err", err)
 			return nil, errInternal
