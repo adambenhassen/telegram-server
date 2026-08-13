@@ -150,11 +150,10 @@ func run(log *slog.Logger) error {
 		}
 	}()
 
-	// Start the admin HTTP server on a separate listener. It serves read-only
-	// operational metrics at GET /admin/metrics behind token auth.
+	// Start the admin HTTP server on a separate listener. All paths behind the
+	// RequireAdmin stub return 401; handlers are wired after auth is complete.
 	if cfg.AdminListenAddr != "" {
 		adminSubMux := http.NewServeMux()
-		adminSubMux.HandleFunc("/admin/metrics", admin.Handler(server.Registry(), st))
 		adminHandler := http.NewServeMux()
 		adminHandler.Handle("/admin/", admin.RequireAdmin(cfg.AdminTokenHash)(adminSubMux))
 		adminSrv := &http.Server{

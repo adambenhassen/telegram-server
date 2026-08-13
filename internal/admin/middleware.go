@@ -2,6 +2,7 @@ package admin
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"net/http"
 )
@@ -20,7 +21,7 @@ func RequireAdmin(tokenHash string) func(http.Handler) http.Handler {
 				return
 			}
 			digest := sha256.Sum256([]byte(token))
-			if hex.EncodeToString(digest[:]) != tokenHash {
+			if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(digest[:])), []byte(tokenHash)) != 1 {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
