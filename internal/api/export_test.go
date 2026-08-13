@@ -274,7 +274,7 @@ func LoadChatsForTest(s *store.Store, ids []int64, viewerID int64) ([]tg.ChatCla
 	for _, id := range ids {
 		set[id] = true
 	}
-	return testHandlers(s).loadChats(context.Background(), set, viewerID)
+	return testHandlers(s).loadChats(context.Background(), set, viewerID, nil)
 }
 
 // LoadChannelsForTest exposes loadChannels for the external api_test package.
