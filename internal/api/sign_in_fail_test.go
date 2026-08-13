@@ -389,9 +389,9 @@ func TestSignInFailIPAndSendCodeIndependent(t *testing.T) {
 	}
 }
 
-// TestSignInFailCorrectCodeRefunded proves the reserve-and-refund model:
-// a correct code from a non-exhausted IP succeeds and the token_count is
-// unchanged after refund (net zero charge on success).
+// TestSignInFailCorrectCodeRefunded proves that a correct code does not
+// charge the failure counter: after a successful sign-in, a subsequent
+// wrong guess is still allowed (budget not consumed by the success).
 func TestSignInFailCorrectCodeRefunded(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

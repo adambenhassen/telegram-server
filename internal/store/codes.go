@@ -136,7 +136,13 @@ func (s *Store) IssueCodeForUsername(ctx context.Context, username string) (stri
 // correct hash charges an attempt. The attempt that reaches maxAttempts exhausts
 // the code.
 func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error {
-	row, err := s.q.GetCodeByHash(ctx, hash)
+	return s.verifyCodeWith(ctx, s.q, phone, hash, code)
+}
+
+// verifyCodeWith is the body of VerifyCode, parameterized on the queries
+// interface so it can be called within a transaction.
+func (s *Store) verifyCodeWith(ctx context.Context, q *db.Queries, phone, hash, code string) error {
+	row, err := q.GetCodeByHash(ctx, hash)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return ErrCodeInvalid
@@ -162,12 +168,12 @@ func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error 
 		return ErrCodeExhausted
 	}
 	if hash != row.CodeHash || code != row.Code {
-		if err := s.q.IncrementCodeAttempts(ctx, hash); err != nil {
+		if err := q.IncrementCodeAttempts(ctx, hash); err != nil {
 			return fmt.Errorf("verify code: %w", err)
 		}
 		return ErrCodeInvalid
 	}
-	rows, err := s.q.ConsumeCode(ctx, db.ConsumeCodeParams{
+	rows, err := q.ConsumeCode(ctx, db.ConsumeCodeParams{
 		Phone:    phone,
 		CodeHash: hash,
 		Code:     code,

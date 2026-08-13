@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const chargeSignInFailCall = `-- name: ChargeSignInFailCall :one
+const chargeSignInFailCall = `-- name: ChargeSignInFailCall :exec
 INSERT INTO sign_in_fail_calls (ip_key, token_count, window_start, expires_at)
 VALUES ($1, 1, now(), now() + $2::INTERVAL)
 ON CONFLICT (ip_key) DO UPDATE SET
@@ -30,7 +30,6 @@ ON CONFLICT (ip_key) DO UPDATE SET
     END
 WHERE sign_in_fail_calls.expires_at <= now()
    OR sign_in_fail_calls.token_count < $3
-RETURNING token_count, expires_at
 `
 
 type ChargeSignInFailCallParams struct {
@@ -39,19 +38,31 @@ type ChargeSignInFailCallParams struct {
 	TokenCount int32
 }
 
-type ChargeSignInFailCallRow struct {
+// Conditional charge: add one token to the counter only if the budget is not
+// exhausted. Called within AttemptSignIn's transaction after a failed
+// VerifyCode. Returns pgx.ErrNoRows when the window is open and at the limit.
+func (q *Queries) ChargeSignInFailCall(ctx context.Context, arg ChargeSignInFailCallParams) error {
+	_, err := q.db.Exec(ctx, chargeSignInFailCall, arg.IpKey, arg.Column2, arg.TokenCount)
+	return err
+}
+
+const checkSignInFailBudget = `-- name: CheckSignInFailBudget :one
+SELECT token_count, expires_at
+FROM sign_in_fail_calls
+WHERE ip_key = $1
+`
+
+type CheckSignInFailBudgetRow struct {
 	TokenCount int32
 	ExpiresAt  pgtype.Timestamptz
 }
 
-// Conditional charge: add one token to the counter only if the budget is not
-// exhausted. Called before VerifyCode to reserve a slot. Returns pgx.ErrNoRows
-// when the window is open and at the limit — the racing request that already
-// consumed the last token wins, and the others get an error the handler fails
-// closed on.
-func (q *Queries) ChargeSignInFailCall(ctx context.Context, arg ChargeSignInFailCallParams) (ChargeSignInFailCallRow, error) {
-	row := q.db.QueryRow(ctx, chargeSignInFailCall, arg.IpKey, arg.Column2, arg.TokenCount)
-	var i ChargeSignInFailCallRow
+// Read-only check: returns the current token_count and expires_at for an IP
+// key. Used within AttemptSignIn's transaction to gate the attempt before
+// VerifyCode. Returns pgx.ErrNoRows when no row exists (budget not exhausted).
+func (q *Queries) CheckSignInFailBudget(ctx context.Context, ipKey netip.Prefix) (CheckSignInFailBudgetRow, error) {
+	row := q.db.QueryRow(ctx, checkSignInFailBudget, ipKey)
+	var i CheckSignInFailBudgetRow
 	err := row.Scan(&i.TokenCount, &i.ExpiresAt)
 	return i, err
 }
@@ -69,20 +80,6 @@ func (q *Queries) GetSignInFailCallExpiry(ctx context.Context, ipKey netip.Prefi
 	var expires_at pgtype.Timestamptz
 	err := row.Scan(&expires_at)
 	return expires_at, err
-}
-
-const refundSignInFailCall = `-- name: RefundSignInFailCall :exec
-UPDATE sign_in_fail_calls
-SET token_count = GREATEST(token_count - 1, 0)
-WHERE ip_key = $1 AND expires_at > now()
-`
-
-// Return a reserved slot to the counter. Called after a successful verification
-// or an internal error (no verification happened). Decrements token_count by 1,
-// floored at 0. Only applies to active windows.
-func (q *Queries) RefundSignInFailCall(ctx context.Context, ipKey netip.Prefix) error {
-	_, err := q.db.Exec(ctx, refundSignInFailCall, ipKey)
-	return err
 }
 
 const sweepExpiredSignInFailCalls = `-- name: SweepExpiredSignInFailCalls :execrows

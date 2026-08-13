@@ -169,41 +169,22 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errMethodNotImpl
 	}
 
-	// Atomically reserve a slot from the per-IP failure budget before VerifyCode.
-	// A correct verification refunds the slot (net zero). A wrong one keeps it.
-	// This eliminates the race between check and charge: the reserve IS the check.
-	res, err := h.store.ConsumeSignInFailBudget(r.Ctx, r.ClientAddr, h.rateLimitSignInFailIP)
-	if err != nil {
-		if errors.Is(err, store.ErrNoClientAddr) {
-			h.log.Info("sign in: connection carries no client address")
-			return nil, FloodWaitError(1)
-		}
-		h.log.Error("sign in fail: consume budget", "err", err)
-		return nil, errInternal
-	}
-	if res != nil {
-		return nil, FloodWaitError(int(res.Wait / time.Second))
-	}
-
 	code, _ := req.GetPhoneCode()
-	if err := h.store.VerifyCode(r.Ctx, req.PhoneNumber, req.PhoneCodeHash, code); err != nil {
-		rpc := verifyToRPC(err)
-		if rpc != errInternal {
-			// Wrong code: keep the reserved slot. No refund.
-			return nil, rpc
-		}
-		// Internal error: refund the slot — no verification happened.
-		if refundErr := h.store.RefundSignInFailBudget(r.Ctx, r.ClientAddr); refundErr != nil {
-			h.log.Error("sign in fail: refund on internal error", "err", refundErr)
-		}
-		h.log.Error("verify code", "err", err)
-		return nil, errInternal
-	}
 
-	// Correct code: refund the reserved slot (net zero charge on success).
-	if refundErr := h.store.RefundSignInFailBudget(r.Ctx, r.ClientAddr); refundErr != nil {
-		h.log.Error("sign in fail: refund on success", "err", refundErr)
-		// Non-fatal: user authenticated. Log and continue.
+	// AttemptSignIn atomically checks the per-IP failure budget, verifies the
+	// code, and charges on failure — all within a single Postgres transaction
+	// protected by an advisory lock. Correct codes never touch the counter.
+	rateLimited, err := h.store.AttemptSignIn(r.Ctx, r.ClientAddr, req.PhoneNumber, req.PhoneCodeHash, code, h.rateLimitSignInFailIP)
+	if rateLimited != nil {
+		return nil, FloodWaitError(int(rateLimited.Wait / time.Second))
+	}
+	if err != nil {
+		rpc := verifyToRPC(err)
+		if rpc == errInternal {
+			h.log.Error("sign in attempt", "err", err)
+			return nil, errInternal
+		}
+		return nil, rpc
 	}
 
 	user, err := h.store.CreateUser(r.Ctx, req.PhoneNumber)

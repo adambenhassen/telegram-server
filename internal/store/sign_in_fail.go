@@ -13,55 +13,92 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
-// ConsumeSignInFailBudget atomically reserves one slot from the per-IP
-// signIn-failure budget. Called before VerifyCode so that the attempt holds
-// a slot regardless of the code's correctness:
+// signInFailLockClass namespaces the advisory locks used by AttemptSignIn.
+// Two-argument form keeps this keyspace disjoint from other advisory locks.
+const signInFailLockClass = 0x7369676e // "sign"
+
+// AttemptSignIn atomically checks the per-IP failure budget, verifies the code,
+// and charges the counter on failure — all within a single Postgres transaction
+// protected by an advisory lock keyed on the IP bucket.
 //
-// - Wrong code → slot is kept (net +1 to the counter)
-// - Correct code → slot is refunded via RefundSignInFailBudget (net zero)
-// - Internal error → slot is refunded (net zero)
+// Return contract:
+//   - (nil, nil)            — code correct, proceed to auth
+//   - (&RateLimitResult{}, nil) — budget exhausted (FLOOD_WAIT)
+//   - (nil, ErrCodeInvalid) — wrong code (handler calls verifyToRPC)
+//   - (nil, ErrCodeExpired) — expired code
+//   - (nil, ErrCodeExhausted) — code exhausted
+//   - (nil, error)          — internal error
 //
-// Returns a RateLimitResult when the budget is exhausted (no slot available),
-// nil when a slot was reserved. Returns ErrNoClientAddr when the connection
-// carries no address to attribute.
-func (s *Store) ConsumeSignInFailBudget(ctx context.Context, addr netip.Addr, cfg RateLimitConfig) (*RateLimitResult, error) {
+// The advisory lock serializes same-IP requests across replicas. No refund
+// step is needed: correct codes never touch the counter.
+func (s *Store) AttemptSignIn(ctx context.Context, addr netip.Addr, phone, hash, code string, cfg RateLimitConfig) (*RateLimitResult, error) {
+	// If rate limit is disabled, just verify the code.
 	if !cfg.enabled() {
-		return nil, nil //nolint:nilnil // disabled config is not an error
-	}
-	key, ok := IPBucketKey(addr)
-	if !ok {
-		return nil, ErrNoClientAddr
+		return nil, s.verifyCodeWith(ctx, s.q, phone, hash, code)
 	}
 
-	_, err := s.q.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{
-		IpKey:      key,
-		Column2:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
-		TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
-	})
-	if err == nil {
-		return nil, nil //nolint:nilnil // slot reserved
+	key, ok := IPBucketKey(addr)
+	if !ok {
+		return &RateLimitResult{Wait: time.Second}, nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("consume sign in fail budget: %w", err)
-	}
-	// Budget exhausted — read expires_at to compute the wait.
-	expiresAt, err := s.q.GetSignInFailCallExpiry(ctx, key)
+
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("sign in fail call expiry: %w", err)
+		return nil, fmt.Errorf("attempt sign in: %w", err)
 	}
-	return &RateLimitResult{Wait: waitUntil(time.Now(), expiresAt.Time)}, nil
-}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
 
-// RefundSignInFailBudget returns a previously reserved slot to the per-IP
-// signIn-failure counter. Called after a successful verification or an internal
-// error (no verification happened). Errors are logged but non-fatal.
-func (s *Store) RefundSignInFailBudget(ctx context.Context, addr netip.Addr) error {
-	key, ok := IPBucketKey(addr)
-	if !ok {
-		return ErrNoClientAddr
+	// Advisory lock on the IP bucket serializes same-IP requests.
+	if _, err := tx.Exec(ctx,
+		"SELECT pg_advisory_xact_lock($1, hashtext($2))",
+		signInFailLockClass, key.String(),
+	); err != nil {
+		return nil, fmt.Errorf("attempt sign in: %w", err)
 	}
 
-	return s.q.RefundSignInFailCall(ctx, key)
+	// Check the budget.
+	row, err := qtx.CheckSignInFailBudget(ctx, key)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// No row exists — budget not exhausted. Proceed to verify.
+	case err != nil:
+		return nil, fmt.Errorf("attempt sign in: %w", err)
+	default:
+		// Row exists — check if budget is exhausted.
+		if row.ExpiresAt.Time.After(time.Now()) && row.TokenCount >= int32(cfg.Limit) { //nolint:gosec // rate limits are small positive ints
+			// Budget exhausted — compute wait.
+			return &RateLimitResult{Wait: waitUntil(time.Now(), row.ExpiresAt.Time)}, nil
+		}
+		// Window expired or under limit — proceed to verify.
+	}
+
+	// Verify the code within the same transaction.
+	verifyErr := s.verifyCodeWith(ctx, qtx, phone, hash, code)
+	if verifyErr != nil {
+		if errors.Is(verifyErr, ErrCodeInvalid) ||
+			errors.Is(verifyErr, ErrCodeExpired) ||
+			errors.Is(verifyErr, ErrCodeExhausted) {
+			// Wrong code: charge within the same transaction. ErrNoRows is
+			// expected if the budget hit between check and verify; other errors
+			// are ignored because the verify error is the authoritative response.
+			_ = qtx.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{ //nolint:errcheck // see comment
+				IpKey:      key,
+				Column2:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
+				TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
+			})
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("attempt sign in: %w", err)
+		}
+		return nil, verifyErr
+	}
+
+	// Correct code: commit with no charge.
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("attempt sign in: %w", err)
+	}
+	return nil, nil //nolint:nilnil // success returns nil result and nil error
 }
 
 // SweepExpiredSignInFailCalls deletes per-IP signIn-failure rows past their
