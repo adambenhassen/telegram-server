@@ -50,6 +50,14 @@ func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code stri
 	h.logIssuedCode(phone, code)
 }
 
+// UnhandledForTest drives the dispatcher's fallback for the external api_test
+// package, over a body positioned at its constructor id. It returns the error
+// the caller would receive and writes the record the RPC-gap capture reads.
+func UnhandledForTest(log *slog.Logger, body *bin.Buffer) error {
+	h := &handlers{log: log}
+	return h.handleUnknown(nil, &mtproto.Request{Ctx: context.Background(), Buf: body})
+}
+
 // TestMaxFileBytes is the per-file upload cap test handlers run with. It is the
 // production default, so MaxFileParts is the same 200 a real server enforces.
 const TestMaxFileBytes int64 = 100 << 20

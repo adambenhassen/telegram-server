@@ -202,15 +202,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesReceivedQueueRequestTypeID, h.handleReceivedQueue)
 	register(d, tg.MessagesSearchRequestTypeID, h.handleSearch)
 	register(d, tg.MessagesSearchGlobalRequestTypeID, h.handleSearchGlobal)
-	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
-		id, err := req.Buf.PeekID()
-		if err != nil {
-			h.log.Warn("method not implemented: peek id failed", "err", err)
-			return errMethodNotImpl
-		}
-		h.log.Warn("method not implemented", "type_id", id)
-		return errMethodNotImpl
-	}))
+	d.Fallback(mtproto.HandlerFunc(h.handleUnknown))
 	return mtproto.UnpackInvoke(d)
 }
 
