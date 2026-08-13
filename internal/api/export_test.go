@@ -795,3 +795,19 @@ func AgeSignInFailWindowForTest(dsn string, addr netip.Addr, d time.Duration) er
 	}
 	return nil
 }
+
+// GetPasswordForTest encodes req and invokes handleGetPassword for the caller.
+func GetPasswordForTest(s *store.Store, userID int64, req *mtproto.Request) (bin.Encoder, error) {
+	h := testHandlers(s)
+	return h.handleGetPassword(req)
+}
+
+// UpdatePasswordSettingsForTest invokes handleUpdatePasswordSettings with a
+// pre-encoded request buffer for the caller.
+func UpdatePasswordSettingsForTest(s *store.Store, userID int64, buf *bin.Buffer) (bin.Encoder, error) {
+	h := testHandlers(s)
+	return h.handleUpdatePasswordSettings(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: buf})
+}
+
+// ProvisionalAllowList exposes the allow-list for tests to verify method IDs.
+var ProvisionalAllowList = provisionalAllowList

@@ -17,13 +17,14 @@ import (
 // dispatches its contents. The connection's auth key must already be set to the
 // key matching the frame's auth key ID, and userID is the user bound to that key
 // (0 when unbound), resolved by the caller in the same lookup as the key.
+// provisional is true when the session is username-mode with no verifier.
 // clientAddr is the peer address of the socket the frame arrived on.
 //
 // slot is the connection's place in the pre-auth bounds, cleared here and
 // nowhere else. Clearing is idempotent, so every frame after the first passes a
 // slot already given back; it is nil for a connection that was never accepted
 // through a listener.
-func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID int64, clientAddr netip.Addr, slot *preAuthSlot) error {
+func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID int64, provisional bool, clientAddr netip.Addr, slot *preAuthSlot) error {
 	m := &crypto.EncryptedMessage{}
 	if err := m.DecodeWithoutCopy(b); err != nil {
 		return fmt.Errorf("decode encrypted message: %w", err)
@@ -52,13 +53,14 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID i
 	b.ResetTo(msg.Data())
 
 	return s.handle(c, &Request{
-		AuthKeyID:  c.authKey.ID,
-		UserID:     userID,
-		ClientAddr: clientAddr,
-		SessionID:  msg.SessionID,
-		MsgID:      msg.MessageID,
-		Buf:        b,
-		Ctx:        ctx,
+		AuthKeyID:   c.authKey.ID,
+		UserID:      userID,
+		Provisional: provisional,
+		ClientAddr:  clientAddr,
+		SessionID:   msg.SessionID,
+		MsgID:       msg.MessageID,
+		Buf:         b,
+		Ctx:         ctx,
 	})
 }
 
@@ -117,13 +119,14 @@ func (s *Server) handle(c *Conn, req *Request) error {
 		for i := range container.Messages {
 			m := container.Messages[i]
 			if err := s.handle(c, &Request{
-				AuthKeyID:  req.AuthKeyID,
-				UserID:     req.UserID,
-				ClientAddr: req.ClientAddr,
-				SessionID:  req.SessionID,
-				MsgID:      m.ID,
-				Buf:        &bin.Buffer{Buf: m.Body},
-				Ctx:        req.Ctx,
+				AuthKeyID:   req.AuthKeyID,
+				UserID:      req.UserID,
+				Provisional: req.Provisional,
+				ClientAddr:  req.ClientAddr,
+				SessionID:   req.SessionID,
+				MsgID:       m.ID,
+				Buf:         &bin.Buffer{Buf: m.Body},
+				Ctx:         req.Ctx,
 			}); err != nil {
 				return err
 			}

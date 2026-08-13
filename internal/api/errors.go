@@ -173,6 +173,9 @@ var (
 	errSearchQueryEmpty = rpcErr(400, "SEARCH_QUERY_EMPTY")
 	// errSearchQueryTooLong rejects a contacts.search query over 256 bytes.
 	errSearchQueryTooLong = rpcErr(400, "SEARCH_QUERY_TOO_LONG")
+	// errPasswordCannotBeRemoved rejects removing the verifier of a username-mode
+	// account: doing so is irreversible lockout with no recovery path.
+	errPasswordCannotBeRemoved = rpcErr(400, "PASSWORD_HASH_INVALID")
 	// errInputFilterInvalid rejects messages.search with an unsupported filter type.
 	errInputFilterInvalid = rpcErr(400, "INPUT_FILTER_INVALID")
 )

@@ -139,6 +139,13 @@ func (s *Store) UserByPhone(ctx context.Context, phone string) (User, bool, erro
 	return UserFromDB(db.UserByIDRow(u)), true, nil
 }
 
+// UserLoginMode returns the login_mode of the user with id.
+// Returns "phone" for phone-mode accounts and "username" for username-mode accounts.
+// Returns an error when the user does not exist or the query fails.
+func (s *Store) UserLoginMode(ctx context.Context, id int64) (string, error) {
+	return s.q.GetUserLoginMode(ctx, id)
+}
+
 // UserFromDB converts a user row to the store's User type. Every query that
 // loads a user selects the same columns, so sqlc emits one identically shaped
 // struct per query and Go converts between them: one converter here is what

@@ -224,8 +224,23 @@ func (h *handlers) checkRateLimit(r *mtproto.Request, surface string, cfg store.
 	return nil
 }
 
+// provisionalAllowList holds the method IDs that a provisional session may call.
+// A provisional session is a username-mode account with no verifier: it can set
+// its password, check password state, or log out — but nothing else.
+var provisionalAllowList = map[uint32]bool{
+	tg.AccountGetPasswordRequestTypeID:            true,
+	tg.AccountUpdatePasswordSettingsRequestTypeID: true,
+	tg.AuthLogOutRequestTypeID:                    true,
+}
+
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
 	registerRevoke(d, id, func(req *mtproto.Request) (bin.Encoder, func(), error) {
+		// Provisional gate: blocks all authorized RPCs except the allow-list.
+		// Does not apply when UserID == 0 (unauthenticated keys already
+		// handled per-method).
+		if req.UserID != 0 && req.Provisional && !provisionalAllowList[id] {
+			return nil, nil, errAuthKeyUnreg
+		}
 		res, err := fn(req)
 		return res, nil, err
 	})
