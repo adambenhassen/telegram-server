@@ -27,11 +27,33 @@ const (
 // IssueCode generates a 5-digit login code and hash for phone, storing it with
 // a TTL. It returns ErrResendTooSoon if an unconsumed prior code was issued
 // within resendCooldown. Each call inserts a new row keyed by code_hash, so
-// attempt counters are isolated between callers.
+// attempt counters are isolated between callers. The cooldown check and insert
+// run inside a single transaction with a row lock on the latest code row,
+// preventing TOCTTOU between concurrent callers for the same phone.
 func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, error) {
 	phone = NormalizePhone(phone)
-	if err := s.checkCooldown(ctx, phone); err != nil {
-		return "", "", err
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("issue code: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	existing, err := qtx.GetLatestCodeForUpdate(ctx, phone)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// No prior code: nothing blocks a fresh issue.
+	case err != nil:
+		return "", "", fmt.Errorf("issue code: %w", err)
+	default:
+		// Gate on "not consumed", not "still active": an exhausted code (attempts
+		// >= maxAttempts) must keep serving the cooldown, else exhausting a code
+		// with wrong guesses would bypass the limit and reopen the brute force. A
+		// consumed code (successful login) bypasses so a real user can re-login;
+		// an expired code is already >codeTTL old so time.Since clears the window.
+		if !existing.ConsumedAt.Valid && time.Since(existing.CreatedAt.Time) < resendCooldown {
+			return "", "", ErrResendTooSoon
+		}
 	}
 
 	code, err := randDigits5()
@@ -42,13 +64,16 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	if err != nil {
 		return "", "", err
 	}
-	err = s.q.InsertCode(ctx, db.InsertCodeParams{
+	err = qtx.InsertCode(ctx, db.InsertCodeParams{
 		Phone:     phone,
 		CodeHash:  hash,
 		Code:      code,
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(codeTTL), Valid: true},
 	})
 	if err != nil {
+		return "", "", fmt.Errorf("issue code: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return "", "", fmt.Errorf("issue code: %w", err)
 	}
 	return hash, code, nil
@@ -77,28 +102,6 @@ func (s *Store) IssueCodeForUsername(ctx context.Context, username string) (stri
 		return "", "", fmt.Errorf("issue code for username: %w", err)
 	}
 	return hash, code, nil
-}
-
-// checkCooldown returns ErrResendTooSoon if the latest code row for the given
-// phone is not consumed and was created within resendCooldown.
-func (s *Store) checkCooldown(ctx context.Context, phone string) error {
-	existing, err := s.q.GetLatestCode(ctx, phone)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		// No prior code: nothing blocks a fresh issue.
-	case err != nil:
-		return fmt.Errorf("issue code: %w", err)
-	default:
-		// Gate on "not consumed", not "still active": an exhausted code (attempts
-		// >= maxAttempts) must keep serving the cooldown, else exhausting a code
-		// with wrong guesses would bypass the limit and reopen the brute force. A
-		// consumed code (successful login) bypasses so a real user can re-login;
-		// an expired code is already >codeTTL old so time.Since clears the window.
-		if !existing.ConsumedAt.Valid && time.Since(existing.CreatedAt.Time) < resendCooldown {
-			return ErrResendTooSoon
-		}
-	}
-	return nil
 }
 
 // VerifyCode checks the code+hash. It is single-use and fail-closed: an

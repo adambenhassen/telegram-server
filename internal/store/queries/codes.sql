@@ -13,6 +13,16 @@ WHERE phone = $1
 ORDER BY created_at DESC
 LIMIT 1;
 
+-- name: GetLatestCodeForUpdate :one
+-- Like GetLatestCode but acquires a row lock (SELECT ... FOR UPDATE) so
+-- concurrent IssueCode calls for the same phone are serialized. Used inside
+-- a transaction with InsertCode to prevent TOCTTOU on the cooldown check.
+SELECT * FROM phone_codes
+WHERE phone = $1
+ORDER BY created_at DESC
+LIMIT 1
+FOR UPDATE;
+
 -- name: GetCodeByHash :one
 -- Looks up a code row by its hash. Used by VerifyCode to find the exact row
 -- the caller's code_hash belongs to, so attempts are charged only against that

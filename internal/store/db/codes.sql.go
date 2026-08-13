@@ -58,7 +58,7 @@ func (q *Queries) DeleteExpiredCodes(ctx context.Context) (int64, error) {
 }
 
 const getCodeByHash = `-- name: GetCodeByHash :one
-SELECT id, phone, code_hash, code, expires_at, attempts, consumed_at, created_at FROM phone_codes WHERE code_hash = $1
+SELECT phone, code_hash, code, expires_at, attempts, consumed_at, created_at, id FROM phone_codes WHERE code_hash = $1
 `
 
 // Looks up a code row by its hash. Used by VerifyCode to find the exact row
@@ -68,7 +68,6 @@ func (q *Queries) GetCodeByHash(ctx context.Context, codeHash string) (PhoneCode
 	row := q.db.QueryRow(ctx, getCodeByHash, codeHash)
 	var i PhoneCode
 	err := row.Scan(
-		&i.ID,
 		&i.Phone,
 		&i.CodeHash,
 		&i.Code,
@@ -76,12 +75,13 @@ func (q *Queries) GetCodeByHash(ctx context.Context, codeHash string) (PhoneCode
 		&i.Attempts,
 		&i.ConsumedAt,
 		&i.CreatedAt,
+		&i.ID,
 	)
 	return i, err
 }
 
 const getLatestCode = `-- name: GetLatestCode :one
-SELECT id, phone, code_hash, code, expires_at, attempts, consumed_at, created_at FROM phone_codes
+SELECT phone, code_hash, code, expires_at, attempts, consumed_at, created_at, id FROM phone_codes
 WHERE phone = $1
 ORDER BY created_at DESC
 LIMIT 1
@@ -94,7 +94,6 @@ func (q *Queries) GetLatestCode(ctx context.Context, phone string) (PhoneCode, e
 	row := q.db.QueryRow(ctx, getLatestCode, phone)
 	var i PhoneCode
 	err := row.Scan(
-		&i.ID,
 		&i.Phone,
 		&i.CodeHash,
 		&i.Code,
@@ -102,6 +101,34 @@ func (q *Queries) GetLatestCode(ctx context.Context, phone string) (PhoneCode, e
 		&i.Attempts,
 		&i.ConsumedAt,
 		&i.CreatedAt,
+		&i.ID,
+	)
+	return i, err
+}
+
+const getLatestCodeForUpdate = `-- name: GetLatestCodeForUpdate :one
+SELECT phone, code_hash, code, expires_at, attempts, consumed_at, created_at, id FROM phone_codes
+WHERE phone = $1
+ORDER BY created_at DESC
+LIMIT 1
+FOR UPDATE
+`
+
+// Like GetLatestCode but acquires a row lock (SELECT ... FOR UPDATE) so
+// concurrent IssueCode calls for the same phone are serialized. Used inside
+// a transaction with InsertCode to prevent TOCTTOU on the cooldown check.
+func (q *Queries) GetLatestCodeForUpdate(ctx context.Context, phone string) (PhoneCode, error) {
+	row := q.db.QueryRow(ctx, getLatestCodeForUpdate, phone)
+	var i PhoneCode
+	err := row.Scan(
+		&i.Phone,
+		&i.CodeHash,
+		&i.Code,
+		&i.ExpiresAt,
+		&i.Attempts,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+		&i.ID,
 	)
 	return i, err
 }

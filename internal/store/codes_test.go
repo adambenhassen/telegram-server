@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -226,44 +227,60 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	}
 }
 
-// TestIssueCodeIsolation verifies that two IssueCode calls for the same phone
-// produce independent rows: exhausting one's attempt counter does not affect the
-// other. The phone path still enforces cooldown, so this test uses
-// IssueCodeForUsername which has no cooldown and exercises the isolation
-// invariant directly.
+// TestIssueCodeForUsernameIndependentRows verifies that two concurrent
+// IssueCodeForUsername calls for the same identifier return independent rows:
+// exhausting one's attempt counter via wrong codes does not affect the other.
+// The two issuances fire behind a sync barrier so they are genuinely concurrent.
 func TestIssueCodeForUsernameIndependentRows(t *testing.T) {
 	t.Parallel()
 	s := open(t)
 	ctx := context.Background()
 	const username = "alice"
 
-	// Two concurrent callers issue codes for the same identifier.
-	hashA, codeA, err := s.IssueCodeForUsername(ctx, username)
-	if err != nil {
-		t.Fatalf("issue A: %v", err)
+	type result struct {
+		hash string
+		code string
+		err  error
 	}
-	hashB, codeB, err := s.IssueCodeForUsername(ctx, username)
-	if err != nil {
-		t.Fatalf("issue B: %v", err)
+	var barrier sync.Once
+	var ch = make(chan result, 2)
+	start := make(chan struct{})
+
+	for range 2 {
+		go func() {
+			barrier.Do(func() { close(start) }) // synchronize launch
+			<-start
+			h, c, e := s.IssueCodeForUsername(ctx, username)
+			ch <- result{hash: h, code: c, err: e}
+		}()
 	}
-	if hashA == hashB {
+
+	rA := <-ch
+	rB := <-ch
+	if rA.err != nil {
+		t.Fatalf("issue A: %v", rA.err)
+	}
+	if rB.err != nil {
+		t.Fatalf("issue B: %v", rB.err)
+	}
+	if rA.hash == rB.hash {
 		t.Fatal("two issuances produced the same hash")
 	}
 
 	// Exhaust A's attempt counter with wrong codes.
-	badA := wrongCode(codeA)
+	badA := wrongCode(rA.code)
 	for i := range 3 {
-		if err := s.VerifyCode(ctx, username, hashA, badA); !errors.Is(err, store.ErrCodeInvalid) {
+		if err := s.VerifyCode(ctx, username, rA.hash, badA); !errors.Is(err, store.ErrCodeInvalid) {
 			t.Fatalf("A wrong attempt %d: got %v, want ErrCodeInvalid", i+1, err)
 		}
 	}
 	// A is now exhausted.
-	if err := s.VerifyCode(ctx, username, hashA, codeA); !errors.Is(err, store.ErrCodeExhausted) {
+	if err := s.VerifyCode(ctx, username, rA.hash, rA.code); !errors.Is(err, store.ErrCodeExhausted) {
 		t.Fatalf("A post-exhaustion: got %v, want ErrCodeExhausted", err)
 	}
 
 	// B's code must still verify correctly — its attempt counter was not touched.
-	if err := s.VerifyCode(ctx, username, hashB, codeB); err != nil {
+	if err := s.VerifyCode(ctx, username, rB.hash, rB.code); err != nil {
 		t.Fatalf("B verify after A exhausted: %v", err)
 	}
 }
