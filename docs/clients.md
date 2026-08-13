@@ -1,14 +1,18 @@
 # Connecting a client to telegramd
 
-`telegramd` speaks real MTProto (transport, handshake, encryption via
-`gotd/tgtest`), but it is a milestone-1 (M1) server: one DC, one RPC method
-set, login codes delivered to the server log instead of SMS (and only when
-`TG_LOG_LOGIN_CODES=true` — off by default, and then not delivered at all),
-and sessions held in memory. A stock Telegram Desktop/mobile client cannot reach it —
-those clients hardcode Telegram's production DCs and RSA keys. You need a
-client built (or patched) to dial our address and trust our key. This is how
-the in-repo e2e test (a real `gotd/td` client) talks to the server; the same
-steps apply to any gotd-based client or a patched official client.
+`telegramd` speaks real MTProto — transport, key exchange and encryption on
+gotd's exported packages, with the accept loop and session bookkeeping this
+repo's own (`gotd/tgtest` was dropped in M2; see `ROADMAP.md`). Through M15 it
+serves 56 RPC methods, and auth keys, sessions, users, messages and files all
+live in Postgres, so a restart keeps them. It is still a single-DC server, and
+login codes are delivered to the server log rather than by SMS, and only when
+`TG_LOG_LOGIN_CODES=true` — off by default, and then not delivered at all.
+
+A stock Telegram Desktop/mobile client cannot reach it: those clients hardcode
+Telegram's production DCs and RSA keys. You need a client built or patched to
+dial our address and trust our key. This is how the in-repo e2e test (a real
+`gotd/td` client) talks to the server; the same steps apply to any gotd-based
+client, and section 5 covers a patched Telegram Desktop.
 
 ## 1. Build and run the server
 
@@ -144,7 +148,96 @@ On a successful `auth.signIn`, the phone number is auto-registered as a new
 user if it hasn't been seen before (`store.CreateUser`) — there is no
 separate registration step or admin approval.
 
-## Known M1 ceilings
+## 5. Telegram Desktop, patched
+
+Stock Telegram Desktop has no user-facing way to change either the DC address
+or the RSA key, so reaching this server needs a patched build. The patches live
+on a branch of our fork, deliberately not vendored here: the checkout is
+~330 MB, the two build systems share nothing, and no CI job builds it.
+
+| | |
+|---|---|
+| Fork | `https://github.com/adambenhassen/tdesktop` |
+| Branch | `spike/MAIN-263-telegramd-endpoint` |
+| Upstream base | `8e18cb71103d83d7d98994ff27f0a2bca55c489c` (`dev`) |
+| Schema layer | 228, the same layer `gotd/td v0.161.0` pins — constructor ids match, no translation needed |
+
+### The three patch points
+
+1. `Telegram/SourceFiles/mtproto/mtproto_dc_options.cpp` — `constructFromBuiltIn`
+   replaces the built-in DC table with a single entry, and
+   `readBuiltInPublicKeys` replaces Telegram's production keys with one read
+   off disk. Both are driven by environment variables rather than compiled-in
+   constants, so the address and the key can change without a rebuild — which
+   matters because the build is hours and the server's advertised address is
+   not known until it runs.
+2. `api_id` / `api_hash`, passed at cmake time as `TDESKTOP_API_ID` and
+   `TDESKTOP_API_HASH`. `telegramd` never reads either, so any values work; the
+   branch was built with the public test pair `17349` /
+   `344583e45741c457fe1862106095a5eb`.
+3. `Telegram/SourceFiles/mtproto/special_config_request.cpp` — the DNS and
+   Firebase fallback resolver is skipped whenever a custom DC is configured.
+   Left live, a failed connect to our address sends the client resolving
+   Telegram's real DCs and then talking to whichever it finds.
+
+### Runtime configuration
+
+| Variable | Meaning |
+|---|---|
+| `TDESKTOP_CUSTOM_DC_ADDRESS` | `host:port` to dial — the server's `advertise` address. Setting it is what activates all three patches |
+| `TDESKTOP_CUSTOM_DC_ID` | DC id the address is registered under; must equal `TG_DC_ID`. Defaults to `2` |
+| `TDESKTOP_CUSTOM_DC_RSA_KEY_FILE` | Path to the server's RSA **public** key in PKCS#1 PEM. The client derives the fingerprint itself, so it only has to match what the server logs at startup |
+
+Derive that public key from the server's private key:
+
+```bash
+openssl rsa -in server_key.pem -pubout -RSAPublicKey_out -out server_pub.pem
+```
+
+### Build
+
+The upstream Linux build runs in `ghcr.io/telegramdesktop/tdesktop/centos_env`,
+which is published **for linux/amd64 only** — it will not run on an arm64 host.
+
+```bash
+docker run --rm -u $(id -u) \
+  -v "$PWD:/usr/src/tdesktop" \
+  -v "$HOME/.cache/tdesktop-ccache:/var/cache/ccache" \
+  -e CONFIG=Debug \
+  ghcr.io/telegramdesktop/tdesktop/centos_env:latest \
+  /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+  -D CMAKE_CONFIGURATION_TYPES=Debug \
+  -D CMAKE_C_FLAGS_DEBUG="-O0" \
+  -D CMAKE_CXX_FLAGS_DEBUG="-O0" \
+  -D TDESKTOP_API_ID=17349 \
+  -D TDESKTOP_API_HASH=344583e45741c457fe1862106095a5eb \
+  -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+  -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+```
+
+The binary lands in `out/Debug/Telegram`. Budget hours for a cold build.
+
+### Connect
+
+Run the server with `TG_LOG_LOGIN_CODES=true` (section 4 — the log is the only
+code delivery channel) and start the client against it:
+
+```bash
+TDESKTOP_CUSTOM_DC_ADDRESS=127.0.0.1:2443 \
+TDESKTOP_CUSTOM_DC_ID=2 \
+TDESKTOP_CUSTOM_DC_RSA_KEY_FILE=/path/to/server_pub.pem \
+  out/Debug/Telegram -workdir ./tdata-telegramd
+```
+
+`-workdir` keeps this profile away from any real Telegram account on the
+machine. The client logs the key it loaded as `MTP Info: using custom public
+RSA key ... fingerprint <int64>`; that number must equal the `fingerprint` the
+server logs at startup, or key exchange fails with no useful client-side error.
+
+Telegram Desktop is GPLv3. Internal use carries no obligation, but any binary
+handed to someone else must ship its source.
+
+## Known ceilings
 
 - **Single DC.** The server only ever advertises itself (`api.DefaultConfig`
   builds one `tg.DCOption`). No multi-DC routing, no migration between DCs.
@@ -152,19 +245,22 @@ separate registration step or admin approval.
   logs the code via `slog` instead of sending SMS. Fine for
   development/testing, not for real users — and with the flag at its default
   there is no delivery channel at all.
-- **In-memory sessions.** Auth state lives in the running process. Restart
-  `telegramd` and every connected client must redo the auth-key handshake
-  and re-authenticate — nothing survives a restart except the Postgres-backed
-  users and phone codes.
-- **Only four RPC methods are implemented**: `help.getConfig`,
-  `auth.sendCode`, `auth.signIn`, `users.getUsers`. `users.getUsers` always
-  reports the caller as unregistered/unauthorized (`AUTH_KEY_UNREGISTERED`) —
-  it exists only so a client's initial auth-status check gets an answer
-  and falls through into the sign-in flow, not as a real user-lookup
-  endpoint. Every other method falls to a fallback handler that returns
-  `INPUT_METHOD_INVALID` and logs `"method not implemented"` with the
-  method's type ID — expect a real client to trip this frequently once past
-  login.
+- **A partial RPC surface.** The 56 methods registered in `api.New`
+  (`internal/api/handler.go`) are the whole of it. Every other method falls to
+  `handlers.handleUnknown`, which returns `INPUT_METHOD_INVALID` and logs one
+  line per call:
+
+  ```
+  level=WARN msg="method not implemented" type_id=0xec86017a method=account.registerDevice#ec86017a error_code=400 error=INPUT_METHOD_INVALID
+  ```
+
+  `method` is resolved through `tg.TypesMap()` and reads `unknown` for a
+  constructor the pinned layer has no name for, which means either a client on
+  a different layer or a method added after `gotd/td v0.161.0`. Grep the log
+  for `"method not implemented"` to inventory what a client wanted and did not
+  get. A full-featured client trips this often once past login.
 - **Placeholder access hash.** The user returned by `auth.signIn` uses its
-  own numeric ID as `AccessHash` (see the `M1: self access hash placeholder`
-  comment in `internal/api/auth.go`) rather than a real per-session hash.
+  own numeric ID as `AccessHash` (see the `self access hash placeholder`
+  comment in `userTL`, `internal/api/passwords.go`) rather than a real
+  per-session hash. Peer access hashes everywhere else are derived per viewer
+  by `internal/peerhash`.
