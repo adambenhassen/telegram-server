@@ -22,15 +22,41 @@ const (
 	// resendCooldown is the minimum interval between issuing codes for a phone
 	// while a prior code is still active.
 	resendCooldown = 60 * time.Second
+	// issueCodeLockClass namespaces this limiter's advisory locks. Two-argument
+	// advisory locks occupy a space of their own, disjoint from the
+	// single-argument ones used elsewhere in the store.
+	issueCodeLockClass = 0x7467434f // "tgCO" (code)
 )
 
 // IssueCode generates a 5-digit login code and hash for phone, storing it with
 // a TTL. It returns ErrResendTooSoon if an unconsumed prior code was issued
-// within resendCooldown. On success it resets the per-code hardening state
-// (attempts, consumed_at, created_at).
+// within resendCooldown. Each call inserts a new row keyed by code_hash, so
+// attempt counters are isolated between callers. The cooldown check and insert
+// run inside a single transaction: pg_advisory_xact_lock hashes the normalized
+// identifier so concurrent callers for the same phone are serialized regardless
+// of whether a row exists yet.
 func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, error) {
 	phone = NormalizePhone(phone)
-	existing, err := s.q.GetCode(ctx, phone)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("issue code: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	// Advisory lock on the normalized identifier serializes concurrent IssueCode
+	// calls for the same phone, preventing TOCTTOU on the cooldown check. The
+	// lock is transaction-scoped (xact) so it is released on commit or rollback.
+	// Two-argument form with a class constant keeps this keyspace disjoint from
+	// single-argument advisory locks used elsewhere in the store.
+	if _, err := tx.Exec(ctx,
+		"SELECT pg_advisory_xact_lock($1, hashtext($2))",
+		issueCodeLockClass, phone,
+	); err != nil {
+		return "", "", fmt.Errorf("issue code: %w", err)
+	}
+
+	existing, err := qtx.GetLatestCode(ctx, phone)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		// No prior code: nothing blocks a fresh issue.
@@ -55,7 +81,7 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	if err != nil {
 		return "", "", err
 	}
-	err = s.q.UpsertCode(ctx, db.UpsertCodeParams{
+	err = qtx.InsertCode(ctx, db.InsertCodeParams{
 		Phone:     phone,
 		CodeHash:  hash,
 		Code:      code,
@@ -64,29 +90,67 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	if err != nil {
 		return "", "", fmt.Errorf("issue code: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", "", fmt.Errorf("issue code: %w", err)
+	}
 	return hash, code, nil
 }
 
-// VerifyCode checks the code+hash for phone. It is single-use and fail-closed:
-// an already-consumed, expired, or exhausted code never verifies. The Go-side
-// checks (consumed → expired → exhausted) map the right sentinel in the common
-// sequential case. Success is decided by a compare-and-swap scoped to the exact
-// issued code (phone+hash+code) with the terminal-state guards in the WHERE, so
-// a concurrent resend/consume/expiry that slips between the read and the write
-// makes the swap affect zero rows → ErrCodeInvalid. Both mutations are scoped by
-// code_hash so they can never corrupt a code that a resend replaced. Both a wrong
-// hash and a wrong code return ErrCodeInvalid without revealing which field was
-// wrong, but only a wrong code under the correct hash charges an attempt: because
-// IncrementCodeAttempts is scoped by code_hash, a wrong hash matches no row and
-// charges nothing. The attempt that reaches maxAttempts exhausts the code.
+// IssueCodeForUsername generates a 5-digit login code and hash for a username
+// identifier. Unlike IssueCode, it does not enforce a resend cooldown — each
+// call inserts a new row keyed by code_hash, so attempt counters are isolated
+// between callers even for the same identifier.
+func (s *Store) IssueCodeForUsername(ctx context.Context, username string) (string, string, error) {
+	code, err := randDigits5()
+	if err != nil {
+		return "", "", err
+	}
+	hash, err := randHex()
+	if err != nil {
+		return "", "", err
+	}
+	err = s.q.InsertCode(ctx, db.InsertCodeParams{
+		Phone:     username,
+		CodeHash:  hash,
+		Code:      code,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(codeTTL), Valid: true},
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("issue code for username: %w", err)
+	}
+	return hash, code, nil
+}
+
+// VerifyCode checks the code+hash. It is single-use and fail-closed: an
+// already-consumed, expired, or exhausted code never verifies. The lookup is by
+// code_hash so the row found belongs exclusively to the caller who received
+// that hash — attempts are charged only against that row, never against a
+// different caller's code for the same phone. After the hash lookup, the phone
+// binding is confirmed (row.Phone == phone); mismatch rejects without charging
+// an attempt to prevent the attacker from learning anything by scanning. Success
+// is decided by a compare-and-swap scoped to (phone + code_hash + code) with the
+// terminal-state guards in the WHERE, so a concurrent resend/consume/expiry that
+// slips between the read and the write makes the swap affect zero rows →
+// ErrCodeInvalid. Both a wrong hash and a wrong code return ErrCodeInvalid
+// without revealing which field was wrong, but only a wrong code under the
+// correct hash charges an attempt. The attempt that reaches maxAttempts exhausts
+// the code.
 func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error {
-	phone = NormalizePhone(phone)
-	row, err := s.q.GetCode(ctx, phone)
+	row, err := s.q.GetCodeByHash(ctx, hash)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return ErrCodeInvalid
 	case err != nil:
 		return fmt.Errorf("verify code: %w", err)
+	}
+	// Bind the code to the identifier it was issued for. An attacker who
+	// obtained a valid code_hash for one identifier must not be able to verify
+	// it under a different one. Reject without incrementing attempts — charging
+	// on an identifier mismatch would hand back the cross-caller charging
+	// primitive this ticket exists to remove.
+	phone = NormalizePhone(phone)
+	if phone != row.Phone {
+		return ErrCodeInvalid
 	}
 	if row.ConsumedAt.Valid {
 		return ErrCodeInvalid
@@ -98,10 +162,7 @@ func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error 
 		return ErrCodeExhausted
 	}
 	if hash != row.CodeHash || code != row.Code {
-		if err := s.q.IncrementCodeAttempts(ctx, db.IncrementCodeAttemptsParams{
-			Phone:    phone,
-			CodeHash: hash,
-		}); err != nil {
+		if err := s.q.IncrementCodeAttempts(ctx, hash); err != nil {
 			return fmt.Errorf("verify code: %w", err)
 		}
 		return ErrCodeInvalid

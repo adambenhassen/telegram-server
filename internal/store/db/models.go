@@ -177,6 +177,7 @@ type PhoneCode struct {
 	Attempts   int32
 	ConsumedAt pgtype.Timestamptz
 	CreatedAt  pgtype.Timestamptz
+	ID         *int64
 }
 
 type PhoneLookup struct {
