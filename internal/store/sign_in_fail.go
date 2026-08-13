@@ -79,14 +79,21 @@ func (s *Store) AttemptSignIn(ctx context.Context, addr netip.Addr, phone, hash,
 		if errors.Is(verifyErr, ErrCodeInvalid) ||
 			errors.Is(verifyErr, ErrCodeExpired) ||
 			errors.Is(verifyErr, ErrCodeExhausted) {
-			// Wrong code: charge within the same transaction. ErrNoRows is
-			// expected if the budget hit between check and verify; other errors
-			// are ignored because the verify error is the authoritative response.
-			_ = qtx.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{ //nolint:errcheck // see comment
+			// Wrong code: charge within the same transaction. Fail closed if
+			// the charge fails or affects no rows — the rollback undoes the
+			// verify writes (IncrementCodeAttempts / ConsumeCode) so the code
+			// is not consumed and the client can retry.
+			n, chargeErr := qtx.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{
 				IpKey:      key,
 				Column2:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
 				TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
 			})
+			if chargeErr != nil {
+				return nil, fmt.Errorf("sign in fail: charge: %w", chargeErr)
+			}
+			if n == 0 {
+				return nil, errors.New("sign in fail: charge affected no rows")
+			}
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("attempt sign in: %w", err)

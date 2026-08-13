@@ -6,10 +6,10 @@ SELECT token_count, expires_at
 FROM sign_in_fail_calls
 WHERE ip_key = $1;
 
--- name: ChargeSignInFailCall :exec
+-- name: ChargeSignInFailCall :execrows
 -- Conditional charge: add one token to the counter only if the budget is not
 -- exhausted. Called within AttemptSignIn's transaction after a failed
--- VerifyCode. Returns pgx.ErrNoRows when the window is open and at the limit.
+-- VerifyCode. Returns 0 rows when the window is open and at the limit.
 INSERT INTO sign_in_fail_calls (ip_key, token_count, window_start, expires_at)
 VALUES ($1, 1, now(), now() + $2::INTERVAL)
 ON CONFLICT (ip_key) DO UPDATE SET

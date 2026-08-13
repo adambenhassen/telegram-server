@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const chargeSignInFailCall = `-- name: ChargeSignInFailCall :exec
+const chargeSignInFailCall = `-- name: ChargeSignInFailCall :execrows
 INSERT INTO sign_in_fail_calls (ip_key, token_count, window_start, expires_at)
 VALUES ($1, 1, now(), now() + $2::INTERVAL)
 ON CONFLICT (ip_key) DO UPDATE SET
@@ -40,10 +40,13 @@ type ChargeSignInFailCallParams struct {
 
 // Conditional charge: add one token to the counter only if the budget is not
 // exhausted. Called within AttemptSignIn's transaction after a failed
-// VerifyCode. Returns pgx.ErrNoRows when the window is open and at the limit.
-func (q *Queries) ChargeSignInFailCall(ctx context.Context, arg ChargeSignInFailCallParams) error {
-	_, err := q.db.Exec(ctx, chargeSignInFailCall, arg.IpKey, arg.Column2, arg.TokenCount)
-	return err
+// VerifyCode. Returns 0 rows when the window is open and at the limit.
+func (q *Queries) ChargeSignInFailCall(ctx context.Context, arg ChargeSignInFailCallParams) (int64, error) {
+	result, err := q.db.Exec(ctx, chargeSignInFailCall, arg.IpKey, arg.Column2, arg.TokenCount)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const checkSignInFailBudget = `-- name: CheckSignInFailBudget :one
