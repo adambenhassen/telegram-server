@@ -10,26 +10,37 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
+// chatMembership holds the precomputed membership and participants result
+// from a create-action user lookup, so loadChats can reuse it and skip
+// duplicate queries.
+type chatMembership struct {
+	member    bool
+	userIDs   []int64
+	partCount int
+}
+
 // createUsersForDialog fetches the participant list for a ChatActionCreate row
 // when the viewer is still a member. A removed viewer gets nil, matching the
-// empty user list getDifference serves for the same event.
-func (h *handlers) createUsersForDialog(ctx context.Context, chatID, viewerID int64) ([]int64, error) {
+// empty user list getDifference serves for the same event. It also returns
+// the membership result so the caller can thread it into loadChats and avoid
+// a duplicate IsMember + Participants query.
+func (h *handlers) createUsersForDialog(ctx context.Context, chatID, viewerID int64) ([]int64, *chatMembership, error) {
 	member, err := h.store.IsMember(ctx, chatID, viewerID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !member {
-		return nil, nil
+		return nil, &chatMembership{member: false}, nil
 	}
 	parts, err := h.store.Participants(ctx, chatID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ids := make([]int64, len(parts))
 	for i, p := range parts {
 		ids[i] = p.UserID
 	}
-	return ids, nil
+	return ids, &chatMembership{member: true, userIDs: ids, partCount: len(parts)}, nil
 }
 
 // maxChannelDialogs caps the channels one getDialogs reply carries.
@@ -117,6 +128,9 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	topCreateUsers := make([][]int64, 0, len(dialogs))
 	peerIDs := map[int64]bool{r.UserID: true}
 	chatIDs := map[int64]bool{}
+	// Precomputed membership/participants results from create-action lookups,
+	// threaded into loadChats so it skips duplicate queries.
+	chatCache := map[int64]*chatMembership{}
 	for _, d := range dialogs {
 		tlDialogs = append(tlDialogs, &tg.Dialog{
 			Peer:            peerToTL(d.PeerType, d.PeerID),
@@ -147,12 +161,13 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 				// gate is needed — the row exists because fan-out wrote it here.
 				peerIDs[m.ActionUserID] = true
 			case store.ChatActionCreate:
-				cu, cerr := h.createUsersForDialog(r.Ctx, m.PeerID, r.UserID)
+				cu, cm, cerr := h.createUsersForDialog(r.Ctx, m.PeerID, r.UserID)
 				if cerr != nil {
 					h.log.Error("get dialogs create users", "user_id", r.UserID, "err", cerr)
 					return nil, errInternal
 				}
 				createUsers = cu
+				chatCache[m.PeerID] = cm
 				for _, id := range cu {
 					peerIDs[id] = true
 				}
@@ -217,7 +232,7 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	// passed down — loadChats degrades those to tg.ChatForbidden, which carries
 	// the id and an empty title and nothing else — no live title, version or
 	// participant count reaches a removed member.
-	chats, err := h.loadChats(r.Ctx, chatIDs, r.UserID)
+	chats, err := h.loadChats(r.Ctx, chatIDs, r.UserID, chatCache)
 	if err != nil {
 		h.log.Error("get dialogs chats", "err", err)
 		return nil, errInternal

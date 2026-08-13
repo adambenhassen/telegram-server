@@ -262,7 +262,7 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
 				return nil, errInternal
 			}
-			chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+			chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID, nil)
 			if err != nil {
 				h.log.Error("load chats on retry", "err", err)
 				return nil, errInternal
@@ -316,7 +316,7 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 		h.log.Error("send chat message users", "err", err)
 		return nil, errInternal
 	}
-	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID, nil)
 	if err != nil {
 		h.log.Error("send chat message chats", "err", err)
 		return nil, errInternal
@@ -469,7 +469,7 @@ func (h *handlers) chatHistory(r *mtproto.Request, chatID int64, msgs []store.Me
 		h.log.Error("get history users", "err", err)
 		return nil, errInternal
 	}
-	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID, nil)
 	if err != nil {
 		h.log.Error("get history chats", "err", err)
 		return nil, errInternal
@@ -894,7 +894,7 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 		basicChatRefs[destPeerID] = true
 		users, err = h.loadUsers(r.Ctx, recipients, r.UserID)
 		if err == nil {
-			chats, err = h.loadChats(r.Ctx, map[int64]bool{destPeerID: true}, r.UserID)
+			chats, err = h.loadChats(r.Ctx, map[int64]bool{destPeerID: true}, r.UserID, nil)
 		}
 	}
 	// Load extra user references from fwd heads that the send/load did not cover.
@@ -1076,7 +1076,7 @@ func (h *handlers) pinChatMessage(r *mtproto.Request, chatID int64, req *tg.Mess
 	}
 	h.notifyPinned(r.Ctx, store.PeerTypeChat, chatID, pinnedMsgID)
 
-	chats, err := h.loadChats(r.Ctx, map[int64]bool{chat.ID: true}, r.UserID)
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chat.ID: true}, r.UserID, nil)
 	if err != nil {
 		h.log.Error("pin chat render", "chat_id", chat.ID, "err", err)
 		return nil, errInternal
@@ -1325,7 +1325,7 @@ func (h *handlers) chatSearch(r *mtproto.Request, chatID int64, msgs []store.Mes
 		h.log.Error("search messages users", "err", err)
 		return nil, errInternal
 	}
-	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID, nil)
 	if err != nil {
 		h.log.Error("search messages chats", "err", err)
 		return nil, errInternal

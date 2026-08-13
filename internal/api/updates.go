@@ -388,7 +388,7 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) 
 	if err != nil {
 		return updateBatch{}, err
 	}
-	b.chats, err = h.loadChats(ctx, basicChats, userID)
+	b.chats, err = h.loadChats(ctx, basicChats, userID, nil)
 	if err != nil {
 		return updateBatch{}, err
 	}
@@ -555,7 +555,7 @@ func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, viewerID i
 //
 // The membership check is one query per chat per batch. A batch references very
 // few distinct chats, so it stays a straight loop with no cache.
-func (h *handlers) loadChats(ctx context.Context, ids map[int64]bool, viewerID int64) ([]tg.ChatClass, error) {
+func (h *handlers) loadChats(ctx context.Context, ids map[int64]bool, viewerID int64, cache map[int64]*chatMembership) ([]tg.ChatClass, error) {
 	chats := make([]tg.ChatClass, 0, len(ids))
 	for id := range ids {
 		c, ok, err := h.store.ChatByID(ctx, id)
@@ -563,6 +563,14 @@ func (h *handlers) loadChats(ctx context.Context, ids map[int64]bool, viewerID i
 			return nil, err
 		}
 		if !ok {
+			continue
+		}
+		if cm, cached := cache[id]; cached {
+			if !cm.member {
+				chats = append(chats, &tg.ChatForbidden{ID: c.ID, Title: ""})
+				continue
+			}
+			chats = append(chats, chatToTL(c, cm.partCount, viewerID))
 			continue
 		}
 		member, err := h.store.IsMember(ctx, id, viewerID)

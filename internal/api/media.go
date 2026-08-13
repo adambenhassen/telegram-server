@@ -158,7 +158,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 				return nil, errInternal
 			}
 			if peerType == store.PeerTypeChat {
-				chats, err := h.loadChats(r.Ctx, map[int64]bool{toID: true}, r.UserID)
+				chats, err := h.loadChats(r.Ctx, map[int64]bool{toID: true}, r.UserID, nil)
 				if err != nil {
 					h.log.Error("load chats on retry", "err", err)
 					return nil, errInternal
@@ -316,7 +316,7 @@ func (h *handlers) sendChatMedia(
 		h.log.Error("send chat media users", "err", err)
 		return nil, errInternal
 	}
-	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID)
+	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID, nil)
 	if err != nil {
 		h.log.Error("send chat media chats", "err", err)
 		return nil, errInternal
