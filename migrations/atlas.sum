@@ -1,4 +1,4 @@
-h1:cIsR7xDx2pKvjJw4krEcDDhzIzXmfowPXfAi6LEePFw=
+h1:qZA1nmwtKtie4maHNpdgdc/W6J8GtP3/yYZkVLyOpTA=
 20260721000001_baseline.sql h1:cnO6K1z0Uv3goEvecgJixKSio6ziaB1rF7cQLoCWOxs=
 20260721000002_auth_keys.sql h1:+vNabm6vdEAgu3H5ZGw2Wr8D/Y6i4ikAAUO3JbfZQeE=
 20260721000003_code_hardening.sql h1:8pbAqUpqcwOONUfac+qC51QjfC1JnObNCcXa1HC/dr0=
@@ -31,4 +31,4 @@ h1:cIsR7xDx2pKvjJw4krEcDDhzIzXmfowPXfAi6LEePFw=
 20260820000027_channel_public_discoverable.sql h1:VMMZZfkt2ftvGwUVNY4u4BdQ6JyUnCaxf4V3JtJljpE=
 20260821000028_nullable_phone.sql h1:J/aRPBgJ9Am1jzVSEvcw3W+gMuNuAsbMXW2o7gqPKQ4=
 20260822000029_login_mode.sql h1:cpfWV+1Va8I1mA89+pcMePfHq00QeZKrBHy8ihwQrx4=
-20260823000030_phone_codes_per_hash.sql h1:5w01sAuNAoo7ihabH2uH0Fb8/x/vzfWs02iLFsudiLc=
+20260823000030_phone_codes_per_hash.sql h1:Z0G+Q1UsRsypwk1raB9Jox+ZEOJa10XeC+CaWwKipGo=

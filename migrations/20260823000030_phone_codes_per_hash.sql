@@ -7,10 +7,14 @@
 --         cooldown lookups.
 --
 -- Forward-only: uses ALTER TABLE so in-flight codes survive the deploy.
--- Rollback: atlas migrate revert drops the index, removes the code_hash
---   uniqueness constraint, and removes the id column. The table reverts to
---   phone-as-PK with no data loss. The Go code on the pre-migration branch
---   still upserts on phone and ignores id, so the revert is safe.
+-- Rollback: atlas migrate down (or revert) drops the index, removes the
+--   code_hash uniqueness constraint, and removes the id column. However
+--   restoring the phone primary key is NOT lossless: the new schema allows
+--   multiple rows per phone, and the old schema does not. A rollback requires
+--   reconciling duplicates first — either by deleting all rows (codes expire
+--   in 5 min) or by manually keeping one row per phone. Only run a rollback
+--   immediately after the deploy, before concurrent IssueCode calls can
+--   create multiple rows for the same phone.
 
 -- Add a surrogate key for future use (sqlc models need a stable PK).
 ALTER TABLE phone_codes ADD COLUMN id BIGSERIAL;

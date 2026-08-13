@@ -3,7 +3,6 @@ package store_test
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -242,18 +241,22 @@ func TestIssueCodeForUsernameIndependentRows(t *testing.T) {
 		code string
 		err  error
 	}
-	var barrier sync.Once
 	var ch = make(chan result, 2)
+	ready := make(chan struct{}, 2)
 	start := make(chan struct{})
 
 	for range 2 {
 		go func() {
-			barrier.Do(func() { close(start) }) // synchronize launch
-			<-start
+			ready <- struct{}{} // signal ready
+			<-start             // wait for barrier
 			h, c, e := s.IssueCodeForUsername(ctx, username)
 			ch <- result{hash: h, code: c, err: e}
 		}()
 	}
+	// Wait for both goroutines to be ready, then release the barrier.
+	<-ready
+	<-ready
+	close(start)
 
 	rA := <-ch
 	rB := <-ch
