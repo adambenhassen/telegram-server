@@ -21,11 +21,16 @@ type RateLimitConfig struct {
 	Window time.Duration
 }
 
-// enabled reports whether this config enforces anything. One definition, so the
-// surfaces that check a limit and the ones that skip a disabled one cannot
+// Enabled reports whether this config enforces anything. One definition, so
+// the surfaces that check a limit and the ones that skip a disabled one cannot
 // drift apart on what "disabled" means.
-func (c RateLimitConfig) enabled() bool {
+func (c RateLimitConfig) Enabled() bool {
 	return c.Limit > 0 && c.Window > 0
+}
+
+// enabled is the unexported alias used inside this package.
+func (c RateLimitConfig) enabled() bool {
+	return c.Enabled()
 }
 
 // RateLimitResult is returned by CheckRateLimit when the request is denied.
