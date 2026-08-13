@@ -13,12 +13,6 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
-// ErrSignInFailBudgetExhausted is returned by ChargeSignInFailIP when the
-// conditional upsert finds the budget already at the limit. This happens when
-// concurrent requests pass the budget check simultaneously and race to charge
-// — only one wins, the rest get this error. The handler fails closed on it.
-var ErrSignInFailBudgetExhausted = errors.New("sign in fail budget exhausted")
-
 // ConsumeSignInFailBudget atomically reserves one slot from the per-IP
 // signIn-failure budget. Called before VerifyCode so that the attempt holds
 // a slot regardless of the code's correctness:

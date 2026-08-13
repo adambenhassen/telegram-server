@@ -410,8 +410,11 @@ func TestSignInFailCorrectCodeRefunded(t *testing.T) {
 
 	addr := netip.MustParseAddr("10.0.0.70")
 
-	// Limit of 10 failures per 10s — generous.
-	cfg := store.RateLimitConfig{Limit: 10, Window: 10 * time.Second}
+	// Limit of 1 failure per 10s: after a correct sign-in that refunds
+	// the slot, token_count should be 0/1 — so a subsequent wrong guess
+	// gets PHONE_CODE_INVALID. Without the refund, counter sits at 1/1
+	// and the wrong guess gets FLOOD_WAIT instead.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
 
 	// Correct code — should succeed and refund the reserved slot.
 	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, cfg, &tg.AuthSignInRequest{
