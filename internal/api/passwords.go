@@ -91,7 +91,7 @@ func (h *handlers) handleGetPassword(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	resp.HasPassword = hasPw
 	if hasPw {
-		srpID, srpB, ierr := h.srp.Issue(target, pw.Verifier)
+		srpID, srpB, ierr := h.srp.Issue(mtproto.AuthKeyIDInt64(r.AuthKeyID), target, pw.Verifier)
 		if ierr != nil {
 			h.log.Error("get password: issue challenge", "user_id", target, "err", ierr)
 			return nil, errInternal
@@ -136,7 +136,7 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 	if !ok {
 		return nil, errPasswordHashInvalid
 	}
-	userID, rpc := h.consumeAndVerify(r.Ctx, proof)
+	userID, rpc := h.consumeAndVerify(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), proof)
 	if rpc != nil {
 		return nil, rpc
 	}
@@ -172,8 +172,8 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 // was issued to. It returns that user id on success. Every failure path is
 // fail-closed: a missing/expired challenge is SRP_ID_INVALID, a bad proof or
 // absent password is PASSWORD_HASH_INVALID.
-func (h *handlers) consumeAndVerify(ctx context.Context, proof *tg.InputCheckPasswordSRP) (int64, *tgerr.Error) {
-	pending, ok := h.srp.Consume(proof.SRPID)
+func (h *handlers) consumeAndVerify(ctx context.Context, authKeyID int64, proof *tg.InputCheckPasswordSRP) (int64, *tgerr.Error) {
+	pending, ok := h.srp.Consume(proof.SRPID, authKeyID)
 	if !ok {
 		return 0, errSRPIDInvalid
 	}
@@ -215,7 +215,7 @@ func (h *handlers) handleUpdatePasswordSettings(r *mtproto.Request) (bin.Encoder
 		if !ok {
 			return nil, errPasswordHashInvalid
 		}
-		uid, rpc := h.consumeAndVerify(r.Ctx, proof)
+		uid, rpc := h.consumeAndVerify(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), proof)
 		if rpc != nil {
 			return nil, rpc
 		}
@@ -282,7 +282,7 @@ func (h *handlers) handleGetPasswordSettings(r *mtproto.Request) (bin.Encoder, e
 	if !ok {
 		return nil, errPasswordHashInvalid
 	}
-	uid, rpc := h.consumeAndVerify(r.Ctx, proof)
+	uid, rpc := h.consumeAndVerify(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), proof)
 	if rpc != nil {
 		return nil, rpc
 	}
