@@ -51,7 +51,7 @@ func TestProvisionalAllowListBlocksOtherMethods(t *testing.T) {
 	}
 }
 
-func TestProvisionalGateBlocksSendMessage(t *testing.T) {
+func TestProvisionalGateBlocksNonAllowListedMethod(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openStore(t)
@@ -82,19 +82,82 @@ func TestProvisionalGateBlocksSendMessage(t *testing.T) {
 		t.Fatal("expected provisional session")
 	}
 
-	// The register wrapper gate would return AUTH_KEY_UNREGISTERED here because:
-	// req.UserID != 0 && req.Provisional && !provisionalAllowList[sendMessage].
-	// We verify the gate logic directly since SendMessageForTest bypasses the
-	// dispatcher (and thus the gate). The gate is exercised by the full server
-	// integration; here we verify the gate condition is correct for this method.
-	id := uint32(tg.MessagesSendMessageRequestTypeID)
-	if api.ProvisionalAllowList[id] {
-		t.Fatal("sendMessage should not be in the provisional allow-list")
+	// Test the gate logic end-to-end: the register wrapper returns
+	// errAuthKeyUnreg when UserID != 0 && Provisional && !allowList[id].
+	// This is the exact condition the register function checks.
+	req := &mtproto.Request{
+		Ctx:         ctx,
+		UserID:      user.ID,
+		Provisional: true,
+		AuthKeyID:   [8]byte{1},
 	}
-	// The gate returns errAuthKeyUnreg when all conditions are met.
-	// We verify the conditions: UserID != 0 (bound key), Provisional = true,
-	// and the method is not in the allow-list.
-	// This is the exact logic the register wrapper applies.
+	err = api.ProvisionalGateBlocked(uint32(tg.MessagesSendMessageRequestTypeID), req)
+	if err == nil {
+		t.Fatal("gate did not block sendMessage for provisional session")
+	}
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) {
+		t.Fatalf("expected RPC error, got %v", err)
+	}
+	if rpc.Code != 401 || rpc.Message != "AUTH_KEY_UNREGISTERED" {
+		t.Fatalf("got %d %s, want 401 AUTH_KEY_UNREGISTERED", rpc.Code, rpc.Message)
+	}
+}
+
+func TestProvisionalGateAllowsAllowListedMethods(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	// Create a username-mode user without a verifier (provisional).
+	user, err := s.CreateUsernameUser(ctx, "allowuser", "Allow", "User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimUsernameForTest(s, user.ID, "allowuser"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save and bind the auth key.
+	if err := s.SaveAuthKey(ctx, int64(0x2), make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindAuthKeyUser(ctx, int64(0x2), user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	req := &mtproto.Request{
+		Ctx:         ctx,
+		UserID:      user.ID,
+		Provisional: true,
+		AuthKeyID:   [8]byte{2},
+	}
+
+	// All three allow-listed methods must not be blocked.
+	allowed := []uint32{
+		uint32(tg.AccountGetPasswordRequestTypeID),
+		uint32(tg.AccountUpdatePasswordSettingsRequestTypeID),
+		uint32(tg.AuthLogOutRequestTypeID),
+	}
+	for _, id := range allowed {
+		if err := api.ProvisionalGateBlocked(id, req); err != nil {
+			t.Errorf("gate blocked allow-listed method %#x: %v", id, err)
+		}
+	}
+}
+
+func TestProvisionalGateDoesNotApplyToUnauthenticated(t *testing.T) {
+	t.Parallel()
+	// Unauthenticated requests (UserID == 0) must never be blocked by the gate.
+	req := &mtproto.Request{
+		Ctx:         context.Background(),
+		UserID:      0,
+		Provisional: true,
+	}
+	err := api.ProvisionalGateBlocked(uint32(tg.MessagesSendMessageRequestTypeID), req)
+	if err != nil {
+		t.Fatalf("gate blocked unauthenticated request: %v", err)
+	}
 }
 
 func TestProvisionalGateAllowsGetPassword(t *testing.T) {
@@ -112,19 +175,14 @@ func TestProvisionalGateAllowsGetPassword(t *testing.T) {
 	}
 
 	// Save and bind the auth key.
-	if err := s.SaveAuthKey(ctx, int64(0x2), make([]byte, 256)); err != nil {
+	if err := s.SaveAuthKey(ctx, int64(0x3), make([]byte, 256)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.BindAuthKeyUser(ctx, int64(0x2), user.ID); err != nil {
+	if err := s.BindAuthKeyUser(ctx, int64(0x3), user.ID); err != nil {
 		t.Fatal(err)
 	}
 
 	// getPassword is in the allow-list, so the gate does not block it.
-	id := uint32(tg.AccountGetPasswordRequestTypeID)
-	if !api.ProvisionalAllowList[id] {
-		t.Fatal("getPassword must be in the provisional allow-list")
-	}
-
 	// Verify the handler itself works for a provisional account.
 	var buf bin.Buffer
 	if err := (&tg.AccountGetPasswordRequest{}).Encode(&buf); err != nil {
@@ -133,7 +191,7 @@ func TestProvisionalGateAllowsGetPassword(t *testing.T) {
 	res, err := api.GetPasswordForTest(s, user.ID, &mtproto.Request{
 		Ctx:       ctx,
 		UserID:    user.ID,
-		AuthKeyID: [8]byte{2},
+		AuthKeyID: [8]byte{3},
 		Buf:       &buf,
 	})
 	if err != nil {
@@ -163,20 +221,14 @@ func TestProvisionalGateAllowsLogOut(t *testing.T) {
 	}
 
 	// Save and bind the auth key.
-	if err := s.SaveAuthKey(ctx, int64(0x3), make([]byte, 256)); err != nil {
+	if err := s.SaveAuthKey(ctx, int64(0x4), make([]byte, 256)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.BindAuthKeyUser(ctx, int64(0x3), user.ID); err != nil {
+	if err := s.BindAuthKeyUser(ctx, int64(0x4), user.ID); err != nil {
 		t.Fatal(err)
 	}
 
-	// logOut is in the allow-list.
-	id := uint32(tg.AuthLogOutRequestTypeID)
-	if !api.ProvisionalAllowList[id] {
-		t.Fatal("logOut must be in the provisional allow-list")
-	}
-
-	key := [8]byte{3}
+	key := [8]byte{4}
 	// logOut from a provisional session must succeed.
 	res, afterReply, err := api.LogOutForTest(s, key)
 	if err != nil {
@@ -190,7 +242,7 @@ func TestProvisionalGateAllowsLogOut(t *testing.T) {
 	}
 
 	// Key should be deleted.
-	_, ok, err := s.AuthKeyByID(ctx, int64(0x3))
+	_, ok, err := s.AuthKeyByID(ctx, int64(0x4))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,15 +266,15 @@ func TestProvisionalGateLiftsAfterSettingVerifier(t *testing.T) {
 	}
 
 	// Save and bind the auth key.
-	if err := s.SaveAuthKey(ctx, int64(0x4), make([]byte, 256)); err != nil {
+	if err := s.SaveAuthKey(ctx, int64(0x5), make([]byte, 256)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.BindAuthKeyUser(ctx, int64(0x4), user.ID); err != nil {
+	if err := s.BindAuthKeyUser(ctx, int64(0x5), user.ID); err != nil {
 		t.Fatal(err)
 	}
 
 	// Verify session is provisional before setting verifier.
-	key, ok, err := s.AuthKeyByID(ctx, int64(0x4))
+	key, ok, err := s.AuthKeyByID(ctx, int64(0x5))
 	if err != nil || !ok {
 		t.Fatalf("AuthKeyByID: ok=%v err=%v", ok, err)
 	}
@@ -263,12 +315,24 @@ func TestProvisionalGateLiftsAfterSettingVerifier(t *testing.T) {
 
 	// Verify the session is no longer provisional: the JOIN in AuthKeyByID
 	// now finds a passwords row, so Provisional derives to false.
-	key, ok, err = s.AuthKeyByID(ctx, int64(0x4))
+	key, ok, err = s.AuthKeyByID(ctx, int64(0x5))
 	if err != nil || !ok {
 		t.Fatalf("AuthKeyByID: ok=%v err=%v", ok, err)
 	}
 	if key.Provisional {
 		t.Fatal("expected non-provisional after setting verifier")
+	}
+
+	// Confirm a non-allow-listed RPC would succeed (gate no longer fires
+	// because Provisional is false).
+	reqAfter := &mtproto.Request{
+		Ctx:         ctx,
+		UserID:      user.ID,
+		Provisional: false,
+		AuthKeyID:   [8]byte{5},
+	}
+	if err := api.ProvisionalGateBlocked(uint32(tg.MessagesSendMessageRequestTypeID), reqAfter); err != nil {
+		t.Fatalf("sendMessage after setting verifier: gate still blocks: %v", err)
 	}
 }
 
@@ -374,13 +438,6 @@ func TestUsernameModeLoginModeCheckBeforeSRPProof(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	// Verify the session is no longer provisional.
-	key, ok, err := s.AuthKeyByID(ctx, int64(0x7))
-	_ = key
-	_ = ok
-	_ = err
-	// Auth key not bound yet, skip — login_mode check happens before proof.
 
 	// Attempting to remove password: the login_mode check rejects before SRP
 	// proof because the handler checks NewAlgo for removal before requiring proof.
