@@ -209,6 +209,25 @@ func (h *handlers) handleUpdatePasswordSettings(r *mtproto.Request) (bin.Encoder
 		h.log.Error("update password: lookup current", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+
+	ns := req.NewSettings
+	// Check for removal early: for username-mode accounts, removing the verifier
+	// is irreversible lockout, so we reject before requiring any SRP proof.
+	// This check runs unconditionally — even when hasCur is false (provisional
+	// accounts that haven't set a password yet), because PasswordKdfAlgoUnknown
+	// from a provisional account would otherwise reach the switch and call
+	// DeletePassword on a non-existent row (a no-op but wrong semantics).
+	if _, isRemoval := ns.NewAlgo.(*tg.PasswordKdfAlgoUnknown); isRemoval {
+		loginMode, err := h.store.UserLoginMode(r.Ctx, r.UserID)
+		if err != nil {
+			h.log.Error("update password: lookup login mode", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		if loginMode == "username" {
+			return nil, errPasswordCannotBeRemoved
+		}
+	}
+
 	// Changing or removing an existing password requires proving the current one.
 	if hasCur {
 		proof, ok := req.Password.(*tg.InputCheckPasswordSRP)
@@ -224,12 +243,12 @@ func (h *handlers) handleUpdatePasswordSettings(r *mtproto.Request) (bin.Encoder
 		}
 	}
 
-	ns := req.NewSettings
 	switch algo := ns.NewAlgo.(type) {
 	case *tg.PasswordKdfAlgoUnknown:
 		// Explicit removal: the client signals it with the unknown algo. An empty
 		// new_algo/new_password_hash alone (e.g. an email-only update) must NOT
-		// delete the password.
+		// delete the password. The username-mode check above already rejected
+		// removal for login_mode='username' accounts before requiring proof.
 		if _, derr := h.store.DeletePassword(r.Ctx, r.UserID); derr != nil {
 			h.log.Error("update password: delete", "user_id", r.UserID, "err", derr)
 			return nil, errInternal
