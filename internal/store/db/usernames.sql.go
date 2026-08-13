@@ -64,7 +64,7 @@ WHERE un.handle = lower($1)
 
 type GetUserByUsernameRow struct {
 	ID         int64
-	Phone      string
+	Phone      *string
 	FirstName  string
 	LastName   string
 	CreatedAt  pgtype.Timestamptz

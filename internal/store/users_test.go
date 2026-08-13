@@ -435,3 +435,102 @@ func TestUpdateUsernameRollbackOnFloodWait(t *testing.T) {
 		t.Fatalf("expected ErrUsernameOccupied, got %v (row was deleted despite flood-wait)", err)
 	}
 }
+
+// --- CreateUsernameUser tests ---
+
+func TestCreateUsernameUserReturnsUsernameMode(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	u, err := s.CreateUsernameUser(ctx, "alice1", "Alice", "Smith")
+	if err != nil {
+		t.Fatalf("create username user: %v", err)
+	}
+	if u.ID == 0 {
+		t.Fatal("zero id")
+	}
+	if u.Phone != "" {
+		t.Errorf("phone = %q, want empty", u.Phone)
+	}
+	if u.FirstName != "Alice" {
+		t.Errorf("first_name = %q, want Alice", u.FirstName)
+	}
+	if u.LastName != "Smith" {
+		t.Errorf("last_name = %q, want Smith", u.LastName)
+	}
+	// Verify the row in DB has login_mode = 'username' via a direct read.
+	var loginMode string
+	err = store.StorePool(s).QueryRow(ctx,
+		"SELECT login_mode FROM users WHERE id = $1", u.ID).Scan(&loginMode)
+	if err != nil {
+		t.Fatalf("read login_mode: %v", err)
+	}
+	if loginMode != "username" {
+		t.Errorf("login_mode = %q, want username", loginMode)
+	}
+}
+
+func TestCreateUsernameUserNoPhoneConflict(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	// Create two username-mode users — neither has a phone, so no conflict.
+	u1, err := s.CreateUsernameUser(ctx, "alice2", "Alice", "Smith")
+	if err != nil {
+		t.Fatalf("create first: %v", err)
+	}
+	u2, err := s.CreateUsernameUser(ctx, "bob2", "Bob", "Jones")
+	if err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+	if u1.ID == u2.ID {
+		t.Error("two username users got same id")
+	}
+}
+
+func TestCreateUsernameUserProvisionsUpdateState(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	u, err := s.CreateUsernameUser(ctx, "carol2", "Carol", "White")
+	if err != nil {
+		t.Fatalf("create username user: %v", err)
+	}
+	// Verify update_state row exists.
+	var hasState bool
+	err = store.StorePool(s).QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM update_state WHERE user_id = $1)", u.ID).Scan(&hasState)
+	if err != nil {
+		t.Fatalf("check update_state: %v", err)
+	}
+	if !hasState {
+		t.Error("update_state row not provisioned for username user")
+	}
+}
+
+func TestCreateUserPhoneModeUnchanged(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	u, err := s.CreateUser(ctx, "+15551260151")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if u.Phone != "15551260151" {
+		t.Errorf("phone = %q, want 15551260151", u.Phone)
+	}
+	// Verify the row in DB has login_mode = 'phone' (default).
+	var loginMode string
+	err = store.StorePool(s).QueryRow(ctx,
+		"SELECT login_mode FROM users WHERE id = $1", u.ID).Scan(&loginMode)
+	if err != nil {
+		t.Fatalf("read login_mode: %v", err)
+	}
+	if loginMode != "phone" {
+		t.Errorf("login_mode = %q, want phone", loginMode)
+	}
+}
