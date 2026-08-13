@@ -228,6 +228,7 @@ func (h *handlers) checkRateLimit(r *mtproto.Request, surface string, cfg store.
 // A provisional session is a username-mode account with no verifier: it can set
 // its password, check password state, or log out — but nothing else.
 var provisionalAllowList = map[uint32]bool{
+	tg.HelpGetConfigRequestTypeID:                 true,
 	tg.AccountGetPasswordRequestTypeID:            true,
 	tg.AccountUpdatePasswordSettingsRequestTypeID: true,
 	tg.AuthLogOutRequestTypeID:                    true,

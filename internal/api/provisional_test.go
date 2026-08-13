@@ -16,9 +16,11 @@ import (
 
 func TestProvisionalAllowListContainsExpectedMethods(t *testing.T) {
 	t.Parallel()
-	// The allow-list must contain exactly the three methods that a provisional
-	// session is permitted to call.
+	// The allow-list must contain exactly the four methods that a provisional
+	// session is permitted to call. help.getConfig is needed because gotd's
+	// connection handshake calls it unconditionally.
 	want := map[uint32]bool{
+		tg.HelpGetConfigRequestTypeID:                 true,
 		tg.AccountGetPasswordRequestTypeID:            true,
 		tg.AccountUpdatePasswordSettingsRequestTypeID: true,
 		tg.AuthLogOutRequestTypeID:                    true,
@@ -133,8 +135,9 @@ func TestProvisionalGateAllowsAllowListedMethods(t *testing.T) {
 		AuthKeyID:   [8]byte{2},
 	}
 
-	// All three allow-listed methods must not be blocked.
+	// All four allow-listed methods must not be blocked.
 	allowed := []uint32{
+		uint32(tg.HelpGetConfigRequestTypeID),
 		uint32(tg.AccountGetPasswordRequestTypeID),
 		uint32(tg.AccountUpdatePasswordSettingsRequestTypeID),
 		uint32(tg.AuthLogOutRequestTypeID),
