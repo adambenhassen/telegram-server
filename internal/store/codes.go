@@ -105,15 +105,16 @@ func (s *Store) checkCooldown(ctx context.Context, phone string) error {
 // already-consumed, expired, or exhausted code never verifies. The lookup is by
 // code_hash so the row found belongs exclusively to the caller who received
 // that hash — attempts are charged only against that row, never against a
-// different caller's code for the same phone. The Go-side checks (consumed →
-// expired → exhausted) map the right sentinel in the common sequential case.
-// Success is decided by a compare-and-swap scoped to the exact issued code
-// (code_hash+code) with the terminal-state guards in the WHERE, so a concurrent
-// resend/consume/expiry that slips between the read and the write makes the
-// swap affect zero rows → ErrCodeInvalid. Both a wrong hash and a wrong code
-// return ErrCodeInvalid without revealing which field was wrong, but only a
-// wrong code under the correct hash charges an attempt. The attempt that reaches
-// maxAttempts exhausts the code.
+// different caller's code for the same phone. After the hash lookup, the phone
+// binding is confirmed (row.Phone == phone); mismatch rejects without charging
+// an attempt to prevent the attacker from learning anything by scanning. Success
+// is decided by a compare-and-swap scoped to (phone + code_hash + code) with the
+// terminal-state guards in the WHERE, so a concurrent resend/consume/expiry that
+// slips between the read and the write makes the swap affect zero rows →
+// ErrCodeInvalid. Both a wrong hash and a wrong code return ErrCodeInvalid
+// without revealing which field was wrong, but only a wrong code under the
+// correct hash charges an attempt. The attempt that reaches maxAttempts exhausts
+// the code.
 func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error {
 	row, err := s.q.GetCodeByHash(ctx, hash)
 	switch {
@@ -121,6 +122,15 @@ func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error 
 		return ErrCodeInvalid
 	case err != nil:
 		return fmt.Errorf("verify code: %w", err)
+	}
+	// Bind the code to the identifier it was issued for. An attacker who
+	// obtained a valid code_hash for one identifier must not be able to verify
+	// it under a different one. Reject without incrementing attempts — charging
+	// on an identifier mismatch would hand back the cross-caller charging
+	// primitive this ticket exists to remove.
+	phone = NormalizePhone(phone)
+	if phone != row.Phone {
+		return ErrCodeInvalid
 	}
 	if row.ConsumedAt.Valid {
 		return ErrCodeInvalid
@@ -138,6 +148,7 @@ func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error 
 		return ErrCodeInvalid
 	}
 	rows, err := s.q.ConsumeCode(ctx, db.ConsumeCodeParams{
+		Phone:    phone,
 		CodeHash: hash,
 		Code:     code,
 		Attempts: maxAttempts,

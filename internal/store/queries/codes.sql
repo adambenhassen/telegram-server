@@ -27,14 +27,16 @@ WHERE code_hash = $1;
 
 -- name: ConsumeCode :execrows
 -- Compare-and-swap: consume only the exact issued code, and only while it is
--- still verifiable. The terminal-state guards live in the WHERE so a code that
--- lost a race to a concurrent resend/consume/expiry affects zero rows.
+-- still verifiable. The phone binding in the WHERE enforces that a code_hash
+-- issued for one identifier cannot be consumed under a different one — the
+-- database-level guard that backs the Go check in VerifyCode.
 UPDATE phone_codes SET consumed_at = now()
-WHERE code_hash = $1
-  AND code = $2
+WHERE phone = $1
+  AND code_hash = $2
+  AND code = $3
   AND consumed_at IS NULL
   AND expires_at >= now()
-  AND attempts < $3;
+  AND attempts < $4;
 
 -- name: DeleteExpiredCodes :execrows
 DELETE FROM phone_codes WHERE expires_at < now();

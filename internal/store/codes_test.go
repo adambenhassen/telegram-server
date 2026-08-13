@@ -267,3 +267,29 @@ func TestIssueCodeForUsernameIndependentRows(t *testing.T) {
 		t.Fatalf("B verify after A exhausted: %v", err)
 	}
 }
+
+// TestVerifyCodeIdentifierBinding verifies that a code_hash issued for one
+// identifier cannot be verified under a different one. Without this check,
+// an attacker who obtains a valid code for their own number can use it to
+// impersonate any victim (two RPCs, no race).
+func TestVerifyCodeIdentifierBinding(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	// Attacker issues a code for a number they control.
+	attackerHash, attackerCode, err := s.IssueCodeForUsername(ctx, "attacker")
+	if err != nil {
+		t.Fatalf("issue for attacker: %v", err)
+	}
+
+	// Attacker tries to verify under a victim's identifier.
+	if err := s.VerifyCode(ctx, "victim", attackerHash, attackerCode); !errors.Is(err, store.ErrCodeInvalid) {
+		t.Fatalf("cross-identifier verify: got %v, want ErrCodeInvalid", err)
+	}
+
+	// The attacker's code must still verify correctly under their own identifier.
+	if err := s.VerifyCode(ctx, "attacker", attackerHash, attackerCode); err != nil {
+		t.Fatalf("attacker self-verify: %v", err)
+	}
+}
