@@ -13,16 +13,14 @@ import (
 
 const consumeCode = `-- name: ConsumeCode :execrows
 UPDATE phone_codes SET consumed_at = now()
-WHERE phone = $1
-  AND code_hash = $2
-  AND code = $3
+WHERE code_hash = $1
+  AND code = $2
   AND consumed_at IS NULL
   AND expires_at >= now()
-  AND attempts < $4
+  AND attempts < $3
 `
 
 type ConsumeCodeParams struct {
-	Phone    string
 	CodeHash string
 	Code     string
 	Attempts int32
@@ -32,12 +30,7 @@ type ConsumeCodeParams struct {
 // still verifiable. The terminal-state guards live in the WHERE so a code that
 // lost a race to a concurrent resend/consume/expiry affects zero rows.
 func (q *Queries) ConsumeCode(ctx context.Context, arg ConsumeCodeParams) (int64, error) {
-	result, err := q.db.Exec(ctx, consumeCode,
-		arg.Phone,
-		arg.CodeHash,
-		arg.Code,
-		arg.Attempts,
-	)
+	result, err := q.db.Exec(ctx, consumeCode, arg.CodeHash, arg.Code, arg.Attempts)
 	if err != nil {
 		return 0, err
 	}
@@ -56,14 +49,44 @@ func (q *Queries) DeleteExpiredCodes(ctx context.Context) (int64, error) {
 	return result.RowsAffected(), nil
 }
 
-const getCode = `-- name: GetCode :one
-SELECT phone, code_hash, code, expires_at, attempts, consumed_at, created_at FROM phone_codes WHERE phone = $1
+const getCodeByHash = `-- name: GetCodeByHash :one
+SELECT id, phone, code_hash, code, expires_at, attempts, consumed_at, created_at FROM phone_codes WHERE code_hash = $1
 `
 
-func (q *Queries) GetCode(ctx context.Context, phone string) (PhoneCode, error) {
-	row := q.db.QueryRow(ctx, getCode, phone)
+// Looks up a code row by its hash. Used by VerifyCode to find the exact row
+// the caller's code_hash belongs to, so attempts are charged only against that
+// row — never against a different caller's code for the same phone.
+func (q *Queries) GetCodeByHash(ctx context.Context, codeHash string) (PhoneCode, error) {
+	row := q.db.QueryRow(ctx, getCodeByHash, codeHash)
 	var i PhoneCode
 	err := row.Scan(
+		&i.ID,
+		&i.Phone,
+		&i.CodeHash,
+		&i.Code,
+		&i.ExpiresAt,
+		&i.Attempts,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getLatestCode = `-- name: GetLatestCode :one
+SELECT id, phone, code_hash, code, expires_at, attempts, consumed_at, created_at FROM phone_codes
+WHERE phone = $1
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+// Returns the most recently created code row for a phone. Used by IssueCode
+// to enforce the resend cooldown: if the latest row is not consumed and was
+// created within the cooldown window, a new issue is rejected.
+func (q *Queries) GetLatestCode(ctx context.Context, phone string) (PhoneCode, error) {
+	row := q.db.QueryRow(ctx, getLatestCode, phone)
+	var i PhoneCode
+	err := row.Scan(
+		&i.ID,
 		&i.Phone,
 		&i.CodeHash,
 		&i.Code,
@@ -77,44 +100,32 @@ func (q *Queries) GetCode(ctx context.Context, phone string) (PhoneCode, error) 
 
 const incrementCodeAttempts = `-- name: IncrementCodeAttempts :exec
 UPDATE phone_codes SET attempts = attempts + 1
-WHERE phone = $1 AND code_hash = $2
+WHERE code_hash = $1
 `
-
-type IncrementCodeAttemptsParams struct {
-	Phone    string
-	CodeHash string
-}
 
 // Scoped to the exact issued code by its hash so a concurrent resend (new hash)
 // is never charged for a failed attempt against the old code.
-func (q *Queries) IncrementCodeAttempts(ctx context.Context, arg IncrementCodeAttemptsParams) error {
-	_, err := q.db.Exec(ctx, incrementCodeAttempts, arg.Phone, arg.CodeHash)
+func (q *Queries) IncrementCodeAttempts(ctx context.Context, codeHash string) error {
+	_, err := q.db.Exec(ctx, incrementCodeAttempts, codeHash)
 	return err
 }
 
-const upsertCode = `-- name: UpsertCode :exec
+const insertCode = `-- name: InsertCode :exec
 INSERT INTO phone_codes (phone, code_hash, code, expires_at)
 VALUES ($1, $2, $3, $4)
-ON CONFLICT (phone) DO UPDATE
-  SET code_hash   = EXCLUDED.code_hash,
-      code        = EXCLUDED.code,
-      expires_at  = EXCLUDED.expires_at,
-      attempts    = 0,
-      consumed_at = NULL,
-      created_at  = now()
 `
 
-type UpsertCodeParams struct {
+type InsertCodeParams struct {
 	Phone     string
 	CodeHash  string
 	Code      string
 	ExpiresAt pgtype.Timestamptz
 }
 
-// Issues a fresh code, resetting the hardening state (attempts, consumed_at,
-// created_at) so a re-issue starts a clean single-use window.
-func (q *Queries) UpsertCode(ctx context.Context, arg UpsertCodeParams) error {
-	_, err := q.db.Exec(ctx, upsertCode,
+// Inserts a new code row. Each IssueCode call creates its own row keyed by
+// code_hash, so attempt counters are isolated between callers.
+func (q *Queries) InsertCode(ctx context.Context, arg InsertCodeParams) error {
+	_, err := q.db.Exec(ctx, insertCode,
 		arg.Phone,
 		arg.CodeHash,
 		arg.Code,

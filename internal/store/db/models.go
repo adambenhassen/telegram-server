@@ -170,6 +170,7 @@ type MessageReaction struct {
 }
 
 type PhoneCode struct {
+	ID         int64
 	Phone      string
 	CodeHash   string
 	Code       string

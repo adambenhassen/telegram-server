@@ -26,25 +26,12 @@ const (
 
 // IssueCode generates a 5-digit login code and hash for phone, storing it with
 // a TTL. It returns ErrResendTooSoon if an unconsumed prior code was issued
-// within resendCooldown. On success it resets the per-code hardening state
-// (attempts, consumed_at, created_at).
+// within resendCooldown. Each call inserts a new row keyed by code_hash, so
+// attempt counters are isolated between callers.
 func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, error) {
 	phone = NormalizePhone(phone)
-	existing, err := s.q.GetCode(ctx, phone)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		// No prior code: nothing blocks a fresh issue.
-	case err != nil:
-		return "", "", fmt.Errorf("issue code: %w", err)
-	default:
-		// Gate on "not consumed", not "still active": an exhausted code (attempts
-		// >= maxAttempts) must keep serving the cooldown, else exhausting a code
-		// with wrong guesses would bypass the limit and reopen the brute force. A
-		// consumed code (successful login) bypasses so a real user can re-login;
-		// an expired code is already >codeTTL old so time.Since clears the window.
-		if !existing.ConsumedAt.Valid && time.Since(existing.CreatedAt.Time) < resendCooldown {
-			return "", "", ErrResendTooSoon
-		}
+	if err := s.checkCooldown(ctx, phone); err != nil {
+		return "", "", err
 	}
 
 	code, err := randDigits5()
@@ -55,7 +42,7 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	if err != nil {
 		return "", "", err
 	}
-	err = s.q.UpsertCode(ctx, db.UpsertCodeParams{
+	err = s.q.InsertCode(ctx, db.InsertCodeParams{
 		Phone:     phone,
 		CodeHash:  hash,
 		Code:      code,
@@ -67,21 +54,68 @@ func (s *Store) IssueCode(ctx context.Context, phone string) (string, string, er
 	return hash, code, nil
 }
 
-// VerifyCode checks the code+hash for phone. It is single-use and fail-closed:
-// an already-consumed, expired, or exhausted code never verifies. The Go-side
-// checks (consumed → expired → exhausted) map the right sentinel in the common
-// sequential case. Success is decided by a compare-and-swap scoped to the exact
-// issued code (phone+hash+code) with the terminal-state guards in the WHERE, so
-// a concurrent resend/consume/expiry that slips between the read and the write
-// makes the swap affect zero rows → ErrCodeInvalid. Both mutations are scoped by
-// code_hash so they can never corrupt a code that a resend replaced. Both a wrong
-// hash and a wrong code return ErrCodeInvalid without revealing which field was
-// wrong, but only a wrong code under the correct hash charges an attempt: because
-// IncrementCodeAttempts is scoped by code_hash, a wrong hash matches no row and
-// charges nothing. The attempt that reaches maxAttempts exhausts the code.
+// IssueCodeForUsername generates a 5-digit login code and hash for a username
+// identifier. Unlike IssueCode, it does not enforce a resend cooldown — each
+// call inserts a new row keyed by code_hash, so attempt counters are isolated
+// between callers even for the same identifier.
+func (s *Store) IssueCodeForUsername(ctx context.Context, username string) (string, string, error) {
+	code, err := randDigits5()
+	if err != nil {
+		return "", "", err
+	}
+	hash, err := randHex()
+	if err != nil {
+		return "", "", err
+	}
+	err = s.q.InsertCode(ctx, db.InsertCodeParams{
+		Phone:     username,
+		CodeHash:  hash,
+		Code:      code,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(codeTTL), Valid: true},
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("issue code for username: %w", err)
+	}
+	return hash, code, nil
+}
+
+// checkCooldown returns ErrResendTooSoon if the latest code row for the given
+// phone is not consumed and was created within resendCooldown.
+func (s *Store) checkCooldown(ctx context.Context, phone string) error {
+	existing, err := s.q.GetLatestCode(ctx, phone)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// No prior code: nothing blocks a fresh issue.
+	case err != nil:
+		return fmt.Errorf("issue code: %w", err)
+	default:
+		// Gate on "not consumed", not "still active": an exhausted code (attempts
+		// >= maxAttempts) must keep serving the cooldown, else exhausting a code
+		// with wrong guesses would bypass the limit and reopen the brute force. A
+		// consumed code (successful login) bypasses so a real user can re-login;
+		// an expired code is already >codeTTL old so time.Since clears the window.
+		if !existing.ConsumedAt.Valid && time.Since(existing.CreatedAt.Time) < resendCooldown {
+			return ErrResendTooSoon
+		}
+	}
+	return nil
+}
+
+// VerifyCode checks the code+hash. It is single-use and fail-closed: an
+// already-consumed, expired, or exhausted code never verifies. The lookup is by
+// code_hash so the row found belongs exclusively to the caller who received
+// that hash — attempts are charged only against that row, never against a
+// different caller's code for the same phone. The Go-side checks (consumed →
+// expired → exhausted) map the right sentinel in the common sequential case.
+// Success is decided by a compare-and-swap scoped to the exact issued code
+// (code_hash+code) with the terminal-state guards in the WHERE, so a concurrent
+// resend/consume/expiry that slips between the read and the write makes the
+// swap affect zero rows → ErrCodeInvalid. Both a wrong hash and a wrong code
+// return ErrCodeInvalid without revealing which field was wrong, but only a
+// wrong code under the correct hash charges an attempt. The attempt that reaches
+// maxAttempts exhausts the code.
 func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error {
-	phone = NormalizePhone(phone)
-	row, err := s.q.GetCode(ctx, phone)
+	row, err := s.q.GetCodeByHash(ctx, hash)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return ErrCodeInvalid
@@ -98,16 +132,12 @@ func (s *Store) VerifyCode(ctx context.Context, phone, hash, code string) error 
 		return ErrCodeExhausted
 	}
 	if hash != row.CodeHash || code != row.Code {
-		if err := s.q.IncrementCodeAttempts(ctx, db.IncrementCodeAttemptsParams{
-			Phone:    phone,
-			CodeHash: hash,
-		}); err != nil {
+		if err := s.q.IncrementCodeAttempts(ctx, hash); err != nil {
 			return fmt.Errorf("verify code: %w", err)
 		}
 		return ErrCodeInvalid
 	}
 	rows, err := s.q.ConsumeCode(ctx, db.ConsumeCodeParams{
-		Phone:    phone,
 		CodeHash: hash,
 		Code:     code,
 		Attempts: maxAttempts,

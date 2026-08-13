@@ -1,36 +1,40 @@
--- name: UpsertCode :exec
--- Issues a fresh code, resetting the hardening state (attempts, consumed_at,
--- created_at) so a re-issue starts a clean single-use window.
+-- name: InsertCode :exec
+-- Inserts a new code row. Each IssueCode call creates its own row keyed by
+-- code_hash, so attempt counters are isolated between callers.
 INSERT INTO phone_codes (phone, code_hash, code, expires_at)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (phone) DO UPDATE
-  SET code_hash   = EXCLUDED.code_hash,
-      code        = EXCLUDED.code,
-      expires_at  = EXCLUDED.expires_at,
-      attempts    = 0,
-      consumed_at = NULL,
-      created_at  = now();
+VALUES ($1, $2, $3, $4);
 
--- name: GetCode :one
-SELECT * FROM phone_codes WHERE phone = $1;
+-- name: GetLatestCode :one
+-- Returns the most recently created code row for a phone. Used by IssueCode
+-- to enforce the resend cooldown: if the latest row is not consumed and was
+-- created within the cooldown window, a new issue is rejected.
+SELECT * FROM phone_codes
+WHERE phone = $1
+ORDER BY created_at DESC
+LIMIT 1;
+
+-- name: GetCodeByHash :one
+-- Looks up a code row by its hash. Used by VerifyCode to find the exact row
+-- the caller's code_hash belongs to, so attempts are charged only against that
+-- row — never against a different caller's code for the same phone.
+SELECT * FROM phone_codes WHERE code_hash = $1;
 
 -- name: IncrementCodeAttempts :exec
 -- Scoped to the exact issued code by its hash so a concurrent resend (new hash)
 -- is never charged for a failed attempt against the old code.
 UPDATE phone_codes SET attempts = attempts + 1
-WHERE phone = $1 AND code_hash = $2;
+WHERE code_hash = $1;
 
 -- name: ConsumeCode :execrows
 -- Compare-and-swap: consume only the exact issued code, and only while it is
 -- still verifiable. The terminal-state guards live in the WHERE so a code that
 -- lost a race to a concurrent resend/consume/expiry affects zero rows.
 UPDATE phone_codes SET consumed_at = now()
-WHERE phone = $1
-  AND code_hash = $2
-  AND code = $3
+WHERE code_hash = $1
+  AND code = $2
   AND consumed_at IS NULL
   AND expires_at >= now()
-  AND attempts < $4;
+  AND attempts < $3;
 
 -- name: DeleteExpiredCodes :execrows
 DELETE FROM phone_codes WHERE expires_at < now();

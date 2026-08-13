@@ -134,8 +134,8 @@ func TestVerifyCodeExpired(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	if _, err := conn.Exec(ctx,
-		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE phone = $1`,
-		store.NormalizePhone(phone),
+		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE code_hash = $1`,
+		hash,
 	); err != nil {
 		t.Fatalf("expire code: %v", err)
 	}
@@ -176,12 +176,15 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	const expiredPhone = "+15551250005"
 	const freshPhone = "+15551250006"
 
-	if _, _, err := s.IssueCode(ctx, expiredPhone); err != nil {
+	expiredHash, _, err := s.IssueCode(ctx, expiredPhone)
+	if err != nil {
 		t.Fatalf("issue expired: %v", err)
 	}
-	if _, _, err := s.IssueCode(ctx, freshPhone); err != nil {
+	freshHash, _, err := s.IssueCode(ctx, freshPhone)
+	if err != nil {
 		t.Fatalf("issue fresh: %v", err)
 	}
+	_ = freshHash
 
 	// Force the first code past its TTL via a direct connection to the same DB.
 	conn, err := pgx.Connect(ctx, dsn)
@@ -190,8 +193,8 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	if _, err := conn.Exec(ctx,
-		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE phone = $1`,
-		store.NormalizePhone(expiredPhone),
+		`UPDATE phone_codes SET expires_at = now() - interval '1 minute' WHERE code_hash = $1`,
+		expiredHash,
 	); err != nil {
 		t.Fatalf("expire code: %v", err)
 	}
@@ -220,5 +223,47 @@ func TestDeleteExpiredCodes(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("fresh row should remain: count=%d", count)
+	}
+}
+
+// TestIssueCodeIsolation verifies that two IssueCode calls for the same phone
+// produce independent rows: exhausting one's attempt counter does not affect the
+// other. The phone path still enforces cooldown, so this test uses
+// IssueCodeForUsername which has no cooldown and exercises the isolation
+// invariant directly.
+func TestIssueCodeForUsernameIndependentRows(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	const username = "alice"
+
+	// Two concurrent callers issue codes for the same identifier.
+	hashA, codeA, err := s.IssueCodeForUsername(ctx, username)
+	if err != nil {
+		t.Fatalf("issue A: %v", err)
+	}
+	hashB, codeB, err := s.IssueCodeForUsername(ctx, username)
+	if err != nil {
+		t.Fatalf("issue B: %v", err)
+	}
+	if hashA == hashB {
+		t.Fatal("two issuances produced the same hash")
+	}
+
+	// Exhaust A's attempt counter with wrong codes.
+	badA := wrongCode(codeA)
+	for i := range 3 {
+		if err := s.VerifyCode(ctx, username, hashA, badA); !errors.Is(err, store.ErrCodeInvalid) {
+			t.Fatalf("A wrong attempt %d: got %v, want ErrCodeInvalid", i+1, err)
+		}
+	}
+	// A is now exhausted.
+	if err := s.VerifyCode(ctx, username, hashA, codeA); !errors.Is(err, store.ErrCodeExhausted) {
+		t.Fatalf("A post-exhaustion: got %v, want ErrCodeExhausted", err)
+	}
+
+	// B's code must still verify correctly — its attempt counter was not touched.
+	if err := s.VerifyCode(ctx, username, hashB, codeB); err != nil {
+		t.Fatalf("B verify after A exhausted: %v", err)
 	}
 }
