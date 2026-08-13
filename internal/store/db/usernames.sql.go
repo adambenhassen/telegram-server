@@ -91,6 +91,46 @@ func (q *Queries) GetUserByUsername(ctx context.Context, handle string) (GetUser
 	return i, err
 }
 
+const getUserByUsernameWithLoginMode = `-- name: GetUserByUsernameWithLoginMode :one
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       u.login_mode, un.handle AS username
+FROM users u
+JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
+WHERE un.handle = lower($1)
+`
+
+type GetUserByUsernameWithLoginModeRow struct {
+	ID         int64
+	Phone      *string
+	FirstName  string
+	LastName   string
+	CreatedAt  pgtype.Timestamptz
+	IsOnline   bool
+	LastSeenAt pgtype.Timestamptz
+	LoginMode  string
+	Username   string
+}
+
+// Resolves a normalized username to the owning user, including login_mode.
+// Only matches owner_type='user' — a channel with the same handle returns no row.
+// Returns login_mode so the signIn handler can decide 2FA vs sign-up vs error.
+func (q *Queries) GetUserByUsernameWithLoginMode(ctx context.Context, handle string) (GetUserByUsernameWithLoginModeRow, error) {
+	row := q.db.QueryRow(ctx, getUserByUsernameWithLoginMode, handle)
+	var i GetUserByUsernameWithLoginModeRow
+	err := row.Scan(
+		&i.ID,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.CreatedAt,
+		&i.IsOnline,
+		&i.LastSeenAt,
+		&i.LoginMode,
+		&i.Username,
+	)
+	return i, err
+}
+
 const getUsernameByHandle = `-- name: GetUsernameByHandle :one
 SELECT handle, owner_type, owner_id FROM usernames WHERE handle = lower($1)
 `

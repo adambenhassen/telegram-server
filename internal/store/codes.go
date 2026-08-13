@@ -190,6 +190,34 @@ func (s *Store) verifyCodeWith(ctx context.Context, q *db.Queries, phone, hash, 
 	return nil
 }
 
+// CheckCodeHash validates a code hash without verifying the actual code value.
+// It confirms the hash exists, is bound to the expected identifier, is not
+// consumed, not expired, and not exhausted. Used by username-mode signIn where
+// the code field is ignored — only the hash is validated.
+func (s *Store) CheckCodeHash(ctx context.Context, phone, hash string) error {
+	phone = NormalizePhone(phone)
+	row, err := s.q.GetCodeByHashAndPhone(ctx, db.GetCodeByHashAndPhoneParams{
+		CodeHash: hash,
+		Phone:    phone,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrCodeInvalid
+	case err != nil:
+		return fmt.Errorf("check code hash: %w", err)
+	}
+	if row.ConsumedAt.Valid {
+		return ErrCodeInvalid
+	}
+	if time.Now().After(row.ExpiresAt.Time) {
+		return ErrCodeExpired
+	}
+	if row.Attempts >= maxAttempts {
+		return ErrCodeExhausted
+	}
+	return nil
+}
+
 // DeleteExpiredCodes removes all login codes past their expiry and returns
 // the number of rows deleted.
 func (s *Store) DeleteExpiredCodes(ctx context.Context) (int64, error) {
