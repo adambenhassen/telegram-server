@@ -169,6 +169,29 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errMethodNotImpl
 	}
 
+	// Classify the identifier: phone or username.
+	input := req.PhoneNumber
+	isUsername := false
+	switch {
+	case validatePhone(input) == nil:
+		// Phone path — unchanged.
+	case validateUsername(input):
+		// Username path — normalise to lowercase.
+		input = strings.ToLower(input)
+		isUsername = true
+	default:
+		return nil, errPhoneInvalid
+	}
+
+	if isUsername {
+		return h.handleSignInUsername(r, input, req.PhoneCodeHash)
+	}
+
+	return h.handleSignInPhone(r, req)
+}
+
+// handleSignInPhone is the phone-mode signIn path, unchanged from before.
+func (h *handlers) handleSignInPhone(r *mtproto.Request, req tg.AuthSignInRequest) (bin.Encoder, error) {
 	code, _ := req.GetPhoneCode()
 
 	// AttemptSignIn atomically checks the per-IP failure budget, verifies the
@@ -217,6 +240,74 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 	return &tg.AuthAuthorization{User: userTL(user)}, nil
+}
+
+// handleSignInUsername is the username-mode signIn path. It validates the code
+// hash (not the code value), resolves the user from the usernames table, and
+// branches on login_mode and verifier presence.
+func (h *handlers) handleSignInUsername(r *mtproto.Request, username, phoneCodeHash string) (bin.Encoder, error) {
+	// Validate the code hash. In username mode the code field is ignored — only
+	// the hash is validated.
+	if err := h.store.CheckCodeHash(r.Ctx, username, phoneCodeHash); err != nil {
+		rpc := verifyToRPC(err)
+		if rpc == errCodeExpired {
+			// Username path must return PHONE_CODE_INVALID for both missing and
+			// expired hashes — the acceptance criteria do not distinguish them.
+			rpc = errCodeInvalid
+		}
+		if rpc == errInternal {
+			h.log.Error("sign in: check code hash", "err", err)
+			return nil, errInternal
+		}
+		return nil, rpc
+	}
+
+	// Resolve the user by username. Only owner_type='user' matches; a channel
+	// with the same handle is treated as "user does not exist".
+	resolved, ok, err := h.store.UserByUsernameWithLoginMode(r.Ctx, username)
+	if err != nil {
+		h.log.Error("sign in: resolve username", "err", err)
+		return nil, errInternal
+	}
+
+	// Unknown username: return authorizationSignUpRequired. No user is created,
+	// no auth key is bound.
+	if !ok {
+		return &tg.AuthAuthorizationSignUpRequired{}, nil
+	}
+
+	// The login_mode check and fail-closed invariant MUST precede SetPendingUser.
+	// SetPendingUser sets user_id = NULL unconditionally; a check placed after
+	// it would destroy the caller's existing session.
+	if resolved.LoginMode != "username" {
+		// This should not happen for a row matched via usernames with owner_type='user'
+		// in normal operation, but fail closed if it does.
+		h.log.Error("sign in: user resolved via username has unexpected login_mode", "user_id", resolved.ID, "login_mode", resolved.LoginMode)
+		return nil, errInternal
+	}
+
+	// Check whether the user has a verifier (cloud password).
+	_, hasVerifier, err := h.store.PasswordByUser(r.Ctx, resolved.ID)
+	if err != nil {
+		h.log.Error("sign in: password lookup", "user_id", resolved.ID, "err", err)
+		return nil, errInternal
+	}
+
+	if !hasVerifier {
+		// Known user with login_mode='username' but no verifier (provisional
+		// account). Fail closed — do not call SetPendingUser.
+		h.log.Error("sign in: provisional account has no verifier", "user_id", resolved.ID)
+		return nil, errInternal
+	}
+
+	// Known user with login_mode='username' and a verifier: stage pending and
+	// require SRP password step.
+	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
+	if err := h.store.SetPendingUser(r.Ctx, keyID, resolved.ID); err != nil {
+		h.log.Error("sign in: set pending", "user_id", resolved.ID, "err", err)
+		return nil, errInternal
+	}
+	return nil, errSessionPasswordNeeded
 }
 
 // handleLogOut serves auth.logOut. It deletes the auth key the request arrived

@@ -644,6 +644,14 @@ func ClaimChannelUsernameForTest(s *store.Store, channelID int64, handle string)
 	return s.ClaimChannelUsername(context.Background(), channelID, handle)
 }
 
+// ClaimUsernameForTest claims a username for a user directly in the usernames
+// table, bypassing UpdateUsername's login_mode guard. Used by tests that need
+// to seed a login_mode='username' account with a handle — the production path
+// that does this is auth.signUp, which is a later ticket.
+func ClaimUsernameForTest(s *store.Store, userID int64, handle string) error {
+	return s.ClaimUsername(context.Background(), userID, handle)
+}
+
 // ContactsSearchForTest invokes handleContactsSearch for the caller against the
 // given request.
 func ContactsSearchForTest(s *store.Store, userID int64, req *tg.ContactsSearchRequest) (bin.Encoder, error) {

@@ -362,6 +362,43 @@ func (s *Store) SearchContacts(ctx context.Context, ownerID int64, query string,
 	return out, nil
 }
 
+// ClaimUsername claims a username for a user: inserts into the usernames table
+// and updates users.username in one transaction. It bypasses the login_mode guard
+// that UpdateUsername enforces, so it is used only by tests and the auth.signUp
+// handler. PK conflict returns ErrUsernameOccupied.
+func (s *Store) ClaimUsername(ctx context.Context, userID int64, handle string) error {
+	xHandle := strings.ToLower(handle)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+	// Release the caller's existing handle first.
+	if _, err := qtx.ReleaseUsernameByOwner(ctx, db.ReleaseUsernameByOwnerParams{
+		OwnerType: "user",
+		OwnerID:   userID,
+	}); err != nil {
+		return fmt.Errorf("release old username: %w", err)
+	}
+	_, err = qtx.ClaimUsername(ctx, db.ClaimUsernameParams{
+		Handle:    xHandle,
+		OwnerType: "user",
+		OwnerID:   userID,
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ErrUsernameOccupied
+		}
+		return fmt.Errorf("claim username: %w", err)
+	}
+	if _, err := qtx.SetUsername(ctx, db.SetUsernameParams{ID: userID, Username: &xHandle}); err != nil {
+		return fmt.Errorf("set username: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
 // ClaimChannelUsername claims a username for a channel atomically: inserts
 // into the usernames table AND updates channels.username in one transaction.
 // The shipped RPC that does this (channels.setUsername) is a later ticket;
