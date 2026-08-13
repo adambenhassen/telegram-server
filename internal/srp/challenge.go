@@ -21,18 +21,18 @@ type Pending struct {
 	UserID  int64
 }
 
-// entry is one stored challenge with its expiry.
+// entry is one stored challenge with its expiry and the auth key that issued it.
 type entry struct {
 	pending   Pending
 	expiresAt time.Time
+	authKeyID int64
 }
 
 // ChallengeStore holds outstanding SRP challenges keyed by srp_id. Entries are
-// single-use (consumed on the first Consume) and expire after ttl. At most one
-// challenge is retained per user: a fresh Issue evicts that user's prior
-// challenge, so a client that repeatedly calls account.getPassword cannot grow
-// the map without bound (it is capped by the number of distinct users
-// mid-challenge, and account creation is itself phone-code gated).
+// single-use (consumed on the first Consume) and expire after ttl. Challenges
+// are keyed by (authKeyID, userID): two distinct auth keys for the same user
+// each get their own challenge and neither evicts the other. Within the same
+// (authKeyID, userID) pair, a fresh Issue evicts the prior challenge.
 //
 // ponytail: in-memory, per-instance, lost on restart — a client just re-calls
 // account.getPassword. Cleanup is opportunistic (swept on Issue) rather than a
@@ -42,8 +42,8 @@ type entry struct {
 type ChallengeStore struct {
 	mu      sync.Mutex
 	ttl     time.Duration
-	entries map[int64]entry // srp_id → challenge
-	byUser  map[int64]int64 // user id → its current srp_id
+	entries map[int64]entry           // srp_id → challenge
+	byUser  map[int64]map[int64]int64 // authKeyID → userID → srp_id
 	now     func() time.Time
 }
 
@@ -52,15 +52,15 @@ func NewChallengeStore(ttl time.Duration) *ChallengeStore {
 	return &ChallengeStore{
 		ttl:     ttl,
 		entries: make(map[int64]entry),
-		byUser:  make(map[int64]int64),
+		byUser:  make(map[int64]map[int64]int64),
 		now:     time.Now,
 	}
 }
 
 // Issue creates a fresh SRP challenge for userID from the stored verifier,
-// registers it under a new non-zero srp_id, and returns srp_id and B. Expired
-// entries are swept in the same pass.
-func (s *ChallengeStore) Issue(userID int64, verifier []byte) (srpID int64, bPublic []byte, err error) {
+// registers it under a new non-zero srp_id bound to authKeyID, and returns
+// srp_id and B. Expired entries are swept in the same pass.
+func (s *ChallengeStore) Issue(authKeyID, userID int64, verifier []byte) (srpID int64, bPublic []byte, err error) {
 	bPub, bSecret, err := Challenge(verifier)
 	if err != nil {
 		return 0, nil, err
@@ -68,9 +68,11 @@ func (s *ChallengeStore) Issue(userID int64, verifier []byte) (srpID int64, bPub
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweepLocked()
-	// Evict this user's prior challenge: only the latest is usable.
-	if prev, ok := s.byUser[userID]; ok {
-		delete(s.entries, prev)
+	// Evict this (authKeyID, userID) pair's prior challenge: only the latest is usable.
+	if keyMap, ok := s.byUser[authKeyID]; ok {
+		if prev, exists := keyMap[userID]; exists {
+			delete(s.entries, prev)
+		}
 	}
 	id, err := s.freeIDLocked()
 	if err != nil {
@@ -79,26 +81,36 @@ func (s *ChallengeStore) Issue(userID int64, verifier []byte) (srpID int64, bPub
 	s.entries[id] = entry{
 		pending:   Pending{BSecret: bSecret, BPublic: bPub, UserID: userID},
 		expiresAt: s.now().Add(s.ttl),
+		authKeyID: authKeyID,
 	}
-	s.byUser[userID] = id
+	if s.byUser[authKeyID] == nil {
+		s.byUser[authKeyID] = make(map[int64]int64)
+	}
+	s.byUser[authKeyID][userID] = id
 	return id, bPub, nil
 }
 
 // Consume returns and removes the challenge for srpID. ok is false when the id
-// is unknown, already consumed, or expired — the caller maps that to
-// SRP_ID_INVALID. Single-use: a consumed id never returns again.
-func (s *ChallengeStore) Consume(srpID int64) (Pending, bool) {
+// is unknown, already consumed, expired, or the authKeyID does not match the
+// one that issued the challenge. The caller maps ok=false to SRP_ID_INVALID.
+// Single-use: a consumed id never returns again.
+func (s *ChallengeStore) Consume(srpID, authKeyID int64) (Pending, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.entries[srpID]
 	if !ok {
 		return Pending{}, false
 	}
-	delete(s.entries, srpID)
-	s.forgetUserLocked(e.pending.UserID, srpID)
-	if s.now().After(e.expiresAt) {
+	if e.authKeyID != authKeyID {
 		return Pending{}, false
 	}
+	if s.now().After(e.expiresAt) {
+		delete(s.entries, srpID)
+		s.forgetUserLocked(e.authKeyID, e.pending.UserID, srpID)
+		return Pending{}, false
+	}
+	delete(s.entries, srpID)
+	s.forgetUserLocked(e.authKeyID, e.pending.UserID, srpID)
 	return e.pending, true
 }
 
@@ -108,16 +120,22 @@ func (s *ChallengeStore) sweepLocked() {
 	for id, e := range s.entries {
 		if now.After(e.expiresAt) {
 			delete(s.entries, id)
-			s.forgetUserLocked(e.pending.UserID, id)
+			s.forgetUserLocked(e.authKeyID, e.pending.UserID, id)
 		}
 	}
 }
 
-// forgetUserLocked drops the byUser back-reference for userID, but only when it
-// still points at srpID (a newer challenge may have replaced it). Caller holds mu.
-func (s *ChallengeStore) forgetUserLocked(userID, srpID int64) {
-	if s.byUser[userID] == srpID {
-		delete(s.byUser, userID)
+// forgetUserLocked drops the byUser back-reference for (authKeyID, userID), but
+// only when it still points at srpID (a newer challenge may have replaced it).
+// Caller holds mu.
+func (s *ChallengeStore) forgetUserLocked(authKeyID, userID, srpID int64) {
+	if keyMap, ok := s.byUser[authKeyID]; ok {
+		if keyMap[userID] == srpID {
+			delete(keyMap, userID)
+			if len(keyMap) == 0 {
+				delete(s.byUser, authKeyID)
+			}
+		}
 	}
 }
 
