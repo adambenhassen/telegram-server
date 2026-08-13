@@ -45,33 +45,13 @@ type ChargeSignInFailCallRow struct {
 }
 
 // Conditional charge: add one token to the counter only if the budget is not
-// exhausted. Called after a failed VerifyCode. Returns pgx.ErrNoRows when the
-// window is open and at the limit — the racing request that already consumed
-// the last token wins, and the others get an error the handler fails closed on.
+// exhausted. Called before VerifyCode to reserve a slot. Returns pgx.ErrNoRows
+// when the window is open and at the limit — the racing request that already
+// consumed the last token wins, and the others get an error the handler fails
+// closed on.
 func (q *Queries) ChargeSignInFailCall(ctx context.Context, arg ChargeSignInFailCallParams) (ChargeSignInFailCallRow, error) {
 	row := q.db.QueryRow(ctx, chargeSignInFailCall, arg.IpKey, arg.Column2, arg.TokenCount)
 	var i ChargeSignInFailCallRow
-	err := row.Scan(&i.TokenCount, &i.ExpiresAt)
-	return i, err
-}
-
-const checkSignInFailBudget = `-- name: CheckSignInFailBudget :one
-SELECT token_count, expires_at
-FROM sign_in_fail_calls
-WHERE ip_key = $1
-`
-
-type CheckSignInFailBudgetRow struct {
-	TokenCount int32
-	ExpiresAt  pgtype.Timestamptz
-}
-
-// Read-only check: returns the current token_count and expires_at for an IP
-// key. Used before VerifyCode to gate the attempt without writing anything.
-// Returns pgx.ErrNoRows when no row exists (budget not exhausted).
-func (q *Queries) CheckSignInFailBudget(ctx context.Context, ipKey netip.Prefix) (CheckSignInFailBudgetRow, error) {
-	row := q.db.QueryRow(ctx, checkSignInFailBudget, ipKey)
-	var i CheckSignInFailBudgetRow
 	err := row.Scan(&i.TokenCount, &i.ExpiresAt)
 	return i, err
 }
@@ -91,6 +71,20 @@ func (q *Queries) GetSignInFailCallExpiry(ctx context.Context, ipKey netip.Prefi
 	return expires_at, err
 }
 
+const refundSignInFailCall = `-- name: RefundSignInFailCall :exec
+UPDATE sign_in_fail_calls
+SET token_count = GREATEST(token_count - 1, 0)
+WHERE ip_key = $1 AND expires_at > now()
+`
+
+// Return a reserved slot to the counter. Called after a successful verification
+// or an internal error (no verification happened). Decrements token_count by 1,
+// floored at 0. Only applies to active windows.
+func (q *Queries) RefundSignInFailCall(ctx context.Context, ipKey netip.Prefix) error {
+	_, err := q.db.Exec(ctx, refundSignInFailCall, ipKey)
+	return err
+}
+
 const sweepExpiredSignInFailCalls = `-- name: SweepExpiredSignInFailCalls :execrows
 DELETE FROM sign_in_fail_calls
 WHERE expires_at <= now()
@@ -103,48 +97,4 @@ func (q *Queries) SweepExpiredSignInFailCalls(ctx context.Context) (int64, error
 		return 0, err
 	}
 	return result.RowsAffected(), nil
-}
-
-const tryConsumeSignInFailCall = `-- name: TryConsumeSignInFailCall :one
-INSERT INTO sign_in_fail_calls (ip_key, token_count, window_start, expires_at)
-VALUES ($1, 1, now(), now() + $2::INTERVAL)
-ON CONFLICT (ip_key) DO UPDATE SET
-    token_count = CASE
-        WHEN sign_in_fail_calls.expires_at <= now() THEN 1
-        ELSE sign_in_fail_calls.token_count + 1
-    END,
-    window_start = CASE
-        WHEN sign_in_fail_calls.expires_at <= now() THEN now()
-        ELSE sign_in_fail_calls.window_start
-    END,
-    expires_at = CASE
-        WHEN sign_in_fail_calls.expires_at <= now() THEN now() + $2::INTERVAL
-        ELSE sign_in_fail_calls.expires_at
-    END
-WHERE sign_in_fail_calls.expires_at <= now()
-   OR sign_in_fail_calls.token_count < $3
-RETURNING token_count, expires_at
-`
-
-type TryConsumeSignInFailCallParams struct {
-	IpKey      netip.Prefix
-	Column2    pgtype.Interval
-	TokenCount int32
-}
-
-type TryConsumeSignInFailCallRow struct {
-	TokenCount int32
-	ExpiresAt  pgtype.Timestamptz
-}
-
-// Attempt to consume one signIn-fail token for an IP key.
-//
-// Same upsert pattern as send_code_ip_calls: one row per key per window,
-// token_count reset and bumped. Returns one row when allowed, pgx.ErrNoRows
-// when the window is open and at the limit.
-func (q *Queries) TryConsumeSignInFailCall(ctx context.Context, arg TryConsumeSignInFailCallParams) (TryConsumeSignInFailCallRow, error) {
-	row := q.db.QueryRow(ctx, tryConsumeSignInFailCall, arg.IpKey, arg.Column2, arg.TokenCount)
-	var i TryConsumeSignInFailCallRow
-	err := row.Scan(&i.TokenCount, &i.ExpiresAt)
-	return i, err
 }

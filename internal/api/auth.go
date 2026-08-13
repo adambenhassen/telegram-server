@@ -169,28 +169,41 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errMethodNotImpl
 	}
 
-	// Check the per-IP failure budget before VerifyCode: if the network has
-	// already burned its quota, refuse without reading or validating anything.
-	if err := h.checkSignInFailBudget(r); err != nil {
-		return nil, err
+	// Atomically reserve a slot from the per-IP failure budget before VerifyCode.
+	// A correct verification refunds the slot (net zero). A wrong one keeps it.
+	// This eliminates the race between check and charge: the reserve IS the check.
+	res, err := h.store.ConsumeSignInFailBudget(r.Ctx, r.ClientAddr, h.rateLimitSignInFailIP)
+	if err != nil {
+		if errors.Is(err, store.ErrNoClientAddr) {
+			h.log.Info("sign in: connection carries no client address")
+			return nil, FloodWaitError(1)
+		}
+		h.log.Error("sign in fail: consume budget", "err", err)
+		return nil, errInternal
+	}
+	if res != nil {
+		return nil, FloodWaitError(int(res.Wait / time.Second))
 	}
 
 	code, _ := req.GetPhoneCode()
 	if err := h.store.VerifyCode(r.Ctx, req.PhoneNumber, req.PhoneCodeHash, code); err != nil {
 		rpc := verifyToRPC(err)
 		if rpc != errInternal {
-			// A failed verification charges the per-IP failure counter so an
-			// attacker cannot use multiple source addresses to get multiple
-			// budgets of guesses against the same identifier. Fail closed if
-			// the charge fails: an unmetered guess reopens the brute-force gate.
-			if chargeErr := h.chargeSignInFailIP(r); chargeErr != nil {
-				h.log.Error("sign in fail: charge counter", "err", chargeErr)
-				return nil, errInternal
-			}
+			// Wrong code: keep the reserved slot. No refund.
 			return nil, rpc
+		}
+		// Internal error: refund the slot — no verification happened.
+		if refundErr := h.store.RefundSignInFailBudget(r.Ctx, r.ClientAddr); refundErr != nil {
+			h.log.Error("sign in fail: refund on internal error", "err", refundErr)
 		}
 		h.log.Error("verify code", "err", err)
 		return nil, errInternal
+	}
+
+	// Correct code: refund the reserved slot (net zero charge on success).
+	if refundErr := h.store.RefundSignInFailBudget(r.Ctx, r.ClientAddr); refundErr != nil {
+		h.log.Error("sign in fail: refund on success", "err", refundErr)
+		// Non-fatal: user authenticated. Log and continue.
 	}
 
 	user, err := h.store.CreateUser(r.Ctx, req.PhoneNumber)
@@ -257,31 +270,4 @@ func (h *handlers) handleLogOut(r *mtproto.Request) (bin.Encoder, func(), error)
 	return &tg.AuthLoggedOut{}, func() {
 		h.notifyEvict(r.Ctx, key.UserID, keyID)
 	}, nil
-}
-
-// checkSignInFailBudget reads the per-IP failure counter and returns a
-// FLOOD_WAIT error when the IP has exhausted its budget. Called before
-// VerifyCode so that even correct codes are blocked when the budget is gone.
-// Writes nothing.
-func (h *handlers) checkSignInFailBudget(r *mtproto.Request) error {
-	res, err := h.store.CheckSignInFailIP(r.Ctx, r.ClientAddr, h.rateLimitSignInFailIP)
-	if err != nil {
-		if errors.Is(err, store.ErrNoClientAddr) {
-			h.log.Info("sign in: connection carries no client address")
-			return FloodWaitError(1)
-		}
-		h.log.Error("sign in fail: check budget", "err", err)
-		return errInternal
-	}
-	if res != nil {
-		return FloodWaitError(int(res.Wait / time.Second))
-	}
-	return nil
-}
-
-// chargeSignInFailIP adds one token to the per-IP failure counter after a
-// failed VerifyCode. Errors are logged but not surfaced — the caller already
-// has a verified error to return.
-func (h *handlers) chargeSignInFailIP(r *mtproto.Request) error {
-	return h.store.ChargeSignInFailIP(r.Ctx, r.ClientAddr, h.rateLimitSignInFailIP)
 }

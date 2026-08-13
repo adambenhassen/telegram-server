@@ -388,3 +388,96 @@ func TestSignInFailIPAndSendCodeIndependent(t *testing.T) {
 		t.Fatalf("signIn after sendCode exhaustion: unexpected FLOOD_WAIT, got %v", err)
 	}
 }
+
+// TestSignInFailCorrectCodeRefunded proves the reserve-and-refund model:
+// a correct code from a non-exhausted IP succeeds and the token_count is
+// unchanged after refund (net zero charge on success).
+func TestSignInFailCorrectCodeRefunded(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	phone := "+15551296701"
+	hash, code, err := s.IssueCode(ctx, phone)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Save the auth key so BindAuthKeyUser succeeds on a correct sign-in.
+	if err := s.SaveAuthKey(ctx, int64(0x1), make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := netip.MustParseAddr("10.0.0.70")
+
+	// Limit of 10 failures per 10s — generous.
+	cfg := store.RateLimitConfig{Limit: 10, Window: 10 * time.Second}
+
+	// Correct code — should succeed and refund the reserved slot.
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, cfg, &tg.AuthSignInRequest{
+		PhoneNumber:   phone,
+		PhoneCodeHash: hash,
+		PhoneCode:     code,
+	})
+	if err != nil {
+		t.Fatalf("correct code: expected success, got %v", err)
+	}
+
+	// The counter should be at 0 (reserved 1, refunded 1 = net zero).
+	// Verify by checking that a subsequent wrong guess is still allowed
+	// (budget not consumed by the successful sign-in).
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, cfg, &tg.AuthSignInRequest{
+		PhoneNumber:   phone,
+		PhoneCodeHash: hash,
+		PhoneCode:     "00000", // wrong
+	})
+	if !isPhoneCodeInvalid(err) {
+		t.Fatalf("wrong guess after correct sign-in: expected PHONE_CODE_INVALID, got %v", err)
+	}
+}
+
+// TestSignInFailCorrectCodeAtExactLimit proves that a correct code from an
+// exactly-exhausted IP returns FLOOD_WAIT (the reserve finds count >= limit
+// before VerifyCode even runs).
+func TestSignInFailCorrectCodeAtExactLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	phone := "+15551296801"
+	hash, code, err := s.IssueCode(ctx, phone)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Save the auth key so BindAuthKeyUser succeeds on a correct sign-in.
+	if err := s.SaveAuthKey(ctx, int64(0x1), make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := netip.MustParseAddr("10.0.0.80")
+
+	// Limit of 1 failure per 10s.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+
+	// One wrong guess — reserves the only slot, keeps it.
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, cfg, &tg.AuthSignInRequest{
+		PhoneNumber:   phone,
+		PhoneCodeHash: hash,
+		PhoneCode:     "00000", // wrong
+	})
+	if !isPhoneCodeInvalid(err) {
+		t.Fatalf("wrong guess: expected PHONE_CODE_INVALID, got %v", err)
+	}
+
+	// Now the budget is at 1/1. A correct code from the same IP should
+	// get FLOOD_WAIT — the reserve finds count >= limit.
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, cfg, &tg.AuthSignInRequest{
+		PhoneNumber:   phone,
+		PhoneCodeHash: hash,
+		PhoneCode:     code, // correct
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("correct code at limit: expected FLOOD_WAIT, got %v", err)
+	}
+}

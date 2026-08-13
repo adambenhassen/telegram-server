@@ -19,17 +19,18 @@ import (
 // — only one wins, the rest get this error. The handler fails closed on it.
 var ErrSignInFailBudgetExhausted = errors.New("sign in fail budget exhausted")
 
-// CheckSignInFailIP reads the per-IP signIn-failure counter for addr and
-// returns a RateLimitResult when the budget is exhausted. Read-only, no lock
-// acquired — the race between check and charge is handled by ChargeSignInFailIP
-// using a conditional upsert that returns pgx.ErrNoRows when the budget is
-// already at the limit. Called before VerifyCode so that even correct codes
-// are blocked when the IP has burned its failure budget.
+// ConsumeSignInFailBudget atomically reserves one slot from the per-IP
+// signIn-failure budget. Called before VerifyCode so that the attempt holds
+// a slot regardless of the code's correctness:
 //
-// Returns nil (no error, no result) when the budget is not exhausted or the
-// config is disabled. Returns ErrNoClientAddr when the connection carries no
-// address to attribute.
-func (s *Store) CheckSignInFailIP(ctx context.Context, addr netip.Addr, cfg RateLimitConfig) (*RateLimitResult, error) {
+// - Wrong code → slot is kept (net +1 to the counter)
+// - Correct code → slot is refunded via RefundSignInFailBudget (net zero)
+// - Internal error → slot is refunded (net zero)
+//
+// Returns a RateLimitResult when the budget is exhausted (no slot available),
+// nil when a slot was reserved. Returns ErrNoClientAddr when the connection
+// carries no address to attribute.
+func (s *Store) ConsumeSignInFailBudget(ctx context.Context, addr netip.Addr, cfg RateLimitConfig) (*RateLimitResult, error) {
 	if !cfg.enabled() {
 		return nil, nil //nolint:nilnil // disabled config is not an error
 	}
@@ -38,51 +39,35 @@ func (s *Store) CheckSignInFailIP(ctx context.Context, addr netip.Addr, cfg Rate
 		return nil, ErrNoClientAddr
 	}
 
-	row, err := s.q.CheckSignInFailBudget(ctx, key)
-	switch {
-	case err == nil:
-		// Row exists — check if at or over the limit.
-		if int(row.TokenCount) >= cfg.Limit && row.ExpiresAt.Time.After(time.Now()) {
-			return &RateLimitResult{Wait: waitUntil(time.Now(), row.ExpiresAt.Time)}, nil
-		}
-		return nil, nil //nolint:nilnil // under limit or expired
-	case errors.Is(err, pgx.ErrNoRows):
-		return nil, nil //nolint:nilnil // no row = no failures yet
-	default:
-		return nil, fmt.Errorf("check sign in fail budget: %w", err)
-	}
-}
-
-// ChargeSignInFailIP adds one token to the per-IP signIn-failure counter.
-// Called only after VerifyCode returns an error. Uses a conditional upsert
-// that returns pgx.ErrNoRows when the budget is already at the limit — this
-// is what prevents the race: if N concurrent requests pass the check and
-// all try to charge, only one succeeds and the rest get pgx.ErrNoRows,
-// which the handler fails closed on (INTERNAL instead of PHONE_CODE_INVALID).
-//
-// No-op when the config is disabled. Returns an error when the budget is
-// already exhausted (race case) or the connection has no client address.
-func (s *Store) ChargeSignInFailIP(ctx context.Context, addr netip.Addr, cfg RateLimitConfig) error {
-	if !cfg.enabled() {
-		return nil
-	}
-	key, ok := IPBucketKey(addr)
-	if !ok {
-		return ErrNoClientAddr
-	}
-
 	_, err := s.q.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{
 		IpKey:      key,
 		Column2:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
 		TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrSignInFailBudgetExhausted
+	if err == nil {
+		return nil, nil //nolint:nilnil // slot reserved
 	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("consume sign in fail budget: %w", err)
+	}
+	// Budget exhausted — read expires_at to compute the wait.
+	expiresAt, err := s.q.GetSignInFailCallExpiry(ctx, key)
 	if err != nil {
-		return fmt.Errorf("charge sign in fail call: %w", err)
+		return nil, fmt.Errorf("sign in fail call expiry: %w", err)
 	}
-	return nil
+	return &RateLimitResult{Wait: waitUntil(time.Now(), expiresAt.Time)}, nil
+}
+
+// RefundSignInFailBudget returns a previously reserved slot to the per-IP
+// signIn-failure counter. Called after a successful verification or an internal
+// error (no verification happened). Errors are logged but non-fatal.
+func (s *Store) RefundSignInFailBudget(ctx context.Context, addr netip.Addr) error {
+	key, ok := IPBucketKey(addr)
+	if !ok {
+		return ErrNoClientAddr
+	}
+
+	return s.q.RefundSignInFailCall(ctx, key)
 }
 
 // SweepExpiredSignInFailCalls deletes per-IP signIn-failure rows past their
