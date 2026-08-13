@@ -14,7 +14,7 @@ import (
 const authKeyByID = `-- name: AuthKeyByID :one
 SELECT ak.id, ak.key_value, ak.user_id, ak.created_at, ak.last_seen_at, ak.pending_user_id,
        u.login_mode,
-       up.user_id IS NOT NULL AS has_password
+       (up.user_id IS NOT NULL) AS has_password
 FROM auth_keys ak
 LEFT JOIN users u ON u.id = ak.user_id
 LEFT JOIN user_passwords up ON up.user_id = ak.user_id

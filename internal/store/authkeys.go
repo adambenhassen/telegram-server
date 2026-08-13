@@ -195,7 +195,11 @@ func (s *Store) authKeyFromDB(k db.AuthKeyByIDRow) (AuthKey, error) {
 	}
 	provisional := false
 	if k.UserID != nil && k.LoginMode != nil && *k.LoginMode == "username" {
-		if hasPw, ok := k.HasPassword.(bool); ok && !hasPw {
+		hasPw, ok := k.HasPassword.(bool)
+		if !ok {
+			return AuthKey{}, fmt.Errorf("auth key %d: has_password has unexpected type %T", k.ID, k.HasPassword)
+		}
+		if !hasPw {
 			provisional = true
 		}
 	}
