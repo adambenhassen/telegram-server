@@ -55,7 +55,7 @@ func (h *handlers) chatMembershipUpdates(ctx context.Context, selfID, target int
 	if err != nil {
 		return nil, err
 	}
-	chats, err := h.loadChats(ctx, map[int64]bool{sender.PeerID: true}, selfID)
+	chats, err := h.loadChats(ctx, map[int64]bool{sender.PeerID: true}, selfID, nil)
 	if err != nil {
 		return nil, err
 	}
