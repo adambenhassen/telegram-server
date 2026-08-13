@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -24,10 +25,13 @@ import (
 type Config struct {
 	ListenAddr string
 	// AdminListenAddr is the address the admin HTTP server binds to.
-	// Empty disables the admin server entirely. Defaults to "127.0.0.1:2444".
+	// Empty disables the admin server entirely.
 	AdminListenAddr string
-	PostgresDSN     string
-	RSAKeyPath      string
+	// AdminTokenHash is the hex-encoded SHA-256 digest of the operator token.
+	// Only set when AdminListenAddr is non-empty.
+	AdminTokenHash string
+	PostgresDSN    string
+	RSAKeyPath     string
 	// AuthKeyEncKey is the 32-byte master key that encrypts auth keys at rest.
 	//
 	// Changing it is a total re-auth event: no stored auth key opens under a new
@@ -189,7 +193,7 @@ const MaxFileBytesLimit int64 = 1 << 40
 func Load(log *slog.Logger) (Config, error) {
 	cfg := Config{
 		ListenAddr:      envOr("TG_LISTEN_ADDR", ":2443"),
-		AdminListenAddr: envOr("TG_ADMIN_LISTEN_ADDR", "127.0.0.1:2444"),
+		AdminListenAddr: os.Getenv("TG_ADMIN_LISTEN_ADDR"),
 		PostgresDSN:     os.Getenv("TG_POSTGRES_DSN"),
 		RSAKeyPath:      envOr("TG_RSA_KEY_PATH", "server_key.pem"),
 		DCID:            2,
@@ -421,6 +425,14 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.AdvertiseHost, cfg.AdvertisePort = advertiseHost, advertisePort
+	// Admin server requires both env vars or neither: a listener without auth
+	// is a denial-of-service vector, and a hash with no listener is wasted work.
+	adminErr := validateAdmin(cfg)
+	if adminErr != nil {
+		return Config{}, adminErr
+	}
+	cfg.AdminTokenHash = os.Getenv("TG_ADMIN_TOKEN_HASH")
+
 	if cfg.PostgresDSN == "" {
 		return Config{}, errors.New("TG_POSTGRES_DSN is required")
 	}
@@ -844,6 +856,34 @@ func decodeEncKey(raw, src string) ([]byte, error) {
 		return nil, fmt.Errorf("%s must be 64 hex chars (32 bytes)", src)
 	}
 	return key, nil
+}
+
+// adminHashRe matches a 64-character lowercase hex string (SHA-256 digest).
+var adminHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// validateAdmin checks that the admin server env vars are consistent.
+//
+// Both TG_ADMIN_LISTEN_ADDR and TG_ADMIN_TOKEN_HASH must be set together, or
+// neither. A listener without a token hash is an unauthenticated admin surface;
+// a token hash with no listener is wasted work. The hash must be a 64-char
+// lowercase hex string (a SHA-256 digest).
+func validateAdmin(cfg Config) error {
+	listenAddr := cfg.AdminListenAddr
+	tokenHash := os.Getenv("TG_ADMIN_TOKEN_HASH")
+
+	switch {
+	case listenAddr == "" && tokenHash == "":
+		return nil // admin server disabled
+	case listenAddr != "" && tokenHash != "":
+		if !adminHashRe.MatchString(tokenHash) {
+			return errors.New("TG_ADMIN_TOKEN_HASH must be a 64-character lowercase hex string (SHA-256 digest of the operator token)")
+		}
+		return nil
+	case listenAddr != "" && tokenHash == "":
+		return errors.New("TG_ADMIN_LISTEN_ADDR is set but TG_ADMIN_TOKEN_HASH is missing: both are required to start the admin HTTP server")
+	default: // listenAddr == "" && tokenHash != ""
+		return errors.New("TG_ADMIN_TOKEN_HASH is set but TG_ADMIN_LISTEN_ADDR is missing: both are required to start the admin HTTP server")
+	}
 }
 
 func envOr(key, fallback string) string {

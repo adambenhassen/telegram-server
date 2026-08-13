@@ -151,15 +151,17 @@ func run(log *slog.Logger) error {
 	}()
 
 	// Start the admin HTTP server on a separate listener. It serves read-only
-	// operational metrics at GET /admin/metrics. Auth middleware can wrap the
-	// handler without changing its shape.
+	// operational metrics at GET /admin/metrics behind token auth.
 	if cfg.AdminListenAddr != "" {
-		adminMux := http.NewServeMux()
-		adminMux.HandleFunc("/admin/metrics", admin.Handler(server.Registry(), st))
+		adminSubMux := http.NewServeMux()
+		adminSubMux.HandleFunc("/admin/metrics", admin.Handler(server.Registry(), st))
+		adminHandler := http.NewServeMux()
+		adminHandler.Handle("/admin/", admin.RequireAdmin(cfg.AdminTokenHash)(adminSubMux))
 		adminSrv := &http.Server{
 			Addr:              cfg.AdminListenAddr,
-			Handler:           adminMux,
+			Handler:           adminHandler,
 			ReadHeaderTimeout: 5 * time.Second,
+			MaxHeaderBytes:    8192,
 		}
 		var adminLC net.ListenConfig
 		adminLn, err := adminLC.Listen(ctx, "tcp", cfg.AdminListenAddr)
