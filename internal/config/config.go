@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -97,6 +98,16 @@ type Config struct {
 	// — at the first frame that decrypts under a server-issued key — and hands
 	// over to the per-user connection cap at sign-in. Zero disables it.
 	MaxConnsPerUnboundKey int
+	// BootstrapUsername is the handle to create at startup. Empty disables
+	// bootstrap. When set, exactly one of BootstrapPassword or
+	// BootstrapPasswordFile must be configured.
+	BootstrapUsername string
+	// BootstrapPassword is the cleartext password for the bootstrap account.
+	// Mutually exclusive with BootstrapPasswordFile.
+	BootstrapPassword string
+	// BootstrapPasswordFile is the path to a file containing the bootstrap
+	// password. Mutually exclusive with BootstrapPassword.
+	BootstrapPasswordFile string
 }
 
 // ClientAddrTrust names the source a client address is taken from.
@@ -536,6 +547,13 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.AuthKeyEncKey = encKey
+	// Bootstrap: resolve username and password source before returning.
+	cfg.BootstrapUsername = os.Getenv("TG_BOOTSTRAP_USERNAME")
+	cfg.BootstrapPassword = os.Getenv("TG_BOOTSTRAP_PASSWORD")
+	cfg.BootstrapPasswordFile = os.Getenv("TG_BOOTSTRAP_PASSWORD_FILE")
+	if err := validateBootstrap(cfg); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -1014,4 +1032,41 @@ func (c Config) ValidateRegistrationMode() error {
 		return nil
 	}
 	return fmt.Errorf("TG_REGISTRATION must be unset, %q, or %q; got %q", RegistrationClosed, RegistrationOpen, c.RegistrationMode)
+}
+
+// validateBootstrap checks that bootstrap env vars are consistent.
+//
+// When TG_BOOTSTRAP_USERNAME is set, exactly one of TG_BOOTSTRAP_PASSWORD or
+// TG_BOOTSTRAP_PASSWORD_FILE must be set. Both set simultaneously is an error;
+// neither set with a username is also an error.
+func validateBootstrap(cfg Config) error {
+	if cfg.BootstrapUsername == "" {
+		return nil // bootstrap disabled
+	}
+
+	bothSet := cfg.BootstrapPassword != "" && cfg.BootstrapPasswordFile != ""
+	noneSet := cfg.BootstrapPassword == "" && cfg.BootstrapPasswordFile == ""
+
+	if bothSet {
+		return errors.New("TG_BOOTSTRAP_PASSWORD and TG_BOOTSTRAP_PASSWORD_FILE are both set: use only one")
+	}
+	if noneSet {
+		return errors.New("TG_BOOTSTRAP_USERNAME is set but no password source is configured: set TG_BOOTSTRAP_PASSWORD or TG_BOOTSTRAP_PASSWORD_FILE")
+	}
+	return nil
+}
+
+// BootstrapPasswordBytes returns the password for the bootstrap account.
+// It reads from the file path when BootstrapPasswordFile is set, otherwise
+// returns the in-memory password. The caller must zero the returned buffer
+// after use.
+func (c Config) BootstrapPasswordBytes() ([]byte, error) {
+	if c.BootstrapPasswordFile != "" {
+		data, err := os.ReadFile(c.BootstrapPasswordFile) // #nosec G304,G703 -- operator-configured path.
+		if err != nil {
+			return nil, fmt.Errorf("read bootstrap password file %s: %w", c.BootstrapPasswordFile, err)
+		}
+		return bytes.TrimSpace(data), nil
+	}
+	return []byte(c.BootstrapPassword), nil
 }
