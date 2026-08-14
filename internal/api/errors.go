@@ -21,12 +21,14 @@ func FloodWaitError(seconds int) *tgerr.Error {
 }
 
 var (
-	errPhoneInvalid  = rpcErr(400, "PHONE_NUMBER_INVALID")
-	errCodeInvalid   = rpcErr(400, "PHONE_CODE_INVALID")
-	errCodeExpired   = rpcErr(400, "PHONE_CODE_EXPIRED")
-	errInternal      = rpcErr(500, "INTERNAL")
-	errMethodNotImpl = rpcErr(400, "INPUT_METHOD_INVALID")
-	errAuthKeyUnreg  = rpcErr(401, "AUTH_KEY_UNREGISTERED")
+	// errInputRequestInvalid rejects auth.signUp when registration is closed.
+	errInputRequestInvalid = rpcErr(400, "INPUT_REQUEST_INVALID")
+	errPhoneInvalid        = rpcErr(400, "PHONE_NUMBER_INVALID")
+	errCodeInvalid         = rpcErr(400, "PHONE_CODE_INVALID")
+	errCodeExpired         = rpcErr(400, "PHONE_CODE_EXPIRED")
+	errInternal            = rpcErr(500, "INTERNAL")
+	errMethodNotImpl       = rpcErr(400, "INPUT_METHOD_INVALID")
+	errAuthKeyUnreg        = rpcErr(401, "AUTH_KEY_UNREGISTERED")
 	// errHashInvalid rejects account.resetAuthorization for a session hash that is
 	// not one of the caller's own auth keys, so a user cannot revoke another's.
 	errHashInvalid = rpcErr(400, "HASH_INVALID")

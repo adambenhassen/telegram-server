@@ -79,6 +79,53 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 	return UserFromDB(db.UserByIDRow(u)), nil
 }
 
+// SignUpUsernameUser atomically creates a username-mode user and claims the
+// handle in the usernames table within a single transaction. It also provisions
+// update_state. Returns the new user.
+//
+// Returns ErrUsernameOccupied when the handle is already taken — the unique
+// index on usernames enforces this, and the PK conflict is caught and returned
+// as ErrUsernameOccupied rather than an internal error.
+func (s *Store) SignUpUsernameUser(ctx context.Context, handle, firstName, lastName string) (User, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return User{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	u, err := qtx.CreateUsernameUser(ctx, db.CreateUsernameUserParams{
+		FirstName: firstName,
+		LastName:  lastName,
+	})
+	if err != nil {
+		return User{}, fmt.Errorf("create username user: %w", err)
+	}
+	if err := qtx.EnsureUpdateState(ctx, u.ID); err != nil {
+		return User{}, fmt.Errorf("ensure update state: %w", err)
+	}
+
+	// Claim the username atomically within the same transaction.
+	xHandle := strings.ToLower(handle)
+	_, err = qtx.ClaimUsername(ctx, db.ClaimUsernameParams{
+		Handle:    xHandle,
+		OwnerType: "user",
+		OwnerID:   u.ID,
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return User{}, ErrUsernameOccupied
+		}
+		return User{}, fmt.Errorf("claim username: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return User{}, fmt.Errorf("commit: %w", err)
+	}
+	return UserFromCreateUsernameUser(u), nil
+}
+
 // CreateUsernameUser inserts a username-mode user with no phone. It provisions
 // update_state in the same transaction. Returns the new user. Does NOT claim
 // the username in the usernames table — the calling handler does that atomically

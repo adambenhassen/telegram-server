@@ -10,6 +10,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -52,6 +53,65 @@ func verifyToRPC(err error) *tgerr.Error {
 	default:
 		return errInternal
 	}
+}
+
+// handleSignUp serves auth.signUp for username-mode registration.
+// It creates a provisional account with the given username and binds the
+// auth key with provisional=true.
+func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.AuthSignUpRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+
+	// Registration closed: reject immediately without touching state.
+	if h.registrationMode != config.RegistrationOpen {
+		return nil, errInputRequestInvalid
+	}
+
+	// Input: req.PhoneNumber is the username; req.PhoneCodeHash is the hash
+	// from a prior sendCode; req.FirstName/LastName are the display name.
+	//
+	// The username must match the username pattern — not the phone regex.
+	// A phone-number format means the client called the wrong method.
+	username := req.PhoneNumber
+	if !validateUsername(username) {
+		return nil, errPhoneInvalid
+	}
+	username = strings.ToLower(username)
+
+	// Hash-only verification: same check as signIn's username path.
+	if err := h.store.CheckCodeHash(r.Ctx, username, req.PhoneCodeHash); err != nil {
+		rpc := verifyToRPC(err)
+		if rpc == errCodeExpired {
+			// Username path returns PHONE_CODE_INVALID for expired hashes.
+			rpc = errCodeInvalid
+		}
+		if rpc == errInternal {
+			h.log.Error("sign up: check code hash", "err", err)
+			return nil, errInternal
+		}
+		return nil, rpc
+	}
+
+	// Create the user and atomically claim the username.
+	user, err := h.store.SignUpUsernameUser(r.Ctx, username, req.FirstName, req.LastName)
+	if err != nil {
+		if errors.Is(err, store.ErrUsernameOccupied) {
+			return nil, errUsernameOccupied
+		}
+		h.log.Error("sign up: create user", "err", err)
+		return nil, errInternal
+	}
+
+	// Bind the auth key to the new user with provisional=true.
+	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
+	if err := h.store.BindAuthKeyUser(r.Ctx, keyID, user.ID); err != nil {
+		h.log.Error("sign up: bind auth key", "user_id", user.ID, "err", err)
+		return nil, errInternal
+	}
+
+	return &tg.AuthAuthorization{User: userTL(user)}, nil
 }
 
 func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
