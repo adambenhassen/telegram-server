@@ -34,21 +34,13 @@ func validateUsername(username string) bool {
 
 // validDisplayName checks that the display name is storable text and does not
 // contain runes that could be used for spoofing: C0/C1 control characters and
-// bidi override/ isolate marks. These characters let an attacker craft a name
+// bidi override/isolate marks. These characters let an attacker craft a name
 // that visually masquerades as another user or service in peer lists.
 func validDisplayName(s string) bool {
 	if !utf8.ValidString(s) || strings.ContainsRune(s, 0) {
 		return false
 	}
-	for _, r := range s {
-		switch {
-		case r <= 0x1f, r >= 0x7f && r <= 0x9f:
-			return false
-		case r == 0x200e, r == 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
-			return false
-		}
-	}
-	return true
+	return !strings.ContainsFunc(s, isDangerousRune)
 }
 
 func newSentCode(hash string) *tg.AuthSentCode {
