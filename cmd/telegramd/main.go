@@ -169,15 +169,34 @@ func run(log *slog.Logger) error {
 		}
 	}()
 
-	// Start the admin HTTP server on a separate listener. All paths behind the
-	// RequireAdmin stub return 401; handlers are wired after auth is complete.
+	// Start the admin HTTP server on a separate listener.
+	// Public routes (login, logout) are not behind RequireAdmin.
+	// Protected routes (metrics) are behind RequireAdmin.
+	// All admin responses carry security headers.
 	if cfg.AdminListenAddr != "" {
+		loginCfg := admin.LoginConfig{
+			Store:       st,
+			TokenHash:   cfg.AdminTokenHash,
+			AdminOrigin: cfg.AdminListenAddr,
+		}
+
+		// Protected sub-mux: behind RequireAdmin.
 		adminSubMux := http.NewServeMux()
-		adminHandler := http.NewServeMux()
-		adminHandler.Handle("/admin/", admin.RequireAdmin(admin.AdminMiddlewareConfig{
+		adminSubMux.HandleFunc("GET /admin/metrics", admin.Handler(server.Registry(), st).ServeHTTP)
+
+		// Top-level admin handler: public routes + protected sub-mux.
+		adminMux := http.NewServeMux()
+		adminMux.HandleFunc("GET /admin/login", admin.LoginGET(loginCfg))
+		adminMux.HandleFunc("POST /admin/login", admin.LoginPOST(loginCfg))
+		adminMux.HandleFunc("POST /admin/logout", admin.LogoutPOST(loginCfg))
+		adminMux.Handle("/admin/", admin.RequireAdmin(admin.AdminMiddlewareConfig{
 			Store:     st,
 			TokenHash: cfg.AdminTokenHash,
 		})(adminSubMux))
+
+		// Wrap with security headers middleware.
+		adminHandler := admin.SecurityHeaders(adminMux)
+
 		adminSrv := &http.Server{
 			Addr:              cfg.AdminListenAddr,
 			Handler:           adminHandler,
