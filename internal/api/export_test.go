@@ -19,6 +19,7 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/adambenhassen/telegram-server/internal/srp"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -85,12 +86,17 @@ func MaxFileParts() int {
 
 func testHandlers(s *store.Store) *handlers {
 	return &handlers{
-		store:                s,
-		log:                  slog.New(slog.DiscardHandler),
-		maxFileBytes:         TestMaxFileBytes,
-		downloads:            map[int64]bool{},
-		peers:                pgtest.PeerDeriver(),
-		rateLimitMessageSend: store.RateLimitConfig{},
+		store:                    s,
+		log:                      slog.New(slog.DiscardHandler),
+		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
+		maxFileBytes:             TestMaxFileBytes,
+		downloads:                map[int64]bool{},
+		peers:                    pgtest.PeerDeriver(),
+		rateLimitMessageSend:     store.RateLimitConfig{},
+		rateLimitCheckPassword:   store.RateLimitConfig{},
+		rateLimitCheckPasswordIP: store.RateLimitConfig{},
+		rateLimitGetPasswordIP:   store.RateLimitConfig{},
+		rateLimitSignUpIP:        store.RateLimitConfig{},
 	}
 }
 
@@ -800,6 +806,31 @@ func AgeSignInFailWindowForTest(dsn string, addr netip.Addr, d time.Duration) er
 func GetPasswordForTest(s *store.Store, userID int64, req *mtproto.Request) (bin.Encoder, error) {
 	h := testHandlers(s)
 	return h.handleGetPassword(req)
+}
+
+// GetPasswordIPForTestWithLimits invokes handleGetPassword for an unauthenticated
+// caller arriving from addr, against the per-IP rate limit given.
+func GetPasswordIPForTestWithLimits(s *store.Store, authKeyID [8]byte, addr netip.Addr, rateLimit store.RateLimitConfig, req *tg.AccountGetPasswordRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitGetPasswordIP = rateLimit
+	return h.handleGetPassword(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+}
+
+// CheckPasswordForTestWithLimits invokes handleCheckPassword for a request
+// arriving from addr, against both per-account and per-IP rate limits.
+func CheckPasswordForTestWithLimits(s *store.Store, authKeyID [8]byte, addr netip.Addr, perAccount, perIP store.RateLimitConfig, req *tg.AuthCheckPasswordRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitCheckPassword = perAccount
+	h.rateLimitCheckPasswordIP = perIP
+	return h.handleCheckPassword(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
 }
 
 // UpdatePasswordSettingsForTest invokes handleUpdatePasswordSettings with a

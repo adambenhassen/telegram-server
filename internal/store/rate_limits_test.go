@@ -495,6 +495,165 @@ func TestRateLimitWaitRoundsUp(t *testing.T) {
 	}
 }
 
+// TestCheckRateLimitBudgetNoRow proves that a budget check on a surface with
+// no row returns nil (allowed) without creating one. This is the invariant that
+// prevents a read-only check from silently seeding a counter.
+func TestCheckRateLimitBudgetNoRow(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 1100
+	const surface = "budget_no_row"
+
+	// Budget check on a clean surface should allow without creating a row.
+	result, err := s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("budget check: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("budget check: unexpected denial: %+v", result)
+	}
+
+	// No row should have been created.
+	count, err := store.CountRateLimits(ctx, s, subject)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("budget check created a row: count = %d, want 0", count)
+	}
+}
+
+// TestCheckRateLimitBudgetAndCharge proves the check-then-charge pattern:
+// ChargeRateLimit creates/increments the counter, and CheckRateLimitBudget
+// reads it without modifying it.
+func TestCheckRateLimitBudgetAndCharge(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 1200
+	const surface = "budget_and_charge"
+
+	// Budget check on a clean surface: allowed, no row created.
+	result, err := s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+	if err != nil || result != nil {
+		t.Fatalf("initial budget check: result=%+v err=%v", result, err)
+	}
+
+	// Charge 3 times (one per failed attempt).
+	for range 3 {
+		if err := s.ChargeRateLimit(ctx, subject, surface, cfg); err != nil {
+			t.Fatalf("charge: %v", err)
+		}
+	}
+
+	// Budget check should now return a denial.
+	result, err = s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("budget check after charges: %v", err)
+	}
+	if result == nil {
+		t.Fatal("budget check: expected denial after 3 charges, got allowed")
+	}
+	if result.Wait < time.Second {
+		t.Errorf("wait = %v, want >= 1s", result.Wait)
+	}
+
+	// Budget check should not have incremented the counter.
+	count, err := store.CountRateLimits(ctx, s, subject)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("budget check created a row: count = %d, want 1", count)
+	}
+
+	// A further charge should increment past the limit.
+	if err := s.ChargeRateLimit(ctx, subject, surface, cfg); err != nil {
+		t.Fatalf("charge past limit: %v", err)
+	}
+
+	// Budget check should still deny.
+	result, err = s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("budget check past limit: %v", err)
+	}
+	if result == nil {
+		t.Fatal("budget check: expected denial after 4 charges, got allowed")
+	}
+}
+
+// TestCheckRateLimitBudgetDisabled proves that a zero limit disables enforcement
+// for the budget check.
+func TestCheckRateLimitBudgetDisabled(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{} // zero = disabled
+	ctx := context.Background()
+	const subject = 1300
+	const surface = "budget_disabled"
+
+	// Budget check should always allow.
+	for range 10 {
+		result, err := s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+		if err != nil || result != nil {
+			t.Fatalf("budget check: result=%+v err=%v", result, err)
+		}
+	}
+}
+
+// TestChargeRateLimitDisabled proves that a zero limit disables charging.
+func TestChargeRateLimitDisabled(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{} // zero = disabled
+	ctx := context.Background()
+	const subject = 1400
+	const surface = "charge_disabled"
+
+	// Charges should be no-ops.
+	for range 10 {
+		if err := s.ChargeRateLimit(ctx, subject, surface, cfg); err != nil {
+			t.Fatalf("charge: %v", err)
+		}
+	}
+
+	// No row should have been created.
+	count, err := store.CountRateLimits(ctx, s, subject)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("disabled charge created a row: count = %d, want 0", count)
+	}
+}
+
 func TestRateLimitDenialNotError(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
