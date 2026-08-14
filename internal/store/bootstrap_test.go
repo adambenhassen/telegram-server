@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/gotd/td/crypto/srp"
@@ -298,6 +299,85 @@ func TestBootstrapAccount_SRPRoundTrip(t *testing.T) {
 	}
 	if tsrp.Verify(pw.Verifier, pw.Salt1, pw.Salt2, wrongAnswer.A, wrongAnswer.M1, bPub, bSecret) {
 		t.Fatal("SRP verify should have rejected wrong password")
+	}
+}
+
+// TestBootstrapAccount_ConcurrentCreate fires two goroutines at the same
+// handle simultaneously and asserts exactly one create and one idempotent
+// no-op, with zero errors — covering the 23505 race recovery path.
+func TestBootstrapAccount_ConcurrentCreate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t, pgtest.DSN(t))
+
+	password := []byte("test-password")
+	params := store.BootstrapParams{
+		Handle:    "operator",
+		FirstName: "Operator",
+		LastName:  "",
+		Password:  password,
+	}
+
+	var wg sync.WaitGroup
+	barrier := make(chan struct{})
+
+	type result struct {
+		created bool
+		userID  int64
+		err     error
+	}
+	results := make([]result, 2)
+
+	for i := range 2 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-barrier
+			res, err := s.BootstrapAccount(ctx, params)
+			results[idx] = result{created: res.Created, userID: res.UserID, err: err}
+		}(i)
+	}
+
+	close(barrier) // release both goroutines simultaneously
+	wg.Wait()
+
+	// Exactly one error-free result expected from each goroutine.
+	for i, r := range results {
+		if r.err != nil {
+			t.Errorf("goroutine %d: unexpected error: %v", i, r.err)
+		}
+	}
+
+	// Exactly one created, one idempotent no-op.
+	createdCount := 0
+	var userID int64
+	for i, r := range results {
+		if r.err != nil {
+			continue
+		}
+		if r.created {
+			createdCount++
+			userID = r.userID
+		}
+		if r.userID == 0 {
+			t.Errorf("goroutine %d: expected non-zero UserID", i)
+		}
+	}
+	if createdCount != 1 {
+		t.Errorf("expected exactly 1 Created=true, got %d", createdCount)
+	}
+	if userID == 0 {
+		t.Fatal("no successful result")
+	}
+
+	// Both goroutines should have returned the same user ID.
+	for i, r := range results {
+		if r.err != nil {
+			continue
+		}
+		if r.userID != userID {
+			t.Errorf("goroutine %d: userID %d != expected %d", i, r.userID, userID)
+		}
 	}
 }
 
