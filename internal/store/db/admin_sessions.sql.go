@@ -11,6 +11,21 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deleteAdminSession = `-- name: DeleteAdminSession :execrows
+DELETE FROM admin_sessions
+WHERE session_hash = $1
+`
+
+// Delete a single admin session row by its hash. Returns rows affected
+// (0 means the session was already gone).
+func (q *Queries) DeleteAdminSession(ctx context.Context, sessionHash []byte) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteAdminSession, sessionHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getAdminSession = `-- name: GetAdminSession :one
 SELECT token_fingerprint, expires_at, last_activity
 FROM admin_sessions

@@ -13,7 +13,7 @@ import (
 // sessionCookieName is the name of the cookie that carries an admin session id.
 // The __Host- prefix enforces Secure, Path=/, and no Domain attribute at the
 // browser level. HttpOnly and SameSite=Strict are not enforced by the prefix
-// and must be set explicitly in the Set-Cookie header (see NewSessionCookie).
+// and must be set explicitly in the Set-Cookie header (see SessionCookie).
 const sessionCookieName = "__Host-admin-session"
 
 // sessionLifetime is how long an admin session is valid from creation.

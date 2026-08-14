@@ -52,6 +52,12 @@ func (s *Store) UpdateAdminSessionActivity(ctx context.Context, sessionHash []by
 	})
 }
 
+// DeleteAdminSession removes a single session row by its hash. Returns the
+// number of rows deleted (0 means the session was already gone).
+func (s *Store) DeleteAdminSession(ctx context.Context, sessionHash []byte) (int64, error) {
+	return s.q.DeleteAdminSession(ctx, sessionHash)
+}
+
 // SweepExpiredAdminSessions deletes session rows whose absolute expiry
 // deadline has passed. Returns the number of rows deleted.
 func (s *Store) SweepExpiredAdminSessions(ctx context.Context) (int64, error) {

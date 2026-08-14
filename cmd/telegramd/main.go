@@ -169,18 +169,29 @@ func run(log *slog.Logger) error {
 		}
 	}()
 
-	// Start the admin HTTP server on a separate listener. All paths behind the
-	// RequireAdmin stub return 401; handlers are wired after auth is complete.
+	// Start the admin HTTP server on a separate listener with login, logout,
+	// CSRF protection, rate limiting, and security headers.
 	if cfg.AdminListenAddr != "" {
-		adminSubMux := http.NewServeMux()
-		adminHandler := http.NewServeMux()
-		adminHandler.Handle("/admin/", admin.RequireAdmin(admin.AdminMiddlewareConfig{
-			Store:     st,
-			TokenHash: cfg.AdminTokenHash,
-		})(adminSubMux))
+		// Derive the admin origin from the listen address for CSRF checks.
+		// When AdminListenAddr is a bare :port (e.g. ":2444"), substitute
+		// localhost so the Origin header matches what a browser sends.
+		adminHost, adminPort, err := net.SplitHostPort(cfg.AdminListenAddr)
+		if err != nil {
+			return fmt.Errorf("admin listen address: %w", err)
+		}
+		if adminHost == "" {
+			adminHost = "localhost"
+		}
+		adminOrigin := "http://" + net.JoinHostPort(adminHost, adminPort)
+		adminRouter := admin.AdminRouter(admin.LoginHandlerConfig{
+			Store:       st,
+			TokenHash:   cfg.AdminTokenHash,
+			Logger:      log,
+			AdminOrigin: adminOrigin,
+		}, server.Registry())
 		adminSrv := &http.Server{
 			Addr:              cfg.AdminListenAddr,
-			Handler:           adminHandler,
+			Handler:           adminRouter,
 			ReadHeaderTimeout: 5 * time.Second,
 			MaxHeaderBytes:    8192,
 		}
