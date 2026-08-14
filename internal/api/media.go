@@ -89,25 +89,10 @@ func sanitizeMIME(s string) string {
 // not a header value, and forcing it to ASCII would mangle every non-English
 // name.
 func sanitizeFileName(s string) string {
-	if len(s) > 255 || !validText(s) || strings.ContainsFunc(s, corruptsName) {
+	if len(s) > 255 || !validText(s) || strings.ContainsFunc(s, isDangerousRune) {
 		return ""
 	}
 	return s
-}
-
-// corruptsName reports the runes a rendered file name cannot survive: the C0
-// and C1 control ranges, which cover CR and LF, and the bidi marks, overrides
-// and isolates. The last group is the extension spoof: a U+202E override
-// before "gnp.exe" renders to a recipient as "...png" while the bytes stay .exe.
-func corruptsName(r rune) bool {
-	switch {
-	case r <= 0x1f, r >= 0x7f && r <= 0x9f:
-		return true
-	case r == 0x200e, r == 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
-		return true
-	default:
-		return false
-	}
 }
 
 // handleSendMedia serves messages.sendMedia: it assembles an in-flight upload
