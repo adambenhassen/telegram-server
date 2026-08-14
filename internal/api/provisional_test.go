@@ -558,8 +558,12 @@ func TestProvisionalAccountCannotRemovePassword(t *testing.T) {
 
 func TestProvisionalGateBlocksUnimplementedMethod(t *testing.T) {
 	t.Parallel()
-	// Unimplemented methods are never in the allow-list, so the gate
-	// predicate blocks them for any authenticated provisional session.
+	// This test asserts the provisionalBlocked predicate directly.
+	// Unimplemented methods are never in the allow-list, so the predicate
+	// returns true for any authenticated provisional session. Note that the
+	// predicate is called only by registerRevoke; the handleUnknownGated
+	// fallback uses its own inline check. Dispatch coverage for the fallback
+	// path is in test/e2e/provisional_gate_test.go (help.getNearestDc assertion).
 	req := &mtproto.Request{
 		Ctx:         context.Background(),
 		UserID:      1,

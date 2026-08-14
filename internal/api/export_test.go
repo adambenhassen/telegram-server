@@ -816,5 +816,6 @@ var ProvisionalAllowList = provisionalAllowList
 var ErrAuthKeyUnreg = errAuthKeyUnreg
 
 // ProvisionalBlocked exposes the gate predicate for tests. It is the same
-// function called by both registerRevoke and handleUnknownGated, not a copy.
+// function called by registerRevoke, not a copy. The handleUnknownGated
+// fallback uses its own inline check and does not call this predicate.
 var ProvisionalBlocked = provisionalBlocked
