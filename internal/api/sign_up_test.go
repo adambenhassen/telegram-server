@@ -509,3 +509,70 @@ func isFirstNameInvalid(err error) bool {
 	var rpc *tgerr.Error
 	return errors.As(err, &rpc) && rpc.Code == 400 && rpc.Message == "FIRSTNAME_INVALID"
 }
+
+func TestSignUpBoundKeyRollsBack(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+
+	// Create a user and bind an auth key to them.
+	existing, err := s.CreateUser(ctx, "+15550009999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyID := int64(0x1)
+	if err := s.SaveAuthKey(ctx, keyID, make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindAuthKeyUser(ctx, keyID, existing.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Record the original binding.
+	keyBefore, _, err := s.AuthKeyByID(ctx, keyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Count users before.
+	before := countUsers(t, dsn)
+
+	// Issue a code for the username.
+	hash, _, err := s.IssueCodeForUsername(ctx, "rollbk")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addr := netip.MustParseAddr("10.0.0.13")
+	cfg := store.RateLimitConfig{}
+
+	// Try to sign up with a key that is already bound.
+	_, err = api.SignUpForTest(s, [8]byte{1}, addr, cfg, config.RegistrationOpen, &tg.AuthSignUpRequest{
+		PhoneNumber:   "rollbk",
+		PhoneCodeHash: hash,
+		FirstName:     "Rollback",
+	})
+	if !isAuthKeyUnreg(err) {
+		t.Fatalf("signUp with bound key: expected AUTH_KEY_UNREGISTERED, got %v", err)
+	}
+
+	// No new user created — the entire transaction rolled back.
+	after := countUsers(t, dsn)
+	if after != before {
+		t.Errorf("users table grew from %d to %d, want no change", before, after)
+	}
+
+	// Original key binding intact.
+	keyAfter, ok, err := s.AuthKeyByID(ctx, keyID)
+	if err != nil || !ok {
+		t.Fatalf("auth key lookup: ok=%v err=%v", ok, err)
+	}
+	if keyAfter.UserID != keyBefore.UserID {
+		t.Errorf("key user_id = %d, want %d (original binding intact)", keyAfter.UserID, keyBefore.UserID)
+	}
+}
+
+func isAuthKeyUnreg(err error) bool {
+	var rpc *tgerr.Error
+	return errors.As(err, &rpc) && rpc.Code == 401 && rpc.Message == "AUTH_KEY_UNREGISTERED"
+}

@@ -127,8 +127,9 @@ func (s *Store) SignUpUsernameUser(ctx context.Context, handle, firstName, lastN
 	}
 
 	// Bind the auth key within the same transaction. The key must exist and be
-	// unbound; a missing or already-bound key rolls back the entire signup.
-	rows, err := qtx.BindAuthKeyUser(ctx, db.BindAuthKeyUserParams{ID: authKeyID, UserID: &u.ID})
+	// unbound (user_id IS NULL, pending_user_id IS NULL); an already-bound or
+	// pending key rolls back the entire signup, leaving no committed state.
+	rows, err := qtx.BindAuthKeyUserForSignUp(ctx, db.BindAuthKeyUserForSignUpParams{ID: authKeyID, UserID: &u.ID})
 	if err != nil {
 		return User{}, fmt.Errorf("bind auth key: %w", err)
 	}
