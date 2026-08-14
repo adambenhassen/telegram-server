@@ -200,6 +200,10 @@ func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store) http.H
 		}
 
 		cache.refresh(r.Context(), registry, st)
+		if cache.failed() {
+			http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		m := cache.get()
 
 		csrfToken, err := generateCSRFToken()
@@ -597,15 +601,13 @@ tr:last-child td { border-bottom: none; }
             <dd class="stat-value" id="v-rate_limit_active" data-metric="rate_limit_active">{{.RateLimitActive}}</dd>
           </dl>
         </div>
-        {{if .UninstrumentedNames}}
-        <div class="uninstr-card">
+        <div class="uninstr-card{{if not .UninstrumentedNames}} hidden{{end}}" id="uninstr-card">
           <div class="uninstr-title">Not yet instrumented</div>
           <ul class="uninstr-list">
             {{range .UninstrumentedNames}}<li>{{.Label}}</li>{{end}}
           </ul>
           <p class="uninstr-note">These are not measured yet — the fields exist so the schema is stable. Not a reading of zero.</p>
         </div>
-        {{end}}
       </div>
     </section>
 
@@ -806,20 +808,22 @@ tr:last-child td { border-bottom: none; }
   };
 
   // Rebuild uninstrSet and the card DOM from each poll response.
-  // This ensures a field newly listed in a response stops rendering as a
-  // number and appears in the card immediately.
+  // The card scaffold is always in the DOM; show/hide it based on whether
+  // the array is non-empty so newly listed fields appear immediately.
   function patchUninstrumented(data) {
     var arr = data.uninstrumented;
     if (!Array.isArray(arr)) return;
     uninstrSet = new Set(arr);
+    var card = document.getElementById('uninstr-card');
     var list = document.querySelector('.uninstr-list');
-    if (!list) return;
+    if (!card || !list) return;
     list.innerHTML = '';
     arr.forEach(function(field) {
       var li = document.createElement('li');
       li.textContent = uninstrLabels[field] || field;
       list.appendChild(li);
     });
+    card.classList.toggle('hidden', arr.length === 0);
   }
 
   // Patch storage table
