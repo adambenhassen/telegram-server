@@ -172,6 +172,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	register(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
+	register(d, tg.AuthSignUpRequestTypeID, h.handleSignUp)
 	registerRevoke(d, tg.AuthLogOutRequestTypeID, h.handleLogOut)
 	register(d, tg.UsersGetUsersRequestTypeID, h.handleGetUsers)
 	register(d, tg.AccountGetAuthorizationsRequestTypeID, h.handleGetAuthorizations)
