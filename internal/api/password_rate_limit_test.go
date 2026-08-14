@@ -336,6 +336,167 @@ func TestPasswordProofDisabled(t *testing.T) {
 	}
 }
 
+// TestPasswordProofRefundOnValidProof proves that a valid SRP proof
+// triggers the refund path: with Limit: 1, two valid proofs in a row
+// both succeed because the first one refunds its token.
+func TestPasswordProofRefundOnValidProof(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551297801")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Compute a valid verifier from a known password.
+	// auth.NewPasswordHash mutates the algo, so use copies for the DB.
+	salt1 := make([]byte, 32)
+	salt2 := make([]byte, 32)
+	for i := range salt1 {
+		salt1[i] = byte(i)
+	}
+	for i := range salt2 {
+		salt2[i] = byte(255 - i)
+	}
+	const password = "test-password"
+	algo := &tg.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow{
+		Salt1: make([]byte, len(salt1)),
+		Salt2: make([]byte, len(salt2)),
+		G:     srp.G,
+		P:     srp.PBytes(),
+	}
+	copy(algo.Salt1, salt1)
+	copy(algo.Salt2, salt2)
+	verifier, err := auth.NewPasswordHash([]byte(password), algo)
+	if err != nil {
+		t.Fatalf("NewPasswordHash: %v", err)
+	}
+
+	// Use post-mutation salt values so the verifier matches.
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   alice.ID,
+		Salt1:    algo.Salt1,
+		Salt2:    algo.Salt2,
+		Verifier: verifier,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Auth key bound to alice.
+	keyID := int64(0x19)
+	if err := s.SaveAuthKey(ctx, keyID, make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindAuthKeyUser(ctx, keyID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit of 1 — without refund, only one proof would succeed.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+
+	// Shared handlers so the SRP challenge store is shared between calls.
+	h := api.SharedHandlersForTest(s)
+	api.SetPasswordProofLimit(h, cfg)
+
+	// Step 1: call handleGetPassword to get a fresh SRP challenge.
+	var bufGP bin.Buffer
+	if err := (&tg.AccountGetPasswordRequest{}).Encode(&bufGP); err != nil {
+		t.Fatal(err)
+	}
+	gpRes, err := api.HandleGetPassword(h, &mtproto.Request{
+		Ctx:       ctx,
+		UserID:    alice.ID,
+		AuthKeyID: [8]byte{0x19},
+		Buf:       &bufGP,
+	})
+	if err != nil {
+		t.Fatalf("getPassword: %v", err)
+	}
+	gp, ok := gpRes.(*tg.AccountPassword)
+	if !ok || !gp.HasPassword {
+		t.Fatalf("getPassword: unexpected result")
+	}
+	srpB, ok := gp.GetSRPB()
+	if !ok || len(srpB) == 0 {
+		t.Fatal("expected SRPB present")
+	}
+
+	// Step 2: compute a valid SRP proof from the password.
+	proof, err := auth.PasswordHash([]byte(password), gp.SRPID, srpB, gp.SecureRandom, gp.CurrentAlgo)
+	if err != nil {
+		t.Fatalf("PasswordHash: %v", err)
+	}
+
+	// Step 3: call handleGetPasswordSettings with the valid proof.
+	var bufGPS bin.Buffer
+	if err := (&tg.AccountGetPasswordSettingsRequest{
+		Password: proof,
+	}).Encode(&bufGPS); err != nil {
+		t.Fatal(err)
+	}
+	res1, err := api.HandleGetPasswordSettings(h, &mtproto.Request{
+		Ctx:       ctx,
+		UserID:    alice.ID,
+		AuthKeyID: [8]byte{0x19},
+		Buf:       &bufGPS,
+	})
+	if err != nil {
+		t.Fatalf("getPasswordSettings 1: %v", err)
+	}
+	if _, ok := res1.(*tg.AccountPasswordSettings); !ok {
+		t.Fatalf("result = %T, want *tg.AccountPasswordSettings", res1)
+	}
+
+	// Step 4: get a fresh challenge for a second valid proof.
+	var bufGP2 bin.Buffer
+	if err := (&tg.AccountGetPasswordRequest{}).Encode(&bufGP2); err != nil {
+		t.Fatal(err)
+	}
+	gpRes2, err := api.HandleGetPassword(h, &mtproto.Request{
+		Ctx:       ctx,
+		UserID:    alice.ID,
+		AuthKeyID: [8]byte{0x19},
+		Buf:       &bufGP2,
+	})
+	if err != nil {
+		t.Fatalf("getPassword 2: %v", err)
+	}
+	gp2, ok := gpRes2.(*tg.AccountPassword)
+	if !ok {
+		t.Fatalf("getPassword 2 result = %T", gpRes2)
+	}
+	srpB2, ok := gp2.GetSRPB()
+	if !ok {
+		t.Fatal("expected SRPB present in second challenge")
+	}
+
+	proof2, err := auth.PasswordHash([]byte(password), gp2.SRPID, srpB2, gp2.SecureRandom, gp2.CurrentAlgo)
+	if err != nil {
+		t.Fatalf("PasswordHash 2: %v", err)
+	}
+
+	// Step 5: second valid proof should also succeed (token was refunded).
+	var bufGPS2 bin.Buffer
+	if err := (&tg.AccountGetPasswordSettingsRequest{
+		Password: proof2,
+	}).Encode(&bufGPS2); err != nil {
+		t.Fatal(err)
+	}
+	res2, err := api.HandleGetPasswordSettings(h, &mtproto.Request{
+		Ctx:       ctx,
+		UserID:    alice.ID,
+		AuthKeyID: [8]byte{0x19},
+		Buf:       &bufGPS2,
+	})
+	if err != nil {
+		t.Fatalf("getPasswordSettings 2: %v (refund not working — Limit:1 should allow two valid proofs)", err)
+	}
+	if _, ok := res2.(*tg.AccountPasswordSettings); !ok {
+		t.Fatalf("result 2 = %T, want *tg.AccountPasswordSettings", res2)
+	}
+}
+
 // TestPasswordProofFailedProofConsumes proves that a failed proof
 // (SRP_ID_INVALID from a bad SRPID) keeps the token consumed.
 func TestPasswordProofFailedProofConsumes(t *testing.T) {
@@ -466,10 +627,11 @@ func TestPasswordProofUIDMismatchConsumes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPasswordHash alice: %v", err)
 	}
+	// auth.NewPasswordHash mutates the algo's Salt1 field; use post-mutation values.
 	if err := s.UpsertPassword(ctx, store.UserPassword{
 		UserID:   alice.ID,
-		Salt1:    salt1,
-		Salt2:    salt2,
+		Salt1:    verifierAlgo.Salt1,
+		Salt2:    verifierAlgo.Salt2,
 		Verifier: verifierAlice,
 	}); err != nil {
 		t.Fatal(err)
@@ -494,10 +656,11 @@ func TestPasswordProofUIDMismatchConsumes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPasswordHash bob: %v", err)
 	}
+	// auth.NewPasswordHash mutates the algo's Salt1 field; use post-mutation values.
 	if err := s.UpsertPassword(ctx, store.UserPassword{
 		UserID:   bob.ID,
-		Salt1:    salt1b,
-		Salt2:    salt2b,
+		Salt1:    verifierBobAlgo.Salt1,
+		Salt2:    verifierBobAlgo.Salt2,
 		Verifier: verifierBob,
 	}); err != nil {
 		t.Fatal(err)
@@ -830,10 +993,11 @@ func TestPasswordProofUIDMismatchBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPasswordHash alice: %v", err)
 	}
+	// auth.NewPasswordHash mutates the algo's Salt1 field; use post-mutation values.
 	if err := s.UpsertPassword(ctx, store.UserPassword{
 		UserID:   alice.ID,
-		Salt1:    salt1,
-		Salt2:    salt2,
+		Salt1:    verifierAlgo.Salt1,
+		Salt2:    verifierAlgo.Salt2,
 		Verifier: verifierAlice,
 	}); err != nil {
 		t.Fatal(err)
@@ -858,10 +1022,11 @@ func TestPasswordProofUIDMismatchBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPasswordHash bob: %v", err)
 	}
+	// auth.NewPasswordHash mutates the algo's Salt1 field; use post-mutation values.
 	if err := s.UpsertPassword(ctx, store.UserPassword{
 		UserID:   bob.ID,
-		Salt1:    salt1b,
-		Salt2:    salt2b,
+		Salt1:    verifierBobAlgo.Salt1,
+		Salt2:    verifierBobAlgo.Salt2,
 		Verifier: verifierBob,
 	}); err != nil {
 		t.Fatal(err)
