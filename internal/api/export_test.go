@@ -815,13 +815,6 @@ var ProvisionalAllowList = provisionalAllowList
 // ErrAuthKeyUnreg exposes the AUTH_KEY_UNREGISTERED error for test assertions.
 var ErrAuthKeyUnreg = errAuthKeyUnreg
 
-// ProvisionalGateBlocked returns the error the register wrapper returns when
-// the provisional gate fires, for a given type ID and request. Returns nil
-// when the gate does not block (unauthenticated or allow-listed method).
-// This is the exact logic the register wrapper applies, extracted for testing.
-func ProvisionalGateBlocked(id uint32, req *mtproto.Request) error {
-	if req.UserID != 0 && req.Provisional && !provisionalAllowList[id] {
-		return errAuthKeyUnreg
-	}
-	return nil
-}
+// ProvisionalBlocked exposes the gate predicate for tests. It is the same
+// function called by both registerRevoke and handleUnknownGated, not a copy.
+var ProvisionalBlocked = provisionalBlocked
