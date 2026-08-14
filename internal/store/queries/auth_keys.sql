@@ -17,6 +17,13 @@ WHERE ak.id = $1;
 -- name: BindAuthKeyUser :execrows
 UPDATE auth_keys SET user_id = $2 WHERE id = $1;
 
+-- name: BindAuthKeyUserForSignUp :execrows
+-- Binds an auth key to a user only when the key is unbound (user_id IS NULL)
+-- and not mid-2FA (pending_user_id IS NULL). Used exclusively by SignUpUsernameUser
+-- so signup cannot rebind an already-authorized session. The shared BindAuthKeyUser
+-- has no such guard — signIn relies on its unconditional rebinding behaviour.
+UPDATE auth_keys SET user_id = $2 WHERE id = $1 AND user_id IS NULL AND pending_user_id IS NULL;
+
 -- name: TouchAuthKey :exec
 UPDATE auth_keys SET last_seen_at = now() WHERE id = $1;
 

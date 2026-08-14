@@ -10,6 +10,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -52,6 +53,82 @@ func verifyToRPC(err error) *tgerr.Error {
 	default:
 		return errInternal
 	}
+}
+
+// handleSignUp serves auth.signUp for username-mode registration.
+// It creates a provisional account with the given username and binds the
+// auth key with provisional=true.
+func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.AuthSignUpRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+
+	// Registration closed: reject immediately without touching state.
+	if h.registrationMode != config.RegistrationOpen {
+		return nil, errInputRequestInvalid
+	}
+
+	// Input: req.PhoneNumber is the username; req.PhoneCodeHash is the hash
+	// from a prior sendCode; req.FirstName/LastName are the display name.
+	//
+	// The username must match the username pattern — not the phone regex.
+	// A phone-number format means the client called the wrong method.
+	username := req.PhoneNumber
+	if !validateUsername(username) {
+		return nil, errPhoneInvalid
+	}
+	username = strings.ToLower(username)
+
+	// Reserved handles must never be claimed.
+	if reservedUsernames[username] {
+		return nil, errPhoneInvalid
+	}
+
+	// Per-IP rate limit: charged before any identifier-dependent work.
+	if err := h.checkAndChargeRateLimitIP(r, "sign_up_ip", h.rateLimitSignUpIP); err != nil {
+		return nil, err
+	}
+
+	// Validate display names: must be valid text with a reasonable length cap.
+	firstName, lastName := req.FirstName, req.LastName
+	if firstName == "" || !validText(firstName) || len(firstName) > 255 {
+		return nil, errFirstNameInvalid
+	}
+	if lastName != "" && (!validText(lastName) || len(lastName) > 255) {
+		return nil, errFirstNameInvalid
+	}
+
+	// Hash-only verification: same check as signIn's username path.
+	if err := h.store.CheckCodeHash(r.Ctx, username, req.PhoneCodeHash); err != nil {
+		rpc := verifyToRPC(err)
+		if rpc == errCodeExpired {
+			// Username path returns PHONE_CODE_INVALID for expired hashes.
+			rpc = errCodeInvalid
+		}
+		if rpc == errInternal {
+			h.log.Error("sign up: check code hash", "err", err)
+			return nil, errInternal
+		}
+		return nil, rpc
+	}
+
+	// Create the user, claim the username, and bind the auth key — all in one
+	// transaction. A failed bind rolls back the account and claim.
+	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
+	user, err := h.store.SignUpUsernameUser(r.Ctx, username, firstName, lastName, keyID)
+	if err != nil {
+		if errors.Is(err, store.ErrUsernameOccupied) {
+			return nil, errUsernameOccupied
+		}
+		if errors.Is(err, store.ErrAuthKeyNotFound) {
+			return nil, errAuthKeyUnreg
+		}
+		h.log.Error("sign up: create user", "err", err)
+		return nil, errInternal
+	}
+
+	return &tg.AuthAuthorization{User: userTL(user)}, nil
 }
 
 func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {

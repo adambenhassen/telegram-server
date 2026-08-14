@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
@@ -57,6 +58,20 @@ func SignInForTestWithLimits(s *store.Store, authKeyID [8]byte, addr netip.Addr,
 	h := testHandlers(s)
 	h.rateLimitSignInFailIP = rateLimit
 	return h.handleSignIn(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+}
+
+// SignUpForTest invokes handleSignUp for a request arriving from addr, against
+// the per-IP rate limit given. The authKeyID is required so the handler can
+// bind the key on success. registrationMode controls whether registration is open.
+func SignUpForTest(s *store.Store, authKeyID [8]byte, addr netip.Addr, rateLimit store.RateLimitConfig, registrationMode config.RegistrationMode, req *tg.AuthSignUpRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitSignUpIP = rateLimit
+	h.registrationMode = registrationMode
+	return h.handleSignUp(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
 }
 
 // LogIssuedCodeForTest drives the gated login-code log line for the external
