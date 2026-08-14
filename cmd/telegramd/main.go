@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -68,6 +69,14 @@ func run(log *slog.Logger) error {
 			log.Error("store close", "err", cerr)
 		}
 	}()
+
+	// Bootstrap: create the first username-mode operator account before the
+	// port binds. Must succeed or fail before anything else starts.
+	if cfg.BootstrapUsername != "" {
+		if err := bootstrapAccount(ctx, st, cfg, log); err != nil {
+			return fmt.Errorf("bootstrap: %w", err)
+		}
+	}
 
 	// Run the sweep under a cancelable child context and wait for it to exit
 	// before the store pool closes, so shutdown never closes the pool out from
@@ -365,4 +374,51 @@ func sweepExpiredAdminSessions(ctx context.Context, st *store.Store, log *slog.L
 			log.Info("swept expired admin sessions", "deleted", n)
 		}
 	}
+}
+
+// bootstrapAccount creates the first username-mode operator account at startup.
+// It validates the username, reads the password, and delegates to the store
+// for the single-transaction bootstrap.
+//
+// The password buffer is zeroed after use.
+func bootstrapAccount(ctx context.Context, st *store.Store, cfg config.Config, log *slog.Logger) error {
+	// Validate the username format and reserved blocklist.
+	handle := strings.ToLower(cfg.BootstrapUsername)
+	if err := store.ValidateBootstrapUsername(handle); err != nil {
+		return err
+	}
+
+	// Read the password.
+	password, err := cfg.BootstrapPasswordBytes()
+	if err != nil {
+		return err
+	}
+	defer clear(password)
+
+	// Warn about credential exposure.
+	if cfg.BootstrapPasswordFile != "" {
+		log.Warn("bootstrap password loaded from file", "path", cfg.BootstrapPasswordFile, "action", "ensure file is readable only by the server process (mode 0600)")
+	} else {
+		log.Warn("bootstrap password is in process environment", "risk", "/proc/self/environ retains the value for the life of the process; orchestrator manifests, docker inspect, and crash dumps can expose it")
+	}
+
+	// Call the store's single-transaction bootstrap.
+	result, err := st.BootstrapAccount(ctx, store.BootstrapParams{
+		Handle:    handle,
+		FirstName: "Operator",
+		LastName:  "",
+		Password:  password,
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.Created {
+		log.Info("bootstrap account created", "user_id", result.UserID, "username", handle)
+	} else {
+		log.Info("bootstrap account already exists (idempotent)", "user_id", result.UserID, "username", handle)
+	}
+	log.Info("bootstrap does not rotate passwords; to change the credential use the M16 dashboard or direct DB access")
+
+	return nil
 }
