@@ -746,3 +746,163 @@ func TestLoadRateLimitEnv(t *testing.T) {
 		t.Errorf("error %q does not name TG_RATE_LIMIT_SEND", err)
 	}
 }
+
+func TestLoadRegistrationMode(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+
+	tests := map[string]struct {
+		raw     string
+		want    config.RegistrationMode
+		wantErr bool
+	}{
+		"unset":        {want: config.RegistrationClosed},
+		"empty string": {raw: "", want: config.RegistrationClosed},
+		"closed":       {raw: "closed", want: config.RegistrationClosed},
+		"open":         {raw: "open", want: config.RegistrationOpen},
+		"invalid":      {raw: "unknown", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if tc.raw != "" {
+				t.Setenv("TG_REGISTRATION", tc.raw)
+			}
+			cfg, err := config.Load(discardLog())
+			if tc.wantErr {
+				if err != nil {
+					// Load itself may not error for invalid values — validation
+					// happens at ValidateRegistrationMode.
+					return
+				}
+				verr := cfg.ValidateRegistrationMode()
+				if verr == nil {
+					t.Fatalf("ValidateRegistrationMode: expected error, got nil")
+				}
+				if !strings.Contains(verr.Error(), "TG_REGISTRATION") {
+					t.Errorf("error %q does not name TG_REGISTRATION", verr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if verr := cfg.ValidateRegistrationMode(); verr != nil {
+				t.Fatalf("ValidateRegistrationMode: %v", verr)
+			}
+			if cfg.RegistrationMode != tc.want {
+				t.Errorf("RegistrationMode = %q, want %q", cfg.RegistrationMode, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadNewRateLimits(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+
+	// Defaults.
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.CheckPassword.Limit != 5 {
+		t.Errorf("CheckPassword limit = %d, want 5", cfg.RateLimits.CheckPassword.Limit)
+	}
+	if cfg.RateLimits.CheckPassword.Window != 10*time.Minute {
+		t.Errorf("CheckPassword window = %v, want 10m", cfg.RateLimits.CheckPassword.Window)
+	}
+	if cfg.RateLimits.CheckPasswordIP.Limit != 10 {
+		t.Errorf("CheckPasswordIP limit = %d, want 10", cfg.RateLimits.CheckPasswordIP.Limit)
+	}
+	if cfg.RateLimits.CheckPasswordIP.Window != time.Hour {
+		t.Errorf("CheckPasswordIP window = %v, want 1h", cfg.RateLimits.CheckPasswordIP.Window)
+	}
+	if cfg.RateLimits.GetPasswordIP.Limit != 20 {
+		t.Errorf("GetPasswordIP limit = %d, want 20", cfg.RateLimits.GetPasswordIP.Limit)
+	}
+	if cfg.RateLimits.GetPasswordIP.Window != time.Hour {
+		t.Errorf("GetPasswordIP window = %v, want 1h", cfg.RateLimits.GetPasswordIP.Window)
+	}
+	if cfg.RateLimits.SignUpIP.Limit != 5 {
+		t.Errorf("SignUpIP limit = %d, want 5", cfg.RateLimits.SignUpIP.Limit)
+	}
+	if cfg.RateLimits.SignUpIP.Window != time.Hour {
+		t.Errorf("SignUpIP window = %v, want 1h", cfg.RateLimits.SignUpIP.Window)
+	}
+
+	// Override check_password.
+	t.Setenv("TG_RATE_LIMIT_CHECK_PASSWORD", "3")
+	t.Setenv("TG_RATE_LIMIT_CHECK_PASSWORD_WINDOW", "5m")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.CheckPassword.Limit != 3 {
+		t.Errorf("CheckPassword limit = %d, want 3", cfg.RateLimits.CheckPassword.Limit)
+	}
+	if cfg.RateLimits.CheckPassword.Window != 5*time.Minute {
+		t.Errorf("CheckPassword window = %v, want 5m", cfg.RateLimits.CheckPassword.Window)
+	}
+
+	// Override check_password_ip.
+	t.Setenv("TG_RATE_LIMIT_CHECK_PASSWORD_IP", "7")
+	t.Setenv("TG_RATE_LIMIT_CHECK_PASSWORD_IP_WINDOW", "30m")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.CheckPasswordIP.Limit != 7 {
+		t.Errorf("CheckPasswordIP limit = %d, want 7", cfg.RateLimits.CheckPasswordIP.Limit)
+	}
+	if cfg.RateLimits.CheckPasswordIP.Window != 30*time.Minute {
+		t.Errorf("CheckPasswordIP window = %v, want 30m", cfg.RateLimits.CheckPasswordIP.Window)
+	}
+
+	// Override get_password_ip.
+	t.Setenv("TG_RATE_LIMIT_GET_PASSWORD_IP", "15")
+	t.Setenv("TG_RATE_LIMIT_GET_PASSWORD_IP_WINDOW", "2h")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.GetPasswordIP.Limit != 15 {
+		t.Errorf("GetPasswordIP limit = %d, want 15", cfg.RateLimits.GetPasswordIP.Limit)
+	}
+	if cfg.RateLimits.GetPasswordIP.Window != 2*time.Hour {
+		t.Errorf("GetPasswordIP window = %v, want 2h", cfg.RateLimits.GetPasswordIP.Window)
+	}
+
+	// Override sign_up_ip.
+	t.Setenv("TG_RATE_LIMIT_SIGN_UP_IP", "3")
+	t.Setenv("TG_RATE_LIMIT_SIGN_UP_IP_WINDOW", "12h")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.SignUpIP.Limit != 3 {
+		t.Errorf("SignUpIP limit = %d, want 3", cfg.RateLimits.SignUpIP.Limit)
+	}
+	if cfg.RateLimits.SignUpIP.Window != 12*time.Hour {
+		t.Errorf("SignUpIP window = %v, want 12h", cfg.RateLimits.SignUpIP.Window)
+	}
+
+	// Zero disables.
+	t.Setenv("TG_RATE_LIMIT_CHECK_PASSWORD", "0")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.CheckPassword.Limit != 0 {
+		t.Errorf("CheckPassword limit = %d, want 0 (disabled)", cfg.RateLimits.CheckPassword.Limit)
+	}
+
+	// Invalid value.
+	t.Setenv("TG_RATE_LIMIT_CHECK_PASSWORD", "abc")
+	_, err = config.Load(discardLog())
+	if err == nil {
+		t.Fatal("expected error for invalid TG_RATE_LIMIT_CHECK_PASSWORD")
+	}
+	if !strings.Contains(err.Error(), "TG_RATE_LIMIT_CHECK_PASSWORD") {
+		t.Errorf("error %q does not name TG_RATE_LIMIT_CHECK_PASSWORD", err)
+	}
+}

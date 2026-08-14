@@ -320,7 +320,7 @@ func bootServerWithSearchLimits(t *testing.T, ctx context.Context, key *rsa.Priv
 	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{
 		SearchMessages: searchMessages,
 		SearchContacts: searchContacts,
-	})
+	}, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdater(st, server.Registry(), log, pgtest.PeerDeriver())
