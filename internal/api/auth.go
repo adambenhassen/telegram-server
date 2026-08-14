@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -29,6 +30,25 @@ func validatePhone(phone string) error {
 
 func validateUsername(username string) bool {
 	return usernameRE.MatchString(username)
+}
+
+// validDisplayName checks that the display name is storable text and does not
+// contain runes that could be used for spoofing: C0/C1 control characters and
+// bidi override/ isolate marks. These characters let an attacker craft a name
+// that visually masquerades as another user or service in peer lists.
+func validDisplayName(s string) bool {
+	if !utf8.ValidString(s) || strings.ContainsRune(s, 0) {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r <= 0x1f, r >= 0x7f && r <= 0x9f:
+			return false
+		case r == 0x200e, r == 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
+			return false
+		}
+	}
+	return true
 }
 
 func newSentCode(hash string) *tg.AuthSentCode {
@@ -91,11 +111,13 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	// Validate display names: must be valid text with a reasonable length cap.
+	// Bidi override and C0/C1 control characters are rejected to prevent
+	// display-name spoofing (extension/identity spoof in peer lists).
 	firstName, lastName := req.FirstName, req.LastName
-	if firstName == "" || !validText(firstName) || len(firstName) > 255 {
+	if firstName == "" || !validDisplayName(firstName) || len(firstName) > 255 {
 		return nil, errFirstNameInvalid
 	}
-	if lastName != "" && (!validText(lastName) || len(lastName) > 255) {
+	if lastName != "" && (!validDisplayName(lastName) || len(lastName) > 255) {
 		return nil, errFirstNameInvalid
 	}
 
