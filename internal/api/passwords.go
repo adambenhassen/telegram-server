@@ -67,15 +67,12 @@ func (h *handlers) handleGetPassword(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errMethodNotImpl
 	}
 
-	// Per-IP rate limit for unauthenticated callers only.
+	// Per-IP rate limit for unauthenticated callers only. Uses atomic
+	// check-and-charge to prevent concurrent bursts from all passing before
+	// any charge.
 	if r.UserID == 0 {
-		if rl, err := h.checkRateLimitIPBudget(r, "get_password_ip", h.rateLimitGetPasswordIP); err != nil {
+		if err := h.checkAndChargeRateLimitIP(r, "get_password_ip", h.rateLimitGetPasswordIP); err != nil {
 			return nil, err
-		} else if rl != nil {
-			return nil, FloodWaitError(int(rl.Wait / time.Second))
-		}
-		if err := h.chargeRateLimitIP(r, "get_password_ip", h.rateLimitGetPasswordIP); err != nil {
-			h.log.Error("get password: charge IP rate limit", "err", err)
 		}
 	}
 

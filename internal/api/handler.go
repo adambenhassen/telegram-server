@@ -289,6 +289,35 @@ func (h *handlers) chargeRateLimitIP(r *mtproto.Request, surface string, cfg sto
 	return h.store.ChargeRateLimit(r.Ctx, subjectID, surface, cfg)
 }
 
+// checkAndChargeRateLimitIP atomically checks and charges the per-IP rate limit
+// for the given surface. Unlike the check-then-charge pattern used by
+// checkPassword, this is a single atomic INSERT-ON-CONFLICT, so concurrent
+// bursts cannot all pass before any charge. Returns nil when allowed, or a
+// FLOOD_WAIT error when denied.
+func (h *handlers) checkAndChargeRateLimitIP(r *mtproto.Request, surface string, cfg store.RateLimitConfig) error {
+	if !cfg.Enabled() {
+		return nil
+	}
+	key, ok := store.IPBucketKey(r.ClientAddr)
+	if !ok {
+		return FloodWaitError(int(cfg.Window / time.Second))
+	}
+	subjectID, err := keyToSubjectID(key)
+	if err != nil {
+		h.log.Error("rate limit: convert IP to subject", "err", err)
+		return errInternal
+	}
+	result, err := h.store.CheckRateLimit(r.Ctx, subjectID, surface, cfg)
+	if err != nil {
+		h.log.Error("rate limit: IP check-and-charge", "err", err)
+		return errInternal
+	}
+	if result != nil {
+		return FloodWaitError(int(result.Wait / time.Second))
+	}
+	return nil
+}
+
 // provisionalAllowList holds the method IDs that a provisional session may call.
 // A provisional session is a username-mode account with no verifier: it can set
 // its password, check password state, or log out — but nothing else.
@@ -326,7 +355,6 @@ func fnv1a64(s string) uint64 {
 		h *= prime64
 	}
 	return h
-}
 }
 
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
