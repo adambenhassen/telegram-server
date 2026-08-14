@@ -2,6 +2,7 @@ package admin
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"net/http"
 	"time"
@@ -10,8 +11,9 @@ import (
 )
 
 // sessionCookieName is the name of the cookie that carries an admin session id.
-// The __Host- prefix enforces Secure, HttpOnly, Path=/, and no Domain attribute
-// at the browser level.
+// The __Host- prefix enforces Secure, Path=/, and no Domain attribute at the
+// browser level. HttpOnly and SameSite=Strict are not enforced by the prefix
+// and must be set explicitly in the Set-Cookie header (see NewSessionCookie).
 const sessionCookieName = "__Host-admin-session"
 
 // sessionLifetime is how long an admin session is valid from creation.
@@ -43,7 +45,7 @@ type AdminMiddlewareConfig struct {
 //
 // Nothing in this middleware logs the raw session id or the token hash.
 func RequireAdmin(cfg AdminMiddlewareConfig) func(http.Handler) http.Handler {
-	tokenFingerprint, err := hex.DecodeString(cfg.TokenHash)
+	decoded, err := hex.DecodeString(cfg.TokenHash)
 	if err != nil {
 		// Invalid config: log and reject all requests. This is a startup
 		// misconfiguration (TG_ADMIN_TOKEN_HASH is not valid hex) that the
@@ -54,6 +56,9 @@ func RequireAdmin(cfg AdminMiddlewareConfig) func(http.Handler) http.Handler {
 			})
 		}
 	}
+	// Double-hash: SHA-256 of the decoded hash bytes. This is the fingerprint
+	// stored in admin_sessions.token_fingerprint.
+	tokenFingerprint := sha256.Sum256(decoded)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +94,7 @@ func RequireAdmin(cfg AdminMiddlewareConfig) func(http.Handler) http.Handler {
 
 			// Check token fingerprint — changing TG_ADMIN_TOKEN_HASH
 			// invalidates all sessions on the next request.
-			if !constantTimeEquals(row.TokenFingerprint, tokenFingerprint) {
+			if subtle.ConstantTimeCompare(row.TokenFingerprint, tokenFingerprint[:]) != 1 {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
@@ -104,24 +109,26 @@ func RequireAdmin(cfg AdminMiddlewareConfig) func(http.Handler) http.Handler {
 	}
 }
 
-// constantTimeEquals compares two byte slices in constant time to prevent
-// timing attacks on the fingerprint comparison.
-func constantTimeEquals(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	result := 0
-	for i := range a {
-		result |= int(a[i] ^ b[i])
-	}
-	return result == 0
+// HashSessionID returns the SHA-256 hash of a session id as raw bytes. It is
+// used by the login handler (stage 3c) to store the session.
+func HashSessionID(sessionID string) []byte {
+	h := sha256.Sum256([]byte(sessionID))
+	return h[:]
 }
 
-// HashSessionID returns the hex-encoded SHA-256 of a session id. It is used
-// by the login handler (stage 3c) to store the session.
-func HashSessionID(sessionID string) string {
-	h := sha256.Sum256([]byte(sessionID))
-	return hex.EncodeToString(h[:])
+// SessionCookie returns a preconfigured http.Cookie for a new admin session.
+// The cookie name carries the __Host- prefix, which enforces Secure, Path=/,
+// and no Domain at the browser level. The returned cookie also sets HttpOnly
+// and SameSite=Strict, which are not enforced by the prefix.
+func SessionCookie(sessionID string) *http.Cookie {
+	return &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    sessionID,
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	}
 }
 
 // SessionCookieName returns the cookie name used for admin sessions.

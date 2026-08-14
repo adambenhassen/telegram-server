@@ -27,6 +27,18 @@ func newTestStore(t *testing.T) *store.Store {
 	return st
 }
 
+// tokenFingerprint computes the SHA-256 of the decoded hex token hash — the
+// same double-hash the middleware applies. This is what gets stored in the
+// database and compared on each request.
+func tokenFingerprint(tokenHash string) []byte {
+	decoded, err := hex.DecodeString(tokenHash)
+	if err != nil {
+		panic(err)
+	}
+	h := sha256.Sum256(decoded)
+	return h[:]
+}
+
 // seedSession inserts a valid admin session into the store. Returns the raw
 // session id (the value the cookie carries).
 func seedSession(t *testing.T, ctx context.Context, st *store.Store, tokenHash string, expiresAt, lastActivity time.Time) string {
@@ -34,11 +46,8 @@ func seedSession(t *testing.T, ctx context.Context, st *store.Store, tokenHash s
 	// Generate a deterministic session id for the test.
 	sessionID := "test-session-id-12345"
 	sessionHash := sha256.Sum256([]byte(sessionID))
-	tokenFingerprint, err := hex.DecodeString(tokenHash)
-	if err != nil {
-		t.Fatalf("invalid token hash: %v", err)
-	}
-	if err := st.CreateAdminSession(ctx, sessionHash[:], tokenFingerprint, expiresAt, lastActivity); err != nil {
+	fingerprint := tokenFingerprint(tokenHash)
+	if err := st.CreateAdminSession(ctx, sessionHash[:], fingerprint, expiresAt, lastActivity); err != nil {
 		t.Fatalf("create admin session: %v", err)
 	}
 	return sessionID
@@ -278,5 +287,42 @@ func TestSessionCookieName_prefix(t *testing.T) {
 	name := admin.SessionCookieName()
 	if !strings.HasPrefix(name, "__Host-") {
 		t.Errorf("cookie name %q does not have __Host- prefix", name)
+	}
+}
+
+func TestSessionCookie_attributes(t *testing.T) {
+	t.Parallel()
+	cookie := admin.SessionCookie("some-session-id")
+
+	if cookie.Name != admin.SessionCookieName() {
+		t.Errorf("Name = %q, want %q", cookie.Name, admin.SessionCookieName())
+	}
+	if cookie.Path != "/" {
+		t.Errorf("Path = %q, want %q", cookie.Path, "/")
+	}
+	if !cookie.Secure {
+		t.Error("Secure = false, want true")
+	}
+	if !cookie.HttpOnly {
+		t.Error("HttpOnly = false, want true")
+	}
+	if cookie.SameSite != http.SameSiteStrictMode {
+		t.Errorf("SameSite = %v, want %v", cookie.SameSite, http.SameSiteStrictMode)
+	}
+	if cookie.Domain != "" {
+		t.Errorf("Domain = %q, want empty", cookie.Domain)
+	}
+}
+
+func TestHashSessionID_returns_raw_bytes(t *testing.T) {
+	t.Parallel()
+	hashed := admin.HashSessionID("test-id")
+	if len(hashed) != 32 {
+		t.Fatalf("HashSessionID returned %d bytes, want 32", len(hashed))
+	}
+	// Verify it is the SHA-256 of the input, not a hex string.
+	expected := sha256.Sum256([]byte("test-id"))
+	if string(hashed) != string(expected[:]) {
+		t.Fatal("HashSessionID did not return SHA-256 digest bytes")
 	}
 }
