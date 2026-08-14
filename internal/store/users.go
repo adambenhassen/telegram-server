@@ -79,14 +79,15 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 	return UserFromDB(db.UserByIDRow(u)), nil
 }
 
-// SignUpUsernameUser atomically creates a username-mode user and claims the
-// handle in the usernames table within a single transaction. It also provisions
-// update_state. Returns the new user.
+// SignUpUsernameUser atomically creates a username-mode user, claims the handle
+// in the usernames table, sets the denormalized users.username column, binds the
+// auth key, and provisions update_state — all in a single transaction. authKeyID
+// is the key to bind; it must already exist and be unbound (user_id IS NULL).
 //
-// Returns ErrUsernameOccupied when the handle is already taken — the unique
-// index on usernames enforces this, and the PK conflict is caught and returned
-// as ErrUsernameOccupied rather than an internal error.
-func (s *Store) SignUpUsernameUser(ctx context.Context, handle, firstName, lastName string) (User, error) {
+// Returns ErrUsernameOccupied when the handle is already taken. Returns
+// ErrAuthKeyNotFound when the auth key does not exist. Both roll back all
+// state so no partially-committed account or orphaned claim can persist.
+func (s *Store) SignUpUsernameUser(ctx context.Context, handle, firstName, lastName string, authKeyID int64) (User, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return User{}, fmt.Errorf("begin: %w", err)
@@ -118,6 +119,21 @@ func (s *Store) SignUpUsernameUser(ctx context.Context, handle, firstName, lastN
 			return User{}, ErrUsernameOccupied
 		}
 		return User{}, fmt.Errorf("claim username: %w", err)
+	}
+
+	// Update the denormalized users.username column.
+	if _, err := qtx.SetUsername(ctx, db.SetUsernameParams{ID: u.ID, Username: &xHandle}); err != nil {
+		return User{}, fmt.Errorf("set username: %w", err)
+	}
+
+	// Bind the auth key within the same transaction. The key must exist and be
+	// unbound; a missing or already-bound key rolls back the entire signup.
+	rows, err := qtx.BindAuthKeyUser(ctx, db.BindAuthKeyUserParams{ID: authKeyID, UserID: &u.ID})
+	if err != nil {
+		return User{}, fmt.Errorf("bind auth key: %w", err)
+	}
+	if rows == 0 {
+		return User{}, ErrAuthKeyNotFound
 	}
 
 	if err := tx.Commit(ctx); err != nil {

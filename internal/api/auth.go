@@ -80,6 +80,25 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	username = strings.ToLower(username)
 
+	// Reserved handles must never be claimed.
+	if reservedUsernames[username] {
+		return nil, errPhoneInvalid
+	}
+
+	// Per-IP rate limit: charged before any identifier-dependent work.
+	if err := h.checkAndChargeRateLimitIP(r, "sign_up_ip", h.rateLimitSignUpIP); err != nil {
+		return nil, err
+	}
+
+	// Validate display names: must be valid text with a reasonable length cap.
+	firstName, lastName := req.FirstName, req.LastName
+	if firstName == "" || !validText(firstName) || len(firstName) > 255 {
+		return nil, errFirstNameInvalid
+	}
+	if lastName != "" && (!validText(lastName) || len(lastName) > 255) {
+		return nil, errFirstNameInvalid
+	}
+
 	// Hash-only verification: same check as signIn's username path.
 	if err := h.store.CheckCodeHash(r.Ctx, username, req.PhoneCodeHash); err != nil {
 		rpc := verifyToRPC(err)
@@ -94,20 +113,18 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, rpc
 	}
 
-	// Create the user and atomically claim the username.
-	user, err := h.store.SignUpUsernameUser(r.Ctx, username, req.FirstName, req.LastName)
+	// Create the user, claim the username, and bind the auth key — all in one
+	// transaction. A failed bind rolls back the account and claim.
+	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
+	user, err := h.store.SignUpUsernameUser(r.Ctx, username, firstName, lastName, keyID)
 	if err != nil {
 		if errors.Is(err, store.ErrUsernameOccupied) {
 			return nil, errUsernameOccupied
 		}
+		if errors.Is(err, store.ErrAuthKeyNotFound) {
+			return nil, errAuthKeyUnreg
+		}
 		h.log.Error("sign up: create user", "err", err)
-		return nil, errInternal
-	}
-
-	// Bind the auth key to the new user with provisional=true.
-	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
-	if err := h.store.BindAuthKeyUser(r.Ctx, keyID, user.ID); err != nil {
-		h.log.Error("sign up: bind auth key", "user_id", user.ID, "err", err)
 		return nil, errInternal
 	}
 

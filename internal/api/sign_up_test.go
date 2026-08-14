@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
@@ -154,6 +155,21 @@ func TestSignUpSuccess(t *testing.T) {
 	after := countUsers(t, dsn)
 	if after != before+1 {
 		t.Errorf("users table grew from %d to %d, want +1", before, after)
+	}
+
+	// Assert the auth key is bound and provisional.
+	key, ok, err := s.AuthKeyByID(ctx, int64(0x1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("auth key not found")
+	}
+	if key.UserID != user.ID {
+		t.Errorf("key user_id = %d, want %d", key.UserID, user.ID)
+	}
+	if !key.Provisional {
+		t.Error("key.Provisional = false, want true")
 	}
 }
 
@@ -377,4 +393,119 @@ func TestSignUpWithLastName(t *testing.T) {
 	if u.LastName != "Smith" {
 		t.Errorf("last name = %q, want Smith", u.LastName)
 	}
+}
+
+func TestSignUpReservedHandle(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+
+	addr := netip.MustParseAddr("10.0.0.10")
+	cfg := store.RateLimitConfig{}
+
+	// Reserved handles like "telegram" must be rejected.
+	_, err := api.SignUpForTest(s, [8]byte{1}, addr, cfg, config.RegistrationOpen, &tg.AuthSignUpRequest{
+		PhoneNumber:   "telegram",
+		PhoneCodeHash: "any-hash",
+		FirstName:     "Admin",
+	})
+	if !isPhoneNumberInvalid(err) {
+		t.Fatalf("signUp with reserved handle: expected PHONE_NUMBER_INVALID, got %v", err)
+	}
+
+	// "admin" is also reserved.
+	_, err = api.SignUpForTest(s, [8]byte{1}, addr, cfg, config.RegistrationOpen, &tg.AuthSignUpRequest{
+		PhoneNumber:   "admin",
+		PhoneCodeHash: "any-hash",
+		FirstName:     "Admin",
+	})
+	if !isPhoneNumberInvalid(err) {
+		t.Fatalf("signUp with reserved handle 'admin': expected PHONE_NUMBER_INVALID, got %v", err)
+	}
+}
+
+func TestSignUpRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	// Issue a code for the username.
+	hash, _, err := s.IssueCodeForUsername(ctx, "ratelt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Save the auth key.
+	if err := s.SaveAuthKey(ctx, int64(0x1), make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := netip.MustParseAddr("10.0.0.11")
+	// Limit: 1 call per hour.
+	cfg := store.RateLimitConfig{Limit: 1, Window: time.Hour}
+
+	// First call should succeed.
+	_, err = api.SignUpForTest(s, [8]byte{1}, addr, cfg, config.RegistrationOpen, &tg.AuthSignUpRequest{
+		PhoneNumber:   "ratelt",
+		PhoneCodeHash: hash,
+		FirstName:     "Rate",
+	})
+	if err != nil {
+		t.Fatalf("first signUp: expected success, got %v", err)
+	}
+
+	// Second call should be rate-limited.
+	_, err = api.SignUpForTest(s, [8]byte{1}, addr, cfg, config.RegistrationOpen, &tg.AuthSignUpRequest{
+		PhoneNumber:   "ratelt2",
+		PhoneCodeHash: hash,
+		FirstName:     "Rate",
+	})
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) || rpc.Code != 420 {
+		t.Fatalf("second signUp: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+func TestSignUpInvalidDisplayName(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+
+	addr := netip.MustParseAddr("10.0.0.12")
+	cfg := store.RateLimitConfig{}
+
+	// Empty first name should be rejected.
+	_, err := api.SignUpForTest(s, [8]byte{1}, addr, cfg, config.RegistrationOpen, &tg.AuthSignUpRequest{
+		PhoneNumber:   "validn",
+		PhoneCodeHash: "any-hash",
+		FirstName:     "",
+	})
+	if !isFirstNameInvalid(err) {
+		t.Fatalf("signUp with empty first name: expected FIRSTNAME_INVALID, got %v", err)
+	}
+
+	// NUL byte in first name should be rejected.
+	_, err = api.SignUpForTest(s, [8]byte{1}, addr, cfg, config.RegistrationOpen, &tg.AuthSignUpRequest{
+		PhoneNumber:   "validn",
+		PhoneCodeHash: "any-hash",
+		FirstName:     "A\x00lice",
+	})
+	if !isFirstNameInvalid(err) {
+		t.Fatalf("signUp with NUL in first name: expected FIRSTNAME_INVALID, got %v", err)
+	}
+
+	// NUL byte in last name should be rejected.
+	_, err = api.SignUpForTest(s, [8]byte{1}, addr, cfg, config.RegistrationOpen, &tg.AuthSignUpRequest{
+		PhoneNumber:   "validn",
+		PhoneCodeHash: "any-hash",
+		FirstName:     "Alice",
+		LastName:      "S\x00mith",
+	})
+	if !isFirstNameInvalid(err) {
+		t.Fatalf("signUp with NUL in last name: expected FIRSTNAME_INVALID, got %v", err)
+	}
+}
+
+// isFirstNameInvalid reports whether err is a 400 FIRSTNAME_INVALID error.
+func isFirstNameInvalid(err error) bool {
+	var rpc *tgerr.Error
+	return errors.As(err, &rpc) && rpc.Code == 400 && rpc.Message == "FIRSTNAME_INVALID"
 }
