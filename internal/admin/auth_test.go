@@ -320,29 +320,17 @@ func TestLogoutPOST_with_csrf_clears_session(t *testing.T) {
 		t.Fatal("no session cookie after login")
 	}
 
-	// GET /admin/login again to get a fresh CSRF token for logout.
-	req = httptest.NewRequestWithContext(ctx, http.MethodGet, "/admin/login", nil)
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	body = rec.Body.String()
-	csrfStart = strings.Index(body, `name="csrf_token" value="`)
-	csrfStart += len(`name="csrf_token" value="`)
-	csrfEnd = strings.Index(body[csrfStart:], `"`)
-	csrfToken = body[csrfStart : csrfStart+csrfEnd]
-
-	csrfCookie = ""
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == "__Host-csrf-token" {
-			csrfCookie = c.Value
-		}
+	// Derive the logout CSRF token from the session cookie, as the dashboard
+	// does. No CSRF cookie is involved for authenticated forms.
+	logoutToken, err := admin.SessionCSRFToken(tokenHash, sessionCookie)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// POST /admin/logout with CSRF and session cookie.
-	form = strings.NewReader("csrf_token=" + csrfToken)
+	form = strings.NewReader("csrf_token=" + logoutToken)
 	req = httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/logout", form)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: "__Host-csrf-token", Value: csrfCookie})       //nolint:gosec // G124: test cookie
 	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -356,7 +344,7 @@ func TestLogoutPOST_with_csrf_clears_session(t *testing.T) {
 
 	// Verify session is deleted from DB.
 	sessionHash := sha256.Sum256([]byte(sessionCookie))
-	_, err := st.GetAdminSession(context.Background(), sessionHash[:])
+	_, err = st.GetAdminSession(context.Background(), sessionHash[:])
 	if err == nil {
 		t.Error("session should be deleted from DB after logout")
 	}
@@ -378,6 +366,169 @@ func TestLogoutPOST_missing_csrf_401(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rec.Code)
 	}
+}
+
+// --- Session-bound CSRF token tests ---
+
+// TestLogoutPOST_second_tab_same_token reproduces MAIN-297: two tabs sharing
+// the same session cookie must both carry a valid logout token. The token is
+// derived from the session, so it does not depend on any cookie the dashboard
+// may have re-issued.
+func TestLogoutPOST_second_tab_same_token(t *testing.T) {
+	t.Parallel()
+	st := newAuthTestStore(t)
+	tokenHash := sha256hex([]byte("correct-token"))
+
+	h := newTestRouter(t, st, tokenHash)
+
+	sessionCookie := loginAndGetSession(t, h, "correct-token")
+
+	// Tab 1 renders the dashboard; capture its token.
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/admin/dashboard", nil)
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard: expected 200, got %d", rec.Code)
+	}
+	tab1Token := extractCSRFToken(t, rec.Body.String())
+
+	// Tab 2 renders the dashboard again (this is what used to re-issue the
+	// CSRF cookie and invalidate tab 1's form).
+	req = httptest.NewRequestWithContext(ctx, http.MethodGet, "/admin/dashboard", nil)
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard: expected 200, got %d", rec.Code)
+	}
+	tab2Token := extractCSRFToken(t, rec.Body.String())
+
+	if tab1Token != tab2Token {
+		t.Fatal("tokens differ between tabs; logout from tab 1 would 401")
+	}
+
+	// Logout using tab 1's token after tab 2 rendered.
+	form := strings.NewReader("csrf_token=" + tab1Token)
+	req = httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/logout", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("logout: expected 302, got %d", rec.Code)
+	}
+}
+
+// TestLogoutPOST_wrong_token_401 verifies a token not derived from this
+// session (e.g. the pre-auth login CSRF token) is rejected.
+func TestLogoutPOST_wrong_token_401(t *testing.T) {
+	t.Parallel()
+	st := newAuthTestStore(t)
+	tokenHash := sha256hex([]byte("correct-token"))
+
+	h := newTestRouter(t, st, tokenHash)
+
+	sessionCookie := loginAndGetSession(t, h, "correct-token")
+
+	form := strings.NewReader("csrf_token=not-derived-from-session")
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/logout", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+// TestLogoutPOST_body_size_limit verifies the body cap is enforced before
+// auth: an oversized body is rejected with 413 even with a valid session.
+func TestLogoutPOST_body_size_limit(t *testing.T) {
+	t.Parallel()
+	st := newAuthTestStore(t)
+	tokenHash := sha256hex([]byte("correct-token"))
+
+	h := newTestRouter(t, st, tokenHash)
+
+	sessionCookie := loginAndGetSession(t, h, "correct-token")
+
+	// A single form value whose length field alone (64 bits + delimiter,
+	// ~9 bytes) exceeds the 4 KiB cap. MaxBytesReader rejects it while the
+	// body is being parsed, before the token check runs.
+	body := "csrf_token=" + strings.Repeat("a", 4096)
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/logout", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for oversized body, got %d", rec.Code)
+	}
+}
+
+// TestCSRFSessionToken_deterministic_and_rotating pins the derivation:
+// identical for the same inputs, different for a different session, and
+// invalidated when the token hash changes.
+func TestCSRFSessionToken_deterministic_and_rotating(t *testing.T) {
+	t.Parallel()
+	hashA := sha256hex([]byte("token-a"))
+	hashB := sha256hex([]byte("token-b"))
+
+	tA1, err := admin.SessionCSRFToken(hashA, "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tA2, err := admin.SessionCSRFToken(hashA, "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tA1 != tA2 {
+		t.Error("token derivation is not deterministic")
+	}
+
+	tB, err := admin.SessionCSRFToken(hashA, "session-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tA1 == tB {
+		t.Error("different sessions must yield different tokens")
+	}
+
+	tArot, err := admin.SessionCSRFToken(hashB, "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tA1 == tArot {
+		t.Error("rotating the token hash must invalidate existing tokens")
+	}
+
+	// Token is a 32-byte hex value.
+	if len(tA1) != 64 {
+		t.Errorf("token length = %d, want 64 hex chars", len(tA1))
+	}
+
+	if _, err := admin.SessionCSRFToken("zz", "session-1"); err == nil {
+		t.Error("expected error for invalid token hash")
+	}
+}
+
+// extractCSRFToken pulls the csrf_token hidden field value out of an HTML page.
+func extractCSRFToken(t *testing.T, body string) string {
+	t.Helper()
+	start := strings.Index(body, `name="csrf_token" value="`)
+	if start == -1 {
+		t.Fatal("could not find csrf_token in response body")
+	}
+	start += len(`name="csrf_token" value="`)
+	end := strings.Index(body[start:], `"`)
+	if end == -1 {
+		t.Fatal("could not find end of csrf_token value")
+	}
+	return body[start : start+end]
 }
 
 // --- Security headers tests ---
