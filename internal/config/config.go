@@ -1058,15 +1058,24 @@ func validateBootstrap(cfg Config) error {
 
 // BootstrapPasswordBytes returns the password for the bootstrap account.
 // It reads from the file path when BootstrapPasswordFile is set, otherwise
-// returns the in-memory password. The caller must zero the returned buffer
-// after use.
+// returns the in-memory password. Both paths trim whitespace. Rejects
+// passwords shorter than 12 bytes.
 func (c Config) BootstrapPasswordBytes() ([]byte, error) {
+	var password []byte
 	if c.BootstrapPasswordFile != "" {
 		data, err := os.ReadFile(c.BootstrapPasswordFile) // #nosec G304,G703 -- operator-configured path.
 		if err != nil {
 			return nil, fmt.Errorf("read bootstrap password file %s: %w", c.BootstrapPasswordFile, err)
 		}
-		return bytes.TrimSpace(data), nil
+		password = bytes.TrimSpace(data)
+	} else {
+		password = []byte(strings.TrimSpace(c.BootstrapPassword))
 	}
-	return []byte(c.BootstrapPassword), nil
+	if len(password) < 12 {
+		if c.BootstrapPasswordFile != "" {
+			return nil, fmt.Errorf("TG_BOOTSTRAP_PASSWORD_FILE: password must be at least 12 bytes (got %d)", len(password))
+		}
+		return nil, fmt.Errorf("TG_BOOTSTRAP_PASSWORD: password must be at least 12 bytes (got %d)", len(password))
+	}
+	return password, nil
 }

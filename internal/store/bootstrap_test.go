@@ -2,12 +2,8 @@ package store_test
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
-	"math/big"
 	"testing"
-
-	"github.com/gotd/td/crypto/srp"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -66,24 +62,12 @@ func TestBootstrapAccount_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t, pgtest.DSN(t))
 
-	// Same salt and password means same verifier → same computed hash
-	// However, NewHash appends random bytes to salt1 internally, so the
-	// verifier will differ. We need to compute the verifier ourselves.
 	password := []byte("test-password")
-	salt1 := make([]byte, 32)
-	rand.Read(salt1)
-	salt2 := make([]byte, 32)
-	rand.Read(salt2)
-
-	verifier := computeVerifier(t, password, salt1, salt2)
-
 	params := store.BootstrapParams{
 		Handle:    "operator",
 		FirstName: "Operator",
 		LastName:  "",
-		Salt1:     salt1,
-		Salt2:     salt2,
-		Verifier:  verifier,
+		Password:  password,
 	}
 
 	// First call creates.
@@ -95,7 +79,7 @@ func TestBootstrapAccount_Idempotent(t *testing.T) {
 		t.Error("expected Created=true for first call")
 	}
 
-	// Second call with same params is idempotent.
+	// Second call with same password is idempotent.
 	result2, err := s.BootstrapAccount(ctx, params)
 	if err != nil {
 		t.Fatalf("second BootstrapAccount: %v", err)
@@ -156,7 +140,7 @@ func TestBootstrapAccount_SquattedByPhoneModeUser(t *testing.T) {
 	}
 }
 
-func TestBootstrapAccount_SquattedWrongVerifier(t *testing.T) {
+func TestBootstrapAccount_SquattedWrongPassword(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openStore(t, pgtest.DSN(t))
@@ -168,20 +152,12 @@ func TestBootstrapAccount_SquattedWrongVerifier(t *testing.T) {
 		t.Fatalf("first BootstrapAccount: %v", err)
 	}
 
-	// Try bootstrap with different password → different verifier.
-	diffSalt1 := make([]byte, 32)
-	rand.Read(diffSalt1)
-	diffSalt2 := make([]byte, 32)
-	rand.Read(diffSalt2)
-	diffVerifier := computeVerifier(t, []byte("different-password"), diffSalt1, diffSalt2)
-
+	// Try bootstrap with different password → verifier mismatch.
 	diffParams := store.BootstrapParams{
 		Handle:    params.Handle,
 		FirstName: params.FirstName,
 		LastName:  params.LastName,
-		Salt1:     diffSalt1,
-		Salt2:     diffSalt2,
-		Verifier:  diffVerifier,
+		Password:  []byte("different-password"),
 	}
 
 	_, err = s.BootstrapAccount(ctx, diffParams)
@@ -251,59 +227,15 @@ func TestValidateBootstrapUsername_Reserved(t *testing.T) {
 	}
 }
 
-// computeVerifier computes the SRP verifier v = g^x mod p for the given password and salts.
-func computeVerifier(tb testing.TB, password, salt1, salt2 []byte) []byte {
-	tb.Helper()
-	p := srpPBytes()
-	alg := srp.Input{
-		Salt1: salt1,
-		Salt2: salt2,
-		G:     3,
-		P:     p,
-	}
-	srpClient := srp.NewSRP(rand.Reader)
-	verifier, _, err := srpClient.NewHash(password, alg)
-	if err != nil {
-		tb.Fatalf("NewHash: %v", err)
-	}
-	return verifier
-}
-
-// bootstrapParams returns a BootstrapParams with a random password (so each
-// test gets an independent credential).
+// bootstrapParams returns a BootstrapParams with a test password.
 func bootstrapParams(tb testing.TB) store.BootstrapParams {
 	tb.Helper()
-	password := []byte("test-password")
-	salt1 := make([]byte, 32)
-	rand.Read(salt1)
-	salt2 := make([]byte, 32)
-	rand.Read(salt2)
-	verifier := computeVerifier(tb, password, salt1, salt2)
 	return store.BootstrapParams{
 		Handle:    "operator",
 		FirstName: "Operator",
 		LastName:  "",
-		Salt1:     salt1,
-		Salt2:     salt2,
-		Verifier:  verifier,
+		Password:  []byte("test-password"),
 	}
-}
-
-// srpPBytes returns the canonical 256-byte padded Telegram SRP prime.
-func srpPBytes() []byte {
-	hex := "" +
-		"C71CAEB9C6B1C9048E6C522F70F13F73980D40238E3E21C14934D037563D930F" +
-		"48198A0AA7C14058229493D22530F4DBFA336F6E0AC925139543AED44CCE7C37" +
-		"20FD51F69458705AC68CD4FE6B6B13ABDC9746512969328454F18FAF8C595F64" +
-		"2477FE96BB2A941D5BCD1D4AC8CC49880708FA9B378E3C4F3A9060BEE67CF9A4" +
-		"A4A695811051907E162753B56B0F6B410DBA74D8A84B2A14B3144E0EF1284754" +
-		"FD17ED950D5965B4B9DD46582DB1178D169C6BC465B0D6FF9CA3928FEF5B9AE4" +
-		"E418FC15E83EBEA0F87FA9FF5EED70050DED2849F47BF959D956850CE929851F" +
-		"0D8115F635B105EE2E4E15D04B2454BF6F4FADF034B10403119CD8E3B92FCC5B"
-	b, _ := new(big.Int).SetString(hex, 16)
-	out := make([]byte, 256)
-	copy(out[256-len(b.Bytes()):], b.Bytes())
-	return out
 }
 
 func openStore(tb testing.TB, dsn string) *store.Store {

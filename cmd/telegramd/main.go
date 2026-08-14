@@ -2,12 +2,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -18,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gotd/td/crypto/srp"
 	"github.com/gotd/td/exchange"
 
 	"github.com/adambenhassen/telegram-server/internal/admin"
@@ -381,8 +377,8 @@ func sweepExpiredAdminSessions(ctx context.Context, st *store.Store, log *slog.L
 }
 
 // bootstrapAccount creates the first username-mode operator account at startup.
-// It validates the username, computes the SRP verifier using gotd's crypto/srp
-// package, and writes the user + username + verifier in a single transaction.
+// It validates the username, reads the password, and delegates to the store
+// for the single-transaction bootstrap.
 //
 // The password buffer is zeroed after use.
 func bootstrapAccount(ctx context.Context, st *store.Store, cfg config.Config, log *slog.Logger) error {
@@ -397,7 +393,7 @@ func bootstrapAccount(ctx context.Context, st *store.Store, cfg config.Config, l
 	if err != nil {
 		return err
 	}
-	defer zeroBytes(password)
+	defer clear(password)
 
 	// Warn about credential exposure.
 	if cfg.BootstrapPasswordFile != "" {
@@ -406,37 +402,12 @@ func bootstrapAccount(ctx context.Context, st *store.Store, cfg config.Config, l
 		log.Warn("bootstrap password is in process environment", "risk", "/proc/self/environ retains the value for the life of the process; orchestrator manifests, docker inspect, and crash dumps can expose it")
 	}
 
-	// Generate KDF salts.
-	salt1 := make([]byte, 32)
-	if _, err := rand.Read(salt1); err != nil {
-		return fmt.Errorf("generate salt1: %w", err)
-	}
-	salt2 := make([]byte, 32)
-	if _, err := rand.Read(salt2); err != nil {
-		return fmt.Errorf("generate salt2: %w", err)
-	}
-
-	// Compute the SRP verifier using gotd's crypto/srp package.
-	srpClient := srp.NewSRP(rand.Reader)
-	algo := srp.Input{
-		Salt1: salt1,
-		Salt2: salt2,
-		G:     3,
-		P:     srpPBytes(),
-	}
-	verifier, _, err := srpClient.NewHash(password, algo)
-	if err != nil {
-		return fmt.Errorf("compute verifier: %w", err)
-	}
-
 	// Call the store's single-transaction bootstrap.
 	result, err := st.BootstrapAccount(ctx, store.BootstrapParams{
 		Handle:    handle,
 		FirstName: "Operator",
 		LastName:  "",
-		Salt1:     salt1,
-		Salt2:     salt2,
-		Verifier:  verifier,
+		Password:  password,
 	})
 	if err != nil {
 		return err
@@ -450,27 +421,4 @@ func bootstrapAccount(ctx context.Context, st *store.Store, cfg config.Config, l
 	log.Info("bootstrap does not rotate passwords; to change the credential use the M16 dashboard or direct DB access")
 
 	return nil
-}
-
-// zeroBytes overwrites b with zeros. It is used to clear sensitive buffers.
-func zeroBytes(b []byte) {
-	bytes.ReplaceAll(b, b, []byte{})
-}
-
-// srpPBytes returns the canonical 256-byte padded Telegram SRP prime.
-// It is the same value used by the server-side SRP implementation.
-func srpPBytes() []byte {
-	hex := "" +
-		"C71CAEB9C6B1C9048E6C522F70F13F73980D40238E3E21C14934D037563D930F" +
-		"48198A0AA7C14058229493D22530F4DBFA336F6E0AC925139543AED44CCE7C37" +
-		"20FD51F69458705AC68CD4FE6B6B13ABDC9746512969328454F18FAF8C595F64" +
-		"2477FE96BB2A941D5BCD1D4AC8CC49880708FA9B378E3C4F3A9060BEE67CF9A4" +
-		"A4A695811051907E162753B56B0F6B410DBA74D8A84B2A14B3144E0EF1284754" +
-		"FD17ED950D5965B4B9DD46582DB1178D169C6BC465B0D6FF9CA3928FEF5B9AE4" +
-		"E418FC15E83EBEA0F87FA9FF5EED70050DED2849F47BF959D956850CE929851F" +
-		"0D8115F635B105EE2E4E15D04B2454BF6F4FADF034B10403119CD8E3B92FCC5B"
-	b, _ := new(big.Int).SetString(hex, 16)
-	out := make([]byte, 256)
-	copy(out[256-len(b.Bytes()):], b.Bytes())
-	return out
 }
