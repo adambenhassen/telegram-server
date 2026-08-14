@@ -9,6 +9,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -119,6 +120,7 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 
 	snap, err := st.Metrics(ctx)
 	if err != nil {
+		slog.Error("admin metrics refresh", "err", err)
 		return
 	}
 

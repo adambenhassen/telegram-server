@@ -737,12 +737,14 @@ tr:last-child td { border-bottom: none; }
     }
   }
 
-  // Show/hide banners
+  // Show/hide banners. Hides all four banners, then unhides el (if non-null).
+  // bannerEmpty is managed separately by patchEmptyBanner on successful fetch;
+  // it must be hidden here too so a 401 or disconnect doesn't show both.
   function showBanner(el) {
     [bannerEmpty, bannerStale, bannerDc, bannerOut].forEach(function(b) {
-      if (b !== bannerEmpty) b.classList.add('hidden');
+      b.classList.add('hidden');
     });
-    if (el && el !== bannerEmpty) el.classList.remove('hidden');
+    if (el) el.classList.remove('hidden');
   }
 
   function updateBanners(age) {
