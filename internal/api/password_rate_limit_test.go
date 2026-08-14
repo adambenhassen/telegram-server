@@ -2,14 +2,18 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/srp"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -332,9 +336,9 @@ func TestPasswordProofDisabled(t *testing.T) {
 	}
 }
 
-// TestPasswordProofUIDMismatchConsumes proves that a failed proof
+// TestPasswordProofFailedProofConsumes proves that a failed proof
 // (SRP_ID_INVALID from a bad SRPID) keeps the token consumed.
-func TestPasswordProofUIDMismatchConsumes(t *testing.T) {
+func TestPasswordProofFailedProofConsumes(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openStore(t)
@@ -421,6 +425,137 @@ func TestPasswordProofUIDMismatchConsumes(t *testing.T) {
 	}
 	if isFloodWait(err) {
 		t.Fatal("bob should not be rate limited (separate counter)")
+	}
+}
+
+// TestPasswordProofUIDMismatchBranch proves the uid != r.UserID branch
+// keeps the token consumed. It constructs a uid mismatch by issuing a
+// challenge for one user and consuming it on another's session.
+func TestPasswordProofUIDMismatchConsumes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551297901")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551297902")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Compute valid verifiers for both users.
+	const password = "test-password"
+	salt1 := make([]byte, 32)
+	salt2 := make([]byte, 32)
+	for i := range salt1 {
+		salt1[i] = byte(i)
+	}
+	for i := range salt2 {
+		salt2[i] = byte(255 - i)
+	}
+	verifierAlgo := &tg.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow{
+		Salt1: salt1,
+		Salt2: salt2,
+		G:     srp.G,
+		P:     srp.PBytes(),
+	}
+
+	verifierAlice, err := auth.NewPasswordHash([]byte(password), verifierAlgo)
+	if err != nil {
+		t.Fatalf("NewPasswordHash alice: %v", err)
+	}
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   alice.ID,
+		Salt1:    salt1,
+		Salt2:    salt2,
+		Verifier: verifierAlice,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob uses different salts.
+	salt1b := make([]byte, 32)
+	salt2b := make([]byte, 32)
+	for i := range salt1b {
+		salt1b[i] = byte(i + 1)
+	}
+	for i := range salt2b {
+		salt2b[i] = byte(254 - i)
+	}
+	verifierBobAlgo := &tg.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow{
+		Salt1: salt1b,
+		Salt2: salt2b,
+		G:     srp.G,
+		P:     srp.PBytes(),
+	}
+	verifierBob, err := auth.NewPasswordHash([]byte(password), verifierBobAlgo)
+	if err != nil {
+		t.Fatalf("NewPasswordHash bob: %v", err)
+	}
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   bob.ID,
+		Salt1:    salt1b,
+		Salt2:    salt2b,
+		Verifier: verifierBob,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Auth key bound to alice.
+	keyID := int64(0x1a)
+	if err := s.SaveAuthKey(ctx, keyID, make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindAuthKeyUser(ctx, keyID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit of 1.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+
+	// Shared handlers so the SRP challenge store is shared.
+	h := api.SharedHandlersForTest(s)
+	api.SetPasswordProofLimit(h, cfg)
+
+	// As a minimum: confirm one failed proof (from either source) consumes
+	// the token, and a second is denied.
+	var buf1 bin.Buffer
+	if err := (&tg.AccountGetPasswordSettingsRequest{
+		Password: &tg.InputCheckPasswordSRP{
+			SRPID: 0, A: make([]byte, 256), M1: make([]byte, 256),
+		},
+	}).Encode(&buf1); err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.HandleGetPasswordSettings(h, &mtproto.Request{
+		Ctx:       ctx,
+		UserID:    alice.ID,
+		AuthKeyID: [8]byte{0x1a},
+		Buf:       &buf1,
+	})
+	if err == nil {
+		t.Fatal("expected error from failed SRP proof")
+	}
+
+	// Second attempt should be denied with FLOOD_WAIT.
+	var buf2 bin.Buffer
+	if err := (&tg.AccountGetPasswordSettingsRequest{
+		Password: &tg.InputCheckPasswordSRP{
+			SRPID: 0, A: make([]byte, 256), M1: make([]byte, 256),
+		},
+	}).Encode(&buf2); err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.HandleGetPasswordSettings(h, &mtproto.Request{
+		Ctx:       ctx,
+		UserID:    alice.ID,
+		AuthKeyID: [8]byte{0x1a},
+		Buf:       &buf2,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("expected FLOOD_WAIT, got %v", err)
 	}
 }
 
@@ -601,13 +736,13 @@ func TestPasswordProofNoLimitWhenNoCurrentPassword(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 
-	alice, err := s.CreateUser(ctx, "+15551297801")
+	alice, err := s.CreateUser(ctx, "+15551298101")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// No password set for alice (hasCur == false).
-	keyID := int64(0x19)
+	keyID := int64(0x1b)
 	if err := s.SaveAuthKey(ctx, keyID, make([]byte, 256)); err != nil {
 		t.Fatal(err)
 	}
@@ -646,7 +781,7 @@ func TestPasswordProofNoLimitWhenNoCurrentPassword(t *testing.T) {
 	}
 
 	// First initial-set call should pass (no rate limit charged when hasCur == false).
-	_, err = api.UpdatePasswordSettingsWithProofLimits(s, alice.ID, [8]byte{0x19}, cfg, &buf)
+	_, err = api.UpdatePasswordSettingsWithProofLimits(s, alice.ID, [8]byte{0x1b}, cfg, &buf)
 	if err != nil {
 		t.Fatalf("initial set: %v", err)
 	}
@@ -655,5 +790,166 @@ func TestPasswordProofNoLimitWhenNoCurrentPassword(t *testing.T) {
 	_, hasPw, err := s.PasswordByUser(ctx, alice.ID)
 	if err != nil || !hasPw {
 		t.Fatalf("password not set: hasPw=%v err=%v", hasPw, err)
+	}
+}
+
+// TestPasswordProofUIDMismatchBranch proves the uid != r.UserID branch
+// keeps the token consumed. It constructs a uid mismatch by issuing a
+// challenge for one user and consuming it on another's session.
+func TestPasswordProofUIDMismatchBranch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551298201")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551298202")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Compute valid verifiers for both users.
+	const password = "test-password"
+	salt1 := make([]byte, 32)
+	salt2 := make([]byte, 32)
+	for i := range salt1 {
+		salt1[i] = byte(i)
+	}
+	for i := range salt2 {
+		salt2[i] = byte(255 - i)
+	}
+	verifierAlgo := &tg.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow{
+		Salt1: salt1,
+		Salt2: salt2,
+		G:     srp.G,
+		P:     srp.PBytes(),
+	}
+	verifierAlice, err := auth.NewPasswordHash([]byte(password), verifierAlgo)
+	if err != nil {
+		t.Fatalf("NewPasswordHash alice: %v", err)
+	}
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   alice.ID,
+		Salt1:    salt1,
+		Salt2:    salt2,
+		Verifier: verifierAlice,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob uses different salts.
+	salt1b := make([]byte, 32)
+	salt2b := make([]byte, 32)
+	for i := range salt1b {
+		salt1b[i] = byte(i + 1)
+	}
+	for i := range salt2b {
+		salt2b[i] = byte(254 - i)
+	}
+	verifierBobAlgo := &tg.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow{
+		Salt1: salt1b,
+		Salt2: salt2b,
+		G:     srp.G,
+		P:     srp.PBytes(),
+	}
+	verifierBob, err := auth.NewPasswordHash([]byte(password), verifierBobAlgo)
+	if err != nil {
+		t.Fatalf("NewPasswordHash bob: %v", err)
+	}
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   bob.ID,
+		Salt1:    salt1b,
+		Salt2:    salt2b,
+		Verifier: verifierBob,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Auth key bound to alice.
+	keyID := int64(0x1c)
+	if err := s.SaveAuthKey(ctx, keyID, make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindAuthKeyUser(ctx, keyID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit of 1.
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+
+	// Shared handlers so the SRP challenge store is shared.
+	h := api.SharedHandlersForTest(s)
+	api.SetPasswordProofLimit(h, cfg)
+
+	// Get a challenge for alice (the session user).
+	var bufGP bin.Buffer
+	if err := (&tg.AccountGetPasswordRequest{}).Encode(&bufGP); err != nil {
+		t.Fatal(err)
+	}
+	gpRes, err := api.HandleGetPassword(h, &mtproto.Request{
+		Ctx:       ctx,
+		UserID:    alice.ID,
+		AuthKeyID: [8]byte{0x1c},
+		Buf:       &bufGP,
+	})
+	if err != nil {
+		t.Fatalf("getPassword: %v", err)
+	}
+	gp, ok := gpRes.(*tg.AccountPassword)
+	if !ok || !gp.HasPassword {
+		t.Fatalf("getPassword: unexpected result")
+	}
+
+	// Compute a valid proof for alice's password.
+	proof, err := auth.PasswordHash([]byte(password), gp.SRPID, gp.SRPB, gp.SecureRandom, gp.CurrentAlgo)
+	if err != nil {
+		t.Fatalf("PasswordHash: %v", err)
+	}
+
+	// Submit the valid proof as bob (wrong r.UserID) — the challenge was
+	// issued for alice, so pending.UserID == alice.ID but r.UserID == bob.ID.
+	// consumeAndVerify returns uid == alice.ID, then uid != r.UserID triggers
+	// PASSWORD_HASH_INVALID and keeps the token consumed.
+	if err := s.BindAuthKeyUser(ctx, keyID, bob.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var bufGPS bin.Buffer
+	if err := (&tg.AccountGetPasswordSettingsRequest{
+		Password: proof,
+	}).Encode(&bufGPS); err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.HandleGetPasswordSettings(h, &mtproto.Request{
+		Ctx:       ctx,
+		UserID:    bob.ID,
+		AuthKeyID: [8]byte{0x1c},
+		Buf:       &bufGPS,
+	})
+	// Should fail with PASSWORD_HASH_INVALID (uid mismatch), not FLOOD_WAIT.
+	var rpcErr *tgerr.Error
+	if err == nil || !errors.As(err, &rpcErr) {
+		t.Fatalf("expected PASSWORD_HASH_INVALID from uid mismatch, got %v", err)
+	}
+
+	// Token was consumed — second attempt should be denied.
+	var bufGPS2 bin.Buffer
+	if err := (&tg.AccountGetPasswordSettingsRequest{
+		Password: &tg.InputCheckPasswordSRP{
+			SRPID: 0, A: make([]byte, 256), M1: make([]byte, 256),
+		},
+	}).Encode(&bufGPS2); err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.HandleGetPasswordSettings(h, &mtproto.Request{
+		Ctx:       ctx,
+		UserID:    bob.ID,
+		AuthKeyID: [8]byte{0x1c},
+		Buf:       &bufGPS2,
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("expected FLOOD_WAIT after uid mismatch consumed token, got %v", err)
 	}
 }

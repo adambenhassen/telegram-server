@@ -918,3 +918,26 @@ func GetPasswordWithAccountLimits(s *store.Store, userID int64, rateLimit store.
 	h.rateLimitGetPassword = rateLimit
 	return h.handleGetPassword(req)
 }
+
+// SharedHandlersForTest builds a single *handlers with shared SRP challenge
+// store, so a challenge issued by handleGetPassword can be consumed by a
+// subsequent handleGetPasswordSettings or handleUpdatePasswordSettings call.
+// The returned handlers has no rate limits enabled by default.
+func SharedHandlersForTest(s *store.Store) *handlers {
+	return testHandlers(s)
+}
+
+// SetPasswordProofLimit sets the password_proof rate limit on a shared handler.
+func SetPasswordProofLimit(h *handlers, cfg store.RateLimitConfig) {
+	h.rateLimitPasswordProof = cfg
+}
+
+// HandleGetPassword invokes handleGetPassword on the given handler.
+func HandleGetPassword(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
+	return h.handleGetPassword(req)
+}
+
+// HandleGetPasswordSettings invokes handleGetPasswordSettings on the given handler.
+func HandleGetPasswordSettings(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
+	return h.handleGetPasswordSettings(req)
+}
