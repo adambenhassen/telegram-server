@@ -150,7 +150,8 @@ func signUpUsername(ctx context.Context, api *tg.Client, username, codeHash, fir
 }
 
 // checkPasswordUsername performs the full SRP password check: fetches password
-// settings, computes the SRP proof, and calls auth.checkPassword.
+// settings, computes the SRP proof, and calls auth.checkPassword. Asserts the
+// returned value is *tg.AuthAuthorization.
 func checkPasswordUsername(ctx context.Context, api *tg.Client, password string) error {
 	pwd, err := api.AccountGetPassword(ctx)
 	if err != nil {
@@ -160,8 +161,14 @@ func checkPasswordUsername(ctx context.Context, api *tg.Client, password string)
 	if err != nil {
 		return err
 	}
-	_, err = api.AuthCheckPassword(ctx, proof)
-	return err
+	resp, err := api.AuthCheckPassword(ctx, proof)
+	if err != nil {
+		return err
+	}
+	if _, ok := resp.(*tg.AuthAuthorization); !ok {
+		return fmt.Errorf("checkPassword: unexpected response type %T, want *tg.AuthAuthorization", resp)
+	}
+	return nil
 }
 
 // isSignUpRequired checks if the error is auth.authorizationSignUpRequired.
@@ -911,6 +918,14 @@ func TestCheckPasswordBruteForceAccount(t *testing.T) {
 				if !isSessionPasswordNeeded(err) {
 					return fmt.Errorf("signIn: expected SESSION_PASSWORD_NEEDED, got %w", err)
 				}
+				// Assert pending key is refused authorized RPCs.
+				_, err = api.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUser{}})
+				if err == nil {
+					return errors.New("users.getUsers: expected AUTH_KEY_UNREGISTERED from pending key, got success")
+				}
+				if !isAuthKeyUnregistered(err) {
+					return fmt.Errorf("users.getUsers: expected AUTH_KEY_UNREGISTERED, got %w", err)
+				}
 				close(ready)
 				// Block until context is cancelled.
 				<-ctx.Done()
@@ -1029,8 +1044,9 @@ func TestSignUpUsernameOccupied(t *testing.T) {
 
 		// signIn → should return SESSION_PASSWORD_NEEDED (user exists with password).
 		_, err = signInUsername(ctx, api, username, hash, "")
-		// We don't care what signIn returns here; we care about signUp.
-		_ = err
+		if !isSessionPasswordNeeded(err) {
+			return fmt.Errorf("signIn: expected SESSION_PASSWORD_NEEDED, got %w", err)
+		}
 
 		// signUp → should be rejected with USERNAME_OCCUPIED.
 		_, err = signUpUsername(ctx, api, username, hash, firstName, "")
