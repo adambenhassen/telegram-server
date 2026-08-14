@@ -906,3 +906,83 @@ func TestLoadNewRateLimits(t *testing.T) {
 		t.Errorf("error %q does not name TG_RATE_LIMIT_CHECK_PASSWORD", err)
 	}
 }
+
+func TestLoad_Bootstrap_NoPassword(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_BOOTSTRAP_USERNAME", "operator")
+	// No password source set.
+	_, err := config.Load(discardLog())
+	if err == nil {
+		t.Fatal("expected error when bootstrap username is set but no password source")
+	}
+	if !strings.Contains(err.Error(), "TG_BOOTSTRAP_PASSWORD") {
+		t.Errorf("error %q does not name expected vars", err)
+	}
+}
+
+func TestLoad_Bootstrap_BothPasswords(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_BOOTSTRAP_USERNAME", "operator")
+	t.Setenv("TG_BOOTSTRAP_PASSWORD", "secret")
+	t.Setenv("TG_BOOTSTRAP_PASSWORD_FILE", "/tmp/pw")
+	_, err := config.Load(discardLog())
+	if err == nil {
+		t.Fatal("expected error when both password sources are set")
+	}
+	if !strings.Contains(err.Error(), "both set") {
+		t.Errorf("error %q does not mention both set", err)
+	}
+}
+
+func TestLoad_Bootstrap_PasswordEnv(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_BOOTSTRAP_USERNAME", "operator")
+	t.Setenv("TG_BOOTSTRAP_PASSWORD", "secret")
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BootstrapUsername != "operator" {
+		t.Errorf("BootstrapUsername = %q, want operator", cfg.BootstrapUsername)
+	}
+	if cfg.BootstrapPassword != "secret" {
+		t.Errorf("BootstrapPassword = %q, want secret", cfg.BootstrapPassword)
+	}
+}
+
+func TestLoad_Bootstrap_PasswordFile(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "password.txt")
+	if err := os.WriteFile(tmp, []byte("file-secret"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_BOOTSTRAP_USERNAME", "operator")
+	t.Setenv("TG_BOOTSTRAP_PASSWORD_FILE", tmp)
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BootstrapUsername != "operator" {
+		t.Errorf("BootstrapUsername = %q, want operator", cfg.BootstrapUsername)
+	}
+	if cfg.BootstrapPasswordFile != tmp {
+		t.Errorf("BootstrapPasswordFile = %q, want %q", cfg.BootstrapPasswordFile, tmp)
+	}
+}
+
+func TestLoad_Bootstrap_Disabled(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	// No bootstrap vars set.
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BootstrapUsername != "" {
+		t.Errorf("BootstrapUsername = %q, want empty", cfg.BootstrapUsername)
+	}
+}
