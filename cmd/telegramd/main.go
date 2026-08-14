@@ -43,6 +43,13 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	// Validate TG_REGISTRATION immediately after config load, before any
+	// resource-intensive init (RSA/DB/blob). A bad value fails fast with a
+	// message naming the variable.
+	if err := cfg.ValidateRegistrationMode(); err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -109,7 +116,7 @@ func run(log *slog.Logger) error {
 	}
 
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
-	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits)
+	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode)
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
 	}

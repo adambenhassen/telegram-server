@@ -3,11 +3,14 @@ package store_test
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestRateLimitBasic(t *testing.T) {
@@ -495,6 +498,165 @@ func TestRateLimitWaitRoundsUp(t *testing.T) {
 	}
 }
 
+// TestCheckRateLimitBudgetNoRow proves that a budget check on a surface with
+// no row returns nil (allowed) without creating one. This is the invariant that
+// prevents a read-only check from silently seeding a counter.
+func TestCheckRateLimitBudgetNoRow(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 1100
+	const surface = "budget_no_row"
+
+	// Budget check on a clean surface should allow without creating a row.
+	result, err := s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("budget check: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("budget check: unexpected denial: %+v", result)
+	}
+
+	// No row should have been created.
+	count, err := store.CountRateLimits(ctx, s, subject)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("budget check created a row: count = %d, want 0", count)
+	}
+}
+
+// TestCheckRateLimitBudgetAndCharge proves the check-then-charge pattern:
+// ChargeRateLimit creates/increments the counter, and CheckRateLimitBudget
+// reads it without modifying it.
+func TestCheckRateLimitBudgetAndCharge(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 1200
+	const surface = "budget_and_charge"
+
+	// Budget check on a clean surface: allowed, no row created.
+	result, err := s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+	if err != nil || result != nil {
+		t.Fatalf("initial budget check: result=%+v err=%v", result, err)
+	}
+
+	// Charge 3 times (one per failed attempt).
+	for range 3 {
+		if err := s.ChargeRateLimit(ctx, subject, surface, cfg); err != nil {
+			t.Fatalf("charge: %v", err)
+		}
+	}
+
+	// Budget check should now return a denial.
+	result, err = s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("budget check after charges: %v", err)
+	}
+	if result == nil {
+		t.Fatal("budget check: expected denial after 3 charges, got allowed")
+	}
+	if result.Wait < time.Second {
+		t.Errorf("wait = %v, want >= 1s", result.Wait)
+	}
+
+	// Budget check should not have incremented the counter.
+	count, err := store.CountRateLimits(ctx, s, subject)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("budget check created a row: count = %d, want 1", count)
+	}
+
+	// A further charge should increment past the limit.
+	if err := s.ChargeRateLimit(ctx, subject, surface, cfg); err != nil {
+		t.Fatalf("charge past limit: %v", err)
+	}
+
+	// Budget check should still deny.
+	result, err = s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("budget check past limit: %v", err)
+	}
+	if result == nil {
+		t.Fatal("budget check: expected denial after 4 charges, got allowed")
+	}
+}
+
+// TestCheckRateLimitBudgetDisabled proves that a zero limit disables enforcement
+// for the budget check.
+func TestCheckRateLimitBudgetDisabled(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{} // zero = disabled
+	ctx := context.Background()
+	const subject = 1300
+	const surface = "budget_disabled"
+
+	// Budget check should always allow.
+	for range 10 {
+		result, err := s.CheckRateLimitBudget(ctx, subject, surface, cfg)
+		if err != nil || result != nil {
+			t.Fatalf("budget check: result=%+v err=%v", result, err)
+		}
+	}
+}
+
+// TestChargeRateLimitDisabled proves that a zero limit disables charging.
+func TestChargeRateLimitDisabled(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{} // zero = disabled
+	ctx := context.Background()
+	const subject = 1400
+	const surface = "charge_disabled"
+
+	// Charges should be no-ops.
+	for range 10 {
+		if err := s.ChargeRateLimit(ctx, subject, surface, cfg); err != nil {
+			t.Fatalf("charge: %v", err)
+		}
+	}
+
+	// No row should have been created.
+	count, err := store.CountRateLimits(ctx, s, subject)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("disabled charge created a row: count = %d, want 0", count)
+	}
+}
+
 func TestRateLimitDenialNotError(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
@@ -529,4 +691,183 @@ func TestRateLimitDenialNotError(t *testing.T) {
 	if result.Wait%time.Second != 0 {
 		t.Errorf("wait = %v, want whole seconds", result.Wait)
 	}
+}
+
+// TestReserveAndRefund proves the reserve-then-refund pattern: a token is
+// consumed before verification and refunded on success.
+func TestReserveAndRefund(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	cfg := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 1500
+	const surface = "reserve_refund"
+
+	// Reserve 3 tokens (one per attempt).
+	var reservations [3]*store.RateLimitReservation
+	for i := range 3 {
+		res, rl, err := s.ReserveRateLimit(ctx, subject, surface, cfg)
+		if err != nil {
+			t.Fatalf("reserve %d: %v", i, err)
+		}
+		if rl != nil {
+			t.Fatalf("reserve %d: unexpected denial: %+v", i, rl)
+		}
+		reservations[i] = res
+	}
+
+	// 4th reserve should be denied.
+	_, rl, err := s.ReserveRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("reserve 4: %v", err)
+	}
+	if rl == nil {
+		t.Fatal("reserve 4: expected denial, got allowed")
+	}
+
+	// Refund one token — should allow another reserve.
+	if err := s.RefundRateLimit(ctx, subject, surface, reservations[0]); err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+
+	// Now one token should be available.
+	res, rl, err := s.ReserveRateLimit(ctx, subject, surface, cfg)
+	if err != nil {
+		t.Fatalf("reserve after refund: %v", err)
+	}
+	if rl != nil {
+		t.Fatalf("reserve after refund: unexpected denial: %+v", rl)
+	}
+	if res == nil {
+		t.Fatal("reserve after refund: expected reservation")
+	}
+
+	// Cross-window case: reserve in window 1 at limit 1, age the row past
+	// expiry, reserve once to open window 2, then refund the window-1
+	// reservation. The refund must be a no-op (window_start = $3 rejects
+	// the stale window).
+	const subjectXW = 1501
+	const surfaceXW = "cross_window"
+	cfgXW := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+
+	// Reserve in window 1 (consumes the only token).
+	w1Res, _, err := s.ReserveRateLimit(ctx, subjectXW, surfaceXW, cfgXW)
+	if err != nil {
+		t.Fatalf("window 1 reserve: %v", err)
+	}
+	if w1Res == nil {
+		t.Fatal("window 1 reserve: expected reservation")
+	}
+
+	// Age the row past expiry so the next reserve opens a new window.
+	if err := ageRateLimitRow(dsn, subjectXW, surfaceXW, 11*time.Second); err != nil {
+		t.Fatalf("age window: %v", err)
+	}
+
+	// Reserve once to open window 2.
+	w2Res, _, err := s.ReserveRateLimit(ctx, subjectXW, surfaceXW, cfgXW)
+	if err != nil {
+		t.Fatalf("window 2 reserve: %v", err)
+	}
+	if w2Res == nil {
+		t.Fatal("window 2 reserve: expected reservation")
+	}
+
+	// Refund the window-1 reservation — must be a no-op.
+	if err := s.RefundRateLimit(ctx, subjectXW, surfaceXW, w1Res); err != nil {
+		t.Fatalf("cross-window refund: %v", err)
+	}
+
+	// Window 2 budget should be unchanged: limit 1, already consumed 1.
+	// Another reserve should be denied.
+	_, rl, err = s.ReserveRateLimit(ctx, subjectXW, surfaceXW, cfgXW)
+	if err != nil {
+		t.Fatalf("window 2 second reserve: %v", err)
+	}
+	if rl == nil {
+		t.Fatal("window 2 second reserve: expected denial (cross-window refund leaked a token)")
+	}
+}
+
+// TestReserveConcurrentBurst proves that concurrent reserves are serialized
+// by the row-level lock: exactly Limit tokens are consumed, the rest are denied.
+func TestReserveConcurrentBurst(t *testing.T) {
+	t.Parallel()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+
+	limit := 5
+	cfg := store.RateLimitConfig{Limit: limit, Window: 10 * time.Second}
+	ctx := context.Background()
+	const subject = 1600
+	const surface = "concurrent_burst"
+
+	const goroutines = 20
+	var (
+		allowed atomic.Int32
+		denied  atomic.Int32
+		errOnce atomic.Bool
+		errCh   = make(chan error, 1)
+	)
+
+	// Fire N goroutines that all try to reserve simultaneously.
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Go(func() {
+			_, rl, err := s.ReserveRateLimit(ctx, subject, surface, cfg)
+			if err != nil {
+				if errOnce.CompareAndSwap(false, true) {
+					errCh <- err
+				}
+				return
+			}
+			if rl != nil {
+				denied.Add(1)
+			} else {
+				allowed.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	close(errCh)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	allowedCount := allowed.Load()
+	deniedCount := denied.Load()
+	if allowedCount != int32(limit) {
+		t.Errorf("allowed = %d, want %d (limit)", allowedCount, limit)
+	}
+	if deniedCount != int32(goroutines-limit) {
+		t.Errorf("denied = %d, want %d (goroutines - limit)", deniedCount, goroutines-limit)
+	}
+}
+
+// ageRateLimitRow rewinds a rate-limit row's timestamps by d, simulating
+// d of wall clock passing since the window opened.
+func ageRateLimitRow(dsn string, subjectID int64, surface string, d time.Duration) error {
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	_, err = pool.Exec(context.Background(),
+		`UPDATE rate_limits
+		    SET window_start = window_start - $3::INTERVAL,
+		        expires_at   = expires_at   - $3::INTERVAL
+		  WHERE subject_id = $1 AND surface = $2`,
+		subjectID, surface, pgtype.Interval{Microseconds: d.Microseconds(), Valid: true})
+	return err
 }

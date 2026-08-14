@@ -171,6 +171,9 @@ func TestWarnClientAddrTrust(t *testing.T) {
 	// no assumption left to warn about.
 	buf.Reset()
 	cfg.RateLimits.SignInFailIP = store.RateLimitConfig{}
+	cfg.RateLimits.CheckPasswordIP = store.RateLimitConfig{}
+	cfg.RateLimits.GetPasswordIP = store.RateLimitConfig{}
+	cfg.RateLimits.SignUpIP = store.RateLimitConfig{}
 	cfg.WarnClientAddrTrust(log)
 	if buf.Len() != 0 {
 		t.Errorf("warned with every per-IP limit disabled:\n%s", buf.String())
