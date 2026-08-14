@@ -416,6 +416,7 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 		protectedMux.HandleFunc(pattern, handler)
 	}
 	registerProtected("GET /admin/metrics", Handler(registry, cfg.Store))
+	registerProtected("GET /admin/dashboard", DashboardHandler(registry, cfg.Store))
 
 	// Top-level mux: specific public routes registered first (they take priority
 	// over the prefix match), then the catch-all protected prefix.
