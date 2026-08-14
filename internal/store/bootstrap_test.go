@@ -2,10 +2,14 @@ package store_test
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"testing"
 
+	"github.com/gotd/td/crypto/srp"
+
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	tsrp "github.com/adambenhassen/telegram-server/internal/srp"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -224,6 +228,76 @@ func TestValidateBootstrapUsername_Reserved(t *testing.T) {
 		if err := store.ValidateBootstrapUsername(name); !errors.Is(err, store.ErrBootstrapReserved) {
 			t.Errorf("ValidateBootstrapUsername(%q): expected ErrBootstrapReserved, got: %v", name, err)
 		}
+	}
+}
+
+// TestBootstrapAccount_SRPRoundTrip verifies a full SRP authentication
+// round-trip against a bootstrap-seeded account: tsrp.Challenge (server) →
+// srp.Hash (client) → tsrp.Verify (server). This is the same path a real
+// username login takes.
+func TestBootstrapAccount_SRPRoundTrip(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t, pgtest.DSN(t))
+
+	password := []byte("test-password")
+	params := store.BootstrapParams{
+		Handle:    "operator",
+		FirstName: "Operator",
+		LastName:  "",
+		Password:  password,
+	}
+
+	// Create the bootstrap account.
+	result, err := s.BootstrapAccount(ctx, params)
+	if err != nil {
+		t.Fatalf("BootstrapAccount: %v", err)
+	}
+	if !result.Created {
+		t.Fatal("expected Created=true")
+	}
+
+	// Read the stored password row (PasswordByUser returns the decrypted verifier).
+	pw, found, err := s.PasswordByUser(ctx, result.UserID)
+	if err != nil || !found {
+		t.Fatalf("PasswordByUser: found=%v err=%v", found, err)
+	}
+
+	// Server side: generate challenge from stored verifier.
+	bPub, bSecret, err := tsrp.Challenge(pw.Verifier)
+	if err != nil {
+		t.Fatalf("srp challenge: %v", err)
+	}
+
+	// Client side: compute SRP answer.
+	random := make([]byte, 256)
+	if _, err := rand.Read(random); err != nil {
+		t.Fatalf("srp random: %v", err)
+	}
+	srpClient := srp.NewSRP(rand.Reader)
+	algo := srp.Input{
+		Salt1: pw.Salt1,
+		Salt2: pw.Salt2,
+		G:     3,
+		P:     tsrp.PBytes(),
+	}
+	answer, err := srpClient.Hash(password, bPub, random, algo)
+	if err != nil {
+		t.Fatalf("srp hash: %v", err)
+	}
+
+	// Server side: verify.
+	if !tsrp.Verify(pw.Verifier, pw.Salt1, pw.Salt2, answer.A, answer.M1, bPub, bSecret) {
+		t.Fatal("SRP verify failed for correct password")
+	}
+
+	// Verify wrong password is rejected.
+	wrongAnswer, err := srpClient.Hash([]byte("wrong-password"), bPub, random, algo)
+	if err != nil {
+		t.Fatalf("srp hash (wrong): %v", err)
+	}
+	if tsrp.Verify(pw.Verifier, pw.Salt1, pw.Salt2, wrongAnswer.A, wrongAnswer.M1, bPub, bSecret) {
+		t.Fatal("SRP verify should have rejected wrong password")
 	}
 }
 
