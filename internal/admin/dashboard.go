@@ -38,6 +38,11 @@ type DashboardData struct {
 	// Uninstrumented card — names from the metrics payload, plus their labels
 	UninstrumentedNames []UninstrLabel
 
+	// UninstrumentedFields is the raw field-name slice for the JS initializer.
+	// html/template renders a []string in a script context as a correctly
+	// escaped JS array literal, so no hand-rolled quoting is needed.
+	UninstrumentedFields []string
+
 	// Storage
 	StorageRows []DashStorageRow
 
@@ -49,9 +54,6 @@ type DashboardData struct {
 
 	// Server timestamp string (for chip tooltip)
 	ServerTimestamp string
-
-	// JSON array of uninstrumented field names for the JS auto-refresh
-	UninstrumentedJSON string
 }
 
 type UninstrLabel struct {
@@ -150,6 +152,7 @@ func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 	}
 
 	// Uninstrumented card.
+	d.UninstrumentedFields = m.Uninstrumented
 	for _, name := range m.Uninstrumented {
 		label, ok := uninstrumentedLabels[name]
 		if !ok {
@@ -160,13 +163,6 @@ func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 			Label: label,
 		})
 	}
-
-	// Build JSON array of uninstrumented field names for the JS refresh handler.
-	quoted := make([]string, len(m.Uninstrumented))
-	for i, n := range m.Uninstrumented {
-		quoted[i] = `"` + n + `"`
-	}
-	d.UninstrumentedJSON = "[" + strings.Join(quoted, ",") + "]"
 
 	// Storage table.
 	storageMap := map[string]int64{
@@ -223,9 +219,7 @@ func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store) http.H
 	}
 }
 
-var dashboardTmpl = template.Must(template.New("dashboard").Funcs(template.FuncMap{
-	"safeJS": func(s string) template.JS { return template.JS(s) }, //nolint:gosec // controlled input
-}).Parse(dashboardHTML))
+var dashboardTmpl = template.Must(template.New("dashboard").Parse(dashboardHTML))
 
 const dashboardHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -651,7 +645,7 @@ tr:last-child td { border-bottom: none; }
 (function() {
   'use strict';
 
-  var uninstrumented = {{safeJS .UninstrumentedJSON}};
+  var uninstrumented = {{.UninstrumentedFields}};
   var uninstrSet = new Set(uninstrumented);
 
   // Field name → element id mapping for scalar metrics
