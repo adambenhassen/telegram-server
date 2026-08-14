@@ -232,7 +232,7 @@ func bootServerWithLimits(
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
 	}
-	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits)
+	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdater(st, server.Registry(), log, pgtest.PeerDeriver())

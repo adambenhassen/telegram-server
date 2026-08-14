@@ -64,7 +64,7 @@ func TestRateLimitE2E(t *testing.T) {
 	rateLimits := config.RateLimitsConfig{
 		MessageSend: store.RateLimitConfig{Limit: 3, Window: 10 * time.Second},
 	}
-	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits)
+	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
 
 	srvCtx, srvCancel := context.WithCancel(ctx)

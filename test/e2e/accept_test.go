@@ -120,7 +120,7 @@ func bootAcceptServer(t *testing.T, ctx context.Context, handshake time.Duration
 	}
 	// The code sink scrapes the issued code out of the log, so the gated line
 	// needs to be on.
-	handler := api.New(st, dcID, api.DefaultConfig(dcID, "127.0.0.1", 0), codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{})
+	handler := api.New(st, dcID, api.DefaultConfig(dcID, "127.0.0.1", 0), codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
 	if handshake > 0 {
 		server.SetHandshakeTimeout(handshake)

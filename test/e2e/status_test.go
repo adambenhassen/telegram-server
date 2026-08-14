@@ -32,7 +32,7 @@ func bootServerWithStatus(t *testing.T, ctx context.Context, key *rsa.PrivateKey
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
 	}
-	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{})
+	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	server.OnStatusChange(func(ctx context.Context, userID int64, online bool) {
