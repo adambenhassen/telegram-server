@@ -195,6 +195,10 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 
 	ipReserve, rl, err := h.reserveRateLimitIP(r, "check_password_ip", h.rateLimitCheckPasswordIP)
 	if err != nil {
+		// Refund the account token since we're not proceeding to SRP.
+		if err := h.store.RefundRateLimit(r.Ctx, pendingUserID, "check_password", accountReserve); err != nil {
+			h.log.Error("check password: refund account reserve", "err", err)
+		}
 		return nil, err
 	}
 	if rl != nil {
