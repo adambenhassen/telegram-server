@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -51,6 +53,10 @@ const (
 	// readyProbe bounds one connection attempt, readyInterval spaces them out.
 	readyProbe    = 5 * time.Second
 	readyInterval = 250 * time.Millisecond
+	// bridgeProbe bounds the one-shot routability test for the container's
+	// bridge address. An unroutable address is dropped rather than refused, so
+	// this is a timeout in the failing case and must stay short.
+	bridgeProbe = 2 * time.Second
 )
 
 var (
@@ -91,10 +97,19 @@ func setup() {
 		errSetup = fmt.Errorf("inspect container: %w", err)
 		return
 	}
-	if bnet, ok := inspect.NetworkSettings.Networks["bridge"]; ok {
-		adminDSN = fmt.Sprintf("postgres://postgres:postgres@%s/postgres?sslmode=disable", net.JoinHostPort(bnet.IPAddress.String(), "5432"))
+	bnet, hasBridge := inspect.NetworkSettings.Networks["bridge"]
+	bridgeAddr := ""
+	if hasBridge {
+		bridgeAddr = net.JoinHostPort(bnet.IPAddress.String(), "5432")
+	}
+	if hasBridge && bridgeRoutable(ctx, bridgeAddr) {
+		adminDSN = fmt.Sprintf("postgres://postgres:postgres@%s/postgres?sslmode=disable", bridgeAddr)
 	} else {
-		// Reused container from before bridge attachment — fall back to published port.
+		// Either a container reused from before bridge attachment, or a bridge
+		// subnet we cannot route to: when DOCKER_HOST points at a remote daemon
+		// (a DinD sidecar, say) the container's bridge IP belongs to that
+		// daemon's network namespace, not ours. Fall back to the published port,
+		// which testcontainers resolves against the right host.
 		adminDSN, errSetup = container.ConnectionString(ctx, "sslmode=disable")
 		if errSetup != nil {
 			return
@@ -126,6 +141,22 @@ func containerOptions() []testcontainers.ContainerCustomizer {
 		postgres.WithPassword("postgres"),
 		postgres.WithConfigFile(fastConfPath()),
 	}
+}
+
+// bridgeRoutable reports whether the container's bridge address is reachable
+// from this process. It is deliberately not a readiness check: a refused
+// connection still proves the route is good (something answered), and Postgres
+// readiness is settled afterwards by waitAccepting. Only an address we cannot
+// reach at all — no route, or packets silently dropped, which is what a remote
+// daemon's bridge subnet looks like from here — sends setup to the published
+// port instead.
+func bridgeRoutable(ctx context.Context, addr string) bool {
+	conn, err := (&net.Dialer{Timeout: bridgeProbe}).DialContext(ctx, "tcp", addr)
+	if err == nil {
+		_ = conn.Close() //nolint:errcheck // probe only, the connection carries no data
+		return true
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // waitAccepting polls dsn until Postgres answers a query, or timeout elapses.
