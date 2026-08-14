@@ -59,8 +59,10 @@ func userTL(u store.User) *tg.User {
 //
 // For unauthenticated callers (pending state), a per-IP rate limit applies:
 // the server runs a 2048-bit modexp on every call, and unlimited calls from
-// one sendCode+signIn sequence are an unmetered CPU sink. Fully authorized
-// callers are not subject to this limit.
+// one sendCode+signIn sequence are an unmetered CPU sink.
+// For fully authorized callers (r.UserID != 0 && hasPw), a per-account rate
+// limit applies to bound modexp + SRP challenge issuance.
+// Provisional accounts (hasPw == false) are not subject to any limit.
 func (h *handlers) handleGetPassword(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AccountGetPasswordRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -89,6 +91,15 @@ func (h *handlers) handleGetPassword(r *mtproto.Request) (bin.Encoder, error) {
 	// (so a modexp will actually run).
 	if r.UserID == 0 && hasPw {
 		if err := h.checkAndChargeRateLimitIP(r, "get_password_ip", h.rateLimitGetPasswordIP); err != nil {
+			return nil, err
+		}
+	}
+
+	// Per-account rate limit for fully authorized callers. Keyed on r.UserID
+	// (not the resolved pending target). Only applies when the caller is
+	// fully authorized and the account has a password.
+	if r.UserID != 0 && hasPw {
+		if err := h.checkRateLimit(r, "get_password", h.rateLimitGetPassword); err != nil {
 			return nil, err
 		}
 	}
@@ -251,6 +262,41 @@ func (h *handlers) resolvePendingUserID(r *mtproto.Request) (int64, *tgerr.Error
 	return key.PendingUserID, nil
 }
 
+// consumeAndVerifyWithRateLimit consumes a token from the password_proof rate
+// limit, then verifies the SRP proof. It uses the reserve-then-refund pattern:
+// a token is atomically consumed before SRP verification, and refunded only on
+// the fully successful path (valid proof and uid matches the session user).
+// SRP_ID_INVALID and uid mismatches both keep the token consumed. Any store
+// error is fail-closed — a Postgres failure does not permit unlimited attempts.
+func (h *handlers) consumeAndVerifyWithRateLimit(ctx context.Context, authKeyID int64, proof *tg.InputCheckPasswordSRP, userID int64) (int64, *tgerr.Error) {
+	// Reserve a token atomically before SRP verification.
+	reserve, rl, err := h.store.ReserveRateLimit(ctx, userID, "password_proof", h.rateLimitPasswordProof)
+	if err != nil {
+		h.log.Error("password proof: rate limit reserve", "err", err)
+		return 0, errInternal
+	}
+	if rl != nil {
+		return 0, FloodWaitError(int(rl.Wait / time.Second))
+	}
+
+	uid, rpc := h.consumeAndVerify(ctx, authKeyID, proof)
+	if rpc != nil {
+		// Failed proof: token remains consumed (no refund).
+		return 0, rpc
+	}
+	if uid != userID {
+		// uid mismatch: token remains consumed (no refund).
+		return 0, errPasswordHashInvalid
+	}
+
+	// Valid proof and uid matches: refund the reserved token.
+	if err := h.store.RefundRateLimit(ctx, userID, "password_proof", reserve); err != nil {
+		h.log.Error("password proof: refund rate limit", "err", err)
+	}
+
+	return uid, nil
+}
+
 // consumeAndVerify consumes the SRP challenge named by proof.SRPID and checks
 // the client's (A, M1) against the stored verifier for the user the challenge
 // was issued to. It returns that user id on success. Every failure path is
@@ -318,7 +364,7 @@ func (h *handlers) handleUpdatePasswordSettings(r *mtproto.Request) (bin.Encoder
 		if !ok {
 			return nil, errPasswordHashInvalid
 		}
-		uid, rpc := h.consumeAndVerify(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), proof)
+		uid, rpc := h.consumeAndVerifyWithRateLimit(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), proof, r.UserID)
 		if rpc != nil {
 			return nil, rpc
 		}
@@ -385,7 +431,7 @@ func (h *handlers) handleGetPasswordSettings(r *mtproto.Request) (bin.Encoder, e
 	if !ok {
 		return nil, errPasswordHashInvalid
 	}
-	uid, rpc := h.consumeAndVerify(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), proof)
+	uid, rpc := h.consumeAndVerifyWithRateLimit(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), proof, r.UserID)
 	if rpc != nil {
 		return nil, rpc
 	}

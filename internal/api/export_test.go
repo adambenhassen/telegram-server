@@ -112,6 +112,8 @@ func testHandlers(s *store.Store) *handlers {
 		rateLimitCheckPasswordIP: store.RateLimitConfig{},
 		rateLimitGetPasswordIP:   store.RateLimitConfig{},
 		rateLimitSignUpIP:        store.RateLimitConfig{},
+		rateLimitPasswordProof:   store.RateLimitConfig{},
+		rateLimitGetPassword:     store.RateLimitConfig{},
 	}
 }
 
@@ -865,3 +867,54 @@ var ErrAuthKeyUnreg = errAuthKeyUnreg
 // function called by registerRevoke, not a copy. The handleUnknownGated
 // fallback uses its own inline check and does not call this predicate.
 var ProvisionalBlocked = provisionalBlocked
+
+// GetPasswordSettingsWithProofLimits invokes handleGetPasswordSettings for an
+// authenticated caller with a custom password_proof rate limit config. The buf
+// is re-encoded from the decoded request, so it can be called multiple times.
+func GetPasswordSettingsWithProofLimits(s *store.Store, userID int64, authKeyID [8]byte, rateLimit store.RateLimitConfig, buf *bin.Buffer) (bin.Encoder, error) {
+	var req tg.AccountGetPasswordSettingsRequest
+	if err := req.Decode(buf); err != nil {
+		return nil, err
+	}
+	var out bin.Buffer
+	if err := req.Encode(&out); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitPasswordProof = rateLimit
+	return h.handleGetPasswordSettings(&mtproto.Request{
+		Ctx:       context.Background(),
+		UserID:    userID,
+		AuthKeyID: authKeyID,
+		Buf:       &out,
+	})
+}
+
+// UpdatePasswordSettingsWithProofLimits invokes handleUpdatePasswordSettings for
+// an authenticated caller with a custom password_proof rate limit config.
+func UpdatePasswordSettingsWithProofLimits(s *store.Store, userID int64, authKeyID [8]byte, rateLimit store.RateLimitConfig, buf *bin.Buffer) (bin.Encoder, error) {
+	var req tg.AccountUpdatePasswordSettingsRequest
+	if err := req.Decode(buf); err != nil {
+		return nil, err
+	}
+	var out bin.Buffer
+	if err := req.Encode(&out); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitPasswordProof = rateLimit
+	return h.handleUpdatePasswordSettings(&mtproto.Request{
+		Ctx:       context.Background(),
+		UserID:    userID,
+		AuthKeyID: authKeyID,
+		Buf:       &out,
+	})
+}
+
+// GetPasswordWithAccountLimits invokes handleGetPassword for an authenticated
+// caller with a custom per-account get_password rate limit config.
+func GetPasswordWithAccountLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *mtproto.Request) (bin.Encoder, error) {
+	h := testHandlers(s)
+	h.rateLimitGetPassword = rateLimit
+	return h.handleGetPassword(req)
+}
