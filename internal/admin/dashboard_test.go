@@ -221,6 +221,127 @@ func TestDashboardData_uninstrumented_driven_by_payload(t *testing.T) {
 	}
 }
 
+// TestDashboardHandler_503_on_db_error verifies that a closed store causes
+// DashboardHandler to return 503 rather than rendering zeros as real metrics.
+// DashboardHandler is called directly (no auth middleware) since we are
+// testing handler behavior, not the gate.
+func TestDashboardHandler_503_on_db_error(t *testing.T) {
+	t.Parallel()
+
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	registry := mtproto.NewSessionRegistry()
+	h := admin.DashboardHandler(registry, st)
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/admin/dashboard", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on DB error, got %d", rec.Code)
+	}
+}
+
+// TestDashboardHTML_uninstr_scaffold_present_when_empty verifies that the
+// uninstrumented card DOM scaffold is always emitted even when the initial
+// uninstrumented list is empty, so patchUninstrumented can show it from a
+// later poll response without re-inserting DOM nodes.
+func TestDashboardHTML_uninstr_scaffold_present_when_empty(t *testing.T) {
+	t.Parallel()
+
+	m := admin.MetricsResponse{Uninstrumented: []string{}}
+	data := admin.BuildDashboardData(m, "csrf-test")
+
+	var buf strings.Builder
+	if err := admin.RenderDashboard(&buf, data); err != nil {
+		t.Fatal(err)
+	}
+	body := buf.String()
+
+	if !strings.Contains(body, `id="uninstr-card"`) {
+		t.Error("uninstr-card scaffold absent from HTML when uninstrumented is empty")
+	}
+	// Card must carry the hidden class so it is not visible on first paint.
+	if !strings.Contains(body, `uninstr-card hidden`) && !strings.Contains(body, `uninstr-card" hidden`) {
+		t.Error("uninstr-card should carry hidden class when uninstrumented is empty")
+	}
+}
+
+// TestDashboardHTML_uninstr_scaffold_visible_when_populated verifies that the
+// uninstrumented card is visible (no hidden class on the card element) when
+// the uninstrumented list is non-empty.
+func TestDashboardHTML_uninstr_scaffold_visible_when_populated(t *testing.T) {
+	t.Parallel()
+
+	m := admin.MetricsResponse{Uninstrumented: []string{"notify_count"}}
+	data := admin.BuildDashboardData(m, "csrf-test")
+
+	var buf strings.Builder
+	if err := admin.RenderDashboard(&buf, data); err != nil {
+		t.Fatal(err)
+	}
+	body := buf.String()
+
+	if !strings.Contains(body, `id="uninstr-card"`) {
+		t.Error("uninstr-card missing from HTML")
+	}
+	// The card must not carry the hidden class when fields are listed.
+	if strings.Contains(body, `uninstr-card hidden`) || strings.Contains(body, `uninstr-card" hidden`) {
+		t.Error("uninstr-card should not be hidden when uninstrumented is non-empty")
+	}
+	if !strings.Contains(body, "NOTIFY events per hour") {
+		t.Error("uninstr-card missing label for notify_count")
+	}
+}
+
+// TestDashboardHandler_security_headers verifies the required security headers
+// are present on every dashboard response.
+func TestDashboardHandler_security_headers(t *testing.T) {
+	t.Parallel()
+
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }() //nolint:errcheck // best-effort close in test
+
+	rawToken := "dashboard-headers-test-token"
+	tokenHash := sha256hex([]byte(rawToken))
+	registry := mtproto.NewSessionRegistry()
+
+	h := admin.AdminRouter(admin.LoginHandlerConfig{
+		Store:     st,
+		TokenHash: tokenHash,
+	}, registry)
+	sessionID := loginAndGetSession(t, h, rawToken)
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/admin/dashboard", nil)
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionID}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, "frame-ancestors") {
+		t.Errorf("Content-Security-Policy = %q, missing frame-ancestors", got)
+	}
+}
+
 func TestFmtInt(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
