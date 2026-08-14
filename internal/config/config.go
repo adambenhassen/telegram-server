@@ -1068,6 +1068,12 @@ func (c Config) BootstrapPasswordBytes() ([]byte, error) {
 			return nil, fmt.Errorf("read bootstrap password file %s: %w", c.BootstrapPasswordFile, err)
 		}
 		password = bytes.TrimSpace(data)
+		// Copy the trimmed password into its own allocation so we can clear
+		// the original ReadFile buffer without corrupting the return value.
+		passwordCopy := make([]byte, len(password))
+		copy(passwordCopy, password)
+		clear(data)
+		password = passwordCopy
 	} else {
 		password = []byte(strings.TrimSpace(c.BootstrapPassword))
 	}
