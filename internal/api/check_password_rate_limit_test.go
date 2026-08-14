@@ -2,12 +2,14 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
@@ -228,5 +230,114 @@ func TestGetPasswordAuthenticatedExempt(t *testing.T) {
 		if err != nil {
 			t.Fatalf("authenticated call: %v", err)
 		}
+	}
+}
+
+// TestCheckPasswordIPReserveErrorRefundsAccount proves that when the per-IP
+// reserve returns an error (invalid address), the already-consumed account
+// token is refunded. Without the refund the account budget is drained by
+// errors that never reached SRP verification.
+func TestCheckPasswordIPReserveErrorRefundsAccount(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551296401")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set a password for alice.
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   alice.ID,
+		Salt1:    []byte("salt1"),
+		Salt2:    []byte("salt2"),
+		Verifier: make([]byte, 256),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Register auth key and stage alice as pending.
+	var authKeyID [8]byte
+	authKeyID[7] = 5
+	keyID := mtproto.AuthKeyIDInt64(authKeyID)
+	if err := s.SaveAuthKey(ctx, keyID, []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPendingUser(ctx, keyID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Per-account limit of 1 so a leaked token is visible.
+	perAccount := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	// Per-IP limit enabled so reserveRateLimitIP runs.
+	perIP := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+
+	// netip.Addr{} is invalid, so IPBucketKey returns ok=false and
+	// reserveRateLimitIP returns an error (FLOOD_WAIT). This hits the error
+	// branch between the account reserve and the IP reserve.
+	_, err = api.CheckPasswordForTestWithLimits(s, authKeyID, netip.Addr{}, perAccount, perIP, &tg.AuthCheckPasswordRequest{
+		Password: &tg.InputCheckPasswordSRP{A: make([]byte, 256), M1: make([]byte, 256)},
+	})
+	if err == nil {
+		t.Fatal("expected error from invalid IP address")
+	}
+
+	// Budget should still be available — the account token was refunded.
+	result, err := s.CheckRateLimitBudget(ctx, alice.ID, "check_password", perAccount)
+	if err != nil {
+		t.Fatalf("CheckRateLimitBudget: %v", err)
+	}
+	if result != nil {
+		t.Fatal("account budget was consumed despite refund — token leaked on IP reserve error")
+	}
+}
+
+// TestCheckPasswordIPReserveErrorReturnsOriginalError proves that the error
+// returned to the client is the original error from the IP reserve, not the
+// refund error.
+func TestCheckPasswordIPReserveErrorReturnsOriginalError(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551296402")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   alice.ID,
+		Salt1:    []byte("salt1"),
+		Salt2:    []byte("salt2"),
+		Verifier: make([]byte, 256),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var authKeyID [8]byte
+	authKeyID[7] = 6
+	keyID := mtproto.AuthKeyIDInt64(authKeyID)
+	if err := s.SaveAuthKey(ctx, keyID, []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPendingUser(ctx, keyID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	perAccount := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	perIP := store.RateLimitConfig{Limit: 3, Window: 10 * time.Second}
+
+	_, err = api.CheckPasswordForTestWithLimits(s, authKeyID, netip.Addr{}, perAccount, perIP, &tg.AuthCheckPasswordRequest{
+		Password: &tg.InputCheckPasswordSRP{A: make([]byte, 256), M1: make([]byte, 256)},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	// The error should be FLOOD_WAIT from the invalid IP, not an internal error.
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) || rpc.Code != 420 {
+		t.Fatalf("expected FLOOD_WAIT (code 420), got %T: %v", err, err)
 	}
 }
