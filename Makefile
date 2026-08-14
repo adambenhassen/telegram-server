@@ -1,4 +1,4 @@
-.PHONY: tools-check sqlc generate migrate-new migrate test test-db docker-bridge lint build run
+.PHONY: tools-check sqlc generate migrate-new migrate test test-unit test-db docker-bridge lint build run
 
 # sqlc lives in a separate tools module (tools/go.mod) so its broken transitive
 # dep graph (grpc test deps -> a non-existent gonum package) stays out of the
@@ -44,6 +44,13 @@ E2E_PKG := github.com/adambenhassen/telegram-server/test/e2e
 test: docker-bridge
 	$(TESTENV) go test -race $$(go list ./... | grep -v '^$(E2E_PKG)$$')
 	$(TESTENV) go test -race -count=1 -timeout 15m $(E2E_PKG)
+
+# All packages except e2e. Agent runtimes share the host CPU with sibling
+# workdirs; e2e takes ~300s and starves under contention, producing spurious
+# timeouts that are not code bugs. Use this for fast development-loop feedback.
+# `make test` (including e2e) remains the pre-PR and CI gate.
+test-unit: docker-bridge
+	$(TESTENV) go test -race $$(go list ./... | grep -v '^$(E2E_PKG)$$')
 
 # The store suite alone, for a quick check while working in internal/store.
 # Deliberately not ./test/... — e2e wants the whole machine to itself and is
