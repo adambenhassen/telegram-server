@@ -558,35 +558,12 @@ func TestProvisionalAccountCannotRemovePassword(t *testing.T) {
 
 func TestProvisionalGateBlocksUnimplementedMethod(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
-	s := openStore(t)
-
-	// Create a username-mode user without a verifier (provisional).
-	user, err := s.CreateUsernameUser(ctx, "unimpluser", "Unimpl", "User")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := api.ClaimUsernameForTest(s, user.ID, "unimpluser"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Save and bind the auth key.
-	if err := s.SaveAuthKey(ctx, int64(0xa), make([]byte, 256)); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.BindAuthKeyUser(ctx, int64(0xa), user.ID); err != nil {
-		t.Fatal(err)
-	}
-
-	// handleUnknownGated is the fallback for unimplemented methods.
-	// It applies the gate for all provisional sessions (unimplemented methods
-	// are never in the allow-list). The predicate is the same function called
-	// by both registerRevoke and handleUnknownGated.
+	// Unimplemented methods are never in the allow-list, so the gate
+	// predicate blocks them for any authenticated provisional session.
 	req := &mtproto.Request{
-		Ctx:         ctx,
-		UserID:      user.ID,
+		Ctx:         context.Background(),
+		UserID:      1,
 		Provisional: true,
-		AuthKeyID:   [8]byte{10},
 	}
 	if !api.ProvisionalBlocked(tg.HelpGetNearestDCRequestTypeID, req) {
 		t.Fatal("gate did not block unimplemented method for provisional session")

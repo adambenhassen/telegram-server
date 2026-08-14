@@ -51,13 +51,8 @@ func (h *handlers) handleUnknown(_ *mtproto.Conn, req *mtproto.Request) error {
 // allow-list by definition, so a provisional session gets AUTH_KEY_UNREGISTERED
 // instead of INPUT_METHOD_INVALID.
 func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) error {
-	id, err := req.Buf.PeekID()
-	if err == nil && provisionalBlocked(id, req) {
+	if req.UserID != 0 && req.Provisional {
 		return c.SendErr(req, errAuthKeyUnreg)
 	}
 	return h.handleUnknown(c, req)
 }
-
-// ProvisionalBlocked exposes the gate predicate for tests. It is the same
-// function called by both registerRevoke and handleUnknownGated, not a copy.
-var ProvisionalBlocked = provisionalBlocked

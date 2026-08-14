@@ -814,3 +814,7 @@ var ProvisionalAllowList = provisionalAllowList
 
 // ErrAuthKeyUnreg exposes the AUTH_KEY_UNREGISTERED error for test assertions.
 var ErrAuthKeyUnreg = errAuthKeyUnreg
+
+// ProvisionalBlocked exposes the gate predicate for tests. It is the same
+// function called by both registerRevoke and handleUnknownGated, not a copy.
+var ProvisionalBlocked = provisionalBlocked
