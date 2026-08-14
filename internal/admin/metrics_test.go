@@ -72,6 +72,18 @@ func TestMetricsHandler(t *testing.T) {
 	if resp.PushLatencyP95 != 0 {
 		t.Errorf("expected push_latency_p95_ms = 0, got %f", resp.PushLatencyP95)
 	}
+
+	// Uninstrumented fields must be listed so the dashboard can distinguish
+	// a genuine zero from an absent instrument.
+	want := []string{"notify_count", "push_latency_p50_ms", "push_latency_p95_ms"}
+	if len(resp.Uninstrumented) != len(want) {
+		t.Fatalf("expected %d uninstrumented fields, got %d: %v", len(want), len(resp.Uninstrumented), resp.Uninstrumented)
+	}
+	for i, name := range want {
+		if resp.Uninstrumented[i] != name {
+			t.Errorf("uninstrumented[%d] = %q, want %q", i, resp.Uninstrumented[i], name)
+		}
+	}
 }
 
 func TestMetricsHandler_POST(t *testing.T) {

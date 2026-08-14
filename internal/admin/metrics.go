@@ -72,6 +72,13 @@ type MetricsResponse struct {
 	// (rows that have not yet expired), approximating recent throttling activity.
 	RateLimitActive int64 `json:"rate_limit_active"`
 
+	// Uninstrumented lists the field names in this payload that are hardcoded
+	// zeroes because the underlying metric is not yet instrumented. A field is
+	// removed from this list when its instrumentation lands, so clients can
+	// distinguish a genuine zero from an absent instrument without hard-coding
+	// field names.
+	Uninstrumented []string `json:"uninstrumented"`
+
 	// StorageRows holds approximate row counts for key database tables.
 	StorageRows StorageRows `json:"storage_rows"`
 }
@@ -135,6 +142,7 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 		NotifyCount:     0, // not yet instrumented
 		PushLatencyP50:  0, // not yet instrumented
 		PushLatencyP95:  0, // not yet instrumented
+		Uninstrumented:  []string{"notify_count", "push_latency_p50_ms", "push_latency_p95_ms"},
 		RateLimitActive: snap.RateLimitHits1H,
 		StorageRows: StorageRows{
 			Users:           snap.StorageRows.Users,
