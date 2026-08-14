@@ -336,6 +336,16 @@ func handleLoginPOST(cfg LoginHandlerConfig, rl *rateLimiter, w http.ResponseWri
 
 // handleLogoutPOST processes logout requests.
 func handleLogoutPOST(cfg LoginHandlerConfig, w http.ResponseWriter, r *http.Request) {
+	// Cap request body size before any auth check (same cap as login).
+	r.Body = http.MaxBytesReader(w, r.Body, loginMaxBodyBytes)
+
+	// Parse the form up front so an oversized body is rejected (413) before
+	// any auth check runs.
+	if err := r.ParseForm(); err != nil {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
+
 	// Origin check (same as login).
 	if cfg.AdminOrigin != "" {
 		origin := r.Header.Get("Origin")
@@ -348,16 +358,6 @@ func handleLogoutPOST(cfg LoginHandlerConfig, w http.ResponseWriter, r *http.Req
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-	}
-
-	// Cap request body size before any auth check (same cap as login).
-	r.Body = http.MaxBytesReader(w, r.Body, loginMaxBodyBytes)
-
-	// Parse the form up front so an oversized body is rejected (413) before
-	// any auth check runs.
-	if err := r.ParseForm(); err != nil {
-		w.WriteHeader(http.StatusRequestEntityTooLarge)
-		return
 	}
 
 	// Look up session from cookie.
@@ -373,8 +373,10 @@ func handleLogoutPOST(cfg LoginHandlerConfig, w http.ResponseWriter, r *http.Req
 	csrfToken := r.FormValue("csrf_token")
 	expected, derr := SessionCSRFToken(cfg.TokenHash, sessionCookie.Value)
 	if derr != nil {
-		// Invalid TokenHash is a startup misconfiguration; reject.
-		w.WriteHeader(http.StatusUnauthorized)
+		// Invalid TokenHash is a startup misconfiguration, not a client
+		// error: same status as DashboardHandler for the same condition.
+		cfg.Logger.Error("derive logout csrf token", "err", derr)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	if csrfToken == "" || subtle.ConstantTimeCompare([]byte(csrfToken), []byte(expected)) != 1 {

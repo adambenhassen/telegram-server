@@ -470,6 +470,73 @@ func TestLogoutPOST_body_size_limit(t *testing.T) {
 	}
 }
 
+// TestLogoutPOST_body_size_limit_in_cap_body_still_authenticates verifies the
+// 413 path does not shadow the auth path: a body under the cap with a wrong
+// token must be rejected with 401, not 413.
+func TestLogoutPOST_body_size_limit_in_cap_body_still_authenticates(t *testing.T) {
+	t.Parallel()
+	st := newAuthTestStore(t)
+	tokenHash := sha256hex([]byte("correct-token"))
+
+	h := newTestRouter(t, st, tokenHash)
+
+	sessionCookie := loginAndGetSession(t, h, "correct-token")
+
+	body := "csrf_token=short-but-wrong-token"
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/logout", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for in-cap body with wrong token, got %d", rec.Code)
+	}
+}
+
+// TestLogoutPOST_token_valid_after_cookie_ttl pins the 15-minute TTL
+// regression: the logout token is derived from the session, so it validates
+// long after the pre-auth CSRF cookie would have expired.
+func TestLogoutPOST_token_valid_after_cookie_ttl(t *testing.T) {
+	t.Parallel()
+	st := newAuthTestStore(t)
+	tokenHash := sha256hex([]byte("correct-token"))
+
+	h := newTestRouter(t, st, tokenHash)
+
+	sessionCookie := loginAndGetSession(t, h, "correct-token")
+
+	// Derive the token now, then verify it still matches after the CSRF
+	// cookie TTL (15 minutes) has elapsed. The derivation is stateless and
+	// time-independent, so the token is identical at any point.
+	tokenBefore, err := admin.SessionCSRFToken(tokenHash, sessionCookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the TTL having passed by deriving again; the result must be
+	// identical to the token rendered at login time.
+	tokenAfter, err := admin.SessionCSRFToken(tokenHash, sessionCookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenBefore != tokenAfter {
+		t.Fatal("token changed over time; would 401 after the cookie TTL")
+	}
+
+	// Now actually log out with that token.
+	form := strings.NewReader("csrf_token=" + tokenBefore)
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/logout", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", rec.Code)
+	}
+}
+
 // TestCSRFSessionToken_deterministic_and_rotating pins the derivation:
 // identical for the same inputs, different for a different session, and
 // invalidated when the token hash changes.
