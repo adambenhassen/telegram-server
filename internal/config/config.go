@@ -180,6 +180,16 @@ type RateLimitsConfig struct {
 	// SignUpIP limits auth.signUp calls per client network. Applied only when
 	// TG_REGISTRATION=open; no-op in closed mode.
 	SignUpIP store.RateLimitConfig
+	// PasswordProof limits account.getPasswordSettings and
+	// account.updatePasswordSettings (the proof-required path) per account, on
+	// one shared budget. Both call consumeAndVerify against the same secret,
+	// so alternating between them must not double the guess budget.
+	PasswordProof store.RateLimitConfig
+	// GetPassword limits account.getPassword per account for fully authorized
+	// callers (r.UserID != 0 && hasPw). Provisional accounts (hasPw == false)
+	// are not subject to this limit. The per-call 2048-bit modexp and SRP
+	// challenge issuance are the costs being bounded.
+	GetPassword store.RateLimitConfig
 }
 
 // DefaultRateLimits returns the shipped per-surface defaults: 60 sends per 60s,
@@ -190,7 +200,10 @@ type RateLimitsConfig struct {
 // signIn attempts per hour per client network, 5 failed checkPassword attempts
 // per 10 min per account, 10 failed checkPassword attempts per hour per client
 // network, 20 getPassword calls per hour per client network (unauthenticated
-// callers only), and 5 signUp calls per hour per client network.
+// callers only), 5 signUp calls per hour per client network, 5 password proof
+// attempts per 10 min per account (shared by getPasswordSettings and
+// updatePasswordSettings), and 20 getPassword calls per hour per account
+// (authorized callers only).
 // Zero disables enforcement for a surface.
 //
 // The upload number is the one derived rather than chosen: at the 512 KiB
@@ -219,6 +232,8 @@ func DefaultRateLimits() RateLimitsConfig {
 		CheckPasswordIP: store.RateLimitConfig{Limit: 10, Window: time.Hour},
 		GetPasswordIP:   store.RateLimitConfig{Limit: 20, Window: time.Hour},
 		SignUpIP:        store.RateLimitConfig{Limit: 5, Window: time.Hour},
+		PasswordProof:   store.RateLimitConfig{Limit: 5, Window: 10 * time.Minute},
+		GetPassword:     store.RateLimitConfig{Limit: 20, Window: time.Hour},
 	}
 }
 
@@ -500,6 +515,37 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_RATE_LIMIT_SIGN_UP_IP_WINDOW must be a duration")
 		}
 		cfg.RateLimits.SignUpIP.Window = d
+	}
+	// PasswordProof per-account rate limit (shared by getPasswordSettings and
+	// updatePasswordSettings proof path).
+	if v := os.Getenv("TG_RATE_LIMIT_PASSWORD_PROOF"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_PASSWORD_PROOF must be an integer")
+		}
+		cfg.RateLimits.PasswordProof.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_PASSWORD_PROOF_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_PASSWORD_PROOF_WINDOW must be a duration")
+		}
+		cfg.RateLimits.PasswordProof.Window = d
+	}
+	// GetPassword per-account rate limit (authorized callers only).
+	if v := os.Getenv("TG_RATE_LIMIT_GET_PASSWORD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_PASSWORD must be an integer")
+		}
+		cfg.RateLimits.GetPassword.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_PASSWORD_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_PASSWORD_WINDOW must be a duration")
+		}
+		cfg.RateLimits.GetPassword.Window = d
 	}
 	preAuth, err := preAuthLimits()
 	if err != nil {
