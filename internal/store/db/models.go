@@ -10,6 +10,13 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AdminSession struct {
+	SessionHash      []byte
+	TokenFingerprint []byte
+	ExpiresAt        pgtype.Timestamptz
+	LastActivity     pgtype.Timestamptz
+}
+
 type AuthKey struct {
 	ID            int64
 	KeyValue      []byte

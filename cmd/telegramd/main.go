@@ -83,6 +83,9 @@ func run(log *slog.Logger) error {
 	sweepWG.Go(func() {
 		sweepExpiredSignInFailLimits(sweepCtx, st, log)
 	})
+	sweepWG.Go(func() {
+		sweepExpiredAdminSessions(sweepCtx, st, log)
+	})
 	defer func() {
 		cancelSweep()
 		sweepWG.Wait()
@@ -155,7 +158,10 @@ func run(log *slog.Logger) error {
 	if cfg.AdminListenAddr != "" {
 		adminSubMux := http.NewServeMux()
 		adminHandler := http.NewServeMux()
-		adminHandler.Handle("/admin/", admin.RequireAdmin(cfg.AdminTokenHash)(adminSubMux))
+		adminHandler.Handle("/admin/", admin.RequireAdmin(admin.AdminMiddlewareConfig{
+			Store:     st,
+			TokenHash: cfg.AdminTokenHash,
+		})(adminSubMux))
 		adminSrv := &http.Server{
 			Addr:              cfg.AdminListenAddr,
 			Handler:           adminHandler,
@@ -328,6 +334,28 @@ func sweepExpiredSignInFailLimits(ctx context.Context, st *store.Store, log *slo
 				continue
 			}
 			log.Info("swept expired sign in fail limits", "deleted", n)
+		}
+	}
+}
+
+// sweepExpiredAdminSessions periodically deletes admin session rows whose
+// absolute expiry deadline has passed. This is what bounds the admin_sessions
+// table: sessions are only created by the login handler and only deleted by
+// this sweep.
+func sweepExpiredAdminSessions(ctx context.Context, st *store.Store, log *slog.Logger) {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := st.SweepExpiredAdminSessions(ctx)
+			if err != nil {
+				log.Error("sweep expired admin sessions", "err", err)
+				continue
+			}
+			log.Info("swept expired admin sessions", "deleted", n)
 		}
 	}
 }
