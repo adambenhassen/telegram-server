@@ -235,8 +235,9 @@ var provisionalAllowList = map[uint32]bool{
 }
 
 // provisionalBlocked reports whether req hits the provisional gate for a
-// registered method with the given TL constructor id. It is the single
-// predicate used by both registerRevoke and handleUnknownGated.
+// registered method with the given TL constructor id. It is called only by
+// registerRevoke; the handleUnknownGated fallback uses its own inline check
+// (req.UserID != 0 && req.Provisional).
 func provisionalBlocked(id uint32, req *mtproto.Request) bool {
 	return req.UserID != 0 && req.Provisional && !provisionalAllowList[id]
 }
