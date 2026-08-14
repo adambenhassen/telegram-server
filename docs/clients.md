@@ -2,8 +2,8 @@
 
 `telegramd` speaks real MTProto — transport, key exchange and encryption on
 gotd's exported packages, with the accept loop and session bookkeeping this
-repo's own (`gotd/tgtest` was dropped in M2; see `ROADMAP.md`). Through M15 it
-serves 56 RPC methods, and auth keys, sessions, users, messages and files all
+repo's own (`gotd/tgtest` was dropped in M2; see `ROADMAP.md`). Through M16 it
+serves 58 RPC methods, and auth keys, sessions, users, messages and files all
 live in Postgres, so a restart keeps them. It is still a single-DC server, and
 login codes are delivered to the server log rather than by SMS, and only when
 `TG_LOG_LOGIN_CODES=true` — off by default, and then not delivered at all.
@@ -12,7 +12,7 @@ A stock Telegram Desktop/mobile client cannot reach it: those clients hardcode
 Telegram's production DCs and RSA keys. You need a client built or patched to
 dial our address and trust our key. This is how the in-repo e2e test (a real
 `gotd/td` client) talks to the server; the same steps apply to any gotd-based
-client, and section 5 covers a patched Telegram Desktop.
+client, and section 6 covers a patched Telegram Desktop.
 
 ## 1. Build and run the server
 
@@ -35,6 +35,7 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_RSA_KEY_PATH`   | `server_key.pem` | Path to the server's RSA private key        |
 | `TG_DC_ID`          | `2`              | DC id this server advertises as `ThisDC`    |
 | `TG_LOG_LOGIN_CODES`| `false`          | Write issued login codes to the log in cleartext. Off by default; with it off no code is delivered anywhere and sign-in cannot complete. A non-boolean value fails startup |
+| `TG_REGISTRATION`   | `closed`         | Controls whether `auth.signUp` creates new accounts. `closed` (default) rejects all registration RPCs; `open` allows them. An unrecognized value fails startup. Sign-in for accounts that already exist is unaffected by this setting |
 | `TG_CLIENT_ADDR_TRUST`| `socket`       | Where the address a per-IP limit is keyed on comes from: `socket` or `proxy-v2`. Any other value fails startup by name. `socket` is the connection's own peer address and assumes one peer address is one client, which fails from either end: behind a proxy or an L4 load balancer every peer address is the balancer's, so one bucket holds every client and the per-IP cap becomes a global one; behind a carrier NAT one address covers thousands of mobile subscribers, who then spend each other's budget. The server warns about both once at startup while any per-IP limit is on. `proxy-v2` takes the address from a PROXY protocol v2 header and is what to run behind an L4 load balancer; it needs `TG_CLIENT_ADDR_PROXY_CIDRS` and emits no such warning, because the misconfiguration it warns about fails the start instead |
 | `TG_MAX_PREAUTH_CONNS`| `1024`       | Concurrent connections that have not authenticated yet, process-wide. Checked on the accept loop, so a socket past the cap is closed before it costs a goroutine, a deadline or a read — refusing is cheaper than accepting, which is what makes the cap shed load rather than apply it. `0` disables it; a negative or non-integer value fails startup |
 | `TG_MAX_PREAUTH_CONNS_PER_IP`| `64`    | The same, per client network, so one peer cannot spend the process-wide cap alone and lock everybody else out. Keyed on the network the per-IP rate limits already use — an address for IPv4, a **/64** for IPv6, since a host on a routed v6 allocation mints addresses inside its own /64 for free — and on the address `TG_CLIENT_ADDR_TRUST` names, which in `proxy-v2` mode is the one the balancer reports and never the socket peer. A connection carrying no address at all (a `LOCAL` health check, or a socket peer the transport could not report) is charged to nothing and stays bounded by the other two. It is a concurrency cap and not a rate: a handshake takes milliseconds, so 64 at once is hundreds of new sessions a second from one network, which leaves room for a carrier NAT or a corporate egress. `0` disables it; a negative or non-integer value fails startup |
@@ -148,7 +149,103 @@ On a successful `auth.signIn`, the phone number is auto-registered as a new
 user if it hasn't been seen before (`store.CreateUser`) — there is no
 separate registration step or admin approval.
 
-## 5. Telegram Desktop, patched
+## 5. Username-mode accounts
+
+Username-mode accounts authenticate with a username and a password (SRP-6a cloud
+password) instead of a phone number and SMS code. A stock Telegram Desktop or
+mobile client **cannot** authenticate as a username-mode account: stock clients
+put a phone number in `auth.sendCode`'s `phone_number` field, the server rejects
+it as neither a valid E.164 phone nor a valid username, and no SMS code delivery
+exists. You need a gotd-based client or the patched Telegram Desktop (section 6)
+with the username credential supplied in the `phone_number` field.
+
+### 5a. Logging in as a username account
+
+A username account must already exist and have its SRP verifier set before
+login is possible (see section 5b for how accounts are created).
+
+```
+1. auth.sendCode(phone_number=<username>)
+   → auth.SentCode  (hash only; no code is delivered)
+
+2. auth.signIn(phone_number=<username>, phone_code_hash=<hash>, phone_code="")
+   → SESSION_PASSWORD_NEEDED
+
+3. account.getPassword()
+   → account.Password  (SRP algorithm, salt, server modulus)
+
+4. auth.checkPassword(password=<SRP proof>)
+   → auth.Authorization
+```
+
+The `phone_code` value passed in step 2 is ignored; only the `phone_code_hash`
+from step 1 is validated. If the username is unknown, step 2 returns
+`authorizationSignUpRequired` instead of `SESSION_PASSWORD_NEEDED` — see
+section 5b. If the username resolves to an account whose verifier was never set
+(a partially-created account), step 2 returns an internal error and access is
+denied.
+
+### 5b. Registering a new account
+
+Registration requires `TG_REGISTRATION=open`. With the default `closed` value,
+`auth.signUp` is rejected at the RPC boundary and new accounts cannot be created
+through the sign-up flow (existing accounts are unaffected).
+
+Once `TG_REGISTRATION=open`:
+
+```
+1. auth.sendCode(phone_number=<username>)
+   → auth.SentCode  (hash only)
+
+2. auth.signIn(phone_number=<username>, phone_code_hash=<hash>, phone_code="")
+   → authorizationSignUpRequired  (username is unknown)
+
+3. auth.signUp(phone_number=<username>, phone_code_hash=<hash>,
+               first_name=<name>, last_name="")
+   → auth.Authorization  (provisional session — password not yet set)
+
+4. account.updatePasswordSettings(...)
+   → account.PasswordSettings  (verifier installed; session becomes full-access)
+```
+
+After step 3 the session is in provisional state: only `help.getConfig`,
+`account.getPassword`, `account.updatePasswordSettings`, and `auth.logOut` may
+be called. Every other RPC returns `AUTH_KEY_UNREGISTERED` until step 4
+completes. If the client disconnects before step 4, the account remains
+provisional and the next sign-in attempt (section 5a step 2) will fail with an
+internal error — the only exits are `account.updatePasswordSettings` to set the
+password, or `auth.logOut` to remove the key.
+
+A username that already exists returns `USERNAME_OCCUPIED` from `auth.signUp`.
+There is no re-registration path: once a username is claimed it cannot be
+reclaimed by starting a new sign-up flow.
+
+### 5c. Seed account at startup (TG_BOOTSTRAP_USERNAME)
+
+`TG_BOOTSTRAP_USERNAME` and `TG_BOOTSTRAP_PASSWORD` (or `TG_BOOTSTRAP_PASSWORD_FILE`)
+create a fully provisioned username-mode operator account before the server binds
+its port, bypassing the registration flow entirely. This is the recommended way
+to create the first account on a server running in `closed` mode.
+
+```bash
+TG_BOOTSTRAP_USERNAME=operator \
+TG_BOOTSTRAP_PASSWORD=<at-least-12-chars> \
+  ./telegramd
+```
+
+The operation is idempotent: if the username already exists as a user-type account
+with `login_mode='username'` and the stored verifier matches the supplied password,
+startup succeeds without modifying anything. It does not rotate passwords: if the
+password in the environment differs from the one stored, startup fails. To change
+a bootstrap account's password, update it through `account.updatePasswordSettings`
+and then update the env var to match.
+
+`TG_BOOTSTRAP_PASSWORD` places the cleartext password in the process environment
+for the life of the process — visible via `/proc/self/environ`, orchestrator
+inspect output, and crash dumps. Use `TG_BOOTSTRAP_PASSWORD_FILE` pointing to a
+mode-0600 file in production environments.
+
+## 6. Telegram Desktop, patched
 
 Stock Telegram Desktop has no user-facing way to change either the DC address
 or the RSA key, so reaching this server needs a patched build. The patches live
@@ -219,8 +316,8 @@ The binary lands in `out/Debug/Telegram`. Budget hours for a cold build.
 
 ### Connect
 
-Run the server with `TG_LOG_LOGIN_CODES=true` (section 4 — the log is the only
-code delivery channel) and start the client against it:
+Run the server with `TG_LOG_LOGIN_CODES=true` (section 4 covers code delivery)
+and start the client against it:
 
 ```bash
 TDESKTOP_CUSTOM_DC_ADDRESS=127.0.0.1:2443 \

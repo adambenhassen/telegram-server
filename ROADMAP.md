@@ -49,7 +49,7 @@ verify is the return.
 ## Current RPC surface
 
 Auth & account
-- `auth.sendCode`, `auth.signIn`, `auth.logOut`, `auth.checkPassword`
+- `auth.sendCode`, `auth.signIn`, `auth.signUp`, `auth.logOut`, `auth.checkPassword`
 - `account.getPassword`, `account.getPasswordSettings`,
   `account.updatePasswordSettings`
 - `account.getAuthorizations`, `account.resetAuthorization`
@@ -689,6 +689,56 @@ Tracked so shortcuts don't rot into "later means never".
 - **Secret-chat messages are permanently non-indexable.** The server stores encrypted blobs
   without inspecting plaintext, so full-text indexing of secret-chat content is not possible by
   design and will not be added. — M13
+
+### M16 — Username/password authentication
+
+- `auth.sendCode` and `auth.signIn` extended to accept a username (5–32 chars `[a-z0-9_]`
+  letter-first) in place of a phone number. `auth.signUp` added as the registration entry point.
+  On `auth.sendCode` with a username the server issues a code hash (no code value is delivered
+  anywhere; the log delivery channel `TG_LOG_LOGIN_CODES=true` still applies).
+- **Fail-closed invariant.** A username-mode account with no SRP verifier cannot complete
+  sign-in: `auth.signIn` returns an internal error rather than binding the session. The
+  only way to clear the state is `account.updatePasswordSettings`, which installs the verifier,
+  or `auth.logOut`, which removes the key.
+- **Provisional account.** `auth.signUp` creates an account in provisional state
+  (`provisional=true` on the auth-key binding). Until `account.updatePasswordSettings`
+  installs a verifier, only four methods may be called: `help.getConfig`,
+  `account.getPassword`, `account.updatePasswordSettings`, and `auth.logOut`. Every other
+  RPC returns `AUTH_KEY_UNREGISTERED`.
+- **No re-registration.** A username that already maps to any account cannot be used to
+  create a new one: `auth.signUp` returns `USERNAME_OCCUPIED` regardless of the existing
+  account's state. A username-mode account cannot be "reclaimed" by re-registering through
+  the sign-up flow.
+- **Stock client incompatibility.** A server in which any account uses username-mode auth
+  cannot be signed into by a stock Telegram Desktop or mobile client for that account: stock
+  clients put a phone number in the `phone_number` field of `auth.sendCode`, the server
+  rejects that input as neither a valid E.164 phone nor a valid username, and no SMS code
+  delivery exists.
+- **`TG_REGISTRATION`** (`closed` / `open`, default `closed`). Controls whether `auth.signUp`
+  creates new accounts. In `closed` mode the RPC is rejected at the boundary; sign-in for
+  accounts that already exist is unaffected. An unrecognized value fails startup.
+- **`TG_BOOTSTRAP_USERNAME` / `TG_BOOTSTRAP_PASSWORD`** (or `TG_BOOTSTRAP_PASSWORD_FILE`).
+  Creates a seed username-mode account with a verifier before the server binds its port.
+  Idempotent when the username already exists, is a user-type owner with `login_mode='username'`,
+  and the stored verifier SRP-verifies against the supplied password; otherwise fails startup.
+  Does not rotate passwords: changing `TG_BOOTSTRAP_PASSWORD` on an existing account fails
+  startup until the value is restored or the credential is updated through the application.
+  Password must be at least 12 bytes. Warning: `TG_BOOTSTRAP_PASSWORD` places the cleartext
+  password in the process environment and retains it for the process lifetime; use
+  `TG_BOOTSTRAP_PASSWORD_FILE` (mode 0600) in any environment where `/proc/self/environ` or
+  orchestrator inspect output is visible to untrusted parties.
+- New rate-limit env vars (defaults apply; `0` disables a surface):
+  - `TG_RATE_LIMIT_CHECK_PASSWORD` / `_WINDOW` — failed `auth.checkPassword` SRP proofs per
+    account (default 5/10 min). Charged only on failures; a valid proof is never charged.
+  - `TG_RATE_LIMIT_CHECK_PASSWORD_IP` / `_WINDOW` — failed `auth.checkPassword` proofs per
+    client network (default 10/h). Charged only on failures.
+  - `TG_RATE_LIMIT_SIGN_UP_IP` / `_WINDOW` — `auth.signUp` calls per client network (default
+    5/h). No-op in `closed` mode.
+- E2E gates prove the full login flow (`auth.sendCode` → `auth.signIn` →
+  `SESSION_PASSWORD_NEEDED` → `account.getPassword` + `auth.checkPassword` →
+  `auth.Authorization`) and the registration flow (`auth.sendCode` → `auth.signIn` →
+  `authorizationSignUpRequired` → `auth.signUp` → `account.updatePasswordSettings`) against
+  a real gotd client.
 
 ## Engineering invariants
 
