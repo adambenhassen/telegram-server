@@ -3,19 +3,14 @@ package store
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/sha512"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"regexp"
 
 	"github.com/gotd/td/crypto/srp"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"golang.org/x/crypto/pbkdf2"
 
 	tsrp "github.com/adambenhassen/telegram-server/internal/srp"
 	"github.com/adambenhassen/telegram-server/internal/store/db"
@@ -84,9 +79,9 @@ type BootstrapResult struct {
 //  2. INSERT usernames (claim the handle)
 //  3. INSERT user_passwords (SRP verifier)
 //
-// If the username already exists, it checks for an idempotent match by reading
-// the stored salts and recomputing the verifier from the bootstrap password.
-//   - owner_type='user' AND login_mode='username' AND verifier matches → no-op (Created=false)
+// If the username already exists, it checks for an idempotent match by running
+// a real SRP round trip against the stored verifier.
+//   - owner_type='user' AND login_mode='username' AND SRP Verify succeeds → no-op (Created=false)
 //   - any other mismatch → ErrBootstrapSquatted
 //
 // Returns BootstrapResult with the user ID and whether a new account was created.
@@ -140,21 +135,11 @@ func (s *Store) BootstrapAccount(ctx context.Context, p BootstrapParams) (Bootst
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			// Race: another process claimed it between our check and this insert.
-			// Re-check existence and try idempotent path.
-			var raceUsername db.Username
-			err = tx.QueryRow(ctx, `
-				SELECT handle, owner_type, owner_id
-				FROM usernames
-				WHERE handle = $1
-			`, p.Handle).Scan(&raceUsername.Handle, &raceUsername.OwnerType, &raceUsername.OwnerID)
-			if err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					return BootstrapResult{}, ErrBootstrapSquatted
-				}
-				return BootstrapResult{}, fmt.Errorf("re-check username after race: %w", err)
-			}
+			// Postgres has aborted this transaction — nothing can reuse it.
+			// Roll back explicitly, open a fresh transaction, and run the
+			// idempotency check on that.
 			_ = tx.Rollback(ctx) //nolint:errcheck // best-effort
-			return s.bootstrapCheckExisting(ctx, s.q.WithTx(tx), p, raceUsername)
+			return s.bootstrapCheckExistingTx(ctx, p)
 		}
 		return BootstrapResult{}, fmt.Errorf("claim username: %w", err)
 	}
@@ -190,13 +175,38 @@ func (s *Store) BootstrapAccount(ctx context.Context, p BootstrapParams) (Bootst
 	return BootstrapResult{UserID: u.ID, Created: true}, nil
 }
 
+// bootstrapCheckExistingTx opens a fresh transaction and runs the idempotency
+// check. Used when the original transaction was aborted (e.g. after a 23505
+// unique violation) and must not be reused.
+func (s *Store) bootstrapCheckExistingTx(ctx context.Context, p BootstrapParams) (BootstrapResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return BootstrapResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	var existing db.Username
+	err = tx.QueryRow(ctx, `
+		SELECT handle, owner_type, owner_id
+		FROM usernames
+		WHERE handle = $1
+	`, p.Handle).Scan(&existing.Handle, &existing.OwnerType, &existing.OwnerID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return BootstrapResult{}, ErrBootstrapSquatted
+	case err != nil:
+		return BootstrapResult{}, fmt.Errorf("re-check username after race: %w", err)
+	}
+	return s.bootstrapCheckExisting(ctx, s.q.WithTx(tx), p, existing)
+}
+
 // bootstrapCheckExisting verifies that an existing username row matches the
 // bootstrap credential. Returns idempotent no-op on match, error on mismatch.
 //
-// It reads the stored salt1/salt2 from the passwords row, recomputes the
-// verifier from the bootstrap password using those salts, and compares
-// against the stored verifier. This ensures repeated bootstrap calls with
-// the same password correctly match on restart.
+// It reads the stored verifier and salts from the passwords row, then runs a
+// real SRP round trip: tsrp.Challenge (server) → srp.Hash (client) → tsrp.Verify
+// (server). This exercises the exact code path a real login takes, rather than
+// re-implementing the KDF chain.
 func (s *Store) bootstrapCheckExisting(ctx context.Context, qtx *db.Queries, p BootstrapParams, existing db.Username) (BootstrapResult, error) {
 	// Must be owned by a user, not a channel.
 	if existing.OwnerType != "user" {
@@ -229,15 +239,34 @@ func (s *Store) bootstrapCheckExisting(ctx context.Context, qtx *db.Queries, p B
 		return BootstrapResult{}, fmt.Errorf("decrypt stored verifier: %w", err)
 	}
 
-	// Recompute the verifier using the stored salts and the bootstrap password.
-	recomputed, err := computeVerifierFromSalts(p.Password, pw.Salt1, pw.Salt2)
+	// Run a real SRP round trip to verify the password.
+	// Server side: generate challenge from stored verifier.
+	bPub, bSecret, err := tsrp.Challenge(storedVerifier)
 	if err != nil {
-		return BootstrapResult{}, fmt.Errorf("recompute verifier: %w", err)
+		return BootstrapResult{}, fmt.Errorf("srp challenge: %w", err)
 	}
 
-	// Compare verifiers in constant time.
-	if subtle.ConstantTimeCompare(storedVerifier, recomputed) != 1 {
-		return BootstrapResult{}, fmt.Errorf("%w: verifier mismatch for user %d", ErrBootstrapSquatted, userID)
+	// Client side: compute SRP answer (A, M1) using the bootstrap password
+	// and stored salts.
+	random := make([]byte, 256)
+	if _, err := io.ReadFull(rand.Reader, random); err != nil {
+		return BootstrapResult{}, fmt.Errorf("srp random: %w", err)
+	}
+	srpClient := srp.NewSRP(rand.Reader)
+	algo := srp.Input{
+		Salt1: pw.Salt1,
+		Salt2: pw.Salt2,
+		G:     3,
+		P:     tsrp.PBytes(),
+	}
+	answer, err := srpClient.Hash(p.Password, bPub, random, algo)
+	if err != nil {
+		return BootstrapResult{}, fmt.Errorf("srp hash: %w", err)
+	}
+
+	// Server side: verify the client's proof.
+	if !tsrp.Verify(storedVerifier, pw.Salt1, pw.Salt2, answer.A, answer.M1, bPub, bSecret) {
+		return BootstrapResult{}, fmt.Errorf("%w: srp verify failed for user %d", ErrBootstrapSquatted, userID)
 	}
 
 	// Idempotent match — no-op.
@@ -272,48 +301,6 @@ func computeSRPVerifier(password []byte) (verifier, salt1, salt2 []byte, err err
 	// NewHash returns the augmented salt1 (original + 32 random bytes).
 	// Store the augmented one — that's what the client will use for verification.
 	return verifier, augmentedSalt1, salt2, nil
-}
-
-// computeVerifierFromSalts computes the SRP verifier v = g^x mod p from the
-// password and given salts. This is the same computation the client performs
-// when checking a password, and is what the server-side SRP Verify function
-// expects to match.
-func computeVerifierFromSalts(password, salt1, salt2 []byte) ([]byte, error) {
-	p := new(big.Int).SetBytes(tsrp.PBytes())
-	g := big.NewInt(3)
-
-	// x = PH2(password, salt1, salt2)
-	x := computeX(password, salt1, salt2)
-	// v = g^x mod p
-	v := new(big.Int).Exp(g, x, p)
-	verifier := make([]byte, 256)
-	copy(verifier[256-len(v.Bytes()):], v.Bytes())
-	return verifier, nil
-}
-
-// computeX computes x = PH2(password, salt1, salt2) using the same KDF chain
-// as gotd's crypto/srp package.
-//
-// PH2(password, salt1, salt2) = SH(PBKDF2-SHA512(PH1(password, salt1, salt2), salt1, 100000), salt2)
-// PH1(password, salt1, salt2) = SH(SH(password, salt1), salt2)
-// SH(data, salt) = SHA256(salt || data || salt)
-func computeX(password, salt1, salt2 []byte) *big.Int {
-	ph1 := saltHash(saltHash(password, salt1), salt2)
-	pbkdf2Result := pbkdf2SHA512(ph1, salt1, 100000)
-	ph2 := saltHash(pbkdf2Result, salt2)
-	return new(big.Int).SetBytes(ph2)
-}
-
-func saltHash(data, salt []byte) []byte {
-	h := sha256.New()
-	h.Write(salt)
-	h.Write(data)
-	h.Write(salt)
-	return h.Sum(nil)
-}
-
-func pbkdf2SHA512(password, salt []byte, iterations int) []byte {
-	return pbkdf2.Key(password, salt, iterations, 64, sha512.New)
 }
 
 // ValidateBootstrapUsername checks the bootstrap username against the same
