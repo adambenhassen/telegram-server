@@ -190,7 +190,9 @@ func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 
 // DashboardHandler returns an http.HandlerFunc for GET /admin/dashboard.
 // It server-renders the full operations dashboard with real metric values.
-func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store) http.HandlerFunc {
+// tokenHash is the hex-encoded SHA-256 digest of TG_ADMIN_TOKEN_HASH, used to
+// derive the session-bound CSRF token for the logout form.
+func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenHash string) http.HandlerFunc {
 	var cache metricsCache
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -206,12 +208,21 @@ func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store) http.H
 		}
 		m := cache.get()
 
-		csrfToken, err := generateCSRFToken()
+		// Derive the logout CSRF token from the session cookie. It is
+		// deterministic, so no Set-Cookie is needed: every tab with the same
+		// session renders the same token and it survives past any cookie TTL.
+		sessionCookie, err := r.Cookie(sessionCookieName)
 		if err != nil {
+			// RequireAdmin already validated the session; this cannot fail.
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
-		http.SetCookie(w, csrfCookie(csrfCookieHash(csrfToken)))
+		csrfToken, err := SessionCSRFToken(tokenHash, sessionCookie.Value)
+		if err != nil {
+			// Invalid TokenHash is a startup misconfiguration; reject.
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
 
 		data := BuildDashboardData(m, csrfToken)
 

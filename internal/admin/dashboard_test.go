@@ -77,6 +77,14 @@ func TestDashboardHandler_returns_html(t *testing.T) {
 		t.Error("body missing csrf_token in logout form")
 	}
 
+	// The logout token is derived from the session: the dashboard must not
+	// issue any CSRF cookie (re-issuing it invalidated other tabs' forms).
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "__Host-csrf-token" {
+			t.Error("dashboard response set a CSRF cookie; token must be session-derived")
+		}
+	}
+
 	// Logout form is a POST, not an anchor.
 	if !strings.Contains(body, `method="post" action="/admin/logout"`) {
 		t.Error("body missing POST logout form")
