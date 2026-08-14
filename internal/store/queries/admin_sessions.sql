@@ -20,6 +20,12 @@ UPDATE admin_sessions
 SET last_activity = GREATEST(last_activity, $2)
 WHERE session_hash = $1;
 
+-- name: DeleteAdminSession :execrows
+-- Delete a single admin session row by its hash. Returns rows affected
+-- (0 means the session was already gone).
+DELETE FROM admin_sessions
+WHERE session_hash = $1;
+
 -- name: SweepExpiredAdminSessions :execrows
 -- Delete session rows whose absolute expiry deadline has passed.
 DELETE FROM admin_sessions
