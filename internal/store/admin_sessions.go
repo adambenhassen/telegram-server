@@ -42,8 +42,10 @@ func (s *Store) GetAdminSession(ctx context.Context, sessionHash []byte) (AdminS
 }
 
 // UpdateAdminSessionActivity touches the last_activity timestamp for an
-// existing session.
-func (s *Store) UpdateAdminSessionActivity(ctx context.Context, sessionHash []byte, lastActivity time.Time) error {
+// existing session. Uses GREATEST so concurrent requests never move the
+// clock backwards. Returns the number of rows updated (0 means the session
+// was deleted between lookup and update).
+func (s *Store) UpdateAdminSessionActivity(ctx context.Context, sessionHash []byte, lastActivity time.Time) (int64, error) {
 	return s.q.UpdateAdminSessionActivity(ctx, db.UpdateAdminSessionActivityParams{
 		SessionHash:  sessionHash,
 		LastActivity: pgtype.Timestamptz{Time: lastActivity, Valid: true},

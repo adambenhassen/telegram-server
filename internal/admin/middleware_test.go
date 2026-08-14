@@ -326,3 +326,71 @@ func TestHashSessionID_returns_raw_bytes(t *testing.T) {
 		t.Fatal("HashSessionID did not return SHA-256 digest bytes")
 	}
 }
+
+func TestUpdateAdminSessionActivity_zero_rows(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	// Try to update a session that does not exist.
+	hash := sha256.Sum256([]byte("nonexistent"))
+	n, err := st.UpdateAdminSessionActivity(ctx, hash[:], time.Now())
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("update affected %d rows, want 0", n)
+	}
+}
+
+func TestUpdateAdminSessionActivity_monotonic(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	// Insert a session with last_activity = T.
+	hash := sha256.Sum256([]byte("mono-test"))
+	fingerprint := tokenFingerprint(hex.EncodeToString(make([]byte, 32)))
+	base := time.Now().Round(time.Second).Add(-10 * time.Minute)
+	if err := st.CreateAdminSession(ctx, hash[:], fingerprint, time.Now().Add(admin.SessionLifetime()), base); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Update with a timestamp older than the current last_activity.
+	older := base.Add(-5 * time.Minute)
+	n, err := st.UpdateAdminSessionActivity(ctx, hash[:], older)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("update affected %d rows, want 1", n)
+	}
+
+	// last_activity should still be base (GREATEST prevents moving backwards).
+	row, err := st.GetAdminSession(ctx, hash[:])
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// Compare with second-level tolerance (Postgres TIMESTAMPTZ truncates sub-second).
+	if row.LastActivity.Unix() != base.Unix() {
+		t.Errorf("last_activity = %v, want %v (GREATEST should keep older value)", row.LastActivity, base)
+	}
+
+	// Update with a newer timestamp — should move forward.
+	newer := base.Add(5 * time.Minute)
+	n, err = st.UpdateAdminSessionActivity(ctx, hash[:], newer)
+	if err != nil {
+		t.Fatalf("update newer: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("update newer affected %d rows, want 1", n)
+	}
+
+	row, err = st.GetAdminSession(ctx, hash[:])
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if row.LastActivity.Unix() != newer.Unix() {
+		t.Errorf("last_activity = %v, want %v", row.LastActivity, newer)
+	}
+}

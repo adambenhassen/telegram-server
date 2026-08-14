@@ -99,10 +99,14 @@ func RequireAdmin(cfg AdminMiddlewareConfig) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Session valid — update last activity. A write failure here is
-			// non-fatal: the request is already validated and the session will
-			// be cleaned up by the sweep when it expires.
-			_ = cfg.Store.UpdateAdminSessionActivity(r.Context(), sessionHash[:], now) //nolint:errcheck // best-effort activity update
+			// Session valid — update last activity. A write failure or zero rows
+			// updated means the session disappeared between lookup and update
+			// (sweep raced ahead), so reject.
+			n, err := cfg.Store.UpdateAdminSessionActivity(r.Context(), sessionHash[:], now)
+			if err != nil || n != 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 
 			next.ServeHTTP(w, r)
 		})

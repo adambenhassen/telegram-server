@@ -70,9 +70,9 @@ func (q *Queries) SweepExpiredAdminSessions(ctx context.Context) (int64, error) 
 	return result.RowsAffected(), nil
 }
 
-const updateAdminSessionActivity = `-- name: UpdateAdminSessionActivity :exec
+const updateAdminSessionActivity = `-- name: UpdateAdminSessionActivity :execrows
 UPDATE admin_sessions
-SET last_activity = $2
+SET last_activity = GREATEST(last_activity, $2)
 WHERE session_hash = $1
 `
 
@@ -81,8 +81,14 @@ type UpdateAdminSessionActivityParams struct {
 	LastActivity pgtype.Timestamptz
 }
 
-// Touch the last_activity timestamp for an existing session.
-func (q *Queries) UpdateAdminSessionActivity(ctx context.Context, arg UpdateAdminSessionActivityParams) error {
-	_, err := q.db.Exec(ctx, updateAdminSessionActivity, arg.SessionHash, arg.LastActivity)
-	return err
+// Touch the last_activity timestamp for an existing session. Uses GREATEST
+// so concurrent requests committing out of order never move the clock
+// backwards and trigger a spurious idle-timeout. Returns rows affected
+// (0 means the session was deleted between lookup and update).
+func (q *Queries) UpdateAdminSessionActivity(ctx context.Context, arg UpdateAdminSessionActivityParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateAdminSessionActivity, arg.SessionHash, arg.LastActivity)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

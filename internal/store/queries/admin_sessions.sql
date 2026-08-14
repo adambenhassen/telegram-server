@@ -11,10 +11,13 @@ SELECT token_fingerprint, expires_at, last_activity
 FROM admin_sessions
 WHERE session_hash = $1;
 
--- name: UpdateAdminSessionActivity :exec
--- Touch the last_activity timestamp for an existing session.
+-- name: UpdateAdminSessionActivity :execrows
+-- Touch the last_activity timestamp for an existing session. Uses GREATEST
+-- so concurrent requests committing out of order never move the clock
+-- backwards and trigger a spurious idle-timeout. Returns rows affected
+-- (0 means the session was deleted between lookup and update).
 UPDATE admin_sessions
-SET last_activity = $2
+SET last_activity = GREATEST(last_activity, $2)
 WHERE session_hash = $1;
 
 -- name: SweepExpiredAdminSessions :execrows
