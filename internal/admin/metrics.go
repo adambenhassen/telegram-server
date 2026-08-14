@@ -9,6 +9,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -102,9 +103,10 @@ const cacheRefresh = 10 * time.Second
 
 // metricsCache holds a stale snapshot and its collection time.
 type metricsCache struct {
-	mu   sync.Mutex
-	last time.Time
-	resp MetricsResponse
+	mu      sync.Mutex
+	last    time.Time
+	resp    MetricsResponse
+	lastErr bool // true if the most recent refresh attempt failed
 }
 
 // refresh re-reads metrics from the store and registry if enough time has
@@ -119,6 +121,8 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 
 	snap, err := st.Metrics(ctx)
 	if err != nil {
+		slog.Error("admin metrics refresh", "err", err)
+		c.lastErr = true
 		return
 	}
 
@@ -156,6 +160,7 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 		},
 	}
 	c.last = time.Now()
+	c.lastErr = false
 }
 
 // get returns the cached metrics response.
@@ -163,6 +168,14 @@ func (c *metricsCache) get() MetricsResponse {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.resp
+}
+
+// failed reports whether the most recent refresh attempt produced an error.
+// When true, the cached snapshot is stale due to a DB failure.
+func (c *metricsCache) failed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastErr
 }
 
 // Handler returns an http.HandlerFunc that serves operational metrics as JSON.
@@ -179,6 +192,10 @@ func Handler(registry *mtproto.SessionRegistry, st *store.Store) http.HandlerFun
 		}
 
 		cache.refresh(r.Context(), registry, st)
+		if cache.failed() {
+			http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		resp := cache.get()
 
 		w.Header().Set("Content-Type", "application/json")

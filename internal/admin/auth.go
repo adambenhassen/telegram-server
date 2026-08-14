@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -25,8 +26,9 @@ const csrfTokenLen = 32
 // loginMaxBodyBytes caps the request body of POST /admin/login.
 const loginMaxBodyBytes = 4 * 1024 // 4 KiB
 
-// csrfCookieTTL is how long the CSRF cookie persists. It is short-lived:
-// the token is re-issued on every successful login.
+// csrfCookieTTL is how long the pre-auth CSRF cookie persists. It is
+// short-lived: the token is re-issued on every GET /admin/login and cleared
+// on successful login.
 const csrfCookieTTL = 15 * time.Minute
 
 // rateLimitWindow is the sliding window for the login rate limiter.
@@ -67,6 +69,24 @@ func generateCSRFToken() (string, error) {
 func csrfCookieHash(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
+}
+
+// SessionCSRFToken derives the CSRF token for an authenticated session.
+// It is deterministic: HMAC-SHA256 of a key derived from the admin token
+// hash, over the SHA-256 of the hex-encoded session id. Every request that
+// carries the same session cookie yields the same token, so the token is
+// identical across tabs, never expires on its own, and rotates when
+// TG_ADMIN_TOKEN_HASH changes.
+func SessionCSRFToken(tokenHash, sessionIDHex string) (string, error) {
+	decoded, err := hex.DecodeString(tokenHash)
+	if err != nil {
+		return "", fmt.Errorf("decode token hash: %w", err)
+	}
+	key := sha256.Sum256(decoded)
+	sessionHash := sha256.Sum256([]byte(sessionIDHex))
+	mac := hmac.New(sha256.New, key[:])
+	mac.Write(sessionHash[:])
+	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
 // csrfCookie returns a preconfigured http.Cookie for a CSRF token.
@@ -316,6 +336,16 @@ func handleLoginPOST(cfg LoginHandlerConfig, rl *rateLimiter, w http.ResponseWri
 
 // handleLogoutPOST processes logout requests.
 func handleLogoutPOST(cfg LoginHandlerConfig, w http.ResponseWriter, r *http.Request) {
+	// Cap request body size before any auth check (same cap as login).
+	r.Body = http.MaxBytesReader(w, r.Body, loginMaxBodyBytes)
+
+	// Parse the form up front so an oversized body is rejected (413) before
+	// any auth check runs.
+	if err := r.ParseForm(); err != nil {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
+
 	// Origin check (same as login).
 	if cfg.AdminOrigin != "" {
 		origin := r.Header.Get("Origin")
@@ -330,27 +360,26 @@ func handleLogoutPOST(cfg LoginHandlerConfig, w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// CSRF check for logout.
-	csrfToken := r.FormValue("csrf_token")
-	if csrfToken == "" {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	csrfCookie, err := r.Cookie(csrfCookieName)
-	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	expectedHash := csrfCookieHash(csrfToken)
-	if subtle.ConstantTimeCompare([]byte(expectedHash), []byte(csrfCookie.Value)) != 1 {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
 	// Look up session from cookie.
 	sessionCookie, err := r.Cookie(sessionCookieName)
 	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	// CSRF check for logout: recompute the expected token from the session
+	// cookie and compare in constant time. The token is derived, not stored,
+	// so it cannot be invalidated by a second tab or a cookie expiry.
+	csrfToken := r.FormValue("csrf_token")
+	expected, derr := SessionCSRFToken(cfg.TokenHash, sessionCookie.Value)
+	if derr != nil {
+		// Invalid TokenHash is a startup misconfiguration, not a client
+		// error: same status as DashboardHandler for the same condition.
+		cfg.Logger.Error("derive logout csrf token", "err", derr)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if csrfToken == "" || subtle.ConstantTimeCompare([]byte(csrfToken), []byte(expected)) != 1 {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -371,8 +400,8 @@ func handleLogoutPOST(cfg LoginHandlerConfig, w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Clear cookies.
-	http.SetCookie(w, clearCSRFCookie())
+	// Clear the session cookie. The pre-auth CSRF cookie is only set by the
+	// login form and does not exist for authenticated sessions.
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
@@ -416,6 +445,7 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 		protectedMux.HandleFunc(pattern, handler)
 	}
 	registerProtected("GET /admin/metrics", Handler(registry, cfg.Store))
+	registerProtected("GET /admin/dashboard", DashboardHandler(registry, cfg.Store, cfg.TokenHash))
 
 	// Top-level mux: specific public routes registered first (they take priority
 	// over the prefix match), then the catch-all protected prefix.
