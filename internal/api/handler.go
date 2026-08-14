@@ -89,6 +89,14 @@ type handlers struct {
 	// rateLimitSignUpIP limits auth.signUp calls per client network. Applied
 	// only when TG_REGISTRATION=open.
 	rateLimitSignUpIP store.RateLimitConfig
+	// rateLimitPasswordProof limits account.getPasswordSettings and
+	// account.updatePasswordSettings (proof-required path) per account, on one
+	// shared budget. Both call consumeAndVerify against the same secret.
+	rateLimitPasswordProof store.RateLimitConfig
+	// rateLimitGetPassword limits account.getPassword per account for fully
+	// authorized callers (r.UserID != 0 && hasPw). Provisional accounts are
+	// not subject to this limit.
+	rateLimitGetPassword store.RateLimitConfig
 	// registrationMode controls whether auth.signUp is available.
 	registrationMode config.RegistrationMode
 }
@@ -166,6 +174,8 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitCheckPasswordIP: rateLimits.CheckPasswordIP,
 		rateLimitGetPasswordIP:   rateLimits.GetPasswordIP,
 		rateLimitSignUpIP:        rateLimits.SignUpIP,
+		rateLimitPasswordProof:   rateLimits.PasswordProof,
+		rateLimitGetPassword:     rateLimits.GetPassword,
 		registrationMode:         registrationMode,
 	}
 	d := mtproto.NewDispatcher()
