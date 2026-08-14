@@ -729,11 +729,11 @@ tr:last-child td { border-bottom: none; }
     }
   }
 
-  // Show/hide banners. Hides all four banners, then unhides el (if non-null).
-  // bannerEmpty is managed separately by patchEmptyBanner on successful fetch;
-  // it must be hidden here too so a 401 or disconnect doesn't show both.
+  // showBanner manages only the three status banners (stale, disconnected,
+  // signed-out). bannerEmpty is owned exclusively by patchEmptyBanner so
+  // chipLoop never suppresses it.
   function showBanner(el) {
-    [bannerEmpty, bannerStale, bannerDc, bannerOut].forEach(function(b) {
+    [bannerStale, bannerDc, bannerOut].forEach(function(b) {
       b.classList.add('hidden');
     });
     if (el) el.classList.remove('hidden');
@@ -872,6 +872,7 @@ tr:last-child td { border-bottom: none; }
           document.body.classList.remove('fetching');
           clearTimer();
           updateChip();
+          bannerEmpty.classList.add('hidden');
           showBanner(bannerOut);
           return null;
         }
