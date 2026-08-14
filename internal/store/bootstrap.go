@@ -138,7 +138,9 @@ func (s *Store) BootstrapAccount(ctx context.Context, p BootstrapParams) (Bootst
 			// Postgres has aborted this transaction — nothing can reuse it.
 			// Roll back explicitly, open a fresh transaction, and run the
 			// idempotency check on that.
-			_ = tx.Rollback(ctx) //nolint:errcheck // best-effort
+			if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+				return BootstrapResult{}, fmt.Errorf("rollback after race: %w", rbErr)
+			}
 			return s.bootstrapCheckExistingTx(ctx, p)
 		}
 		return BootstrapResult{}, fmt.Errorf("claim username: %w", err)
@@ -178,12 +180,16 @@ func (s *Store) BootstrapAccount(ctx context.Context, p BootstrapParams) (Bootst
 // bootstrapCheckExistingTx opens a fresh transaction and runs the idempotency
 // check. Used when the original transaction was aborted (e.g. after a 23505
 // unique violation) and must not be reused.
-func (s *Store) bootstrapCheckExistingTx(ctx context.Context, p BootstrapParams) (BootstrapResult, error) {
+func (s *Store) bootstrapCheckExistingTx(ctx context.Context, p BootstrapParams) (res BootstrapResult, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return BootstrapResult{}, fmt.Errorf("begin: %w", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	defer func() {
+		if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			err = fmt.Errorf("rollback in fresh tx: %w", rbErr)
+		}
+	}()
 
 	var existing db.Username
 	err = tx.QueryRow(ctx, `
