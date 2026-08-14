@@ -37,9 +37,9 @@ type Config struct {
 	AdminListenAddr string
 	// AdminTokenHash is the hex-encoded SHA-256 digest of the operator token.
 	// Only set when AdminListenAddr is non-empty.
-	AdminTokenHash   string
-	PostgresDSN      string
-	RSAKeyPath       string
+	AdminTokenHash string
+	PostgresDSN    string
+	RSAKeyPath     string
 	// RegistrationMode controls whether auth.signUp is available.
 	RegistrationMode RegistrationMode
 	// AuthKeyEncKey is the 32-byte master key that encrypts auth keys at rest.

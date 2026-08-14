@@ -94,6 +94,29 @@ func (q *Queries) GetRateLimitExpiresAt(ctx context.Context, arg GetRateLimitExp
 	return expires_at, err
 }
 
+const refundRateLimit = `-- name: RefundRateLimit :exec
+UPDATE rate_limits
+SET token_count = GREATEST(token_count - 1, 0)
+WHERE subject_id = $1
+  AND surface = $2
+  AND window_start = $3
+`
+
+type RefundRateLimitParams struct {
+	SubjectID   int64
+	Surface     string
+	WindowStart pgtype.Timestamptz
+}
+
+// Refund one token for a previously consumed rate-limit counter. Used after
+// a valid SRP proof in auth.checkPassword to return the reserved token.
+// Guarded on window_start so a refund never lands in a later window:
+// once the window rolls, tokens consumed in it are gone.
+func (q *Queries) RefundRateLimit(ctx context.Context, arg RefundRateLimitParams) error {
+	_, err := q.db.Exec(ctx, refundRateLimit, arg.SubjectID, arg.Surface, arg.WindowStart)
+	return err
+}
+
 const sweepExpiredRateLimits = `-- name: SweepExpiredRateLimits :execrows
 DELETE FROM rate_limits
 WHERE expires_at < now()

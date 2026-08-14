@@ -148,3 +148,70 @@ func (s *Store) ChargeRateLimit(ctx context.Context, subjectID int64, surface st
 		Column3:   pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
 	})
 }
+
+// ReserveRateLimit atomically reserves a token for the given subject/surface.
+// Returns a RateLimitReservation on success (carrying the window start for
+// potential refunds), a RateLimitResult on denial, or an error on storage
+// failure.
+//
+// This is the admission step for the reserve-then-refund pattern used by
+// auth.checkPassword: a token is consumed before SRP verification, and
+// refunded on a valid proof.
+func (s *Store) ReserveRateLimit(ctx context.Context, subjectID int64, surface string, cfg RateLimitConfig) (*RateLimitReservation, *RateLimitResult, error) {
+	if !cfg.enabled() {
+		return nil, nil, nil
+	}
+
+	row, err := s.q.TryConsumeRateLimit(ctx, db.TryConsumeRateLimitParams{
+		SubjectID:  subjectID,
+		Surface:    surface,
+		Column3:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
+		TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
+	})
+	if err == nil {
+		// Allowed — token was consumed.
+		return &RateLimitReservation{WindowStart: row.WindowStart.Time}, nil, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, fmt.Errorf("reserve rate limit: %w", err)
+	}
+
+	// Test hook: fires after INSERT denial, before GET.
+	if s.deniedHook != nil {
+		s.deniedHook()
+	}
+
+	// Denied — read expires_at in a fresh snapshot.
+	expiresAt, err := s.q.GetRateLimitExpiresAt(ctx, db.GetRateLimitExpiresAtParams{
+		SubjectID: subjectID,
+		Surface:   surface,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Row swept between INSERT and GET — window has expired, allow.
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("get rate limit: %w", err)
+	}
+
+	return nil, &RateLimitResult{Wait: waitUntil(s.now(), expiresAt.Time)}, nil
+}
+
+// RateLimitReservation carries the window start from a successful token
+// reservation, so a refund can be scoped to the same window.
+type RateLimitReservation struct {
+	WindowStart time.Time
+}
+
+// RefundRateLimit refunds one token for a previously reserved rate-limit
+// counter. Guarded on window_start so a refund never lands in a later window.
+func (s *Store) RefundRateLimit(ctx context.Context, subjectID int64, surface string, res *RateLimitReservation) error {
+	if res == nil {
+		return nil
+	}
+	return s.q.RefundRateLimit(ctx, db.RefundRateLimitParams{
+		SubjectID:   subjectID,
+		Surface:     surface,
+		WindowStart: pgtype.Timestamptz{Time: res.WindowStart, Valid: true},
+	})
+}

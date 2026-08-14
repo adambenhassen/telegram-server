@@ -124,6 +124,60 @@ func TestGetPasswordIPRateLimit(t *testing.T) {
 	}
 }
 
+// TestCheckPasswordFailedProofCharges proves that a failed SRP proof keeps
+// the reserved token consumed (no refund on failure). The refund-on-success
+// path is tested at the store level in TestReserveAndRefund.
+func TestCheckPasswordFailedProofCharges(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551296301")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set a password for alice.
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   alice.ID,
+		Salt1:    []byte("salt1"),
+		Salt2:    []byte("salt2"),
+		Verifier: make([]byte, 256),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Register auth key and stage alice as pending.
+	var authKeyID [8]byte
+	authKeyID[7] = 4
+	keyID := mtproto.AuthKeyIDInt64(authKeyID)
+	if err := s.SaveAuthKey(ctx, keyID, []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPendingUser(ctx, keyID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := netip.MustParseAddr("192.0.2.4")
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+
+	// One failed attempt consumes the only token.
+	_, err = api.CheckPasswordForTestWithLimits(s, authKeyID, addr, cfg, cfg, &tg.AuthCheckPasswordRequest{
+		Password: &tg.InputCheckPasswordSRP{SRPID: 0, A: make([]byte, 256), M1: make([]byte, 256)},
+	})
+	if err == nil {
+		t.Fatal("expected error from failed SRP proof")
+	}
+
+	// A second attempt should be denied with FLOOD_WAIT (token consumed, no refund on failure).
+	_, err = api.CheckPasswordForTestWithLimits(s, authKeyID, addr, cfg, cfg, &tg.AuthCheckPasswordRequest{
+		Password: &tg.InputCheckPasswordSRP{SRPID: 0, A: make([]byte, 256), M1: make([]byte, 256)},
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("expected FLOOD_WAIT, got %v", err)
+	}
+}
+
 // TestGetPasswordAuthenticatedExempt proves that a fully authenticated caller
 // (r.UserID != 0) is not subject to the getPassword IP rate limit.
 func TestGetPasswordAuthenticatedExempt(t *testing.T) {

@@ -86,3 +86,14 @@ ON CONFLICT (subject_id, surface) DO UPDATE SET
         WHEN rate_limits.expires_at <= now() THEN now() + $3::INTERVAL
         ELSE rate_limits.expires_at
     END;
+
+-- name: RefundRateLimit :exec
+-- Refund one token for a previously consumed rate-limit counter. Used after
+-- a valid SRP proof in auth.checkPassword to return the reserved token.
+-- Guarded on window_start so a refund never lands in a later window:
+-- once the window rolls, tokens consumed in it are gone.
+UPDATE rate_limits
+SET token_count = GREATEST(token_count - 1, 0)
+WHERE subject_id = $1
+  AND surface = $2
+  AND window_start = $3;

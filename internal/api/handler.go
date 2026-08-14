@@ -244,54 +244,8 @@ func (h *handlers) checkRateLimit(r *mtproto.Request, surface string, cfg store.
 	return nil
 }
 
-// checkRateLimitIPBudget checks the per-IP rate limit budget for the given
-// surface without consuming a token. Returns a RateLimitResult when denied,
-// nil when allowed, or an error (FLOOD_WAIT for no client address, or wrapped
-// for storage errors).
-func (h *handlers) checkRateLimitIPBudget(r *mtproto.Request, surface string, cfg store.RateLimitConfig) (*store.RateLimitResult, error) {
-	if !cfg.Enabled() {
-		return nil, nil //nolint:nilnil // disabled config is not an error
-	}
-	key, ok := store.IPBucketKey(r.ClientAddr)
-	if !ok {
-		// No valid address: refuse rather than wave through.
-		return nil, FloodWaitError(int(cfg.Window / time.Second))
-	}
-	subjectID, err := keyToSubjectID(key)
-	if err != nil {
-		h.log.Error("rate limit: convert IP to subject", "err", err)
-		return nil, errInternal
-	}
-	result, err := h.store.CheckRateLimitBudget(r.Ctx, subjectID, surface, cfg)
-	if err != nil {
-		h.log.Error("rate limit: IP budget check", "err", err)
-		return nil, errInternal
-	}
-	return result, nil
-}
-
-// chargeRateLimitIP charges the per-IP rate limit counter for the given
-// surface. It is the write half of the check-then-charge pattern: called only
-// after a failure, so it always increments (or seeds at 1).
-func (h *handlers) chargeRateLimitIP(r *mtproto.Request, surface string, cfg store.RateLimitConfig) error {
-	if !cfg.Enabled() {
-		return nil
-	}
-	key, ok := store.IPBucketKey(r.ClientAddr)
-	if !ok {
-		return nil
-	}
-	subjectID, err := keyToSubjectID(key)
-	if err != nil {
-		h.log.Error("rate limit: convert IP to subject", "err", err)
-		return err
-	}
-	return h.store.ChargeRateLimit(r.Ctx, subjectID, surface, cfg)
-}
-
 // checkAndChargeRateLimitIP atomically checks and charges the per-IP rate limit
-// for the given surface. Unlike the check-then-charge pattern used by
-// checkPassword, this is a single atomic INSERT-ON-CONFLICT, so concurrent
+// for the given surface. Single atomic INSERT-ON-CONFLICT, so concurrent
 // bursts cannot all pass before any charge. Returns nil when allowed, or a
 // FLOOD_WAIT error when denied.
 func (h *handlers) checkAndChargeRateLimitIP(r *mtproto.Request, surface string, cfg store.RateLimitConfig) error {
@@ -316,6 +270,43 @@ func (h *handlers) checkAndChargeRateLimitIP(r *mtproto.Request, surface string,
 		return FloodWaitError(int(result.Wait / time.Second))
 	}
 	return nil
+}
+
+// reserveRateLimitIP atomically reserves a token for the per-IP rate limit.
+// Returns a reservation on success, a denial result on rejection, or an error
+// on storage failure. Used by checkPassword for the reserve-then-refund pattern.
+func (h *handlers) reserveRateLimitIP(r *mtproto.Request, surface string, cfg store.RateLimitConfig) (*store.RateLimitReservation, *store.RateLimitResult, error) {
+	if !cfg.Enabled() {
+		return nil, nil, nil
+	}
+	key, ok := store.IPBucketKey(r.ClientAddr)
+	if !ok {
+		return nil, nil, FloodWaitError(int(cfg.Window / time.Second))
+	}
+	subjectID, err := keyToSubjectID(key)
+	if err != nil {
+		h.log.Error("rate limit: convert IP to subject", "err", err)
+		return nil, nil, errInternal
+	}
+	return h.store.ReserveRateLimit(r.Ctx, subjectID, surface, cfg)
+}
+
+// refundRateLimitIP refunds a previously reserved per-IP rate-limit token.
+// No-op when the reservation is nil.
+func (h *handlers) refundRateLimitIP(r *mtproto.Request, surface string, res *store.RateLimitReservation) error {
+	if res == nil {
+		return nil
+	}
+	key, ok := store.IPBucketKey(r.ClientAddr)
+	if !ok {
+		return nil
+	}
+	subjectID, err := keyToSubjectID(key)
+	if err != nil {
+		h.log.Error("rate limit: convert IP to subject", "err", err)
+		return err
+	}
+	return h.store.RefundRateLimit(r.Ctx, subjectID, surface, res)
 }
 
 // provisionalAllowList holds the method IDs that a provisional session may call.

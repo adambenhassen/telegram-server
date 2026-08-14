@@ -67,23 +67,30 @@ func (h *handlers) handleGetPassword(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errMethodNotImpl
 	}
 
-	// Per-IP rate limit for unauthenticated callers only. Uses atomic
-	// check-and-charge to prevent concurrent bursts from all passing before
-	// any charge.
-	if r.UserID == 0 {
-		if err := h.checkAndChargeRateLimitIP(r, "get_password_ip", h.rateLimitGetPasswordIP); err != nil {
-			return nil, err
-		}
-	}
-
+	// Resolve the target user before rate limiting, so an anonymous key
+	// (no pending state) fails with AUTH_KEY_UNREGISTERED before burning
+	// shared IP budget.
 	target, rpc := h.resolvePasswordUser(r)
 	if rpc != nil {
 		return nil, rpc
 	}
+
+	// Look up password state early so the rate limit only fires when a
+	// modexp will actually run.
 	pw, hasPw, err := h.store.PasswordByUser(r.Ctx, target)
 	if err != nil {
 		h.log.Error("get password: lookup", "user_id", target, "err", err)
 		return nil, errInternal
+	}
+
+	// Per-IP rate limit for unauthenticated callers only. Uses atomic
+	// check-and-charge to prevent concurrent bursts. Only applies when the
+	// caller is in pending state (r.UserID == 0) and the target has a password
+	// (so a modexp will actually run).
+	if r.UserID == 0 && hasPw {
+		if err := h.checkAndChargeRateLimitIP(r, "get_password_ip", h.rateLimitGetPasswordIP); err != nil {
+			return nil, err
+		}
 	}
 
 	newSalt1, err := randBytes(saltLen)
@@ -145,8 +152,9 @@ func (h *handlers) resolvePasswordUser(r *mtproto.Request) (int64, *tgerr.Error)
 //
 // Rate limits are checked before SRP verification so the (N+1)th guess is
 // blocked without the cost of evaluating the proof. Both per-account and
-// per-IP limits are charged only on failed attempts — a valid proof is never
-// charged.
+// per-IP limits use a reserve-then-refund pattern: a token is atomically
+// consumed before SRP verification, and refunded on a valid proof. This
+// prevents concurrent bursts from bypassing the limit.
 func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthCheckPasswordRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -163,33 +171,41 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 		return nil, rpc
 	}
 
-	// Rate limits run before SRP verification. Budget is checked (read-only)
-	// first; if over limit, FLOOD_WAIT is returned without evaluating the proof.
-	// On a failed proof, the counter is charged. On success, nothing is charged.
-	if rl, err := h.store.CheckRateLimitBudget(r.Ctx, pendingUserID, "check_password", h.rateLimitCheckPassword); err != nil {
-		h.log.Error("check password: rate limit budget", "err", err)
+	// Reserve tokens atomically before SRP verification. If over limit,
+	// FLOOD_WAIT is returned without evaluating the proof.
+	accountReserve, rl, err := h.store.ReserveRateLimit(r.Ctx, pendingUserID, "check_password", h.rateLimitCheckPassword)
+	if err != nil {
+		h.log.Error("check password: rate limit reserve", "err", err)
 		return nil, errInternal
-	} else if rl != nil {
+	}
+	if rl != nil {
 		return nil, FloodWaitError(int(rl.Wait / time.Second))
 	}
-	if rl, err := h.checkRateLimitIPBudget(r, "check_password_ip", h.rateLimitCheckPasswordIP); err != nil {
+
+	ipReserve, rl, err := h.reserveRateLimitIP(r, "check_password_ip", h.rateLimitCheckPasswordIP)
+	if err != nil {
 		return nil, err
-	} else if rl != nil {
+	}
+	if rl != nil {
+		// Refund the account token since we're denying.
+		if err := h.store.RefundRateLimit(r.Ctx, pendingUserID, "check_password", accountReserve); err != nil {
+			h.log.Error("check password: refund account reserve", "err", err)
+		}
 		return nil, FloodWaitError(int(rl.Wait / time.Second))
 	}
 
 	userID, rpc := h.consumeAndVerify(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID), proof)
 	if rpc != nil {
-		// Failed proof: charge the rate limit counters. Errors are logged but
-		// not surfaced: the client already received the password error, and a
-		// failed charge is a storage issue that does not change the outcome.
-		if err := h.store.ChargeRateLimit(r.Ctx, pendingUserID, "check_password", h.rateLimitCheckPassword); err != nil {
-			h.log.Error("check password: charge rate limit", "err", err)
-		}
-		if err := h.chargeRateLimitIP(r, "check_password_ip", h.rateLimitCheckPasswordIP); err != nil {
-			h.log.Error("check password: charge IP rate limit", "err", err)
-		}
+		// Failed proof: tokens remain consumed (no refund).
 		return nil, rpc
+	}
+
+	// Valid proof: refund both reserved tokens.
+	if err := h.store.RefundRateLimit(r.Ctx, pendingUserID, "check_password", accountReserve); err != nil {
+		h.log.Error("check password: refund account reserve", "err", err)
+	}
+	if err := h.refundRateLimitIP(r, "check_password_ip", ipReserve); err != nil {
+		h.log.Error("check password: refund IP reserve", "err", err)
 	}
 
 	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
