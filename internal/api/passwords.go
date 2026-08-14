@@ -74,6 +74,9 @@ func (h *handlers) handleGetPassword(r *mtproto.Request) (bin.Encoder, error) {
 		} else if rl != nil {
 			return nil, FloodWaitError(int(rl.Wait / time.Second))
 		}
+		if err := h.chargeRateLimitIP(r, "get_password_ip", h.rateLimitGetPasswordIP); err != nil {
+			h.log.Error("get password: charge IP rate limit", "err", err)
+		}
 	}
 
 	target, rpc := h.resolvePasswordUser(r)
