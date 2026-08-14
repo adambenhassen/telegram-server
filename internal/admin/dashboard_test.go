@@ -238,7 +238,7 @@ func TestDashboardHandler_503_on_db_error(t *testing.T) {
 	}
 
 	registry := mtproto.NewSessionRegistry()
-	h := admin.DashboardHandler(registry, st)
+	h := admin.DashboardHandler(registry, st, authTestTokenHash())
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/admin/dashboard", nil)
 	rec := httptest.NewRecorder()
