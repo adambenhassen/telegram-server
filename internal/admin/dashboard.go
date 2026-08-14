@@ -553,12 +553,10 @@ tr:last-child td { border-bottom: none; }
           <dl class="stat-tile">
             <dt class="stat-label">Active last 24 hours</dt>
             <dd class="stat-value" id="v-active_users_24h" data-metric="active_users_24h">{{.ActiveUsers24H}}</dd>
-            {{if .ActiveUsersMeta}}
-            <div class="meter-wrap" id="meter-wrap" data-total="{{.TotalUsers}}" data-active="{{.ActiveUsers24H}}">
+            <div class="meter-wrap{{if not .ActiveUsersMeta}} hidden{{end}}" id="meter-wrap">
               <div class="meter" role="presentation"><div class="meter-fill" id="meter-fill" style="width:{{printf "%.0f" .ActiveUsersPct}}%"></div></div>
               <div class="meter-text" id="meter-text">{{.ActiveUsersMeta}}</div>
             </div>
-            {{end}}
           </dl>
         </div>
       </div>
@@ -683,10 +681,10 @@ tr:last-child td { border-bottom: none; }
   var bannerOut    = document.getElementById('banner-signedout');
   var bannerDcText = document.getElementById('banner-dc-text');
 
-  var lastOk = Date.now();  // time of last successful 200
+  var lastOk = Date.now();   // time of last successful 200
+  var lastFailed = false;    // true when the last fetch errored (network, non-2xx, JSON)
   var paused = false;
   var signedOut = false;
-  var interval = 10000;
   var backoff = 10000;
   var timer = null;
   var fetching = false;
@@ -728,12 +726,12 @@ tr:last-child td { border-bottom: none; }
     if (signedOut) { setChip('chip-critical', 'Signed out', true); return; }
     if (paused) { setChip('chip-paused', '⏸ Paused · updated ' + ago(Date.now() - lastOk), false); return; }
     var age = Date.now() - lastOk;
-    if (age <= 40000) {
-      setChip('chip-good', '● Live · updated ' + ago(age), true);
-    } else if (age <= 120000) {
-      setChip('chip-warning', '● Stale · updated ' + ago(age), true);
-    } else {
+    if (lastFailed || age > 120000) {
       setChip('chip-critical', '● Disconnected · last updated ' + ago(age), true);
+    } else if (age <= 40000) {
+      setChip('chip-good', '● Live · updated ' + ago(age), true);
+    } else {
+      setChip('chip-warning', '● Stale · updated ' + ago(age), true);
     }
   }
 
@@ -749,8 +747,8 @@ tr:last-child td { border-bottom: none; }
 
   function updateBanners(age) {
     if (signedOut) { showBanner(bannerOut); return; }
-    if (age > 120000) {
-      bannerDcText.textContent = "Can't reach the server. Last updated " + ago(age) + '.';
+    if (lastFailed || age > 120000) {
+      bannerDcText.textContent = "Can't reach the server. Last updated " + ago(Date.now() - lastOk) + '.';
       showBanner(bannerDc);
     } else {
       showBanner(null);
@@ -781,28 +779,53 @@ tr:last-child td { border-bottom: none; }
     });
   }
 
-  // Patch active users meter
+  // Patch active users meter. The scaffold is always in the DOM (even when
+  // initial total_users=0), so elements are always found.
   function patchMeter(data) {
     var wrap = document.getElementById('meter-wrap');
     var fill = document.getElementById('meter-fill');
     var txt  = document.getElementById('meter-text');
-    if (!fill || !txt) return;
+    if (!wrap || !fill || !txt) return;
     var total  = data.total_users || 0;
     var active = data.active_users_24h || 0;
     if (total <= 0) {
-      if (wrap) wrap.classList.add('hidden');
+      wrap.classList.add('hidden');
       return;
     }
     var pct = Math.min(100, active / total * 100);
     fill.style.width = pct.toFixed(0) + '%';
     txt.textContent = formatN(active) + ' of ' + formatN(total) + ' (' + Math.round(pct) + '%)';
-    if (wrap) wrap.classList.remove('hidden');
+    wrap.classList.remove('hidden');
   }
 
   // Patch empty-deployment banner
   function patchEmptyBanner(data) {
     var none = (data.total_users === 0) && (data.connections === 0) && (data.messages_24h === 0);
     bannerEmpty.classList.toggle('hidden', !none);
+  }
+
+  // Uninstrumented field label map (mirrors Go-side uninstrumentedLabels).
+  var uninstrLabels = {
+    'notify_count':        'NOTIFY events per hour',
+    'push_latency_p50_ms': 'Push latency p50',
+    'push_latency_p95_ms': 'Push latency p95',
+  };
+
+  // Rebuild uninstrSet and the card DOM from each poll response.
+  // This ensures a field newly listed in a response stops rendering as a
+  // number and appears in the card immediately.
+  function patchUninstrumented(data) {
+    var arr = data.uninstrumented;
+    if (!Array.isArray(arr)) return;
+    uninstrSet = new Set(arr);
+    var list = document.querySelector('.uninstr-list');
+    if (!list) return;
+    list.innerHTML = '';
+    arr.forEach(function(field) {
+      var li = document.createElement('li');
+      li.textContent = uninstrLabels[field] || field;
+      list.appendChild(li);
+    });
   }
 
   // Patch storage table
@@ -864,24 +887,26 @@ tr:last-child td { border-bottom: none; }
       .then(function(data) {
         if (!data) return;
         lastOk = Date.now();
+        lastFailed = false;
         backoff = 10000;
         fetching = false;
         document.body.classList.remove('fetching');
+        patchUninstrumented(data); // rebuild uninstrSet before patchScalars reads it
         patchScalars(data);
         patchMeter(data);
-        patchEmptyBanner(data);
         patchStorage(data);
         updateChip();
-        updateBanners(0);
+        updateBanners(0);        // clear disconnect banners first
+        patchEmptyBanner(data);  // then show empty-alert if all-zeros
         scheduleNext(10000);
       })
       .catch(function() {
         fetching = false;
+        lastFailed = true;
         document.body.classList.remove('fetching');
         backoff = Math.min(backoff * 2, 60000);
         updateChip();
-        var age = Date.now() - lastOk;
-        updateBanners(age);
+        updateBanners(0); // lastFailed=true forces Disconnected regardless of age
         scheduleNext(backoff);
       });
   }
