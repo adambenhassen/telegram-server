@@ -234,6 +234,13 @@ var provisionalAllowList = map[uint32]bool{
 	tg.AuthLogOutRequestTypeID:                    true,
 }
 
+// provisionalBlocked reports whether req hits the provisional gate for a
+// registered method with the given TL constructor id. It is the single
+// predicate used by both registerRevoke and handleUnknownGated.
+func provisionalBlocked(id uint32, req *mtproto.Request) bool {
+	return req.UserID != 0 && req.Provisional && !provisionalAllowList[id]
+}
+
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
 	registerRevoke(d, id, func(req *mtproto.Request) (bin.Encoder, func(), error) {
 		res, err := fn(req)
@@ -251,7 +258,7 @@ func registerRevoke(d *mtproto.Dispatcher, id uint32, fn revokeFunc) {
 		// Provisional gate: blocks all authorized RPCs except the allow-list.
 		// Does not apply when UserID == 0 (unauthenticated keys already
 		// handled per-method).
-		if req.UserID != 0 && req.Provisional && !provisionalAllowList[id] {
+		if provisionalBlocked(id, req) {
 			return c.SendErr(req, errAuthKeyUnreg)
 		}
 		res, afterReply, err := fn(req)
