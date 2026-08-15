@@ -37,6 +37,49 @@ FROM users u
 LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 WHERE u.id = $1;
 
+-- name: UsersByID :many
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM users u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
+WHERE u.id = ANY(sqlc.arg(ids)::bigint[]);
+
+-- name: EntitledUserIDs :many
+-- Returns the subset of ids the viewer is entitled to see live. An id is
+-- entitled iff any of the four live edges holds:
+--   1. the id is the viewer themself;
+--   2. the two share a 1:1 dialog row (peer_type = 1);
+--   3. both are current participants of some chat;
+--   4. both are current members of some channel, and neither is banned at now().
+-- The channel edge requires the VIEWER's own row to be unbanned as well: a
+-- banned viewer is not a current member, so the channel admits nothing for
+-- them. The ban predicate is the same one ChannelMember.Banned uses in Go:
+-- banned_until IS NULL OR banned_until <= now().
+SELECT id FROM (
+    SELECT sqlc.arg(ids)::bigint[] AS id_arr
+) seed, UNNEST(seed.id_arr) AS id
+WHERE id = sqlc.arg(viewer_id)::bigint
+   OR EXISTS (
+       SELECT 1 FROM dialogs d
+       WHERE d.peer_type = 1
+         AND ((d.owner_id = sqlc.arg(viewer_id)::bigint AND d.peer_id = id)
+           OR (d.owner_id = id AND d.peer_id = sqlc.arg(viewer_id)::bigint))
+   )
+   OR EXISTS (
+       SELECT 1 FROM chat_participants p1
+       JOIN chat_participants p2 ON p1.chat_id = p2.chat_id
+       WHERE p1.user_id = sqlc.arg(viewer_id)::bigint
+         AND p2.user_id = id
+   )
+   OR EXISTS (
+       SELECT 1 FROM channel_participants v
+       JOIN channel_participants m ON v.channel_id = m.channel_id
+       WHERE v.user_id = sqlc.arg(viewer_id)::bigint
+         AND m.user_id = id
+         AND (v.banned_until IS NULL OR v.banned_until <= now())
+         AND (m.banned_until IS NULL OR m.banned_until <= now())
+   );
+
 -- name: SetUserStatus :execrows
 UPDATE users SET is_online = $2, last_seen_at = now() WHERE id = $1;
 

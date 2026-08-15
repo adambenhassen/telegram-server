@@ -592,3 +592,41 @@ func TestCreateUserPhoneModeUnchanged(t *testing.T) {
 		t.Errorf("login_mode = %q, want phone", loginMode)
 	}
 }
+
+func TestUsersByIDBatchedLookup(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551260101")
+	b := mustUser(t, s, "+15551260102")
+	c := mustUser(t, s, "+15551260103")
+
+	got, err := s.UsersByID(ctx, []int64{a.ID, b.ID, c.ID, 987654321})
+	if err != nil {
+		t.Fatalf("users by id: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d users, want 3 (absent id omitted)", len(got))
+	}
+	for _, id := range []int64{a.ID, b.ID, c.ID} {
+		u, ok := got[id]
+		if !ok {
+			t.Fatalf("missing user %d", id)
+		}
+		if u.ID != id {
+			t.Fatalf("user id = %d, want %d", u.ID, id)
+		}
+	}
+	if _, ok := got[987654321]; ok {
+		t.Fatal("absent id present in result")
+	}
+
+	// Empty set returns an empty map without an error.
+	empty, err := s.UsersByID(ctx, nil)
+	if err != nil {
+		t.Fatalf("empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty = %d, want 0", len(empty))
+	}
+}

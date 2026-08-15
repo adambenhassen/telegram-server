@@ -190,6 +190,55 @@ func (s *Store) UserByID(ctx context.Context, id int64) (User, bool, error) {
 	return UserFromDB(u), true, nil
 }
 
+// UsersByID returns every user in ids in one query, keyed by id. Absent ids
+// are simply missing from the map. It is the batched counterpart of UserByID
+// for callers that hydrate a whole id set at once.
+func (s *Store) UsersByID(ctx context.Context, ids []int64) (map[int64]User, error) {
+	if len(ids) == 0 {
+		return map[int64]User{}, nil
+	}
+	rows, err := s.q.UsersByID(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("users by id: %w", err)
+	}
+	out := make(map[int64]User, len(rows))
+	for _, r := range rows {
+		out[r.ID] = UserFromDB(db.UserByIDRow(r))
+	}
+	return out, nil
+}
+
+// EntitledUserIDs returns the subset of ids the viewer is entitled to see
+// live, in one query. An id is entitled iff any of the four live edges holds:
+// the id is the viewer, the two share a 1:1 dialog row, both are current
+// participants of some chat, or both are current unbanned members of some
+// channel. The channel edge requires the viewer's own row to be unbanned as
+// well: a banned viewer is not a current member, so the channel admits nothing
+// for them. This is the single round-trip predicate loadUsers uses; it
+// replaces the per-edge fan-out that would otherwise materialize the viewer's
+// entire dialog, chat and channel neighbourhood on every call.
+func (s *Store) EntitledUserIDs(ctx context.Context, viewerID int64, ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.q.EntitledUserIDs(ctx, db.EntitledUserIDsParams{
+		ViewerID: viewerID,
+		Ids:      ids,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("entitled user ids: %w", err)
+	}
+	out := make([]int64, len(rows))
+	for i, r := range rows {
+		id, ok := r.(int64)
+		if !ok {
+			return nil, fmt.Errorf("entitled user ids: unexpected type %T for row %d", r, i)
+		}
+		out[i] = id
+	}
+	return out, nil
+}
+
 // UserByPhone returns the user for phone, ok=false when absent.
 func (s *Store) UserByPhone(ctx context.Context, phone string) (User, bool, error) {
 	normalized := NormalizePhone(phone)
@@ -267,8 +316,8 @@ func (s *Store) SetUserStatus(ctx context.Context, userID int64, online bool) er
 	return nil
 }
 
-// DialogPartners returns the distinct set of user IDs that share a non-deleted
-// 1:1 dialog with userID. Used as the fan-out target set for status changes.
+// DialogPartners returns the distinct set of user IDs that share a 1:1 dialog
+// row with userID. Used as the fan-out target set for status changes.
 func (s *Store) DialogPartners(ctx context.Context, userID int64) ([]int64, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT CASE d.owner_id WHEN $1 THEN d.peer_id ELSE d.owner_id END AS partner_id
