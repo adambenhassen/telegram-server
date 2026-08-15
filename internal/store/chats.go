@@ -131,6 +131,24 @@ func (s *Store) Participants(ctx context.Context, chatID int64) ([]Participant, 
 	return out, nil
 }
 
+// ChatParticipantsOfChats returns the participant rows of every chat in
+// chatIDs in one query, so a caller can decide who shares a chat with a
+// viewer across the whole set without one query per chat.
+func (s *Store) ChatParticipantsOfChats(ctx context.Context, chatIDs []int64) ([]Participant, error) {
+	if len(chatIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.q.ChatParticipantsOfChats(ctx, chatIDs)
+	if err != nil {
+		return nil, fmt.Errorf("chat participants of chats: %w", err)
+	}
+	out := make([]Participant, len(rows))
+	for i, r := range rows {
+		out[i] = Participant{UserID: r.UserID, InviterID: r.InviterID, Date: r.Date.Time}
+	}
+	return out, nil
+}
+
 // IsMember reports whether userID is a participant of chatID. This is the whole
 // authorization boundary for the chat RPCs: an unknown chat id and a non-member
 // both report false, and nothing but a chat_participants row makes it true.

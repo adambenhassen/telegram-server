@@ -98,6 +98,36 @@ func (q *Queries) ChatParticipants(ctx context.Context, chatID int64) ([]ChatPar
 	return items, nil
 }
 
+const chatParticipantsOfChats = `-- name: ChatParticipantsOfChats :many
+SELECT chat_id, user_id, inviter_id, date FROM chat_participants
+WHERE chat_id = ANY($1::bigint[])
+`
+
+func (q *Queries) ChatParticipantsOfChats(ctx context.Context, chatIds []int64) ([]ChatParticipant, error) {
+	rows, err := q.db.Query(ctx, chatParticipantsOfChats, chatIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChatParticipant
+	for rows.Next() {
+		var i ChatParticipant
+		if err := rows.Scan(
+			&i.ChatID,
+			&i.UserID,
+			&i.InviterID,
+			&i.Date,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const chatsForUser = `-- name: ChatsForUser :many
 SELECT c.id, c.title, c.creator_id, c.version, c.date, c.pinned_message_id FROM chats c
 JOIN chat_participants p ON p.chat_id = c.id

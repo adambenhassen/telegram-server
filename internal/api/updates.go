@@ -585,18 +585,20 @@ func (h *handlers) entitledUserIDs(ctx context.Context, viewerID int64, ids []in
 	for _, id := range partners {
 		out[id] = true
 	}
+	chatIDs := []int64{}
 	chats, err := h.store.ChatsForUser(ctx, viewerID)
 	if err != nil {
 		return nil, err
 	}
 	for _, c := range chats {
-		parts, err := h.store.Participants(ctx, c.ID)
-		if err != nil {
-			return nil, err
-		}
-		for _, p := range parts {
-			out[p.UserID] = true
-		}
+		chatIDs = append(chatIDs, c.ID)
+	}
+	parts, err := h.store.ChatParticipantsOfChats(ctx, chatIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range parts {
+		out[p.UserID] = true
 	}
 	channelIDs := []int64{}
 	channels, err := h.store.ChannelsForUser(ctx, viewerID)
