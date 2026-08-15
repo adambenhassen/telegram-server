@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -327,6 +328,57 @@ func PeerDeriver() *peerhash.Deriver {
 		panic(err)
 	}
 	return d
+}
+
+// DSNFor clones a fresh database from the template and returns its connection
+// string, for non-testing entry points such as the Playwright e2e server
+// (test/e2e/admin_server.go). The database is dropped when the returned
+// cleanup function runs; the caller owns its lifetime. out receives setup
+// diagnostics.
+func DSNFor(out io.Writer) (string, func(), error) {
+	if err := Prewarm(); err != nil {
+		return "", nil, err
+	}
+
+	ctx := context.Background()
+	name := "t_" + randNameNoT()
+
+	conn, err := pgx.Connect(ctx, adminDSN)
+	if err != nil {
+		return "", nil, fmt.Errorf("admin connect: %w", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close of admin conn
+
+	// G201 is not a risk here: name is internally-generated hex and templateName
+	// is a constant prefix + hex hash; Postgres DDL cannot bind identifiers.
+	if _, err := conn.Exec(ctx,
+		fmt.Sprintf(`CREATE DATABASE %s TEMPLATE %s`, name, templateName),
+	); err != nil {
+		return "", nil, fmt.Errorf("clone db: %w", err)
+	}
+
+	return replaceDBName(adminDSN, name), func() {
+		dctx := context.Background()
+		dconn, err := pgx.Connect(dctx, adminDSN)
+		if err != nil {
+			_, _ = fmt.Fprintf(out, "pgtest cleanup connect: %v\n", err) //nolint:errcheck // diagnostics only
+			return
+		}
+		defer func() { _ = dconn.Close(dctx) }() //nolint:errcheck // best-effort close of cleanup conn
+		if _, err := dconn.Exec(dctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, name)); err != nil {
+			_, _ = fmt.Fprintf(out, "pgtest cleanup drop %s: %v\n", name, err) //nolint:errcheck // diagnostics only
+		}
+	}, nil
+}
+
+// randNameNoT generates a random hex name without a testing.TB, for entry
+// points outside the test framework.
+func randNameNoT() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("pgtest rand: %v", err))
+	}
+	return hex.EncodeToString(b)
 }
 
 // Prewarm triggers the one-time container setup (image pull and boot) outside of

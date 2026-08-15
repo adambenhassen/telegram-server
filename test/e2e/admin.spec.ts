@@ -1,0 +1,187 @@
+import { expect, test, type Page, type Response } from '@playwright/test';
+
+// The admin token the Go e2e server (test/e2e/adminserver) was started with.
+const ADMIN_TOKEN = 'e2e-secret-token';
+
+const SESSION_COOKIE = '__Host-admin-session';
+const CSRF_COOKIE = '__Host-csrf-token';
+
+// extractCsrfToken pulls the token out of a rendered form field. The tests
+// deliberately never compute tokens: a template change that drops the field
+// must fail the test, not silently pass.
+async function extractCsrfToken(page: Page, url: string): Promise<string> {
+  const response = await page.goto(url);
+  expect(response, `GET ${url}`).not.toBeNull();
+  expect(response!.status(), `GET ${url} status`).toBe(200);
+  const token = await page.locator('input[name="csrf_token"]').getAttribute('value');
+  expect(token, `csrf_token field on ${url}`).toMatch(/^[0-9a-f]{64}$/);
+  return token;
+}
+
+// login drives the real login form and returns the session cookie value.
+async function login(page: Page): Promise<string> {
+  await extractCsrfToken(page, '/admin/login');
+  await page.locator('input[name="token"]').fill(ADMIN_TOKEN);
+  const [response] = await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().includes('/admin/login') && r.request().method() === 'POST',
+      { timeout: 15_000 },
+    ),
+    page.locator('form[action="/admin/login"] button[type="submit"]').click(),
+  ]);
+  expect(response.status(), 'login POST status').toBe(302);
+
+  const session = (await page.context().cookies()).find((c) => c.name === SESSION_COOKIE);
+  expect(session, 'session cookie after login').toBeTruthy();
+  return session!.value;
+}
+
+// logoutFromDashboard submits the dashboard's logout form and returns the
+// final response after the redirect chain.
+async function logoutFromDashboard(page: Page): Promise<Response> {
+  await extractCsrfToken(page, '/admin/dashboard');
+  const [response] = await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().includes('/admin/logout') && r.request().method() === 'POST',
+      { timeout: 15_000 },
+    ),
+    page.locator('form.logout-form button[type="submit"]').click(),
+  ]);
+  expect(response.status(), 'logout POST status').toBe(302);
+  // The 302 lands on /admin/login, which the browser follows.
+  await page.waitForURL('**/admin/login');
+  return response;
+}
+
+// The admin session cookie is a __Host- prefix cookie: Chromium rejects
+// addCookies for it unless the full attribute set (httpOnly, secure,
+// sameSite) is present, so every synthetic cookie carries them.
+const cookieAttrs = { domain: '127.0.0.1', path: '/', httpOnly: true, secure: true, sameSite: 'Strict' as const };
+
+// postLogout issues a raw POST /admin/logout with an explicit Cookie header,
+// so scenarios that need a stale or missing cookie can be driven precisely.
+// The header overrides the context cookie jar; addCookies would also send
+// both cookie names on every subsequent request.
+async function postLogout(
+  page: Page,
+  cookies: Array<{ name: string; value: string }>,
+  csrfToken: string,
+): Promise<Response> {
+  const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+  return page.request.post('/admin/logout', {
+    form: { csrf_token: csrfToken },
+    headers: cookieHeader ? { Cookie: cookieHeader } : {},
+    // No Origin header: the handler only rejects a present-but-wrong Origin.
+  });
+}
+
+test.describe('admin login/logout CSRF flow', () => {
+  test('full flow: login, dashboard, logout', async ({ page }) => {
+    // Pre-auth: the login page issues a CSRF cookie and a form-bound token.
+    const loginPage = await page.goto('/admin/login');
+    expect(loginPage).not.toBeNull();
+    expect(loginPage!.status()).toBe(200);
+    const preAuthCookie = (await page.context().cookies()).find((c) => c.name === CSRF_COOKIE);
+    expect(preAuthCookie, 'pre-auth CSRF cookie').toBeTruthy();
+    expect(preAuthCookie!.value).toMatch(/^[0-9a-f]{64}$/);
+
+    const sessionValue = await login(page);
+    expect(sessionValue).toMatch(/^[0-9a-f]{64}$/);
+
+    // The CSRF cookie is cleared on successful login.
+    const csrfAfterLogin = (await page.context().cookies()).find((c) => c.name === CSRF_COOKIE);
+    expect(csrfAfterLogin?.value ?? '', 'CSRF cookie must be cleared after login').toBe('');
+
+    // Dashboard renders with a session-bound CSRF token.
+    const dashboardToken = await extractCsrfToken(page, '/admin/dashboard');
+    expect(dashboardToken).toMatch(/^[0-9a-f]{64}$/);
+
+    // Logout with the session cookie and the session-bound token redirects
+    // to the login page: no 401, no 403.
+    await logoutFromDashboard(page);
+    expect(page.url()).toContain('/admin/login');
+
+    // The session is gone: the dashboard now rejects the old cookie.
+    const dashboard = await page.goto('/admin/dashboard');
+    expect(dashboard!.status()).toBe(401);
+  });
+
+  test('multi-tab: identical token across contexts, logout from either succeeds', async ({
+    browser,
+    page,
+  }) => {
+    const sessionValue = await login(page);
+
+    // Two contexts sharing the session cookie simulate two tabs.
+    const contextA = await browser.newContext();
+    const contextB = await browser.newContext();
+    for (const context of [contextA, contextB]) {
+      await context.addCookies([{ name: SESSION_COOKIE, value: sessionValue, ...cookieAttrs }]);
+    }
+    const pageA = await contextA.newPage();
+    const pageB = await contextB.newPage();
+
+    const tokenA = await extractCsrfToken(pageA, '/admin/dashboard');
+    const tokenB = await extractCsrfToken(pageB, '/admin/dashboard');
+    expect(tokenA, 'CSRF token must be identical across tabs').toBe(tokenB);
+
+    // Logout from either context succeeds.
+    await logoutFromDashboard(pageA);
+    expect(pageA.url()).toContain('/admin/login');
+
+    // The session is deleted server-side, so the second tab is logged out too.
+    const dashboardB = await pageB.goto('/admin/dashboard');
+    expect(dashboardB!.status()).toBe(401);
+
+    await contextA.close();
+    await contextB.close();
+  });
+
+  test('stale pre-auth CSRF cookie does not break post-auth logout', async ({ page }) => {
+    // Grab a pre-auth CSRF cookie, then log in (which clears it).
+    const preAuth = await page.goto('/admin/login');
+    expect(preAuth!.status()).toBe(200);
+    const preAuthCookie = (await page.context().cookies()).find((c) => c.name === CSRF_COOKIE);
+    expect(preAuthCookie?.value, 'pre-auth CSRF cookie').toMatch(/^[0-9a-f]{64}$/);
+
+    const sessionValue = await login(page);
+
+    // Logout carrying the stale pre-auth CSRF cookie alongside the session
+    // cookie still succeeds: the logout check derives the expected token from
+    // the session, not the CSRF cookie.
+    const dashboardToken = await extractCsrfToken(page, '/admin/dashboard');
+    const logoutResponse = await postLogout(
+      page,
+      [
+        { name: SESSION_COOKIE, value: sessionValue },
+        { name: CSRF_COOKIE, value: preAuthCookie!.value },
+      ],
+      dashboardToken,
+    );
+    // The 302 redirect to /admin/login is followed by the API client, so the
+    // final status is 200; what matters is that it is not a 401.
+    expect(logoutResponse.status(), 'logout with stale CSRF cookie').toBe(200);
+    expect(logoutResponse.url()).toContain('/admin/login');
+  });
+
+  test('rejection: wrong or missing CSRF token, missing session', async ({ page }) => {
+    const sessionValue = await login(page);
+    const dashboardToken = await extractCsrfToken(page, '/admin/dashboard');
+
+    // Wrong token: 401, not 200.
+    const wrongToken = await postLogout(page, [{ name: SESSION_COOKIE, value: sessionValue }], '0'.repeat(64));
+    expect(wrongToken.status(), 'logout with wrong CSRF token').toBe(401);
+
+    // Missing token: 401.
+    const missingToken = await postLogout(
+      page,
+      [{ name: SESSION_COOKIE, value: sessionValue }],
+      '',
+    );
+    expect(missingToken.status(), 'logout with missing CSRF token').toBe(401);
+
+    // No session cookie: 401, even with a well-formed token.
+    const noSession = await postLogout(page, [], dashboardToken);
+    expect(noSession.status(), 'logout with no session cookie').toBe(401);
+  });
+});
