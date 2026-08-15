@@ -1,9 +1,3 @@
-// Package admin provides read-only operational metrics for the M16 dashboard.
-//
-// The handler is auth-agnostic: it returns a JSON payload and does not perform
-// any access check itself. An admin-only HTTP server in main.go is where
-// middleware attaches — the handler can sit behind it with zero structural change
-// to its handler code.
 package admin
 
 import (

@@ -3,6 +3,8 @@ module github.com/adambenhassen/telegram-server
 go 1.26.6
 
 require (
+	github.com/Oudwins/tailwind-merge-go v0.2.3
+	github.com/a-h/templ v0.3.1020
 	github.com/gotd/log v0.1.0
 	github.com/gotd/td v0.161.0
 	github.com/jackc/pgx/v5 v5.10.0
@@ -23,7 +25,7 @@ require (
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/platforms v0.2.1 // indirect
 	github.com/cpuguy83/dockercfg v0.3.2 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/docker/go-connections v0.8.1 // indirect

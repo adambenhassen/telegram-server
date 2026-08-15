@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adambenhassen/telegram-server/internal/admin/assets"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -456,6 +457,50 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 	// over the prefix match), then the catch-all protected prefix.
 	mux := http.NewServeMux()
 
+	// Dashboard CSS — public so it loads before authentication redirects.
+	mux.HandleFunc("GET /admin/assets/dashboard.css", func(w http.ResponseWriter, r *http.Request) {
+		data, err := assets.FS.ReadFile("dashboard.css")
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		if _, err := w.Write(data); err != nil {
+			return
+		}
+	})
+	// Component JS bundle — public so the browser can fetch it before the session check.
+	mux.HandleFunc("GET /admin/assets/shadcn-templ.js", func(w http.ResponseWriter, r *http.Request) {
+		data, err := assets.FS.ReadFile("shadcn_templ.js")
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		if _, err := w.Write(data); err != nil {
+			return
+		}
+	})
+	// htmx and SSE extension — public; loaded before the session check.
+	for name, file := range map[string]string{
+		"GET /admin/assets/htmx.min.js":         "htmx.min.js",
+		"GET /admin/assets/htmx-ext-sse.min.js": "htmx-ext-sse.min.js",
+	} {
+		mux.HandleFunc(name, func(w http.ResponseWriter, r *http.Request) {
+			data, err := assets.FS.ReadFile(file)
+			if err != nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			if _, err := w.Write(data); err != nil {
+				return
+			}
+		})
+	}
 	// Public login form (GET).
 	mux.HandleFunc("GET /admin/login", func(w http.ResponseWriter, r *http.Request) {
 		handleLoginGET(cfg, w, r)

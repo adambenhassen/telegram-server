@@ -100,9 +100,9 @@ func TestDashboardHandler_returns_html(t *testing.T) {
 		t.Error("body contains raw -1 value; should render as —")
 	}
 
-	// Auto-refresh JS is present.
-	if !strings.Contains(body, "/admin/metrics") {
-		t.Error("body missing auto-refresh fetch target")
+	// SSE live-update endpoint is present.
+	if !strings.Contains(body, "/admin/events") {
+		t.Error("body missing SSE connect target")
 	}
 }
 
