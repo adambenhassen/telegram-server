@@ -53,7 +53,7 @@ templ dashboardPage(d DashboardData) {
 							&#8635; Reload
 						}
 						<!-- Logout -->
-						<form method="post" action="/admin/logout" class="inline">
+						<form method="post" action="/admin/logout" class="logout-form inline">
 							<input type="hidden" name="csrf_token" value={ d.CSRFToken }/>
 							@button.Button(button.Props{Variant: button.VariantGhost, Type: button.TypeSubmit}) {
 								Log out
