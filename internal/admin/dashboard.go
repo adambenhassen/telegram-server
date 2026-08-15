@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,19 +13,6 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
-
-// Fragment and FragmentRenderer are defined here so DashboardFragmentRenderer
-// compiles before internal/admin/sse.go (MAIN-303) lands. The definitions are
-// byte-identical to the MAIN-303 originals and will be removed on rebase.
-
-// Fragment is one server-rendered HTML update addressed to a named SSE event.
-type Fragment struct {
-	Event string
-	HTML  string
-}
-
-// FragmentRenderer turns a metrics snapshot into SSE fragments.
-type FragmentRenderer func(MetricsResponse) ([]Fragment, error)
 
 // DashboardFragmentRenderer renders the metrics sections fragment using templ
 // components. Pass it as BroadcasterConfig.Render to replace DefaultFragmentRenderer.
@@ -264,8 +252,7 @@ func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenH
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := dashboardPage(data).Render(r.Context(), w); err != nil {
-			// Headers already sent; nothing to do.
-			_ = err
+			slog.Error("render dashboard", "err", err)
 			return
 		}
 	}
