@@ -376,37 +376,6 @@ templ chipScript() {
 			var lastOk    = Date.now();
 			var connected = false;
 
-			// Datastar dispatches one custom event per SSE lifecycle transition
-			// on the element that opened the stream. The names are read off the
-			// bundled datastar.min.js (the Sse* error codes); they are not part
-			// of Datastar's documented API, so a rename in a future bundle
-			// degrades the chip to "connecting…" forever rather than breaking
-			// the stream itself.
-			var sseRoot = document.getElementById('sse-root');
-
-			sseRoot.addEventListener('datastar-sse-open', function() {
-				connected = true;
-				bannerDc.classList.add('hidden');
-				setChip('chip-good', '● Live · connecting…');
-			});
-
-			sseRoot.addEventListener('datastar-patch-elements', function() {
-				lastOk = Date.now();
-				connected = true;
-			});
-
-			sseRoot.addEventListener('datastar-sse-closed', function() {
-				connected = false;
-				bannerDc.classList.remove('hidden');
-				updateChip();
-			});
-
-			sseRoot.addEventListener('datastar-sse-error', function() {
-				connected = false;
-				bannerDc.classList.remove('hidden');
-				updateChip();
-			});
-
 			var baseChipClass = 'chip inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium';
 
 			function ago(ms) {
@@ -434,6 +403,40 @@ templ chipScript() {
 					setChip('chip-warning', '● Stale · updated ' + ago(age));
 				}
 			}
+
+			// Datastar dispatches one document-level custom event per SSE
+			// lifecycle transition: datastar-sse with detail {type, elId}, where
+			// elId is the id of the element that opened the stream and type is
+			// "started", "finished" or "error". The event name and detail shape
+			// are read off the bundled datastar.min.js; they are not part of
+			// Datastar's documented API, so a rename in a future bundle degrades
+			// the chip to "connecting…" forever rather than breaking the stream
+			// itself.
+			document.addEventListener('datastar-sse', function(e) {
+				if (e.detail.elId !== 'sse-root') return;
+				switch (e.detail.type) {
+				case 'started':
+					connected = true;
+					bannerDc.classList.add('hidden');
+					setChip('chip-good', '● Live · connecting…');
+					break;
+				case 'finished':
+				case 'error':
+					connected = false;
+					bannerDc.classList.remove('hidden');
+					updateChip();
+					break;
+			}
+			});
+
+			// Data events have no lifecycle event of their own: the patch lands
+			// as a DOM change on #metrics-stream, so a MutationObserver is what
+			// advances lastOk.
+			var metricsStream = document.getElementById('metrics-stream');
+			new MutationObserver(function() {
+				lastOk = Date.now();
+				connected = true;
+			}).observe(metricsStream, {childList: true, subtree: true});
 
 			if (refreshBtn) {
 				refreshBtn.addEventListener('click', function() { location.reload(); });

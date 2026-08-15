@@ -21,15 +21,16 @@ import (
 // Server-sent-events defaults for GET /admin/events.
 const (
 	// sseDefaultEvent is the event name used when a Fragment leaves it empty.
-	// Datastar dispatches any datastar-prefixed event from a stream it opened
-	// itself, so this is the only name the dashboard reacts to.
+	// It is the name Datastar's MergeFragments plugin registers on: any
+	// datastar-prefixed event the bundle does not know is dispatched but
+	// handled by nothing.
 	//
 	// The event name and the fragment's selector are the contract with
 	// MAIN-302, and the dashboard page is the side that must be matched: an
 	// unknown event name or a selector that hits nothing is answered with a
 	// 200 and no patch, so a mismatch reads as a frozen dashboard rather than
 	// an error anyone would notice.
-	sseDefaultEvent = "datastar-patch-elements"
+	sseDefaultEvent = "datastar-merge-fragments"
 
 	// sseDefaultSelector is the element a fragment without its own selector
 	// patches. It is the same target the dashboard declares for first paint
@@ -37,10 +38,11 @@ const (
 	// dashboard_contract asserts both sides.
 	sseDefaultSelector = "#metrics-stream"
 
-	// sseDefaultMode is the merge mode applied to the selector. inner keeps
-	// the element the first paint created (listeners and attributes intact)
-	// and replaces only its children, which is what the dashboard wants.
-	sseDefaultMode = "innerHTML"
+	// sseDefaultMode is the merge mode applied to the selector, carried on
+	// the mergeMode data line. inner keeps the element the first paint
+	// created (listeners and attributes intact) and replaces only its
+	// children, which is what the dashboard wants.
+	sseDefaultMode = "inner"
 
 	// sseInterval is the shared sampler's cadence. One sample per interval
 	// serves every connected client.
@@ -73,16 +75,17 @@ const (
 )
 
 // Fragment is one server-rendered HTML update addressed to a named SSE event.
-// Datastar patches the HTML into the element the selector names.
+// Datastar's MergeFragments plugin merges the HTML into the element the
+// selector names.
 type Fragment struct {
 	// Event is the SSE event name. Empty means sseDefaultEvent.
 	Event string
-	// Selector targets the element to patch. Empty means
+	// Selector targets the element to merge into. Empty means
 	// sseDefaultSelector.
 	Selector string
-	// Mode is the merge mode Datastar applies (inner, outer, ...). Empty
-	// means sseDefaultMode.
-	Mode string
+	// MergeMode is the merge mode Datastar applies (morph, inner, outer,
+	// ...). Empty means sseDefaultMode.
+	MergeMode string
 	// HTML is the rendered fragment. It is written verbatim, so the renderer
 	// owns escaping.
 	HTML string
@@ -352,9 +355,9 @@ func (b *Broadcaster) closeAll() {
 }
 
 // encodeFragment serialises one fragment as a Datastar SSE event. The
-// selector, mode and elements lines each carry one value; multi-line HTML
-// needs one data: line per source line and Datastar rejoins the lines of the
-// same key with newlines.
+// MergeFragments plugin parses the data lines into keys: selector, mergeMode
+// and fragments. Multi-line HTML needs one data: line per source line and
+// Datastar rejoins the lines of the same key with newlines.
 func encodeFragment(f Fragment) []byte {
 	event := f.Event
 	if event == "" {
@@ -364,9 +367,9 @@ func encodeFragment(f Fragment) []byte {
 	if selector == "" {
 		selector = sseDefaultSelector
 	}
-	mode := f.Mode
-	if mode == "" {
-		mode = sseDefaultMode
+	mergeMode := f.MergeMode
+	if mergeMode == "" {
+		mergeMode = sseDefaultMode
 	}
 
 	html := strings.ReplaceAll(f.HTML, "\r\n", "\n")
@@ -379,11 +382,11 @@ func encodeFragment(f Fragment) []byte {
 	buf.WriteString("data: selector ")
 	buf.WriteString(selector)
 	buf.WriteByte('\n')
-	buf.WriteString("data: mode ")
-	buf.WriteString(mode)
+	buf.WriteString("data: mergeMode ")
+	buf.WriteString(mergeMode)
 	buf.WriteByte('\n')
 	for line := range strings.SplitSeq(html, "\n") {
-		buf.WriteString("data: elements ")
+		buf.WriteString("data: fragments ")
 		buf.WriteString(line)
 		buf.WriteByte('\n')
 	}
@@ -479,7 +482,7 @@ func EventsHandler(b *Broadcaster) http.HandlerFunc {
 }
 
 // DefaultFragmentRenderer renders the dashboard's metric values as a single
-// datastar-patch-elements event. It keeps the endpoint useful and testable on
+// datastar-merge-fragments event. It keeps the endpoint useful and testable on
 // its own; the dashboard supplies its own renderer for its own markup.
 func DefaultFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	// The logout form's CSRF token is session-bound and deliberately absent

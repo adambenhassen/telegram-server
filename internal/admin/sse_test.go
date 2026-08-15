@@ -158,7 +158,7 @@ func TestSSE_streams_events(t *testing.T) {
 	if !strings.Contains(got, "retry: ") {
 		t.Errorf("stream missing reconnect hint; got:\n%s", got)
 	}
-	if !strings.Contains(got, "data: elements <span id=\"v-connections\">7</span>") {
+	if !strings.Contains(got, "data: fragments <span id=\"v-connections\">7</span>") {
 		t.Errorf("stream missing rendered fragment; got:\n%s", got)
 	}
 }
@@ -176,10 +176,10 @@ func TestSSE_multiline_fragment_is_framed_per_line(t *testing.T) {
 
 	want := "event: custom-event\n" +
 		"data: selector #metrics-stream\n" +
-		"data: mode innerHTML\n" +
-		"data: elements <div>\n" +
-		"data: elements   <span>1</span>\n" +
-		"data: elements </div>\n\n"
+		"data: mergeMode inner\n" +
+		"data: fragments <div>\n" +
+		"data: fragments   <span>1</span>\n" +
+		"data: fragments </div>\n\n"
 	if got != want {
 		t.Errorf("EncodeFragment =\n%q\nwant\n%q", got, want)
 	}
@@ -577,8 +577,8 @@ func TestSSE_route_behind_admin_gate(t *testing.T) {
 func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 	t.Parallel()
 
-	if got := admin.SSEDefaultEvent(); got != "datastar-patch-elements" {
-		t.Errorf("default event name = %q, want datastar-patch-elements", got)
+	if got := admin.SSEDefaultEvent(); got != "datastar-merge-fragments" {
+		t.Errorf("default event name = %q, want datastar-merge-fragments", got)
 	}
 
 	fragments, err := admin.DefaultFragmentRenderer(admin.MetricsResponse{Connections: 3})
@@ -603,7 +603,7 @@ func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 	// An empty Event on the wire must resolve to the Datastar event name and
 	// the dashboard's target selector.
 	wire := string(admin.EncodeFragment(admin.Fragment{HTML: "<i>x</i>"}))
-	if !strings.HasPrefix(wire, "event: datastar-patch-elements\n") {
+	if !strings.HasPrefix(wire, "event: datastar-merge-fragments\n") {
 		t.Errorf("unnamed fragment encoded as %q", wire)
 	}
 	if !strings.Contains(wire, "data: selector #metrics-stream\n") {
