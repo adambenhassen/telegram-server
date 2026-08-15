@@ -542,8 +542,10 @@ Tracked so shortcuts don't rot into "later means never".
   and `fwd_limit` are accepted and ignored, so a removed member keeps their own
   copies of past messages and a new member sees no history before they joined. — M6
 - **Removed-member history access.** A removed member's dialog returns
-  `ChatForbidden`; their retained message rows and `pts` are reachable only
-  through `updates.getDifference` replay, not through `messages.getHistory`. The
+  `ChatForbidden`; their retained message rows and `pts` are reachable through
+  `updates.getDifference` replay and through `messages.searchGlobal` (the owned
+  arm reaches rows by `owner_id` without a membership check), but not through
+  `messages.getHistory`. The
   `ChatForbidden` title is served empty rather than live, a deliberate divergence
   from upstream — which is assumed to serve the chat's current title — because any
   remaining member may rename the chat and that would keep writing into a removed
