@@ -171,7 +171,7 @@ func TestReactionOnDeletedMessage(t *testing.T) {
 	b := mustUser(t, s, "+15551290002")
 
 	msg := send(t, s, a, b, "gone", 9999)
-	_, err := s.DeleteMessages(ctx, a.ID, []int64{msg.LocalID})
+	_, err := s.DeleteMessages(ctx, a.ID, []int64{msg.LocalID}, true)
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
