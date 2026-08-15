@@ -43,6 +43,11 @@ internal/store       Postgres persistence: pgx, with sqlc-generated
 Postgres             schema from migrations/, applied with atlas
 ```
 
+In prose: a gotd client connects to `internal/mtproto`, which owns the accept
+loop, key exchange and session bookkeeping and dispatches each RPC to
+`internal/api`'s handlers, which read and write through `internal/store` to
+Postgres.
+
 `cmd/telegramd` wires this together from the environment variables
 `internal/config` reads, and when `TG_ADMIN_LISTEN_ADDR` is set it also serves
 `internal/admin` (read-only operational metrics and dashboard) on a separate
@@ -86,7 +91,13 @@ docker compose up
 
 The server listens on `127.0.0.1:2443`. The stack enables
 `TG_LOG_LOGIN_CODES`, so phone-mode login codes appear in
-`docker compose logs telegramd`. `docker compose down` keeps the volumes
+`docker compose logs telegramd`; a first phone-mode sign-in auto-registers the
+account, so that is all a gotd client needs to get in. Username/password
+accounts are a different story on this stack: `docker-compose.yml` does not
+forward the `TG_BOOTSTRAP_*` variables and `TG_REGISTRATION` keeps its `closed`
+default, so setting them in `.env` does nothing (compose passthrough tracked in
+MAIN-306). To seed a username/password operator account, use the local run
+below. `docker compose down` keeps the volumes
 (rows, RSA identity, auth-key master key); `down -v` destroys them and every
 client has to re-handshake. `.env.example` documents each variable.
 
@@ -103,12 +114,13 @@ The server refuses to start without a database and a master key:
 | Variable | Default | Purpose |
 |---|---|---|
 | `TG_POSTGRES_DSN` | *(required)* | Postgres connection string, migrated schema (see below) |
-| `TG_AUTHKEY_ENC_KEY` | *(required)* | 64 hex chars, the AES-256-GCM master key over stored auth keys. Alternatively set `TG_AUTHKEY_ENC_KEY_FILE` to read/generate the key from a file; one of the two must be set |
+| `TG_AUTHKEY_ENC_KEY` | *(one of two required)* | 64 hex chars, the AES-256-GCM master key over stored auth keys. Alternatively set `TG_AUTHKEY_ENC_KEY_FILE` to read/generate the key from a file; one of the two must be set |
 | `TG_LISTEN_ADDR` | `:2443` | Address the MTProto listener binds |
 | `TG_RSA_KEY_PATH` | `server_key.pem` | Server RSA private key; generated on first start |
 | `TG_BLOB_DIR` | `blobs` | Where uploaded file bodies are written |
 | `TG_DC_ID` | `2` | DC id the server advertises |
 | `TG_BOOTSTRAP_USERNAME` | *(unset)* | Seed a username/password operator account at startup; requires exactly one of `TG_BOOTSTRAP_PASSWORD` or `TG_BOOTSTRAP_PASSWORD_FILE` |
+| `TG_BOOTSTRAP_PASSWORD_FILE` | *(unset)* | File (mode 0600) the bootstrap password is read from. Prefer it over `TG_BOOTSTRAP_PASSWORD`: an env value stays visible in `/proc/<pid>/environ`, orchestrator inspect output and crash dumps for the life of the process |
 | `TG_REGISTRATION` | `closed` | `open` allows `auth.signUp` to create accounts |
 | `TG_LOG_LOGIN_CODES` | `false` | Write phone-mode login codes to the log; with it off, phone-number sign-in cannot complete (username/password sign-in is unaffected) |
 | `TG_ADMIN_LISTEN_ADDR` | *(unset)* | Enables the admin HTTP server; requires `TG_ADMIN_TOKEN_HASH` (SHA-256 hex of the operator token) |
@@ -119,11 +131,16 @@ sign in to with username + password:
 ```bash
 export TG_POSTGRES_DSN="postgres://user:pass@localhost:5432/telegram?sslmode=disable"
 make migrate
+printf '%s' 'change-me-at-least-12-chars' > bootstrap_password && chmod 600 bootstrap_password
 TG_AUTHKEY_ENC_KEY="$(openssl rand -hex 32)" \
 TG_BOOTSTRAP_USERNAME=operator \
-TG_BOOTSTRAP_PASSWORD=change-me-12chars \
+TG_BOOTSTRAP_PASSWORD_FILE=./bootstrap_password \
   make run
 ```
+
+The password goes through a file rather than `TG_BOOTSTRAP_PASSWORD` on
+purpose: an environment value is readable in `/proc/<pid>/environ` and
+orchestrator inspect output for as long as the server runs.
 
 The full variable reference (rate limits, pre-auth connection bounds, PROXY
 protocol support, upload limits) is in `docs/clients.md` and
