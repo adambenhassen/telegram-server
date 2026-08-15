@@ -195,6 +195,10 @@ type LoginHandlerConfig struct {
 	// AdminOrigin is the expected Origin header for login/logout POST requests.
 	// Derived from the admin listen address at startup.
 	AdminOrigin string
+	// Events is the shared metrics broadcaster backing GET /admin/events.
+	// A nil value registers the route but reports it unavailable, so the
+	// dashboard falls back to its server-rendered first paint.
+	Events *Broadcaster
 }
 
 // handleLoginGET serves the login form with a CSRF token.
@@ -446,6 +450,7 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 	}
 	registerProtected("GET /admin/metrics", Handler(registry, cfg.Store))
 	registerProtected("GET /admin/dashboard", DashboardHandler(registry, cfg.Store, cfg.TokenHash))
+	registerProtected("GET /admin/events", EventsHandler(cfg.Events))
 
 	// Top-level mux: specific public routes registered first (they take priority
 	// over the prefix match), then the catch-all protected prefix.

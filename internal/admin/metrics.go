@@ -9,6 +9,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -119,19 +120,35 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 		return
 	}
 
-	snap, err := st.Metrics(ctx)
+	resp, err := collectMetrics(ctx, reg, st)
 	if err != nil {
 		slog.Error("admin metrics refresh", "err", err)
 		c.lastErr = true
 		return
 	}
 
+	c.resp = resp
+	c.last = time.Now()
+	c.lastErr = false
+}
+
+// collectMetrics assembles one metrics snapshot from the store and the session
+// registry. Both the cached JSON endpoint and the SSE broadcaster's shared
+// sampler read through it, so the two surfaces cannot drift apart.
+func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store) (MetricsResponse, error) {
+	snap, err := st.Metrics(ctx)
+	if err != nil {
+		return MetricsResponse{}, fmt.Errorf("collect metrics: %w", err)
+	}
+
+	// A failed gap query degrades to zero rather than failing the whole
+	// snapshot: every other metric is still worth serving.
 	var maxGap int64
 	if gap, err := st.MaxPtsGap(ctx); err == nil {
 		maxGap = gap
 	}
 
-	c.resp = MetricsResponse{
+	return MetricsResponse{
 		Timestamp:       time.Now(),
 		Connections:     reg.TotalConns(),
 		Sessions:        reg.TotalSessions(),
@@ -158,9 +175,7 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 			Files:           snap.StorageRows.Files,
 			AuthKeys:        snap.StorageRows.AuthKeys,
 		},
-	}
-	c.last = time.Now()
-	c.lastErr = false
+	}, nil
 }
 
 // get returns the cached metrics response.
