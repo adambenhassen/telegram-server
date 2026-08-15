@@ -9,6 +9,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -119,19 +120,52 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 		return
 	}
 
-	snap, err := st.Metrics(ctx)
+	resp, err := collectMetrics(ctx, reg, st, tolerateGapFailure)
 	if err != nil {
 		slog.Error("admin metrics refresh", "err", err)
 		c.lastErr = true
 		return
 	}
 
-	var maxGap int64
-	if gap, err := st.MaxPtsGap(ctx); err == nil {
-		maxGap = gap
+	c.resp = resp
+	c.last = time.Now()
+	c.lastErr = false
+}
+
+// Gap-failure tolerance for collectMetrics, named at the call sites because a
+// bare boolean there says nothing.
+const (
+	// tolerateGapFailure degrades a failed pts-gap query to zero and serves the
+	// rest of the snapshot. It is the JSON endpoint's long-standing behaviour:
+	// a polling client sees the same field every 10 s and a transient zero
+	// corrects itself on the next poll.
+	tolerateGapFailure = true
+
+	// requireAllMetrics fails the whole snapshot instead. The SSE stream needs
+	// this: it only emits on a successful sample, and a zeroed MaxPtsGap
+	// carrying a fresh timestamp would push a false "all clients caught up"
+	// that nothing later contradicts.
+	requireAllMetrics = false
+)
+
+// collectMetrics assembles one metrics snapshot from the store and the session
+// registry. Both the cached JSON endpoint and the SSE broadcaster's shared
+// sampler read through it, so the two surfaces cannot drift apart.
+func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool) (MetricsResponse, error) {
+	snap, err := st.Metrics(ctx)
+	if err != nil {
+		return MetricsResponse{}, fmt.Errorf("collect metrics: %w", err)
 	}
 
-	c.resp = MetricsResponse{
+	maxGap, err := st.MaxPtsGap(ctx)
+	if err != nil {
+		if !tolerateGapErr {
+			return MetricsResponse{}, fmt.Errorf("collect max pts gap: %w", err)
+		}
+		maxGap = 0
+	}
+
+	return MetricsResponse{
 		Timestamp:       time.Now(),
 		Connections:     reg.TotalConns(),
 		Sessions:        reg.TotalSessions(),
@@ -158,9 +192,7 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 			Files:           snap.StorageRows.Files,
 			AuthKeys:        snap.StorageRows.AuthKeys,
 		},
-	}
-	c.last = time.Now()
-	c.lastErr = false
+	}, nil
 }
 
 // get returns the cached metrics response.

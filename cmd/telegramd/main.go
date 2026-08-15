@@ -38,6 +38,10 @@ func main() {
 // sweepInterval is how often the background sweep deletes expired login codes.
 const sweepInterval = 5 * time.Minute
 
+// adminShutdownTimeout bounds how long the admin server waits for in-flight
+// requests to finish before it gives up.
+const adminShutdownTimeout = 5 * time.Second
+
 func run(log *slog.Logger) error {
 	cfg, err := config.Load(log)
 	if err != nil {
@@ -183,11 +187,24 @@ func run(log *slog.Logger) error {
 			adminHost = "localhost"
 		}
 		adminOrigin := "http://" + net.JoinHostPort(adminHost, adminPort)
+
+		// One shared sampler feeds every dashboard stream; it idles while
+		// nobody is connected.
+		events := admin.NewBroadcaster(admin.BroadcasterConfig{
+			Sample: admin.NewMetricsSampler(server.Registry(), st),
+			Logger: log,
+		})
+		var eventsWG sync.WaitGroup
+		eventsCtx, stopEvents := context.WithCancel(ctx)
+		defer stopEvents()
+		eventsWG.Go(func() { events.Run(eventsCtx) })
+
 		adminRouter := admin.AdminRouter(admin.LoginHandlerConfig{
 			Store:       st,
 			TokenHash:   cfg.AdminTokenHash,
 			Logger:      log,
 			AdminOrigin: adminOrigin,
+			Events:      events,
 		}, server.Registry())
 		adminSrv := &http.Server{
 			Addr:              cfg.AdminListenAddr,
@@ -207,7 +224,14 @@ func run(log *slog.Logger) error {
 			}
 		}()
 		defer func() {
-			if err := adminSrv.Shutdown(context.Background()); err != nil {
+			// Stop the broadcaster first: it closes every open SSE stream, and
+			// Shutdown waits on in-flight requests, which a live stream is.
+			stopEvents()
+			eventsWG.Wait()
+
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), adminShutdownTimeout)
+			defer cancel()
+			if err := adminSrv.Shutdown(shutdownCtx); err != nil {
 				log.Error("admin server shutdown", "err", err)
 			}
 		}()

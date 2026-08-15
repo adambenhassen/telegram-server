@@ -91,11 +91,25 @@ func run(log *slog.Logger) error {
 	defer sweepWG.Wait()
 
 	registry := mtproto.NewSessionRegistry()
+
+	events := admin.NewBroadcaster(admin.BroadcasterConfig{
+		Sample: admin.NewMetricsSampler(registry, st),
+		Logger: log,
+	})
+	eventsCtx, stopEvents := context.WithCancel(ctx)
+	var eventsWG sync.WaitGroup
+	eventsWG.Go(func() { events.Run(eventsCtx) })
+	defer func() {
+		stopEvents()
+		eventsWG.Wait()
+	}()
+
 	router := admin.AdminRouter(admin.LoginHandlerConfig{
 		Store:       st,
 		TokenHash:   tokenHash,
 		Logger:      log,
 		AdminOrigin: "http://" + adminListenAddr,
+		Events:      events,
 	}, registry)
 
 	srv := &http.Server{
@@ -119,6 +133,11 @@ func run(log *slog.Logger) error {
 	}()
 	select {
 	case <-ctx.Done():
+		// Close the SSE streams before Shutdown, which otherwise waits on them
+		// as in-flight requests.
+		stopEvents()
+		eventsWG.Wait()
+
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
