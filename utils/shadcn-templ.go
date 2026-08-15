@@ -166,12 +166,6 @@ func flattenClasses(values []any) []string {
 	return out
 }
 
-// Ptr returns a pointer to v. Useful for optional props whose zero value is
-// meaningful (e.g. togglegroup.Props{Spacing: utils.Ptr(0)}).
-func Ptr[T any](v T) *T {
-	return &v
-}
-
 // IfElse returns trueValue if condition is true, otherwise falseValue.
 // Example: true, "bg-red-500", "bg-gray-300" → "bg-red-500"
 func IfElse[T any](condition bool, trueValue T, falseValue T) T {
