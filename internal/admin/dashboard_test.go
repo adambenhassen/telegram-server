@@ -376,9 +376,9 @@ func TestRenderFragment_non_empty(t *testing.T) {
 	t.Parallel()
 
 	m := admin.MetricsResponse{
-		Connections:  5,
-		Sessions:     3,
-		TotalUsers:   100,
+		Connections:   5,
+		Sessions:      3,
+		TotalUsers:    100,
 		ActiveUsers1H: 12,
 	}
 	data := admin.BuildDashboardData(m, "")
@@ -399,7 +399,7 @@ func TestRenderFragment_non_empty(t *testing.T) {
 	if tagEnd < 0 {
 		tagEnd = 800
 	}
-	bannerCtx := body[bannerIdx : min(bannerIdx+tagEnd+1, len(body))]
+	bannerCtx := body[bannerIdx:min(bannerIdx+tagEnd+1, len(body))]
 	if !strings.Contains(bannerCtx, "hidden") {
 		t.Error("banner-empty should carry hidden class when metrics are non-zero")
 	}
