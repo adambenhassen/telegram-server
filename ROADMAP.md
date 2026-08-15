@@ -667,9 +667,6 @@ Tracked so shortcuts don't rot into "later means never".
   cross-replica delivery is covered by the existing `LISTEN`/`NOTIFY` architecture but is not gated
   against a two-replica topology. — M9
 
-- **Username display in `User`/`Channel` objects.** Existing RPCs that return user or channel
-  objects do not yet populate the `Username` field. Clients cannot yet surface usernames from
-  their contact list or dialog headers without a separate `contacts.resolveUsername` lookup. — M12
 - **Username privacy controls.** Any holder of an @username can resolve it to a peer. The
   Telegram hide-from-non-contacts control is deferred pending a contacts and block-list model;
   the resolution endpoint has no membership boundary to gate on until one exists. — M12
