@@ -95,6 +95,69 @@ func (q *Queries) CreateUsernameUser(ctx context.Context, arg CreateUsernameUser
 	return i, err
 }
 
+const entitledUserIDs = `-- name: EntitledUserIDs :many
+SELECT id FROM (
+    SELECT $1::bigint[] AS id_arr
+) seed, UNNEST(seed.id_arr) AS id
+WHERE id = $2::bigint
+   OR EXISTS (
+       SELECT 1 FROM dialogs d
+       WHERE d.peer_type = 1
+         AND ((d.owner_id = $2::bigint AND d.peer_id = id)
+           OR (d.owner_id = id AND d.peer_id = $2::bigint))
+   )
+   OR EXISTS (
+       SELECT 1 FROM chat_participants p1
+       JOIN chat_participants p2 ON p1.chat_id = p2.chat_id
+       WHERE p1.user_id = $2::bigint
+         AND p2.user_id = id
+   )
+   OR EXISTS (
+       SELECT 1 FROM channel_participants v
+       JOIN channel_participants m ON v.channel_id = m.channel_id
+       WHERE v.user_id = $2::bigint
+         AND m.user_id = id
+         AND (v.banned_until IS NULL OR v.banned_until <= now())
+         AND (m.banned_until IS NULL OR m.banned_until <= now())
+   )
+`
+
+type EntitledUserIDsParams struct {
+	Ids      []int64
+	ViewerID int64
+}
+
+// Returns the subset of ids the viewer is entitled to see live. An id is
+// entitled iff any of the four live edges holds:
+//  1. the id is the viewer themself;
+//  2. the two share a 1:1 dialog row (peer_type = 1);
+//  3. both are current participants of some chat;
+//  4. both are current members of some channel, and neither is banned at now().
+//
+// The channel edge requires the VIEWER's own row to be unbanned as well: a
+// banned viewer is not a current member, so the channel admits nothing for
+// them. The ban predicate is the same one ChannelMember.Banned uses in Go:
+// banned_until IS NULL OR banned_until <= now().
+func (q *Queries) EntitledUserIDs(ctx context.Context, arg EntitledUserIDsParams) ([]interface{}, error) {
+	rows, err := q.db.Query(ctx, entitledUserIDs, arg.Ids, arg.ViewerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []interface{}
+	for rows.Next() {
+		var id interface{}
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getUserLoginMode = `-- name: GetUserLoginMode :one
 SELECT login_mode FROM users WHERE id = $1
 `

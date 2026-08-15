@@ -187,6 +187,59 @@ func TestLoadUsersEmptySet(t *testing.T) {
 	}
 }
 
+// TestLoadUsersBannedViewerGetsUserEmpty proves the banned-viewer regression:
+// a viewer who is banned from a channel is not a current member, so the channel
+// edge admits nothing for them. They receive userEmpty for every member of that
+// channel, not full profiles.
+func TestLoadUsersBannedViewerGetsUserEmpty(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	creator := mustUser(t, s, "+15551960301")
+	member := mustUser(t, s, "+15551960302")
+	bannedViewer := mustUser(t, s, "+15551960303")
+
+	// A channel with creator and member; bannedViewer joins then is banned.
+	ch, err := s.CreateChannel(ctx, creator.ID, "News", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	for _, id := range []int64{member.ID, bannedViewer.ID} {
+		hash, err := s.CreateChannelInvite(ctx, ch.ID, ch.CreatorID)
+		if err != nil {
+			t.Fatalf("invite %d: %v", id, err)
+		}
+		if _, _, err := s.JoinChannelByInvite(ctx, hash, id); err != nil {
+			t.Fatalf("join %d: %v", id, err)
+		}
+	}
+	// Ban the viewer from the channel. The participant row is retained (banned
+	// rows are not deleted), so ChannelsForUser still returns the channel for
+	// the viewer — but the entitlement predicate must not admit it.
+	if err := s.SetChannelBan(ctx, ch.ID, creator.ID, bannedViewer.ID, nil, true); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+
+	// The banned viewer sees no one from the channel as live.
+	users, err := api.LoadUsersForTest(s, []int64{creator.ID, member.ID, bannedViewer.ID}, bannedViewer.ID)
+	if err != nil {
+		t.Fatalf("load users: %v", err)
+	}
+	// Self is always live.
+	if self, ok := loadUsersWire(t, users, bannedViewer.ID).(*tg.User); !ok || !self.Self {
+		t.Fatalf("banned viewer is not self: %v", loadUsersWire(t, users, bannedViewer.ID))
+	}
+	// Creator and member: the viewer is banned from their only shared channel,
+	// so both degrade to userEmpty.
+	if e, ok := loadUsersWire(t, users, creator.ID).(*tg.UserEmpty); !ok || e.ID != creator.ID {
+		t.Fatalf("banned viewer sees creator as %v, want userEmpty %d", loadUsersWire(t, users, creator.ID), creator.ID)
+	}
+	if e, ok := loadUsersWire(t, users, member.ID).(*tg.UserEmpty); !ok || e.ID != member.ID {
+		t.Fatalf("banned viewer sees member as %v, want userEmpty %d", loadUsersWire(t, users, member.ID), member.ID)
+	}
+}
+
 // TestLoadUsersDegradedForNoSharedDialog reproduces the removed-member case the
 // ticket names at the loadUsers level: after B removes C from their chat and C
 // shares no 1:1 dialog with B, C's view of B degrades to userEmpty, and B's

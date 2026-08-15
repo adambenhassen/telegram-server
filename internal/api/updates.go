@@ -540,9 +540,10 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 // reference would keep serving live profiles — names, handles, presence —
 // for accounts they no longer share anything live with.
 //
-// The predicate is one batched query per id set per call, not one per user:
-// the whole id set is fetched in one UsersByID, and the viewer's dialog
-// partners, chat mates and channel mates in one query each.
+// The predicate is two store round trips per call: one UsersByID fetch of the
+// whole id set, and one EntitledUserIDs query that takes the id set and the
+// viewer and returns only the ids a live edge admits. The viewer's dialog,
+// chat and channel neighbourhood is never materialized on the client side.
 func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, viewerID int64) ([]tg.UserClass, error) {
 	if len(ids) == 0 {
 		return []tg.UserClass{}, nil
@@ -575,48 +576,20 @@ func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, viewerID i
 // the viewer is in, or a current unbanned member of a channel the viewer is in.
 // The four sources are the live edges that admit an account's metadata to a
 // client — exactly the surfaces the store already uses for chat and channel
-// admission. Absent or unknown ids simply are not reported.
+// admission. The predicate is one store round trip: the query takes the id set
+// and the viewer and returns only the ids an edge admits, so a viewer in a
+// large channel does not materialize the channel's whole member list on every
+// loadUsers call. The channel edge requires the viewer's own row to be
+// unbanned: a banned viewer is not a current member, so the channel admits
+// nothing for them.
 func (h *handlers) entitledUserIDs(ctx context.Context, viewerID int64, ids []int64) (map[int64]bool, error) {
-	out := map[int64]bool{viewerID: true}
-	partners, err := h.store.DialogPartners(ctx, viewerID)
+	rows, err := h.store.EntitledUserIDs(ctx, viewerID, ids)
 	if err != nil {
 		return nil, err
 	}
-	for _, id := range partners {
+	out := make(map[int64]bool, len(rows))
+	for _, id := range rows {
 		out[id] = true
-	}
-	chatIDs := []int64{}
-	chats, err := h.store.ChatsForUser(ctx, viewerID)
-	if err != nil {
-		return nil, err
-	}
-	for _, c := range chats {
-		chatIDs = append(chatIDs, c.ID)
-	}
-	parts, err := h.store.ChatParticipantsOfChats(ctx, chatIDs)
-	if err != nil {
-		return nil, err
-	}
-	for _, p := range parts {
-		out[p.UserID] = true
-	}
-	channelIDs := []int64{}
-	channels, err := h.store.ChannelsForUser(ctx, viewerID)
-	if err != nil {
-		return nil, err
-	}
-	for _, ch := range channels {
-		channelIDs = append(channelIDs, ch.ID)
-	}
-	members, err := h.store.ChannelMembersOfChannels(ctx, channelIDs)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
-	for _, m := range members {
-		if !m.Banned(now) {
-			out[m.UserID] = true
-		}
 	}
 	return out, nil
 }
