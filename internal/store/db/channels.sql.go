@@ -179,38 +179,6 @@ func (q *Queries) ChannelInviteByHashForUpdate(ctx context.Context, hash string)
 	return i, err
 }
 
-const channelMembersOfChannels = `-- name: ChannelMembersOfChannels :many
-SELECT channel_id, user_id, role, banned_until, join_pts, date FROM channel_participants
-WHERE channel_id = ANY($1::bigint[])
-`
-
-func (q *Queries) ChannelMembersOfChannels(ctx context.Context, channelIds []int64) ([]ChannelParticipant, error) {
-	rows, err := q.db.Query(ctx, channelMembersOfChannels, channelIds)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []ChannelParticipant
-	for rows.Next() {
-		var i ChannelParticipant
-		if err := rows.Scan(
-			&i.ChannelID,
-			&i.UserID,
-			&i.Role,
-			&i.BannedUntil,
-			&i.JoinPts,
-			&i.Date,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const channelParticipantByUser = `-- name: ChannelParticipantByUser :one
 SELECT channel_id, user_id, role, banned_until, join_pts, date FROM channel_participants WHERE channel_id = $1 AND user_id = $2
 `

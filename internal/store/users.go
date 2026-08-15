@@ -317,8 +317,7 @@ func (s *Store) SetUserStatus(ctx context.Context, userID int64, online bool) er
 }
 
 // DialogPartners returns the distinct set of user IDs that share a 1:1 dialog
-// row with userID. Used as the fan-out target set for status changes and as
-// one arm of the loadUsers entitlement predicate.
+// row with userID. Used as the fan-out target set for status changes.
 func (s *Store) DialogPartners(ctx context.Context, userID int64) ([]int64, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT CASE d.owner_id WHEN $1 THEN d.peer_id ELSE d.owner_id END AS partner_id
