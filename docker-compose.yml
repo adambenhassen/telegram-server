@@ -88,6 +88,14 @@ services:
       # .env copied before this line existed must still boot into a server you
       # can sign in to. A bare `true` here would take the knob away instead.
       TG_LOG_LOGIN_CODES: ${TG_LOG_LOGIN_CODES:-true}
+      # Optional, no default: leave them unset and first boot behaves exactly
+      # as before — registration closed, no account seeded. Set them in .env
+      # and the server creates the operator account on first start, which is
+      # the only way in while TG_REGISTRATION stays closed. The password must
+      # be at least 12 bytes; the server refuses to boot otherwise.
+      TG_BOOTSTRAP_USERNAME: ${TG_BOOTSTRAP_USERNAME:-}
+      TG_BOOTSTRAP_PASSWORD: ${TG_BOOTSTRAP_PASSWORD:-}
+      TG_BOOTSTRAP_PASSWORD_FILE: ${TG_BOOTSTRAP_PASSWORD_FILE:-}
     ports:
       # Loopback only. 2443 is unauthenticated at the transport layer, so whoever
       # reaches it feeds chosen bytes into the MTProto decode path before any
