@@ -25,20 +25,28 @@ internet.
 
 ## Architecture
 
+A request flows top to bottom:
+
 ```
-cmd/telegramd ── internal/config ── environment
-      │
-      ├── internal/mtproto   accept loop, key exchange, session bookkeeping,
-      │        │             message dispatch (on gotd's exported packages)
-      │        └── internal/api    the MTProto RPC method handlers
-      │                 │
-      ├── internal/admin     read-only operational metrics + dashboard,
-      │                      served on a separate admin-only HTTP listener
-      │
-      └── internal/store     Postgres persistence (pgx), sqlc-generated
-               │             queries in internal/store/db
-               └── migrations/   atlas migration files
+gotd client
+    |  MTProto over TCP (:2443)
+    v
+internal/mtproto     accept loop, key exchange, session bookkeeping,
+    |                message dispatch (on gotd's exported packages)
+    v
+internal/api         the MTProto RPC method handlers
+    |
+    v
+internal/store       Postgres persistence: pgx, with sqlc-generated
+    |                queries in internal/store/db
+    v
+Postgres             schema from migrations/, applied with atlas
 ```
+
+`cmd/telegramd` wires this together from the environment variables
+`internal/config` reads, and when `TG_ADMIN_LISTEN_ADDR` is set it also serves
+`internal/admin` (read-only operational metrics and dashboard) on a separate
+admin-only HTTP listener.
 
 Supporting packages: `internal/rsakey` (server RSA identity for the auth-key
 exchange), `internal/keycrypt` (AES-256-GCM sealing of auth keys at rest),
