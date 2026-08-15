@@ -913,7 +913,7 @@ func TestPeerIdentityRoundTrip(t *testing.T) {
 
 	// 5. Delete.
 	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
-		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{msgID}})
+		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{Revoke: true, ID: []int{msgID}})
 		return err
 	})
 	recvOrCtx(t, ctx, collB.delMsg, "B updateDeleteMessages")

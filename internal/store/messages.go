@@ -499,16 +499,22 @@ func editChatMessage(ctx context.Context, tx pgx.Tx, qtx *db.Queries, pre db.Mes
 	return int(authorPts), nil
 }
 
-// DeleteMessages marks the given owner-local messages deleted on both sides,
-// emitting one delete event per message per affected owner. It fails closed
+// DeleteMessages marks the given owner-local messages deleted, emitting one
+// delete event per message per affected owner. It fails closed
 // (ErrMessageInvalid, no changes) if any id is absent. Returns the resulting
 // pts per affected user (owner and peers) for the caller to notify.
+//
+// revoke controls a user-peer message: true soft-deletes both the owner row and
+// the mirror row and bumps both users' pts, false deletes only the caller's row
+// and bumps only the caller's pts, leaving the peer's row, pts and event log
+// untouched. The chat fan-out path ignores revoke: a chat delete always walks
+// every current member's copy, which is the only delete a chat message has.
 //
 // A chat message deletes every per-member copy of its fan-out instead of one
 // mirror row, so only its author may delete it and a service message may not be
 // deleted at all; the caller must also still be a member of every chat the batch
 // touches. A batch may span several chats and both peer types.
-func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []int64) (map[int64]int, error) {
+func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []int64, revoke bool) (map[int64]int, error) {
 	if len(localIDs) == 0 {
 		return map[int64]int{}, nil
 	}
@@ -604,9 +610,6 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 		if err = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: ownerID, LocalID: m.LocalID}); err != nil {
 			return nil, fmt.Errorf("delete owner row: %w", err)
 		}
-		if err = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: m.PeerID, LocalID: m.PeerLocalID}); err != nil {
-			return nil, fmt.Errorf("delete mirror row: %w", err)
-		}
 		ownerPts, e := qtx.BumpPtsOnly(ctx, ownerID)
 		if e != nil {
 			return nil, fmt.Errorf("bump owner: %w", e)
@@ -615,6 +618,12 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 			return nil, fmt.Errorf("owner delete event: %w", e)
 		}
 		perOwner[ownerID] = int(ownerPts)
+		if !revoke {
+			continue
+		}
+		if err = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: m.PeerID, LocalID: m.PeerLocalID}); err != nil {
+			return nil, fmt.Errorf("delete mirror row: %w", err)
+		}
 		peerPts, e := qtx.BumpPtsOnly(ctx, m.PeerID)
 		if e != nil {
 			return nil, fmt.Errorf("bump peer: %w", e)
