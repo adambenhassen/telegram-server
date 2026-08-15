@@ -1,0 +1,182 @@
+# telegram-server
+
+An MTProto (Telegram protocol) server in Go, built on [gotd](https://github.com/gotd/td)'s
+exported packages — transport, key exchange, crypto and proto — with the accept
+loop, session bookkeeping and RPC dispatch implemented in this repository. It is
+a single-DC server: auth keys, sessions, users, messages and files persist in
+Postgres, so a restart keeps them. Real gotd clients (including the in-repo e2e
+suite) can complete the full key exchange, sign in and exchange messages against
+it; `docs/clients.md` covers connecting clients, including a patched Telegram
+Desktop.
+
+There is no SMS or push transport: login codes are written to the server log,
+and only when `TG_LOG_LOGIN_CODES=true`. This is a development and research
+server, not something to expose to the internet.
+
+## Architecture
+
+```
+cmd/telegramd ── internal/config ── environment
+      │
+      ├── internal/mtproto   accept loop, key exchange, session bookkeeping,
+      │        │             message dispatch (on gotd's exported packages)
+      │        └── internal/api    the MTProto RPC method handlers
+      │                 │
+      ├── internal/admin     read-only operational metrics + dashboard,
+      │                      served on a separate admin-only HTTP listener
+      │
+      └── internal/store     Postgres persistence (pgx), sqlc-generated
+               │             queries in internal/store/db
+               └── migrations/   atlas migration files
+```
+
+Supporting packages: `internal/rsakey` (server RSA identity for the auth-key
+exchange), `internal/keycrypt` (AES-256-GCM sealing of auth keys at rest),
+`internal/srp` (server side of Telegram's SRP-6a cloud password / 2FA),
+`internal/peerhash` (per-viewer peer access hashes), `internal/blob` (opaque
+blob storage for uploaded file bodies), `internal/pgtest` (the Postgres test
+harness).
+
+The schema is managed with [Atlas](https://atlasgo.io) migrations in
+`migrations/`; queries are written as SQL in `internal/store/queries` and
+compiled to Go by [sqlc](https://sqlc.dev) into `internal/store/db`.
+
+## Requirements
+
+- **Go 1.25+** (`go.mod`)
+- **Docker** — required for the tests (the Postgres harness starts a
+  `postgres:16-alpine` container), for Atlas's dev database, and for the
+  compose stack
+- **Atlas CLI** — migrations; CI and the compose stack pin `v1.2.0`
+  ([install](https://atlasgo.io/getting-started))
+- **golangci-lint** — `make lint`; CI pins `v2.12.2`
+- **sqlc** — not installed separately: `make sqlc` builds the pinned binary
+  from the `tools/` module into `./bin/sqlc`
+- **Node 22 + pnpm 10** — only for the Playwright admin-dashboard e2e suite
+
+`make tools-check` verifies the sqlc and atlas toolchain.
+
+## Quick start (Docker Compose)
+
+The fastest way to a running server — Postgres, migrations and the server, in
+order:
+
+```bash
+cp .env.example .env && chmod 600 .env
+docker compose up
+```
+
+The server listens on `127.0.0.1:2443`. Login codes appear in
+`docker compose logs telegramd`. `docker compose down` keeps the volumes (rows,
+RSA identity, auth-key master key); `down -v` destroys them and every client
+has to re-handshake. `.env.example` documents each variable.
+
+## Build and run locally
+
+```bash
+make build   # go build ./...
+make run     # go run ./cmd/telegramd
+```
+
+Configuration is environment variables, read in `internal/config/config.go`.
+The server refuses to start without a database and a master key:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TG_POSTGRES_DSN` | *(required)* | Postgres connection string, migrated schema (see below) |
+| `TG_AUTHKEY_ENC_KEY` | *(required)* | 64 hex chars — AES-256-GCM master key over stored auth keys. Alternatively set `TG_AUTHKEY_ENC_KEY_FILE` to read/generate the key from a file; one of the two must be set |
+| `TG_LISTEN_ADDR` | `:2443` | Address the MTProto listener binds |
+| `TG_RSA_KEY_PATH` | `server_key.pem` | Server RSA private key; generated on first start |
+| `TG_BLOB_DIR` | `blobs` | Where uploaded file bodies are written |
+| `TG_DC_ID` | `2` | DC id the server advertises |
+| `TG_LOG_LOGIN_CODES` | `false` | Write login codes to the log; without it sign-in cannot complete |
+| `TG_REGISTRATION` | `closed` | `open` allows `auth.signUp` to create accounts |
+| `TG_ADMIN_LISTEN_ADDR` | *(unset)* | Enables the admin HTTP server; requires `TG_ADMIN_TOKEN_HASH` (SHA-256 hex of the operator token) |
+
+A minimal run against a local Postgres:
+
+```bash
+export TG_POSTGRES_DSN="postgres://user:pass@localhost:5432/telegram?sslmode=disable"
+make migrate
+TG_AUTHKEY_ENC_KEY="$(openssl rand -hex 32)" TG_LOG_LOGIN_CODES=true make run
+```
+
+The full variable reference — rate limits, pre-auth connection bounds, PROXY
+protocol support, upload limits — is in `docs/clients.md` and
+`internal/config/config.go`.
+
+## Tests and lint
+
+```bash
+make test        # everything, -race; e2e runs in its own -count=1 invocation
+make test-unit   # all packages except test/e2e — fast development loop
+make test-db     # just internal/store
+make lint        # golangci-lint run
+```
+
+These are the same targets CI runs (`.github/workflows/ci.yml` runs
+`make test`). The Postgres tests need no setup beyond Docker:
+`internal/pgtest` starts one reusable `tg-test-pg` container and clones a
+fresh database per test from a template. When the tests themselves run inside
+a container, the `make` targets join Docker's default bridge network first;
+`docs/testing.md` explains why, and what to do when invoking `go test`
+directly.
+
+The admin dashboard has a browser e2e suite (Playwright, `test/e2e/admin.spec.ts`),
+run as a separate CI job:
+
+```bash
+pnpm install
+pnpm exec playwright install chromium
+pnpm test        # playwright test; starts its own server on 127.0.0.1:2444
+pnpm lint        # eslint over test/e2e
+```
+
+## Migrations and codegen
+
+Schema changes are Atlas migration files in `migrations/`, tracked by
+`migrations/atlas.sum`. `atlas.hcl` defines the `local` env: the target
+database comes from `TG_POSTGRES_DSN`, and validate/diff use a throwaway
+`docker://postgres/16` dev database.
+
+```bash
+export TG_POSTGRES_DSN="postgres://user:pass@localhost:5432/telegram?sslmode=disable"
+make migrate-new name=add_sessions   # diff current schema into a new migration
+make migrate                         # atlas migrate apply --env local
+```
+
+Hand-written migrations need `atlas migrate hash --env local` to update the
+sum file. Details, including validation: `docs/migrations.md`.
+
+Query changes: edit the SQL in `internal/store/queries`, then
+
+```bash
+make sqlc        # regenerate internal/store/db (alias: make generate)
+```
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `cmd/telegramd` | Server entrypoint |
+| `internal/mtproto` | MTProto server loop: accept, key exchange, sessions, dispatch |
+| `internal/api` | RPC method handlers |
+| `internal/store` | Postgres persistence; sqlc-generated code in `store/db`, SQL in `store/queries` |
+| `internal/admin` | Read-only operational metrics and dashboard handlers |
+| `internal/config` | Environment-variable configuration |
+| `internal/blob`, `internal/keycrypt`, `internal/rsakey`, `internal/srp`, `internal/peerhash` | Blob storage, auth-key sealing, RSA identity, SRP 2FA, peer access hashes |
+| `internal/pgtest` | Postgres test harness (testcontainers) |
+| `migrations/` | Atlas migration files + `atlas.sum` |
+| `test/e2e` | End-to-end suite: a real gotd client against a full server; `admin.spec.ts` + `adminserver` for the browser suite |
+| `tools/` | Separate Go module pinning the sqlc binary |
+| `docs/` | `clients.md` (connecting clients, full config reference), `migrations.md`, `testing.md` |
+| `ROADMAP.md` | Milestone history and plans |
+
+## Further reading
+
+- `docs/clients.md` — connecting a gotd client or a patched Telegram Desktop;
+  the complete configuration reference
+- `docs/migrations.md` — the Atlas workflow in detail
+- `docs/testing.md` — how the Postgres tests get a database, running inside
+  containers
+- `ROADMAP.md` — where the project has been and where it is going
