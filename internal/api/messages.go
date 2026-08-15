@@ -552,7 +552,9 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 }
 
 // handleDeleteMessages serves messages.deleteMessages: marks the caller's ids
-// deleted on both sides, nudges every affected user, and returns affected pts.
+// deleted, nudges every affected user, and returns affected pts. The client's
+// revoke flag decides whether a user-peer delete also removes the peer's copy
+// (revoke=true) or only the caller's (revoke=false, the client default).
 func (h *handlers) handleDeleteMessages(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesDeleteMessagesRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -566,7 +568,7 @@ func (h *handlers) handleDeleteMessages(r *mtproto.Request) (bin.Encoder, error)
 	for i, v := range req.ID {
 		ids[i] = int64(v)
 	}
-	perOwner, err := h.store.DeleteMessages(r.Ctx, r.UserID, ids)
+	perOwner, err := h.store.DeleteMessages(r.Ctx, r.UserID, ids, req.Revoke)
 	if errors.Is(err, store.ErrMessageInvalid) {
 		return nil, errMessageIDInvalid
 	}

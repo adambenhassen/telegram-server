@@ -448,7 +448,7 @@ func TestMessagingRealtime(t *testing.T) {
 
 	// 6. A deletes → B receives updateDeleteMessages.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
-		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{1}})
+		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{Revoke: true, ID: []int{1}})
 		return err
 	}); err != nil {
 		t.Fatalf("A delete: %v", err)

@@ -267,7 +267,7 @@ func TestDeleteMessagesBothSides(t *testing.T) {
 
 	sender := send(t, s, a, b, "bye", 1)
 
-	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID})
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}, true)
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -293,7 +293,86 @@ func TestDeleteMessagesBothSides(t *testing.T) {
 		}
 	}
 
-	if _, err := s.DeleteMessages(ctx, a.ID, []int64{999}); !errors.Is(err, store.ErrMessageInvalid) {
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{999}, true); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("delete absent: want ErrMessageInvalid, got %v", err)
+	}
+}
+
+// TestDeleteMessagesOneSided pins the revoke=false contract: the caller's row
+// is soft-deleted and the caller's pts bumped, and nothing touches the peer's
+// row, pts or event log.
+func TestDeleteMessagesOneSided(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551250031")
+	b := mustUser(t, s, "+15551250032")
+
+	sender := send(t, s, a, b, "bye", 1)
+
+	// a's own copy deleted without revoking b: b keeps its mirror and stays at
+	// pts 1 with only the send event.
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}, false)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if len(perOwner) != 1 || perOwner[a.ID] != 2 {
+		t.Fatalf("delete pts = %+v, want only a at 2", perOwner)
+	}
+
+	own := msgAt(t, s, a.ID, sender.LocalID)
+	if !own.Deleted {
+		t.Fatal("owner row not deleted")
+	}
+	mirror := msgAt(t, s, b.ID, sender.PeerLocalID)
+	if mirror.Deleted {
+		t.Fatal("mirror row deleted despite revoke=false")
+	}
+
+	stA, err := s.State(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("state a: %v", err)
+	}
+	if stA.Pts != 2 {
+		t.Fatalf("a pts = %d, want 2", stA.Pts)
+	}
+	stB, err := s.State(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("state b: %v", err)
+	}
+	if stB.Pts != 1 {
+		t.Fatalf("b pts = %d, want unchanged 1", stB.Pts)
+	}
+	eva, err := s.EventsSince(ctx, a.ID, 1)
+	if err != nil {
+		t.Fatalf("events a: %v", err)
+	}
+	if len(eva) != 1 || eva[0].Type != store.EventDelete {
+		t.Fatalf("a delete event = %+v", eva)
+	}
+	evb, err := s.EventsSince(ctx, b.ID, 0)
+	if err != nil {
+		t.Fatalf("events b: %v", err)
+	}
+	if len(evb) != 1 || evb[0].Type != store.EventNewMessage {
+		t.Fatalf("b events = %+v, want only the original send", evb)
+	}
+
+	// The reverse direction: b deletes her inbound copy one-sidedly and a keeps
+	// the message.
+	sender2 := send(t, s, a, b, "again", 2)
+	if _, err := s.DeleteMessages(ctx, b.ID, []int64{sender2.PeerLocalID}, false); err != nil {
+		t.Fatalf("one-sided inbound delete: %v", err)
+	}
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{999}, false); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("delete absent: want ErrMessageInvalid, got %v", err)
+	}
+	aRow := msgAt(t, s, a.ID, sender2.LocalID)
+	if aRow.Deleted {
+		t.Fatal("sender row deleted by recipient's one-sided delete")
+	}
+	bRow := msgAt(t, s, b.ID, sender2.PeerLocalID)
+	if !bRow.Deleted {
+		t.Fatal("deleter's own row not deleted")
 	}
 }

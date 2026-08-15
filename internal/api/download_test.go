@@ -181,12 +181,10 @@ func TestGetFileGate(t *testing.T) {
 	assertEncodes(t, enc)
 }
 
-// TestGetFileDeletedMessageRevokes pins that deleting a media message revokes
-// retrieval rather than being cosmetic.
-//
-// DeleteMessages on a user peer soft-deletes the owner row AND the mirror row
-// (internal/store/messages.go:522), so a delete by the recipient revokes the
-// file for BOTH accounts, not only the deleter.
+// TestGetFileDeletedMessageRevokes pins that a one-sided delete (revoke=false,
+// the client default) revokes retrieval only for the deleter: the sender keeps
+// the message and the file, while the deleter gets LOCATION_INVALID. The
+// revoke=true companion case below asserts both sides are revoked.
 func TestGetFileDeletedMessageRevokes(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -215,10 +213,41 @@ func TestGetFileDeletedMessageRevokes(t *testing.T) {
 		}
 	}
 
-	if _, err = s.DeleteMessages(ctx, b.ID, []int64{int64(inbox.ID)}); err != nil {
+	// b deletes her copy one-sidedly: only her retrieval is revoked.
+	if _, err = s.DeleteMessages(ctx, b.ID, []int64{int64(inbox.ID)}, false); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
+	if got := string(getBytes(t, s, blobs, a.ID, doc, 0, 64)); got != downloadPayload {
+		t.Fatalf("sender read after one-sided delete = %q, want %q", got, downloadPayload)
+	}
+	_, err = api.GetFileForTest(s, b.ID, blobs, &tg.UploadGetFileRequest{
+		Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+		Offset:   0,
+		Limit:    1024,
+	})
+	if msg := rpcMessage(t, err); msg != "LOCATION_INVALID" {
+		t.Errorf("deleter read after one-sided delete: got %s, want LOCATION_INVALID", msg)
+	}
+
+	// revoke=true deletes both rows and revokes both accounts.
+	hist2, err := api.GetHistoryForTest(s, a.ID, &tg.MessagesGetHistoryRequest{
+		Peer: api.InputPeerUser(a.ID, b.ID),
+	})
+	if err != nil {
+		t.Fatalf("get history a: %v", err)
+	}
+	outbox, ok := hist2.(*tg.MessagesMessages)
+	if !ok || len(outbox.Messages) != 1 {
+		t.Fatalf("history a = %#v, want one message", hist2)
+	}
+	out, ok := outbox.Messages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("history a message type = %T", outbox.Messages[0])
+	}
+	if _, err = s.DeleteMessages(ctx, a.ID, []int64{int64(out.ID)}, true); err != nil {
+		t.Fatalf("revoke delete: %v", err)
+	}
 	for _, uid := range []int64{a.ID, b.ID} {
 		_, err = api.GetFileForTest(s, uid, blobs, &tg.UploadGetFileRequest{
 			Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
@@ -226,7 +255,7 @@ func TestGetFileDeletedMessageRevokes(t *testing.T) {
 			Limit:    1024,
 		})
 		if msg := rpcMessage(t, err); msg != "LOCATION_INVALID" {
-			t.Errorf("post-delete read by %d: got %s, want LOCATION_INVALID", uid, msg)
+			t.Errorf("post-revoke read by %d: got %s, want LOCATION_INVALID", uid, msg)
 		}
 	}
 }

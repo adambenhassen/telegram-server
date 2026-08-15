@@ -274,7 +274,7 @@ func TestDeleteChatMessageEveryCopy(t *testing.T) {
 
 	sender, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: a.ID, Text: "bye", RandomID: 1})
 
-	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID})
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}, true)
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -314,11 +314,11 @@ func TestDeleteChatMessageIsAuthorOnly(t *testing.T) {
 	})
 
 	// b holds an inbound copy of a's message: same fan-out, not b's to destroy.
-	if _, err := s.DeleteMessages(ctx, b.ID, []int64{1}); !errors.Is(err, store.ErrMessageInvalid) {
+	if _, err := s.DeleteMessages(ctx, b.ID, []int64{1}, true); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("member deleting another member's chat message: want ErrMessageInvalid, got %v", err)
 	}
 	// a triggered the title change, so its copy is outgoing — still undeletable.
-	if _, err := s.DeleteMessages(ctx, a.ID, []int64{service.LocalID}); !errors.Is(err, store.ErrMessageInvalid) {
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{service.LocalID}, true); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("deleting a service message: want ErrMessageInvalid, got %v", err)
 	}
 
@@ -334,7 +334,7 @@ func TestDeleteChatMessageIsAuthorOnly(t *testing.T) {
 	}
 
 	// The author still deletes their own text message for everyone.
-	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{text.LocalID})
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{text.LocalID}, true)
 	if err != nil {
 		t.Fatalf("author delete: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestRemovedMemberCannotEditOrDeleteChatMessage(t *testing.T) {
 	if _, _, err := s.EditMessage(ctx, a.ID, sender.LocalID, "hijacked"); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("removed member edit: want ErrMessageInvalid, got %v", err)
 	}
-	if _, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}); !errors.Is(err, store.ErrMessageInvalid) {
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}, true); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("removed member delete: want ErrMessageInvalid, got %v", err)
 	}
 
@@ -443,7 +443,7 @@ func TestChatWriteSkipsMemberRemovedAfterSend(t *testing.T) {
 		}
 	}
 
-	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID})
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}, true)
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -493,7 +493,7 @@ func TestChatWriteNeverTouchesOneToOneRows(t *testing.T) {
 	if _, _, err := s.EditMessage(ctx, a.ID, bogus, "rewrite everything"); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("edit zero-fanout chat row: want ErrMessageInvalid, got %v", err)
 	}
-	if _, err := s.DeleteMessages(ctx, a.ID, []int64{bogus}); !errors.Is(err, store.ErrMessageInvalid) {
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{bogus}, true); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("delete zero-fanout chat row: want ErrMessageInvalid, got %v", err)
 	}
 	assertPrivateIntact("after rejected zero-fanout writes")
@@ -509,7 +509,7 @@ func TestChatWriteNeverTouchesOneToOneRows(t *testing.T) {
 		t.Fatalf("edit chat message: %v", err)
 	}
 	assertPrivateIntact("after a chat edit")
-	if _, err := s.DeleteMessages(ctx, a.ID, []int64{group.LocalID}); err != nil {
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{group.LocalID}, true); err != nil {
 		t.Fatalf("delete chat message: %v", err)
 	}
 	assertPrivateIntact("after a chat delete")
@@ -770,14 +770,14 @@ func TestDeleteMessagesAcrossChatAndOneToOne(t *testing.T) {
 		chatCopy[u.ID] = h[0].LocalID
 	}
 
-	if _, err := s.DeleteMessages(ctx, a.ID, []int64{private.LocalID, group.LocalID, 999}); !errors.Is(err, store.ErrMessageInvalid) {
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{private.LocalID, group.LocalID, 999}, true); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("batch with a missing id: want ErrMessageInvalid, got %v", err)
 	}
 	if m, ok := msgOpt(t, s, a.ID, private.LocalID); !ok || m.Deleted {
 		t.Fatal("failed batch deleted the 1:1 row anyway")
 	}
 
-	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{private.LocalID, group.LocalID})
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{private.LocalID, group.LocalID}, true)
 	if err != nil {
 		t.Fatalf("mixed batch delete: %v", err)
 	}

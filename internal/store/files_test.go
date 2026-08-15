@@ -136,7 +136,7 @@ func TestFileForDownloadGate(t *testing.T) {
 	}
 
 	// Soft-deleting the message revokes retrieval on both sides.
-	if _, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}); err != nil {
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}, true); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if _, err := s.FileForDownload(ctx, f.ID, f.AccessHash, a.ID); !errors.Is(err, store.ErrFileNotFound) {
