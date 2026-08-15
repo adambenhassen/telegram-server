@@ -314,6 +314,15 @@ func BuildUpdatesChatsForTest(s *store.Store, userID int64, fromPts int) ([]tg.U
 	return b.ups, b.users, b.chats, err
 }
 
+// LoadUsersForTest exposes loadUsers for the external api_test package.
+func LoadUsersForTest(s *store.Store, ids []int64, viewerID int64) ([]tg.UserClass, error) {
+	set := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return testHandlers(s).loadUsers(context.Background(), set, viewerID)
+}
+
 // LoadChatsForTest exposes loadChats for the external api_test package.
 func LoadChatsForTest(s *store.Store, ids []int64, viewerID int64) ([]tg.ChatClass, error) {
 	set := make(map[int64]bool, len(ids))

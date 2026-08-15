@@ -438,8 +438,10 @@ func TestBuildUpdatesChatMessage(t *testing.T) {
 		t.Fatalf("action = %+v, want MessageActionChatAddUser [%d]", ms.Action, users[2].ID)
 	}
 	// The added user is named by the action, so the batch must carry them: a
-	// client with only the sender renders the add as an unknown user.
-	if !hasUser(svcUsers, users[2].ID) {
+	// client with only the sender renders the add as an unknown user. The viewer
+	// shares no live edge with the just-added user, so the gate degrades them to
+	// userEmpty — the id is still present, which is what the client needs.
+	if !hasUserOrEmpty(svcUsers, users[2].ID) {
 		t.Fatalf("batch users = %v, want the added user %d", userIDs(svcUsers), users[2].ID)
 	}
 
@@ -585,6 +587,25 @@ func userIDs(us []tg.UserClass) []int64 {
 
 func hasUser(us []tg.UserClass, id int64) bool {
 	return slices.Contains(userIDs(us), id)
+}
+
+// hasUserOrEmpty reports whether us carries id as either a full user or a
+// degraded userEmpty, which the loadUsers gate emits for an id the viewer is
+// not entitled to see live.
+func hasUserOrEmpty(us []tg.UserClass, id int64) bool {
+	for _, uc := range us {
+		switch u := uc.(type) {
+		case *tg.User:
+			if u.ID == id {
+				return true
+			}
+		case *tg.UserEmpty:
+			if u.ID == id {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestGetDifferenceRendersSameMediaAsHistory(t *testing.T) {

@@ -661,6 +661,59 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 		t.Fatalf("history error type = %T, want *tgerr.Error", histErr)
 	}
 
+	// F7: the removed member's loadUsers gate. A and C share no 1:1 dialog and
+	// no live chat or channel, so C's getDialogs must degrade A to userEmpty —
+	// and must not leak A's new handle after A changes it.
+	var newHandle string
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.AccountUpdateUsername(ctx, "removed_a_newhandle")
+		if err != nil {
+			return err
+		}
+		u, ok := res.(*tg.User)
+		if !ok || u.Username == "" {
+			return errors.New("updateUsername: no username in reply")
+		}
+		newHandle = u.Username
+		return nil
+	})
+	if newHandle != "removed_a_newhandle" {
+		t.Fatalf("A new handle = %q, want removed_a_newhandle", newHandle)
+	}
+
+	checkUserEmpty := func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+			OffsetDate: 0, OffsetID: 0, OffsetPeer: &tg.InputPeerEmpty{}, Limit: 100,
+		})
+		if err != nil {
+			return err
+		}
+		diags, ok := res.(*tg.MessagesDialogs)
+		if !ok {
+			return errors.New("unexpected dialogs type")
+		}
+		var sawA bool
+		for _, uc := range diags.Users {
+			switch u := uc.(type) {
+			case *tg.User:
+				if u.ID == aUserID {
+					return fmt.Errorf("removed member A served as live user, username %q", u.Username)
+				}
+			case *tg.UserEmpty:
+				if u.ID == aUserID {
+					sawA = true
+				} else {
+					return fmt.Errorf("userEmpty id = %d, want A's %d", u.ID, aUserID)
+				}
+			}
+		}
+		if !sawA {
+			return errors.New("A not present in C's dialogs users at all")
+		}
+		return nil
+	}
+	execChat(t, ctx, cCmds, checkUserEmpty)
+
 	close(aCmds)
 	close(cCmds)
 	if err := <-errA; err != nil && !errors.Is(err, context.Canceled) {

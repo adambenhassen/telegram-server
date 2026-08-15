@@ -529,19 +529,94 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 // loadUsers hydrates the given user ids into wire users, marking selfID as
 // Self. viewerID is the account receiving this response; it is used to derive
 // the per-viewer access hash for each user.
+//
+// Every id the viewer is not entitled to see degrades to tg.UserEmpty: it
+// carries the id and nothing else, which is what tells a client to stop
+// rendering the account as reachable. Entitlement holds iff the id is the
+// viewer, the two share a 1:1 dialog row, both are current participants of
+// some chat, or both are current (unbanned) members of some channel. A
+// removed member keeps their dialog row and their retained message copies by
+// design, so without this gate a batched read of the ids their own rows
+// reference would keep serving live profiles — names, handles, presence —
+// for accounts they no longer share anything live with.
+//
+// The predicate is one batched query per id set per call, not one per user:
+// the whole id set is fetched in one UsersByID, and the viewer's dialog
+// partners, chat mates and channel mates in one query each.
 func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, viewerID int64) ([]tg.UserClass, error) {
-	users := make([]tg.UserClass, 0, len(ids))
+	if len(ids) == 0 {
+		return []tg.UserClass{}, nil
+	}
+	list := make([]int64, 0, len(ids))
 	for id := range ids {
-		u, ok, err := h.store.UserByID(ctx, id)
+		list = append(list, id)
+	}
+	users, err := h.store.UsersByID(ctx, list)
+	if err != nil {
+		return nil, err
+	}
+	entitled, err := h.entitledUserIDs(ctx, viewerID, list)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]tg.UserClass, 0, len(users))
+	for id, u := range users {
+		if id != viewerID && !entitled[id] {
+			out = append(out, &tg.UserEmpty{ID: id})
+			continue
+		}
+		out = append(out, h.userToTL(u, viewerID, id == viewerID))
+	}
+	return out, nil
+}
+
+// entitledUserIDs reports which of ids the viewer is entitled to see live:
+// the viewer themself, a 1:1 dialog partner, a current participant of a chat
+// the viewer is in, or a current unbanned member of a channel the viewer is in.
+// The four sources are the live edges that admit an account's metadata to a
+// client — exactly the surfaces the store already uses for chat and channel
+// admission. Absent or unknown ids simply are not reported.
+func (h *handlers) entitledUserIDs(ctx context.Context, viewerID int64, ids []int64) (map[int64]bool, error) {
+	out := map[int64]bool{viewerID: true}
+	partners, err := h.store.DialogPartners(ctx, viewerID)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range partners {
+		out[id] = true
+	}
+	chats, err := h.store.ChatsForUser(ctx, viewerID)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range chats {
+		parts, err := h.store.Participants(ctx, c.ID)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			continue
+		for _, p := range parts {
+			out[p.UserID] = true
 		}
-		users = append(users, h.userToTL(u, viewerID, id == viewerID))
 	}
-	return users, nil
+	channelIDs := []int64{}
+	channels, err := h.store.ChannelsForUser(ctx, viewerID)
+	if err != nil {
+		return nil, err
+	}
+	for _, ch := range channels {
+		channelIDs = append(channelIDs, ch.ID)
+	}
+	members, err := h.store.ChannelMembersOfChannels(ctx, channelIDs)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	for _, m := range members {
+		if !m.Banned(now) {
+			out[m.UserID] = true
+		}
+	}
+	return out, nil
 }
 
 // loadChats hydrates chat ids for viewerID. A chat the viewer is no longer a

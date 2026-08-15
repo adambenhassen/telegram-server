@@ -322,3 +322,51 @@ func (q *Queries) UserByPhone(ctx context.Context, phone *string) (UserByPhoneRo
 	)
 	return i, err
 }
+
+const usersByID = `-- name: UsersByID :many
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM users u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
+WHERE u.id = ANY($1::bigint[])
+`
+
+type UsersByIDRow struct {
+	ID         int64
+	Phone      *string
+	FirstName  string
+	LastName   string
+	CreatedAt  pgtype.Timestamptz
+	IsOnline   bool
+	LastSeenAt pgtype.Timestamptz
+	Username   *string
+}
+
+func (q *Queries) UsersByID(ctx context.Context, ids []int64) ([]UsersByIDRow, error) {
+	rows, err := q.db.Query(ctx, usersByID, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []UsersByIDRow
+	for rows.Next() {
+		var i UsersByIDRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Phone,
+			&i.FirstName,
+			&i.LastName,
+			&i.CreatedAt,
+			&i.IsOnline,
+			&i.LastSeenAt,
+			&i.Username,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

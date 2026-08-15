@@ -312,6 +312,26 @@ func (s *Store) ChannelMembers(ctx context.Context, channelID int64) ([]ChannelM
 	return out, nil
 }
 
+// ChannelMembersOfChannels returns the participant rows of every channel in
+// channelIDs in one query, so a caller can decide who shares a channel with a
+// viewer across the whole set without one query per channel. Banned rows are
+// included as-is: a ban is data here, and the caller decides what it means by
+// calling ChannelMember.Banned.
+func (s *Store) ChannelMembersOfChannels(ctx context.Context, channelIDs []int64) ([]ChannelMember, error) {
+	if len(channelIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.q.ChannelMembersOfChannels(ctx, channelIDs)
+	if err != nil {
+		return nil, fmt.Errorf("channel members of channels: %w", err)
+	}
+	out := make([]ChannelMember, len(rows))
+	for i, r := range rows {
+		out[i] = channelMemberFromRow(r)
+	}
+	return out, nil
+}
+
 // ChannelMemberOf returns userID's participant row of channelID; ok=false when
 // there is none. The row is returned as it stands: a ban is data here, not a
 // verdict, and the caller decides what it means by calling ChannelMember.Banned.

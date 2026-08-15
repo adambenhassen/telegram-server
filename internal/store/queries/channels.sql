@@ -47,6 +47,10 @@ SELECT * FROM channel_participants
 WHERE user_id = sqlc.arg(viewer_id)::bigint
   AND channel_id = ANY(sqlc.arg(channel_ids)::bigint[]);
 
+-- name: ChannelMembersOfChannels :many
+SELECT * FROM channel_participants
+WHERE channel_id = ANY(sqlc.arg(channel_ids)::bigint[]);
+
 -- name: IsChannelMember :one
 SELECT EXISTS(SELECT 1 FROM channel_participants WHERE channel_id = $1 AND user_id = $2);
 

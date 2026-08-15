@@ -37,6 +37,13 @@ FROM users u
 LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 WHERE u.id = $1;
 
+-- name: UsersByID :many
+SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
+       un.handle AS username
+FROM users u
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
+WHERE u.id = ANY(sqlc.arg(ids)::bigint[]);
+
 -- name: SetUserStatus :execrows
 UPDATE users SET is_online = $2, last_seen_at = now() WHERE id = $1;
 
