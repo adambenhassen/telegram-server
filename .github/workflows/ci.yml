@@ -136,6 +136,132 @@ jobs:
           docker logs --tail 50 tg-test-pg 2>&1 || true
           free -m
 
+  # Drives the admin dashboard through a real browser (test/e2e/admin.spec.ts).
+  # Everything the suite needs is started by Playwright's webServer:
+  # test/e2e/adminserver builds its own Postgres from the pgtest testcontainers
+  # harness, exactly as the Go tests do, so there is no service container to
+  # wire up here. Gated behind ci because a browser run is the slowest and least
+  # specific way to learn that the Go build or the unit tests are broken.
+  e2e-admin:
+    runs-on: ubuntu-latest
+    needs: ci
+    # The suite is a handful of specs against a local server; this only catches
+    # a hang (a browser that never launches, a webServer that never binds).
+    timeout-minutes: 20
+
+    env:
+      # Same reasoning as the ci job: the runner is destroyed at the end of the
+      # job, so there is nothing for testcontainers' reaper to reap, and losing
+      # its connection kills the shared tg-test-pg container mid-run.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # internal/pgtest reads migrations/ at run time to build its template
+      # database, so the same mtime pinning the ci job does applies here — the
+      # admin server goes through that harness.
+      - name: Pin migration timestamps for the test cache
+        run: touch -d @0 migrations/* migrations
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: go-mod-${{ runner.os }}-
+
+      # Read-only on purpose, unlike the ci job: that job's key is built to
+      # always miss so it always saves, and two jobs writing a build cache in
+      # the same run would race for the same entry. This one just borrows
+      # whatever ci already published for this go.sum.
+      - name: Restore Go build cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-
+
+      # Before setup-node, whose pnpm cache mode shells out to pnpm to find the
+      # store path. Version pinned here because package.json carries no
+      # packageManager field; 10 is the major that writes lockfileVersion 9.0.
+      - uses: pnpm/action-setup@v6.0.10
+        with:
+          version: 10
+
+      # No engines field or .nvmrc in the repo, so the version is a choice made
+      # here: current LTS, comfortably above Playwright's floor.
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Browsers land outside the repo and are not covered by the pnpm cache.
+      # Keyed on the lockfile because that is what pins the Playwright version,
+      # and a browser build belongs to exactly one of those; no restore-keys,
+      # since a stale browser for a newer Playwright is worse than a fresh
+      # download.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+
+      # playwright.config.ts declares no projects, so the suite runs on Chromium
+      # alone and there is no reason to download the other two. --with-deps is
+      # still needed on a cache hit: the apt libraries it installs live on the
+      # runner image, not in the cached browser directory.
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+
+      # The webServer runs this same package with `go run`, so a compile error
+      # would otherwise surface as a 120s webServer timeout with the real error
+      # buried in a captured stdout pipe. Building it first fails in seconds
+      # with the compiler's own message, and warms the cache the run then uses.
+      - name: Build the e2e admin server
+        run: go build -tags e2e_admin_server -o /dev/null ./test/e2e/adminserver
+
+      # The html reporter is added here rather than in playwright.config.ts so a
+      # local run keeps the list output it has today; it is what writes the
+      # playwright-report/ directory uploaded below. PLAYWRIGHT_HTML_OPEN stops
+      # the reporter from trying to serve that report on a runner with no
+      # browser to open it in.
+      - name: Run Playwright tests
+        env:
+          PLAYWRIGHT_HTML_OPEN: never
+        run: pnpm exec playwright test --reporter=list,html
+
+      # Both directories, because they answer different questions: the report is
+      # the readable summary, and test-results/ holds the traces the config
+      # retains on failure, which are the only way to replay the run.
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Same failure mode as the ci job: the suite talks to one shared Postgres
+      # container, and when it dies every remaining spec fails with a connection
+      # error that says nothing about why.
+      - name: Postgres container state on failure
+        if: failure()
+        run: |
+          docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oomkilled={{.State.OOMKilled}} error={{.State.Error}}' tg-test-pg || echo "container gone"
+          docker logs --tail 50 tg-test-pg 2>&1 || true
+          free -m
+
   # Builds the image and boots it against a migrated database. Docker is not
   # available in the environments the Dockerfile is edited from, so this job is
   # the only place it is ever built — it is the gate that stops it rotting.
