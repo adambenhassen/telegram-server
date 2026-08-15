@@ -1,6 +1,6 @@
-# golang:1.25 matches the `go 1.25.0` directive in go.mod; the module file stays
+# golang:1.26 matches the `go 1.26.6` directive in go.mod; the module file stays
 # the single source of the version, so a bump there is the only thing to change.
-FROM golang:1.25 AS build
+FROM golang:1.26 AS build
 
 WORKDIR /src
 
