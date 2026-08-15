@@ -185,3 +185,40 @@ test.describe('admin login/logout CSRF flow', () => {
     expect(noSession.status(), 'logout with no session cookie').toBe(401);
   });
 });
+
+test.describe('admin SSE stream', () => {
+  test('live tick delivers DashboardFragmentRenderer markup', async ({ page }) => {
+    // Log in so the page context holds the session cookie.
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    // Open a native EventSource from the browser context. The session cookie is
+    // sent automatically; this exercises the full broadcaster path including the
+    // wired DashboardFragmentRenderer.
+    const eventData = await page.evaluate((): Promise<string> => {
+      return new Promise((resolve, reject) => {
+        const es = new EventSource('/admin/events');
+        const timer = setTimeout(() => {
+          es.close();
+          reject(new Error('SSE timeout: no metrics event within 5 s'));
+        }, 5000);
+        es.addEventListener('metrics', (e: Event) => {
+          clearTimeout(timer);
+          es.close();
+          resolve((e as MessageEvent).data);
+        });
+        es.onerror = () => {
+          clearTimeout(timer);
+          es.close();
+          reject(new Error('SSE connection error'));
+        };
+      });
+    });
+
+    // DashboardFragmentRenderer produces shadcn-templ card markup.
+    // DefaultFragmentRenderer produces minimal <span data-metric="..."> elements
+    // with no card structure. Either assertion distinguishes the two renderers.
+    expect(eventData).toContain('data-slot="card-content"');
+    expect(eventData).toContain('id="v-connections"');
+  });
+});
