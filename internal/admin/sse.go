@@ -21,8 +21,10 @@ import (
 // Server-sent-events defaults for GET /admin/events.
 const (
 	// sseDefaultEvent is the event name used when a Fragment leaves it empty.
-	// The dashboard subscribes to it with the htmx SSE extension.
-	sseDefaultEvent = "metrics"
+	// The dashboard subscribes to it with the htmx SSE extension and swaps the
+	// fragment into #dashboard-data. Agreed with MAIN-302; changing it here
+	// without changing it there gives htmx a 200 it silently does not swap.
+	sseDefaultEvent = "dashboard-update"
 
 	// sseInterval is the shared sampler's cadence. One sample per interval
 	// serves every connected client.
@@ -34,6 +36,12 @@ const (
 
 	// sseRetryHint is the reconnect delay advertised to the browser.
 	sseRetryHint = 5 * time.Second
+
+	// sseCapRetryAfter is the backoff sent with the 503 that a refused stream
+	// gets. It is deliberately much longer than sseRetryHint: hitting the cap
+	// is not a transient condition, and a client retrying every 5 s would spin
+	// against a full server.
+	sseCapRetryAfter = 60 * time.Second
 
 	// sseMaxStreamDuration bounds a single stream's lifetime. It must stay
 	// below idleTimeout: RequireAdmin refreshes a session's last-activity
@@ -72,7 +80,9 @@ type Sampler func(context.Context) (MetricsResponse, error)
 // GET /admin/metrics serves.
 func NewMetricsSampler(registry *mtproto.SessionRegistry, st *store.Store) Sampler {
 	return func(ctx context.Context) (MetricsResponse, error) {
-		return collectMetrics(ctx, registry, st)
+		// requireAllMetrics: the stream stays silent on a partial snapshot
+		// rather than pushing a metric that reads as good news.
+		return collectMetrics(ctx, registry, st, requireAllMetrics)
 	}
 }
 
@@ -277,12 +287,21 @@ func (b *Broadcaster) subscribe() (*subscriber, []byte, error) {
 	sub := &subscriber{ch: make(chan []byte, 1)}
 	b.subs[sub] = struct{}{}
 	last := b.last
+	firstClient := len(b.subs) == 1
 	b.mu.Unlock()
 
-	// Nothing has been sampled yet — ask the sampler for one now rather than
-	// leaving the first client blank for a full interval. Later connections
-	// reuse last, so reconnect churn cannot drive extra queries.
-	if last == nil {
+	// Waking the sampler on the 0-to-1 transition covers both the very first
+	// connection and a reconnect after the broadcaster has been idle, where
+	// last is however old the last client left it. Connections 2..N reuse last
+	// untouched, and the buffered wake collapses a burst into one sample, so
+	// neither reconnect churn nor a crowd of tabs multiplies the query load.
+	//
+	// last is still served immediately even when stale: it paints the page now
+	// and the fresh sample this wake triggers replaces it a moment later. The
+	// fragment carries the server timestamp, so a snapshot that never refreshes
+	// surfaces on the dashboard's freshness threshold rather than passing for
+	// live data.
+	if firstClient {
 		select {
 		case b.wake <- struct{}{}:
 		default:
@@ -364,7 +383,7 @@ func EventsHandler(b *Broadcaster) http.HandlerFunc {
 
 		sub, last, err := b.subscribe()
 		if err != nil {
-			w.Header().Set("Retry-After", strconv.Itoa(int(sseRetryHint.Seconds())))
+			w.Header().Set("Retry-After", strconv.Itoa(int(sseCapRetryAfter.Seconds())))
 			http.Error(w, "too many streams", http.StatusServiceUnavailable)
 			return
 		}
@@ -441,7 +460,9 @@ var metricsFragmentTmpl = template.Must(template.New("metrics-fragment").Parse(m
 
 // metricsFragmentHTML mirrors the data-metric attributes the dashboard uses, so
 // a swap target can address the same values it server-rendered on first paint.
-const metricsFragmentHTML = `<div id="metrics-stream" data-timestamp="{{.ServerTimestamp}}">` +
+// The wrapper id is the swap target agreed on MAIN-302 and is asserted by
+// TestSSE_default_contract_is_the_dashboard_contract.
+const metricsFragmentHTML = `<div id="dashboard-data" data-timestamp="{{.ServerTimestamp}}">` +
 	`<span data-metric="connections">{{.Connections}}</span>` +
 	`<span data-metric="sessions">{{.Sessions}}</span>` +
 	`<span data-metric="messages_1h">{{.Messages1H}}</span>` +

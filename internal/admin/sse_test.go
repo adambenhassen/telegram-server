@@ -13,8 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/adambenhassen/telegram-server/internal/admin"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 // sseTestBroadcaster builds a Broadcaster over a canned sampler and renderer,
@@ -29,9 +33,10 @@ func sseTestBroadcaster(t *testing.T, cfg admin.BroadcasterConfig) *admin.Broadc
 	}
 	if cfg.Render == nil {
 		cfg.Render = func(m admin.MetricsResponse) ([]admin.Fragment, error) {
+			// Event left empty on purpose: the stream tests then assert the
+			// real default event name rather than a name local to the test.
 			return []admin.Fragment{{
-				Event: "metrics",
-				HTML:  "<span id=\"v-connections\">" + admin.FmtInt(int64(m.Connections)) + "</span>",
+				HTML: "<span id=\"v-connections\">" + admin.FmtInt(int64(m.Connections)) + "</span>",
 			}}, nil
 		}
 	}
@@ -147,7 +152,7 @@ func TestSSE_streams_events(t *testing.T) {
 	}
 
 	got := readSSEUntil(t, resp.Body, "v-connections", 5*time.Second)
-	if !strings.Contains(got, "event: metrics") {
+	if !strings.Contains(got, "event: "+admin.SSEDefaultEvent()) {
 		t.Errorf("stream missing event name; got:\n%s", got)
 	}
 	if !strings.Contains(got, "retry: ") {
@@ -165,11 +170,11 @@ func TestSSE_multiline_fragment_is_framed_per_line(t *testing.T) {
 	t.Parallel()
 
 	got := string(admin.EncodeFragment(admin.Fragment{
-		Event: "metrics",
+		Event: "custom-event",
 		HTML:  "<div>\r\n  <span>1</span>\n</div>",
 	}))
 
-	want := "event: metrics\ndata: <div>\ndata:   <span>1</span>\ndata: </div>\n\n"
+	want := "event: custom-event\ndata: <div>\ndata:   <span>1</span>\ndata: </div>\n\n"
 	if got != want {
 		t.Errorf("EncodeFragment =\n%q\nwant\n%q", got, want)
 	}
@@ -206,7 +211,7 @@ func TestSSE_heartbeat_keeps_idle_stream_open(t *testing.T) {
 	}
 
 	got := readSSEUntil(t, resp.Body, ": keepalive", 5*time.Second)
-	if strings.Contains(got, "event: metrics") {
+	if strings.Contains(got, "event: ") {
 		t.Errorf("sampler failed but an event was emitted:\n%s", got)
 	}
 }
@@ -252,7 +257,7 @@ func TestSSE_shutdown_closes_streams(t *testing.T) {
 			return admin.MetricsResponse{Connections: 1}, nil
 		},
 		Render: func(admin.MetricsResponse) ([]admin.Fragment, error) {
-			return []admin.Fragment{{Event: "metrics", HTML: "<b>hi</b>"}}, nil
+			return []admin.Fragment{{HTML: "<b>hi</b>"}}, nil
 		},
 		Interval:  20 * time.Millisecond,
 		Heartbeat: time.Hour,
@@ -505,8 +510,9 @@ func TestSSE_route_behind_admin_gate(t *testing.T) {
 	tokenHash := sha256hex([]byte(rawToken))
 
 	b := sseTestBroadcaster(t, admin.BroadcasterConfig{
-		MaxStreamDuration: 200 * time.Millisecond,
-		Heartbeat:         time.Hour,
+		Interval:          30 * time.Millisecond,
+		Heartbeat:         30 * time.Millisecond,
+		MaxStreamDuration: 400 * time.Millisecond,
 	})
 	h := admin.AdminRouter(admin.LoginHandlerConfig{
 		Store:     st,
@@ -548,7 +554,243 @@ func TestSSE_route_behind_admin_gate(t *testing.T) {
 			t.Errorf("%s = %q, want %q", header, got, want)
 		}
 	}
-	if !strings.Contains(rec.Body.String(), "event: metrics") {
-		t.Errorf("no event reached the client through the router:\n%s", rec.Body.String())
+	body := rec.Body.String()
+	// Past first paint: the stream must keep producing through the middleware
+	// chain, not just deliver the snapshot it opened with.
+	if n := strings.Count(body, "event: "+admin.SSEDefaultEvent()); n < 2 {
+		t.Errorf("only %d events reached the client through the router; the stream stopped after first paint:\n%s", n, body)
+	}
+	if !strings.Contains(body, ": keepalive") {
+		t.Errorf("no keepalive reached the client through the router:\n%s", body)
+	}
+}
+
+// TestSSE_default_contract_is_the_dashboard_contract pins the event name and
+// swap target agreed with MAIN-302. htmx answers a mismatched event name with a
+// silent no-swap — a 200 and a page that never updates — so a rename on either
+// side has to break a test here.
+func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
+	t.Parallel()
+
+	if got := admin.SSEDefaultEvent(); got != "dashboard-update" {
+		t.Errorf("default event name = %q, want dashboard-update (MAIN-302 sse-swap target)", got)
+	}
+
+	fragments, err := admin.DefaultFragmentRenderer(admin.MetricsResponse{Connections: 3})
+	if err != nil {
+		t.Fatalf("DefaultFragmentRenderer: %v", err)
+	}
+	if len(fragments) != 1 {
+		t.Fatalf("DefaultFragmentRenderer returned %d fragments, want 1", len(fragments))
+	}
+	if fragments[0].Event != "" && fragments[0].Event != admin.SSEDefaultEvent() {
+		t.Errorf("fragment event = %q, want %q", fragments[0].Event, admin.SSEDefaultEvent())
+	}
+	if !strings.Contains(fragments[0].HTML, `id="dashboard-data"`) {
+		t.Errorf("fragment does not carry the agreed swap target id:\n%s", fragments[0].HTML)
+	}
+
+	// An empty Event on the wire must resolve to the same name.
+	wire := string(admin.EncodeFragment(admin.Fragment{HTML: "<i>x</i>"}))
+	if !strings.HasPrefix(wire, "event: dashboard-update\n") {
+		t.Errorf("unnamed fragment encoded as %q", wire)
+	}
+}
+
+// TestSSE_slow_reader_gets_the_latest_snapshot verifies the fan-out contract for
+// a client that stops draining: the broadcaster replaces the queued payload
+// instead of blocking on it or growing a backlog, so the reader resumes on
+// current values rather than replaying history.
+func TestSSE_slow_reader_gets_the_latest_snapshot(t *testing.T) {
+	t.Parallel()
+
+	var sampleNo atomic.Int64
+	b := sseTestBroadcaster(t, admin.BroadcasterConfig{
+		Sample: func(context.Context) (admin.MetricsResponse, error) {
+			return admin.MetricsResponse{Connections: int(sampleNo.Add(1))}, nil
+		},
+		Interval: 10 * time.Millisecond,
+	})
+
+	ch, _, unsubscribe, err := b.SubscribeForTest()
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	// Never read while the sampler runs, so every fan-out finds the buffer full.
+	deadline := time.Now().Add(2 * time.Second)
+	for sampleNo.Load() < 5 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	produced := sampleNo.Load()
+	if produced < 5 {
+		t.Fatalf("sampler only produced %d snapshots", produced)
+	}
+
+	// Unsubscribing stops further fan-out to this channel under the same lock
+	// fanout takes, so what remains in it is exactly what was queued.
+	unsubscribe()
+
+	var queued [][]byte
+	for {
+		select {
+		case payload := <-ch:
+			queued = append(queued, payload)
+			continue
+		default:
+		}
+		break
+	}
+
+	if len(queued) != 1 {
+		t.Fatalf("%d payloads queued for a reader that never drained, want 1: a backlog accumulated", len(queued))
+	}
+
+	// The one queued payload is a recent snapshot, not the first that arrived
+	// and then sat there while five more were produced.
+	got := string(queued[0])
+	if !strings.Contains(got, ">"+admin.FmtInt(produced)+"<") &&
+		!strings.Contains(got, ">"+admin.FmtInt(produced-1)+"<") {
+		t.Errorf("slow reader was served a stale snapshot after %d samples:\n%s", produced, got)
+	}
+}
+
+// TestSSE_wakes_sampler_when_first_client_returns verifies that the sampler is
+// woken on the 0-to-1 subscriber transition, not only on the very first
+// connection. Without it, a client reconnecting after an idle period would be
+// served whatever stale snapshot the previous client left behind and would wait
+// a full interval for real data.
+func TestSSE_wakes_sampler_when_first_client_returns(t *testing.T) {
+	t.Parallel()
+
+	var samples atomic.Int64
+	b := sseTestBroadcaster(t, admin.BroadcasterConfig{
+		Sample: func(context.Context) (admin.MetricsResponse, error) {
+			samples.Add(1)
+			return admin.MetricsResponse{Connections: int(samples.Load())}, nil
+		},
+		// Long enough that a wake, not the ticker, has to be what samples.
+		Interval: time.Hour,
+	})
+
+	_, _, unsubscribe, err := b.SubscribeForTest()
+	if err != nil {
+		t.Fatalf("first subscribe: %v", err)
+	}
+	waitForSamples(t, &samples, 1, 2*time.Second)
+
+	// Everyone leaves, then someone comes back.
+	unsubscribe()
+	waitForClients(t, b, 0, 2*time.Second)
+
+	_, _, unsubscribe2, err := b.SubscribeForTest()
+	if err != nil {
+		t.Fatalf("second subscribe: %v", err)
+	}
+	defer unsubscribe2()
+
+	waitForSamples(t, &samples, 2, 2*time.Second)
+}
+
+// TestSSE_extra_clients_do_not_wake_the_sampler verifies the other half of that
+// rule: connections 2..N reuse the last snapshot, so a crowd of tabs — or a
+// reconnect loop — cannot multiply the query load.
+func TestSSE_extra_clients_do_not_wake_the_sampler(t *testing.T) {
+	t.Parallel()
+
+	var samples atomic.Int64
+	b := sseTestBroadcaster(t, admin.BroadcasterConfig{
+		Sample: func(context.Context) (admin.MetricsResponse, error) {
+			samples.Add(1)
+			return admin.MetricsResponse{Connections: 1}, nil
+		},
+		Interval: time.Hour,
+	})
+
+	_, _, unsubscribe, err := b.SubscribeForTest()
+	if err != nil {
+		t.Fatalf("first subscribe: %v", err)
+	}
+	defer unsubscribe()
+	waitForSamples(t, &samples, 1, 2*time.Second)
+
+	for i := range 5 {
+		_, last, drop, err := b.SubscribeForTest()
+		if err != nil {
+			t.Fatalf("subscribe %d: %v", i, err)
+		}
+		defer drop()
+		if last == nil {
+			t.Errorf("client %d was not served the last snapshot", i)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if n := samples.Load(); n != 1 {
+		t.Errorf("5 extra clients drove %d samples, want 1", n)
+	}
+}
+
+// waitForSamples polls until the sampler has run at least n times.
+func waitForSamples(t *testing.T, samples *atomic.Int64, n int64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if samples.Load() >= n {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("expected at least %d samples, got %d", n, samples.Load())
+}
+
+// TestSSE_sampler_fails_snapshot_on_partial_query verifies the difference
+// between the two metric surfaces when the pts-gap query fails.
+//
+// The JSON endpoint degrades that field to zero, which is safe for a poller:
+// the next poll 10s later corrects it. The stream cannot do that. It only emits
+// on a successful sample and its contract is that a failed sample leaves the
+// last values in place, so a zeroed MaxPtsGap riding a fresh timestamp would
+// push "every client is caught up" and nothing would ever contradict it.
+func TestSSE_sampler_fails_snapshot_on_partial_query(t *testing.T) {
+	t.Parallel()
+
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() }) //nolint:errcheck // best-effort close
+
+	registry := mtproto.NewSessionRegistry()
+
+	// Both surfaces agree while every query works.
+	if _, err := admin.CollectMetricsStrict(ctx, registry, st); err != nil {
+		t.Fatalf("healthy strict collect: %v", err)
+	}
+
+	// Break only what MaxPtsGap reads; the rest of the snapshot still resolves.
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `ALTER TABLE update_state RENAME TO update_state_hidden`); err != nil {
+		t.Fatalf("break pts gap query: %v", err)
+	}
+
+	if _, err := admin.CollectMetricsStrict(ctx, registry, st); err == nil {
+		t.Error("SSE sampler returned a snapshot with a failed pts-gap query; it would push a false zero")
+	}
+
+	tolerant, err := admin.CollectMetricsTolerant(ctx, registry, st)
+	if err != nil {
+		t.Fatalf("GET /admin/metrics behaviour changed: %v", err)
+	}
+	if tolerant.MaxPtsGap != 0 {
+		t.Errorf("tolerant MaxPtsGap = %d, want 0", tolerant.MaxPtsGap)
+	}
+	if tolerant.TotalUsers < 0 {
+		t.Errorf("tolerant snapshot is not otherwise populated: %+v", tolerant)
 	}
 }
