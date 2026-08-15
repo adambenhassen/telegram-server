@@ -10,3 +10,6 @@ blobs/
 # Must stay below .env.*, which would otherwise swallow it; the template carries
 # no secret values.
 !.env.example
+node_modules/
+test-results/
+playwright-report/
