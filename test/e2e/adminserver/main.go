@@ -95,6 +95,7 @@ func run(log *slog.Logger) error {
 	events := admin.NewBroadcaster(admin.BroadcasterConfig{
 		Sample: admin.NewMetricsSampler(registry, st),
 		Logger: log,
+		Render: admin.DashboardFragmentRenderer,
 	})
 	eventsCtx, stopEvents := context.WithCancel(ctx)
 	var eventsWG sync.WaitGroup

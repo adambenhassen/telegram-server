@@ -53,9 +53,14 @@ func IdleTimeout() time.Duration {
 	return idleTimeout
 }
 
-// RenderDashboard executes the dashboard template with data into w.
-// Exposed for package-level integration tests that need to inspect the
-// rendered HTML without going through the full HTTP handler.
+// RenderDashboard renders the full dashboard page into w.
+// Exposed for package-level integration tests.
 func RenderDashboard(w io.Writer, data DashboardData) error {
-	return dashboardTmpl.Execute(w, data)
+	return dashboardPage(data).Render(context.Background(), w)
+}
+
+// RenderFragment renders only the SSE-swappable metrics fragment into w.
+// Exposed for testing DashboardFragmentRenderer without going through HTTP.
+func RenderFragment(w io.Writer, data DashboardData) error {
+	return metricsFragment(data).Render(context.Background(), w)
 }

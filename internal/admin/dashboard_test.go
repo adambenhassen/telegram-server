@@ -100,9 +100,9 @@ func TestDashboardHandler_returns_html(t *testing.T) {
 		t.Error("body contains raw -1 value; should render as —")
 	}
 
-	// Auto-refresh JS is present.
-	if !strings.Contains(body, "/admin/metrics") {
-		t.Error("body missing auto-refresh fetch target")
+	// SSE live-update endpoint is present.
+	if !strings.Contains(body, "/admin/events") {
+		t.Error("body missing SSE connect target")
 	}
 }
 
@@ -339,6 +339,77 @@ func TestDashboardHandler_security_headers(t *testing.T) {
 	}
 	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, "frame-ancestors") {
 		t.Errorf("Content-Security-Policy = %q, missing frame-ancestors", got)
+	}
+}
+
+// TestRenderFragment_all_zeros verifies that the SSE metrics fragment renders
+// without error when all metrics are zero (empty deployment baseline).
+func TestRenderFragment_all_zeros(t *testing.T) {
+	t.Parallel()
+
+	m := admin.MetricsResponse{}
+	data := admin.BuildDashboardData(m, "")
+
+	var buf strings.Builder
+	if err := admin.RenderFragment(&buf, data); err != nil {
+		t.Fatal(err)
+	}
+	body := buf.String()
+
+	// The empty-deployment banner must be visible.
+	if !strings.Contains(body, `id="banner-empty"`) {
+		t.Error("banner-empty element missing from fragment")
+	}
+	// CSRF token must never appear in the fragment (fanned out to all clients).
+	if strings.Contains(body, "csrf_token") {
+		t.Error("csrf_token must not appear in SSE fragment")
+	}
+	// SSE swap target element IDs must be present.
+	if !strings.Contains(body, `id="v-connections"`) {
+		t.Error("fragment missing v-connections metric element")
+	}
+}
+
+// TestRenderFragment_non_empty verifies that the fragment renders live metrics
+// correctly when the snapshot contains non-zero data.
+func TestRenderFragment_non_empty(t *testing.T) {
+	t.Parallel()
+
+	m := admin.MetricsResponse{
+		Connections:   5,
+		Sessions:      3,
+		TotalUsers:    100,
+		ActiveUsers1H: 12,
+	}
+	data := admin.BuildDashboardData(m, "")
+
+	var buf strings.Builder
+	if err := admin.RenderFragment(&buf, data); err != nil {
+		t.Fatal(err)
+	}
+	body := buf.String()
+
+	// The banner must carry the hidden class when metrics are non-zero.
+	bannerIdx := strings.Index(body, `id="banner-empty"`)
+	if bannerIdx < 0 {
+		t.Fatal("banner-empty element missing from fragment")
+	}
+	// Find the end of the opening tag to bound the search.
+	tagEnd := strings.Index(body[bannerIdx:], ">")
+	if tagEnd < 0 {
+		tagEnd = 800
+	}
+	bannerCtx := body[bannerIdx:min(bannerIdx+tagEnd+1, len(body))]
+	if !strings.Contains(bannerCtx, "hidden") {
+		t.Error("banner-empty should carry hidden class when metrics are non-zero")
+	}
+	// Connection count must appear.
+	if !strings.Contains(body, "5") {
+		t.Error("fragment missing connection count")
+	}
+	// CSRF token must never appear.
+	if strings.Contains(body, "csrf_token") {
+		t.Error("csrf_token must not appear in SSE fragment")
 	}
 }
 

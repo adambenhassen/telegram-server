@@ -1,0 +1,449 @@
+package admin
+
+import (
+	"github.com/adambenhassen/telegram-server/components/alert"
+	"github.com/adambenhassen/telegram-server/components/badge"
+	"github.com/adambenhassen/telegram-server/components/button"
+	"github.com/adambenhassen/telegram-server/components/card"
+	"github.com/adambenhassen/telegram-server/components/progress"
+	"github.com/adambenhassen/telegram-server/components/table"
+)
+
+// dashboardPage renders the full admin operations dashboard.
+templ dashboardPage(d DashboardData) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>Operations — telegram-server</title>
+			<link rel="stylesheet" href="/admin/assets/dashboard.css"/>
+			<script src="/admin/assets/htmx.min.js"></script>
+			<script src="/admin/assets/htmx-ext-sse.min.js"></script>
+			<script src="/admin/assets/shadcn-templ.js"></script>
+			<script>
+				if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+					document.documentElement.classList.add('dark');
+				}
+			</script>
+		</head>
+		<body class="style-nova min-h-screen bg-background text-foreground">
+			<a href="#main" class="skip">Skip to content</a>
+			<div class="mx-auto max-w-[1440px] px-6 py-8 sm:px-4">
+				<!-- Header -->
+				<header class="mb-6 flex flex-wrap items-start justify-between gap-4">
+					<div class="flex flex-col">
+						<h1 class="text-xl font-semibold leading-tight">Operations</h1>
+						<span class="text-xs text-muted-foreground">telegram-server</span>
+					</div>
+					<div class="flex flex-wrap items-center gap-3">
+						<!-- Freshness chip (updated by SSE event handlers) -->
+						<span
+							id="chip"
+							class="chip chip-good inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium"
+							role="status"
+							aria-live="polite"
+							title={ "Server snapshot: " + d.ServerTimestamp }
+						>
+							<span class="chip-dot size-1.5 rounded-full bg-current flex-shrink-0"></span>
+							<span id="chip-text">Live &middot; connecting&hellip;</span>
+						</span>
+						<!-- Reload button -->
+						@button.Button(button.Props{ID: "refresh-btn", Variant: button.VariantGhost, Type: button.TypeButton, Attributes: templ.Attributes{"aria-label": "Reload page"}}) {
+							&#8635; Reload
+						}
+						<!-- Logout -->
+						<form method="post" action="/admin/logout" class="logout-form inline">
+							<input type="hidden" name="csrf_token" value={ d.CSRFToken }/>
+							@button.Button(button.Props{Variant: button.VariantGhost, Type: button.TypeSubmit}) {
+								Log out
+							}
+						</form>
+					</div>
+				</header>
+				<main id="main">
+					<!-- Disconnected banner — outside SSE swap, controlled by chip script -->
+					@alert.Alert(alert.Props{
+						ID:      "banner-disconnected",
+						Class:   "hidden mb-4",
+						Variant: alert.VariantDestructive,
+						Attributes: templ.Attributes{
+							"aria-atomic": "true",
+						},
+					}) {
+						@alert.Description() {
+							<span id="banner-dc-text">Connection lost.</span>
+						}
+						@alert.Action() {
+							@button.Button(button.Props{Variant: button.VariantGhost, Href: "/admin/login"}) {
+								Log in again
+							}
+						}
+					}
+					<!-- SSE-powered metrics sections -->
+					<div id="sse-root" hx-ext="sse" sse-connect="/admin/events">
+						<div id="metrics-stream" sse-swap="metrics" hx-swap="innerHTML">
+							@metricsFragment(d)
+						</div>
+					</div>
+				</main>
+			</div>
+			@chipScript()
+		</body>
+	</html>
+}
+
+// metricsFragment renders the live-updating metrics sections. It is the SSE
+// swap target: the broadcaster calls DashboardFragmentRenderer to produce the
+// HTML that replaces the innerHTML of #metrics-stream on each tick.
+//
+// Nothing session-bound (CSRF token, user identity) may appear here — the
+// fragment is rendered once per tick and fanned out to every connected client.
+templ metricsFragment(d DashboardData) {
+	<!-- Empty-deployment banner -->
+	if d.ShowEmptyAlert {
+		@alert.Alert(alert.Props{
+			ID:      "banner-empty",
+			Variant: alert.VariantDefault,
+			Attributes: templ.Attributes{
+				"aria-atomic": "true",
+			},
+		}) {
+			@alert.Description() {
+				No activity recorded yet. Every value below is a real zero, not missing data.
+			}
+		}
+	} else {
+		@alert.Alert(alert.Props{
+			ID:      "banner-empty",
+			Class:   "hidden",
+			Variant: alert.VariantDefault,
+			Attributes: templ.Attributes{
+				"aria-atomic": "true",
+			},
+		}) {
+			@alert.Description() {
+				No activity recorded yet. Every value below is a real zero, not missing data.
+			}
+		}
+	}
+	<!-- LIVE section -->
+	<section class="mb-8" aria-labelledby="h-live">
+		<h2 id="h-live" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Live</h2>
+		@card.Card() {
+			@card.Content() {
+				<div class="flex flex-col gap-0 sm:flex-row sm:items-stretch">
+					<!-- Hero: connections -->
+					<dl class="flex flex-col gap-1 pb-4 pr-0 sm:pb-0 sm:pr-6">
+						<dt class="text-sm text-muted-foreground">Live connections</dt>
+						<dd class="text-5xl font-semibold leading-tight" id="v-connections" data-metric="connections">{ d.Connections }</dd>
+					</dl>
+					<div class="hidden w-px bg-border sm:block"></div>
+					<!-- Secondary stats -->
+					<dl class="flex flex-1 flex-col gap-0 sm:pl-6">
+						@secondaryStat("v-sessions", "sessions", d.Sessions, "Authenticated sessions", "Distinct users with at least one live connection.", "tip-sessions")
+						<hr class="border-border"/>
+						@secondaryStat("v-messages_1h", "messages_1h", d.Messages1H, "Messages last hour", "", "")
+						<hr class="border-border"/>
+						@secondaryStat("v-max_pts_gap", "max_pts_gap", d.MaxPtsGap, "Max pts spread", "Spread between the furthest-ahead and furthest-behind account across all connected sessions. Not a lag from the head of the stream.", "tip-pts")
+					</dl>
+				</div>
+			}
+		}
+	</section>
+	<!-- ACCOUNTS section -->
+	<section class="mb-8" aria-labelledby="h-accounts">
+		<h2 id="h-accounts" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Accounts</h2>
+		<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			@card.Card() {
+				@card.Content() {
+					@statTile("v-total_users", "total_users", d.TotalUsers, "Total accounts", "", "")
+				}
+			}
+			@card.Card() {
+				@card.Content() {
+					@statTile("v-active_users_1h", "active_users_1h", d.ActiveUsers1H, "Active last hour", "Accounts with last_seen_at in the last hour.", "tip-active1h")
+				}
+			}
+			@card.Card() {
+				@card.Content() {
+					<dl class="flex flex-col gap-1">
+						<dt class="text-sm text-muted-foreground">Active last 24 hours</dt>
+						<dd class="text-3xl font-semibold leading-tight" id="v-active_users_24h" data-metric="active_users_24h">{ d.ActiveUsers24H }</dd>
+						if d.ActiveUsersMeta != "" {
+							<div id="meter-wrap" class="mt-2">
+								@progress.Progress(progress.Props{
+									Value: int(d.ActiveUsersPct),
+									Attributes: templ.Attributes{
+										"aria-label": "Active users ratio",
+									},
+								}) {}
+								<p id="meter-text" class="mt-1 text-xs text-muted-foreground">{ d.ActiveUsersMeta }</p>
+							</div>
+						} else {
+							<div id="meter-wrap" class="hidden mt-2">
+								@progress.Progress(progress.Props{
+									Value: 0,
+									Attributes: templ.Attributes{
+										"aria-label": "Active users ratio",
+									},
+								}) {}
+								<p id="meter-text" class="mt-1 text-xs text-muted-foreground"></p>
+							</div>
+						}
+					</dl>
+				}
+			}
+		</div>
+	</section>
+	<!-- CONTENT section -->
+	<section class="mb-8" aria-labelledby="h-content">
+		<h2 id="h-content" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Content</h2>
+		<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			@card.Card() {
+				@card.Content() {
+					@statTile("v-total_channels", "total_channels", d.TotalChannels, "Channels", "", "")
+				}
+			}
+			@card.Card() {
+				@card.Content() {
+					@statTile("v-total_chats", "total_chats", d.TotalChats, "Group chats", "", "")
+				}
+			}
+			@card.Card() {
+				@card.Content() {
+					@statTile("v-messages_24h", "messages_24h", d.Messages24H, "Messages last 24 hours", "", "")
+				}
+			}
+		</div>
+	</section>
+	<!-- THROTTLING section -->
+	<section class="mb-8" aria-labelledby="h-throttle">
+		<h2 id="h-throttle" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Throttling</h2>
+		<div class="grid grid-cols-1 gap-4 sm:grid-cols-[auto_1fr]">
+			@card.Card(card.Props{Class: "min-w-40"}) {
+				@card.Content() {
+					@statTile("v-rate_limit_active", "rate_limit_active", d.RateLimitActive, "Active rate limits", "Rate-limit rows that have not yet expired — a live count, not a rate. Some throttling is normal.", "tip-ratelimit")
+				}
+			}
+			if len(d.UninstrumentedNames) > 0 {
+				// "uninstr-card" also appears as a class so the JS patchUninstrumented
+				// can toggle visibility via classList ("uninstr-card hidden").
+				@card.Card(card.Props{ID: "uninstr-card", Class: "uninstr-card"}) {
+					@card.Content() {
+						<p class="mb-1 text-xs font-medium text-muted-foreground">Not yet instrumented</p>
+						<ul class="uninstr-list list-none text-xs text-muted-foreground">
+							for _, u := range d.UninstrumentedNames {
+								<li>{ u.Label }</li>
+							}
+						</ul>
+						<p class="mt-2 text-xs text-muted-foreground leading-snug">These are not measured yet — the fields exist so the schema is stable. Not a reading of zero.</p>
+					}
+				}
+			} else {
+				@card.Card(card.Props{ID: "uninstr-card", Class: "uninstr-card hidden"}) {
+					@card.Content() {
+						<p class="mb-1 text-xs font-medium text-muted-foreground">Not yet instrumented</p>
+						<ul class="uninstr-list list-none text-xs text-muted-foreground"></ul>
+						<p class="mt-2 text-xs text-muted-foreground leading-snug">These are not measured yet — the fields exist so the schema is stable. Not a reading of zero.</p>
+					}
+				}
+			}
+		</div>
+	</section>
+	<!-- STORAGE section -->
+	<section class="mb-8" aria-labelledby="h-storage">
+		<h2 id="h-storage" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Storage</h2>
+		@card.Card() {
+			@card.Content(card.ContentProps{Class: "overflow-auto p-0"}) {
+				@table.Table() {
+					@table.Header() {
+						@table.Row() {
+							@table.Head() { Table }
+							@table.Head() { Rows }
+							@table.Head() { Source }
+						}
+					}
+					@table.Body(table.BodyProps{ID: "storage-tbody"}) {
+						for _, row := range d.StorageRows {
+							@storageRow(row)
+						}
+					}
+				}
+			}
+		}
+	</section>
+}
+
+// secondaryStat renders a stat inside the Live card's right column.
+templ secondaryStat(id, metric, value, label, tooltip, tooltipID string) {
+	<div class="flex flex-col gap-1 py-3">
+		<dt class="flex items-center gap-1 text-sm text-muted-foreground">
+			{ label }
+			if tooltip != "" {
+				<span class="relative inline-flex">
+					<button
+						class="rounded px-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+						type="button"
+						aria-describedby={ tooltipID }
+					>&#9432;</button>
+					<span
+						id={ tooltipID }
+						role="tooltip"
+						class="pointer-events-none absolute bottom-[calc(100%+6px)] left-1/2 z-10 hidden -translate-x-1/2 max-w-[280px] rounded-md bg-foreground px-2.5 py-1.5 text-xs text-background [button:focus+&]:block [button:hover~&]:block"
+					>{ tooltip }</span>
+				</span>
+			}
+		</dt>
+		<dd class="text-2xl font-semibold leading-tight" id={ id } data-metric={ metric }>{ value }</dd>
+	</div>
+}
+
+// statTile renders a standard metric tile inside a Card.
+templ statTile(id, metric, value, label, tooltip, tooltipID string) {
+	<dl class="flex flex-col gap-1">
+		<dt class="flex items-center gap-1 text-sm text-muted-foreground">
+			{ label }
+			if tooltip != "" {
+				<span class="relative inline-flex">
+					<button
+						class="rounded px-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+						type="button"
+						aria-describedby={ tooltipID }
+					>&#9432;</button>
+					<span
+						id={ tooltipID }
+						role="tooltip"
+						class="pointer-events-none absolute bottom-[calc(100%+6px)] left-1/2 z-10 hidden -translate-x-1/2 max-w-[280px] rounded-md bg-foreground px-2.5 py-1.5 text-xs text-background [button:focus+&]:block [button:hover~&]:block"
+					>{ tooltip }</span>
+				</span>
+			}
+		</dt>
+		<dd class="text-3xl font-semibold leading-tight" id={ id } data-metric={ metric }>{ value }</dd>
+	</dl>
+}
+
+// storageRow renders one row in the storage table.
+templ storageRow(row DashStorageRow) {
+	@table.Row() {
+		@table.Cell(table.CellProps{Attributes: templ.Attributes{"data-label": "Table"}}) {
+			<code class="font-mono text-xs">{ row.Table }</code>
+		}
+		if row.Source == "Unknown" {
+			@table.Cell(table.CellProps{
+				Class: "font-variant-numeric tabular-nums",
+				Attributes: templ.Attributes{
+					"data-label": "Rows",
+					"title":      "Estimate not available yet — Postgres has not analyzed this table.",
+				},
+			}) {
+				{ row.Display }
+			}
+		} else {
+			@table.Cell(table.CellProps{
+				Class:      "tabular-nums",
+				Attributes: templ.Attributes{"data-label": "Rows"},
+			}) {
+				{ row.Display }
+			}
+		}
+		@table.Cell(table.CellProps{Attributes: templ.Attributes{"data-label": "Source"}}) {
+			switch row.Source {
+				case "Exact":
+					@badge.Badge(badge.Props{Variant: badge.VariantDefault}) { Exact }
+				case "Estimated":
+					@badge.Badge(badge.Props{Variant: badge.VariantSecondary}) { Estimated }
+				default:
+					@badge.Badge(badge.Props{Variant: badge.VariantGhost}) { Unknown }
+			}
+		}
+	}
+}
+
+// chipScript manages the freshness chip and disconnection banner via htmx SSE
+// lifecycle events. No JSON polling — the broadcaster drives all updates.
+templ chipScript() {
+	<script>
+		(function() {
+			'use strict';
+
+			var chipEl   = document.getElementById('chip');
+			var chipText = document.getElementById('chip-text');
+			var bannerDc = document.getElementById('banner-disconnected');
+			var refreshBtn = document.getElementById('refresh-btn');
+
+			var lastOk    = Date.now();
+			var connected = false;
+
+			var baseChipClass = 'chip inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium';
+
+			function ago(ms) {
+				var s = Math.round(ms / 1000);
+				if (s < 60) return s + 's ago';
+				var m = Math.round(s / 60);
+				if (m < 60) return m + 'm ago';
+				return Math.round(m / 60) + 'h ago';
+			}
+
+			function setChip(cls, text) {
+				chipEl.className = baseChipClass + ' ' + cls;
+				chipText.textContent = text;
+			}
+
+			function updateChip() {
+				if (!connected) {
+					setChip('chip-critical', '● Disconnected · last updated ' + ago(Date.now() - lastOk));
+					return;
+				}
+				var age = Date.now() - lastOk;
+				if (age <= 40000) {
+					setChip('chip-good', '● Live · updated ' + ago(age));
+				} else {
+					setChip('chip-warning', '● Stale · updated ' + ago(age));
+				}
+			}
+
+			document.body.addEventListener('htmx:sseOpen', function() {
+				connected = true;
+				bannerDc.classList.add('hidden');
+				setChip('chip-good', '● Live · connecting…');
+			});
+
+			document.body.addEventListener('htmx:sseBeforeMessage', function() {
+				lastOk = Date.now();
+				connected = true;
+			});
+
+			document.body.addEventListener('htmx:sseClosed', function() {
+				connected = false;
+				bannerDc.classList.remove('hidden');
+				updateChip();
+			});
+
+			document.body.addEventListener('htmx:sseError', function() {
+				connected = false;
+				bannerDc.classList.remove('hidden');
+				updateChip();
+			});
+
+			if (refreshBtn) {
+				refreshBtn.addEventListener('click', function() { location.reload(); });
+			}
+
+			document.querySelectorAll('[aria-describedby]').forEach(function(btn) {
+				btn.addEventListener('click', function() {
+					var expanded = this.getAttribute('aria-expanded') === 'true';
+					this.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+				});
+				btn.addEventListener('keydown', function(e) {
+					if (e.key === 'Escape') {
+						this.setAttribute('aria-expanded', 'false');
+						this.blur();
+					}
+				});
+			});
+
+			setInterval(updateChip, 10000);
+		})();
+	</script>
+}

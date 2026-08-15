@@ -1,0 +1,302 @@
+@import "tailwindcss";
+@import "./tw-animate.css";
+@import "./shadcn-tailwind.css";
+
+/* shadcn/ui nova theme variables (no font imports — admin tool uses system fonts) */
+
+@layer base {
+  :root {
+    --background: oklch(1 0 0);
+    --foreground: oklch(0% 0 0);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0% 0 0);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0% 0 0);
+    --primary: oklch(0% 0 0);
+    --primary-foreground: oklch(0.985 0 0);
+    --secondary: oklch(0.97 0 0);
+    --secondary-foreground: oklch(0.205 0 0);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.556 0 0);
+    --accent: oklch(0.97 0 0);
+    --accent-foreground: oklch(0.205 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --destructive-foreground: oklch(0.97 0.01 17);
+    --border: oklch(0.922 0 0);
+    --input: oklch(0.922 0 0);
+    --ring: oklch(0.708 0 0);
+    --radius: 0.625rem;
+    --radius-sm: calc(var(--radius) - 4px);
+    --radius-md: calc(var(--radius) - 2px);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) + 4px);
+    /* Status colours for StatTile severity (kept from MAIN-282 design) */
+    --status-good: oklch(0.527 0.154 150);
+    --status-warning: oklch(0.75 0.15 85);
+    --status-critical: oklch(0.5 0.2 25);
+    --status-good-bg: oklch(0.95 0.04 150);
+    --status-warning-bg: oklch(0.97 0.04 85);
+    --status-critical-bg: oklch(0.97 0.02 25);
+  }
+  .dark {
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.371 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --destructive-foreground: oklch(0.58 0.22 27);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --status-good: oklch(0.65 0.14 150);
+    --status-warning: oklch(0.8 0.14 85);
+    --status-critical: oklch(0.65 0.18 25);
+    --status-good-bg: oklch(0.25 0.05 150);
+    --status-warning-bg: oklch(0.25 0.05 85);
+    --status-critical-bg: oklch(0.25 0.04 25);
+  }
+  * {
+    border-color: var(--border);
+    @apply border-border outline-ring/50;
+  }
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Map Tailwind semantic colors to shadcn CSS variables */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  /* sidebar colours used in some cn-* classes */
+  --color-sidebar: var(--sidebar, var(--card));
+  --color-sidebar-foreground: var(--sidebar-foreground, var(--card-foreground));
+  --color-sidebar-primary: var(--sidebar-primary, var(--primary));
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground, var(--primary-foreground));
+  --color-sidebar-accent: var(--sidebar-accent, var(--accent));
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground, var(--accent-foreground));
+  --color-sidebar-border: var(--sidebar-border, var(--border));
+  --color-sidebar-ring: var(--sidebar-ring, var(--ring));
+  --radius: var(--radius);
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+  --radius-xl: var(--radius-xl);
+  --font-heading: var(--font-sans);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Nova component styles */
+
+@import "./style-nova.css" layer(base);
+
+@custom-variant dark (&:is(.dark *));
+
+/* Admin dashboard — StatTile severity badges (no shadcn-templ primitive for these) */
+
+.stat-severity-good {
+  background-color: var(--status-good-bg);
+  color: var(--status-good);
+}
+
+.stat-severity-warning {
+  background-color: var(--status-warning-bg);
+  color: var(--status-warning);
+}
+
+.stat-severity-critical {
+  background-color: var(--status-critical-bg);
+  color: var(--status-critical);
+}
+
+/* Freshness chip variants */
+
+.chip-good {
+  background-color: var(--status-good);
+  color: oklch(0.985 0 0);
+}
+
+.chip-warning {
+  background-color: var(--status-warning);
+  color: oklch(0.145 0 0);
+}
+
+.chip-critical {
+  background-color: var(--status-critical);
+  color: oklch(0.985 0 0);
+}
+
+.chip-paused {
+  background-color: var(--muted);
+  color: var(--muted-foreground);
+  border: 1px solid var(--border);
+}
+
+@keyframes pulse-dot {
+  0%,100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: .4;
+  }
+}
+
+.chip-good .chip-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chip-dot {
+    animation: none;
+  }
+}
+
+/* Skip link */
+
+.skip {
+  position: absolute;
+  top: -40px;
+  left: 8px;
+  background: var(--foreground);
+  color: var(--background);
+  padding: 4px 8px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  transition: top .1s;
+  z-index: 100;
+}
+
+.skip:focus {
+  top: 8px;
+}
+
+/* Active-users meter — shadcn Progress has no muted-track variant */
+
+.meter-track {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  background: var(--foreground);
+  border-radius: 3px;
+  transition: width .3s;
+}
+
+/* Fetching state */
+
+.fetching .stat-value {
+  opacity: .6;
+}
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}

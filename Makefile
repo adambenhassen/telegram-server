@@ -1,4 +1,4 @@
-.PHONY: tools-check sqlc generate migrate-new migrate test test-unit test-db docker-bridge lint build run
+.PHONY: tools-check sqlc generate templ css migrate-new migrate test test-unit test-db docker-bridge lint build run
 
 # sqlc lives in a separate tools module (tools/go.mod) so its broken transitive
 # dep graph (grpc test deps -> a non-existent gonum package) stays out of the
@@ -13,7 +13,16 @@ bin/sqlc:
 sqlc: bin/sqlc
 	"$(CURDIR)/bin/sqlc" generate
 
-generate: sqlc
+templ:
+	templ generate ./internal/admin/
+
+css:
+	npx --yes @tailwindcss/cli@4.3.3 \
+		-i internal/admin/ui/input.css \
+		-o internal/admin/assets/dashboard.css \
+		--minify
+
+generate: sqlc templ css
 
 # Diff the current migration dir against the desired schema into a new file.
 # Usage: make migrate-new name=add_sessions

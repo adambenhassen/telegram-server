@@ -9,10 +9,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # An allowlist rather than `COPY . .` — a file nobody remembered to put in
-# .dockerignore still cannot reach a layer. These four paths are the whole
-# build input; nothing under cmd/ or internal/ embeds anything else.
+# .dockerignore still cannot reach a layer. These paths are the whole build
+# input; components/ and utils/ hold the shadcn-templ copy-in packages.
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
+COPY components/ ./components/
+COPY utils/ ./utils/
 
 # The module has no cgo dependency (pgx is pure Go), so a static binary is both
 # available and required — the distroless static base has no libc to link to.
