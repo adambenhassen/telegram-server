@@ -18,8 +18,7 @@ templ dashboardPage(d DashboardData) {
 			<meta name="viewport" content="width=device-width, initial-scale=1"/>
 			<title>Operations — telegram-server</title>
 			<link rel="stylesheet" href="/admin/assets/dashboard.css"/>
-			<script src="/admin/assets/htmx.min.js"></script>
-			<script src="/admin/assets/htmx-ext-sse.min.js"></script>
+			<script src="/admin/assets/datastar.min.js"></script>
 			<script src="/admin/assets/shadcn-templ.js"></script>
 			<script>
 				if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
@@ -80,9 +79,11 @@ templ dashboardPage(d DashboardData) {
 							}
 						}
 					}
-					<!-- SSE-powered metrics sections -->
-					<div id="sse-root" hx-ext="sse" sse-connect="/admin/events">
-						<div id="metrics-stream" sse-swap="metrics" hx-swap="innerHTML">
+					<!-- SSE-powered metrics sections. The Datastar attribute
+						 opens the SSE stream on load; openWhenHidden keeps it open
+						 for operators who park the tab in the background. -->
+					<div id="sse-root" data-on-load="@get('/admin/events', {openWhenHidden: true})">
+						<div id="metrics-stream">
 							@metricsFragment(d)
 						</div>
 					</div>
@@ -360,8 +361,8 @@ templ storageRow(row DashStorageRow) {
 	}
 }
 
-// chipScript manages the freshness chip and disconnection banner via htmx SSE
-// lifecycle events. No JSON polling — the broadcaster drives all updates.
+// chipScript manages the freshness chip and disconnection banner via Datastar
+// SSE lifecycle events. No JSON polling — the broadcaster drives all updates.
 templ chipScript() {
 	<script>
 		(function() {
@@ -374,6 +375,37 @@ templ chipScript() {
 
 			var lastOk    = Date.now();
 			var connected = false;
+
+			// Datastar dispatches one custom event per SSE lifecycle transition
+			// on the element that opened the stream. The names are read off the
+			// bundled datastar.min.js (the Sse* error codes); they are not part
+			// of Datastar's documented API, so a rename in a future bundle
+			// degrades the chip to "connecting…" forever rather than breaking
+			// the stream itself.
+			var sseRoot = document.getElementById('sse-root');
+
+			sseRoot.addEventListener('datastar-sse-open', function() {
+				connected = true;
+				bannerDc.classList.add('hidden');
+				setChip('chip-good', '● Live · connecting…');
+			});
+
+			sseRoot.addEventListener('datastar-patch-elements', function() {
+				lastOk = Date.now();
+				connected = true;
+			});
+
+			sseRoot.addEventListener('datastar-sse-closed', function() {
+				connected = false;
+				bannerDc.classList.remove('hidden');
+				updateChip();
+			});
+
+			sseRoot.addEventListener('datastar-sse-error', function() {
+				connected = false;
+				bannerDc.classList.remove('hidden');
+				updateChip();
+			});
 
 			var baseChipClass = 'chip inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium';
 
@@ -402,29 +434,6 @@ templ chipScript() {
 					setChip('chip-warning', '● Stale · updated ' + ago(age));
 				}
 			}
-
-			document.body.addEventListener('htmx:sseOpen', function() {
-				connected = true;
-				bannerDc.classList.add('hidden');
-				setChip('chip-good', '● Live · connecting…');
-			});
-
-			document.body.addEventListener('htmx:sseBeforeMessage', function() {
-				lastOk = Date.now();
-				connected = true;
-			});
-
-			document.body.addEventListener('htmx:sseClosed', function() {
-				connected = false;
-				bannerDc.classList.remove('hidden');
-				updateChip();
-			});
-
-			document.body.addEventListener('htmx:sseError', function() {
-				connected = false;
-				bannerDc.classList.remove('hidden');
-				updateChip();
-			});
 
 			if (refreshBtn) {
 				refreshBtn.addEventListener('click', function() { location.reload(); });

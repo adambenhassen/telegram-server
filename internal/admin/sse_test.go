@@ -158,7 +158,7 @@ func TestSSE_streams_events(t *testing.T) {
 	if !strings.Contains(got, "retry: ") {
 		t.Errorf("stream missing reconnect hint; got:\n%s", got)
 	}
-	if !strings.Contains(got, "data: <span id=\"v-connections\">7</span>") {
+	if !strings.Contains(got, "data: elements <span id=\"v-connections\">7</span>") {
 		t.Errorf("stream missing rendered fragment; got:\n%s", got)
 	}
 }
@@ -174,7 +174,12 @@ func TestSSE_multiline_fragment_is_framed_per_line(t *testing.T) {
 		HTML:  "<div>\r\n  <span>1</span>\n</div>",
 	}))
 
-	want := "event: custom-event\ndata: <div>\ndata:   <span>1</span>\ndata: </div>\n\n"
+	want := "event: custom-event\n" +
+		"data: selector #metrics-stream\n" +
+		"data: mode innerHTML\n" +
+		"data: elements <div>\n" +
+		"data: elements   <span>1</span>\n" +
+		"data: elements </div>\n\n"
 	if got != want {
 		t.Errorf("EncodeFragment =\n%q\nwant\n%q", got, want)
 	}
@@ -566,16 +571,14 @@ func TestSSE_route_behind_admin_gate(t *testing.T) {
 }
 
 // TestSSE_default_contract_is_the_dashboard_contract pins the event name and
-// swap target agreed with MAIN-302. htmx answers a mismatched event name with a
-// silent no-swap — a 200 and a page that never updates — so a rename on either
-// side has to break a test here.
+// patch target agreed with MAIN-302. Datastar answers an unknown event name or
+// a selector that hits nothing with a 200 and no patch — a page that never
+// updates — so a rename on either side has to break a test here.
 func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 	t.Parallel()
 
-	// Both names are read off the dashboard page in MAIN-302: it declares
-	// sse-swap="metrics" on div#metrics-stream.
-	if got := admin.SSEDefaultEvent(); got != "metrics" {
-		t.Errorf("default event name = %q, want metrics (the dashboard's sse-swap value)", got)
+	if got := admin.SSEDefaultEvent(); got != "datastar-patch-elements" {
+		t.Errorf("default event name = %q, want datastar-patch-elements", got)
 	}
 
 	fragments, err := admin.DefaultFragmentRenderer(admin.MetricsResponse{Connections: 3})
@@ -588,14 +591,23 @@ func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 	if fragments[0].Event != "" && fragments[0].Event != admin.SSEDefaultEvent() {
 		t.Errorf("fragment event = %q, want %q", fragments[0].Event, admin.SSEDefaultEvent())
 	}
+	// The selector must address the element the fragment replaces: a selector
+	// drift between the two sides freezes the dashboard silently.
+	if fragments[0].Selector != "" && fragments[0].Selector != "#metrics-stream" {
+		t.Errorf("fragment selector = %q, want #metrics-stream", fragments[0].Selector)
+	}
 	if !strings.Contains(fragments[0].HTML, `id="metrics-stream"`) {
-		t.Errorf("fragment does not carry the agreed swap target id:\n%s", fragments[0].HTML)
+		t.Errorf("fragment does not carry the agreed patch target id:\n%s", fragments[0].HTML)
 	}
 
-	// An empty Event on the wire must resolve to the same name.
+	// An empty Event on the wire must resolve to the Datastar event name and
+	// the dashboard's target selector.
 	wire := string(admin.EncodeFragment(admin.Fragment{HTML: "<i>x</i>"}))
-	if !strings.HasPrefix(wire, "event: metrics\n") {
+	if !strings.HasPrefix(wire, "event: datastar-patch-elements\n") {
 		t.Errorf("unnamed fragment encoded as %q", wire)
+	}
+	if !strings.Contains(wire, "data: selector #metrics-stream\n") {
+		t.Errorf("unnamed fragment did not pin the dashboard selector:\n%s", wire)
 	}
 }
 

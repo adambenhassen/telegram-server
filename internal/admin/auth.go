@@ -483,10 +483,9 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 			return
 		}
 	})
-	// htmx and SSE extension — public; loaded before the session check.
+	// Datastar — public; loaded before the session check.
 	for name, file := range map[string]string{
-		"GET /admin/assets/htmx.min.js":         "htmx.min.js",
-		"GET /admin/assets/htmx-ext-sse.min.js": "htmx-ext-sse.min.js",
+		"GET /admin/assets/datastar.min.js": "datastar.min.js",
 	} {
 		mux.HandleFunc(name, func(w http.ResponseWriter, r *http.Request) {
 			data, err := assets.FS.ReadFile(file)

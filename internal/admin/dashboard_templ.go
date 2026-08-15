@@ -39,14 +39,14 @@ func dashboardPage(d DashboardData) templ.Component {
 			templ_7745c5c3_Var1 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Operations — telegram-server</title><link rel=\"stylesheet\" href=\"/admin/assets/dashboard.css\"><script src=\"/admin/assets/htmx.min.js\"></script><script src=\"/admin/assets/htmx-ext-sse.min.js\"></script><script src=\"/admin/assets/shadcn-templ.js\"></script><script>\n\t\t\t\tif (window.matchMedia('(prefers-color-scheme: dark)').matches) {\n\t\t\t\t\tdocument.documentElement.classList.add('dark');\n\t\t\t\t}\n\t\t\t</script></head><body class=\"style-nova min-h-screen bg-background text-foreground\"><a href=\"#main\" class=\"skip\">Skip to content</a><div class=\"mx-auto max-w-[1440px] px-6 py-8 sm:px-4\"><!-- Header --><header class=\"mb-6 flex flex-wrap items-start justify-between gap-4\"><div class=\"flex flex-col\"><h1 class=\"text-xl font-semibold leading-tight\">Operations</h1><span class=\"text-xs text-muted-foreground\">telegram-server</span></div><div class=\"flex flex-wrap items-center gap-3\"><!-- Freshness chip (updated by SSE event handlers) --><span id=\"chip\" class=\"chip chip-good inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium\" role=\"status\" aria-live=\"polite\" title=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Operations — telegram-server</title><link rel=\"stylesheet\" href=\"/admin/assets/dashboard.css\"><script src=\"/admin/assets/datastar.min.js\"></script><script src=\"/admin/assets/shadcn-templ.js\"></script><script>\n\t\t\t\tif (window.matchMedia('(prefers-color-scheme: dark)').matches) {\n\t\t\t\t\tdocument.documentElement.classList.add('dark');\n\t\t\t\t}\n\t\t\t</script></head><body class=\"style-nova min-h-screen bg-background text-foreground\"><a href=\"#main\" class=\"skip\">Skip to content</a><div class=\"mx-auto max-w-[1440px] px-6 py-8 sm:px-4\"><!-- Header --><header class=\"mb-6 flex flex-wrap items-start justify-between gap-4\"><div class=\"flex flex-col\"><h1 class=\"text-xl font-semibold leading-tight\">Operations</h1><span class=\"text-xs text-muted-foreground\">telegram-server</span></div><div class=\"flex flex-wrap items-center gap-3\"><!-- Freshness chip (updated by SSE event handlers) --><span id=\"chip\" class=\"chip chip-good inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium\" role=\"status\" aria-live=\"polite\" title=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var2 string
 		templ_7745c5c3_Var2, templ_7745c5c3_Err = templ.ResolveAttributeValue("Server snapshot: " + d.ServerTimestamp)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 46, Col: 54}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 45, Col: 54}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var2)
 		if templ_7745c5c3_Err != nil {
@@ -85,7 +85,7 @@ func dashboardPage(d DashboardData) templ.Component {
 		var templ_7745c5c3_Var4 string
 		templ_7745c5c3_Var4, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.CSRFToken)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 57, Col: 65}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 56, Col: 65}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var4)
 		if templ_7745c5c3_Err != nil {
@@ -212,7 +212,7 @@ func dashboardPage(d DashboardData) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 11, "<!-- SSE-powered metrics sections --><div id=\"sse-root\" hx-ext=\"sse\" sse-connect=\"/admin/events\"><div id=\"metrics-stream\" sse-swap=\"metrics\" hx-swap=\"innerHTML\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 11, "<!-- SSE-powered metrics sections. The Datastar attribute\n\t\t\t\t\t\t opens the SSE stream on load; openWhenHidden keeps it open\n\t\t\t\t\t\t for operators who park the tab in the background. --><div id=\"sse-root\" data-on-load=\"@get('/admin/events', {openWhenHidden: true})\"><div id=\"metrics-stream\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -398,7 +398,7 @@ func metricsFragment(d DashboardData) templ.Component {
 				var templ_7745c5c3_Var17 string
 				templ_7745c5c3_Var17, templ_7745c5c3_Err = templ.JoinStringErrs(d.Connections)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 139, Col: 115}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 140, Col: 115}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var17))
 				if templ_7745c5c3_Err != nil {
@@ -559,7 +559,7 @@ func metricsFragment(d DashboardData) templ.Component {
 				var templ_7745c5c3_Var24 string
 				templ_7745c5c3_Var24, templ_7745c5c3_Err = templ.JoinStringErrs(d.ActiveUsers24H)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 172, Col: 128}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 173, Col: 128}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var24))
 				if templ_7745c5c3_Err != nil {
@@ -590,7 +590,7 @@ func metricsFragment(d DashboardData) templ.Component {
 					var templ_7745c5c3_Var25 string
 					templ_7745c5c3_Var25, templ_7745c5c3_Err = templ.JoinStringErrs(d.ActiveUsersMeta)
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 181, Col: 89}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 182, Col: 89}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var25))
 					if templ_7745c5c3_Err != nil {
@@ -844,7 +844,7 @@ func metricsFragment(d DashboardData) templ.Component {
 						var templ_7745c5c3_Var36 string
 						templ_7745c5c3_Var36, templ_7745c5c3_Err = templ.JoinStringErrs(u.Label)
 						if templ_7745c5c3_Err != nil {
-							return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 237, Col: 21}
+							return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 238, Col: 21}
 						}
 						_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var36))
 						if templ_7745c5c3_Err != nil {
@@ -1146,7 +1146,7 @@ func secondaryStat(id, metric, value, label, tooltip, tooltipID string) templ.Co
 		var templ_7745c5c3_Var49 string
 		templ_7745c5c3_Var49, templ_7745c5c3_Err = templ.JoinStringErrs(label)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 282, Col: 10}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 283, Col: 10}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var49))
 		if templ_7745c5c3_Err != nil {
@@ -1164,7 +1164,7 @@ func secondaryStat(id, metric, value, label, tooltip, tooltipID string) templ.Co
 			var templ_7745c5c3_Var50 string
 			templ_7745c5c3_Var50, templ_7745c5c3_Err = templ.ResolveAttributeValue(tooltipID)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 288, Col: 34}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 289, Col: 34}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var50)
 			if templ_7745c5c3_Err != nil {
@@ -1177,7 +1177,7 @@ func secondaryStat(id, metric, value, label, tooltip, tooltipID string) templ.Co
 			var templ_7745c5c3_Var51 string
 			templ_7745c5c3_Var51, templ_7745c5c3_Err = templ.ResolveAttributeValue(tooltipID)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 291, Col: 20}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 292, Col: 20}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var51)
 			if templ_7745c5c3_Err != nil {
@@ -1190,7 +1190,7 @@ func secondaryStat(id, metric, value, label, tooltip, tooltipID string) templ.Co
 			var templ_7745c5c3_Var52 string
 			templ_7745c5c3_Var52, templ_7745c5c3_Err = templ.JoinStringErrs(tooltip)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 294, Col: 15}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 295, Col: 15}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var52))
 			if templ_7745c5c3_Err != nil {
@@ -1208,7 +1208,7 @@ func secondaryStat(id, metric, value, label, tooltip, tooltipID string) templ.Co
 		var templ_7745c5c3_Var53 string
 		templ_7745c5c3_Var53, templ_7745c5c3_Err = templ.ResolveAttributeValue(id)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 298, Col: 58}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 299, Col: 58}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var53)
 		if templ_7745c5c3_Err != nil {
@@ -1221,7 +1221,7 @@ func secondaryStat(id, metric, value, label, tooltip, tooltipID string) templ.Co
 		var templ_7745c5c3_Var54 string
 		templ_7745c5c3_Var54, templ_7745c5c3_Err = templ.ResolveAttributeValue(metric)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 298, Col: 81}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 299, Col: 81}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var54)
 		if templ_7745c5c3_Err != nil {
@@ -1234,7 +1234,7 @@ func secondaryStat(id, metric, value, label, tooltip, tooltipID string) templ.Co
 		var templ_7745c5c3_Var55 string
 		templ_7745c5c3_Var55, templ_7745c5c3_Err = templ.JoinStringErrs(value)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 298, Col: 91}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 299, Col: 91}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var55))
 		if templ_7745c5c3_Err != nil {
@@ -1277,7 +1277,7 @@ func statTile(id, metric, value, label, tooltip, tooltipID string) templ.Compone
 		var templ_7745c5c3_Var57 string
 		templ_7745c5c3_Var57, templ_7745c5c3_Err = templ.JoinStringErrs(label)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 306, Col: 10}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 307, Col: 10}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var57))
 		if templ_7745c5c3_Err != nil {
@@ -1295,7 +1295,7 @@ func statTile(id, metric, value, label, tooltip, tooltipID string) templ.Compone
 			var templ_7745c5c3_Var58 string
 			templ_7745c5c3_Var58, templ_7745c5c3_Err = templ.ResolveAttributeValue(tooltipID)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 312, Col: 34}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 313, Col: 34}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var58)
 			if templ_7745c5c3_Err != nil {
@@ -1308,7 +1308,7 @@ func statTile(id, metric, value, label, tooltip, tooltipID string) templ.Compone
 			var templ_7745c5c3_Var59 string
 			templ_7745c5c3_Var59, templ_7745c5c3_Err = templ.ResolveAttributeValue(tooltipID)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 315, Col: 20}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 316, Col: 20}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var59)
 			if templ_7745c5c3_Err != nil {
@@ -1321,7 +1321,7 @@ func statTile(id, metric, value, label, tooltip, tooltipID string) templ.Compone
 			var templ_7745c5c3_Var60 string
 			templ_7745c5c3_Var60, templ_7745c5c3_Err = templ.JoinStringErrs(tooltip)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 318, Col: 15}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 319, Col: 15}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var60))
 			if templ_7745c5c3_Err != nil {
@@ -1339,7 +1339,7 @@ func statTile(id, metric, value, label, tooltip, tooltipID string) templ.Compone
 		var templ_7745c5c3_Var61 string
 		templ_7745c5c3_Var61, templ_7745c5c3_Err = templ.ResolveAttributeValue(id)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 322, Col: 58}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 323, Col: 58}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var61)
 		if templ_7745c5c3_Err != nil {
@@ -1352,7 +1352,7 @@ func statTile(id, metric, value, label, tooltip, tooltipID string) templ.Compone
 		var templ_7745c5c3_Var62 string
 		templ_7745c5c3_Var62, templ_7745c5c3_Err = templ.ResolveAttributeValue(metric)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 322, Col: 81}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 323, Col: 81}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var62)
 		if templ_7745c5c3_Err != nil {
@@ -1365,7 +1365,7 @@ func statTile(id, metric, value, label, tooltip, tooltipID string) templ.Compone
 		var templ_7745c5c3_Var63 string
 		templ_7745c5c3_Var63, templ_7745c5c3_Err = templ.JoinStringErrs(value)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 322, Col: 91}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 323, Col: 91}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var63))
 		if templ_7745c5c3_Err != nil {
@@ -1432,7 +1432,7 @@ func storageRow(row DashStorageRow) templ.Component {
 				var templ_7745c5c3_Var67 string
 				templ_7745c5c3_Var67, templ_7745c5c3_Err = templ.JoinStringErrs(row.Table)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 330, Col: 46}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 331, Col: 46}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var67))
 				if templ_7745c5c3_Err != nil {
@@ -1468,7 +1468,7 @@ func storageRow(row DashStorageRow) templ.Component {
 					var templ_7745c5c3_Var69 string
 					templ_7745c5c3_Var69, templ_7745c5c3_Err = templ.JoinStringErrs(row.Display)
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 340, Col: 17}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 341, Col: 17}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var69))
 					if templ_7745c5c3_Err != nil {
@@ -1502,7 +1502,7 @@ func storageRow(row DashStorageRow) templ.Component {
 					var templ_7745c5c3_Var71 string
 					templ_7745c5c3_Var71, templ_7745c5c3_Err = templ.JoinStringErrs(row.Display)
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 347, Col: 17}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/admin/dashboard.templ`, Line: 348, Col: 17}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var71))
 					if templ_7745c5c3_Err != nil {
@@ -1621,8 +1621,8 @@ func storageRow(row DashStorageRow) templ.Component {
 	})
 }
 
-// chipScript manages the freshness chip and disconnection banner via htmx SSE
-// lifecycle events. No JSON polling — the broadcaster drives all updates.
+// chipScript manages the freshness chip and disconnection banner via Datastar
+// SSE lifecycle events. No JSON polling — the broadcaster drives all updates.
 func chipScript() templ.Component {
 	return templruntime.GeneratedTemplate(func(templ_7745c5c3_Input templruntime.GeneratedComponentInput) (templ_7745c5c3_Err error) {
 		templ_7745c5c3_W, ctx := templ_7745c5c3_Input.Writer, templ_7745c5c3_Input.Context
@@ -1644,7 +1644,7 @@ func chipScript() templ.Component {
 			templ_7745c5c3_Var76 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 75, "<script>\n\t\t(function() {\n\t\t\t'use strict';\n\n\t\t\tvar chipEl   = document.getElementById('chip');\n\t\t\tvar chipText = document.getElementById('chip-text');\n\t\t\tvar bannerDc = document.getElementById('banner-disconnected');\n\t\t\tvar refreshBtn = document.getElementById('refresh-btn');\n\n\t\t\tvar lastOk    = Date.now();\n\t\t\tvar connected = false;\n\n\t\t\tvar baseChipClass = 'chip inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium';\n\n\t\t\tfunction ago(ms) {\n\t\t\t\tvar s = Math.round(ms / 1000);\n\t\t\t\tif (s < 60) return s + 's ago';\n\t\t\t\tvar m = Math.round(s / 60);\n\t\t\t\tif (m < 60) return m + 'm ago';\n\t\t\t\treturn Math.round(m / 60) + 'h ago';\n\t\t\t}\n\n\t\t\tfunction setChip(cls, text) {\n\t\t\t\tchipEl.className = baseChipClass + ' ' + cls;\n\t\t\t\tchipText.textContent = text;\n\t\t\t}\n\n\t\t\tfunction updateChip() {\n\t\t\t\tif (!connected) {\n\t\t\t\t\tsetChip('chip-critical', '● Disconnected · last updated ' + ago(Date.now() - lastOk));\n\t\t\t\t\treturn;\n\t\t\t\t}\n\t\t\t\tvar age = Date.now() - lastOk;\n\t\t\t\tif (age <= 40000) {\n\t\t\t\t\tsetChip('chip-good', '● Live · updated ' + ago(age));\n\t\t\t\t} else {\n\t\t\t\t\tsetChip('chip-warning', '● Stale · updated ' + ago(age));\n\t\t\t\t}\n\t\t\t}\n\n\t\t\tdocument.body.addEventListener('htmx:sseOpen', function() {\n\t\t\t\tconnected = true;\n\t\t\t\tbannerDc.classList.add('hidden');\n\t\t\t\tsetChip('chip-good', '● Live · connecting…');\n\t\t\t});\n\n\t\t\tdocument.body.addEventListener('htmx:sseBeforeMessage', function() {\n\t\t\t\tlastOk = Date.now();\n\t\t\t\tconnected = true;\n\t\t\t});\n\n\t\t\tdocument.body.addEventListener('htmx:sseClosed', function() {\n\t\t\t\tconnected = false;\n\t\t\t\tbannerDc.classList.remove('hidden');\n\t\t\t\tupdateChip();\n\t\t\t});\n\n\t\t\tdocument.body.addEventListener('htmx:sseError', function() {\n\t\t\t\tconnected = false;\n\t\t\t\tbannerDc.classList.remove('hidden');\n\t\t\t\tupdateChip();\n\t\t\t});\n\n\t\t\tif (refreshBtn) {\n\t\t\t\trefreshBtn.addEventListener('click', function() { location.reload(); });\n\t\t\t}\n\n\t\t\tdocument.querySelectorAll('[aria-describedby]').forEach(function(btn) {\n\t\t\t\tbtn.addEventListener('click', function() {\n\t\t\t\t\tvar expanded = this.getAttribute('aria-expanded') === 'true';\n\t\t\t\t\tthis.setAttribute('aria-expanded', expanded ? 'false' : 'true');\n\t\t\t\t});\n\t\t\t\tbtn.addEventListener('keydown', function(e) {\n\t\t\t\t\tif (e.key === 'Escape') {\n\t\t\t\t\t\tthis.setAttribute('aria-expanded', 'false');\n\t\t\t\t\t\tthis.blur();\n\t\t\t\t\t}\n\t\t\t\t});\n\t\t\t});\n\n\t\t\tsetInterval(updateChip, 10000);\n\t\t})();\n\t</script>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 75, "<script>\n\t\t(function() {\n\t\t\t'use strict';\n\n\t\t\tvar chipEl   = document.getElementById('chip');\n\t\t\tvar chipText = document.getElementById('chip-text');\n\t\t\tvar bannerDc = document.getElementById('banner-disconnected');\n\t\t\tvar refreshBtn = document.getElementById('refresh-btn');\n\n\t\t\tvar lastOk    = Date.now();\n\t\t\tvar connected = false;\n\n\t\t\t// Datastar dispatches one custom event per SSE lifecycle transition\n\t\t\t// on the element that opened the stream. The names are read off the\n\t\t\t// bundled datastar.min.js (the Sse* error codes); they are not part\n\t\t\t// of Datastar's documented API, so a rename in a future bundle\n\t\t\t// degrades the chip to \"connecting…\" forever rather than breaking\n\t\t\t// the stream itself.\n\t\t\tvar sseRoot = document.getElementById('sse-root');\n\n\t\t\tsseRoot.addEventListener('datastar-sse-open', function() {\n\t\t\t\tconnected = true;\n\t\t\t\tbannerDc.classList.add('hidden');\n\t\t\t\tsetChip('chip-good', '● Live · connecting…');\n\t\t\t});\n\n\t\t\tsseRoot.addEventListener('datastar-patch-elements', function() {\n\t\t\t\tlastOk = Date.now();\n\t\t\t\tconnected = true;\n\t\t\t});\n\n\t\t\tsseRoot.addEventListener('datastar-sse-closed', function() {\n\t\t\t\tconnected = false;\n\t\t\t\tbannerDc.classList.remove('hidden');\n\t\t\t\tupdateChip();\n\t\t\t});\n\n\t\t\tsseRoot.addEventListener('datastar-sse-error', function() {\n\t\t\t\tconnected = false;\n\t\t\t\tbannerDc.classList.remove('hidden');\n\t\t\t\tupdateChip();\n\t\t\t});\n\n\t\t\tvar baseChipClass = 'chip inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium';\n\n\t\t\tfunction ago(ms) {\n\t\t\t\tvar s = Math.round(ms / 1000);\n\t\t\t\tif (s < 60) return s + 's ago';\n\t\t\t\tvar m = Math.round(s / 60);\n\t\t\t\tif (m < 60) return m + 'm ago';\n\t\t\t\treturn Math.round(m / 60) + 'h ago';\n\t\t\t}\n\n\t\t\tfunction setChip(cls, text) {\n\t\t\t\tchipEl.className = baseChipClass + ' ' + cls;\n\t\t\t\tchipText.textContent = text;\n\t\t\t}\n\n\t\t\tfunction updateChip() {\n\t\t\t\tif (!connected) {\n\t\t\t\t\tsetChip('chip-critical', '● Disconnected · last updated ' + ago(Date.now() - lastOk));\n\t\t\t\t\treturn;\n\t\t\t\t}\n\t\t\t\tvar age = Date.now() - lastOk;\n\t\t\t\tif (age <= 40000) {\n\t\t\t\t\tsetChip('chip-good', '● Live · updated ' + ago(age));\n\t\t\t\t} else {\n\t\t\t\t\tsetChip('chip-warning', '● Stale · updated ' + ago(age));\n\t\t\t\t}\n\t\t\t}\n\n\t\t\tif (refreshBtn) {\n\t\t\t\trefreshBtn.addEventListener('click', function() { location.reload(); });\n\t\t\t}\n\n\t\t\tdocument.querySelectorAll('[aria-describedby]').forEach(function(btn) {\n\t\t\t\tbtn.addEventListener('click', function() {\n\t\t\t\t\tvar expanded = this.getAttribute('aria-expanded') === 'true';\n\t\t\t\t\tthis.setAttribute('aria-expanded', expanded ? 'false' : 'true');\n\t\t\t\t});\n\t\t\t\tbtn.addEventListener('keydown', function(e) {\n\t\t\t\t\tif (e.key === 'Escape') {\n\t\t\t\t\t\tthis.setAttribute('aria-expanded', 'false');\n\t\t\t\t\t\tthis.blur();\n\t\t\t\t\t}\n\t\t\t\t});\n\t\t\t});\n\n\t\t\tsetInterval(updateChip, 10000);\n\t\t})();\n\t</script>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

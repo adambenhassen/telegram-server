@@ -21,14 +21,26 @@ import (
 // Server-sent-events defaults for GET /admin/events.
 const (
 	// sseDefaultEvent is the event name used when a Fragment leaves it empty.
-	// The dashboard subscribes to it with the htmx SSE extension and swaps the
-	// fragment into #metrics-stream.
+	// Datastar dispatches any datastar-prefixed event from a stream it opened
+	// itself, so this is the only name the dashboard reacts to.
 	//
-	// These two identifiers are the contract with MAIN-302, and the dashboard
-	// page is the side that must be matched: htmx answers an event name it does
-	// not subscribe to with a 200 and no swap, so a mismatch reads as a frozen
-	// dashboard rather than an error anyone would notice.
-	sseDefaultEvent = "metrics"
+	// The event name and the fragment's selector are the contract with
+	// MAIN-302, and the dashboard page is the side that must be matched: an
+	// unknown event name or a selector that hits nothing is answered with a
+	// 200 and no patch, so a mismatch reads as a frozen dashboard rather than
+	// an error anyone would notice.
+	sseDefaultEvent = "datastar-patch-elements"
+
+	// sseDefaultSelector is the element a fragment without its own selector
+	// patches. It is the same target the dashboard declares for first paint
+	// and must stay in lockstep with it; TestSSE_default_contract_is_the_
+	// dashboard_contract asserts both sides.
+	sseDefaultSelector = "#metrics-stream"
+
+	// sseDefaultMode is the merge mode applied to the selector. inner keeps
+	// the element the first paint created (listeners and attributes intact)
+	// and replaces only its children, which is what the dashboard wants.
+	sseDefaultMode = "innerHTML"
 
 	// sseInterval is the shared sampler's cadence. One sample per interval
 	// serves every connected client.
@@ -61,11 +73,16 @@ const (
 )
 
 // Fragment is one server-rendered HTML update addressed to a named SSE event.
-// The htmx SSE extension swaps the HTML into whichever element declares
-// sse-swap="<Event>".
+// Datastar patches the HTML into the element the selector names.
 type Fragment struct {
 	// Event is the SSE event name. Empty means sseDefaultEvent.
 	Event string
+	// Selector targets the element to patch. Empty means
+	// sseDefaultSelector.
+	Selector string
+	// Mode is the merge mode Datastar applies (inner, outer, ...). Empty
+	// means sseDefaultMode.
+	Mode string
 	// HTML is the rendered fragment. It is written verbatim, so the renderer
 	// owns escaping.
 	HTML string
@@ -334,23 +351,39 @@ func (b *Broadcaster) closeAll() {
 	}
 }
 
-// encodeFragment serialises one fragment as an SSE event. Multi-line HTML needs
-// one data: line per source line; the client rejoins them with newlines.
+// encodeFragment serialises one fragment as a Datastar SSE event. The
+// selector, mode and elements lines each carry one value; multi-line HTML
+// needs one data: line per source line and Datastar rejoins the lines of the
+// same key with newlines.
 func encodeFragment(f Fragment) []byte {
 	event := f.Event
 	if event == "" {
 		event = sseDefaultEvent
 	}
+	selector := f.Selector
+	if selector == "" {
+		selector = sseDefaultSelector
+	}
+	mode := f.Mode
+	if mode == "" {
+		mode = sseDefaultMode
+	}
+
+	html := strings.ReplaceAll(f.HTML, "\r\n", "\n")
+	html = strings.ReplaceAll(html, "\r", "\n")
 
 	var buf bytes.Buffer
 	buf.WriteString("event: ")
 	buf.WriteString(event)
 	buf.WriteByte('\n')
-
-	html := strings.ReplaceAll(f.HTML, "\r\n", "\n")
-	html = strings.ReplaceAll(html, "\r", "\n")
+	buf.WriteString("data: selector ")
+	buf.WriteString(selector)
+	buf.WriteByte('\n')
+	buf.WriteString("data: mode ")
+	buf.WriteString(mode)
+	buf.WriteByte('\n')
 	for line := range strings.SplitSeq(html, "\n") {
-		buf.WriteString("data: ")
+		buf.WriteString("data: elements ")
 		buf.WriteString(line)
 		buf.WriteByte('\n')
 	}
@@ -446,8 +479,8 @@ func EventsHandler(b *Broadcaster) http.HandlerFunc {
 }
 
 // DefaultFragmentRenderer renders the dashboard's metric values as a single
-// "metrics" event. It keeps the endpoint useful and testable on its own; the
-// dashboard supplies its own renderer for its own markup.
+// datastar-patch-elements event. It keeps the endpoint useful and testable on
+// its own; the dashboard supplies its own renderer for its own markup.
 func DefaultFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	// The logout form's CSRF token is session-bound and deliberately absent
 	// from a fragment that is rendered once and fanned out to every client.
@@ -463,8 +496,8 @@ func DefaultFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 var metricsFragmentTmpl = template.Must(template.New("metrics-fragment").Parse(metricsFragmentHTML))
 
 // metricsFragmentHTML mirrors the data-metric attributes the dashboard uses, so
-// a swap target can address the same values it server-rendered on first paint.
-// The wrapper id is the swap target agreed on MAIN-302 and is asserted by
+// a patch target can address the same values it server-rendered on first paint.
+// The wrapper id is the patch target agreed on MAIN-302 and is asserted by
 // TestSSE_default_contract_is_the_dashboard_contract.
 const metricsFragmentHTML = `<div id="metrics-stream" data-timestamp="{{.ServerTimestamp}}">` +
 	`<span data-metric="connections">{{.Connections}}</span>` +
