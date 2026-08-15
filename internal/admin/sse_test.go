@@ -572,8 +572,10 @@ func TestSSE_route_behind_admin_gate(t *testing.T) {
 func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 	t.Parallel()
 
-	if got := admin.SSEDefaultEvent(); got != "dashboard-update" {
-		t.Errorf("default event name = %q, want dashboard-update (MAIN-302 sse-swap target)", got)
+	// Both names are read off the dashboard page in MAIN-302: it declares
+	// sse-swap="metrics" on div#metrics-stream.
+	if got := admin.SSEDefaultEvent(); got != "metrics" {
+		t.Errorf("default event name = %q, want metrics (the dashboard's sse-swap value)", got)
 	}
 
 	fragments, err := admin.DefaultFragmentRenderer(admin.MetricsResponse{Connections: 3})
@@ -586,13 +588,13 @@ func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 	if fragments[0].Event != "" && fragments[0].Event != admin.SSEDefaultEvent() {
 		t.Errorf("fragment event = %q, want %q", fragments[0].Event, admin.SSEDefaultEvent())
 	}
-	if !strings.Contains(fragments[0].HTML, `id="dashboard-data"`) {
+	if !strings.Contains(fragments[0].HTML, `id="metrics-stream"`) {
 		t.Errorf("fragment does not carry the agreed swap target id:\n%s", fragments[0].HTML)
 	}
 
 	// An empty Event on the wire must resolve to the same name.
 	wire := string(admin.EncodeFragment(admin.Fragment{HTML: "<i>x</i>"}))
-	if !strings.HasPrefix(wire, "event: dashboard-update\n") {
+	if !strings.HasPrefix(wire, "event: metrics\n") {
 		t.Errorf("unnamed fragment encoded as %q", wire)
 	}
 }

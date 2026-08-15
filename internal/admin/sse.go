@@ -22,9 +22,13 @@ import (
 const (
 	// sseDefaultEvent is the event name used when a Fragment leaves it empty.
 	// The dashboard subscribes to it with the htmx SSE extension and swaps the
-	// fragment into #dashboard-data. Agreed with MAIN-302; changing it here
-	// without changing it there gives htmx a 200 it silently does not swap.
-	sseDefaultEvent = "dashboard-update"
+	// fragment into #metrics-stream.
+	//
+	// These two identifiers are the contract with MAIN-302, and the dashboard
+	// page is the side that must be matched: htmx answers an event name it does
+	// not subscribe to with a 200 and no swap, so a mismatch reads as a frozen
+	// dashboard rather than an error anyone would notice.
+	sseDefaultEvent = "metrics"
 
 	// sseInterval is the shared sampler's cadence. One sample per interval
 	// serves every connected client.
@@ -462,7 +466,7 @@ var metricsFragmentTmpl = template.Must(template.New("metrics-fragment").Parse(m
 // a swap target can address the same values it server-rendered on first paint.
 // The wrapper id is the swap target agreed on MAIN-302 and is asserted by
 // TestSSE_default_contract_is_the_dashboard_contract.
-const metricsFragmentHTML = `<div id="dashboard-data" data-timestamp="{{.ServerTimestamp}}">` +
+const metricsFragmentHTML = `<div id="metrics-stream" data-timestamp="{{.ServerTimestamp}}">` +
 	`<span data-metric="connections">{{.Connections}}</span>` +
 	`<span data-metric="sessions">{{.Sessions}}</span>` +
 	`<span data-metric="messages_1h">{{.Messages1H}}</span>` +
