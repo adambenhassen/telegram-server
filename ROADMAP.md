@@ -382,7 +382,7 @@ Secret chats
   both user and channel names.
 - `account.updateUsername` — self-service username set/clear; 5–32 chars
   `[a-z0-9_]` letter-first; reserved-handle blocklist; 2 changes/24h rate limit.
-- `channels.editChannelUsername` — admin-only; same validation and rate limit as
+- `channels.updateUsername` — admin-only; same validation and rate limit as
   `account.updateUsername`.
 - `contacts.resolveUsername` — resolves @username to user or channel peer with
   per-viewer `access_hash`; 100 distinct lookups/24h + 20/min burst cap;
