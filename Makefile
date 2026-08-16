@@ -18,6 +18,7 @@ templ:
 
 internal/admin/ui/node_modules: internal/admin/ui/package-lock.json
 	npm install --prefix internal/admin/ui
+	touch internal/admin/ui/node_modules
 
 css: internal/admin/ui/node_modules
 	npx --yes @tailwindcss/cli@4.3.3 \
