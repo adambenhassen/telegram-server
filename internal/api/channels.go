@@ -312,11 +312,21 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 		return nil, err
 	}
 
+	replyToMsgID := int64(0)
+	if replyTo, ok := req.GetReplyTo(); ok {
+		if rep, ok := replyTo.(*tg.InputReplyToMessage); ok && rep.ReplyToMsgID > 0 {
+			replyToMsgID = int64(rep.ReplyToMsgID)
+		}
+	}
+
 	// PostChannelMessageAs, never PostChannelMessage: the latter is the
 	// unchecked primitive and trusts its caller to have decided post rights.
-	msg, pts, dup, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil)
+	msg, pts, dup, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil, replyToMsgID)
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
+	}
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
 	}
 	if err != nil {
 		h.log.Error("send channel message", "user_id", r.UserID, "channel_id", channelID, "err", err)

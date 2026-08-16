@@ -275,7 +275,7 @@ func SeedChannelPost(ctx context.Context, s *Store, creatorID, memberID, fileID 
 	if err != nil {
 		return 0, 0, err
 	}
-	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creatorID, "post", 0, &fileID)
+	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creatorID, "post", 0, &fileID, 0)
 	if err != nil {
 		return 0, 0, err
 	}

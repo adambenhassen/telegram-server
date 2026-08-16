@@ -96,7 +96,7 @@ func TestPostChannelMessageDedupReportsTheStoredPts(t *testing.T) {
 	first, firstPts := post(t, s, ch, author.ID, "one", 31)
 	post(t, s, ch, author.ID, "two", 32)
 
-	stored, pts, dup, err := s.PostChannelMessage(ctx, ch, author.ID, "one", 31, nil)
+	stored, pts, dup, err := s.PostChannelMessage(ctx, ch, author.ID, "one", 31, nil, 0)
 	if err != nil || !dup {
 		t.Fatalf("resend: dup=%v err=%v", dup, err)
 	}

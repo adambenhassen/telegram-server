@@ -39,6 +39,8 @@ type ChannelMessage struct {
 	Deleted   bool
 	RandomID  int64
 	FileID    *int64
+	// ReplyToMsgID is the local_id of the post this post replies to; 0 = no reply.
+	ReplyToMsgID int32
 }
 
 // channelMsgFields is a layout-identical copy of the five sqlc channel-message
@@ -46,15 +48,16 @@ type ChannelMessage struct {
 // the single channelMessageFromFields function below is the only place that maps
 // database columns to ChannelMessage fields.
 type channelMsgFields struct {
-	ChannelID int64
-	LocalID   int64
-	FromID    int64
-	Date      pgtype.Timestamptz
-	Message   string
-	EditDate  pgtype.Timestamptz
-	Deleted   bool
-	RandomID  int64
-	FileID    *int64
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	FileID       *int64
+	ReplyToMsgID *int32
 }
 
 // channelMessageFromFields is the sole row-to-struct converter for channel
@@ -67,6 +70,10 @@ func channelMessageFromFields(r channelMsgFields) ChannelMessage {
 		t := r.EditDate.Time
 		editDate = &t
 	}
+	var replyToMsgID int32
+	if r.ReplyToMsgID != nil {
+		replyToMsgID = *r.ReplyToMsgID
+	}
 	return ChannelMessage{
 		r.ChannelID,
 		r.LocalID,
@@ -77,6 +84,7 @@ func channelMessageFromFields(r channelMsgFields) ChannelMessage {
 		r.Deleted,
 		r.RandomID,
 		r.FileID,
+		replyToMsgID,
 	}
 }
 
@@ -128,6 +136,9 @@ func (s *Store) ChannelPostPts(ctx context.Context, channelID, localID int64) (i
 // A repeat carrying the same non-zero randomID returns the already-stored post
 // with dup == true, writing nothing and leaving pts where it was.
 //
+// replyToMsgID is the local_id of the post this post replies to; 0 = no reply.
+// A non-zero replyToMsgID that names a deleted or absent post returns ErrMessageInvalid.
+//
 // This layer trusts its caller: it does not check that fromID may post here.
 //
 // Locking: no Go-level lock and no advisory lock, only the channel_state row
@@ -135,9 +146,9 @@ func (s *Store) ChannelPostPts(ctx context.Context, channelID, localID int64) (i
 // commit. That is the ordering every future channel write inherits — the
 // channel's own row first, before any channel_messages or channel_events write.
 func (s *Store) PostChannelMessage(
-	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64,
+	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64, replyToMsgID int64,
 ) (ChannelMessage, int, bool, error) {
-	return s.postChannelMessage(ctx, channelID, fromID, text, randomID, fileID, false)
+	return s.postChannelMessage(ctx, channelID, fromID, text, randomID, fileID, replyToMsgID, false)
 }
 
 // PostChannelMessageAs is PostChannelMessage with the post-rights check
@@ -160,13 +171,13 @@ func (s *Store) PostChannelMessage(
 // runs in its own transaction, so a member banned concurrently would still land
 // a post. That ordering is what every future channel write inherits.
 func (s *Store) PostChannelMessageAs(
-	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64,
+	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64, replyToMsgID int64,
 ) (ChannelMessage, int, bool, error) {
-	return s.postChannelMessage(ctx, channelID, fromID, text, randomID, fileID, true)
+	return s.postChannelMessage(ctx, channelID, fromID, text, randomID, fileID, replyToMsgID, true)
 }
 
 func (s *Store) postChannelMessage(
-	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64, checkRights bool,
+	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64, replyToMsgID int64, checkRights bool,
 ) (ChannelMessage, int, bool, error) {
 	if channelID == 0 || fromID == 0 {
 		return ChannelMessage{}, 0, false, ErrMessageInvalid
@@ -232,13 +243,31 @@ func (s *Store) postChannelMessage(
 		}
 	}
 
+	// Validate reply_to_msg_id under the lock, before any write. A deleted or
+	// absent post returns ErrMessageInvalid without distinguishing the two cases,
+	// so the channel's post ids are not an existence oracle for another channel.
+	var replyTo *int32
+	if replyToMsgID > 0 {
+		_, verr := qtx.ChannelPostExistsActive(ctx, db.ChannelPostExistsActiveParams{
+			ChannelID: channelID, LocalID: replyToMsgID,
+		})
+		if errors.Is(verr, pgx.ErrNoRows) {
+			return ChannelMessage{}, 0, false, ErrMessageInvalid
+		}
+		if verr != nil {
+			return ChannelMessage{}, 0, false, fmt.Errorf("reply_to_msg_id check: %w", verr)
+		}
+		v := int32(replyToMsgID) //nolint:gosec // G115: local_id fits int32 wire space
+		replyTo = &v
+	}
+
 	b, err := qtx.BumpChannelState(ctx, channelID)
 	if err != nil {
 		return ChannelMessage{}, 0, false, fmt.Errorf("bump channel state: %w", err)
 	}
 	if err = qtx.InsertChannelMessage(ctx, db.InsertChannelMessageParams{
 		ChannelID: channelID, LocalID: b.LocalID, FromID: fromID,
-		Message: text, RandomID: randomID, FileID: fileID,
+		Message: text, RandomID: randomID, FileID: fileID, ReplyToMsgID: replyTo,
 	}); err != nil {
 		return ChannelMessage{}, 0, false, fmt.Errorf("insert channel message: %w", err)
 	}

@@ -831,7 +831,7 @@ func TestForwardFromChannel(t *testing.T) {
 	}
 
 	// Seed a channel post directly via the store (no wire handler for posting).
-	post, _, _, perr := st.PostChannelMessage(ctx, channelID, aUserID, "channel post", 0, nil)
+	post, _, _, perr := st.PostChannelMessage(ctx, channelID, aUserID, "channel post", 0, nil, 0)
 	if perr != nil {
 		t.Fatalf("seed channel post: %v", perr)
 	}

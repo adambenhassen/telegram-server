@@ -38,24 +38,30 @@ WHERE channel_id = $1 AND local_id = $2 AND type = 1;
 INSERT INTO channel_events (channel_id, pts, type, local_id) VALUES ($1, $2, $3, $4);
 
 -- name: InsertChannelMessage :exec
-INSERT INTO channel_messages (channel_id, local_id, from_id, message, random_id, file_id)
-VALUES ($1, $2, $3, $4, $5, $6);
+INSERT INTO channel_messages (channel_id, local_id, from_id, message, random_id, file_id, reply_to_msg_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7);
+
+-- ChannelPostExistsActive returns the local_id of an existing, non-deleted post
+-- in channelID. Used to validate reply_to_msg_id inside the post transaction.
+-- name: ChannelPostExistsActive :one
+SELECT local_id FROM channel_messages
+WHERE channel_id = $1 AND local_id = $2 AND deleted = false;
 
 -- name: ChannelMessageByLocal :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages WHERE channel_id = $1 AND local_id = $2;
 
 -- name: ChannelMessageByRandomID :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages WHERE channel_id = $1 AND random_id = $2 AND random_id <> 0;
 
 -- name: ChannelMessagesByLocalIDs :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages
 WHERE channel_id = $1 AND local_id = ANY(sqlc.arg(local_ids)::bigint[]);
 
 -- name: ChannelHistoryPage :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages
 WHERE channel_id = sqlc.arg(channel_id) AND deleted = false
   AND (sqlc.arg(offset_id)::bigint = 0 OR local_id < sqlc.arg(offset_id)::bigint)
@@ -68,7 +74,7 @@ LIMIT sqlc.arg(lim)::int;
 -- membership is the caller's whole gate, checked before this runs.
 -- message_tsv is index-backed (GIN), so the match is not a sequential scan.
 -- name: SearchChannelPostsPage :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages
 WHERE channel_id = sqlc.arg(channel_id) AND deleted = false
   AND message_tsv @@ plainto_tsquery('simple', sqlc.arg(query))
