@@ -222,3 +222,47 @@ test.describe('admin SSE stream', () => {
     expect(eventData).toContain('id="v-connections"');
   });
 });
+
+test.describe('admin dashboard component script', () => {
+  // shadcn-templ.js registers every progressbar it finds and re-registers
+  // markup swapped in later, via a MutationObserver on document.body. The
+  // script is loaded from <head>, so whether that observer is ever attached
+  // depends on the script tag: without defer, document.body is still null when
+  // that line runs and the registration path dies with it. Load-time init
+  // survives — it waits for DOMContentLoaded — so this only shows up once the
+  // first SSE patch replaces the markup that init had already registered.
+  test('components re-init after an SSE swap', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+
+    await login(page);
+
+    // Count swaps from inside the page: the first patch can land before the
+    // test could tag anything, so the swap has to be observed, not inferred.
+    await page.addInitScript(() => {
+      (window as unknown as { __swaps: number }).__swaps = 0;
+      document.addEventListener('DOMContentLoaded', () => {
+        const target = document.getElementById('metrics-stream');
+        if (!target) return;
+        new MutationObserver(() => {
+          (window as unknown as { __swaps: number }).__swaps++;
+        }).observe(target, { childList: true });
+      });
+    });
+    await page.goto('/admin/dashboard');
+
+    await expect
+      .poll(() => page.evaluate(() => (window as unknown as { __swaps: number }).__swaps), {
+        timeout: 20000,
+      })
+      .toBeGreaterThan(0);
+
+    // Every bar on the page now came from the stream. Each carries the marker
+    // only if the observer re-registered it after the swap.
+    await expect(
+      page.locator('[role="progressbar"]:not([data-tui-progress-observed])'),
+    ).toHaveCount(0);
+
+    expect(errors, 'JS errors on dashboard load').toEqual([]);
+  });
+});
