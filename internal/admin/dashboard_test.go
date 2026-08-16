@@ -442,12 +442,21 @@ func TestDashboardCSS_defines_the_utilities_the_page_relies_on(t *testing.T) {
 
 	// A representative sample of the layout utilities the dashboard renders
 	// with. These disappear together when the stylesheet is built without the
-	// templates in scope, which is how `.hidden` went missing.
-	for _, class := range []string{"flex", "block", "grid", "border", "absolute", "relative"} {
+	// templates in scope, which is how `.hidden` went missing. `block` is
+	// checked as `sm:block`: the dashboard only ever uses the responsive form
+	// (the tooltip reveal), and with source(none) scoping an unscoped utility
+	// that no template emits is not generated, so the bare name is absent
+	// from a correct build. The emitted selector escapes the colon
+	// (`.sm\:block`), so the pattern is built by hand for that one.
+	for _, class := range []string{"flex", "grid", "border", "absolute", "relative"} {
 		re := regexp.MustCompile(`(^|[,}])\.` + regexp.QuoteMeta(class) + `\{`)
 		if !re.MatchString(sheet) {
 			t.Errorf("dashboard.css defines no .%s rule; the stylesheet is stale against the templates — regenerate with `make css`", class)
 		}
+	}
+	smBlock := regexp.MustCompile(`\{\.sm\\:block\{`)
+	if !smBlock.MatchString(sheet) {
+		t.Error("dashboard.css defines no .sm\\:block rule; the stylesheet is stale against the templates — regenerate with `make css`")
 	}
 }
 
