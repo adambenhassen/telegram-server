@@ -80,22 +80,38 @@ generates a new 2048-bit RSA key and writes it there (PKCS1 PEM, mode
 same file, so the key (and its fingerprint) stays stable across restarts as
 long as the file persists.
 
-## 2. Get the RSA key fingerprint
+## 2. Get the RSA key identity
 
 At startup the server logs the key it loaded/generated:
 
 ```
-level=INFO msg="server RSA key" fingerprint=<int64> path=server_key.pem
+level=INFO msg="server RSA key" key_id=<64 hex chars in 16 dash-separated groups of 4> fingerprint=<int64> path=server_key.pem
 ```
 
-(`cmd/telegramd/main.go`, right after `rsakey.LoadOrGenerate`). A client
-must be built with this exact public key (read `path`, e.g.
-`server_key.pem`, and derive/embed the PEM) and its fingerprint, since
-gotd-style clients select the RSA key to use for the auth-key handshake by
-fingerprint. Also note the `listening addr=... advertise=... dc=...` log line
-that follows — it confirms the actual bind address, the address clients are
-told to dial, and the DC id the process is using, which may differ from what
-you passed if `TG_LISTEN_ADDR` was left at default.
+(`cmd/telegramd/main.go`, right after `rsakey.LoadOrGenerate`).
+
+- `key_id` is the SHA-256 of the DER SubjectPublicKeyInfo encoding of the
+  public key, hex-encoded as 16 dash-separated groups of 4 characters
+  (e.g. `a1b2-c3d4-e5f6-a7b8-...`). **This is the value to compare out of
+  band** — a client UI that displays the same digest for the key it loaded
+  must render the identical grouped format. The int64 `fingerprint` is the
+  legacy Telegram value; it is retained for clients that still match on it
+  but is too short to be a trustworthy out-of-band check. Byte-level oracle
+  for the digest, against a public key file (SPKI or PKCS#1 PEM — OpenSSL
+  normalises both to SPKI on `-pubin`):
+
+  ```bash
+  openssl pkey -pubin -in server_pub.pem -outform DER | sha256sum
+  ```
+- A client must be built with this exact public key (read `path`, e.g.
+  `server_key.pem`, and derive/embed the PEM) and its fingerprint, since
+  gotd-style clients select the RSA key to use for the auth-key handshake by
+  fingerprint.
+
+Also note the `listening addr=... advertise=... dc=...` log line that
+follows — it confirms the actual bind address, the address clients are told
+to dial, and the DC id the process is using, which may differ from what you
+passed if `TG_LISTEN_ADDR` was left at default.
 
 ## 3. Point a client at this server
 
@@ -360,7 +376,11 @@ TDESKTOP_CUSTOM_DC_RSA_KEY_FILE=/path/to/server_pub.pem \
 `-workdir` keeps this profile away from any real Telegram account on the
 machine. The client logs the key it loaded as `MTP Info: using custom public
 RSA key ... fingerprint <int64>`; that number must equal the `fingerprint` the
-server logs at startup, or key exchange fails with no useful client-side error.
+server logs at startup, or key exchange fails with no useful client-side
+error. For the out-of-band check, compare the `key_id` the server logs at
+startup (section 2) against the SHA-256 of the DER SubjectPublicKeyInfo
+encoding of the key file you gave the client — the same value the login
+screen of the tdesktop fork (MAIN-314) renders from `server_pub.pem`.
 
 A mismatched fingerprint is not, however, the failure to expect first: against
 an unmodified server key exchange never completes at all, for reasons that have
