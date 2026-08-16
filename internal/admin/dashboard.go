@@ -21,10 +21,16 @@ import (
 func DashboardFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	d := BuildDashboardData(m, "")
 	var buf bytes.Buffer
+	// The wrapper is the patch target itself, reproducing the element the
+	// first paint put around the same component: a fragment must be a single
+	// element whose id is the selector, or the merge keeps only its last
+	// top-level node.
+	buf.WriteString(`<div id="` + sseTargetID + `">`)
 	if err := metricsFragment(d).Render(context.Background(), &buf); err != nil {
 		return nil, fmt.Errorf("render metrics fragment: %w", err)
 	}
-	return []Fragment{{Event: "metrics", HTML: buf.String()}}, nil
+	buf.WriteString(`</div>`)
+	return []Fragment{{Event: sseDefaultEvent, HTML: buf.String()}}, nil
 }
 
 // DashboardData is the template data for GET /admin/dashboard. Exported for
