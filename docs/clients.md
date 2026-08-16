@@ -268,10 +268,9 @@ on a branch of our fork, deliberately not vendored here: the checkout is
    constants, so the address and the key can change without a rebuild — which
    matters because the build is hours and the server's advertised address is
    not known until it runs.
-2. `api_id` / `api_hash`, passed at cmake time as `TDESKTOP_API_ID` and
-   `TDESKTOP_API_HASH`. `telegramd` never reads either, so any values work; the
-   branch was built with the public test pair `17349` /
-   `344583e45741c457fe1862106095a5eb`.
+2. `api_id` / `api_hash`, cmake options rather than a patch. `telegramd` never
+   reads either, so any values work; the branch was built with
+   `-D TDESKTOP_API_TEST=ON`, which selects upstream's public test pair.
 3. `Telegram/SourceFiles/mtproto/special_config_request.cpp` — the DNS and
    Firebase fallback resolver is skipped whenever a custom DC is configured.
    Left live, a failed connect to our address sends the client resolving
@@ -300,6 +299,12 @@ and building it natively on aarch64 works, and takes about two hours on four
 cores. Everything below was run against such an image, tagged
 `tdesktop:centos_env-arm64`.
 
+One dependency needs a patch before that render succeeds: rnnoise v0.2's NEON
+and generic paths in `src/vec.h` include a header rnnoise does not vendor, so
+they compile on no architecture at all — upstream only ever reaches its
+AVX/SSE2 branch. The fix is on our fork as PR #2. Without it the image build
+fails on rnnoise, whatever else is right.
+
 Clone with `--recursive`; the build needs all 36 submodules.
 
 ```bash
@@ -320,7 +325,9 @@ docker run --rm -u $(id -u) \
 
 `-D TDESKTOP_API_TEST=ON` is the public test api id/hash pair, and is enough
 here because the server reads neither. The image sets `CCACHE_DISABLE=true`, so
-`env -u CCACHE_DISABLE` is what makes the ccache mount do anything.
+`env -u CCACHE_DISABLE` is what makes the ccache mount do anything, and
+`-fpch-preprocess` is what lets ccache hash the build's precompiled headers
+rather than silently missing on every one — both are upstream's own CI line.
 
 The binary lands in `out/Debug/Telegram` and is around 1.2 GB. A cold build is
 2209 targets, roughly an hour on four cores.
@@ -334,7 +341,7 @@ docker create --name tdbuild --user root -w /work <image-tag> sleep infinity
 docker start tdbuild
 docker cp ./tdesktop tdbuild:/work/tdesktop
 docker exec tdbuild bash -c 'cd /work/tdesktop && env -u CCACHE_DISABLE CONFIG=Debug \
-  ./Telegram/build/docker/centos_env/build.sh ...'
+  ./Telegram/build/docker/centos_env/build.sh <same -D flags as above>'
 ```
 
 ### Connect
@@ -353,6 +360,11 @@ TDESKTOP_CUSTOM_DC_RSA_KEY_FILE=/path/to/server_pub.pem \
 machine. The client logs the key it loaded as `MTP Info: using custom public
 RSA key ... fingerprint <int64>`; that number must equal the `fingerprint` the
 server logs at startup, or key exchange fails with no useful client-side error.
+
+A mismatched fingerprint is not, however, the failure to expect first: against
+an unmodified server key exchange never completes at all, for reasons that have
+nothing to do with the key. See "What stops it today" below before debugging
+anything here.
 
 Telegram Desktop is GPLv3. Internal use carries no obligation, but any binary
 handed to someone else must ship its source.
