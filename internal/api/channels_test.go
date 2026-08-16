@@ -1447,7 +1447,7 @@ func TestImportChatInviteIsIdempotent(t *testing.T) {
 
 	// A post between the two joins moves the channel's pts, so a second join that
 	// rewrote join_pts would seat the joiner above history they already hold.
-	if _, _, _, err = s.PostChannelMessageAs(ctx, ch.ID, creator.ID, "hello", 7, nil); err != nil {
+	if _, _, _, err = s.PostChannelMessageAs(ctx, ch.ID, creator.ID, "hello", 7, nil, 0); err != nil {
 		t.Fatalf("post: %v", err)
 	}
 
@@ -1486,7 +1486,7 @@ func TestGetChannelDifferenceThreePosts(t *testing.T) {
 	}
 
 	for i := range 3 {
-		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil, 0)
 		if err != nil {
 			t.Fatalf("post %d: %v", i, err)
 		}
@@ -1530,7 +1530,7 @@ func TestGetChannelDifferencePartialPts(t *testing.T) {
 	}
 
 	for i := range 3 {
-		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil, 0)
 		if err != nil {
 			t.Fatalf("post %d: %v", i, err)
 		}
@@ -1574,7 +1574,7 @@ func TestGetChannelDifferenceCaughtUp(t *testing.T) {
 	}
 
 	for i := range 3 {
-		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil, 0)
 		if err != nil {
 			t.Fatalf("post %d: %v", i, err)
 		}
@@ -1615,7 +1615,7 @@ func TestGetChannelDifferenceAheadOfServer(t *testing.T) {
 	}
 
 	for i := range 3 {
-		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil, 0)
 		if err != nil {
 			t.Fatalf("post %d: %v", i, err)
 		}
@@ -1647,7 +1647,7 @@ func TestGetChannelDifferenceJoinPtsClamp(t *testing.T) {
 	creator, _, ch := channelWith(t, s, "+1555144001", "+1555144002")
 
 	for i := range 2 {
-		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil, 0)
 		if err != nil {
 			t.Fatalf("post %d: %v", i, err)
 		}
@@ -1663,7 +1663,7 @@ func TestGetChannelDifferenceJoinPtsClamp(t *testing.T) {
 		t.Fatalf("import: %v", err)
 	}
 
-	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "after join", 3, nil); err != nil {
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "after join", 3, nil, 0); err != nil {
 		t.Fatalf("post after join: %v", err)
 	}
 
@@ -1696,7 +1696,7 @@ func TestGetChannelDifferenceNonMember(t *testing.T) {
 	s := openStore(t)
 	creator, _, ch := channelWith(t, s, "+1555145001", "+1555145002")
 
-	if _, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg", 1, nil); err != nil {
+	if _, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg", 1, nil, 0); err != nil {
 		t.Fatalf("post: %v", err)
 	}
 
@@ -1723,7 +1723,7 @@ func TestGetChannelDifferenceBanned(t *testing.T) {
 
 	joinChannel(t, ctx, dsn, ch.ID, other.ID)
 
-	if _, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg", 1, nil); err != nil {
+	if _, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg", 1, nil, 0); err != nil {
 		t.Fatalf("post: %v", err)
 	}
 
@@ -1754,7 +1754,7 @@ func TestGetChannelDifferenceTruncated(t *testing.T) {
 	}
 
 	for i := range 5 {
-		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil)
+		_, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("msg %d", i), int64(i+1), nil, 0)
 		if err != nil {
 			t.Fatalf("post %d: %v", i, err)
 		}
@@ -2256,7 +2256,7 @@ func TestGetChannelDifferenceSkippedEvent(t *testing.T) {
 		t.Fatalf("import: %v", err)
 	}
 
-	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg", 1, nil); err != nil {
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg", 1, nil, 0); err != nil {
 		t.Fatalf("post: %v", err)
 	}
 
@@ -2269,7 +2269,7 @@ func TestGetChannelDifferenceSkippedEvent(t *testing.T) {
 		`UPDATE channel_state SET pts = $2 WHERE channel_id = $1`,
 		ch.ID, 2)
 
-	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg2", 3, nil); err != nil {
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg2", 3, nil, 0); err != nil {
 		t.Fatalf("post2: %v", err)
 	}
 
@@ -2781,7 +2781,7 @@ func TestJoinChannelIdempotent(t *testing.T) {
 	}
 
 	// Post between joins to advance pts.
-	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "hello", 1, nil); err != nil {
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "hello", 1, nil, 0); err != nil {
 		t.Fatalf("post: %v", err)
 	}
 
@@ -2879,7 +2879,7 @@ func TestJoinChannelSetsJoinPts(t *testing.T) {
 
 	// Post before join.
 	for i := range 3 {
-		if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("pre %d", i), int64(i+1), nil); err != nil {
+		if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, fmt.Sprintf("pre %d", i), int64(i+1), nil, 0); err != nil {
 			t.Fatalf("post %d: %v", i, err)
 		}
 	}
@@ -2900,7 +2900,7 @@ func TestJoinChannelSetsJoinPts(t *testing.T) {
 	}
 
 	// Post after join.
-	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "post join", 10, nil); err != nil {
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "post join", 10, nil, 0); err != nil {
 		t.Fatalf("post after join: %v", err)
 	}
 
@@ -3121,7 +3121,7 @@ func TestJoinChannelDeliversNewPosts(t *testing.T) {
 	}
 
 	// Post after join.
-	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "after join", 1, nil); err != nil {
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "after join", 1, nil, 0); err != nil {
 		t.Fatalf("post: %v", err)
 	}
 

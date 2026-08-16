@@ -80,7 +80,7 @@ func (q *Queries) ChannelEventsWindow(ctx context.Context, arg ChannelEventsWind
 }
 
 const channelHistoryPage = `-- name: ChannelHistoryPage :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages
 WHERE channel_id = $1 AND deleted = false
   AND ($2::bigint = 0 OR local_id < $2::bigint)
@@ -95,15 +95,16 @@ type ChannelHistoryPageParams struct {
 }
 
 type ChannelHistoryPageRow struct {
-	ChannelID int64
-	LocalID   int64
-	FromID    int64
-	Date      pgtype.Timestamptz
-	Message   string
-	EditDate  pgtype.Timestamptz
-	Deleted   bool
-	RandomID  int64
-	FileID    *int64
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	FileID       *int64
+	ReplyToMsgID *int32
 }
 
 func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPageParams) ([]ChannelHistoryPageRow, error) {
@@ -125,6 +126,7 @@ func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPage
 			&i.Deleted,
 			&i.RandomID,
 			&i.FileID,
+			&i.ReplyToMsgID,
 		); err != nil {
 			return nil, err
 		}
@@ -137,7 +139,7 @@ func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPage
 }
 
 const channelMessageByLocal = `-- name: ChannelMessageByLocal :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages WHERE channel_id = $1 AND local_id = $2
 `
 
@@ -147,15 +149,16 @@ type ChannelMessageByLocalParams struct {
 }
 
 type ChannelMessageByLocalRow struct {
-	ChannelID int64
-	LocalID   int64
-	FromID    int64
-	Date      pgtype.Timestamptz
-	Message   string
-	EditDate  pgtype.Timestamptz
-	Deleted   bool
-	RandomID  int64
-	FileID    *int64
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	FileID       *int64
+	ReplyToMsgID *int32
 }
 
 func (q *Queries) ChannelMessageByLocal(ctx context.Context, arg ChannelMessageByLocalParams) (ChannelMessageByLocalRow, error) {
@@ -171,12 +174,13 @@ func (q *Queries) ChannelMessageByLocal(ctx context.Context, arg ChannelMessageB
 		&i.Deleted,
 		&i.RandomID,
 		&i.FileID,
+		&i.ReplyToMsgID,
 	)
 	return i, err
 }
 
 const channelMessageByRandomID = `-- name: ChannelMessageByRandomID :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages WHERE channel_id = $1 AND random_id = $2 AND random_id <> 0
 `
 
@@ -186,15 +190,16 @@ type ChannelMessageByRandomIDParams struct {
 }
 
 type ChannelMessageByRandomIDRow struct {
-	ChannelID int64
-	LocalID   int64
-	FromID    int64
-	Date      pgtype.Timestamptz
-	Message   string
-	EditDate  pgtype.Timestamptz
-	Deleted   bool
-	RandomID  int64
-	FileID    *int64
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	FileID       *int64
+	ReplyToMsgID *int32
 }
 
 func (q *Queries) ChannelMessageByRandomID(ctx context.Context, arg ChannelMessageByRandomIDParams) (ChannelMessageByRandomIDRow, error) {
@@ -210,12 +215,13 @@ func (q *Queries) ChannelMessageByRandomID(ctx context.Context, arg ChannelMessa
 		&i.Deleted,
 		&i.RandomID,
 		&i.FileID,
+		&i.ReplyToMsgID,
 	)
 	return i, err
 }
 
 const channelMessagesByLocalIDs = `-- name: ChannelMessagesByLocalIDs :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages
 WHERE channel_id = $1 AND local_id = ANY($2::bigint[])
 `
@@ -226,15 +232,16 @@ type ChannelMessagesByLocalIDsParams struct {
 }
 
 type ChannelMessagesByLocalIDsRow struct {
-	ChannelID int64
-	LocalID   int64
-	FromID    int64
-	Date      pgtype.Timestamptz
-	Message   string
-	EditDate  pgtype.Timestamptz
-	Deleted   bool
-	RandomID  int64
-	FileID    *int64
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	FileID       *int64
+	ReplyToMsgID *int32
 }
 
 func (q *Queries) ChannelMessagesByLocalIDs(ctx context.Context, arg ChannelMessagesByLocalIDsParams) ([]ChannelMessagesByLocalIDsRow, error) {
@@ -256,6 +263,7 @@ func (q *Queries) ChannelMessagesByLocalIDs(ctx context.Context, arg ChannelMess
 			&i.Deleted,
 			&i.RandomID,
 			&i.FileID,
+			&i.ReplyToMsgID,
 		); err != nil {
 			return nil, err
 		}
@@ -265,6 +273,30 @@ func (q *Queries) ChannelMessagesByLocalIDs(ctx context.Context, arg ChannelMess
 		return nil, err
 	}
 	return items, nil
+}
+
+const channelPostExistsActive = `-- name: ChannelPostExistsActive :one
+SELECT local_id FROM channel_messages
+WHERE channel_id = $1 AND local_id = $2 AND deleted = false
+`
+
+type ChannelPostExistsActiveParams struct {
+	ChannelID int64
+	LocalID   int64
+}
+
+// ChannelPostExistsActive returns the local_id of an existing, non-deleted post
+// in channelID. Used to validate reply_to_msg_id inside the post transaction.
+//
+// LOCK INVARIANT: callers must hold the channel_state row lock (LockChannelState)
+// before calling this. A future channel-post delete path must acquire the same
+// lock before writing deleted = true, or the snapshot read here can race it and
+// accept a reply reference to a post that is deleted by the time we commit.
+func (q *Queries) ChannelPostExistsActive(ctx context.Context, arg ChannelPostExistsActiveParams) (int64, error) {
+	row := q.db.QueryRow(ctx, channelPostExistsActive, arg.ChannelID, arg.LocalID)
+	var local_id int64
+	err := row.Scan(&local_id)
+	return local_id, err
 }
 
 const ensureChannelState = `-- name: EnsureChannelState :exec
@@ -314,17 +346,18 @@ func (q *Queries) InsertChannelEvent(ctx context.Context, arg InsertChannelEvent
 }
 
 const insertChannelMessage = `-- name: InsertChannelMessage :exec
-INSERT INTO channel_messages (channel_id, local_id, from_id, message, random_id, file_id)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO channel_messages (channel_id, local_id, from_id, message, random_id, file_id, reply_to_msg_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 `
 
 type InsertChannelMessageParams struct {
-	ChannelID int64
-	LocalID   int64
-	FromID    int64
-	Message   string
-	RandomID  int64
-	FileID    *int64
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Message      string
+	RandomID     int64
+	FileID       *int64
+	ReplyToMsgID *int32
 }
 
 func (q *Queries) InsertChannelMessage(ctx context.Context, arg InsertChannelMessageParams) error {
@@ -335,6 +368,7 @@ func (q *Queries) InsertChannelMessage(ctx context.Context, arg InsertChannelMes
 		arg.Message,
 		arg.RandomID,
 		arg.FileID,
+		arg.ReplyToMsgID,
 	)
 	return err
 }
@@ -379,7 +413,7 @@ func (q *Queries) NewChannelPostPts(ctx context.Context, arg NewChannelPostPtsPa
 }
 
 const searchChannelPostsPage = `-- name: SearchChannelPostsPage :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
 FROM channel_messages
 WHERE channel_id = $1 AND deleted = false
   AND message_tsv @@ plainto_tsquery('simple', $2)
@@ -396,15 +430,16 @@ type SearchChannelPostsPageParams struct {
 }
 
 type SearchChannelPostsPageRow struct {
-	ChannelID int64
-	LocalID   int64
-	FromID    int64
-	Date      pgtype.Timestamptz
-	Message   string
-	EditDate  pgtype.Timestamptz
-	Deleted   bool
-	RandomID  int64
-	FileID    *int64
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	FileID       *int64
+	ReplyToMsgID *int32
 }
 
 // SearchChannelPostsPage is ChannelHistoryPage narrowed by a full-text match.
@@ -436,6 +471,7 @@ func (q *Queries) SearchChannelPostsPage(ctx context.Context, arg SearchChannelP
 			&i.Deleted,
 			&i.RandomID,
 			&i.FileID,
+			&i.ReplyToMsgID,
 		); err != nil {
 			return nil, err
 		}

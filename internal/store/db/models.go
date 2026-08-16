@@ -57,16 +57,17 @@ type ChannelInvite struct {
 }
 
 type ChannelMessage struct {
-	ChannelID  int64
-	LocalID    int64
-	FromID     int64
-	Date       pgtype.Timestamptz
-	Message    string
-	EditDate   pgtype.Timestamptz
-	Deleted    bool
-	RandomID   int64
-	FileID     *int64
-	MessageTsv interface{}
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	FileID       *int64
+	MessageTsv   interface{}
+	ReplyToMsgID *int32
 }
 
 type ChannelParticipant struct {

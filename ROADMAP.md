@@ -65,7 +65,8 @@ Contacts
 Messaging
 - `messages.sendMessage`, `messages.getDialogs`, `messages.getHistory`,
   `messages.readHistory`, `messages.editMessage`, `messages.deleteMessages`,
-  `messages.setTyping`, `messages.createChat`, `messages.addChatUser`,
+  `messages.setTyping`, `messages.forwardMessages`, `messages.sendReaction`,
+  `messages.updatePinnedMessage`, `messages.createChat`, `messages.addChatUser`,
   `messages.deleteChatUser`, `messages.editChatTitle`, `messages.search`,
   `messages.searchGlobal`
 
@@ -79,10 +80,14 @@ Updates
 Channels
 - `channels.createChannel`, `channels.getChannels`, `channels.joinChannel`,
   `channels.leaveChannel`, `channels.editAdmin`, `channels.editBanned`,
-  `channels.getMessages`, `channels.editChannelUsername`
+  `channels.getMessages`, `channels.updateUsername`
 - `messages.exportChatInvite`, `messages.checkChatInvite`,
   `messages.importChatInvite`, `messages.revokeExportedChatInvite`
 - `updates.getChannelDifference`
+
+Secret chats
+- `messages.getDhConfig`, `messages.requestEncryption`, `messages.acceptEncryption`,
+  `messages.discardEncryption`, `messages.sendEncrypted`, `messages.receivedQueue`
 
 ## Shipped
 
@@ -349,12 +354,35 @@ Channels
   `secret_chats` table for per-chat key state and metadata,
   `update_state.qts` counter advancing on each secret-chat event.
 
+### M11 — Message features
+- **Reply threading.** `reply_to_msg_id` stored and echoed on send; history and
+  update payloads carry the reply reference so clients can render threads. Covers
+  1:1 and group-chat peers; channel posts do not carry reply threading (MAIN-328).
+- **Message forwarding.** `messages.forwardMessages` with a forwarded-from header;
+  per-pair `access_hash` re-derived for the recipient rather than passed through.
+  Channel peers are not valid forwarding destinations; forwarding a channel post to
+  a 1:1 or group destination carries the channel peer and post id in `FwdFrom` and
+  is gated on the forwarder's current channel membership.
+- **Reactions.** `messages.sendReaction` sets or clears the caller's emoji reaction
+  on 1:1 and group-chat messages; channel messages are out of scope. Reaction counts
+  embedded in `getHistory` and update payloads; `updateMessageReactions` pushed to
+  all entitled peers on change. Reactions are rendered on read paths and pushed on
+  change; `messages.getMessagesReactions` is not implemented — the full per-message
+  reaction list is a missing convenience surface, not missing functionality (MAIN-329).
+- **Pinned messages.** `messages.updatePinnedMessage` pins or unpins a message;
+  admin-only in channels; `updatePinnedMessages` pushed to members carrying the
+  current pinned message id.
+- E2E gates (`test/e2e/`): reply threading — `reply_test.go`; forwarding —
+  `forward_test.go` (1:1, group, channel-origin, auth rejection, dedup, multi-id);
+  reactions — `reactions_test.go` (realtime and chat fan-out); pinning —
+  `pinned_test.go` (chat and channel).
+
 ### M12 — Usernames & public channels
 - Shared `usernames` table: globally unique, case-insensitive handles covering
   both user and channel names.
 - `account.updateUsername` — self-service username set/clear; 5–32 chars
   `[a-z0-9_]` letter-first; reserved-handle blocklist; 2 changes/24h rate limit.
-- `channels.editChannelUsername` — admin-only; same validation and rate limit as
+- `channels.updateUsername` — admin-only; same validation and rate limit as
   `account.updateUsername`.
 - `contacts.resolveUsername` — resolves @username to user or channel peer with
   per-viewer `access_hash`; 100 distinct lookups/24h + 20/min burst cap;
@@ -474,20 +502,6 @@ Channels
   non-members, and the two-vector result structure
   (`TestContactsSearchChannelDiscovery`); cross-dialog search across all three
   peer types (`TestSearchGlobalAcrossDialogs`).
-
-## Planned — feature track
-
-### M11 — Message features
-Four stages in sequence:
-
-1. **Reply threading.** `reply_to_msg_id` stored and echoed on send; history and
-   update payloads carry the reply reference so clients can render threads.
-2. **Message forwarding.** `messages.forwardMessages` with a forwarded-from header;
-   per-pair `access_hash` re-derived for the recipient rather than passed through.
-3. **Reactions.** Per-message emoji reactions; reaction counts in update payloads;
-   `messages.sendReaction` and `messages.getMessagesReactions`.
-4. **Pinned messages.** `messages.updatePinnedMessage` (admin-only in channels);
-   `updatePinnedMessages` pushed to members; pinned message id surfaced in dialog.
 
 ## Planned — operational track
 
