@@ -150,14 +150,14 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	if peerType == store.PeerTypeChannel {
-		return h.sendChannelMessage(r, toID, &req)
-	}
 	replyToMsgID := int64(0)
 	if replyTo, ok := req.GetReplyTo(); ok {
 		if rep, ok := replyTo.(*tg.InputReplyToMessage); ok && rep.ReplyToMsgID > 0 {
 			replyToMsgID = int64(rep.ReplyToMsgID)
 		}
+	}
+	if peerType == store.PeerTypeChannel {
+		return h.sendChannelMessage(r, toID, &req, replyToMsgID)
 	}
 
 	if peerType == store.PeerTypeChat {

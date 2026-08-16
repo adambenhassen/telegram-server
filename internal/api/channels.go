@@ -270,7 +270,7 @@ func (h *handlers) requireChannelMember(ctx context.Context, channelID, userID i
 // ride. store.ErrNotMember covers "not a member", "banned", "may not post in a
 // broadcast" and "no such channel" alike, and all four must stay one wire error
 // so channel ids are not enumerable.
-func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *tg.MessagesSendMessageRequest, replyToMsgID int64) (bin.Encoder, error) {
 	// Check for a transport retry before the rate limit.
 	if req.RandomID != 0 {
 		if existing, ok, err := h.store.ChannelMessageByRandomID(r.Ctx, channelID, req.RandomID); err == nil && ok {
@@ -314,9 +314,12 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 
 	// PostChannelMessageAs, never PostChannelMessage: the latter is the
 	// unchecked primitive and trusts its caller to have decided post rights.
-	msg, pts, dup, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil)
+	msg, pts, dup, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil, replyToMsgID)
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
+	}
+	if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
 	}
 	if err != nil {
 		h.log.Error("send channel message", "user_id", r.UserID, "channel_id", channelID, "err", err)

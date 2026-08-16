@@ -966,6 +966,7 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 				r.TopDeleted,
 				r.TopRandomID,
 				r.TopFileID,
+				r.TopReplyToMsgID,
 			})
 			row.Top = &top
 		}
