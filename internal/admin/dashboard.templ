@@ -103,7 +103,8 @@ templ dashboardPage(d DashboardData) {
 
 // metricsFragment renders the live-updating metrics sections. It is the SSE
 // swap target: the broadcaster calls DashboardFragmentRenderer to produce the
-// HTML that replaces the innerHTML of #metrics-stream on each tick.
+// fragment (a <div id="metrics-stream"> wrapping this component), which
+// Datastar morphs in place on each tick (mergeMode morph, not innerHTML).
 //
 // Nothing session-bound (CSRF token, user identity) may appear here — the
 // fragment is rendered once per tick and fanned out to every connected client.
