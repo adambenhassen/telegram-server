@@ -294,25 +294,48 @@ openssl rsa -in server_key.pem -pubout -RSAPublicKey_out -out server_pub.pem
 ### Build
 
 The upstream Linux build runs in `ghcr.io/telegramdesktop/tdesktop/centos_env`,
-which is published **for linux/amd64 only** — it will not run on an arm64 host.
+which is **published for linux/amd64 only**. The image *definition* is not
+architecture-locked, though: rendering its Dockerfile with `DEBUG=` and `LTO=`
+and building it natively on aarch64 works, and takes about two hours on four
+cores. Everything below was run against such an image, tagged
+`tdesktop:centos_env-arm64`.
+
+Clone with `--recursive`; the build needs all 36 submodules.
 
 ```bash
 docker run --rm -u $(id -u) \
   -v "$PWD:/usr/src/tdesktop" \
   -v "$HOME/.cache/tdesktop-ccache:/var/cache/ccache" \
   -e CONFIG=Debug \
-  ghcr.io/telegramdesktop/tdesktop/centos_env:latest \
+  <image-tag> \
+  env -u CCACHE_DISABLE \
   /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
   -D CMAKE_CONFIGURATION_TYPES=Debug \
-  -D CMAKE_C_FLAGS_DEBUG="-O0" \
-  -D CMAKE_CXX_FLAGS_DEBUG="-O0" \
-  -D TDESKTOP_API_ID=17349 \
-  -D TDESKTOP_API_HASH=344583e45741c457fe1862106095a5eb \
+  -D CMAKE_C_FLAGS_DEBUG="-O0 -fpch-preprocess" \
+  -D CMAKE_CXX_FLAGS_DEBUG="-O0 -fpch-preprocess" \
+  -D TDESKTOP_API_TEST=ON \
   -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
   -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
 ```
 
-The binary lands in `out/Debug/Telegram`. Budget hours for a cold build.
+`-D TDESKTOP_API_TEST=ON` is the public test api id/hash pair, and is enough
+here because the server reads neither. The image sets `CCACHE_DISABLE=true`, so
+`env -u CCACHE_DISABLE` is what makes the ccache mount do anything.
+
+The binary lands in `out/Debug/Telegram` and is around 1.2 GB. A cold build is
+2209 targets, roughly an hour on four cores.
+
+Bind mounts do not work from an agent runtime — the Docker daemon resolves `-v`
+paths on its own host, not in the workdir, and silently mounts an empty
+directory. There, create a long-lived container and copy the tree in instead:
+
+```bash
+docker create --name tdbuild --user root -w /work <image-tag> sleep infinity
+docker start tdbuild
+docker cp ./tdesktop tdbuild:/work/tdesktop
+docker exec tdbuild bash -c 'cd /work/tdesktop && env -u CCACHE_DISABLE CONFIG=Debug \
+  ./Telegram/build/docker/centos_env/build.sh ...'
+```
 
 ### Connect
 
@@ -333,6 +356,34 @@ server logs at startup, or key exchange fails with no useful client-side error.
 
 Telegram Desktop is GPLv3. Internal use carries no obligation, but any binary
 handed to someone else must ship its source.
+
+### What stops it today
+
+A patched Telegram Desktop built as above does **not** reach the server on an
+unmodified `telegramd`. Three things block it, in the order they bite. None is
+an RPC the client could route around, and the first two stop it before any
+handler runs:
+
+1. **Transport obfuscation.** Telegram Desktop always wraps the TCP stream in
+   obfuscated2 — `TcpConnection::prepareConnectionStartPrefix` sends a 64-byte
+   nonce and AES-CTR encrypts everything after it, with no way to turn it off.
+   The codec sniff in `internal/mtproto/accept.go` reads that nonce as a
+   plaintext codec tag, falls through to `Full`, and every frame after it fails
+   as `invalid message length`. gotd already ships the fix as
+   `transport.ObfuscatedListener`; what it needs is a sniff that still accepts
+   the plain codecs the e2e client uses.
+2. **`auth.bindTempAuthKey`.** The client's PFS step. Unimplemented, it answers
+   `INPUT_METHOD_INVALID`, and because the client only clears its binder on
+   `ENCRYPTED_MESSAGE_INVALID` it then retries without any backoff — measured at
+   about 1400 calls a second from one client.
+3. **`config.expires`.** `DefaultConfig` sends `Date: 0, Expires: 0`.
+   `Instance::Private::configLoadDone` computes `expires - now`, reads the
+   config as already stale, and re-requests it immediately — about 400
+   `help.getConfig` calls a second, forever.
+
+With those three worked around locally, the client signs in against this server
+and reaches its main window. MAIN-263 carries the wire-verified inventory of
+what it calls on the way and what breaks after.
 
 ## Known ceilings
 
