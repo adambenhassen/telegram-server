@@ -222,3 +222,26 @@ test.describe('admin SSE stream', () => {
     expect(eventData).toContain('id="v-connections"');
   });
 });
+
+test.describe('admin dashboard stylesheet', () => {
+  // dashboard.css is generated and committed, and nothing regenerates it
+  // automatically. When it goes stale against the templates the page still
+  // renders — it just loses the rules it was built without. `hidden` is the
+  // one that changes behaviour rather than looks: the templates hide the
+  // banners by toggling it, so a missing rule leaves them permanently on
+  // screen. Asserted here rather than in Go because only a browser resolves
+  // the stylesheet.
+  test('hidden class actually hides', async ({ page }) => {
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const banner = page.locator('#banner-disconnected');
+    await expect(banner).toHaveClass(/\bhidden\b/);
+    await expect(banner).toBeHidden();
+
+    // Nothing else is keeping it off the page: dropping the class alone must
+    // reveal it, which is what the chip does on disconnect.
+    await banner.evaluate((el) => el.classList.remove('hidden'));
+    await expect(banner).toBeVisible();
+  });
+});
