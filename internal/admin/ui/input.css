@@ -1,4 +1,16 @@
-@import "tailwindcss";
+/* source(none) because automatic detection scans the whole repository: it
+   harvested `bg-red-500` out of a doc comment in utils/shadcn-templ.go and
+   `resize` out of the vendored htmx bundle, and it makes dashboard.css a
+   function of every file in the repo — so an unrelated Go or Markdown change
+   would fail the CSS drift check in CI. The globs below are the markup that
+   actually renders the dashboard; anything new that carries classes has to be
+   added here or its utilities will not be generated. */
+@import "tailwindcss" source(none);
+@source "../*.templ";
+@source "../assets/shadcn_templ.js";
+@source "../../../components/**/*.templ";
+@source "../../../components/**/*.js";
+
 @import "./tw-animate.css";
 @import "./shadcn-tailwind.css";
 

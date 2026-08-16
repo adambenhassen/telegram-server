@@ -158,14 +158,14 @@ jobs:
           node-version: 22
 
       # `make css` runs the pinned Tailwind CLI through npx, but the CLI still
-      # has to resolve `tailwindcss` itself from the tree to satisfy the
-      # `@import "tailwindcss"` in internal/admin/ui/input.css, and no manifest
-      # in the repo declares it. --no-save keeps package.json and the pnpm
-      # lockfile (which the e2e job installs with --frozen-lockfile) untouched.
-      # MAIN-319 makes the Makefile install this itself; this step goes away
-      # when it lands.
+      # has to resolve `tailwindcss` itself to satisfy the `@import "tailwindcss"`
+      # in internal/admin/ui/input.css. --prefix installs it into the directory
+      # that import resolves from, using the version already pinned in
+      # internal/admin/ui/package.json rather than a second copy of it here; the
+      # root manifests are the Playwright/eslint tree and are unrelated.
+      # MAIN-319 makes the Makefile do this itself; this step goes away then.
       - name: Install the Tailwind runtime
-        run: npm install --no-save tailwindcss@4.3.3
+        run: npm install --prefix internal/admin/ui
 
       - name: Regenerate dashboard.css
         run: make css
