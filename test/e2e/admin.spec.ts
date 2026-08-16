@@ -306,6 +306,33 @@ test.describe('admin SSE stream', () => {
 
     await expect(banner).toBeVisible();
   });
+
+  // The test above pins the reveal half; this one pins the reverse. The
+  // reconnect branch of the same handler re-hides the banner, and a
+  // regression there leaves it on screen after the stream is back — until an
+  // unrelated data patch happens to re-hide it. Both transitions are driven
+  // by the lifecycle events the page listens for, never by class edits.
+  test('reconnect re-hides the banner', async ({ page }) => {
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#chip-text')).toHaveText(/Live · updated/, { timeout: 15000 });
+
+    const banner = page.locator('#banner-disconnected');
+    await expect(banner).toBeHidden();
+
+    const lifecycle = (type: string) =>
+      page.evaluate((t) => {
+        document.dispatchEvent(
+          new CustomEvent('datastar-sse', { detail: { type: t, elId: 'sse-root' } }),
+        );
+      }, type);
+
+    await lifecycle('finished');
+    await expect(banner).toBeVisible();
+
+    await lifecycle('started');
+    await expect(banner).toBeHidden();
+  });
 });
 
 test.describe('admin dashboard stylesheet', () => {
