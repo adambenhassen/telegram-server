@@ -136,6 +136,38 @@ jobs:
           docker logs --tail 50 tg-test-pg 2>&1 || true
           free -m
 
+  # internal/admin/assets/dashboard.css is a build output that is committed, so
+  # nothing forces a template change to be followed by `make css`. It has gone
+  # stale unnoticed before (MAIN-316, 197 utilities missing), and the failure is
+  # invisible: the dashboard renders, it just renders without the classes the
+  # new markup asks for. Regenerating it here and diffing turns that into a
+  # build failure on the PR that caused it.
+  #
+  # No path filter and no `needs`: this is a seconds-long job, and a filtered
+  # required check reports as skipped rather than passing, which stalls the
+  # merge gate on every PR that does not touch internal/admin.
+  css:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # Node is the only thing the runner is missing: `make css` installs
+      # internal/admin/ui/node_modules itself and runs the Tailwind CLI through
+      # npx, both of which need it on PATH.
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 22
+
+      - name: Regenerate dashboard.css
+        run: make css
+
+      # The diff is the report: it names the utilities the committed file is
+      # missing, so the fix is `make css` and commit the result.
+      - name: Check the committed CSS matches the templates
+        run: git diff --exit-code internal/admin/assets/dashboard.css
+
   # Drives the admin dashboard through a real browser (test/e2e/admin.spec.ts).
   # Everything the suite needs is started by Playwright's webServer:
   # test/e2e/adminserver builds its own Postgres from the pgtest testcontainers

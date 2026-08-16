@@ -22,7 +22,11 @@ templ dashboardPage(d DashboardData) {
 				 rejects the bundle's export statement and no attribute plugin ever
 				 registers, which reads as a dashboard that simply stops updating. -->
 			<script type="module" src="/admin/assets/datastar.min.js"></script>
-			<script src="/admin/assets/shadcn-templ.js"></script>
+			<!-- defer, not plain: the script attaches a MutationObserver to
+				 document.body at parse time, which is null from <head>. Without
+				 it the component registration path dies on load and swapped-in
+				 markup is never wired up. -->
+			<script defer src="/admin/assets/shadcn-templ.js"></script>
 			<script>
 				if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
 					document.documentElement.classList.add('dark');
@@ -99,7 +103,8 @@ templ dashboardPage(d DashboardData) {
 
 // metricsFragment renders the live-updating metrics sections. It is the SSE
 // swap target: the broadcaster calls DashboardFragmentRenderer to produce the
-// HTML that replaces the innerHTML of #metrics-stream on each tick.
+// fragment (a <div id="metrics-stream"> wrapping this component), which
+// Datastar morphs in place on each tick (mergeMode morph, not innerHTML).
 //
 // Nothing session-bound (CSRF token, user identity) may appear here — the
 // fragment is rendered once per tick and fanned out to every connected client.
