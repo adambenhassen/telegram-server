@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -45,6 +46,16 @@ func TestPeerUserIDValidatesAccessHash(t *testing.T) {
 	}
 }
 
+// testBlobs opens a blob store rooted in the test's own temporary directory.
+func testBlobs(t *testing.T) blob.Store {
+	t.Helper()
+	b, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	return b
+}
+
 func openStore(t *testing.T) *store.Store {
 	t.Helper()
 	s, _ := openStoreDSN(t)
@@ -57,7 +68,7 @@ func openStore(t *testing.T) *store.Store {
 func openStoreDSN(t *testing.T) (*store.Store, string) {
 	t.Helper()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

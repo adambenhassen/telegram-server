@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/netip"
+	"os"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -99,7 +100,20 @@ func MaxFileParts() int {
 	return testHandlers(nil).maxFileParts()
 }
 
+// testBlobsDir is where testHandlers' upload-part blob backend lives. Tests
+// that need to inspect the part objects open a second store on this directory.
+var testBlobsDir = os.TempDir() + "/tg-api-test-blobs"
+
+// BlobsDirForTest exposes the directory the test handlers' upload-part blob
+// backend is rooted in, so a test can open a second store on it and inspect
+// the part objects the handlers wrote.
+func BlobsDirForTest() string { return testBlobsDir }
+
 func testHandlers(s *store.Store) *handlers {
+	blobs, err := blob.NewLocal(testBlobsDir)
+	if err != nil {
+		panic(err)
+	}
 	return &handlers{
 		store:                    s,
 		log:                      slog.New(slog.DiscardHandler),
@@ -114,6 +128,7 @@ func testHandlers(s *store.Store) *handlers {
 		rateLimitSignUpIP:        store.RateLimitConfig{},
 		rateLimitPasswordProof:   store.RateLimitConfig{},
 		rateLimitGetPassword:     store.RateLimitConfig{},
+		blobs:                    blobs,
 	}
 }
 
@@ -167,6 +182,18 @@ func SaveFilePartForTest(s *store.Store, userID int64, req *tg.UploadSaveFilePar
 	return testHandlers(s).handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SaveFilePartBlobsForTest is SaveFilePartForTest against a handler wired to
+// blobs, for tests that inspect the part objects afterwards.
+func SaveFilePartBlobsForTest(s *store.Store, blobs blob.Store, userID int64, req *tg.UploadSaveFilePartRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.blobs = blobs
+	return h.handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SaveFilePartCappedForTest is SaveFilePartForTest against a handler built with
 // maxFileBytes, so a test can reach the per-file and per-user caps without
 // uploading a hundred megabytes.
@@ -175,7 +202,11 @@ func SaveFilePartCappedForTest(s *store.Store, userID int64, maxFileBytes int64,
 	if err := req.Encode(&buf); err != nil {
 		return nil, err
 	}
-	h := &handlers{store: s, log: slog.New(slog.DiscardHandler), maxFileBytes: maxFileBytes}
+	blobs, err := blob.NewLocal(testBlobsDir)
+	if err != nil {
+		panic(err)
+	}
+	h := &handlers{store: s, log: slog.New(slog.DiscardHandler), maxFileBytes: maxFileBytes, blobs: blobs}
 	return h.handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 

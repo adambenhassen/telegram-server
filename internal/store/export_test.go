@@ -2,12 +2,14 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
@@ -349,6 +351,72 @@ func UploadPartDate(ctx context.Context, s *Store, userID, fileID int64, partInd
 		`SELECT date FROM upload_parts WHERE user_id = $1 AND file_id = $2 AND part_index = $3`,
 		userID, fileID, partIndex).Scan(&at)
 	return at, err
+}
+
+// UploadPartRow returns one upload part's recorded size and blob key — the
+// accounting the caps aggregate over and the bytes are read back from.
+func UploadPartRow(ctx context.Context, s *Store, userID, fileID int64, partIndex int32) (size int64, key string, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT size, blob_key FROM upload_parts WHERE user_id = $1 AND file_id = $2 AND part_index = $3`,
+		userID, fileID, partIndex).Scan(&size, &key)
+	return size, key, err
+}
+
+// UploadPartsWithBytes reports how many upload part rows exist for which the
+// named blob key is absent from the store — the "row without bytes" state the
+// crash window between a row commit and its byte write produces.
+func UploadPartsWithoutBytes(ctx context.Context, s *Store, blobs blob.Store) (int64, error) {
+	rows, err := s.pool.Query(ctx, `SELECT blob_key FROM upload_parts`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var missing int64
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return 0, err
+		}
+		if _, err := blobs.ReadAt(ctx, key, 0, 1); errors.Is(err, blob.ErrNotFound) {
+			missing++
+		}
+	}
+	return missing, rows.Err()
+}
+
+// ReadPartBytes reads one part's bytes straight from the store's blob backend
+// at key, for the tests that assert where the bytes live.
+func (s *Store) ReadPartBytes(ctx context.Context, key string) ([]byte, error) {
+	return s.blobs.ReadAt(ctx, key, 0, 1<<30)
+}
+
+// BlobsOf returns the Store's blob backend.
+func BlobsOf(s *Store) blob.Store { return s.blobs }
+
+// SetSweepBlobs swaps the blob backend a sweep pass deletes through, so a test
+// can simulate a storage backend that cannot delete. Scoped to the Store for
+// the reason the other test hooks are.
+func SetSweepBlobs(s *Store, blobs blob.Store) error {
+	if blobs == nil {
+		return errors.New("sweep blobs: nil backend")
+	}
+	s.blobs = blobs
+	return nil
+}
+
+// ClaimExpiredPartsForTest runs one sweep claim in isolation, so a test can
+// interpose a re-save between the claim and the byte delete.
+func (s *Store) ClaimExpiredPartsForTest(ctx context.Context, cutoff time.Time, batch int) ([]string, error) {
+	return s.q.ClaimExpiredUploadParts(ctx, db.ClaimExpiredUploadPartsParams{
+		Date: pgtype.Timestamptz{Time: cutoff, Valid: true},
+		Lim:  int32(batch), //nolint:gosec // batch is a test constant
+	})
+}
+
+// FinaliseExpiredPartsForTest runs one sweep finalise in isolation, against the
+// keys a claim returned.
+func (s *Store) FinaliseExpiredPartsForTest(ctx context.Context, keys []string) error {
+	return s.finaliseExpiredUploadParts(ctx, keys)
 }
 
 // CountRateLimits returns the number of rate limit rows for a given subject,

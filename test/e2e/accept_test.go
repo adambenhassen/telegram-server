@@ -102,7 +102,7 @@ func bootAcceptServer(t *testing.T, ctx context.Context, handshake time.Duration
 		t.Fatalf("server key: %v", err)
 	}
 
-	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey())
+	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatalf("store open: %v", err)
 	}

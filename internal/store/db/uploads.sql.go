@@ -11,40 +11,51 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const deleteExpiredUploadParts = `-- name: DeleteExpiredUploadParts :execrows
-DELETE FROM upload_parts p
-USING (
-    SELECT old.user_id, old.file_id, old.part_index FROM upload_parts old
-    WHERE old.date < $1
-    ORDER BY old.date
-    LIMIT $2::int
-    FOR UPDATE SKIP LOCKED
-) expired
-WHERE p.user_id = expired.user_id
-  AND p.file_id = expired.file_id
-  AND p.part_index = expired.part_index
+const claimExpiredUploadParts = `-- name: ClaimExpiredUploadParts :many
+SELECT old.blob_key
+FROM upload_parts old
+WHERE old.date < $1
+ORDER BY old.date
+LIMIT $2::int
+FOR UPDATE SKIP LOCKED
 `
 
-type DeleteExpiredUploadPartsParams struct {
+type ClaimExpiredUploadPartsParams struct {
 	Date pgtype.Timestamptz
 	Lim  int32
 }
 
-// DeleteExpiredUploadParts removes at most one batch of expired parts, oldest
-// first. The bound is the point: unbounded, this is one DELETE over every
-// account's expired rows, holding row locks and writing WAL in proportion to
-// whatever accumulated while the sweep was down. The caller repeats it until a
-// pass comes back short.
+// ClaimExpiredUploadParts claims at most one batch of expired parts, oldest
+// first, returning the blob keys the batch names. The bound is the point:
+// unbounded, this is one statement over every account's expired rows, holding
+// row locks and writing WAL in proportion to whatever accumulated while the
+// sweep was down. The caller repeats it until a pass comes back short.
 //
 // SKIP LOCKED because every replica runs this sweep: a batch another replica
-// already holds is its work, and blocking on it would serialise the sweeps into
-// one and re-create the long transaction the bound removes.
-func (q *Queries) DeleteExpiredUploadParts(ctx context.Context, arg DeleteExpiredUploadPartsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteExpiredUploadParts, arg.Date, arg.Lim)
+// already holds is its work, and blocking on it would serialise the sweeps
+// into one and re-create the long transaction the bound removes.
+//
+// This only claims: it returns the keys and holds no locks once committed. The
+// byte delete and the conditional row delete run afterwards, outside any
+// transaction, so a hanging storage backend cannot pin the claim's locks.
+func (q *Queries) ClaimExpiredUploadParts(ctx context.Context, arg ClaimExpiredUploadPartsParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, claimExpiredUploadParts, arg.Date, arg.Lim)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var blob_key string
+		if err := rows.Scan(&blob_key); err != nil {
+			return nil, err
+		}
+		items = append(items, blob_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const deleteUploadParts = `-- name: DeleteUploadParts :execrows
@@ -64,8 +75,22 @@ func (q *Queries) DeleteUploadParts(ctx context.Context, arg DeleteUploadPartsPa
 	return result.RowsAffected(), nil
 }
 
+const deleteUploadPartsByKey = `-- name: DeleteUploadPartsByKey :exec
+DELETE FROM upload_parts WHERE blob_key = $1
+`
+
+// DeleteUploadPartsByKey drops the one row naming blob_key, if any. The
+// sweep's finalise step uses it per claimed key: the delete is conditional on
+// the row still naming the key the sweep deleted — never blind on the primary
+// key — so a re-save that committed in the window between the claim and the
+// byte delete keeps its row and its new object.
+func (q *Queries) DeleteUploadPartsByKey(ctx context.Context, blobKey string) error {
+	_, err := q.db.Exec(ctx, deleteUploadPartsByKey, blobKey)
+	return err
+}
+
 const fileOutstandingBytes = `-- name: FileOutstandingBytes :one
-SELECT coalesce(sum(length(payload)), 0)::bigint FROM upload_parts
+SELECT coalesce(sum(size), 0)::bigint FROM upload_parts
 WHERE user_id = $1 AND file_id = $2
 `
 
@@ -74,6 +99,9 @@ type FileOutstandingBytesParams struct {
 	FileID int64
 }
 
+// FileOutstandingBytes sums the recorded sizes. The caps aggregate over rows,
+// so a retry is still not billed twice: there is no counter to increment,
+// only a SUM over rows the upsert has already deduplicated.
 func (q *Queries) FileOutstandingBytes(ctx context.Context, arg FileOutstandingBytesParams) (int64, error) {
 	row := q.db.QueryRow(ctx, fileOutstandingBytes, arg.UserID, arg.FileID)
 	var column_1 int64
@@ -81,27 +109,66 @@ func (q *Queries) FileOutstandingBytes(ctx context.Context, arg FileOutstandingB
 	return column_1, err
 }
 
-const uploadPartPayload = `-- name: UploadPartPayload :one
-SELECT payload FROM upload_parts WHERE user_id = $1 AND file_id = $2 AND part_index = $3
+const uploadPartKey = `-- name: UploadPartKey :one
+SELECT blob_key, size FROM upload_parts WHERE user_id = $1 AND file_id = $2 AND part_index = $3
 `
 
-type UploadPartPayloadParams struct {
+type UploadPartKeyParams struct {
 	UserID    int64
 	FileID    int64
 	PartIndex int32
 }
 
-func (q *Queries) UploadPartPayload(ctx context.Context, arg UploadPartPayloadParams) ([]byte, error) {
-	row := q.db.QueryRow(ctx, uploadPartPayload, arg.UserID, arg.FileID, arg.PartIndex)
-	var payload []byte
-	err := row.Scan(&payload)
-	return payload, err
+type UploadPartKeyRow struct {
+	BlobKey string
+	Size    int64
+}
+
+// UploadPartKey returns one part's recorded blob key and size. The key is
+// what the bytes are read back from; the size is what assembly reconciles
+// the read against.
+func (q *Queries) UploadPartKey(ctx context.Context, arg UploadPartKeyParams) (UploadPartKeyRow, error) {
+	row := q.db.QueryRow(ctx, uploadPartKey, arg.UserID, arg.FileID, arg.PartIndex)
+	var i UploadPartKeyRow
+	err := row.Scan(&i.BlobKey, &i.Size)
+	return i, err
+}
+
+const uploadPartKeys = `-- name: UploadPartKeys :many
+SELECT blob_key FROM upload_parts WHERE user_id = $1 AND file_id = $2
+`
+
+type UploadPartKeysParams struct {
+	UserID int64
+	FileID int64
+}
+
+// UploadPartKeys lists the blob keys an upload's rows currently name, so the
+// assembly cleanup can delete the bytes before the rows.
+func (q *Queries) UploadPartKeys(ctx context.Context, arg UploadPartKeysParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, uploadPartKeys, arg.UserID, arg.FileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var blob_key string
+		if err := rows.Scan(&blob_key); err != nil {
+			return nil, err
+		}
+		items = append(items, blob_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const uploadPartsSummary = `-- name: UploadPartsSummary :one
 SELECT count(*)::bigint AS parts,
        coalesce(max(part_index), -1)::int AS max_index,
-       coalesce(sum(length(payload)), 0)::bigint AS total_bytes
+       coalesce(sum(size), 0)::bigint AS total_bytes
 FROM upload_parts WHERE user_id = $1 AND file_id = $2
 `
 
@@ -128,40 +195,53 @@ func (q *Queries) UploadPartsSummary(ctx context.Context, arg UploadPartsSummary
 }
 
 const upsertUploadPart = `-- name: UpsertUploadPart :exec
-INSERT INTO upload_parts (user_id, file_id, part_index, payload)
-VALUES ($1, $2, $3, $4)
+INSERT INTO upload_parts (user_id, file_id, part_index, size, blob_key)
+VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (user_id, file_id, part_index)
-DO UPDATE SET payload = excluded.payload
+DO UPDATE SET size = greatest(upload_parts.size, excluded.size),
+              blob_key = excluded.blob_key
 `
 
 type UpsertUploadPartParams struct {
 	UserID    int64
 	FileID    int64
 	PartIndex int32
-	Payload   []byte
+	Size      int64
+	BlobKey   string
 }
 
-// UpsertUploadPart writes one part of an in-flight upload. Re-saving the same
-// part is legal — a client retries a failed part — so this is an upsert, and
-// the caller re-reads the sums afterwards rather than tracking a delta.
+// UpsertUploadPart writes one part's accounting row. The bytes live in the
+// blob store under blob_key; the row names the key and the server-measured
+// size, and nothing in the row is client-declared.
+//
+// Re-saving the same part is legal — a client retries a failed part — so this
+// is an upsert, and the caller re-reads the sums afterwards rather than
+// tracking a delta.
+//
+// The conflict clause is the size rule: the recorded size is never lowered
+// below the size of the object that may still exist at the part's key. A
+// re-save that records a smaller size while the larger object is still there
+// would let the outstanding-byte cap be evaded by shrinking rows, so a
+// smaller size keeps the larger one. The bytes themselves are replaced
+// unconditionally, so the assembled file reflects the retry.
 //
 // date is deliberately NOT refreshed on conflict: it is what the TTL sweep
 // measures from, so a re-save that moved it would let an account hold an
-// outstanding set alive forever by touching each part every TTL/2. The payload
-// still wins, so a retry's bytes are the ones assembled.
+// outstanding set alive forever by touching each part every TTL/2.
 func (q *Queries) UpsertUploadPart(ctx context.Context, arg UpsertUploadPartParams) error {
 	_, err := q.db.Exec(ctx, upsertUploadPart,
 		arg.UserID,
 		arg.FileID,
 		arg.PartIndex,
-		arg.Payload,
+		arg.Size,
+		arg.BlobKey,
 	)
 	return err
 }
 
 const userOutstanding = `-- name: UserOutstanding :one
 SELECT count(*)::bigint AS parts,
-       coalesce(sum(length(payload)), 0)::bigint AS total_bytes
+       coalesce(sum(size), 0)::bigint AS total_bytes
 FROM upload_parts WHERE user_id = $1
 `
 

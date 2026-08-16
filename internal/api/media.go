@@ -15,9 +15,9 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
-// partsReader streams an in-flight upload's parts out of Postgres in index
-// order, so assembling a 100 MiB file never holds more than one 512 KiB part in
-// memory at a time.
+// partsReader streams an in-flight upload's parts out of the blob store in
+// index order, so assembling a 100 MiB file never holds more than one 512 KiB
+// part in memory at a time.
 type partsReader struct {
 	ctx    context.Context
 	store  *store.Store
@@ -382,6 +382,22 @@ func (h *handlers) assembleFile(
 	// the same check.
 	if n != int64(parts) || maxIndex != parts-1 || total <= 0 {
 		return store.File{}, errMediaInvalid
+	}
+
+	// The recorded sizes are the only place accounting and bytes are compared
+	// now, so the comparison is fail-closed: a part whose bytes are gone or
+	// short — the crash window between a part row's commit and its byte write
+	// — fails the assembly rather than assembling a file the row does not
+	// describe.
+	for i := range parts {
+		_, size, ok, err := h.store.UploadPartKey(ctx, userID, clientFileID, i)
+		if err != nil {
+			h.log.Error("assemble file", "user_id", userID, "err", err)
+			return store.File{}, errInternal
+		}
+		if !ok || size <= 0 {
+			return store.File{}, errMediaInvalid
+		}
 	}
 
 	file, err := h.store.AllocateFile(ctx, userID, total, sanitizeMIME(mimeType), sanitizeFileName(name), h.maxUserStorageBytes)

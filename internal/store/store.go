@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -19,6 +20,9 @@ type Store struct {
 	pool   *pgxpool.Pool
 	q      *db.Queries
 	cipher *keycrypt.Cipher
+	// blobs is the backend in-flight upload part bytes go to; the parts rows
+	// account for them. Every Store owns one.
+	blobs blob.Store
 
 	// log carries the store's own diagnostics: the states a write reaches that
 	// no return value reports. Never nil — Open defaults it to slog.Default(),
@@ -93,6 +97,14 @@ var (
 
 // Option configures a Store at Open time.
 type Option func(*Store)
+
+// WithBlobStore wires the blob backend the Store uses for in-flight upload
+// part bytes.
+func WithBlobStore(blobs blob.Store) Option {
+	return func(s *Store) {
+		s.blobs = blobs
+	}
+}
 
 // WithLogger routes the store's diagnostics to log instead of slog.Default().
 // It is per-Store rather than a package-level setting so that two Stores in one

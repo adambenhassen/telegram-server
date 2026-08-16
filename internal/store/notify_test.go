@@ -17,7 +17,7 @@ import (
 
 func openDSN(t *testing.T, dsn string) *store.Store {
 	t.Helper()
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

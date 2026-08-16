@@ -33,7 +33,7 @@ func TestDashboardHandler_returns_html(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestDashboardHandler_post_rejected(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +231,7 @@ func TestDashboardHandler_503_on_db_error(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestDashboardHandler_security_headers(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

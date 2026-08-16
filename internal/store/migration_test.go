@@ -28,7 +28,7 @@ func TestOpenRejectsUnmigratedSchema(t *testing.T) {
 		t.Fatalf("drop table: %v", err)
 	}
 
-	if _, err := store.Open(ctx, dsn, pgtest.EncKey()); err == nil {
+	if _, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t))); err == nil {
 		t.Fatal("Open must fail against an un-migrated schema")
 	} else if !strings.Contains(err.Error(), "not migrated") {
 		t.Fatalf("want a migration error, got %v", err)
