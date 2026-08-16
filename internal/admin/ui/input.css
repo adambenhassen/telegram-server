@@ -6,7 +6,7 @@
    actually renders the dashboard; anything new that carries classes has to be
    added here or its utilities will not be generated. */
 @import "tailwindcss" source(none);
-@source "../*.templ";
+@source "../**/*.templ";
 @source "../assets/shadcn_templ.js";
 @source "../../../components/**/*.templ";
 @source "../../../components/**/*.js";
