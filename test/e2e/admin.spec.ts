@@ -286,45 +286,66 @@ test.describe('admin SSE stream', () => {
 });
 
 test.describe('admin dashboard component script', () => {
-  // shadcn-templ.js registers every progressbar it finds and re-registers
-  // markup swapped in later, via a MutationObserver on document.body. The
-  // script is loaded from <head>, so whether that observer is ever attached
-  // depends on the script tag: without defer, document.body is still null when
-  // that line runs and the registration path dies with it. Load-time init
-  // survives — it waits for DOMContentLoaded — so this only shows up once the
-  // first SSE patch replaces the markup that init had already registered.
-  test('components re-init after an SSE swap', async ({ page }) => {
+  // shadcn-templ.js ends by attaching a MutationObserver to document.body, so
+  // that markup arriving after load registers itself. Loaded from <head>
+  // without defer, that line runs while document.body is still null: the
+  // script dies there with a TypeError, taking the observer with it. Load-time
+  // registration survives — it waits for DOMContentLoaded — so the page looks
+  // correct until something inserts markup.
+  test('no JS errors on dashboard load', async ({ page }) => {
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
 
     await login(page);
-
-    // Count swaps from inside the page: the first patch can land before the
-    // test could tag anything, so the swap has to be observed, not inferred.
-    await page.addInitScript(() => {
-      (window as unknown as { __swaps: number }).__swaps = 0;
-      document.addEventListener('DOMContentLoaded', () => {
-        const target = document.getElementById('metrics-stream');
-        if (!target) return;
-        new MutationObserver(() => {
-          (window as unknown as { __swaps: number }).__swaps++;
-        }).observe(target, { childList: true });
-      });
-    });
     await page.goto('/admin/dashboard');
-
-    await expect
-      .poll(() => page.evaluate(() => (window as unknown as { __swaps: number }).__swaps), {
-        timeout: 20000,
-      })
-      .toBeGreaterThan(0);
-
-    // Every bar on the page now came from the stream. Each carries the marker
-    // only if the observer re-registered it after the swap.
-    await expect(
-      page.locator('[role="progressbar"]:not([data-tui-progress-observed])'),
-    ).toHaveCount(0);
+    await expect(page.locator('#v-connections')).toBeVisible();
 
     expect(errors, 'JS errors on dashboard load').toEqual([]);
+  });
+
+  // Datastar morphs the fragment into #metrics-stream, so a steady-state patch
+  // updates attributes on the bars already there and inserts nothing. Nodes do
+  // appear once the patch changes structure — a storage row coming or going —
+  // and the server's numbers decide when that happens, which is not something
+  // a test can provoke. So the insertion is done here instead, with a clone of
+  // a real server-rendered bar: what the observer sees is the same either way.
+  test('markup inserted after load registers itself', async ({ page }) => {
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    await page.evaluate(() => {
+      const source = document.querySelector('[role="progressbar"]');
+      if (!source) throw new Error('no server-rendered progressbar to clone');
+
+      const clone = source.cloneNode(true) as HTMLElement;
+      clone.id = 'probe-bar';
+      // Arrive as unregistered markup would, at a value no bar on the page
+      // holds, so a stale indicator cannot pass for a fresh one.
+      clone.removeAttribute('data-tui-progress-observed');
+      clone.removeAttribute('aria-valuetext');
+      clone.setAttribute('aria-valuenow', '37');
+      clone.setAttribute('aria-valuemax', '100');
+      clone
+        .querySelectorAll<HTMLElement>('[data-tui-progress-indicator]')
+        .forEach((el) => (el.style.width = ''));
+
+      document.getElementById('metrics-stream')!.appendChild(clone);
+    });
+
+    // The observer registers the bar and runs it through updateProgress: the
+    // marker, the computed indicator width and the value text all come from
+    // that one path, and none of them appears if the observer never attached.
+    const probe = page.locator('#probe-bar');
+    await expect(probe).toHaveAttribute('data-tui-progress-observed', 'true');
+    await expect(probe).toHaveAttribute('aria-valuetext', '37%');
+    await expect(probe.locator('[data-tui-progress-indicator]')).toHaveCSS('width', /.+/);
+
+    // Registration is what wires later attribute changes to the indicator, so
+    // the bar must now track its own value the way a patched one does.
+    await page.evaluate(() => {
+      document.getElementById('probe-bar')!.setAttribute('aria-valuenow', '81');
+    });
+    await expect(probe).toHaveAttribute('aria-valuetext', '81%');
   });
 });
