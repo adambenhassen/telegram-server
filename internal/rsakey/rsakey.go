@@ -61,7 +61,7 @@ func Fingerprint(pub *rsa.PublicKey) int64 {
 
 // KeyID returns the SHA-256 of the DER SubjectPublicKeyInfo encoding of the
 // public key, hex-encoded as 16 dash-separated groups of 4 characters
-// (e.g. "a1b2c3d4-e5f6a7b8-..."). The grouping keeps the 64-character digest
+// (e.g. "a1b2-c3d4-e5f6-a7b8-..."). The grouping keeps the 64-character digest
 // comparable by eye against the client UI; MAIN-314 renders the identical
 // format.
 func KeyID(pub *rsa.PublicKey) (string, error) {

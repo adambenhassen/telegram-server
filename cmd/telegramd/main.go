@@ -66,7 +66,7 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	log.Info("server RSA key", "fingerprint", rsakey.Fingerprint(&key.PublicKey), "key_id", keyID, "path", cfg.RSAKeyPath)
+	log.Info("server RSA key", "key_id", keyID, "fingerprint", rsakey.Fingerprint(&key.PublicKey), "path", cfg.RSAKeyPath)
 
 	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log))
 	if err != nil {

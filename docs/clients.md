@@ -85,18 +85,24 @@ long as the file persists.
 At startup the server logs the key it loaded/generated:
 
 ```
-level=INFO msg="server RSA key" fingerprint=<int64> key_id=<64 hex chars in 16 dash-separated groups of 4> path=server_key.pem
+level=INFO msg="server RSA key" key_id=<64 hex chars in 16 dash-separated groups of 4> fingerprint=<int64> path=server_key.pem
 ```
 
 (`cmd/telegramd/main.go`, right after `rsakey.LoadOrGenerate`).
 
 - `key_id` is the SHA-256 of the DER SubjectPublicKeyInfo encoding of the
   public key, hex-encoded as 16 dash-separated groups of 4 characters
-  (e.g. `a1b2c3d4-e5f6a7b8-...`). **This is the value to compare out of
+  (e.g. `a1b2-c3d4-e5f6-a7b8-...`). **This is the value to compare out of
   band** — a client UI that displays the same digest for the key it loaded
   must render the identical grouped format. The int64 `fingerprint` is the
   legacy Telegram value; it is retained for clients that still match on it
-  but is too short to be a trustworthy out-of-band check.
+  but is too short to be a trustworthy out-of-band check. Byte-level oracle
+  for the digest, against a public key file (SPKI or PKCS#1 PEM — OpenSSL
+  normalises both to SPKI on `-pubin`):
+
+  ```bash
+  openssl pkey -pubin -in server_pub.pem -outform DER | sha256sum
+  ```
 - A client must be built with this exact public key (read `path`, e.g.
   `server_key.pem`, and derive/embed the PEM) and its fingerprint, since
   gotd-style clients select the RSA key to use for the auth-key handshake by
