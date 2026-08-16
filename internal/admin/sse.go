@@ -21,14 +21,39 @@ import (
 // Server-sent-events defaults for GET /admin/events.
 const (
 	// sseDefaultEvent is the event name used when a Fragment leaves it empty.
-	// The dashboard subscribes to it with the htmx SSE extension and swaps the
-	// fragment into #metrics-stream.
+	// It is the name Datastar's MergeFragments plugin registers on: any
+	// datastar-prefixed event the bundle does not know is dispatched but
+	// handled by nothing.
 	//
-	// These two identifiers are the contract with MAIN-302, and the dashboard
-	// page is the side that must be matched: htmx answers an event name it does
-	// not subscribe to with a 200 and no swap, so a mismatch reads as a frozen
-	// dashboard rather than an error anyone would notice.
-	sseDefaultEvent = "metrics"
+	// The event name and the fragment's selector are the contract with
+	// MAIN-302, and the dashboard page is the side that must be matched: an
+	// unknown event name or a selector that hits nothing is answered with a
+	// 200 and no patch, so a mismatch reads as a frozen dashboard rather than
+	// an error anyone would notice.
+	sseDefaultEvent = "datastar-merge-fragments"
+
+	// sseTargetID is the id the dashboard gives the element it first-paints
+	// and the id every fragment wraps itself in. Both the selector below and
+	// DashboardFragmentRenderer derive from it, so the two sides of the
+	// contract cannot drift apart.
+	sseTargetID = "metrics-stream"
+
+	// sseDefaultSelector is the element a fragment without its own selector
+	// patches. It is the same target the dashboard declares for first paint
+	// and must stay in lockstep with it; TestSSE_default_contract_is_the_
+	// dashboard_contract asserts both sides.
+	sseDefaultSelector = "#" + sseTargetID
+
+	// sseDefaultMode is the merge mode applied to the selector, carried on
+	// the mergeMode data line.
+	//
+	// morph, not inner: the bundle walks the fragment's top-level nodes and
+	// merges each one into the same selector in turn, so under inner a
+	// fragment of sibling <section>s leaves only the last section standing —
+	// a dashboard that loses most of its cards on the first tick while the
+	// stream still looks healthy. A fragment is therefore one element whose
+	// id is the selector, morphed in place.
+	sseDefaultMode = "morph"
 
 	// sseInterval is the shared sampler's cadence. One sample per interval
 	// serves every connected client.
@@ -61,11 +86,17 @@ const (
 )
 
 // Fragment is one server-rendered HTML update addressed to a named SSE event.
-// The htmx SSE extension swaps the HTML into whichever element declares
-// sse-swap="<Event>".
+// Datastar's MergeFragments plugin merges the HTML into the element the
+// selector names.
 type Fragment struct {
 	// Event is the SSE event name. Empty means sseDefaultEvent.
 	Event string
+	// Selector targets the element to merge into. Empty means
+	// sseDefaultSelector.
+	Selector string
+	// MergeMode is the merge mode Datastar applies (morph, inner, outer,
+	// ...). Empty means sseDefaultMode.
+	MergeMode string
 	// HTML is the rendered fragment. It is written verbatim, so the renderer
 	// owns escaping.
 	HTML string
@@ -334,23 +365,39 @@ func (b *Broadcaster) closeAll() {
 	}
 }
 
-// encodeFragment serialises one fragment as an SSE event. Multi-line HTML needs
-// one data: line per source line; the client rejoins them with newlines.
+// encodeFragment serialises one fragment as a Datastar SSE event. The
+// MergeFragments plugin parses the data lines into keys: selector, mergeMode
+// and fragments. Multi-line HTML needs one data: line per source line and
+// Datastar rejoins the lines of the same key with newlines.
 func encodeFragment(f Fragment) []byte {
 	event := f.Event
 	if event == "" {
 		event = sseDefaultEvent
 	}
+	selector := f.Selector
+	if selector == "" {
+		selector = sseDefaultSelector
+	}
+	mergeMode := f.MergeMode
+	if mergeMode == "" {
+		mergeMode = sseDefaultMode
+	}
+
+	html := strings.ReplaceAll(f.HTML, "\r\n", "\n")
+	html = strings.ReplaceAll(html, "\r", "\n")
 
 	var buf bytes.Buffer
 	buf.WriteString("event: ")
 	buf.WriteString(event)
 	buf.WriteByte('\n')
-
-	html := strings.ReplaceAll(f.HTML, "\r\n", "\n")
-	html = strings.ReplaceAll(html, "\r", "\n")
+	buf.WriteString("data: selector ")
+	buf.WriteString(selector)
+	buf.WriteByte('\n')
+	buf.WriteString("data: mergeMode ")
+	buf.WriteString(mergeMode)
+	buf.WriteByte('\n')
 	for line := range strings.SplitSeq(html, "\n") {
-		buf.WriteString("data: ")
+		buf.WriteString("data: fragments ")
 		buf.WriteString(line)
 		buf.WriteByte('\n')
 	}
@@ -446,8 +493,8 @@ func EventsHandler(b *Broadcaster) http.HandlerFunc {
 }
 
 // DefaultFragmentRenderer renders the dashboard's metric values as a single
-// "metrics" event. It keeps the endpoint useful and testable on its own; the
-// dashboard supplies its own renderer for its own markup.
+// datastar-merge-fragments event. It keeps the endpoint useful and testable on
+// its own; the dashboard supplies its own renderer for its own markup.
 func DefaultFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	// The logout form's CSRF token is session-bound and deliberately absent
 	// from a fragment that is rendered once and fanned out to every client.
@@ -463,10 +510,10 @@ func DefaultFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 var metricsFragmentTmpl = template.Must(template.New("metrics-fragment").Parse(metricsFragmentHTML))
 
 // metricsFragmentHTML mirrors the data-metric attributes the dashboard uses, so
-// a swap target can address the same values it server-rendered on first paint.
-// The wrapper id is the swap target agreed on MAIN-302 and is asserted by
+// a patch target can address the same values it server-rendered on first paint.
+// The wrapper id is the patch target agreed on MAIN-302 and is asserted by
 // TestSSE_default_contract_is_the_dashboard_contract.
-const metricsFragmentHTML = `<div id="metrics-stream" data-timestamp="{{.ServerTimestamp}}">` +
+const metricsFragmentHTML = `<div id="` + sseTargetID + `" data-timestamp="{{.ServerTimestamp}}">` +
 	`<span data-metric="connections">{{.Connections}}</span>` +
 	`<span data-metric="sessions">{{.Sessions}}</span>` +
 	`<span data-metric="messages_1h">{{.Messages1H}}</span>` +
