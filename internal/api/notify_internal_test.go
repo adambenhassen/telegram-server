@@ -454,7 +454,7 @@ func TestDeliverChannelPostPushesViaRealStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, alice.ID, "hello", 1, nil); err != nil {
+	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, alice.ID, "hello", 1, nil, 0); err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	currentPts, err := s.ChannelState(ctx, ch.ID)

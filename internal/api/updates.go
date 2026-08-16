@@ -129,6 +129,12 @@ func channelMessageToTL(m store.ChannelMessage, viewerID int64, files map[int64]
 	if m.EditDate != nil {
 		msg.EditDate = int(m.EditDate.Unix())
 	}
+	if m.ReplyToMsgID > 0 {
+		hdr := new(tg.MessageReplyHeader)
+		hdr.SetReplyToMsgID(int(m.ReplyToMsgID))
+		hdr.SetReplyToPeerID(&tg.PeerChannel{ChannelID: m.ChannelID})
+		msg.SetReplyTo(hdr)
+	}
 	// SetMedia rather than a plain assignment: Media is a conditional field and
 	// encodes only when its flag is set with it.
 	if m.FileID != nil {

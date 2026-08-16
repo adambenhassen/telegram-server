@@ -14,7 +14,7 @@ import (
 
 func post(t *testing.T, s *store.Store, channelID, fromID int64, text string, rid int64) (store.ChannelMessage, int) {
 	t.Helper()
-	m, pts, dup, err := s.PostChannelMessage(context.Background(), channelID, fromID, text, rid, nil)
+	m, pts, dup, err := s.PostChannelMessage(context.Background(), channelID, fromID, text, rid, nil, 0)
 	if err != nil {
 		t.Fatalf("post %q: %v", text, err)
 	}
@@ -94,7 +94,7 @@ func TestPostChannelMessageDedupsRandomID(t *testing.T) {
 
 	first, pts1 := post(t, s, ch, author.ID, "hi", 42)
 
-	again, pts2, dup, err := s.PostChannelMessage(ctx, ch, author.ID, "hi", 42, nil)
+	again, pts2, dup, err := s.PostChannelMessage(ctx, ch, author.ID, "hi", 42, nil, 0)
 	if err != nil {
 		t.Fatalf("resend: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestPostChannelMessageDedupsUnderConcurrency(t *testing.T) {
 		wg.Go(func() {
 			<-start
 			r := &results[i]
-			r.msg, r.pts, r.dup, r.err = s.PostChannelMessage(ctx, ch, author.ID, "hi", 42, nil)
+			r.msg, r.pts, r.dup, r.err = s.PostChannelMessage(ctx, ch, author.ID, "hi", 42, nil, 0)
 		})
 	}
 	close(start)
@@ -325,7 +325,7 @@ func mustMegagroup(t *testing.T, s *store.Store, creatorID int64, title string) 
 // postAs asserts the checked entry point accepted the post.
 func postAs(t *testing.T, s *store.Store, channelID, fromID int64, text string, rid int64) store.ChannelMessage {
 	t.Helper()
-	m, _, dup, err := s.PostChannelMessageAs(context.Background(), channelID, fromID, text, rid, nil)
+	m, _, dup, err := s.PostChannelMessageAs(context.Background(), channelID, fromID, text, rid, nil, 0)
 	if err != nil {
 		t.Fatalf("post as %d: %v", fromID, err)
 	}
@@ -349,7 +349,7 @@ func refusedAs(t *testing.T, s *store.Store, channelID, fromID int64, rid int64)
 		t.Fatalf("events before: %v", err)
 	}
 
-	if _, _, _, err = s.PostChannelMessageAs(ctx, channelID, fromID, "nope", rid, nil); !errors.Is(err, store.ErrNotMember) {
+	if _, _, _, err = s.PostChannelMessageAs(ctx, channelID, fromID, "nope", rid, nil, 0); !errors.Is(err, store.ErrNotMember) {
 		t.Fatalf("post as %d = %v, want ErrNotMember", fromID, err)
 	}
 
@@ -471,7 +471,7 @@ func TestPostChannelMessageAsHidesUnknownChannel(t *testing.T) {
 	// caller is not in, not the channel_state foreign-key error that would say the
 	// id is free.
 	missing := ch.ID + 1_000_000
-	if _, _, _, err := s.PostChannelMessageAs(ctx, missing, user.ID, "nope", 1, nil); !errors.Is(err, store.ErrNotMember) {
+	if _, _, _, err := s.PostChannelMessageAs(ctx, missing, user.ID, "nope", 1, nil, 0); !errors.Is(err, store.ErrNotMember) {
 		t.Fatalf("post to unknown channel = %v, want ErrNotMember", err)
 	}
 	if pts, err := s.ChannelState(ctx, missing); err != nil || pts != 0 {
