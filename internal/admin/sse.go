@@ -32,17 +32,28 @@ const (
 	// an error anyone would notice.
 	sseDefaultEvent = "datastar-merge-fragments"
 
+	// sseTargetID is the id the dashboard gives the element it first-paints
+	// and the id every fragment wraps itself in. Both the selector below and
+	// DashboardFragmentRenderer derive from it, so the two sides of the
+	// contract cannot drift apart.
+	sseTargetID = "metrics-stream"
+
 	// sseDefaultSelector is the element a fragment without its own selector
 	// patches. It is the same target the dashboard declares for first paint
 	// and must stay in lockstep with it; TestSSE_default_contract_is_the_
 	// dashboard_contract asserts both sides.
-	sseDefaultSelector = "#metrics-stream"
+	sseDefaultSelector = "#" + sseTargetID
 
 	// sseDefaultMode is the merge mode applied to the selector, carried on
-	// the mergeMode data line. inner keeps the element the first paint
-	// created (listeners and attributes intact) and replaces only its
-	// children, which is what the dashboard wants.
-	sseDefaultMode = "inner"
+	// the mergeMode data line.
+	//
+	// morph, not inner: the bundle walks the fragment's top-level nodes and
+	// merges each one into the same selector in turn, so under inner a
+	// fragment of sibling <section>s leaves only the last section standing —
+	// a dashboard that loses most of its cards on the first tick while the
+	// stream still looks healthy. A fragment is therefore one element whose
+	// id is the selector, morphed in place.
+	sseDefaultMode = "morph"
 
 	// sseInterval is the shared sampler's cadence. One sample per interval
 	// serves every connected client.
@@ -502,7 +513,7 @@ var metricsFragmentTmpl = template.Must(template.New("metrics-fragment").Parse(m
 // a patch target can address the same values it server-rendered on first paint.
 // The wrapper id is the patch target agreed on MAIN-302 and is asserted by
 // TestSSE_default_contract_is_the_dashboard_contract.
-const metricsFragmentHTML = `<div id="metrics-stream" data-timestamp="{{.ServerTimestamp}}">` +
+const metricsFragmentHTML = `<div id="` + sseTargetID + `" data-timestamp="{{.ServerTimestamp}}">` +
 	`<span data-metric="connections">{{.Connections}}</span>` +
 	`<span data-metric="sessions">{{.Sessions}}</span>` +
 	`<span data-metric="messages_1h">{{.Messages1H}}</span>` +

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 
 	"github.com/adambenhassen/telegram-server/internal/admin"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
@@ -176,7 +178,7 @@ func TestSSE_multiline_fragment_is_framed_per_line(t *testing.T) {
 
 	want := "event: custom-event\n" +
 		"data: selector #metrics-stream\n" +
-		"data: mergeMode inner\n" +
+		"data: mergeMode morph\n" +
 		"data: fragments <div>\n" +
 		"data: fragments   <span>1</span>\n" +
 		"data: fragments </div>\n\n"
@@ -600,6 +602,28 @@ func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 		t.Errorf("fragment does not carry the agreed patch target id:\n%s", fragments[0].HTML)
 	}
 
+	// DashboardFragmentRenderer, not DefaultFragmentRenderer, is what the
+	// server wires in production, so it is the one that decides whether the
+	// live dashboard updates. It has to answer to the same contract.
+	prod, err := admin.DashboardFragmentRenderer(admin.MetricsResponse{Connections: 3})
+	if err != nil {
+		t.Fatalf("DashboardFragmentRenderer: %v", err)
+	}
+	if len(prod) != 1 {
+		t.Fatalf("DashboardFragmentRenderer returned %d fragments, want 1", len(prod))
+	}
+	if prod[0].Event != "" && prod[0].Event != admin.SSEDefaultEvent() {
+		t.Errorf("production fragment event = %q, want %q", prod[0].Event, admin.SSEDefaultEvent())
+	}
+	if prod[0].Selector != "" && prod[0].Selector != "#metrics-stream" {
+		t.Errorf("production fragment selector = %q, want #metrics-stream", prod[0].Selector)
+	}
+	assertSingleRootWithTargetID(t, "DashboardFragmentRenderer", prod[0].HTML)
+	if !strings.Contains(prod[0].HTML, `id="v-connections"`) {
+		t.Errorf("production fragment does not carry the first-paint metric ids:\n%s", prod[0].HTML)
+	}
+	assertSingleRootWithTargetID(t, "DefaultFragmentRenderer", fragments[0].HTML)
+
 	// An empty Event on the wire must resolve to the Datastar event name and
 	// the dashboard's target selector.
 	wire := string(admin.EncodeFragment(admin.Fragment{HTML: "<i>x</i>"}))
@@ -608,6 +632,52 @@ func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 	}
 	if !strings.Contains(wire, "data: selector #metrics-stream\n") {
 		t.Errorf("unnamed fragment did not pin the dashboard selector:\n%s", wire)
+	}
+}
+
+// assertSingleRootWithTargetID fails unless html is exactly one element and
+// that element carries the id the selector addresses.
+//
+// The bundle merges every top-level node of a fragment into the same selector
+// in turn, so a fragment of sibling sections is applied section by section and
+// only the last one survives: the dashboard loses most of its cards on the
+// first tick while the stream, the event name and the selector all still look
+// correct. Nothing but a structural check catches that.
+func assertSingleRootWithTargetID(t *testing.T, name, fragment string) {
+	t.Helper()
+
+	nodes, err := html.ParseFragment(strings.NewReader(fragment), &html.Node{
+		Type:     html.ElementNode,
+		Data:     "body",
+		DataAtom: atom.Body,
+	})
+	if err != nil {
+		t.Fatalf("%s: parsing fragment: %v", name, err)
+	}
+
+	var roots []*html.Node
+	for _, n := range nodes {
+		if n.Type == html.ElementNode {
+			roots = append(roots, n)
+		}
+	}
+	if len(roots) != 1 {
+		names := make([]string, 0, len(roots))
+		for _, n := range roots {
+			names = append(names, n.Data)
+		}
+		t.Fatalf("%s: fragment has %d top-level elements (%s), want exactly 1 — every one after the first overwrites it",
+			name, len(roots), strings.Join(names, ", "))
+	}
+
+	var id string
+	for _, a := range roots[0].Attr {
+		if a.Key == "id" {
+			id = a.Val
+		}
+	}
+	if id != "metrics-stream" {
+		t.Errorf("%s: fragment root id = %q, want metrics-stream", name, id)
 	}
 }
 
