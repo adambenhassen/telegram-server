@@ -80,7 +80,7 @@ Updates
 Channels
 - `channels.createChannel`, `channels.getChannels`, `channels.joinChannel`,
   `channels.leaveChannel`, `channels.editAdmin`, `channels.editBanned`,
-  `channels.getMessages`, `channels.editChannelUsername`
+  `channels.getMessages`, `channels.updateUsername`
 - `messages.exportChatInvite`, `messages.checkChatInvite`,
   `messages.importChatInvite`, `messages.revokeExportedChatInvite`
 - `updates.getChannelDifference`
@@ -360,17 +360,18 @@ Secret chats
   1:1 and group-chat peers; channel posts do not carry reply threading (MAIN-328).
 - **Message forwarding.** `messages.forwardMessages` with a forwarded-from header;
   per-pair `access_hash` re-derived for the recipient rather than passed through.
-  Forwarding a channel post carries the channel peer and post id in `FwdFrom` and
-  is gated on the forwarder's current membership.
-- **Reactions.** `messages.sendReaction` sets or clears the caller's emoji reaction;
-  reaction counts embedded in `getHistory` and update payloads; `updateMessageReactions`
-  pushed to all entitled peers on change. Reactions are rendered on read paths and
-  pushed on change; `messages.getMessagesReactions` is not implemented — the full
-  per-message reaction list is a missing convenience surface, not missing
-  functionality (MAIN-329).
+  Channel peers are not valid forwarding destinations; forwarding a channel post to
+  a 1:1 or group destination carries the channel peer and post id in `FwdFrom` and
+  is gated on the forwarder's current channel membership.
+- **Reactions.** `messages.sendReaction` sets or clears the caller's emoji reaction
+  on 1:1 and group-chat messages; channel messages are out of scope. Reaction counts
+  embedded in `getHistory` and update payloads; `updateMessageReactions` pushed to
+  all entitled peers on change. Reactions are rendered on read paths and pushed on
+  change; `messages.getMessagesReactions` is not implemented — the full per-message
+  reaction list is a missing convenience surface, not missing functionality (MAIN-329).
 - **Pinned messages.** `messages.updatePinnedMessage` pins or unpins a message;
-  admin-only in channels; `updatePinnedMessages` pushed to members; pinned message
-  id surfaced in the dialog.
+  admin-only in channels; `updatePinnedMessages` pushed to members carrying the
+  current pinned message id.
 - E2E gates (`test/e2e/`): reply threading — `reply_test.go`; forwarding —
   `forward_test.go` (1:1, group, channel-origin, auth rejection, dedup, multi-id);
   reactions — `reactions_test.go` (realtime and chat fan-out); pinning —
