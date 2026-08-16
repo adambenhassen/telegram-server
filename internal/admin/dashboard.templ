@@ -18,8 +18,10 @@ templ dashboardPage(d DashboardData) {
 			<meta name="viewport" content="width=device-width, initial-scale=1"/>
 			<title>Operations — telegram-server</title>
 			<link rel="stylesheet" href="/admin/assets/dashboard.css"/>
-			<script src="/admin/assets/htmx.min.js"></script>
-			<script src="/admin/assets/htmx-ext-sse.min.js"></script>
+			<!-- Datastar ships as an ES module: without type="module" the browser
+				 rejects the bundle's export statement and no attribute plugin ever
+				 registers, which reads as a dashboard that simply stops updating. -->
+			<script type="module" src="/admin/assets/datastar.min.js"></script>
 			<!-- defer, not plain: the script attaches a MutationObserver to
 				 document.body at parse time, which is null from <head>. Without
 				 it the component registration path dies on load and swapped-in
@@ -84,9 +86,11 @@ templ dashboardPage(d DashboardData) {
 							}
 						}
 					}
-					<!-- SSE-powered metrics sections -->
-					<div id="sse-root" hx-ext="sse" sse-connect="/admin/events">
-						<div id="metrics-stream" sse-swap="metrics" hx-swap="innerHTML">
+					<!-- SSE-powered metrics sections. The Datastar attribute
+						 opens the SSE stream on load; openWhenHidden keeps it open
+						 for operators who park the tab in the background. -->
+					<div id="sse-root" data-sse-event={ sseDefaultEvent } data-on-load="@get('/admin/events', {openWhenHidden: true})">
+						<div id="metrics-stream">
 							@metricsFragment(d)
 						</div>
 					</div>
@@ -364,8 +368,8 @@ templ storageRow(row DashStorageRow) {
 	}
 }
 
-// chipScript manages the freshness chip and disconnection banner via htmx SSE
-// lifecycle events. No JSON polling — the broadcaster drives all updates.
+// chipScript manages the freshness chip and disconnection banner via Datastar
+// SSE lifecycle events. No JSON polling — the broadcaster drives all updates.
 templ chipScript() {
 	<script>
 		(function() {
@@ -407,27 +411,48 @@ templ chipScript() {
 				}
 			}
 
-			document.body.addEventListener('htmx:sseOpen', function() {
-				connected = true;
-				bannerDc.classList.add('hidden');
-				setChip('chip-good', '● Live · connecting…');
-			});
+			// Datastar dispatches one document-level custom event per SSE
+			// transition: datastar-sse with detail {type, elId}, where elId is
+			// the id of the element that opened the stream. type is "started",
+			// "finished" or "error" for the lifecycle, and the event name for a
+			// data event — so an arriving patch is observable directly.
+			//
+			// The chip is driven only by these events, never by watching the
+			// DOM: the component script re-initialises swapped-in markup and
+			// its mutations are indistinguishable from a patch, which would
+			// leave the chip reporting a healthy stream that is in fact dead.
+			//
+			// The event name and detail shape are read off the bundled
+			// datastar.min.js; they are not part of Datastar's documented API,
+			// so a rename in a future bundle degrades the chip to "connecting…"
+			// rather than breaking the stream itself.
+			// The data event's name is the wire contract, so the page reads it
+			// off the element the server rendered rather than repeating it.
+			var sseRoot = document.getElementById('sse-root');
+			var dataEvent = sseRoot.getAttribute('data-sse-event');
 
-			document.body.addEventListener('htmx:sseBeforeMessage', function() {
-				lastOk = Date.now();
-				connected = true;
-			});
-
-			document.body.addEventListener('htmx:sseClosed', function() {
-				connected = false;
-				bannerDc.classList.remove('hidden');
-				updateChip();
-			});
-
-			document.body.addEventListener('htmx:sseError', function() {
-				connected = false;
-				bannerDc.classList.remove('hidden');
-				updateChip();
+			document.addEventListener('datastar-sse', function(e) {
+				if (e.detail.elId !== 'sse-root') return;
+				if (e.detail.type === dataEvent) {
+					lastOk = Date.now();
+					connected = true;
+					bannerDc.classList.add('hidden');
+					updateChip();
+					return;
+				}
+				switch (e.detail.type) {
+				case 'started':
+					connected = true;
+					bannerDc.classList.add('hidden');
+					setChip('chip-good', '● Live · connecting…');
+					break;
+				case 'finished':
+				case 'error':
+					connected = false;
+					bannerDc.classList.remove('hidden');
+					updateChip();
+					break;
+			}
 			});
 
 			if (refreshBtn) {

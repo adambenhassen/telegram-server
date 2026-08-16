@@ -200,9 +200,9 @@ test.describe('admin SSE stream', () => {
         const es = new EventSource('/admin/events');
         const timer = setTimeout(() => {
           es.close();
-          reject(new Error('SSE timeout: no metrics event within 5 s'));
+          reject(new Error('SSE timeout: no datastar-merge-fragments event within 5 s'));
         }, 5000);
-        es.addEventListener('metrics', (e: Event) => {
+        es.addEventListener('datastar-merge-fragments', (e: Event) => {
           clearTimeout(timer);
           es.close();
           resolve((e as MessageEvent).data);
@@ -215,11 +215,73 @@ test.describe('admin SSE stream', () => {
       });
     });
 
+    // The Datastar data lines carry the patch target and merge mode; the
+    // bundle drops the event silently if either drifts from the page.
+    expect(eventData).toContain('selector #metrics-stream');
+    expect(eventData).toContain('mergeMode morph');
+
     // DashboardFragmentRenderer produces shadcn-templ card markup.
     // DefaultFragmentRenderer produces minimal <span data-metric="..."> elements
     // with no card structure. Either assertion distinguishes the two renderers.
     expect(eventData).toContain('data-slot="card-content"');
     expect(eventData).toContain('id="v-connections"');
+  });
+
+  // The raw-EventSource test above proves the server emits the right bytes. It
+  // cannot tell whether the bundle acts on them: a wrong event name, wire key,
+  // merge mode or selector is answered with a 200 and no patch, so the page
+  // just stops updating. This drives the bundle itself and asserts what an
+  // operator sees.
+  test('Datastar bundle patches the page and the chip reports live', async ({ page }) => {
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    // First paint is server-rendered and must not wait on the stream.
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    // The chip reaches its live state only if the bundle dispatched
+    // datastar-sse with elId sse-root, and only reports a fresh age if the
+    // MutationObserver saw a patch land on #metrics-stream.
+    await expect(page.locator('#chip-text')).toHaveText(/Live · updated/, {
+      timeout: 15000,
+    });
+
+    // The patch must leave the dashboard whole. A fragment with more than one
+    // top-level node is merged node by node into the same selector, so every
+    // card but the last disappears while the chip still reads live.
+    await expect(page.locator('#v-connections')).toBeVisible();
+    await expect(page.locator('#v-total_users')).toBeVisible();
+    await expect(page.locator('#storage-tbody tr').first()).toBeVisible();
+    // The fragment carries the target id: merged into itself, never nested.
+    await expect(page.locator('#metrics-stream #metrics-stream')).toHaveCount(0);
+  });
+
+  // Criterion: the chip flips to its critical state when the stream ends and
+  // recovers when it comes back. The server only closes on the 25-minute cap
+  // or shutdown, so the transition is driven through the lifecycle events the
+  // bundle dispatches — "started" / "finished" / "error" on datastar-sse, the
+  // names read off the bundle itself.
+  test('chip reports disconnect and recovers on reconnect', async ({ page }) => {
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#chip-text')).toHaveText(/Live · updated/, { timeout: 15000 });
+
+    const lifecycle = (type: string) =>
+      page.evaluate((t) => {
+        document.dispatchEvent(
+          new CustomEvent('datastar-sse', { detail: { type: t, elId: 'sse-root' } }),
+        );
+      }, type);
+
+    await lifecycle('finished');
+    await expect(page.locator('#chip-text')).toHaveText(/Disconnected/);
+
+    await lifecycle('started');
+    await expect(page.locator('#chip-text')).toHaveText(/Live/);
+
+    // An error on the stream is the same observable state as a clean close.
+    await lifecycle('error');
+    await expect(page.locator('#chip-text')).toHaveText(/Disconnected/);
   });
 });
 
