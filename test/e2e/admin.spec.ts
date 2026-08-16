@@ -283,6 +283,29 @@ test.describe('admin SSE stream', () => {
     await lifecycle('error');
     await expect(page.locator('#chip-text')).toHaveText(/Disconnected/);
   });
+
+  // The chip test above proves the bundle reacts to the lifecycle event, but
+  // it asserts chip text only. Both assertions would survive the banner toggle
+  // being dropped from the disconnect branch, so the banner is pinned here:
+  // same event, direct visibility assertion, no class editing from the test.
+  test('disconnect reveals the banner', async ({ page }) => {
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#chip-text')).toHaveText(/Live · updated/, { timeout: 15000 });
+
+    const banner = page.locator('#banner-disconnected');
+    await expect(banner).toBeHidden();
+
+    // "finished" is the lifecycle event the bundle dispatches when the SSE
+    // stream closes; the chip and the banner share its handler branch.
+    await page.evaluate(() => {
+      document.dispatchEvent(
+        new CustomEvent('datastar-sse', { detail: { type: 'finished', elId: 'sse-root' } }),
+      );
+    });
+
+    await expect(banner).toBeVisible();
+  });
 });
 
 test.describe('admin dashboard stylesheet', () => {
