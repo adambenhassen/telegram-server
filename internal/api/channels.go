@@ -270,7 +270,7 @@ func (h *handlers) requireChannelMember(ctx context.Context, channelID, userID i
 // ride. store.ErrNotMember covers "not a member", "banned", "may not post in a
 // broadcast" and "no such channel" alike, and all four must stay one wire error
 // so channel ids are not enumerable.
-func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *tg.MessagesSendMessageRequest, replyToMsgID int64) (bin.Encoder, error) {
 	// Check for a transport retry before the rate limit.
 	if req.RandomID != 0 {
 		if existing, ok, err := h.store.ChannelMessageByRandomID(r.Ctx, channelID, req.RandomID); err == nil && ok {
@@ -310,13 +310,6 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 	// Rate limit: new message, consume a token.
 	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
 		return nil, err
-	}
-
-	replyToMsgID := int64(0)
-	if replyTo, ok := req.GetReplyTo(); ok {
-		if rep, ok := replyTo.(*tg.InputReplyToMessage); ok && rep.ReplyToMsgID > 0 {
-			replyToMsgID = int64(rep.ReplyToMsgID)
-		}
 	}
 
 	// PostChannelMessageAs, never PostChannelMessage: the latter is the

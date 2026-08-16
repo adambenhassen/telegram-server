@@ -43,6 +43,11 @@ VALUES ($1, $2, $3, $4, $5, $6, $7);
 
 -- ChannelPostExistsActive returns the local_id of an existing, non-deleted post
 -- in channelID. Used to validate reply_to_msg_id inside the post transaction.
+--
+-- LOCK INVARIANT: callers must hold the channel_state row lock (LockChannelState)
+-- before calling this. A future channel-post delete path must acquire the same
+-- lock before writing deleted = true, or the snapshot read here can race it and
+-- accept a reply reference to a post that is deleted by the time we commit.
 -- name: ChannelPostExistsActive :one
 SELECT local_id FROM channel_messages
 WHERE channel_id = $1 AND local_id = $2 AND deleted = false;

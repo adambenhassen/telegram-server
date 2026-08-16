@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,8 +18,9 @@ import (
 // a channel post carrying InputReplyToMessage stores the reference; the
 // reference appears on real-time push, on getChannelDifference backfill, and
 // on getMessages / getHistory reads. A post with no reply has no reference. A
-// post whose ReplyToMsgID names a deleted, absent or cross-channel post is
-// refused with MESSAGE_ID_INVALID and writes nothing.
+// post whose ReplyToMsgID names an absent or cross-channel post is refused with
+// MESSAGE_ID_INVALID and writes nothing. The deleted case is not exercised here
+// because channel post deletion is not yet implemented through RPC.
 func TestChannelReplyPersisted(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -296,6 +298,74 @@ func TestChannelReplyPersisted(t *testing.T) {
 			}
 			if len(diff.NewMessages) != 2 {
 				t.Errorf("message count after refused reply = %d, want 2", len(diff.NewMessages))
+			}
+		}
+		return nil
+	})
+
+	// Criterion 4 (cross-channel oracle): a local_id valid in a second channel must
+	// be indistinguishable from an absent id in the first channel. chID currently has
+	// local_ids 1 and 2; post 3 messages in a fresh channel so its third post carries
+	// local_id 3, which exists there but not in chID.
+	ch2ID := createBroadcastChannel(t, ctx, aCmds, "OtherChannel")
+	for i, randomID := range []int64{96001004, 96001005} {
+		msg := fmt.Sprintf("filler %d", i+1)
+		execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+			_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+				Peer: peerChannel(aUserID, ch2ID), Message: msg, RandomID: randomID,
+			})
+			return err
+		})
+	}
+	var ch2ThirdMsgID int
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerChannel(aUserID, ch2ID), Message: "third in other channel", RandomID: 96001006,
+		})
+		if err != nil {
+			return err
+		}
+		if ups, ok := res.(*tg.Updates); ok {
+			for _, u := range ups.Updates {
+				if nm, ok := u.(*tg.UpdateNewChannelMessage); ok {
+					if m, ok := nm.Message.(*tg.Message); ok {
+						ch2ThirdMsgID = m.ID
+					}
+				}
+			}
+		}
+		return nil
+	})
+	if ch2ThirdMsgID == 0 {
+		t.Fatal("ch2 third post ID is zero")
+	}
+	assertChannelRPCError(t, ctx, aCmds, "MESSAGE_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+		req := &tg.MessagesSendMessageRequest{
+			Peer:     peerChannel(aUserID, chID),
+			Message:  "cross-channel reply",
+			RandomID: 96001007,
+		}
+		req.SetReplyTo(&tg.InputReplyToMessage{ReplyToMsgID: ch2ThirdMsgID})
+		_, err := c.MessagesSendMessage(ctx, req)
+		return err
+	})
+	// Both refusals must write nothing: no row, no event, no pts advance.
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
+			Channel: inputChannel(aUserID, chID),
+			Filter:  &tg.ChannelMessagesFilterEmpty{},
+			Pts:     0,
+			Limit:   100,
+		})
+		if err != nil {
+			return err
+		}
+		if diff, ok := d.(*tg.UpdatesChannelDifference); ok {
+			if diff.Pts != ptsBefore {
+				t.Errorf("pts after cross-channel refusal = %d, want %d (no advance)", diff.Pts, ptsBefore)
+			}
+			if len(diff.NewMessages) != 2 {
+				t.Errorf("message count after cross-channel refusal = %d, want 2 (no row written)", len(diff.NewMessages))
 			}
 		}
 		return nil
