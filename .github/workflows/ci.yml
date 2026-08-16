@@ -153,19 +153,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
+      # Node is the only thing the runner is missing: `make css` installs
+      # internal/admin/ui/node_modules itself and runs the Tailwind CLI through
+      # npx, both of which need it on PATH.
       - uses: actions/setup-node@v7.0.0
         with:
           node-version: 22
-
-      # `make css` runs the pinned Tailwind CLI through npx, but the CLI still
-      # has to resolve `tailwindcss` itself to satisfy the `@import "tailwindcss"`
-      # in internal/admin/ui/input.css. --prefix installs it into the directory
-      # that import resolves from, using the version already pinned in
-      # internal/admin/ui/package.json rather than a second copy of it here; the
-      # root manifests are the Playwright/eslint tree and are unrelated.
-      # MAIN-319 makes the Makefile do this itself; this step goes away then.
-      - name: Install the Tailwind runtime
-        run: npm install --prefix internal/admin/ui
 
       - name: Regenerate dashboard.css
         run: make css
