@@ -299,11 +299,12 @@ and building it natively on aarch64 works, and takes about two hours on four
 cores. Everything below was run against such an image, tagged
 `tdesktop:centos_env-arm64`.
 
-One dependency needs a patch before that render succeeds: rnnoise v0.2's NEON
-and generic paths in `src/vec.h` include a header rnnoise does not vendor, so
-they compile on no architecture at all — upstream only ever reaches its
-AVX/SSE2 branch. The fix is on our fork as PR #2. Without it the image build
-fails on rnnoise, whatever else is right.
+Render it from our fork's `dev`, not from upstream. rnnoise v0.2's NEON and
+generic paths in `src/vec.h` include a header rnnoise does not vendor, so they
+compile on no architecture at all — upstream never notices because its AVX/SSE2
+branch never reaches that line, and an aarch64 render from upstream fails there.
+The fix is already merged on the fork as `81f5657`, so nothing has to be applied
+by hand.
 
 Clone with `--recursive`; the build needs all 36 submodules.
 
