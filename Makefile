@@ -16,7 +16,10 @@ sqlc: bin/sqlc
 templ:
 	templ generate ./internal/admin/
 
-css:
+internal/admin/ui/node_modules: internal/admin/ui/package-lock.json
+	npm install --prefix internal/admin/ui
+
+css: internal/admin/ui/node_modules
 	npx --yes @tailwindcss/cli@4.3.3 \
 		-i internal/admin/ui/input.css \
 		-o internal/admin/assets/dashboard.css \
