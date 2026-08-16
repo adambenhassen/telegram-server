@@ -336,11 +336,8 @@ test.describe('admin dashboard component script', () => {
     // The observer registers the bar and runs it through updateProgress: the
     // marker and the value text come from that one path, and neither appears
     // if the observer never attached. The indicator's width is not asserted
-    // here: the server-rendered inline width is cleared above, but the
-    // computed width of an unregistered bar still resolves to a full value
-    // (the track collapses to zero height, so the block-level indicator
-    // takes the container width), so a width check cannot tell a wired-up
-    // bar from a dead one.
+    // here: /.+/ matches every computed width value, so such a check could
+    // never fail on any build.
     const probe = page.locator('#probe-bar');
     await expect(probe).toHaveAttribute('data-tui-progress-observed', 'true');
     await expect(probe).toHaveAttribute('aria-valuetext', '37%');
