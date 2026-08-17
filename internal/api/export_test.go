@@ -85,9 +85,13 @@ func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code stri
 // UnhandledForTest drives the dispatcher's fallback for the external api_test
 // package, over a body positioned at its constructor id. It returns the error
 // the caller would receive and writes the record the RPC-gap capture reads.
-func UnhandledForTest(log *slog.Logger, body *bin.Buffer) error {
+//
+// c carries the per-connection budget the fallback charges, so a caller driving
+// the bound passes the same conn across calls and one driving a single call
+// passes a fresh one.
+func UnhandledForTest(log *slog.Logger, c *mtproto.Conn, body *bin.Buffer) error {
 	h := &handlers{log: log}
-	return h.handleUnknown(nil, &mtproto.Request{Ctx: context.Background(), Buf: body})
+	return h.handleUnknown(c, &mtproto.Request{Ctx: context.Background(), Buf: body})
 }
 
 // TestMaxFileBytes is the per-file upload cap test handlers run with. It is the
