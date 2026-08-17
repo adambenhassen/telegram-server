@@ -202,13 +202,13 @@ func (s *Store) checkSchema(ctx context.Context) error {
 		              WHERE table_name = 'upload_parts' AND column_name = 'size'),
 		       EXISTS(SELECT 1 FROM information_schema.columns
 		              WHERE table_name = 'upload_parts' AND column_name = 'blob_key'),
-		       NOT EXISTS(SELECT 1 FROM information_schema.columns
+		       EXISTS(SELECT 1 FROM information_schema.columns
 		                   WHERE table_name = 'upload_parts' AND column_name = 'payload')`,
 	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || !hasPartPayload {
+	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || hasPartPayload {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil
