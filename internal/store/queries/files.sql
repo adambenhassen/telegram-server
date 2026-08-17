@@ -51,5 +51,20 @@ WHERE f.id = $1 AND f.access_hash = $2 AND f.stored = true
       )
   );
 
+-- LockFileForReference is the M17 interlock. messages.file_id has no foreign
+-- key and the pool runs at READ COMMITTED, so a reference insert is invisible
+-- to a concurrent reader and no re-read of the reference set can see one in
+-- flight. The files row is therefore the lock object: every path that writes a
+-- non-zero messages.file_id takes this inside the transaction that inserts the
+-- referencing row(s), and an eraser takes the same row FOR UPDATE before
+-- deleting it, so the two orders are the only two possible and each is correct.
+--
+-- Shared, not exclusive: concurrent references to one file are ordinary traffic
+-- and must not serialize behind each other. Returning no row is the fail-closed
+-- branch — the caller aborts rather than writing a reference to a file that is
+-- not there to lock.
+-- name: LockFileForReference :one
+SELECT id FROM files WHERE id = $1 FOR SHARE;
+
 -- name: FilesByIDs :many
 SELECT * FROM files WHERE id = ANY(sqlc.arg(ids)::bigint[]) AND stored = true;
