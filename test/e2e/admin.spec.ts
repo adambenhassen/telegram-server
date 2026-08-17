@@ -344,8 +344,17 @@ test.describe('admin SSE stream', () => {
       .poll(() => chipTexts(page), { message: 'chip text after "finished"' })
       .toEqual(expect.arrayContaining([expect.stringMatching(/Disconnected/)]));
 
-    await lifecycle('started');
-    await expect(page.locator('#chip-text')).toHaveText(/Live/);
+    // "started" sets the chip to exactly "● Live · connecting…" — distinct from
+    // the data-patch branch, which calls updateChip() and writes "● Live · updated
+    // Xs ago". Reading synchronously in the same evaluate call blocks any async
+    // patch from landing between the dispatch and the assertion.
+    const chipTextAfterStarted = await page.evaluate(() => {
+      document.dispatchEvent(
+        new CustomEvent('datastar-sse', { detail: { type: 'started', elId: 'sse-root' } }),
+      );
+      return document.getElementById('chip-text')?.textContent ?? '';
+    });
+    expect(chipTextAfterStarted, '"started" sets chip to connecting state').toMatch(/Live · connecting/);
 
     // An error on the stream is the same observable state as a clean close.
     await recordDisconnectState(page);
@@ -408,8 +417,19 @@ test.describe('admin SSE stream', () => {
       .poll(() => bannerWasShown(page), { message: 'banner revealed on disconnect' })
       .toBe(true);
 
-    await lifecycle('started');
-    await expect(banner).toBeHidden();
+    // The "started" branch adds the "hidden" class synchronously when its event
+    // handler runs. Reading the class in the same evaluate call that dispatches
+    // the event means no data patch can arrive and re-hide the banner between
+    // the dispatch and the assertion. If the started branch is deleted the banner
+    // remains visible immediately after dispatch, even though a later patch would
+    // eventually re-hide it.
+    const bannerHiddenAfterReconnect = await page.evaluate(() => {
+      document.dispatchEvent(
+        new CustomEvent('datastar-sse', { detail: { type: 'started', elId: 'sse-root' } }),
+      );
+      return document.getElementById('banner-disconnected')?.classList.contains('hidden') ?? false;
+    });
+    expect(bannerHiddenAfterReconnect, 'reconnect re-hides the banner').toBe(true);
   });
 });
 
