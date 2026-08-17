@@ -1452,3 +1452,165 @@ func TestSearchChatByTitleListsParticipants(t *testing.T) {
 		}
 	}
 }
+
+// channelIDFromCreate extracts the channel id from the *tg.Updates returned by
+// CreateChannelForTest. Fatally fails t if the response is not parseable.
+func channelIDFromCreate(t *testing.T, enc bin.Encoder) int64 {
+	t.Helper()
+	ups, ok := enc.(*tg.Updates)
+	if !ok || len(ups.Chats) == 0 {
+		t.Fatalf("create channel: unexpected response %T", enc)
+	}
+	ch, ok := ups.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("create channel: chats[0] is %T, want *tg.Channel", ups.Chats[0])
+	}
+	return ch.ID
+}
+
+// channelPostIDFromSend extracts the new channel message id from the *tg.Updates
+// returned by SendMessageForTest. Fatally fails t if the response is not parseable.
+func channelPostIDFromSend(t *testing.T, enc bin.Encoder) int {
+	t.Helper()
+	ups, ok := enc.(*tg.Updates)
+	if !ok {
+		t.Fatalf("send channel message: unexpected response %T", enc)
+	}
+	for _, u := range ups.Updates {
+		if nm, ok := u.(*tg.UpdateNewChannelMessage); ok {
+			if m, ok := nm.Message.(*tg.Message); ok {
+				return m.ID
+			}
+		}
+	}
+	t.Fatal("send channel message: no UpdateNewChannelMessage in updates")
+	return 0
+}
+
+func TestSendMessageCrossPeerReplyRefused(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	a, err := s.CreateUser(ctx, "+15553530001")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15553530002")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+	chat, err := s.CreateChat(ctx, a.ID, "Crew", []int64{b.ID})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	chRes, err := api.CreateChannelForTest(s, a.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "News"})
+	if err != nil {
+		t.Fatalf("channel: %v", err)
+	}
+	chID := channelIDFromCreate(t, chRes)
+
+	// 1:1 send: ReplyToPeerID names a chat, not the user destination.
+	req := &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerUser(a.ID, b.ID), Message: "hi", RandomID: 1,
+	}
+	replyTo := &tg.InputReplyToMessage{ReplyToMsgID: 1}
+	replyTo.SetReplyToPeerID(&tg.InputPeerChat{ChatID: chat.ID})
+	req.SetReplyTo(replyTo)
+	_, err = api.SendMessageForTest(s, a.ID, req)
+	rpcError(t, err, "MESSAGE_ID_INVALID")
+
+	// Chat send: ReplyToPeerID names a user, not the chat destination.
+	req = &tg.MessagesSendMessageRequest{
+		Peer: &tg.InputPeerChat{ChatID: chat.ID}, Message: "hi", RandomID: 2,
+	}
+	replyTo = &tg.InputReplyToMessage{ReplyToMsgID: 1}
+	replyTo.SetReplyToPeerID(api.InputPeerUser(a.ID, b.ID))
+	req.SetReplyTo(replyTo)
+	_, err = api.SendMessageForTest(s, a.ID, req)
+	rpcError(t, err, "MESSAGE_ID_INVALID")
+
+	// Channel send: ReplyToPeerID names a user, not the channel destination.
+	req = &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerChannel(a.ID, chID), Message: "hi", RandomID: 3,
+	}
+	replyTo = &tg.InputReplyToMessage{ReplyToMsgID: 1}
+	replyTo.SetReplyToPeerID(api.InputPeerUser(a.ID, b.ID))
+	req.SetReplyTo(replyTo)
+	_, err = api.SendMessageForTest(s, a.ID, req)
+	rpcError(t, err, "MESSAGE_ID_INVALID")
+}
+
+func TestSendMessageSamePeerReplyPassesThrough(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	a, err := s.CreateUser(ctx, "+15553530011")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15553530012")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+
+	// 1:1 path: send a message, then reply with ReplyToPeerID naming the same user.
+	if _, err = api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerUser(a.ID, b.ID), Message: "first", RandomID: 100,
+	}); err != nil {
+		t.Fatalf("1:1 initial send: %v", err)
+	}
+	req := &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerUser(a.ID, b.ID), Message: "reply", RandomID: 101,
+	}
+	replyTo := &tg.InputReplyToMessage{ReplyToMsgID: 1}
+	replyTo.SetReplyToPeerID(api.InputPeerUser(a.ID, b.ID))
+	req.SetReplyTo(replyTo)
+	if _, err = api.SendMessageForTest(s, a.ID, req); err != nil {
+		t.Errorf("1:1 same-peer reply: %v", err)
+	}
+
+	// Chat path: send a message, then reply with ReplyToPeerID naming the same chat.
+	chat, err := s.CreateChat(ctx, a.ID, "Crew", []int64{b.ID})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if _, err = api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
+		Peer: &tg.InputPeerChat{ChatID: chat.ID}, Message: "first", RandomID: 102,
+	}); err != nil {
+		t.Fatalf("chat initial send: %v", err)
+	}
+	req = &tg.MessagesSendMessageRequest{
+		Peer: &tg.InputPeerChat{ChatID: chat.ID}, Message: "reply", RandomID: 103,
+	}
+	replyTo = &tg.InputReplyToMessage{ReplyToMsgID: 1}
+	replyTo.SetReplyToPeerID(&tg.InputPeerChat{ChatID: chat.ID})
+	req.SetReplyTo(replyTo)
+	if _, err = api.SendMessageForTest(s, a.ID, req); err != nil {
+		t.Errorf("chat same-peer reply: %v", err)
+	}
+
+	// Channel path: post a message, then reply with ReplyToPeerID naming the same channel.
+	chRes, err := api.CreateChannelForTest(s, a.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "News"})
+	if err != nil {
+		t.Fatalf("channel: %v", err)
+	}
+	chID := channelIDFromCreate(t, chRes)
+	postEnc, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerChannel(a.ID, chID), Message: "first post", RandomID: 104,
+	})
+	if err != nil {
+		t.Fatalf("channel initial post: %v", err)
+	}
+	postID := channelPostIDFromSend(t, postEnc)
+	req = &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerChannel(a.ID, chID), Message: "reply", RandomID: 105,
+	}
+	replyTo = &tg.InputReplyToMessage{ReplyToMsgID: postID}
+	replyTo.SetReplyToPeerID(api.InputPeerChannel(a.ID, chID))
+	req.SetReplyTo(replyTo)
+	if _, err = api.SendMessageForTest(s, a.ID, req); err != nil {
+		t.Errorf("channel same-peer reply: %v", err)
+	}
+}
