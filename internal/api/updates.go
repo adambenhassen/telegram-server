@@ -93,19 +93,29 @@ func messageToTL(m store.Message, createUsers []int64, files map[int64]*tg.Docum
 		msg.SetFwdFrom(fwd)
 	}
 	if len(reactions) > 0 {
-		reactionClasses := make([]tg.ReactionClass, len(reactions))
-		for i, r := range reactions {
-			reactionClasses[i] = &tg.ReactionEmoji{Emoticon: r.Reaction}
-		}
-		mr := &tg.MessageReactions{
-			Results: make([]tg.ReactionCount, len(reactionClasses)),
-		}
-		for i, rc := range reactionClasses {
-			mr.Results[i] = tg.ReactionCount{Reaction: rc, Count: 1}
-		}
-		msg.SetReactions(*mr)
+		msg.SetReactions(reactionsToTL(reactions))
 	}
 	return msg
+}
+
+// reactionsToTL is the single wire projection of stored reactions, shared by
+// every surface that renders them. Each stored row is one reactor's single
+// emoji, so each renders as its own ReactionCount with Count 1.
+//
+// It deliberately populates neither RecentReactions nor any user list:
+// message_reactions.reactor_id is stored but no surface discloses who reacted,
+// and a second projection is how the read paths would come to disagree.
+func reactionsToTL(reactions []store.Reaction) tg.MessageReactions {
+	mr := tg.MessageReactions{
+		Results: make([]tg.ReactionCount, len(reactions)),
+	}
+	for i, r := range reactions {
+		mr.Results[i] = tg.ReactionCount{
+			Reaction: &tg.ReactionEmoji{Emoticon: r.Reaction},
+			Count:    1,
+		}
+	}
+	return mr
 }
 
 // channelMessageToTL maps a stored channel post to the wire message, the
