@@ -393,10 +393,11 @@ func (s *Store) ReadPartBytes(ctx context.Context, key string) ([]byte, error) {
 // BlobsOf returns the Store's blob backend.
 func BlobsOf(s *Store) blob.Store { return s.blobs }
 
-// SetSweepBlobs swaps the blob backend a sweep pass deletes through, so a test
-// can simulate a storage backend that cannot delete. Scoped to the Store for
-// the reason the other test hooks are.
-func SetSweepBlobs(s *Store, blobs blob.Store) error {
+// SetPartBlobs swaps the blob backend every part path reads and writes
+// through, so a test can put a backend that cannot delete, or one that answers
+// at network speed, under the shipped code. Scoped to the Store for the reason
+// the other test hooks are.
+func SetPartBlobs(s *Store, blobs blob.Store) error {
 	if blobs == nil {
 		return errors.New("sweep blobs: nil backend")
 	}

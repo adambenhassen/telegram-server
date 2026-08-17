@@ -319,10 +319,14 @@ func (s *Store) UploadPart(ctx context.Context, userID, fileID int64, partIndex 
 }
 
 // DeleteUploadParts drops every part of one in-flight upload, returning how
-// many rows it retired. Called once an upload has been assembled. The bytes go
-// first: a failure deleting them leaves rows that name objects, which the sweep
-// retires on schedule, rather than objects no row names, which nothing
-// reclaims.
+// many rows it retired. Called once an upload has been assembled.
+//
+// The bytes go before the rows and again after them, and both halves are
+// load-bearing. Before: a failure between them leaves rows that name objects,
+// which the sweep retires on schedule, rather than objects no row names, which
+// nothing reclaims. After, in retirePartRows: a write that was still in flight
+// during the first delete lands under a key this had already passed, and only
+// the transaction that retired the row can collect it.
 //
 // The row delete is retirePartRows', one row per object actually deleted and
 // conditional on the row still naming it, for the reason stated there. A blind
@@ -427,9 +431,13 @@ func (s *Store) SweepExpiredUploadParts(ctx context.Context, cutoff time.Time, b
 //     failure stops the pass with the rows still in place, so the next pass
 //     retries them rather than the bytes becoming unreachable.
 //  3. Finalise: one delete per claimed row, naming both its primary key and the
-//     blob key the pass deleted. A re-save that committed in the window between
-//     the claim and the byte delete has renamed the row: it is not deleted and
-//     it is not counted.
+//     blob key the pass deleted, and then the objects of the rows that actually
+//     went, deleted a second time after that transaction commits. A re-save
+//     that committed in the window between the claim and the byte delete has
+//     renamed the row: it is not deleted and it is not counted. A save whose
+//     bytes were still in flight when step 2 passed their key is what the
+//     second delete collects — the claim can read a key whose object has not
+//     landed yet exactly as the assembly cleanup can.
 func (s *Store) deleteExpiredUploadParts(ctx context.Context, cutoff time.Time, batch int) (int64, error) {
 	// Refused rather than read as "no bound": the unbounded DELETE is exactly
 	// what this parameter exists to prevent, and a caller that computed a zero
@@ -491,6 +499,24 @@ func (s *Store) finaliseExpiredUploadParts(ctx context.Context, claimed []db.Cla
 //
 // One transaction, so a caller that reads its own count back sees all of the
 // deletes or none.
+//
+// Then it deletes the objects of the rows it actually retired, a second time
+// and after the commit, and that is the half that makes the whole thing hold.
+// The caller's delete before this ran against the keys as they were when it
+// read them, and a write for one of those keys can still be in flight at that
+// moment: the row is not wrong — it names the key the write is landing under —
+// so neither the conditional delete nor the writer's own re-read has anything
+// to notice, and the object outlives the row. The rule that closes it is about
+// ownership rather than order: whoever last changes a row's state owns the
+// bytes at the key that row named. This transaction is that party for the rows
+// it retired, so it collects them once it has committed. A write landing before
+// this second delete is collected by it; a write landing after it belongs to a
+// writer whose re-read now finds no row and collects its own. There is no third
+// case.
+//
+// A failure here is logged, not returned: the rows are already gone, so the
+// caller has nothing to retry, and an object no row names is the residue this
+// design accepted from the start.
 func (s *Store) retirePartRows(ctx context.Context, rows []db.DeleteUploadPartByKeyParams) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
@@ -501,16 +527,28 @@ func (s *Store) retirePartRows(ctx context.Context, rows []db.DeleteUploadPartBy
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
-	var retired int64
+	retired := make([]string, 0, len(rows))
 	for _, r := range rows {
 		n, err := qtx.DeleteUploadPartByKey(ctx, r)
 		if err != nil {
 			return 0, fmt.Errorf("delete part rows: %w", err)
 		}
-		retired += n
+		if n > 0 {
+			retired = append(retired, r.BlobKey)
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit: %w", err)
 	}
-	return retired, nil
+
+	// Safe to delete unconditionally: a part key is drawn from crypto/rand for
+	// one save, so once the row naming it is gone no row can ever name it
+	// again. Deleting an object that is already gone is a no-op, which is what
+	// this is for every key whose bytes the caller's first delete did reach.
+	for _, key := range retired {
+		if err = s.removePartBytes(ctx, key); err != nil {
+			s.log.Error("remove retired upload part bytes", "key", key, "err", err)
+		}
+	}
+	return int64(len(retired)), nil
 }

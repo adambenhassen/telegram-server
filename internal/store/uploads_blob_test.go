@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -301,7 +302,7 @@ func TestSweepInterruptedLeavesNoRowWithoutBytes(t *testing.T) {
 	_, dir := localBlobsOf(t, s)
 	healthy := store.BlobsOf(s)
 	bad := &failingRemoveBlobs{Store: healthy}
-	if err := store.SetSweepBlobs(s, bad); err != nil {
+	if err := store.SetPartBlobs(s, bad); err != nil {
 		t.Fatalf("swap blobs: %v", err)
 	}
 
@@ -324,7 +325,7 @@ func TestSweepInterruptedLeavesNoRowWithoutBytes(t *testing.T) {
 	}
 
 	// With a healthy backend the same sweep completes, and the bytes go.
-	if err := store.SetSweepBlobs(s, healthy); err != nil {
+	if err := store.SetPartBlobs(s, healthy); err != nil {
 		t.Fatalf("restore blobs: %v", err)
 	}
 	if _, err := s.SweepExpiredUploadParts(ctx, time.Now().Add(time.Hour), sweepBatch); err != nil {
@@ -536,6 +537,130 @@ func TestAssemblyCleanupRacingResaveLeavesNoUnnamedObject(t *testing.T) {
 		// Whatever the race left is an ordinary in-flight part, so an
 		// uncontended cleanup retires it and its bytes together.
 		if _, err := s.DeleteUploadParts(ctx, u.ID, 27); err != nil {
+			t.Fatalf("round %d drain: %v", r, err)
+		}
+		if n := countPartKeys(t, dir); n != 0 {
+			t.Fatalf("round %d: %d part objects survive an uncontended cleanup, want 0", r, n)
+		}
+	}
+}
+
+// latencyBlobs answers at network speed: each call takes a round trip and its
+// effect lands at the end of one, which is what MAIN-342's backend will do and
+// what the local filesystem does not. It is not a timing knob invented for the
+// test — the window below is sub-millisecond on the local backend and seconds
+// wide on a remote one, so this is the backend the invariant has to hold
+// against, run at a scale a test can assert on.
+//
+// putStarted closes when the first Put is entered, before its delay, so a test
+// can begin the racing side at a point the shipped code defines rather than at
+// a point a sleep guesses at.
+type latencyBlobs struct {
+	blob.Store
+
+	put, remove time.Duration
+	started     chan struct{}
+	once        sync.Once
+}
+
+func newLatencyBlobs(inner blob.Store, put, remove time.Duration) *latencyBlobs {
+	return &latencyBlobs{Store: inner, put: put, remove: remove, started: make(chan struct{})}
+}
+
+func (l *latencyBlobs) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
+	l.once.Do(func() { close(l.started) })
+	time.Sleep(l.put)
+	return l.Store.Put(ctx, key, r)
+}
+
+func (l *latencyBlobs) Remove(ctx context.Context, key string) error {
+	time.Sleep(l.remove)
+	return l.Store.Remove(ctx, key)
+}
+
+// TestRetirementCollectsBytesLandingInsideIt is the third door, and the one
+// neither the conditional row delete nor the writer's re-read can see. The
+// sequence is six ordinary steps: the save commits so the row names its new
+// key, the cleanup reads the part set and sees that key, the cleanup deletes
+// bytes that have not landed yet, the save's write lands, the save re-reads and
+// correctly keeps its object because nothing has retired the row, and only then
+// does the cleanup retire it. Nobody misbehaves and nobody can observe the
+// problem locally: the row is consistent every time either party looks at it.
+//
+// What closes it is ownership rather than order — the party that last changes a
+// row's state owns the bytes at the key that row named — so the retiring
+// transaction deletes those objects again once it has committed.
+//
+// The oracle is the latency backend rather than the scheduler. On the local
+// filesystem this window is a sub-millisecond alignment that a loaded host hits
+// once in a few hundred rounds, which is a flake whichever way it lands; at
+// round-trip speed the ordering above is forced, and the test fails every run
+// without the second delete and passes every run with it.
+func TestRetirementCollectsBytesLandingInsideIt(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000113")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	plain, dir := localBlobsOf(t, s)
+
+	// The production per-file cap: the row cap is derived from it and the
+	// fillers need the headroom.
+	const wideFile = 100 << 20
+	// Enough fillers that the cleanup is still deleting objects when the
+	// racing save's write lands and it re-reads its row: 11 removes at 20ms
+	// against one put at 100ms.
+	const fillers = 10
+	const putDelay = 100 * time.Millisecond
+	const removeDelay = 20 * time.Millisecond
+	const rounds = 5
+
+	for r := range rounds {
+		// Seed on the plain backend: the setup is not what is under test.
+		if err := store.SetPartBlobs(s, plain); err != nil {
+			t.Fatalf("round %d plain backend: %v", r, err)
+		}
+		if err := s.SaveUploadPart(ctx, u.ID, 29, 0, part('a', 512*1024), wideFile); err != nil {
+			t.Fatalf("round %d seed part 0: %v", r, err)
+		}
+		for i := 1; i <= fillers; i++ {
+			if err := s.SaveUploadPart(ctx, u.ID, 29, i, part('f', 1), wideFile); err != nil {
+				t.Fatalf("round %d seed filler %d: %v", r, i, err)
+			}
+		}
+
+		slow := newLatencyBlobs(plain, putDelay, removeDelay)
+		if err := store.SetPartBlobs(s, slow); err != nil {
+			t.Fatalf("round %d slow backend: %v", r, err)
+		}
+
+		var saveErr, cleanupErr error
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			saveErr = s.SaveUploadPart(ctx, u.ID, 29, 0, part('b', 512*1024), wideFile)
+		})
+		// The save has committed its row and is inside its write: the cleanup
+		// now reads a key whose object does not exist yet.
+		<-slow.started
+		wg.Go(func() {
+			_, cleanupErr = s.DeleteUploadParts(ctx, u.ID, 29)
+		})
+		wg.Wait()
+		if saveErr != nil {
+			t.Fatalf("round %d racing save: %v", r, saveErr)
+		}
+		if cleanupErr != nil {
+			t.Fatalf("round %d cleanup: %v", r, cleanupErr)
+		}
+
+		if err := store.SetPartBlobs(s, plain); err != nil {
+			t.Fatalf("round %d restore backend: %v", r, err)
+		}
+		assertEveryPartObjectIsNamed(t, s, dir, fmt.Sprintf("round %d", r))
+
+		if _, err := s.DeleteUploadParts(ctx, u.ID, 29); err != nil {
 			t.Fatalf("round %d drain: %v", r, err)
 		}
 		if n := countPartKeys(t, dir); n != 0 {
