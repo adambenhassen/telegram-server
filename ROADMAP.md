@@ -600,9 +600,14 @@ Tracked so shortcuts don't rot into "later means never".
   on both sides, so with the ownership gate nobody can retrieve it afterwards —
   but the bytes stay on disk indefinitely. A deletion request is not erasure, so
   any retention or deletion promise made to a user is false for media until a
-  deleter ships. The reference set is `messages.file_id`; a future deleter derives
-  its count from there rather than from a stored counter, which is why no counter
-  exists to drift. — M5
+  deleter ships. The reference set is `messages.file_id` and
+  `channel_messages.file_id`: a file id is live when any non-deleted row in either
+  table names it. The two are not symmetric: `channel_messages.file_id` carries a
+  foreign key to `files`, so a database-level delete of a `files` row is refused on
+  the channel side and silently orphans the message side. The forward path copies the
+  source file id into new message rows, so references to an existing blob can appear
+  at any time. A future deleter derives its count from both tables rather than from a
+  stored counter, which is why no counter exists to drift. — M5
 - **Per-account storage is a lifetime quota.** Nothing decrements
   `TG_MAX_USER_STORAGE_BYTES`, so an account that reaches it can never upload
   again, and the aggregate disk is `accounts × quota` of permanent storage. That
