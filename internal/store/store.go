@@ -170,11 +170,11 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 //
 // ponytail: presence-check of the newest migration's artifacts, not a version
 // table — pgtest applies raw SQL and has no Atlas revisions table to read. The
-// sentinels track the latest migration (pinned_message_id on chats/channels) plus
-// chat_participants, messages.fanout_id and message_events from the ones
-// before it; update them when a migration adds new schema.
+// sentinels track the latest migration (upload_parts.size and blob_key, with
+// payload dropped) plus the ones before it; update them when a migration adds
+// new schema.
 func (s *Store) checkSchema(ctx context.Context) error {
-	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions bool
+	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
@@ -197,12 +197,18 @@ func (s *Store) checkSchema(ctx context.Context) error {
 		       to_regclass('public.sign_in_fail_calls') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
 		              WHERE table_name = 'users' AND column_name = 'login_mode'),
-		       to_regclass('public.admin_sessions') IS NOT NULL`,
-	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions)
+		       to_regclass('public.admin_sessions') IS NOT NULL,
+		       EXISTS(SELECT 1 FROM information_schema.columns
+		              WHERE table_name = 'upload_parts' AND column_name = 'size'),
+		       EXISTS(SELECT 1 FROM information_schema.columns
+		              WHERE table_name = 'upload_parts' AND column_name = 'blob_key'),
+		       NOT EXISTS(SELECT 1 FROM information_schema.columns
+		                   WHERE table_name = 'upload_parts' AND column_name = 'payload')`,
+	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions {
+	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || !hasPartPayload {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil
