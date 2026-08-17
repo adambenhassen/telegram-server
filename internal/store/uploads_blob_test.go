@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -412,6 +414,85 @@ func TestSweepRacesResaveIsConditionalOnKey(t *testing.T) {
 	}
 	if got := countPartKeys(t, dir); got != 1 {
 		t.Fatalf("part objects after finalise = %d, want 1 (the re-save's)", got)
+	}
+}
+
+// TestConcurrentResavesLeaveNoUnnamedObject is the invariant the serial case
+// above cannot reach: an orphaned object is reachable only through process or
+// backend failure, never through a well-formed sequence of client requests.
+// Concurrent saves of one part are well formed — a client retrying a part it
+// has not had an answer for yet sends exactly this — and they are the case the
+// advisory lock does not cover, because it orders the two rows and then
+// releases at the commit while both saves still have their byte work to do.
+// Rounds rather than one shot: the interleaving that produces the object is a
+// race, so one pass proves nothing about the pass that would have lost.
+func TestConcurrentResavesLeaveNoUnnamedObject(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000111")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	_, dir := localBlobsOf(t, s)
+
+	// A max-size part is what makes the window observable rather than
+	// theoretical: the losing saver's write has to still be in flight when the
+	// winner's cleanup runs, and 512 KiB is long enough next to the round trips
+	// the winner makes first. Against the unfixed save path this fails inside
+	// ten rounds, every run.
+	const savers = 4
+	const rounds = 40
+	marks := [savers]byte{'a', 'b', 'c', 'd'}
+	for r := range rounds {
+		errs := make([]error, savers)
+		var wg sync.WaitGroup
+		for i := range savers {
+			wg.Go(func() {
+				errs[i] = s.SaveUploadPart(ctx, u.ID, 25, 0, part(marks[i], 512*1024), maxFile)
+			})
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d saver %d: %v", r, i, err)
+			}
+		}
+		assertEveryPartObjectIsNamed(t, s, dir, fmt.Sprintf("round %d", r))
+	}
+
+	// One part, one row, one object: the caps still describe what is stored.
+	parts, _, total, err := s.UploadPartsSummary(ctx, u.ID, 25)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if parts != 1 || total != 512*1024 {
+		t.Fatalf("after %d concurrent saves: parts=%d total=%d, want 1/524288", savers*rounds, parts, total)
+	}
+	if n := countPartKeys(t, dir); n != 1 {
+		t.Fatalf("part objects after %d concurrent saves = %d, want 1", savers*rounds, n)
+	}
+}
+
+// assertEveryPartObjectIsNamed fails if anything under the parts prefix is not
+// named by an upload_parts row. It reads the directory rather than the blob
+// interface on purpose: blob.Store has no enumeration and does not grow one
+// here, and the filesystem is the ground truth the caps are supposed to
+// describe.
+func assertEveryPartObjectIsNamed(t *testing.T, s *store.Store, dir, when string) {
+	t.Helper()
+	keys, err := store.UploadPartKeysNamed(context.Background(), s)
+	if err != nil {
+		t.Fatalf("%s: read named keys: %v", when, err)
+	}
+	named := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		named[k] = true
+	}
+	for _, name := range listPartKeys(t, dir) {
+		if !named[blob.PartsPrefix+name] {
+			t.Fatalf("%s: object %q under the parts prefix is named by no row", when, name)
+		}
 	}
 }
 

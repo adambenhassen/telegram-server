@@ -423,6 +423,27 @@ func (s *Store) FinaliseExpiredPartsForTest(ctx context.Context, claimed []db.Cl
 	return s.finaliseExpiredUploadParts(ctx, claimed)
 }
 
+// UploadPartKeysNamed returns every blob key the upload_parts rows currently
+// name, across all accounts. It is the other half of the orphan assertion: an
+// object under the parts prefix that is not in this set is named by no row, and
+// nothing row-driven will ever reclaim it.
+func UploadPartKeysNamed(ctx context.Context, s *Store) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT blob_key FROM upload_parts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
 // InsertUploadPartWithoutKey writes a parts row carrying the migration's
 // default empty blob_key — the state every part in flight at deploy is left
 // in. No shipped path produces one, and the sweep still has to retire it.

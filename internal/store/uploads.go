@@ -81,6 +81,15 @@ func partIndexOf(i int) (int32, bool) {
 // a loop grows stored bytes without bound while the row-based caps — which
 // count rows, not objects — stay flat.
 //
+// Two deletes, not one, and together they are what makes that hold under
+// concurrency as well as serially: this save's own object is dropped too if the
+// row has moved off it by the time the bytes are down. The advisory lock orders
+// the rows of two concurrent saves of one part but not their byte work, so
+// without the second delete the later saver's cleanup can run before the
+// earlier saver's write and leave an object no row names — reachable on demand,
+// not by any failure. With it, an orphan needs this process or the backend to
+// fail between the write and the cleanup.
+//
 // Lock: one advisory lock on user_id, taken first, so one account's concurrent
 // saves serialise and two of them cannot both read a sum that is under the cap
 // and both commit. It is the same per-owner advisory namespace lockOwners uses
@@ -155,11 +164,28 @@ func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIn
 	// one is already named by no row. It runs whether or not the write above
 	// succeeded, because the commit orphaned it either way, and a failure is
 	// logged rather than returned: the part itself is in the state its row
-	// describes, and an object no row names is what MAIN-344's age pass over
-	// the parts prefix reclaims.
+	// describes.
 	if superseded != "" && superseded != key {
 		if err = s.removePartBytes(ctx, superseded); err != nil {
 			s.log.Error("remove superseded upload part bytes",
+				"user_id", userID, "file_id", fileID, "part", partIndex, "err", err)
+		}
+	}
+
+	// And the object this save just wrote, if the row has already moved off it.
+	// That happens without any failure: two concurrent saves of one part
+	// serialise their rows on the advisory lock but not their byte work, so the
+	// later one's delete of this key can run before this write did, and the
+	// write then lands under a key no row names. The check is AFTER the write
+	// and not before it for exactly that reason — a check before would only
+	// narrow the window, while a writer looking at the row it already committed
+	// against can see the whole outcome. The ordering that makes it total: if
+	// this read still sees our key, then it ran before any superseding commit,
+	// so that save's delete of our key runs after this write and collects it;
+	// if it does not, we collect it here.
+	if putErr == nil {
+		if err = s.dropUnnamedPartBytes(ctx, userID, fileID, partIndex, key); err != nil {
+			s.log.Error("drop unnamed upload part bytes",
 				"user_id", userID, "file_id", fileID, "part", partIndex, "err", err)
 		}
 	}
@@ -169,6 +195,25 @@ func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIn
 		return fmt.Errorf("write part bytes: %w", putErr)
 	}
 	return nil
+}
+
+// dropUnnamedPartBytes deletes the object at key when the part's row no longer
+// names it — because a concurrent save superseded it, or because a sweep or an
+// assembly cleanup retired the row while the bytes were landing. An absent row
+// is the same answer as a different key: nothing names these bytes.
+//
+// A read that fails leaves the object alone. Not knowing which key the row
+// names is not a reason to delete bytes it may still name, and a failing
+// database is the failure class the residual bound already covers.
+func (s *Store) dropUnnamedPartBytes(ctx context.Context, userID, fileID int64, partIndex int, key string) error {
+	current, _, found, err := s.UploadPartKey(ctx, userID, fileID, partIndex)
+	if err != nil {
+		return fmt.Errorf("re-read part key: %w", err)
+	}
+	if found && current == key {
+		return nil
+	}
+	return s.removePartBytes(ctx, key)
 }
 
 // removePartBytes deletes one part's object. An empty key is the migration
