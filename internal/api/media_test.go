@@ -3,7 +3,9 @@ package api_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -56,7 +58,9 @@ func TestSanitizeFileName(t *testing.T) {
 	}
 }
 
-// saveParts uploads each payload as one part of fileID under userID.
+// saveParts uploads each payload as one part of fileID under userID, through
+// the handler that testHandlers builds for this store's blob backend, so the
+// parts land where assembly will look for them.
 func saveParts(t *testing.T, s *store.Store, userID, fileID int64, payloads ...[]byte) {
 	t.Helper()
 	for i, p := range payloads {
@@ -126,7 +130,11 @@ func TestPartsReaderConcatenates(t *testing.T) {
 	}
 	saveParts(t, s, u.ID, 700, []byte("hello "), []byte("wide "), []byte("world"))
 
-	got, err := io.ReadAll(api.NewPartsReaderForTest(s, u.ID, 700, 3))
+	r, err := api.NewPartsReaderForTest(s, u.ID, 700)
+	if err != nil {
+		t.Fatalf("parts reader: %v", err)
+	}
+	got, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -135,7 +143,11 @@ func TestPartsReaderConcatenates(t *testing.T) {
 	}
 
 	// Zero parts is end of stream, not an error and not a spin.
-	empty, err := io.ReadAll(api.NewPartsReaderForTest(s, u.ID, 701, 0))
+	r, err = api.NewPartsReaderForTest(s, u.ID, 701)
+	if err != nil {
+		t.Fatalf("empty parts reader: %v", err)
+	}
+	empty, err := io.ReadAll(r)
 	if err != nil || len(empty) != 0 {
 		t.Errorf("empty read = %q err=%v", empty, err)
 	}
@@ -219,6 +231,44 @@ func TestSendMediaToUser(t *testing.T) {
 	if n != 0 {
 		t.Errorf("parts left = %d, want 0", n)
 	}
+	// The part objects go with the rows: nothing of the upload is left in the
+	// store.
+	if got := partObjects(t, blobs); len(got) != 0 {
+		t.Errorf("part objects left = %d, want 0", len(got))
+	}
+}
+
+// partObjects lists the keys under the parts prefix that blobs still holds.
+func partObjects(t *testing.T, blobs blob.Store) []string {
+	t.Helper()
+	dir, ok := blobLocalDir(t, blobs)
+	if !ok {
+		t.Skip("blob backend is not local; object listing is not available")
+	}
+	entries, err := os.ReadDir(dir + "/parts")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read parts dir: %v", err)
+	}
+	keys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			keys = append(keys, blob.PartsPrefix+e.Name())
+		}
+	}
+	return keys
+}
+
+// blobLocalDir reports the root directory of a local blob backend.
+func blobLocalDir(t *testing.T, b blob.Store) (string, bool) {
+	t.Helper()
+	l, ok := b.(*blob.Local)
+	if !ok {
+		return "", false
+	}
+	return l.RootDir(), true
 }
 
 func TestSendMediaSanitizesStoredMIME(t *testing.T) {

@@ -28,7 +28,7 @@ func TestMain(m *testing.M) {
 func TestBuildUpdatesNewMessage(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey())
+	s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestLoadChannelsNonMemberForbidden(t *testing.T) {
 func chatFixture(t *testing.T, phonePrefix string, members int) (*store.Store, []store.User, store.Chat) {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey())
+	s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

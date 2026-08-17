@@ -51,7 +51,7 @@ func TestRestartPersistence(t *testing.T) {
 	}
 
 	// One database for the whole test.
-	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey())
+	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,6 +158,16 @@ func TestRestartPersistence(t *testing.T) {
 }
 
 // mustListen binds a TCP listener on addr, failing the test on error.
+// testBlobs opens a blob store rooted in the test's own temporary directory.
+func testBlobs(t *testing.T) blob.Store {
+	t.Helper()
+	b, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	return b
+}
+
 func mustListen(t *testing.T, ctx context.Context, addr string) net.Listener {
 	t.Helper()
 	var lc net.ListenConfig

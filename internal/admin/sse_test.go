@@ -840,7 +840,7 @@ func TestSSE_sampler_fails_snapshot_on_partial_query(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

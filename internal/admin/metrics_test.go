@@ -18,7 +18,7 @@ func TestMetricsHandler(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestMetricsHandler_POST(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestMetricsWithUserData(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

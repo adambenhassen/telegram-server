@@ -16,7 +16,7 @@ import (
 func TestRateLimitBasic(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestRateLimitBasic(t *testing.T) {
 func TestRateLimitWindowExpiry(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestRateLimitWindowExpiry(t *testing.T) {
 func TestRateLimitWindowRunsToItsRecordedDeadline(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestRateLimitWindowRunsToItsRecordedDeadline(t *testing.T) {
 func TestRateLimitIndependentSubjects(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestRateLimitIndependentSubjects(t *testing.T) {
 func TestRateLimitIndependentSurfaces(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestRateLimitIndependentSurfaces(t *testing.T) {
 func TestRateLimitDisabled(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestRateLimitDisabled(t *testing.T) {
 func TestRateLimitConcurrentBoundary(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestRateLimitConcurrentBoundary(t *testing.T) {
 func TestRateLimitWaitAccuracy(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +403,7 @@ func TestRateLimitWaitAccuracy(t *testing.T) {
 func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +456,7 @@ func TestRateLimitWaitMinimumOneSecond(t *testing.T) {
 func TestRateLimitWaitRoundsUp(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +504,7 @@ func TestRateLimitWaitRoundsUp(t *testing.T) {
 func TestCheckRateLimitBudgetNoRow(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -540,7 +540,7 @@ func TestCheckRateLimitBudgetNoRow(t *testing.T) {
 func TestCheckRateLimitBudgetAndCharge(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +605,7 @@ func TestCheckRateLimitBudgetAndCharge(t *testing.T) {
 func TestCheckRateLimitBudgetDisabled(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +629,7 @@ func TestCheckRateLimitBudgetDisabled(t *testing.T) {
 func TestChargeRateLimitDisabled(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +660,7 @@ func TestChargeRateLimitDisabled(t *testing.T) {
 func TestRateLimitDenialNotError(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +698,7 @@ func TestRateLimitDenialNotError(t *testing.T) {
 func TestReserveAndRefund(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -800,7 +800,7 @@ func TestReserveAndRefund(t *testing.T) {
 func TestReserveConcurrentBurst(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

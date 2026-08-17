@@ -307,6 +307,30 @@ func loadMigrations() ([]migration, error) {
 	return migs, nil
 }
 
+// AdminDSN triggers the one-time container setup and returns the DSN to the
+// reusable container's "postgres" admin database. A setup failure panics: the
+// callers are tests, and a broken container is not a recoverable state.
+func AdminDSN() string {
+	once.Do(setup)
+	if errSetup != nil {
+		panic("pgtest setup: " + errSetup.Error())
+	}
+	return adminDSN
+}
+
+// DSNFrom returns a DSN for an existing database in the reusable container.
+// The caller owns the database's lifetime; use for building databases from a
+// subset of migrations that the template does not carry.
+func DSNFrom(dbName string) string {
+	return replaceDBName(AdminDSN(), dbName)
+}
+
+// RandomHex returns 16 hex characters of randomness, for callers that build
+// database names in the same "t_" namespace DSN uses.
+func RandomHex() string {
+	return randNameNoT()
+}
+
 // EncKey returns a fixed 32-byte auth-key encryption master key for tests. It is
 // deterministic so a store reopened against the same database (restart tests)
 // decrypts keys written by the prior instance.
