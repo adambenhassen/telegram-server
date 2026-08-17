@@ -1510,35 +1510,52 @@ func TestSendMessageCrossPeerReplyRefused(t *testing.T) {
 	}
 	chID := channelIDFromCreate(t, chRes)
 
-	// 1:1 send: ReplyToPeerID names a chat, not the user destination.
-	req := &tg.MessagesSendMessageRequest{
-		Peer: api.InputPeerUser(a.ID, b.ID), Message: "hi", RandomID: 1,
+	// Post a real message to the channel so the store's own reply-existence check
+	// would accept it. Only the cross-peer guard can then produce MESSAGE_ID_INVALID.
+	postEnc, err := api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerChannel(a.ID, chID), Message: "root", RandomID: 4,
+	})
+	if err != nil {
+		t.Fatalf("channel root post: %v", err)
 	}
-	replyTo := &tg.InputReplyToMessage{ReplyToMsgID: 1}
-	replyTo.SetReplyToPeerID(&tg.InputPeerChat{ChatID: chat.ID})
-	req.SetReplyTo(replyTo)
-	_, err = api.SendMessageForTest(s, a.ID, req)
-	rpcError(t, err, "MESSAGE_ID_INVALID")
+	chPostID := channelPostIDFromSend(t, postEnc)
 
-	// Chat send: ReplyToPeerID names a user, not the chat destination.
-	req = &tg.MessagesSendMessageRequest{
-		Peer: &tg.InputPeerChat{ChatID: chat.ID}, Message: "hi", RandomID: 2,
-	}
-	replyTo = &tg.InputReplyToMessage{ReplyToMsgID: 1}
-	replyTo.SetReplyToPeerID(api.InputPeerUser(a.ID, b.ID))
-	req.SetReplyTo(replyTo)
-	_, err = api.SendMessageForTest(s, a.ID, req)
-	rpcError(t, err, "MESSAGE_ID_INVALID")
+	t.Run("user", func(t *testing.T) {
+		// ReplyToPeerID names a chat, not the user destination.
+		req := &tg.MessagesSendMessageRequest{
+			Peer: api.InputPeerUser(a.ID, b.ID), Message: "hi", RandomID: 1,
+		}
+		replyTo := &tg.InputReplyToMessage{ReplyToMsgID: 1}
+		replyTo.SetReplyToPeerID(&tg.InputPeerChat{ChatID: chat.ID})
+		req.SetReplyTo(replyTo)
+		_, err := api.SendMessageForTest(s, a.ID, req)
+		rpcError(t, err, "MESSAGE_ID_INVALID")
+	})
 
-	// Channel send: ReplyToPeerID names a user, not the channel destination.
-	req = &tg.MessagesSendMessageRequest{
-		Peer: api.InputPeerChannel(a.ID, chID), Message: "hi", RandomID: 3,
-	}
-	replyTo = &tg.InputReplyToMessage{ReplyToMsgID: 1}
-	replyTo.SetReplyToPeerID(api.InputPeerUser(a.ID, b.ID))
-	req.SetReplyTo(replyTo)
-	_, err = api.SendMessageForTest(s, a.ID, req)
-	rpcError(t, err, "MESSAGE_ID_INVALID")
+	t.Run("chat", func(t *testing.T) {
+		// ReplyToPeerID names a user, not the chat destination.
+		req := &tg.MessagesSendMessageRequest{
+			Peer: &tg.InputPeerChat{ChatID: chat.ID}, Message: "hi", RandomID: 2,
+		}
+		replyTo := &tg.InputReplyToMessage{ReplyToMsgID: 1}
+		replyTo.SetReplyToPeerID(api.InputPeerUser(a.ID, b.ID))
+		req.SetReplyTo(replyTo)
+		_, err := api.SendMessageForTest(s, a.ID, req)
+		rpcError(t, err, "MESSAGE_ID_INVALID")
+	})
+
+	t.Run("channel", func(t *testing.T) {
+		// ReplyToPeerID names a user, not the channel destination.
+		// chPostID is a real post, so only the guard produces MESSAGE_ID_INVALID.
+		req := &tg.MessagesSendMessageRequest{
+			Peer: api.InputPeerChannel(a.ID, chID), Message: "hi", RandomID: 3,
+		}
+		replyTo := &tg.InputReplyToMessage{ReplyToMsgID: chPostID}
+		replyTo.SetReplyToPeerID(api.InputPeerUser(a.ID, b.ID))
+		req.SetReplyTo(replyTo)
+		_, err := api.SendMessageForTest(s, a.ID, req)
+		rpcError(t, err, "MESSAGE_ID_INVALID")
+	})
 }
 
 func TestSendMessageSamePeerReplyPassesThrough(t *testing.T) {
@@ -1556,6 +1573,8 @@ func TestSendMessageSamePeerReplyPassesThrough(t *testing.T) {
 	}
 
 	// 1:1 path: send a message, then reply with ReplyToPeerID naming the same user.
+	// Asserts criterion 2: the peer field is treated as absent, not stripped —
+	// the returned message carries the reply header with the sent id.
 	if _, err = api.SendMessageForTest(s, a.ID, &tg.MessagesSendMessageRequest{
 		Peer: api.InputPeerUser(a.ID, b.ID), Message: "first", RandomID: 100,
 	}); err != nil {
@@ -1567,9 +1586,11 @@ func TestSendMessageSamePeerReplyPassesThrough(t *testing.T) {
 	replyTo := &tg.InputReplyToMessage{ReplyToMsgID: 1}
 	replyTo.SetReplyToPeerID(api.InputPeerUser(a.ID, b.ID))
 	req.SetReplyTo(replyTo)
-	if _, err = api.SendMessageForTest(s, a.ID, req); err != nil {
-		t.Errorf("1:1 same-peer reply: %v", err)
+	enc, err := api.SendMessageForTest(s, a.ID, req)
+	if err != nil {
+		t.Fatalf("1:1 same-peer reply: %v", err)
 	}
+	assertReplyToMsgID(t, "1:1", enc, 1)
 
 	// Chat path: send a message, then reply with ReplyToPeerID naming the same chat.
 	chat, err := s.CreateChat(ctx, a.ID, "Crew", []int64{b.ID})
@@ -1587,9 +1608,11 @@ func TestSendMessageSamePeerReplyPassesThrough(t *testing.T) {
 	replyTo = &tg.InputReplyToMessage{ReplyToMsgID: 1}
 	replyTo.SetReplyToPeerID(&tg.InputPeerChat{ChatID: chat.ID})
 	req.SetReplyTo(replyTo)
-	if _, err = api.SendMessageForTest(s, a.ID, req); err != nil {
-		t.Errorf("chat same-peer reply: %v", err)
+	enc, err = api.SendMessageForTest(s, a.ID, req)
+	if err != nil {
+		t.Fatalf("chat same-peer reply: %v", err)
 	}
+	assertReplyToMsgID(t, "chat", enc, 1)
 
 	// Channel path: post a message, then reply with ReplyToPeerID naming the same channel.
 	chRes, err := api.CreateChannelForTest(s, a.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "News"})
@@ -1610,7 +1633,54 @@ func TestSendMessageSamePeerReplyPassesThrough(t *testing.T) {
 	replyTo = &tg.InputReplyToMessage{ReplyToMsgID: postID}
 	replyTo.SetReplyToPeerID(api.InputPeerChannel(a.ID, chID))
 	req.SetReplyTo(replyTo)
-	if _, err = api.SendMessageForTest(s, a.ID, req); err != nil {
-		t.Errorf("channel same-peer reply: %v", err)
+	enc, err = api.SendMessageForTest(s, a.ID, req)
+	if err != nil {
+		t.Fatalf("channel same-peer reply: %v", err)
 	}
+	assertReplyToMsgID(t, "channel", enc, postID)
+}
+
+// assertReplyToMsgID checks that enc (a *tg.Updates from SendMessageForTest)
+// contains a new-message update whose ReplyTo header carries wantID.
+func assertReplyToMsgID(t *testing.T, path string, enc bin.Encoder, wantID int) {
+	t.Helper()
+	ups, ok := enc.(*tg.Updates)
+	if !ok {
+		t.Errorf("%s: result type = %T, want *tg.Updates", path, enc)
+		return
+	}
+	for _, u := range ups.Updates {
+		var msg *tg.Message
+		switch nm := u.(type) {
+		case *tg.UpdateNewMessage:
+			msg, ok = nm.Message.(*tg.Message)
+		case *tg.UpdateNewChannelMessage:
+			msg, ok = nm.Message.(*tg.Message)
+		default:
+			continue
+		}
+		if !ok {
+			continue
+		}
+		rt, ok := msg.GetReplyTo()
+		if !ok {
+			t.Errorf("%s: message has no ReplyTo header", path)
+			return
+		}
+		hdr, ok := rt.(*tg.MessageReplyHeader)
+		if !ok {
+			t.Errorf("%s: ReplyTo type = %T, want *tg.MessageReplyHeader", path, rt)
+			return
+		}
+		id, ok := hdr.GetReplyToMsgID()
+		if !ok {
+			t.Errorf("%s: ReplyTo header missing ReplyToMsgID", path)
+			return
+		}
+		if id != wantID {
+			t.Errorf("%s: ReplyToMsgID = %d, want %d", path, id, wantID)
+		}
+		return
+	}
+	t.Errorf("%s: no new-message update found in updates", path)
 }

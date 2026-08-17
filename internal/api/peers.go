@@ -72,6 +72,11 @@ func (h *handlers) inputPeer(peer tg.InputPeerClass, viewerID int64) (store.Peer
 // replyPeerIsDest reports whether p names the same peer as (destType, destID).
 // selfID is the caller's user id, used to resolve InputPeerSelf. No database
 // access is performed, so a foreign peer's existence cannot be probed.
+//
+// InputPeerUserFromMessage and InputPeerChannelFromMessage always return false:
+// they carry a message reference, not just an id, so they cannot be compared
+// structurally to the destination. This is the only reading criterion 4 permits
+// — accepting them as a destination match would require a message lookup.
 func replyPeerIsDest(p tg.InputPeerClass, destType store.PeerType, destID, selfID int64) bool {
 	switch v := p.(type) {
 	case *tg.InputPeerEmpty:
