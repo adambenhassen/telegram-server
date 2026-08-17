@@ -7,6 +7,8 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const fileForDownload = `-- name: FileForDownload :one
@@ -174,6 +176,106 @@ func (q *Queries) MarkFileStored(ctx context.Context, id int64) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const maxFileID = `-- name: MaxFileID :one
+SELECT coalesce(max(id), 0)::bigint FROM files
+`
+
+func (q *Queries) MaxFileID(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, maxFileID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const mediaErasureScan = `-- name: MediaErasureScan :many
+SELECT f.id, f.size, f.stored,
+       (f.date < $1::timestamptz) AS aged,
+       EXISTS (
+           SELECT 1 FROM messages m
+           WHERE m.file_id = f.id AND m.deleted = false
+       ) AS message_ref,
+       EXISTS (
+           SELECT 1 FROM channel_messages cm
+           WHERE cm.file_id = f.id AND cm.deleted = false
+       ) AS channel_ref
+FROM files f
+WHERE f.id > $2 AND f.id <= $3
+ORDER BY f.id
+LIMIT $4::int
+`
+
+type MediaErasureScanParams struct {
+	OlderThan pgtype.Timestamptz
+	AfterID   int64
+	ThroughID int64
+	Lim       int32
+}
+
+type MediaErasureScanRow struct {
+	ID         int64
+	Size       int64
+	Stored     bool
+	Aged       bool
+	MessageRef bool
+	ChannelRef bool
+}
+
+// MediaErasureScan classifies one bounded window of files rows: for each row it
+// reports whether anything live references it, and whether it is past the age
+// cutoff. It names nothing for deletion; it deletes nothing.
+//
+// It takes no lock of any kind, and that is a requirement rather than an
+// omission. files is the terminal lock class — a reference insert takes that
+// row FOR SHARE and waits for nothing afterwards — so a scan holding one would
+// put a send, a forward or a download behind a background pass. Naming a
+// candidate does not require holding it; deciding what an eraser holds, and in
+// what order, is stage 3's design.
+//
+// The window is the whole table paged by id rather than a pre-filtered
+// candidate set, because the caller has to report why each file it did NOT name
+// was held back. Filtering those out here would make that count unobservable.
+//
+// The reference predicate is the union the download gate already reads:
+// non-deleted messages OR non-deleted channel_messages. channel_messages is in
+// it even though no handler can currently post channel media — omitting it
+// passes every test that can be written today and starts destroying live
+// channel media the day channel posts carry a file id.
+//
+// access_hash is deliberately not selected. It is the unguessable half of a
+// download credential, and a candidate report is exactly the kind of record
+// that ends up in log aggregation.
+func (q *Queries) MediaErasureScan(ctx context.Context, arg MediaErasureScanParams) ([]MediaErasureScanRow, error) {
+	rows, err := q.db.Query(ctx, mediaErasureScan,
+		arg.OlderThan,
+		arg.AfterID,
+		arg.ThroughID,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []MediaErasureScanRow
+	for rows.Next() {
+		var i MediaErasureScanRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Size,
+			&i.Stored,
+			&i.Aged,
+			&i.MessageRef,
+			&i.ChannelRef,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const userStoredBytes = `-- name: UserStoredBytes :one

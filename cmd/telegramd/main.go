@@ -110,6 +110,11 @@ func run(log *slog.Logger) error {
 	sweepWG.Go(func() {
 		sweepExpiredAdminSessions(sweepCtx, st, log)
 	})
+	if cfg.MediaErasureReportInterval > 0 {
+		sweepWG.Go(func() {
+			reportMediaErasureCandidates(sweepCtx, st, cfg.MediaErasureMinAge, cfg.MediaErasureReportInterval, log)
+		})
+	}
 	defer func() {
 		cancelSweep()
 		sweepWG.Wait()
@@ -325,6 +330,55 @@ func sweepExpiredUploadParts(ctx context.Context, st *store.Store, ttl time.Dura
 				continue
 			}
 			log.Info("swept expired upload parts", "deleted", n)
+		}
+	}
+}
+
+// reportMediaErasureCandidates periodically counts what a media erase could
+// reclaim and what is holding the rest back, until ctx is canceled.
+//
+// It is named a report rather than a sweep because it removes nothing: no row,
+// no blob, no quota. The eraser is a later stage of M17 and lands with its own
+// human decision to enable destruction; this pass exists so an operator can see
+// the size of the reclaim before anything is allowed to perform it, and it is
+// safe to leave running indefinitely.
+//
+// It logs aggregates and never a file's access hash. That value is the
+// unguessable half of a download credential, so it must not reach log
+// aggregation for every file a report names — which is why store's candidate
+// type does not carry it at all rather than this line choosing not to print it.
+//
+// Off unless an operator sets an interval, and that default is why: the
+// reference predicate is a SubPlan the planner cannot lift into a semi-join,
+// and past roughly 300k media messages it stops being hashable and runs once
+// per files row. See MediaErasureReportInterval for the measurement. An index
+// on messages (file_id) is what makes it cheap, and that belongs with the
+// ticket that decides how often a reclaim runs — it buys a write on every send,
+// which is not a cost a report should be quietly incurring.
+func reportMediaErasureCandidates(ctx context.Context, st *store.Store, minAge, interval time.Duration, log *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// The cutoff is read per pass, not per batch: what a report holds
+			// back is decided once, at its start, the same way a sweep's is.
+			c, err := st.MediaErasureSummary(ctx, time.Now().Add(-minAge), store.ErasureScanBatch)
+			if err != nil {
+				log.Error("media erasure report", "err", err)
+				continue
+			}
+			log.Info("media erasure candidates",
+				"scanned", c.Scanned,
+				"unreferenced", c.Unreferenced,
+				"unreferenced_bytes", c.UnreferencedBytes,
+				"unassembled", c.Unassembled,
+				"unassembled_bytes", c.UnassembledBytes,
+				"skipped_message_ref", c.SkippedMessageRef,
+				"skipped_channel_ref", c.SkippedChannelRef,
+				"skipped_too_new", c.SkippedTooNew)
 		}
 	}
 }
