@@ -73,10 +73,10 @@ func (h *handlers) inputPeer(peer tg.InputPeerClass, viewerID int64) (store.Peer
 // selfID is the caller's user id, used to resolve InputPeerSelf. No database
 // access is performed, so a foreign peer's existence cannot be probed.
 //
-// InputPeerUserFromMessage and InputPeerChannelFromMessage always return false:
-// they carry a message reference, not just an id, so they cannot be compared
-// structurally to the destination. This is the only reading criterion 4 permits
-// — accepting them as a destination match would require a message lookup.
+// InputPeerUserFromMessage and InputPeerChannelFromMessage always return false.
+// They are "min" peer references resolved via a message context; inputPeer does
+// not accept those forms as destinations, so treating them as a destination
+// match here would be inconsistent with the rest of the send path.
 func replyPeerIsDest(p tg.InputPeerClass, destType store.PeerType, destID, selfID int64) bool {
 	switch v := p.(type) {
 	case *tg.InputPeerEmpty:
