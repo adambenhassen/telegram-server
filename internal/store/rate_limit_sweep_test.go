@@ -14,7 +14,7 @@ func TestSweepRemovesExpiredRows(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(ctx, dsn, pgtest.EncKey())
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestSweepCannotChangeTheAnswer(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
 			dsn := pgtest.DSN(t)
-			s, err := store.Open(ctx, dsn, pgtest.EncKey())
+			s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -124,7 +124,7 @@ func TestSweepVsCheckRace(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(ctx, dsn, pgtest.EncKey())
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

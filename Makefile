@@ -94,18 +94,38 @@ TESTENV := $(shell [ -f /.dockerenv ] && echo TESTCONTAINERS_RYUK_DISABLED=true)
 # (API 1.48); an older daemon refuses the flag, and setup must not start
 # failing where it used to work, so we retry plainly and say what moves.
 #
-# Only "already in the network" is ignored, and nothing else: a silent failure
-# here buys back the exact timeout this target exists to prevent, minutes later
-# and looking like a broken test. /etc/hostname is not the container's Docker
-# name under --hostname or pod-style networking, and the socket may be absent —
-# both must be loud. A container already on the bridge keeps whatever priority
-# it joined with; `docker network disconnect bridge <name>` once, then rerun.
+# A daemon reached over a TCP DOCKER_HOST rather than a bind-mounted socket — a
+# DinD sidecar — has never heard of this container, so it answers "No such
+# container" and no join is possible there. None is needed either: that
+# daemon's bridge subnet is not ours to route to, and pgtest already probes the
+# bridge address and falls back to the published port, which testcontainers
+# resolves against the daemon's host. So that one answer is a skip, and it is
+# still an answer: it proves the daemon is up and talking, which is what this
+# target checks for. Postgres being unreachable after that stays loud in
+# pgtest's own setup, which names the host and port it gave up on.
+#
+# That skip is gated on the topology, not on the message, because the same
+# message means something else on a local socket: /etc/hostname is not the
+# container's Docker name under --hostname or pod-style networking, and there
+# the join really is needed and really did not happen. So on a local socket
+# (DOCKER_HOST unset or unix://) "No such container" stays loud, as does every
+# other failure — a silent one here buys back the exact timeout this target
+# exists to prevent, minutes later and looking like a broken test.
+#
+# A container already on the bridge keeps whatever priority it joined with;
+# `docker network disconnect bridge <name>` once, then rerun.
 docker-bridge:
 	@[ -f /.dockerenv ] || exit 0; \
 	name=$$(cat /etc/hostname); \
 	out=$$(docker network connect --gw-priority=-100 bridge "$$name" 2>&1) && exit 0; \
 	case "$$out" in \
 	*"already exists in network"*) exit 0;; \
+	*"No such container"*) \
+	   case "$$DOCKER_HOST" in \
+	   ""|unix://*) ;; \
+	   *) echo "make: docker daemon at $$DOCKER_HOST does not manage this container, so there is no bridge to join; pgtest will reach Postgres on its published port. See docs/testing.md" >&2; \
+	      exit 0;; \
+	   esac;; \
 	*"unknown flag"*|*"unknown shorthand flag"*|*"requires API version"*) \
 	   echo "make: this docker daemon predates --gw-priority (Docker 28+); joining the bridge without it, which moves this container's default route to the bridge gateway. See docs/testing.md" >&2; \
 	   out=$$(docker network connect bridge "$$name" 2>&1) && exit 0; \

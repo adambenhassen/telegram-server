@@ -248,8 +248,9 @@ type UploadPart struct {
 	UserID    int64
 	FileID    int64
 	PartIndex int32
-	Payload   []byte
 	Date      pgtype.Timestamptz
+	Size      int64
+	BlobKey   string
 }
 
 type User struct {

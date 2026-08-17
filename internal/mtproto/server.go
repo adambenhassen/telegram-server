@@ -400,6 +400,11 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 	}()
 
 	conn := newConn(tconn, s.cipher, s.msgID, s.clock, s.writeTimeout, s.log)
+	// The not-implemented sampler holds its suppressed count open until a later
+	// line on this conn, and a conn that ends or goes quiet has no later line.
+	// The drop writes whatever it owes, before the socket closes and never
+	// under any counter lock the sampler would have — there is none.
+	defer conn.FlushUnimplementedLog()
 	b := new(bin.Buffer)
 	var lastTouch time.Time
 	// registeredUser is the userID this conn is currently registered under

@@ -17,7 +17,7 @@ import (
 func TestUsernameLookupBurstCap(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestUsernameLookupBurstCap(t *testing.T) {
 func TestUsernameLookupQuota(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestUsernameLookupQuota(t *testing.T) {
 func TestUsernameLookupRetrySame(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestUsernameLookupRetrySame(t *testing.T) {
 func TestUsernameLookupConcurrentBoundary(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

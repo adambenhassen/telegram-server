@@ -40,6 +40,24 @@ func (s *logSampler) allow(now time.Time, interval time.Duration) (int64, bool) 
 	return s.dropped.Swap(0), true
 }
 
+// flush reports the lines suppressed since the last one emitted and owes a
+// line only when there is a count to say. allow is the interval gate; flush is
+// the drop gate — a caller that is ending or going quiet owes the count even
+// though no further line will come to carry it. It emits nothing when nothing
+// was suppressed: the last line already stood for every call, and a drop that
+// wrote a zero-count line would be a line the conn never owed. It writes
+// nothing itself: the caller decides what the line says, the same way it does
+// for allow.
+func (s *logSampler) flush(now time.Time) (int64, bool) {
+	n := now.UnixNano()
+	last := s.last.Load()
+	if !s.last.CompareAndSwap(last, n) {
+		return 0, false
+	}
+	dropped := s.dropped.Swap(0)
+	return dropped, dropped > 0
+}
+
 const (
 	// proxyV2FixedLen is the fixed part of a v2 header: the 12-byte signature,
 	// one byte of version and command, one of address family and protocol, and

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/admin"
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -59,7 +60,11 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, dsn, make([]byte, 32))
+	blobs, err := blob.NewLocal(os.TempDir() + "/tg-admin-e2e-blobs")
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(ctx, dsn, make([]byte, 32), store.WithBlobStore(blobs))
 	if err != nil {
 		return err
 	}

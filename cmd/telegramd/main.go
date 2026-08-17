@@ -68,7 +68,12 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("server RSA key", "key_id", keyID, "fingerprint", rsakey.Fingerprint(&key.PublicKey), "path", cfg.RSAKeyPath)
 
-	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log))
+	blobs, err := blob.NewLocal(cfg.BlobDir)
+	if err != nil {
+		return err
+	}
+
+	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log), store.WithBlobStore(blobs))
 	if err != nil {
 		return err
 	}
@@ -119,11 +124,6 @@ func run(log *slog.Logger) error {
 		cancelSweep()
 		sweepWG.Wait()
 	}()
-
-	blobs, err := blob.NewLocal(cfg.BlobDir)
-	if err != nil {
-		return err
-	}
 
 	// Derive the peer-hash subkey here, at process start, and hand only the
 	// subkey to the RPC layer. cfg.AuthKeyEncKey itself must not travel past

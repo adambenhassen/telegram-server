@@ -11,6 +11,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -436,7 +437,11 @@ func TestDeliverChannelPostPushesViaRealStore(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(ctx, dsn, pgtest.EncKey())
+	b, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(b))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

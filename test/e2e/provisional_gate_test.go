@@ -39,7 +39,7 @@ func TestProvisionalGateProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey())
+	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

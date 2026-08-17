@@ -395,7 +395,7 @@ func bootstrapParams(tb testing.TB) store.BootstrapParams {
 func openStore(tb testing.TB, dsn string) *store.Store {
 	tb.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, dsn, pgtest.EncKey())
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(tb)))
 	if err != nil {
 		tb.Fatalf("store.Open: %v", err)
 	}

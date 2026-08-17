@@ -11,15 +11,26 @@ import (
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/admin"
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
+
+// testBlobs opens a blob store rooted in the test's own temporary directory.
+func testBlobs(t *testing.T) blob.Store {
+	t.Helper()
+	b, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	return b
+}
 
 // newTestStore opens a store and returns it along with a cleanup function.
 func newTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

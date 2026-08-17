@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/netip"
+	"os"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -84,9 +85,13 @@ func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code stri
 // UnhandledForTest drives the dispatcher's fallback for the external api_test
 // package, over a body positioned at its constructor id. It returns the error
 // the caller would receive and writes the record the RPC-gap capture reads.
-func UnhandledForTest(log *slog.Logger, body *bin.Buffer) error {
+//
+// c carries the per-connection budget the fallback charges, so a caller driving
+// the bound passes the same conn across calls and one driving a single call
+// passes a fresh one.
+func UnhandledForTest(log *slog.Logger, c *mtproto.Conn, body *bin.Buffer) error {
 	h := &handlers{log: log}
-	return h.handleUnknown(nil, &mtproto.Request{Ctx: context.Background(), Buf: body})
+	return h.handleUnknown(c, &mtproto.Request{Ctx: context.Background(), Buf: body})
 }
 
 // TestMaxFileBytes is the per-file upload cap test handlers run with. It is the
@@ -99,7 +104,20 @@ func MaxFileParts() int {
 	return testHandlers(nil).maxFileParts()
 }
 
+// testBlobsDir is where testHandlers' upload-part blob backend lives. Tests
+// that need to inspect the part objects open a second store on this directory.
+var testBlobsDir = os.TempDir() + "/tg-api-test-blobs"
+
+// BlobsDirForTest exposes the directory the test handlers' upload-part blob
+// backend is rooted in, so a test can open a second store on it and inspect
+// the part objects the handlers wrote.
+func BlobsDirForTest() string { return testBlobsDir }
+
 func testHandlers(s *store.Store) *handlers {
+	blobs, err := blob.NewLocal(testBlobsDir)
+	if err != nil {
+		panic(err)
+	}
 	return &handlers{
 		store:                    s,
 		log:                      slog.New(slog.DiscardHandler),
@@ -115,6 +133,7 @@ func testHandlers(s *store.Store) *handlers {
 		rateLimitSignUpIP:        store.RateLimitConfig{},
 		rateLimitPasswordProof:   store.RateLimitConfig{},
 		rateLimitGetPassword:     store.RateLimitConfig{},
+		blobs:                    blobs,
 	}
 }
 
@@ -168,6 +187,18 @@ func SaveFilePartForTest(s *store.Store, userID int64, req *tg.UploadSaveFilePar
 	return testHandlers(s).handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SaveFilePartBlobsForTest is SaveFilePartForTest against a handler wired to
+// blobs, for tests that inspect the part objects afterwards.
+func SaveFilePartBlobsForTest(s *store.Store, blobs blob.Store, userID int64, req *tg.UploadSaveFilePartRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.blobs = blobs
+	return h.handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SaveFilePartCappedForTest is SaveFilePartForTest against a handler built with
 // maxFileBytes, so a test can reach the per-file and per-user caps without
 // uploading a hundred megabytes.
@@ -176,7 +207,11 @@ func SaveFilePartCappedForTest(s *store.Store, userID int64, maxFileBytes int64,
 	if err := req.Encode(&buf); err != nil {
 		return nil, err
 	}
-	h := &handlers{store: s, log: slog.New(slog.DiscardHandler), maxFileBytes: maxFileBytes}
+	blobs, err := blob.NewLocal(testBlobsDir)
+	if err != nil {
+		panic(err)
+	}
+	h := &handlers{store: s, log: slog.New(slog.DiscardHandler), maxFileBytes: maxFileBytes, blobs: blobs}
 	return h.handleSaveFilePart(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
@@ -528,9 +563,15 @@ var (
 )
 
 // NewPartsReaderForTest builds the streaming reader over an in-flight upload's
-// parts, for the external api_test package.
-func NewPartsReaderForTest(s *store.Store, userID, fileID int64, total int) io.Reader {
-	return &partsReader{ctx: context.Background(), store: s, userID: userID, fileID: fileID, total: total}
+// parts, for the external api_test package. It reads the refs the way assembly
+// does, so the reader under test is fed exactly what the shipped path feeds it.
+func NewPartsReaderForTest(s *store.Store, userID, fileID int64) (io.Reader, error) {
+	ctx := context.Background()
+	refs, err := s.UploadPartRefs(ctx, userID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	return &partsReader{ctx: ctx, store: s, refs: refs}, nil
 }
 
 // EditMessageForTest encodes req and invokes handleEditMessage for the caller.
