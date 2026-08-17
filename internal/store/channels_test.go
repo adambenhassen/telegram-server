@@ -987,7 +987,7 @@ func TestSetChannelPinnedMessageRejectsDemotedAdmin(t *testing.T) {
 	}
 
 	// Post a message so there is something to pin.
-	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "pin me", 1, nil)
+	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "pin me", 1, nil, 0)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
@@ -1057,7 +1057,7 @@ func TestSetChannelPinnedMessageRejectsBannedAdmin(t *testing.T) {
 	}
 
 	// Post a message so there is something to pin.
-	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "pin me", 1, nil)
+	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "pin me", 1, nil, 0)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
@@ -1127,7 +1127,7 @@ func TestSetChannelPinnedMessageAllowsLegitimateAdmin(t *testing.T) {
 	}
 
 	// Post a message so there is something to pin.
-	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "pin me", 1, nil)
+	post, _, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "pin me", 1, nil, 0)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
@@ -1176,7 +1176,7 @@ func TestSetChannelPinnedMessageRejectsDeletedPost(t *testing.T) {
 	ch := mustChannel(t, s, author.ID, "test channel").ID
 
 	// Post a message.
-	post, _, _, err := s.PostChannelMessage(ctx, ch, author.ID, "hello", 1, nil)
+	post, _, _, err := s.PostChannelMessage(ctx, ch, author.ID, "hello", 1, nil, 0)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}

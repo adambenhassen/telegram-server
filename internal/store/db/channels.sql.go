@@ -53,12 +53,13 @@ SELECT
     top.edit_date              AS top_edit_date,
     COALESCE(top.deleted, false) AS top_deleted,
     COALESCE(top.random_id, 0) AS top_random_id,
-    top.file_id                AS top_file_id
+    top.file_id                AS top_file_id,
+    top.reply_to_msg_id        AS top_reply_to_msg_id
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
 LEFT JOIN LATERAL (
-    SELECT cm.channel_id, cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date, cm.deleted, cm.random_id, cm.file_id
+    SELECT cm.channel_id, cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date, cm.deleted, cm.random_id, cm.file_id, cm.reply_to_msg_id
     FROM channel_messages cm
     WHERE cm.channel_id = c.id AND cm.deleted = false
     ORDER BY cm.local_id DESC
@@ -69,24 +70,25 @@ ORDER BY c.id
 `
 
 type ChannelDialogsForUserRow struct {
-	ChannelID   int64
-	Title       string
-	About       string
-	CreatorID   int64
-	Megagroup   bool
-	Version     int32
-	ChannelDate pgtype.Timestamptz
-	Pts         int64
-	NextLocalID int64
-	StateDate   pgtype.Timestamptz
-	TopLocalID  int64
-	TopFromID   int64
-	TopDate     pgtype.Timestamptz
-	TopMessage  string
-	TopEditDate pgtype.Timestamptz
-	TopDeleted  bool
-	TopRandomID int64
-	TopFileID   *int64
+	ChannelID       int64
+	Title           string
+	About           string
+	CreatorID       int64
+	Megagroup       bool
+	Version         int32
+	ChannelDate     pgtype.Timestamptz
+	Pts             int64
+	NextLocalID     int64
+	StateDate       pgtype.Timestamptz
+	TopLocalID      int64
+	TopFromID       int64
+	TopDate         pgtype.Timestamptz
+	TopMessage      string
+	TopEditDate     pgtype.Timestamptz
+	TopDeleted      bool
+	TopRandomID     int64
+	TopFileID       *int64
+	TopReplyToMsgID *int32
 }
 
 // ChannelDialogsForUser returns every channel the user belongs to alongside the
@@ -125,6 +127,7 @@ func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Ch
 			&i.TopDeleted,
 			&i.TopRandomID,
 			&i.TopFileID,
+			&i.TopReplyToMsgID,
 		); err != nil {
 			return nil, err
 		}

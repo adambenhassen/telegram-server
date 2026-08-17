@@ -5,11 +5,14 @@ package rsakey
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/gotd/td/crypto"
 )
@@ -54,4 +57,23 @@ func generate(path string) (*rsa.PrivateKey, error) {
 // Fingerprint returns the Telegram RSA fingerprint of the public key.
 func Fingerprint(pub *rsa.PublicKey) int64 {
 	return crypto.RSAFingerprint(pub)
+}
+
+// KeyID returns the SHA-256 of the DER SubjectPublicKeyInfo encoding of the
+// public key, hex-encoded as 16 dash-separated groups of 4 characters
+// (e.g. "a1b2-c3d4-e5f6-a7b8-..."). The grouping keeps the 64-character digest
+// comparable by eye against the client UI; MAIN-314 renders the identical
+// format.
+func KeyID(pub *rsa.PublicKey) (string, error) {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return "", fmt.Errorf("marshal SubjectPublicKeyInfo: %w", err)
+	}
+	sum := sha256.Sum256(der)
+	hexStr := hex.EncodeToString(sum[:])
+	groups := make([]string, 0, 16)
+	for i := 0; i < len(hexStr); i += 4 {
+		groups = append(groups, hexStr[i:i+4])
+	}
+	return strings.Join(groups, "-"), nil
 }
