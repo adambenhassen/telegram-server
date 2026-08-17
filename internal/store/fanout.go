@@ -192,6 +192,14 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, log *slog.Logger, f
 		return Message{}, nil, false, err
 	}
 
+	// One lock for the whole fan-out, taken before the first per-member insert,
+	// which is what makes the fan-out all-or-nothing with respect to the file:
+	// every copy carries the reference or the transaction writes none of them.
+	// Service messages carry no file id and reach no query here.
+	if err = lockFileRefs(ctx, qtx, f.FileID); err != nil {
+		return Message{}, nil, false, err
+	}
+
 	// Idempotency: a resend with the same random_id returns the original. The
 	// token lives on the sender's copy only, so the 1:1 contract carries over
 	// unchanged — no new rows, no new events, no pts movement, and each owner

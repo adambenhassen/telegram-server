@@ -141,6 +141,29 @@ func (q *Queries) InsertFile(ctx context.Context, arg InsertFileParams) (File, e
 	return i, err
 }
 
+const lockFileForReference = `-- name: LockFileForReference :one
+SELECT id FROM files WHERE id = $1 FOR SHARE
+`
+
+// LockFileForReference is the M17 interlock. messages.file_id has no foreign
+// key and the pool runs at READ COMMITTED, so a reference insert is invisible
+// to a concurrent reader and no re-read of the reference set can see one in
+// flight. The files row is therefore the lock object: every path that writes a
+// non-zero messages.file_id takes this inside the transaction that inserts the
+// referencing row(s), and an eraser takes the same row FOR UPDATE before
+// deleting it, so the two orders are the only two possible and each is correct.
+//
+// Shared, not exclusive: concurrent references to one file are ordinary traffic
+// and must not serialize behind each other. Returning no row is the fail-closed
+// branch — the caller aborts rather than writing a reference to a file that is
+// not there to lock.
+func (q *Queries) LockFileForReference(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRow(ctx, lockFileForReference, id)
+	var id_2 int64
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const markFileStored = `-- name: MarkFileStored :execrows
 UPDATE files SET stored = true WHERE id = $1 AND stored = false
 `

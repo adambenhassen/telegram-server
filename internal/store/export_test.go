@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -330,6 +332,112 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 // StorePool returns the Store's pgxpool.Pool for tests that need a raw
 // connection independent of the Store's query layer.
 func StorePool(s *Store) *pgxpool.Pool { return s.pool }
+
+// EraseFileRow deletes one files row. Nothing in the shipped server deletes one
+// — the eraser is a later stage of M17 — so this is the only way a test can
+// reach the state the reference interlock fails closed on.
+func EraseFileRow(ctx context.Context, s *Store, fileID int64) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM files WHERE id = $1`, fileID)
+	if err != nil {
+		return err
+	}
+	// A wrong id would otherwise leave the row in place and the test asserting
+	// against a file that is still perfectly referenceable.
+	if n := tag.RowsAffected(); n != 1 {
+		return fmt.Errorf("erase file row: %d rows for id %d, want 1", n, fileID)
+	}
+	return nil
+}
+
+// FileRowHold is an open transaction holding one files row, standing in for the
+// eraser that does not exist yet. It is how a test controls the moment a
+// reference insert is allowed past the row.
+type FileRowHold struct {
+	tx pgx.Tx
+	id int64
+}
+
+// HoldFileRow takes fileID's files row FOR UPDATE in a transaction of its own
+// and holds it until the caller releases or erases it.
+func HoldFileRow(ctx context.Context, s *Store, fileID int64) (*FileRowHold, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var got int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM files WHERE id = $1 FOR UPDATE`, fileID).Scan(&got); err != nil {
+		_ = tx.Rollback(ctx) //nolint:errcheck // best effort on the error path
+		return nil, err
+	}
+	return &FileRowHold{tx: tx, id: fileID}, nil
+}
+
+// Release drops the lock without touching the row. It takes no context so a
+// test can defer it, and it is safe to call twice — a rollback of a finished
+// transaction is a no-op — so a test can also release early.
+func (h *FileRowHold) Release() {
+	_ = h.tx.Rollback(context.Background()) //nolint:errcheck // nothing to commit
+}
+
+// EraseAndCommit deletes the held row and commits, which is the sequence the
+// eraser will perform and the one a concurrent reference insert has to lose to.
+func (h *FileRowHold) EraseAndCommit(ctx context.Context) error {
+	if _, err := h.tx.Exec(ctx, `DELETE FROM files WHERE id = $1`, h.id); err != nil {
+		return err
+	}
+	return h.tx.Commit(ctx)
+}
+
+// HoldFileRowShared takes fileID's files row FOR SHARE — the same mode a
+// reference insert takes — and holds it until release is called. It is how a
+// test asserts that two references to one file are concurrent rather than
+// serialized.
+func HoldFileRowShared(ctx context.Context, s *Store, fileID int64) (release func(), err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var got int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM files WHERE id = $1 FOR SHARE`, fileID).Scan(&got); err != nil {
+		_ = tx.Rollback(ctx) //nolint:errcheck // best effort on the error path
+		return nil, err
+	}
+	return func() { _ = tx.Rollback(ctx) }, nil //nolint:errcheck // nothing to commit
+}
+
+// FilesTableAccesses reports how many scans Postgres has recorded against the
+// files table in this test's database. "The text path issues no extra query" is
+// a statement about what reached the table, and this is the only place that is
+// observable without instrumenting the pool.
+//
+// Each backend buffers its own statistics and flushes them on a timer that runs
+// to ten seconds when idle, so reading the view straight after the work under
+// test measures nothing and reports zero — a negative assertion built on that
+// would pass on any code at all. Forcing the flush on every pooled connection
+// first is what makes this a measurement: the work ran on those connections,
+// and by the time each SELECT returns its backend has reported.
+//
+// Safe to read per test because internal/pgtest clones one database per test,
+// and these counters are keyed by database.
+func FilesTableAccesses(ctx context.Context, s *Store) (int64, error) {
+	for _, c := range s.pool.AcquireAllIdle(ctx) {
+		_, err := c.Exec(ctx, `SELECT pg_stat_force_next_flush()`)
+		c.Release()
+		if err != nil {
+			return 0, err
+		}
+	}
+	var n int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT coalesce(seq_scan, 0) + coalesce(idx_scan, 0)
+		   FROM pg_stat_user_tables WHERE relname = 'files'`).Scan(&n)
+	// No row means no backend has yet reported a scan of the table, which is
+	// zero accesses, not an error.
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
 
 // DeleteExpiredUploadPartsPass runs ONE bounded sweep pass. The drain is the
 // shipped entry point and is tested through SweepExpiredUploadParts; this is

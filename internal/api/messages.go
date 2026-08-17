@@ -722,7 +722,7 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		randomIDs := make([]int64, len(req.RandomID))
 		copy(randomIDs, req.RandomID)
 		perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
-		if errors.Is(err, store.ErrMessageInvalid) {
+		if errors.Is(err, store.ErrMessageInvalid) || errors.Is(err, store.ErrFileMissing) {
 			return nil, errMessageIDInvalid
 		}
 		if errors.Is(err, store.ErrNotMember) {
@@ -769,7 +769,11 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 	randomIDs := make([]int64, len(req.RandomID))
 	copy(randomIDs, req.RandomID)
 	perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
-	if errors.Is(err, store.ErrMessageInvalid) {
+	// A source whose file row is gone is a source that can no longer be
+	// forwarded, and it reports as the same invalid message id an already
+	// deleted one does — the caller learns nothing new about a file it was
+	// entitled to a moment ago.
+	if errors.Is(err, store.ErrMessageInvalid) || errors.Is(err, store.ErrFileMissing) {
 		return nil, errMessageIDInvalid
 	}
 	if errors.Is(err, store.ErrNotMember) {
