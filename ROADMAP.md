@@ -596,9 +596,11 @@ Tracked so shortcuts don't rot into "later means never".
   naming the victim, which is the primitive already accepted as residual for M6.
   Raised as low, not a gate. — M6
 - **No blob deleter.** M5 maintains no reference count and deletes no stored file
-  body. Deleting a media message removes every `messages` row referencing the file
-  on both sides, so with the ownership gate nobody can retrieve it afterwards —
-  but the bytes stay on disk indefinitely. A deletion request is not erasure, so
+  body. A delete removes only that message's own copies — the caller's row and,
+  on a revoke, the mirror for a user-peer message, or every current-member
+  fan-out copy for a chat message — so a forward or a channel post naming the
+  same file keeps it retrievable through the download gate, but the bytes stay
+  on disk indefinitely. A deletion request is not erasure, so
   any retention or deletion promise made to a user is false for media until a
   deleter ships. The reference set is `messages.file_id` and
   `channel_messages.file_id`: a file id is live when any non-deleted row in either
