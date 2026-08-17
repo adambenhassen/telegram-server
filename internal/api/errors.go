@@ -76,8 +76,11 @@ var (
 	// outstanding-bytes cap. FLOOD_WAIT is the closest Telegram signal: the
 	// condition clears on its own once the account assembles or its parts expire.
 	errStorageQuota = rpcErr(420, "FLOOD_WAIT_60")
-	// errMediaInvalid rejects a media type M5 does not serve, and an input file
-	// whose parts are missing or inconsistent.
+	// errMediaInvalid rejects a media type M5 does not serve, an input file
+	// whose parts are missing or inconsistent, and a send whose file row is no
+	// longer there to reference. The last of those answers nothing about
+	// another account's files: the id it names came from this caller's own
+	// upload, so it is not the download path's enumeration concern.
 	errMediaInvalid = rpcErr(400, "MEDIA_INVALID")
 	// errFileQuota rejects an upload that would take the account past its total
 	// stored-bytes cap.

@@ -37,6 +37,13 @@ var ErrStorageQuota = errors.New("storage quota exceeded")
 // error on purpose — see the query's comment.
 var ErrFileNotFound = errors.New("file not found")
 
+// ErrFileMissing is returned when a message would reference a files row that is
+// not there to lock. It is separate from ErrFileNotFound because it is not a
+// download rejection and answers nothing about a file the caller was not
+// already holding: both paths that reach it arrive carrying a file id read off
+// the caller's own upload or off a message the caller owns.
+var ErrFileMissing = errors.New("referenced file is missing")
+
 func fileFromRow(r db.File) File {
 	return File{
 		ID:         r.ID,
@@ -153,6 +160,38 @@ func (s *Store) FileForDownload(ctx context.Context, fileID, accessHash, callerI
 		return File{}, fmt.Errorf("file for download: %w", err)
 	}
 	return fileFromRow(row), nil
+}
+
+// lockFileRefs takes the shared row lock on every file a message is about to
+// reference, and fails closed with ErrFileMissing when one of them is not there
+// to lock. Zero is the "no media" sentinel and is dropped, so a text message
+// takes no lock and issues no query at all.
+//
+// Lock order. This is the last lock class a reference-creating transaction
+// takes: the chats row lock and the per-owner advisory locks are both already
+// held by the time any caller gets here, and none of them is ever taken after.
+// A transaction holding a files row therefore waits for nothing else in this
+// server, which is what makes a cycle through it impossible. Within the class
+// the ids are taken ascending, so a caller naming several files cannot hold one
+// and wait for another a second caller holds the other way round — the same
+// rule lockOwners follows, and the one an eraser has to follow too.
+func lockFileRefs(ctx context.Context, qtx *db.Queries, ids ...int64) error {
+	live := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id != 0 {
+			live = append(live, id)
+		}
+	}
+	for _, id := range ascendingUnique(live) {
+		_, err := qtx.LockFileForReference(ctx, id)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return ErrFileMissing
+		case err != nil:
+			return fmt.Errorf("lock file %d: %w", id, err)
+		}
+	}
+	return nil
 }
 
 // FilesByIDs loads stored files by id, keyed by id, for hydrating media onto
