@@ -79,6 +79,24 @@ type Config struct {
 	// within minutes, and the TTL is the term that makes worst-case retained
 	// bytes finite at accounts x cap.
 	UploadPartTTL time.Duration
+	// MediaErasureMinAge is how old a file must be before the media erasure
+	// report will name it. It is configurable because nothing in the server
+	// bounds how long an assembly or a send may take, so no constant can be
+	// derived: an operator who sees live files named shortens nothing, they
+	// lengthen this.
+	//
+	// It is defence in depth and not the safety control. Every media file is
+	// stored with zero live references for the length of one send, which is why
+	// an age gate is needed at all — but what keeps a live file safe is the
+	// interlock on its files row, taken by every path that writes a reference.
+	// Nothing in this build deletes a file, so the value affects a report only.
+	MediaErasureMinAge time.Duration
+	// MediaErasureReportInterval is how often that report runs. Zero disables
+	// it, as a zero limit disables a rate limit. It is a knob rather than a
+	// constant because the report reads the whole files table in bounded
+	// batches and nothing consumes it automatically yet, so an operator who
+	// does not want the read pays nothing for it.
+	MediaErasureReportInterval time.Duration
 	// RateLimits holds the per-surface rate-limit configurations. Zero limit
 	// disables enforcement for that surface.
 	RateLimits RateLimitsConfig
@@ -259,6 +277,9 @@ func Load(log *slog.Logger) (Config, error) {
 		MaxFileBytes:        100 << 20,
 		MaxUserStorageBytes: 2 << 30,
 		UploadPartTTL:       6 * time.Hour,
+		MediaErasureMinAge:  24 * time.Hour,
+
+		MediaErasureReportInterval: time.Hour,
 
 		MaxConnsPerUnboundKey: mtproto.DefaultMaxConnsPerUnboundKey,
 
@@ -303,6 +324,26 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_UPLOAD_PART_TTL must be positive")
 		}
 		cfg.UploadPartTTL = d
+	}
+	if v := os.Getenv("TG_MEDIA_ERASURE_MIN_AGE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_MIN_AGE must be a duration")
+		}
+		if d <= 0 {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_MIN_AGE must be positive")
+		}
+		cfg.MediaErasureMinAge = d
+	}
+	if v := os.Getenv("TG_MEDIA_ERASURE_REPORT_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_REPORT_INTERVAL must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_REPORT_INTERVAL must not be negative")
+		}
+		cfg.MediaErasureReportInterval = d
 	}
 	if v := os.Getenv("TG_LOG_LOGIN_CODES"); v != "" {
 		on, err := strconv.ParseBool(v)
