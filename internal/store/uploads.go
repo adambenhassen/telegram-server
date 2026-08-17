@@ -561,15 +561,32 @@ type PartOrphanResult struct {
 	Bytes int64
 }
 
-// PartOrphanSweepBatch is how many objects one orphan pass examines. It
-// bounds the enumeration and the live-key set, not the retention: the caller
-// repeats passes until one comes back short.
-const PartOrphanSweepBatch = 500
+// PartOrphanPageSize is how many objects one ListPrefix call returns. It
+// bounds the memory and the walk depth of a single enumeration page.
+const PartOrphanPageSize = 500
+
+// PartOrphanExamineBudget is how many objects one orphan pass examines per
+// run. It is the per-run bound: a backlog drains over successive runs, the
+// same way the row sweep drains over successive batches. It must be a
+// multiple of PartOrphanPageSize or the final page of a run is wasted.
+const PartOrphanExamineBudget = 5000
 
 // PartOrphanMargin is the extra age on top of the part TTL before an
-// unaccounted object is eligible for reclamation. It absorbs clock skew
-// between replicas and the window between a row commit and its byte write.
-const PartOrphanMargin = time.Hour
+// unaccounted object is eligible for reclamation. It must exceed the row
+// sweep's own lag (one tick at ttl/4) so that the age gate is independent of
+// the live-key gate: no window exists in which an object is past the cutoff
+// while a row still names it and the sweep has not yet retired the row.
+// The caller passes the TTL so the margin scales with the configured sweep
+// cadence rather than being a fixed constant.
+func PartOrphanMargin(ttl time.Duration) time.Duration {
+	// The row sweep ticks at max(ttl/4, 1s). The margin must exceed that lag
+	// plus one second of clock-skew absorption, so that an object whose row
+	// is about to be swept is never past the cutoff while the row is still
+	// live. ttl/4 + 1s is the sweep lag; adding 1s more gives the skew
+	// margin. At the 6h default TTL this is 1h 1m, well past the 1h that
+	// was previously hardcoded and too small.
+	return ttl/4 + 2*time.Second
+}
 
 // ReclaimOrphanedPartBytes walks the parts prefix, reclaims objects older
 // than the cutoff whose key no row still names, and returns what it removed.
@@ -582,47 +599,59 @@ const PartOrphanMargin = time.Hour
 //
 // cutoff is the earliest an object may be removed. The caller passes
 // now-(TTL+margin); the pass clamps it to that floor so a misconfigured small
-// cutoff cannot reach a live part. A live part is younger than the TTL by
-// definition, and the margin absorbs clock skew between replicas.
+// cutoff cannot reach a live part. The margin is derived from the sweep
+// cadence (PartOrphanMargin) so the age gate is independent of the live-key
+// gate.
 //
 // The pass is bounded per run by limit: it examines at most limit objects and
-// deletes at most limit. A backlog drains over successive runs, the same way
-// the row sweep drains over successive batches.
+// deletes at most limit. It drains pages with a cursor, resuming after the
+// last key examined, so every orphan under the prefix is reachable within a
+// bounded number of runs regardless of where its key sorts. A backlog drains
+// over successive runs, the same way the row sweep drains over successive
+// batches.
 func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, partTTL time.Duration, limit int) (PartOrphanResult, error) {
 	if limit <= 0 {
 		return PartOrphanResult{}, fmt.Errorf("reclaim orphaned part bytes: limit %d must be positive", limit)
 	}
 
 	// Floor: the cutoff can never be younger than TTL+margin. A misconfigured
-	// small cutoff is clamped rather than trusted: a live part is younger than
-	// the TTL by definition, so a cutoff above the floor could reach one.
-	floor := time.Now().Add(-(partTTL + PartOrphanMargin))
+	// small cutoff is clamped rather than trusted: the margin derives from
+	// the sweep cadence so the age gate is independent of the live-key gate.
+	margin := PartOrphanMargin(partTTL)
+	floor := time.Now().Add(-(partTTL + margin))
 	if cutoff.After(floor) {
 		cutoff = floor
 	}
 
 	// The live key set: every blob key a row still names. An object whose key
-	// is in this set is never removed, whatever its age. The read is
-	// autocommit and holds no lock across a storage call.
+	// is in this set is never removed, whatever its age. Keyset pagination
+	// keeps the set complete under concurrent row deletes: a row deleted
+	// between pages cannot shift the cursor and skip a live key.
 	live, err := s.livePartKeys(ctx)
 	if err != nil {
 		return PartOrphanResult{}, fmt.Errorf("live part keys: %w", err)
 	}
 
-	// Walk the parts prefix. Each page is bounded; the pass stops after limit
-	// objects examined, not limit deleted, so a page full of live objects does
-	// not starve the pass.
+	// Walk the parts prefix in bounded pages, resuming after the last key
+	// examined. The pass stops after limit objects examined or a page comes
+	// back short, whichever first. Every orphan is reachable within a
+	// bounded number of runs: each run examines limit keys in key order, so
+	// an orphan at position k in the keyspace is examined within ceil(k/limit)
+	// runs.
 	var res PartOrphanResult
-	walk := func(prefix string, remaining *int) error {
-		page, err := s.blobs.ListPrefix(ctx, prefix, PartOrphanSweepBatch)
+	next := blob.PartsPrefix
+	examined := 0
+	for {
+		remaining := limit - examined
+		if remaining <= 0 {
+			break
+		}
+		pageSize := min(remaining, PartOrphanPageSize)
+		page, err := s.blobs.ListPrefix(ctx, next, pageSize)
 		if err != nil {
-			return fmt.Errorf("list part prefix: %w", err)
+			return res, fmt.Errorf("list part prefix: %w", err)
 		}
 		for _, obj := range page {
-			if *remaining <= 0 {
-				return nil
-			}
-			*remaining--
 			// Age gate: an object younger than cutoff is never removed.
 			if time.Since(obj.Modified) < time.Since(cutoff) {
 				continue
@@ -632,38 +661,48 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 				continue
 			}
 			if err := s.blobs.Remove(ctx, obj.Key); err != nil {
-				return fmt.Errorf("remove orphaned part %s: %w", obj.Key, err)
+				// Log what was already reclaimed before surfacing the error:
+				// the partial result is the operator-visible record of this run.
+				s.log.Info("reclaim orphaned part bytes: partial",
+					"objects", res.Objects, "bytes", res.Bytes, "err", err)
+				return res, fmt.Errorf("remove orphaned part %s: %w", obj.Key, err)
 			}
 			res.Objects++
 			res.Bytes += obj.Size
 		}
-		return nil
-	}
-
-	remaining := limit
-	if err := walk(blob.PartsPrefix, &remaining); err != nil {
-		return res, err
+		examined += len(page)
+		if len(page) < pageSize {
+			break
+		}
+		// Resume after the last key in this page.
+		next = page[len(page)-1].Key + "\x00"
 	}
 	return res, nil
 }
 
 // livePartKeys returns the set of every blob key a parts row still names.
-// The read is autocommit; it holds no row lock and no advisory lock.
+// Keyset pagination: the cursor is the last row's primary key, so a row
+// deleted between pages cannot shift the cursor and skip a live key. The
+// read is autocommit; it holds no row lock and no advisory lock.
 func (s *Store) livePartKeys(ctx context.Context) (map[string]bool, error) {
 	const batch = 1000
 	out := make(map[string]bool)
-	var off int32
+	var cursor db.LivePartBlobKeysParams
+	cursor.Lim = int32(batch)
 	for {
-		keys, err := s.q.LivePartBlobKeys(ctx, db.LivePartBlobKeysParams{Off: off, Lim: int32(batch)})
+		rows, err := s.q.LivePartBlobKeys(ctx, cursor)
 		if err != nil {
 			return nil, err
 		}
-		for _, k := range keys {
-			out[k] = true
+		for _, r := range rows {
+			out[r.BlobKey] = true
 		}
-		if len(keys) < batch {
+		if len(rows) < batch {
 			return out, nil
 		}
-		off += int32(batch)
+		last := rows[len(rows)-1]
+		cursor.Uid = last.UserID
+		cursor.Fid = last.FileID
+		cursor.Pidx = last.PartIndex
 	}
 }

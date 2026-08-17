@@ -121,15 +121,36 @@ func (l *Local) ListPrefix(_ context.Context, prefix string, limit int) ([]Objec
 	}
 	// Walk the shallowest directory that contains only the prefix, rather than
 	// the store root: an unrelated sibling is not a walk it will error out on,
-	// and the assembled shards are not. A cursor that carries a byte past the
-	// last key (the "last key + 1" form a paged caller resumes with) resolves
-	// to a file or a missing path inside that directory; the walk still
-	// starts at the directory, and the filter below handles the cursor.
-	root := strings.TrimSuffix(prefix, "/")
-	if i := strings.LastIndex(prefix, "/"); i+1 < len(prefix) {
+	// and the assembled shards are not. A prefix with no separator (a
+	// top-level shard such as "92") names the store root itself.
+	root := "."
+	if i := strings.LastIndex(prefix, "/"); i >= 0 {
 		root = strings.TrimSuffix(prefix[:i+1], "/")
 	}
-	var all []Object
+	// A cursor that carries a byte past the last key (the "last key + 1" form
+	// a paged caller resumes with) resolves to a file or a missing path inside
+	// the directory; the walk still starts at the directory, and the filter
+	// below handles the cursor.
+	if fi, err := l.root.Lstat(root); err == nil && !fi.IsDir() {
+		if i := strings.LastIndex(root, "/"); i > 0 {
+			root = root[:i]
+		} else {
+			root = "."
+		}
+	}
+	// A prefix that ends in "/" or names a real directory is a containment
+	// filter: only keys under it. A prefix that carries a byte past the last
+	// key is a cursor: keys at or after it, still under the same directory.
+	cursor := false
+	if !strings.HasSuffix(prefix, "/") {
+		if fi, err := l.root.Lstat(prefix); err != nil || !fi.IsDir() {
+			cursor = true
+		}
+	}
+	// Walk the tree, collecting entries. The walk stops once it has limit
+	// entries that pass the filter, so memory and work are bounded by the
+	// page size rather than the whole subtree.
+	var out []Object
 	var walk func(p string) error
 	walk = func(p string) error {
 		f, err := l.root.Open(p)
@@ -144,6 +165,10 @@ func (l *Local) ListPrefix(_ context.Context, prefix string, limit int) ([]Objec
 		if err != nil {
 			return err
 		}
+		// Sort this directory's entries by name so keys come out in order
+		// within the directory. For a flat prefix (no subdirectories) this
+		// gives the final key order directly.
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 		for _, e := range entries {
 			child := e.Name()
 			if p != "." {
@@ -155,38 +180,27 @@ func (l *Local) ListPrefix(_ context.Context, prefix string, limit int) ([]Objec
 				}
 				continue
 			}
-			all = append(all, Object{Key: child, Size: e.Size(), Modified: e.ModTime()})
+			if cursor {
+				if child < prefix {
+					continue
+				}
+			} else if !strings.HasPrefix(child, prefix) {
+				continue
+			}
+			out = append(out, Object{Key: child, Size: e.Size(), Modified: e.ModTime()})
+			if len(out) >= limit {
+				return nil
+			}
 		}
 		return nil
 	}
 	if err := walk(root); err != nil {
 		return nil, fmt.Errorf("blob list: %w", err)
 	}
-	// A prefix that ends in "/" or names a real directory is a containment
-	// filter: only keys under it. A prefix that carries a byte past the last
-	// key is a cursor: keys at or after it, still under the same directory.
-	// The two are told apart by whether the prefix itself is a directory.
-	cursor := false
-	if !strings.HasSuffix(prefix, "/") {
-		if fi, err := l.root.Lstat(prefix); err != nil || !fi.IsDir() {
-			cursor = true
-		}
-	}
-	var out []Object
-	for _, o := range all {
-		if cursor {
-			if o.Key < prefix {
-				continue
-			}
-		} else if !strings.HasPrefix(o.Key, prefix) {
-			continue
-		}
-		out = append(out, o)
-	}
+	// For a flat prefix the walk already produced keys in order. For a nested
+	// prefix the per-directory sorts may not give global key order, so sort
+	// the result to be safe.
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	if len(out) > limit {
-		out = out[:limit]
-	}
 	return out, nil
 }
 

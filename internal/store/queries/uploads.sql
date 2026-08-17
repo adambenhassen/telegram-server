@@ -120,12 +120,14 @@ FOR UPDATE SKIP LOCKED;
 DELETE FROM upload_parts
 WHERE user_id = $1 AND file_id = $2 AND part_index = $3 AND blob_key = $4;
 
--- LivePartBlobKeys returns every blob key a parts row still names. The
--- orphan pass uses this to tell an object no row points at (reclaimable) from
--- one a live row still does (never touch). A single bounded statement; the
--- caller batches with OFFSET when the row count is large.
+-- LivePartBlobKeys returns the next page of blob keys a parts row still
+-- names, in primary-key order. The caller passes the last row's primary key
+-- as the resume cursor (keyset pagination), so a row deleted between pages
+-- cannot shift the cursor and skip a live key. The first page passes the
+-- zero cursor, which sorts before every real row.
 -- name: LivePartBlobKeys :many
-SELECT blob_key FROM upload_parts
+SELECT blob_key, user_id, file_id, part_index FROM upload_parts
 WHERE blob_key <> ''
+  AND (user_id, file_id, part_index) > (sqlc.arg(uid)::bigint, sqlc.arg(fid)::bigint, sqlc.arg(pidx)::int)
 ORDER BY user_id, file_id, part_index
-LIMIT sqlc.arg(lim)::int OFFSET sqlc.arg(off)::int;
+LIMIT sqlc.arg(lim)::int;

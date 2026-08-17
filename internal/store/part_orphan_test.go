@@ -12,6 +12,24 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
+// testTTL is the part TTL the orphan tests run against. The floor is
+// TTL + PartOrphanMargin(TTL) = TTL + TTL/4 + 2s, so objects must be aged
+// past that to be reclaimable.
+const testTTL = 6 * time.Hour
+
+// testCutoff returns a cutoff well past the floor for testTTL.
+func testCutoff() time.Time {
+	return time.Now().Add(-(testTTL + store.PartOrphanMargin(testTTL) + time.Hour))
+}
+
+// ageObject sets an object's mtime to the given time.
+func ageObject(t *testing.T, dir, key string, at time.Time) {
+	t.Helper()
+	if err := os.Chtimes(filepath.Join(dir, filepath.FromSlash(key)), at, at); err != nil {
+		t.Fatalf("chtimes %s: %v", key, err)
+	}
+}
+
 // TestPartOrphanPassReclaimsCrashWindowBytes is criterion 4: an object whose
 // row was committed and then swept, leaving bytes no row names, is reclaimed
 // by the age pass. The test simulates the MAIN-341 crash window: save a part
@@ -46,16 +64,11 @@ func TestPartOrphanPassReclaimsCrashWindowBytes(t *testing.T) {
 		t.Fatalf("delete row: %v", err)
 	}
 
-	// Age the object past the part TTL plus margin.
+	// Age the object past the floor (TTL + margin).
 	_, dir := localBlobsOf(t, s)
-	past := time.Now().Add(-7 * time.Hour) // 6h TTL + 1h margin
-	if err := os.Chtimes(filepath.Join(dir, filepath.FromSlash(key)), past, past); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
+	ageObject(t, dir, key, time.Now().Add(-12*time.Hour))
 
-	// Run the age pass with a cutoff of now-6h (the part TTL).
-	cutoff := time.Now().Add(-6 * time.Hour)
-	res, err := s.ReclaimOrphanedPartBytes(ctx, cutoff, 6*time.Hour, 100)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 100)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
@@ -92,17 +105,11 @@ func TestPartOrphanPassSavesLiveRow(t *testing.T) {
 		t.Fatalf("read row: %v", err)
 	}
 
-	// Age the object well past the cutoff.
+	// Age the object well past the floor.
 	_, dir := localBlobsOf(t, s)
-	past := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(filepath.Join(dir, filepath.FromSlash(key)), past, past); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
+	ageObject(t, dir, key, time.Now().Add(-48*time.Hour))
 
-	// Run the pass with a cutoff that would reclaim it if the row check
-	// were absent.
-	cutoff := time.Now().Add(-6 * time.Hour)
-	res, err := s.ReclaimOrphanedPartBytes(ctx, cutoff, 6*time.Hour, 100)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 100)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
@@ -144,15 +151,12 @@ func TestPartOrphanPassRespectsFloor(t *testing.T) {
 		t.Fatalf("delete row: %v", err)
 	}
 	_, dir := localBlobsOf(t, s)
-	past := time.Now().Add(-1 * time.Hour)
-	if err := os.Chtimes(filepath.Join(dir, filepath.FromSlash(key)), past, past); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
+	ageObject(t, dir, key, time.Now().Add(-time.Hour))
 
 	// A misconfigured cutoff of now-30m would reclaim a 1h-old object if the
-	// floor (TTL + margin = 7h) were not enforced.
+	// floor were not enforced.
 	cutoff := time.Now().Add(-30 * time.Minute)
-	res, err := s.ReclaimOrphanedPartBytes(ctx, cutoff, 6*time.Hour, 100)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, cutoff, testTTL, 100)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
@@ -176,13 +180,9 @@ func TestPartOrphanPassDoesNotTouchAssembledPrefix(t *testing.T) {
 	if _, err := b.Put(ctx, assembledKey, bytes.NewReader(payload)); err != nil {
 		t.Fatalf("put assembled: %v", err)
 	}
-	past := time.Now().Add(-72 * time.Hour)
-	if err := os.Chtimes(filepath.Join(dir, filepath.FromSlash(assembledKey)), past, past); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
+	ageObject(t, dir, assembledKey, time.Now().Add(-72*time.Hour))
 
-	cutoff := time.Now().Add(-6 * time.Hour)
-	res, err := s.ReclaimOrphanedPartBytes(ctx, cutoff, 6*time.Hour, 100)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 100)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
@@ -221,15 +221,11 @@ func TestPartOrphanPassBounded(t *testing.T) {
 		if _, err := b.Put(ctx, key, bytes.NewReader(part('o', 100))); err != nil {
 			t.Fatalf("put: %v", err)
 		}
-		past := time.Now().Add(-12 * time.Hour)
-		if err := os.Chtimes(filepath.Join(dir, filepath.FromSlash(key)), past, past); err != nil {
-			t.Fatalf("chtimes: %v", err)
-		}
+		ageObject(t, dir, key, time.Now().Add(-12*time.Hour))
 	}
 
 	// Bound the pass to 2 objects per run.
-	cutoff := time.Now().Add(-6 * time.Hour)
-	res, err := s.ReclaimOrphanedPartBytes(ctx, cutoff, 6*time.Hour, 2)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 2)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
@@ -238,7 +234,7 @@ func TestPartOrphanPassBounded(t *testing.T) {
 	}
 
 	// A second run reclaims the rest.
-	res, err = s.ReclaimOrphanedPartBytes(ctx, cutoff, 6*time.Hour, 2)
+	res, err = s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 2)
 	if err != nil {
 		t.Fatalf("reclaim 2: %v", err)
 	}
@@ -247,7 +243,7 @@ func TestPartOrphanPassBounded(t *testing.T) {
 	}
 
 	// Third run: only 1 left.
-	res, err = s.ReclaimOrphanedPartBytes(ctx, cutoff, 6*time.Hour, 2)
+	res, err = s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 2)
 	if err != nil {
 		t.Fatalf("reclaim 3: %v", err)
 	}
@@ -257,11 +253,65 @@ func TestPartOrphanPassBounded(t *testing.T) {
 	_ = u
 }
 
-// TestPartOrphanPassNoStorageInTransaction is criterion 8: no storage call
-// happens inside a transaction holding row or advisory locks. This is a
-// structural guarantee verified by reading the implementation, but the test
-// verifies the observable contract: the pass works correctly even when the
-// database is under load (simulated by a concurrent save).
+// TestPartOrphanPassCrossesPageBoundary crosses the PartOrphanPageSize
+// boundary: PartOrphanPageSize+1 old orphans are all reclaimed over
+// successive runs, proving the cursor drains pages rather than restarting
+// at the same page every run.
+func TestPartOrphanPassCrossesPageBoundary(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000206")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	// Plant PartOrphanPageSize+1 orphaned objects, all old.
+	_, dir := localBlobsOf(t, s)
+	b := store.BlobsOf(s)
+	n := store.PartOrphanPageSize + 1
+	for range n {
+		key, err := blob.NewPartKey()
+		if err != nil {
+			t.Fatalf("key: %v", err)
+		}
+		if _, err := b.Put(ctx, key, bytes.NewReader(part('p', 64))); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+		ageObject(t, dir, key, time.Now().Add(-12*time.Hour))
+	}
+
+	// Run the pass with a budget of PartOrphanPageSize: it should reclaim
+	// exactly that many, and the next run should get the remainder.
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, store.PartOrphanPageSize)
+	if err != nil {
+		t.Fatalf("reclaim 1: %v", err)
+	}
+	if res.Objects != store.PartOrphanPageSize {
+		t.Fatalf("first run reclaimed %d, want %d", res.Objects, store.PartOrphanPageSize)
+	}
+
+	res, err = s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, store.PartOrphanPageSize)
+	if err != nil {
+		t.Fatalf("reclaim 2: %v", err)
+	}
+	if res.Objects != 1 {
+		t.Fatalf("second run reclaimed %d, want 1", res.Objects)
+	}
+
+	// Third run: nothing left.
+	res, err = s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, store.PartOrphanPageSize)
+	if err != nil {
+		t.Fatalf("reclaim 3: %v", err)
+	}
+	if res.Objects != 0 {
+		t.Fatalf("third run reclaimed %d, want 0", res.Objects)
+	}
+	_ = u
+}
+
+// TestPartOrphanPassConcurrentWithSave verifies the pass works correctly
+// even when a save is in flight on a different part.
 func TestPartOrphanPassConcurrentWithSave(t *testing.T) {
 	t.Parallel()
 	s := open(t)
@@ -283,13 +333,9 @@ func TestPartOrphanPassConcurrentWithSave(t *testing.T) {
 		t.Fatalf("delete row: %v", err)
 	}
 	_, dir := localBlobsOf(t, s)
-	past := time.Now().Add(-12 * time.Hour)
-	if err := os.Chtimes(filepath.Join(dir, filepath.FromSlash(key)), past, past); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
+	ageObject(t, dir, key, time.Now().Add(-12*time.Hour))
 
 	// Run the pass concurrently with a save on a different part.
-	cutoff := time.Now().Add(-6 * time.Hour)
 	done := make(chan struct{})
 	go func() {
 		if err := s.SaveUploadPart(ctx, u.ID, 59, 0, part('n', 256), maxFile); err != nil {
@@ -297,12 +343,35 @@ func TestPartOrphanPassConcurrentWithSave(t *testing.T) {
 		}
 		close(done)
 	}()
-	res, err := s.ReclaimOrphanedPartBytes(ctx, cutoff, 6*time.Hour, 10)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 10)
 	<-done
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
 	if res.Objects != 1 {
 		t.Fatalf("reclaimed %d objects, want 1", res.Objects)
+	}
+}
+
+// TestPartOrphanMarginScalesWithTTL verifies the margin derives from the
+// sweep cadence: a longer TTL produces a larger margin, so the age gate
+// stays independent of the live-key gate at any configured TTL.
+func TestPartOrphanMarginScalesWithTTL(t *testing.T) {
+	t.Parallel()
+	// At the 6h default, the margin is 1h 1m 2s (6h/4 + 2s).
+	m6 := store.PartOrphanMargin(6 * time.Hour)
+	if m6 != 90*time.Minute+2*time.Second {
+		t.Fatalf("margin(6h) = %v, want %v", m6, 90*time.Minute+2*time.Second)
+	}
+	// At 24h, the margin is 6h 2s.
+	m24 := store.PartOrphanMargin(24 * time.Hour)
+	if m24 != 6*time.Hour+2*time.Second {
+		t.Fatalf("margin(24h) = %v, want %v", m24, 6*time.Hour+2*time.Second)
+	}
+	// The margin always exceeds the sweep lag (ttl/4).
+	for _, ttl := range []time.Duration{time.Hour, 6 * time.Hour, 24 * time.Hour} {
+		if store.PartOrphanMargin(ttl) <= ttl/4 {
+			t.Fatalf("margin(%v) = %v does not exceed sweep lag %v", ttl, store.PartOrphanMargin(ttl), ttl/4)
+		}
 	}
 }

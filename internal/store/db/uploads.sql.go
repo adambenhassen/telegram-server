@@ -132,34 +132,55 @@ func (q *Queries) FileOutstandingBytes(ctx context.Context, arg FileOutstandingB
 }
 
 const livePartBlobKeys = `-- name: LivePartBlobKeys :many
-SELECT blob_key FROM upload_parts
+SELECT blob_key, user_id, file_id, part_index FROM upload_parts
 WHERE blob_key <> ''
+  AND (user_id, file_id, part_index) > ($1::bigint, $2::bigint, $3::int)
 ORDER BY user_id, file_id, part_index
-LIMIT $2::int OFFSET $1::int
+LIMIT $4::int
 `
 
 type LivePartBlobKeysParams struct {
-	Off int32
-	Lim int32
+	Uid  int64
+	Fid  int64
+	Pidx int32
+	Lim  int32
 }
 
-// LivePartBlobKeys returns every blob key a parts row still names. The
-// orphan pass uses this to tell an object no row points at (reclaimable) from
-// one a live row still does (never touch). A single bounded statement; the
-// caller batches with OFFSET when the row count is large.
-func (q *Queries) LivePartBlobKeys(ctx context.Context, arg LivePartBlobKeysParams) ([]string, error) {
-	rows, err := q.db.Query(ctx, livePartBlobKeys, arg.Off, arg.Lim)
+type LivePartBlobKeysRow struct {
+	BlobKey   string
+	UserID    int64
+	FileID    int64
+	PartIndex int32
+}
+
+// LivePartBlobKeys returns the next page of blob keys a parts row still
+// names, in primary-key order. The caller passes the last row's primary key
+// as the resume cursor (keyset pagination), so a row deleted between pages
+// cannot shift the cursor and skip a live key. The first page passes the
+// zero cursor, which sorts before every real row.
+func (q *Queries) LivePartBlobKeys(ctx context.Context, arg LivePartBlobKeysParams) ([]LivePartBlobKeysRow, error) {
+	rows, err := q.db.Query(ctx, livePartBlobKeys,
+		arg.Uid,
+		arg.Fid,
+		arg.Pidx,
+		arg.Lim,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []string
+	var items []LivePartBlobKeysRow
 	for rows.Next() {
-		var blob_key string
-		if err := rows.Scan(&blob_key); err != nil {
+		var i LivePartBlobKeysRow
+		if err := rows.Scan(
+			&i.BlobKey,
+			&i.UserID,
+			&i.FileID,
+			&i.PartIndex,
+		); err != nil {
 			return nil, err
 		}
-		items = append(items, blob_key)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
