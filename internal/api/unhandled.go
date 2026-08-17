@@ -51,6 +51,17 @@ func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
 	answer := errMethodNotImpl
 	switch c.ChargeUnimplemented() {
 	case mtproto.UnimplementedClose:
+		// The burst ends the connection on this call, so no later line on it
+		// comes to carry the sampler's pending count. The drop writes it —
+		// the serve loop flushes the conn before it closes the socket — and
+		// this call is the one it stands for, so it is owed here too.
+		if suppressed, ok := c.LogUnimplemented(); ok {
+			h.log.Warn("method not implemented",
+				"error_code", answer.Code,
+				"error", answer.Message,
+				"suppressed", suppressed,
+			)
+		}
 		return errMethodNotImplBurst
 	case mtproto.UnimplementedFloodWait:
 		answer = errMethodNotImplFlood

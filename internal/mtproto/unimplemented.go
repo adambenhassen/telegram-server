@@ -100,6 +100,16 @@ func (b *unimplementedBudget) logAllow(now time.Time) (int64, bool) {
 	return b.log.allow(now, unimplementedLogInterval)
 }
 
+// logFlush reports the lines suppressed since the last one emitted, and owes a
+// line only when there is a count to say. A burst ends the connection or stops,
+// and a connection that ends or goes quiet owes no further line to flush the
+// count — the count is lost unless the drop itself writes one. A drop with
+// nothing suppressed writes nothing: the last line already stood for every
+// call, and a zero-count line would be one the conn never owed.
+func (b *unimplementedBudget) logFlush(now time.Time) (int64, bool) {
+	return b.log.flush(now)
+}
+
 // ChargeUnimplemented records one call to a method this server does not
 // implement on this connection and reports what it is owed. The caller decides
 // what an answer looks like — the error a client sees is the RPC layer's, not
@@ -116,4 +126,26 @@ func (c *Conn) ChargeUnimplemented() UnimplementedVerdict {
 // be emitted now and, when it may, how many lines it stands for.
 func (c *Conn) LogUnimplemented() (int64, bool) {
 	return c.unimplemented.logAllow(c.clock.Now())
+}
+
+// FlushUnimplementedLog writes the line this connection's not-implemented
+// calls have been suppressed behind, when it owes one. It is owed by a
+// connection that ends having spent its budget: the burst that fills the
+// sampler ends the socket, and no later call on this conn comes to flush the
+// count, so the count is lost unless the drop writes it. It is owed by a
+// connection that goes quiet the same way: the sampler holds the count open
+// until a later line, and a quiet conn has no later line.
+//
+// It writes at most one line, the same line the sampled path writes, and it
+// never runs while a counter lock is held — there is none, the budget is
+// touched only by the serve goroutine, and the caller writes it before the
+// socket closes, not while closing it.
+func (c *Conn) FlushUnimplementedLog() {
+	suppressed, ok := c.unimplemented.logFlush(c.clock.Now())
+	if !ok {
+		return
+	}
+	c.log.Warn("method not implemented",
+		"suppressed", suppressed,
+	)
 }
