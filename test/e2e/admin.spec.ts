@@ -192,14 +192,15 @@ test.describe('admin login/logout CSRF flow', () => {
 // (internal/admin/dashboard.templ). A patch landing between the dispatched
 // event and the assertion erases the state before Playwright samples it, and
 // nothing puts it back — no further disconnect fires — so the assertion fails
-// outright rather than merely arriving late. Patches land every few seconds,
-// well inside the assertion window.
+// outright rather than merely arriving late. The broadcaster ticks every 10s
+// (sseInterval in internal/admin/sse.go), with one off-cadence wake on first
+// subscribe, so a patch lands well inside the 5s default expect window.
 //
 // So the disconnected state is recorded as the handler writes it instead of
 // sampled afterwards. Nothing is widened, slept on or retried: the recorder is
 // installed before the event is dispatched, and what it captures is exactly the
 // transition the handler owns. A handler that never enters its disconnect
-// branch records nothing and still fails the test.
+// branch records no "Disconnected" entry and still fails the test.
 interface DisconnectRecord {
   chip: string[];
   bannerShown: boolean;
@@ -220,7 +221,9 @@ async function recordDisconnectState(page: Page): Promise<void> {
       const chip = document.getElementById('chip-text');
       if (chip?.textContent) record.chip.push(chip.textContent);
       const banner = document.getElementById('banner-disconnected');
-      if (banner && !banner.classList.contains('hidden')) record.bannerShown = true;
+      if (banner && banner.getClientRects().length > 0 && getComputedStyle(banner).display !== 'none') {
+        record.bannerShown = true;
+      }
     };
     snapshot();
 
@@ -237,10 +240,16 @@ async function recordDisconnectState(page: Page): Promise<void> {
 // bannerWasShown / chipTexts read back what the recorder captured since
 // recordDisconnectState was last called.
 const bannerWasShown = (page: Page): Promise<boolean> =>
-  page.evaluate(() => window.__disconnectRecord?.bannerShown ?? false);
+  page.evaluate(() => {
+    if (!window.__disconnectRecord) throw new Error('recordDisconnectState was not called');
+    return window.__disconnectRecord.bannerShown;
+  });
 
 const chipTexts = (page: Page): Promise<string[]> =>
-  page.evaluate(() => window.__disconnectRecord?.chip ?? []);
+  page.evaluate(() => {
+    if (!window.__disconnectRecord) throw new Error('recordDisconnectState was not called');
+    return window.__disconnectRecord.chip;
+  });
 
 test.describe('admin SSE stream', () => {
   test('live tick delivers DashboardFragmentRenderer markup', async ({ page }) => {
@@ -349,7 +358,8 @@ test.describe('admin SSE stream', () => {
   // The chip test above proves the bundle reacts to the lifecycle event, but
   // it asserts chip text only. Both assertions would survive the banner toggle
   // being dropped from the disconnect branch, so the banner is pinned here:
-  // same event, direct visibility assertion, no class editing from the test.
+  // same event, recorded by getClientRects/getComputedStyle rather than a
+  // class check, so an inline display:none or a hidden attribute also fails it.
   test('disconnect reveals the banner', async ({ page }) => {
     await login(page);
     await page.goto('/admin/dashboard');
