@@ -11,6 +11,42 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const existingFileIDs = `-- name: ExistingFileIDs :many
+SELECT id FROM files WHERE id = ANY($1::bigint[])
+`
+
+// ExistingFileIDs answers "which of these ids does the database still account
+// for", for a pass classifying what is on the blob store's disk.
+//
+// stored is deliberately not in the predicate, unlike FilesByIDs. A row with
+// stored = false is an assembly that crashed or one running right now, and its
+// bytes are on their way to that exact key: treating it as unaccounted for
+// would name a live upload's blob, which is the one mistake this classification
+// exists to avoid. Whether an unstored row is itself reclaimable is the files
+// table's question and MediaErasureScan already answers it.
+//
+// No lock and no join. It is one indexed probe per id over the primary key, so
+// a background walk of the tree never puts a send or a download behind it.
+func (q *Queries) ExistingFileIDs(ctx context.Context, ids []int64) ([]int64, error) {
+	rows, err := q.db.Query(ctx, existingFileIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const fileForDownload = `-- name: FileForDownload :one
 SELECT f.id, f.uploader_id, f.access_hash, f.size, f.mime_type, f.file_name, f.stored, f.date FROM files f
 WHERE f.id = $1 AND f.access_hash = $2 AND f.stored = true

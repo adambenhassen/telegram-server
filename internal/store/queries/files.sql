@@ -72,6 +72,21 @@ SELECT * FROM files WHERE id = ANY(sqlc.arg(ids)::bigint[]) AND stored = true;
 -- name: MaxFileID :one
 SELECT coalesce(max(id), 0)::bigint FROM files;
 
+-- ExistingFileIDs answers "which of these ids does the database still account
+-- for", for a pass classifying what is on the blob store's disk.
+--
+-- stored is deliberately not in the predicate, unlike FilesByIDs. A row with
+-- stored = false is an assembly that crashed or one running right now, and its
+-- bytes are on their way to that exact key: treating it as unaccounted for
+-- would name a live upload's blob, which is the one mistake this classification
+-- exists to avoid. Whether an unstored row is itself reclaimable is the files
+-- table's question and MediaErasureScan already answers it.
+--
+-- No lock and no join. It is one indexed probe per id over the primary key, so
+-- a background walk of the tree never puts a send or a download behind it.
+-- name: ExistingFileIDs :many
+SELECT id FROM files WHERE id = ANY(sqlc.arg(ids)::bigint[]);
+
 -- MediaErasureScan classifies one bounded window of files rows: for each row it
 -- reports whether anything live references it, and whether it is past the age
 -- cutoff. It names nothing for deletion; it deletes nothing.

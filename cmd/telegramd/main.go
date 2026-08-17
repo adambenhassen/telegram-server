@@ -20,6 +20,7 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/admin"
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/blobscan"
 	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
@@ -123,6 +124,14 @@ func run(log *slog.Logger) error {
 	blobs, err := blob.NewLocal(cfg.BlobDir)
 	if err != nil {
 		return err
+	}
+	// Started here rather than with the sweeps above because it is the first
+	// background pass that needs the blob store; sweepCtx and sweepWG already
+	// cover it, so it is cancelled and waited for with the rest.
+	if cfg.BlobScanReportInterval > 0 {
+		sweepWG.Go(func() {
+			reportBlobDisk(sweepCtx, blobs, st, cfg.BlobScanTempMinAge, cfg.BlobScanReportInterval, log)
+		})
 	}
 
 	// Derive the peer-hash subkey here, at process start, and hand only the
@@ -379,6 +388,55 @@ func reportMediaErasureCandidates(ctx context.Context, st *store.Store, minAge, 
 				"skipped_message_ref", c.SkippedMessageRef,
 				"skipped_channel_ref", c.SkippedChannelRef,
 				"skipped_too_new", c.SkippedTooNew)
+		}
+	}
+}
+
+// reportBlobDisk periodically classifies what is on the blob store against what
+// the database accounts for, until ctx is canceled.
+//
+// A report, not a sweep: it removes nothing, and the pass it runs takes no lock
+// and opens no transaction, so it is safe to leave running on a live server.
+// The unaccounted bytes it finds are the completion mechanism a later stage
+// needs — an eraser deletes a files row and unlinks afterwards, so a crash
+// between the two leaves bytes nothing else will ever name — and an operator
+// wants to see the size of that before anything is enabled to act on it.
+//
+// Paths the blob layout does not explain are logged one by one, at warn, and
+// deliberately not counted alongside the reclaimable classes. Something is
+// under the blob root that this server did not put there; that is a question
+// for a person, and a pass that guessed at it would be how an unrelated file
+// gets destroyed.
+func reportBlobDisk(ctx context.Context, blobs *blob.Local, st *store.Store, tempMinAge, interval time.Duration, log *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// The cutoff is read per pass, the same way a sweep's is: what a
+			// report holds back is decided once, at its start.
+			rep, err := blobscan.Scan(ctx, blobs, st, time.Now().Add(-tempMinAge))
+			if err != nil {
+				log.Error("blob disk report", "err", err)
+				continue
+			}
+			log.Info("blob disk classification",
+				"through_file_id", rep.Through,
+				"walked", rep.Walked,
+				"orphans", rep.Orphans.Count,
+				"orphan_bytes", rep.Orphans.Bytes,
+				"abandoned_temp", rep.Temps.Count,
+				"abandoned_temp_bytes", rep.Temps.Bytes,
+				"unexplained", rep.Unexplained.Count,
+				"unexplained_bytes", rep.Unexplained.Bytes,
+				"accounted", rep.Accounted,
+				"above_snapshot", rep.AboveSnapshot,
+				"temp_in_flight", rep.TempsInFlight)
+			for _, p := range rep.Unexplained.Paths {
+				log.Warn("path under the blob root the layout does not explain", "path", p.Key, "bytes", p.Size)
+			}
 		}
 	}
 }
