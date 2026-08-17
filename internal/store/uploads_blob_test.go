@@ -474,6 +474,76 @@ func TestConcurrentResavesLeaveNoUnnamedObject(t *testing.T) {
 	}
 }
 
+// TestAssemblyCleanupRacingResaveLeavesNoUnnamedObject is the same invariant
+// through the other door. The assembly cleanup reads the part set, deletes
+// those objects, then retires the rows; a save that commits inside that window
+// puts a new key on its row and writes the object for it, and a row delete that
+// did not check which key the row names takes that row away and strands the
+// object. Both sides are ordinary requests — messages.sendMedia and
+// upload.saveFilePart naming one file.
+//
+// A part re-saved mid-cleanup keeping its row and its object is the right
+// outcome, not a leak: it is an in-flight part like any other, counted by the
+// caps and retired by the next assembly or by the TTL sweep.
+//
+// The filler parts widen the cleanup's unlink loop, which is the window the
+// save has to land in. They are one byte each, which is also what makes the
+// leak worth closing rather than rate-limiting: the window costs an attacker
+// almost nothing against the byte caps.
+func TestAssemblyCleanupRacingResaveLeavesNoUnnamedObject(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000112")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	_, dir := localBlobsOf(t, s)
+
+	// The production per-file cap rather than this file's small one: the row
+	// cap is derived from it, and the filler parts need the headroom.
+	const wideFile = 100 << 20
+	const fillers = 200
+	const rounds = 12
+
+	for r := range rounds {
+		if err := s.SaveUploadPart(ctx, u.ID, 27, 0, part('a', 512*1024), wideFile); err != nil {
+			t.Fatalf("round %d seed part 0: %v", r, err)
+		}
+		for i := 1; i <= fillers; i++ {
+			if err := s.SaveUploadPart(ctx, u.ID, 27, i, part('f', 1), wideFile); err != nil {
+				t.Fatalf("round %d seed filler %d: %v", r, i, err)
+			}
+		}
+
+		var cleanupErr, saveErr error
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, cleanupErr = s.DeleteUploadParts(ctx, u.ID, 27)
+		})
+		wg.Go(func() {
+			saveErr = s.SaveUploadPart(ctx, u.ID, 27, 0, part('b', 512*1024), wideFile)
+		})
+		wg.Wait()
+		if cleanupErr != nil {
+			t.Fatalf("round %d cleanup: %v", r, cleanupErr)
+		}
+		if saveErr != nil {
+			t.Fatalf("round %d racing save: %v", r, saveErr)
+		}
+		assertEveryPartObjectIsNamed(t, s, dir, fmt.Sprintf("round %d", r))
+
+		// Whatever the race left is an ordinary in-flight part, so an
+		// uncontended cleanup retires it and its bytes together.
+		if _, err := s.DeleteUploadParts(ctx, u.ID, 27); err != nil {
+			t.Fatalf("round %d drain: %v", r, err)
+		}
+		if n := countPartKeys(t, dir); n != 0 {
+			t.Fatalf("round %d: %d part objects survive an uncontended cleanup, want 0", r, n)
+		}
+	}
+}
+
 // assertEveryPartObjectIsNamed fails if anything under the parts prefix is not
 // named by an upload_parts row. It reads the directory rather than the blob
 // interface on purpose: blob.Store has no enumeration and does not grow one

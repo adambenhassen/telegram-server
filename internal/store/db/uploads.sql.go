@@ -12,6 +12,7 @@ import (
 )
 
 const claimExpiredUploadParts = `-- name: ClaimExpiredUploadParts :many
+
 SELECT old.user_id, old.file_id, old.part_index, old.blob_key
 FROM upload_parts old
 WHERE old.date < $1
@@ -32,6 +33,11 @@ type ClaimExpiredUploadPartsRow struct {
 	BlobKey   string
 }
 
+// There is deliberately no delete over a whole upload. DeleteUploadPartByKey
+// below is the only statement that removes a parts row, so a row can only be
+// retired by naming it and the key whose bytes were deleted for it. A
+// convenience delete over (user_id, file_id) is what the assembly cleanup used
+// to run, and it dropped rows whose bytes it had never touched.
 // ClaimExpiredUploadParts takes at most one batch of expired parts, oldest
 // first, returning each row's primary key and the blob key it names. The bound
 // is the point: unbounded, this is one statement over every account's expired
@@ -99,23 +105,6 @@ func (q *Queries) DeleteUploadPartByKey(ctx context.Context, arg DeleteUploadPar
 		arg.PartIndex,
 		arg.BlobKey,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const deleteUploadParts = `-- name: DeleteUploadParts :execrows
-DELETE FROM upload_parts WHERE user_id = $1 AND file_id = $2
-`
-
-type DeleteUploadPartsParams struct {
-	UserID int64
-	FileID int64
-}
-
-func (q *Queries) DeleteUploadParts(ctx context.Context, arg DeleteUploadPartsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteUploadParts, arg.UserID, arg.FileID)
 	if err != nil {
 		return 0, err
 	}

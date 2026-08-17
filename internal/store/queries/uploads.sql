@@ -79,8 +79,11 @@ SELECT part_index, blob_key, size FROM upload_parts
 WHERE user_id = $1 AND file_id = $2
 ORDER BY part_index;
 
--- name: DeleteUploadParts :execrows
-DELETE FROM upload_parts WHERE user_id = $1 AND file_id = $2;
+-- There is deliberately no delete over a whole upload. DeleteUploadPartByKey
+-- below is the only statement that removes a parts row, so a row can only be
+-- retired by naming it and the key whose bytes were deleted for it. A
+-- convenience delete over (user_id, file_id) is what the assembly cleanup used
+-- to run, and it dropped rows whose bytes it had never touched.
 
 -- ClaimExpiredUploadParts takes at most one batch of expired parts, oldest
 -- first, returning each row's primary key and the blob key it names. The bound

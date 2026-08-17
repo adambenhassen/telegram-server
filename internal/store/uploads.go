@@ -318,22 +318,40 @@ func (s *Store) UploadPart(ctx context.Context, userID, fileID int64, partIndex 
 	return b, true, nil
 }
 
-// DeleteUploadParts drops every part of one in-flight upload, returning the row
-// count. Called once an upload has been assembled. The bytes go first: a
-// failure deleting them leaves rows that name objects, which the sweep retires
-// on schedule, rather than objects no row names, which nothing reclaims.
+// DeleteUploadParts drops every part of one in-flight upload, returning how
+// many rows it retired. Called once an upload has been assembled. The bytes go
+// first: a failure deleting them leaves rows that name objects, which the sweep
+// retires on schedule, rather than objects no row names, which nothing
+// reclaims.
+//
+// The row delete is retirePartRows', one row per object actually deleted and
+// conditional on the row still naming it, for the reason stated there. A blind
+// delete over the whole upload would drop rows whose bytes it never touched: a
+// save committing between the read above and the delete below has put a new key
+// on its row and written the object for it, and taking that row away strands
+// the object. The row it spares instead is an ordinary in-flight part, counted
+// by the caps, retired by the next assembly or by the TTL sweep.
 func (s *Store) DeleteUploadParts(ctx context.Context, userID, fileID int64) (int64, error) {
 	refs, err := s.UploadPartRefs(ctx, userID, fileID)
 	if err != nil {
 		return 0, err
 	}
+	deleted := make([]db.DeleteUploadPartByKeyParams, 0, len(refs))
 	for _, ref := range refs {
+		idx, ok := partIndexOf(ref.Index)
+		if !ok {
+			// Unreachable: the index came out of the int32 column.
+			return 0, fmt.Errorf("delete upload parts: part index %d out of range", ref.Index)
+		}
 		if err = s.removePartBytes(ctx, ref.Key); err != nil {
 			s.log.Error("delete upload part bytes", "user_id", userID, "file_id", fileID, "err", err)
 			return 0, fmt.Errorf("delete part bytes: %w", err)
 		}
+		deleted = append(deleted, db.DeleteUploadPartByKeyParams{
+			UserID: userID, FileID: fileID, PartIndex: idx, BlobKey: ref.Key,
+		})
 	}
-	n, err := s.q.DeleteUploadParts(ctx, db.DeleteUploadPartsParams{UserID: userID, FileID: fileID})
+	n, err := s.retirePartRows(ctx, deleted)
 	if err != nil {
 		return 0, fmt.Errorf("delete upload parts: %w", err)
 	}
@@ -445,13 +463,38 @@ func (s *Store) deleteExpiredUploadParts(ctx context.Context, cutoff time.Time, 
 }
 
 // finaliseExpiredUploadParts drops the rows a sweep pass claimed and reports
-// how many went. Each delete names one row's primary key and requires it to
-// still carry the blob key whose bytes the pass deleted. The primary key is
-// what makes it one row — the rows a deploy leaves behind all share the empty
-// blob key, and a delete keyed on that alone would take every one of them at
-// once — and the blob key is what makes it conditional, so a re-save that
-// landed in the pass's window keeps both its row and its new object.
+// how many went.
 func (s *Store) finaliseExpiredUploadParts(ctx context.Context, claimed []db.ClaimExpiredUploadPartsRow) (int64, error) {
+	rows := make([]db.DeleteUploadPartByKeyParams, len(claimed))
+	for i, c := range claimed {
+		rows[i] = db.DeleteUploadPartByKeyParams(c)
+	}
+	return s.retirePartRows(ctx, rows)
+}
+
+// retirePartRows drops the rows whose objects a caller has just deleted, and
+// reports how many went. It is the one place a parts row is deleted alongside
+// its bytes, and it is one function rather than a rule each caller reimplements
+// because both callers that had to follow it did not: the assembly cleanup
+// dropped an upload's rows blind until this was pulled out of the sweep.
+//
+// Each delete names one row's primary key and requires it to still carry the
+// blob key whose bytes went. The primary key is what makes it one row — the
+// rows a deploy leaves behind all share the empty blob key, and a delete keyed
+// on that alone would take every one of them at once, losing the sweep's
+// per-batch bound exactly where it is needed. The blob key is what makes it
+// conditional: a save that committed after the caller read the key has moved
+// its row onto a new one and written the object for it, and that row must not
+// be deleted, because deleting it would strand the object. Sparing it leaves an
+// ordinary in-flight part, which the caps count and the next assembly or TTL
+// sweep retires.
+//
+// One transaction, so a caller that reads its own count back sees all of the
+// deletes or none.
+func (s *Store) retirePartRows(ctx context.Context, rows []db.DeleteUploadPartByKeyParams) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin: %w", err)
@@ -459,10 +502,10 @@ func (s *Store) finaliseExpiredUploadParts(ctx context.Context, claimed []db.Cla
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 	var retired int64
-	for _, c := range claimed {
-		n, err := qtx.DeleteUploadPartByKey(ctx, db.DeleteUploadPartByKeyParams(c))
+	for _, r := range rows {
+		n, err := qtx.DeleteUploadPartByKey(ctx, r)
 		if err != nil {
-			return 0, fmt.Errorf("delete expired part rows: %w", err)
+			return 0, fmt.Errorf("delete part rows: %w", err)
 		}
 		retired += n
 	}
