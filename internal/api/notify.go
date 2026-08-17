@@ -448,7 +448,11 @@ func (u *Updater) DeliverReactions(ctx context.Context, ownerID, localID, userID
 		return
 	}
 	msg, ok := msgs[localID]
-	if !ok {
+	// A copy its owner soft-deleted is gone from every read surface they have,
+	// so pushing a reaction on it would name a message they cannot open. The
+	// reaction row outlives the delete and is deliberately left in place; only
+	// this owner's push is dropped, and the other parties still get theirs.
+	if !ok || msg.Deleted {
 		return
 	}
 
