@@ -47,6 +47,12 @@ type Conn struct {
 	// created is touched only by the connection's single serve goroutine.
 	created map[int64]struct{}
 
+	// unimplemented bounds what this connection may spend on methods this
+	// server does not implement, and thins the line they produce. Touched only
+	// by the same serve goroutine as created, which is the only one that
+	// dispatches this connection's frames.
+	unimplemented unimplementedBudget
+
 	// lastPushedPts is the highest pts already pushed to this conn, so a
 	// notification never re-delivers events. Read/written only by the delivery
 	// goroutine, but atomic for safety across the registry hand-off.

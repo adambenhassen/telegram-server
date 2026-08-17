@@ -30,7 +30,13 @@ var (
 	errCodeExpired      = rpcErr(400, "PHONE_CODE_EXPIRED")
 	errInternal         = rpcErr(500, "INTERNAL")
 	errMethodNotImpl    = rpcErr(400, "INPUT_METHOD_INVALID")
-	errAuthKeyUnreg     = rpcErr(401, "AUTH_KEY_UNREGISTERED")
+	// errMethodNotImplFlood answers a call to an unimplemented method past what
+	// one connection may spend on them in a window. FLOOD_WAIT is the signal a
+	// client already backs off on, and it says what is true: the condition
+	// clears on its own as the window rolls. It replaces errMethodNotImpl only
+	// past the budget, never inside it.
+	errMethodNotImplFlood = rpcErr(420, "FLOOD_WAIT_30")
+	errAuthKeyUnreg       = rpcErr(401, "AUTH_KEY_UNREGISTERED")
 	// errHashInvalid rejects account.resetAuthorization for a session hash that is
 	// not one of the caller's own auth keys, so a user cannot revoke another's.
 	errHashInvalid = rpcErr(400, "HASH_INVALID")
