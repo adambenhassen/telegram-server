@@ -186,6 +186,71 @@ test.describe('admin login/logout CSRF flow', () => {
   });
 });
 
+// The disconnected state the lifecycle tests below assert is not stable while
+// the real stream is open: every arriving data patch re-runs the handler's
+// connected branch, which re-hides the banner and rewrites the chip to "Live"
+// (internal/admin/dashboard.templ). A patch landing between the dispatched
+// event and the assertion erases the state before Playwright samples it, and
+// nothing puts it back — no further disconnect fires — so the assertion fails
+// outright rather than merely arriving late. The broadcaster ticks every 10s
+// (sseInterval in internal/admin/sse.go), with one off-cadence wake on first
+// subscribe, so a patch lands well inside the 5s default expect window.
+//
+// So the disconnected state is recorded as the handler writes it instead of
+// sampled afterwards. Nothing is widened, slept on or retried: the recorder is
+// installed before the event is dispatched, and what it captures is exactly the
+// transition the handler owns. A handler that never enters its disconnect
+// branch records no "Disconnected" entry and still fails the test.
+interface DisconnectRecord {
+  chip: string[];
+  bannerShown: boolean;
+}
+
+declare global {
+  interface Window {
+    __disconnectRecord?: DisconnectRecord;
+  }
+}
+
+async function recordDisconnectState(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const record: DisconnectRecord = { chip: [], bannerShown: false };
+    window.__disconnectRecord = record;
+
+    const snapshot = () => {
+      const chip = document.getElementById('chip-text');
+      if (chip?.textContent) record.chip.push(chip.textContent);
+      const banner = document.getElementById('banner-disconnected');
+      if (banner && banner.getClientRects().length > 0 && getComputedStyle(banner).display !== 'none') {
+        record.bannerShown = true;
+      }
+    };
+    snapshot();
+
+    new MutationObserver(snapshot).observe(document.body, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ['class'],
+    });
+  });
+}
+
+// bannerWasShown / chipTexts read back what the recorder captured since
+// recordDisconnectState was last called.
+const bannerWasShown = (page: Page): Promise<boolean> =>
+  page.evaluate(() => {
+    if (!window.__disconnectRecord) throw new Error('recordDisconnectState was not called');
+    return window.__disconnectRecord.bannerShown;
+  });
+
+const chipTexts = (page: Page): Promise<string[]> =>
+  page.evaluate(() => {
+    if (!window.__disconnectRecord) throw new Error('recordDisconnectState was not called');
+    return window.__disconnectRecord.chip;
+  });
+
 test.describe('admin SSE stream', () => {
   test('live tick delivers DashboardFragmentRenderer markup', async ({ page }) => {
     // Log in so the page context holds the session cookie.
@@ -273,21 +338,28 @@ test.describe('admin SSE stream', () => {
         );
       }, type);
 
+    await recordDisconnectState(page);
     await lifecycle('finished');
-    await expect(page.locator('#chip-text')).toHaveText(/Disconnected/);
+    await expect
+      .poll(() => chipTexts(page), { message: 'chip text after "finished"' })
+      .toEqual(expect.arrayContaining([expect.stringMatching(/Disconnected/)]));
 
     await lifecycle('started');
     await expect(page.locator('#chip-text')).toHaveText(/Live/);
 
     // An error on the stream is the same observable state as a clean close.
+    await recordDisconnectState(page);
     await lifecycle('error');
-    await expect(page.locator('#chip-text')).toHaveText(/Disconnected/);
+    await expect
+      .poll(() => chipTexts(page), { message: 'chip text after "error"' })
+      .toEqual(expect.arrayContaining([expect.stringMatching(/Disconnected/)]));
   });
 
   // The chip test above proves the bundle reacts to the lifecycle event, but
   // it asserts chip text only. Both assertions would survive the banner toggle
   // being dropped from the disconnect branch, so the banner is pinned here:
-  // same event, direct visibility assertion, no class editing from the test.
+  // same event, recorded by getClientRects/getComputedStyle rather than a
+  // class check, so an inline display:none or a hidden attribute also fails it.
   test('disconnect reveals the banner', async ({ page }) => {
     await login(page);
     await page.goto('/admin/dashboard');
@@ -298,13 +370,16 @@ test.describe('admin SSE stream', () => {
 
     // "finished" is the lifecycle event the bundle dispatches when the SSE
     // stream closes; the chip and the banner share its handler branch.
+    await recordDisconnectState(page);
     await page.evaluate(() => {
       document.dispatchEvent(
         new CustomEvent('datastar-sse', { detail: { type: 'finished', elId: 'sse-root' } }),
       );
     });
 
-    await expect(banner).toBeVisible();
+    await expect
+      .poll(() => bannerWasShown(page), { message: 'banner revealed on disconnect' })
+      .toBe(true);
   });
 
   // The test above pins the reveal half; this one pins the reverse. The
@@ -327,8 +402,11 @@ test.describe('admin SSE stream', () => {
         );
       }, type);
 
+    await recordDisconnectState(page);
     await lifecycle('finished');
-    await expect(banner).toBeVisible();
+    await expect
+      .poll(() => bannerWasShown(page), { message: 'banner revealed on disconnect' })
+      .toBe(true);
 
     await lifecycle('started');
     await expect(banner).toBeHidden();
@@ -353,8 +431,34 @@ test.describe('admin dashboard stylesheet', () => {
 
     // Nothing else is keeping it off the page: dropping the class alone must
     // reveal it, which is what the chip does on disconnect.
-    await banner.evaluate((el) => el.classList.remove('hidden'));
-    await expect(banner).toBeVisible();
+    //
+    // The class is dropped on a copy, never on the live banner. Every arriving
+    // data patch re-runs the chip handler, which re-adds `hidden` to the real
+    // banner — so removing it there is undone by the next tick and the reveal
+    // assertion fails whenever a patch lands inside its window. The copy
+    // carries the same classes and the same computed style, which is what this
+    // test reads, and the chip script holds a direct reference to the original
+    // so it never touches the copy.
+    await page.evaluate(() => {
+      const source = document.getElementById('banner-disconnected');
+      if (!source) throw new Error('no #banner-disconnected to copy');
+
+      const copy = source.cloneNode(true) as HTMLElement;
+      // Ids would otherwise be duplicated across the document.
+      copy.querySelectorAll('[id]').forEach((el) => el.removeAttribute('id'));
+      copy.id = 'banner-style-probe';
+
+      const host = document.getElementById('main');
+      if (!host) throw new Error('no #main to host the banner copy');
+      host.appendChild(copy);
+    });
+
+    const probe = page.locator('#banner-style-probe');
+    await expect(probe).toHaveClass(/\bhidden\b/);
+    await expect(probe).toBeHidden();
+
+    await probe.evaluate((el) => el.classList.remove('hidden'));
+    await expect(probe).toBeVisible();
   });
 });
 
@@ -382,6 +486,13 @@ test.describe('admin dashboard component script', () => {
   // and the server's numbers decide when that happens, which is not something
   // a test can provoke. So the insertion is done here instead, with a clone of
   // a real server-rendered bar: what the observer sees is the same either way.
+  //
+  // The clone goes into #main, never into #metrics-stream. The observer this
+  // test pins watches document.body with subtree: true, so the insertion point
+  // makes no difference to what it sees — but a morph deletes any node inside
+  // the swap target that the server did not render, and the first patch lands
+  // within ~100 ms of load. Injecting into the target raced that patch and
+  // reddened unrelated PRs. #main is outside the target and is never patched.
   test('markup inserted after load registers itself', async ({ page }) => {
     await login(page);
     await page.goto('/admin/dashboard');
@@ -403,7 +514,14 @@ test.describe('admin dashboard component script', () => {
         .querySelectorAll<HTMLElement>('[data-tui-progress-indicator]')
         .forEach((el) => (el.style.width = ''));
 
-      document.getElementById('metrics-stream')!.appendChild(clone);
+      const target = document.getElementById('metrics-stream');
+      if (!target) throw new Error('no #metrics-stream swap target on the page');
+      const host = document.getElementById('main');
+      if (!host) throw new Error('no #main to host the probe bar');
+      if (target.contains(host)) {
+        throw new Error('#main sits inside the swap target: the probe would race the morph');
+      }
+      host.appendChild(clone);
     });
 
     // The observer registers the bar and runs it through updateProgress: the
@@ -418,7 +536,9 @@ test.describe('admin dashboard component script', () => {
     // Registration is what wires later attribute changes to the indicator, so
     // the bar must now track its own value the way a patched one does.
     await page.evaluate(() => {
-      document.getElementById('probe-bar')!.setAttribute('aria-valuenow', '81');
+      const bar = document.getElementById('probe-bar');
+      if (!bar) throw new Error('probe bar vanished before the second value change');
+      bar.setAttribute('aria-valuenow', '81');
     });
     await expect(probe).toHaveAttribute('aria-valuetext', '81%');
   });
