@@ -48,7 +48,7 @@ func TestListPrefix(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	got, err := l.ListPrefix(ctx, prefix, 10)
+	got, err := l.ListPrefix(ctx, prefix, "", 10)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -91,24 +91,20 @@ func TestListPrefixBounded(t *testing.T) {
 
 	// The caller resumes past the page's last key; a page that returns fewer
 	// than limit objects is the last one.
-	next := blob.PartsPrefix
+	after := ""
 	var seen []string
 	for {
-		got, err := l.ListPrefix(ctx, next, 2)
+		got, err := l.ListPrefix(ctx, blob.PartsPrefix, after, 2)
 		if err != nil {
 			t.Fatalf("list: %v", err)
 		}
-		for i, o := range got {
+		for _, o := range got {
 			seen = append(seen, o.Key)
-			if i == len(got)-1 && len(got) == 2 {
-				// Any byte above a legal key byte sorts after every real key,
-				// so this prefix continues right after the page.
-				next = o.Key + "\x00"
-			}
 		}
 		if len(got) < 2 {
 			break
 		}
+		after = got[len(got)-1].Key
 	}
 	sort.Strings(seen)
 	want := make([]string, n)
@@ -128,11 +124,87 @@ func TestListPrefixEmptyPrefix(t *testing.T) {
 	if _, err := l.Put(context.Background(), blob.Key(4242), strings.NewReader("x")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	got, err := l.ListPrefix(context.Background(), "", 10)
+	got, err := l.ListPrefix(context.Background(), "", "", 10)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("empty prefix listed %d objects, want none", len(got))
+	}
+}
+
+// TestListPrefixSeparatorFreeFailsClosed asserts that a separator-free prefix
+// (a top-level shard such as "92") cannot return a key outside its containment
+// scope. The prefix names a directory; if that directory does not exist the
+// call returns nothing, and if it does exist only keys under it are returned.
+// A file at the scope path is not a directory, so the call fails closed.
+func TestListPrefixSeparatorFreeFailsClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	l, dir := newLocal(t)
+
+	// Plant objects under two assembled shards and the parts prefix.
+	for _, k := range []string{blob.Key(4242), blob.Key(999), blob.PartsPrefix + "aaaa"} {
+		if _, err := l.Put(ctx, k, strings.NewReader("x")); err != nil {
+			t.Fatalf("put %s: %v", k, err)
+		}
+	}
+
+	// A separator-free prefix naming a non-existent shard directory returns
+	// nothing: it does not widen to the store root.
+	got, err := l.ListPrefix(ctx, "ff", "", 100)
+	if err != nil {
+		t.Fatalf("list non-existent shard: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("non-existent shard listed %d objects, want 0: %v", len(got), got)
+	}
+
+	// A separator-free prefix naming an existing shard directory returns only
+	// keys under that shard.
+	got, err = l.ListPrefix(ctx, "92", "", 100)
+	if err != nil {
+		t.Fatalf("list shard 92: %v", err)
+	}
+	for _, o := range got {
+		if !strings.HasPrefix(o.Key, "92/") {
+			t.Fatalf("shard 92 returned key outside scope: %q", o.Key)
+		}
+	}
+
+	// A separator-free prefix naming a file (not a directory) fails closed.
+	if err := os.WriteFile(filepath.Join(dir, "ab"), []byte("a file"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	_, err = l.ListPrefix(ctx, "ab", "", 100)
+	if err == nil {
+		t.Fatal("prefix naming a file succeeded, want a fail-closed error")
+	}
+}
+
+// TestListPrefixAfterResumes verifies the after parameter: keys at or below
+// after are skipped, and the page is the limit smallest keys above after
+// within the prefix.
+func TestListPrefixAfterResumes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	l, _ := newLocal(t)
+	for i := range 5 {
+		key := blob.PartsPrefix + string(rune('a'+i))
+		if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	// Resume after "parts/c": should get d and e.
+	got, err := l.ListPrefix(ctx, blob.PartsPrefix, blob.PartsPrefix+"c", 10)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d objects, want 2: %v", len(got), got)
+	}
+	if got[0].Key != blob.PartsPrefix+"d" || got[1].Key != blob.PartsPrefix+"e" {
+		t.Fatalf("got %v, want [parts/d parts/e]", got)
 	}
 }

@@ -357,7 +357,7 @@ func reclaimOrphanedPartBytes(ctx context.Context, st *store.Store, ttl time.Dur
 		case <-ticker.C:
 			margin := store.PartOrphanMargin(ttl)
 			cutoff := time.Now().Add(-(ttl + margin))
-			res, err := st.ReclaimOrphanedPartBytes(ctx, cutoff, ttl, store.PartOrphanExamineBudget)
+			res, err := st.ReclaimOrphanedPartBytes(ctx, cutoff, ttl)
 			if err != nil {
 				log.Error("reclaim orphaned part bytes", "objects", res.Objects, "bytes", res.Bytes, "err", err)
 				continue

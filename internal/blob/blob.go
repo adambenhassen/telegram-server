@@ -33,14 +33,18 @@ type Store interface {
 	// Remove deletes key. Deleting a key that is not there is a no-op, so a
 	// caller that races a sweep or a re-save never needs to know which won.
 	Remove(ctx context.Context, key string) error
-	// ListPrefix returns at most limit objects whose keys start with prefix,
-	// each with the size and modification time an age-based pass needs. The
-	// result is a page, not the whole prefix: keys are ordered, a call
-	// returning fewer than limit objects is the last page, and a caller that
-	// walks the prefix repeats the call from where the previous page ended.
-	// An empty prefix lists nothing: the assembled keyspace has no single
-	// prefix, so nothing outside a named prefix is reachable through this.
-	ListPrefix(ctx context.Context, prefix string, limit int) ([]Object, error)
+	// ListPrefix returns the limit smallest keys at or after after within
+	// prefix, each with the size and modification time an age-based pass
+	// needs. Containment is always enforced: every key returned is under
+	// prefix, and a prefix that does not resolve to a containment scope
+	// fails closed rather than widening. after is the resume position, a
+	// separate input from prefix: an empty after starts at the beginning of
+	// the prefix. A page never exceeds limit and is globally ordered by key,
+	// so a caller that walks the prefix passes the last key of each page as
+	// the next after. An empty prefix lists nothing: the assembled keyspace
+	// has no single prefix, so nothing outside a named prefix is reachable
+	// through this.
+	ListPrefix(ctx context.Context, prefix, after string, limit int) ([]Object, error)
 }
 
 // Object is one entry of a [Store.ListPrefix] page: the key and the two
@@ -101,62 +105,58 @@ func NewLocal(dir string) (*Local, error) {
 // RootDir reports the directory the store is rooted in.
 func (l *Local) RootDir() string { return l.dir }
 
-// ListPrefix returns up to limit objects under prefix, in key order. The
-// walk is confined to the prefix's own subtree: a sibling of the prefix
-// directory, and a file that merely carries the prefix as a name prefix
-// ("parts" vs "parts/"), are not under it. Keys come back slash-separated,
-// the same form Put and Remove take, so a page feeds straight back into the
-// store. limit must be positive; an empty prefix lists nothing for the reason
-// in the interface.
+// ListPrefix returns the limit smallest keys at or after after within
+// prefix, globally ordered by key. Containment is always enforced: every key
+// returned starts with prefix, and a prefix that does not name a directory
+// scope (a file, a missing path, or the empty string) fails closed rather
+// than widening to the store root. after is the resume position, separate
+// from prefix: an empty after starts at the beginning of the prefix, and a
+// non-empty after skips every key that sorts at or below it. A page never
+// exceeds limit.
 //
-// A page is a snapshot: an object written or deleted between pages may appear
-// or vanish, and a caller that deletes what it lists must not care which of
-// the two happened.
-func (l *Local) ListPrefix(_ context.Context, prefix string, limit int) ([]Object, error) {
+// The walk collects every key under the prefix's directory subtree, filters
+// by containment and resume position, sorts globally, and returns the first
+// limit. The walk cannot stop early: for a nested prefix, a directory that
+// sorts late may hold keys that sort before keys in an earlier directory, so
+// the limit smallest are not known until the whole subtree is seen. The parts
+// prefix is flat (one directory), so in practice this is one directory read.
+func (l *Local) ListPrefix(_ context.Context, prefix, after string, limit int) ([]Object, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("blob list: limit %d must be positive", limit)
 	}
 	if prefix == "" {
 		return nil, nil
 	}
-	// Walk the shallowest directory that contains only the prefix, rather than
-	// the store root: an unrelated sibling is not a walk it will error out on,
-	// and the assembled shards are not. A prefix with no separator (a
-	// top-level shard such as "92") names the store root itself.
-	root := "."
-	if i := strings.LastIndex(prefix, "/"); i >= 0 {
-		root = strings.TrimSuffix(prefix[:i+1], "/")
+	// The containment scope is the directory the prefix names. A prefix with
+	// no separator ("92") names a top-level shard directory; one with a
+	// separator ("parts/aaa") names the directory it sits in. A prefix that
+	// does not resolve to a directory fails closed: widening to the store
+	// root would enumerate the assembled keyspace, which is exactly what this
+	// method must not do.
+	scope := strings.TrimSuffix(prefix, "/")
+	if i := strings.LastIndex(prefix, "/"); i >= 0 && i+1 < len(prefix) {
+		scope = strings.TrimSuffix(prefix[:i+1], "/")
 	}
-	// A cursor that carries a byte past the last key (the "last key + 1" form
-	// a paged caller resumes with) resolves to a file or a missing path inside
-	// the directory; the walk still starts at the directory, and the filter
-	// below handles the cursor.
-	if fi, err := l.root.Lstat(root); err == nil && !fi.IsDir() {
-		if i := strings.LastIndex(root, "/"); i > 0 {
-			root = root[:i]
-		} else {
-			root = "."
+	fi, err := l.root.Lstat(scope)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil // the prefix has no objects yet
 		}
+		return nil, fmt.Errorf("blob list: %w", err)
 	}
-	// A prefix that ends in "/" or names a real directory is a containment
-	// filter: only keys under it. A prefix that carries a byte past the last
-	// key is a cursor: keys at or after it, still under the same directory.
-	cursor := false
-	if !strings.HasSuffix(prefix, "/") {
-		if fi, err := l.root.Lstat(prefix); err != nil || !fi.IsDir() {
-			cursor = true
-		}
+	if !fi.IsDir() {
+		// A file, not a directory: the prefix names no containment scope.
+		// Fail closed rather than widen to the parent.
+		return nil, fmt.Errorf("blob list: %q is not a directory", scope)
 	}
-	// Walk the tree, collecting entries. The walk stops once it has limit
-	// entries that pass the filter, so memory and work are bounded by the
-	// page size rather than the whole subtree.
-	var out []Object
+	// Collect every object under the scope.
+	var all []Object
 	var walk func(p string) error
 	walk = func(p string) error {
 		f, err := l.root.Open(p)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return nil // the prefix has no objects yet
+				return nil
 			}
 			return err
 		}
@@ -165,10 +165,6 @@ func (l *Local) ListPrefix(_ context.Context, prefix string, limit int) ([]Objec
 		if err != nil {
 			return err
 		}
-		// Sort this directory's entries by name so keys come out in order
-		// within the directory. For a flat prefix (no subdirectories) this
-		// gives the final key order directly.
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 		for _, e := range entries {
 			child := e.Name()
 			if p != "." {
@@ -180,28 +176,26 @@ func (l *Local) ListPrefix(_ context.Context, prefix string, limit int) ([]Objec
 				}
 				continue
 			}
-			if cursor {
-				if child < prefix {
-					continue
-				}
-			} else if !strings.HasPrefix(child, prefix) {
+			// Containment: only keys under the caller's prefix.
+			if !strings.HasPrefix(child, prefix) {
 				continue
 			}
-			out = append(out, Object{Key: child, Size: e.Size(), Modified: e.ModTime()})
-			if len(out) >= limit {
-				return nil
+			// Resume: skip keys at or below the after position.
+			if after != "" && child <= after {
+				continue
 			}
+			all = append(all, Object{Key: child, Size: e.Size(), Modified: e.ModTime()})
 		}
 		return nil
 	}
-	if err := walk(root); err != nil {
+	if err := walk(scope); err != nil {
 		return nil, fmt.Errorf("blob list: %w", err)
 	}
-	// For a flat prefix the walk already produced keys in order. For a nested
-	// prefix the per-directory sorts may not give global key order, so sort
-	// the result to be safe.
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	return out, nil
+	sort.Slice(all, func(i, j int) bool { return all[i].Key < all[j].Key })
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
 }
 
 // Put writes r to a temporary file and renames it into place, so a reader

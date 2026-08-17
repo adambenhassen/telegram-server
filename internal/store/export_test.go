@@ -572,6 +572,17 @@ func DeleteUploadPartRow(ctx context.Context, s *Store, userID, fileID int64, pa
 	return err
 }
 
+// InsertUploadPartWithKey writes a parts row carrying the given blob key. The
+// orphan-pass tests use it to create a live row that names a specific object,
+// so the live-key gate can be exercised against a known key.
+func InsertUploadPartWithKey(ctx context.Context, s *Store, userID, fileID int64, partIndex int32, size int64, blobKey string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO upload_parts (user_id, file_id, part_index, size, blob_key)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		userID, fileID, partIndex, size, blobKey)
+	return err
+}
+
 // CountRateLimits returns the number of rate limit rows for a given subject,
 // for tests that need to assert the rate_limits table state.
 func CountRateLimits(ctx context.Context, s *Store, subjectID int64) (int, error) {

@@ -120,14 +120,11 @@ FOR UPDATE SKIP LOCKED;
 DELETE FROM upload_parts
 WHERE user_id = $1 AND file_id = $2 AND part_index = $3 AND blob_key = $4;
 
--- LivePartBlobKeys returns the next page of blob keys a parts row still
--- names, in primary-key order. The caller passes the last row's primary key
--- as the resume cursor (keyset pagination), so a row deleted between pages
--- cannot shift the cursor and skip a live key. The first page passes the
--- zero cursor, which sorts before every real row.
--- name: LivePartBlobKeys :many
-SELECT blob_key, user_id, file_id, part_index FROM upload_parts
-WHERE blob_key <> ''
-  AND (user_id, file_id, part_index) > (sqlc.arg(uid)::bigint, sqlc.arg(fid)::bigint, sqlc.arg(pidx)::int)
-ORDER BY user_id, file_id, part_index
-LIMIT sqlc.arg(lim)::int;
+-- LivePartKeys reports which of the given blob keys a parts row still names.
+-- The orphan pass gates each enumeration page with this: one lookup over the
+-- page's at-most-500 keys, so the live-key set is bounded by the page rather
+-- than the table, and the gate reads row state at delete time rather than at
+-- run start. A key absent from the result is named by no row.
+-- name: LivePartKeys :many
+SELECT blob_key FROM upload_parts
+WHERE blob_key = ANY(sqlc.arg(keys)::text[]);

@@ -131,56 +131,29 @@ func (q *Queries) FileOutstandingBytes(ctx context.Context, arg FileOutstandingB
 	return column_1, err
 }
 
-const livePartBlobKeys = `-- name: LivePartBlobKeys :many
-SELECT blob_key, user_id, file_id, part_index FROM upload_parts
-WHERE blob_key <> ''
-  AND (user_id, file_id, part_index) > ($1::bigint, $2::bigint, $3::int)
-ORDER BY user_id, file_id, part_index
-LIMIT $4::int
+const livePartKeys = `-- name: LivePartKeys :many
+SELECT blob_key FROM upload_parts
+WHERE blob_key = ANY($1::text[])
 `
 
-type LivePartBlobKeysParams struct {
-	Uid  int64
-	Fid  int64
-	Pidx int32
-	Lim  int32
-}
-
-type LivePartBlobKeysRow struct {
-	BlobKey   string
-	UserID    int64
-	FileID    int64
-	PartIndex int32
-}
-
-// LivePartBlobKeys returns the next page of blob keys a parts row still
-// names, in primary-key order. The caller passes the last row's primary key
-// as the resume cursor (keyset pagination), so a row deleted between pages
-// cannot shift the cursor and skip a live key. The first page passes the
-// zero cursor, which sorts before every real row.
-func (q *Queries) LivePartBlobKeys(ctx context.Context, arg LivePartBlobKeysParams) ([]LivePartBlobKeysRow, error) {
-	rows, err := q.db.Query(ctx, livePartBlobKeys,
-		arg.Uid,
-		arg.Fid,
-		arg.Pidx,
-		arg.Lim,
-	)
+// LivePartKeys reports which of the given blob keys a parts row still names.
+// The orphan pass gates each enumeration page with this: one lookup over the
+// page's at-most-500 keys, so the live-key set is bounded by the page rather
+// than the table, and the gate reads row state at delete time rather than at
+// run start. A key absent from the result is named by no row.
+func (q *Queries) LivePartKeys(ctx context.Context, keys []string) ([]string, error) {
+	rows, err := q.db.Query(ctx, livePartKeys, keys)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []LivePartBlobKeysRow
+	var items []string
 	for rows.Next() {
-		var i LivePartBlobKeysRow
-		if err := rows.Scan(
-			&i.BlobKey,
-			&i.UserID,
-			&i.FileID,
-			&i.PartIndex,
-		); err != nil {
+		var blob_key string
+		if err := rows.Scan(&blob_key); err != nil {
 			return nil, err
 		}
-		items = append(items, i)
+		items = append(items, blob_key)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

@@ -67,14 +67,26 @@ func TestOpenRejectsPartBlobMigrationMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read migrations dir: %v", err)
 	}
+	// The sentinel guards against a migrations/ directory that stops short of
+	// the part-blob migration: the one that adds the blob_key column. Find it
+	// by content rather than by position, so index-only migrations added after
+	// it do not shift the "latest" and leave the test removing a file whose
+	// absence is harmless.
 	var latest string
 	for _, e := range migs {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") && e.Name() > latest {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("..", "..", "migrations", e.Name()))
+		if err != nil {
+			t.Fatalf("read migration %s: %v", e.Name(), err)
+		}
+		if strings.Contains(string(b), "blob_key") && strings.Contains(string(b), "ADD COLUMN") {
 			latest = e.Name()
 		}
 	}
 	if latest == "" {
-		t.Fatal("no migration files found")
+		t.Fatal("part-blob migration not found")
 	}
 
 	admin, err := pgx.Connect(ctx, pgtest.AdminDSN())
@@ -107,7 +119,12 @@ func TestOpenRejectsPartBlobMigrationMissing(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	for _, e := range migs {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") || e.Name() == latest {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		// Skip the part-blob migration and every migration that comes after
+		// it: they may depend on the blob_key column it adds.
+		if e.Name() >= latest {
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join("..", "..", "migrations", e.Name()))

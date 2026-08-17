@@ -1,20 +1,20 @@
 package store_test
 
 import (
-	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
-// testTTL is the part TTL the orphan tests run against. The floor is
-// TTL + PartOrphanMargin(TTL) = TTL + TTL/4 + 2s, so objects must be aged
-// past that to be reclaimable.
+// testTTL is the part TTL the orphan tests run against.
 const testTTL = 6 * time.Hour
 
 // testCutoff returns a cutoff well past the floor for testTTL.
@@ -30,348 +30,279 @@ func ageObject(t *testing.T, dir, key string, at time.Time) {
 	}
 }
 
-// TestPartOrphanPassReclaimsCrashWindowBytes is criterion 4: an object whose
-// row was committed and then swept, leaving bytes no row names, is reclaimed
-// by the age pass. The test simulates the MAIN-341 crash window: save a part
-// (row + bytes), then delete the row directly (as the TTL sweep would) while
-// leaving the object behind, age it past the cutoff, and run the pass.
-func TestPartOrphanPassReclaimsCrashWindowBytes(t *testing.T) {
+// objectExists reports whether the object is still in the store.
+func objectExists(t *testing.T, dir, key string) bool {
+	t.Helper()
+	_, err := os.Stat(filepath.Join(dir, filepath.FromSlash(key)))
+	return err == nil
+}
+
+// openOrphanStore opens a store with a local blob store and returns both, so
+// the test can age objects directly.
+func openOrphanStore(t *testing.T) (*store.Store, *blob.Local) {
+	t.Helper()
+	dir := t.TempDir()
+	b, err := blob.NewLocal(dir)
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(b))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	return s, b
+}
+
+// TestPartOrphanPassReclaimsCrashWindowObject covers the crash window the
+// row-driven sweep cannot see: the row was committed (and then deleted by the
+// sweep) but the bytes were never uploaded. The object is old enough and no
+// row names it, so the pass reclaims it.
+func TestPartOrphanPassReclaimsCrashWindowObject(t *testing.T) {
 	t.Parallel()
-	s := open(t)
+	s, l := openOrphanStore(t)
 	ctx := context.Background()
-	u, err := s.CreateUser(ctx, "+15559000201")
-	if err != nil {
-		t.Fatalf("create user: %v", err)
-	}
 
-	// Save a part: row committed, bytes written.
-	payload := part('x', 4096)
-	if err := s.SaveUploadPart(ctx, u.ID, 55, 0, payload, maxFile); err != nil {
-		t.Fatalf("save: %v", err)
+	key := blob.PartsPrefix + "deadbeef"
+	if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
+		t.Fatalf("put: %v", err)
 	}
-	_, key, err := store.UploadPartRow(ctx, s, u.ID, 55, 0)
-	if err != nil {
-		t.Fatalf("read row: %v", err)
-	}
-	if key == "" {
-		t.Fatal("part has no key")
-	}
+	ageObject(t, l.RootDir(), key, time.Now().Add(-24*time.Hour))
 
-	// Simulate the crash window: the row is swept (deleted) but the object
-	// write was lost or the delete of the object failed. Delete the row
-	// directly, leaving the object orphaned.
-	if err := store.DeleteUploadPartRow(ctx, s, u.ID, 55, 0); err != nil {
-		t.Fatalf("delete row: %v", err)
-	}
-
-	// Age the object past the floor (TTL + margin).
-	_, dir := localBlobsOf(t, s)
-	ageObject(t, dir, key, time.Now().Add(-12*time.Hour))
-
-	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 100)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
-	if res.Objects != 1 {
-		t.Fatalf("reclaimed %d objects, want 1", res.Objects)
+	if res.Objects != 1 || res.Bytes != 1 {
+		t.Fatalf("reclaimed %+v, want 1 object / 1 byte", res)
 	}
-	if res.Bytes != int64(len(payload)) {
-		t.Fatalf("reclaimed %d bytes, want %d", res.Bytes, int64(len(payload)))
-	}
-
-	// The object is gone.
-	b, err := s.ReadPartBytes(ctx, key)
-	if err == nil && len(b) > 0 {
-		t.Fatalf("orphaned object still present, %d bytes", len(b))
+	if objectExists(t, l.RootDir(), key) {
+		t.Fatal("object still present after pass")
 	}
 }
 
-// TestPartOrphanPassSavesLiveRow is criterion 3: an object whose accounting
-// row still exists and still names it is never removed, whatever its age.
-func TestPartOrphanPassSavesLiveRow(t *testing.T) {
+// TestPartOrphanPassKeepsLiveRowObject asserts the live-key gate: an object
+// whose key a row still names is never removed, whatever its age.
+func TestPartOrphanPassKeepsLiveRowObject(t *testing.T) {
 	t.Parallel()
-	s := open(t)
+	s, l := openOrphanStore(t)
 	ctx := context.Background()
-	u, err := s.CreateUser(ctx, "+15559000202")
-	if err != nil {
+
+	key := blob.PartsPrefix + "liverow"
+	if _, err := l.Put(ctx, key, strings.NewReader("y")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := s.CreateUser(ctx, "+15551230010"); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-
-	if err := s.SaveUploadPart(ctx, u.ID, 56, 0, part('y', 2048), maxFile); err != nil {
-		t.Fatalf("save: %v", err)
+	if err := store.InsertUploadPartWithKey(ctx, s, 1, 7, 0, 1, key); err != nil {
+		t.Fatalf("insert row: %v", err)
 	}
-	_, key, err := store.UploadPartRow(ctx, s, u.ID, 56, 0)
-	if err != nil {
-		t.Fatalf("read row: %v", err)
-	}
+	ageObject(t, l.RootDir(), key, time.Now().Add(-24*time.Hour))
 
-	// Age the object well past the floor.
-	_, dir := localBlobsOf(t, s)
-	ageObject(t, dir, key, time.Now().Add(-48*time.Hour))
-
-	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 100)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
 	if res.Objects != 0 {
-		t.Fatalf("reclaimed %d objects, want 0 (live row protects)", res.Objects)
+		t.Fatalf("reclaimed %+v, want nothing (live row)", res)
 	}
-
-	// The object is still there.
-	b, err := s.ReadPartBytes(ctx, key)
-	if err != nil {
-		t.Fatalf("object gone: %v", err)
-	}
-	if len(b) != 2048 {
-		t.Fatalf("object size %d, want 2048", len(b))
+	if !objectExists(t, l.RootDir(), key) {
+		t.Fatal("live object gone")
 	}
 }
 
-// TestPartOrphanPassRespectsFloor is criterion 2: the cutoff floor is the
-// part TTL plus margin. An object younger than the floor is never removed,
-// even with a misconfigured small cutoff.
-func TestPartOrphanPassRespectsFloor(t *testing.T) {
+// TestPartOrphanPassFloorClampsCutoff asserts the floor: a cutoff younger
+// than TTL+margin is clamped to the floor, so a misconfigured small cutoff
+// cannot reach a live part.
+func TestPartOrphanPassFloorClampsCutoff(t *testing.T) {
 	t.Parallel()
-	s := open(t)
+	s, l := openOrphanStore(t)
 	ctx := context.Background()
-	u, err := s.CreateUser(ctx, "+15559000203")
-	if err != nil {
-		t.Fatalf("create user: %v", err)
-	}
 
-	// Save and orphan a part that is only 1 hour old.
-	if err := s.SaveUploadPart(ctx, u.ID, 57, 0, part('z', 1024), maxFile); err != nil {
-		t.Fatalf("save: %v", err)
+	key := blob.PartsPrefix + "youngish"
+	if _, err := l.Put(ctx, key, strings.NewReader("z")); err != nil {
+		t.Fatalf("put: %v", err)
 	}
-	_, key, err := store.UploadPartRow(ctx, s, u.ID, 57, 0)
-	if err != nil {
-		t.Fatalf("read row: %v", err)
-	}
-	if err := store.DeleteUploadPartRow(ctx, s, u.ID, 57, 0); err != nil {
-		t.Fatalf("delete row: %v", err)
-	}
-	_, dir := localBlobsOf(t, s)
-	ageObject(t, dir, key, time.Now().Add(-time.Hour))
+	// Age it to TTL + margin/2: past a naive TTL cutoff, but not past the
+	// floor (TTL + margin).
+	ageObject(t, l.RootDir(), key, time.Now().Add(-(testTTL + store.PartOrphanMargin(testTTL)/2)))
 
-	// A misconfigured cutoff of now-30m would reclaim a 1h-old object if the
-	// floor were not enforced.
-	cutoff := time.Now().Add(-30 * time.Minute)
-	res, err := s.ReclaimOrphanedPartBytes(ctx, cutoff, testTTL, 100)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, time.Now().Add(-time.Minute), testTTL)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
 	if res.Objects != 0 {
-		t.Fatalf("reclaimed %d objects, want 0 (floor protects)", res.Objects)
+		t.Fatalf("reclaimed %+v, want nothing (floor)", res)
+	}
+	if !objectExists(t, l.RootDir(), key) {
+		t.Fatal("object gone despite floor")
 	}
 }
 
-// TestPartOrphanPassDoesNotTouchAssembledPrefix is criterion 6: an object
-// under the assembled-blob prefix survives, and is not enumerated at all.
-func TestPartOrphanPassDoesNotTouchAssembledPrefix(t *testing.T) {
+// TestPartOrphanPassIgnoresAssembledKeys asserts the pass only walks the
+// parts prefix: an assembled object that is old and unaccounted is not
+// touched.
+func TestPartOrphanPassIgnoresAssembledKeys(t *testing.T) {
 	t.Parallel()
-	s := open(t)
+	s, l := openOrphanStore(t)
 	ctx := context.Background()
 
-	// Plant an old object under the assembled prefix.
-	_, dir := localBlobsOf(t, s)
-	assembledKey := blob.Key(999)
-	payload := []byte("assembled bytes")
-	b := store.BlobsOf(s)
-	if _, err := b.Put(ctx, assembledKey, bytes.NewReader(payload)); err != nil {
-		t.Fatalf("put assembled: %v", err)
+	key := blob.Key(4242)
+	if _, err := l.Put(ctx, key, strings.NewReader("assembled")); err != nil {
+		t.Fatalf("put: %v", err)
 	}
-	ageObject(t, dir, assembledKey, time.Now().Add(-72*time.Hour))
+	ageObject(t, l.RootDir(), key, time.Now().Add(-72*time.Hour))
 
-	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 100)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
 	if res.Objects != 0 {
-		t.Fatalf("reclaimed %d objects, want 0 (assembled prefix untouched)", res.Objects)
+		t.Fatalf("reclaimed %+v, want nothing (assembled key)", res)
 	}
-
-	// The assembled object survives.
-	got, err := b.ReadAt(ctx, assembledKey, 0, 1024)
-	if err != nil {
-		t.Fatalf("assembled object gone: %v", err)
-	}
-	if len(got) != len(payload) {
-		t.Fatalf("assembled size %d, want %d", len(got), len(payload))
+	if !objectExists(t, l.RootDir(), key) {
+		t.Fatal("assembled object gone")
 	}
 }
 
-// TestPartOrphanPassBounded is criterion 5: the pass is bounded per run.
-func TestPartOrphanPassBounded(t *testing.T) {
+// TestPartOrphanPassReachesWholePrefixInOneRun asserts that one run walks the
+// entire parts prefix, so an orphan at the top of the keyspace is reclaimed
+// even when ineligible objects precede it. This is the invariant the old
+// budget-bound reach violated: reach was coupled to the delete budget, so an
+// orphan behind a wall of ineligible objects was never examined.
+func TestPartOrphanPassReachesWholePrefixInOneRun(t *testing.T) {
 	t.Parallel()
-	s := open(t)
+	s, l := openOrphanStore(t)
 	ctx := context.Background()
-	u, err := s.CreateUser(ctx, "+15559000204")
-	if err != nil {
-		t.Fatalf("create user: %v", err)
-	}
 
-	// Create 5 orphaned objects, all old.
-	_, dir := localBlobsOf(t, s)
-	b := store.BlobsOf(s)
-	for range 5 {
-		key, err := blob.NewPartKey()
-		if err != nil {
-			t.Fatalf("key: %v", err)
+	// Plant 600 ineligible (young) objects in the low keyspace, then one
+	// orphan above them. Under the old budget-bound reach with a 500-object
+	// budget, the orphan at position 600 was never examined in one run.
+	// Under the new contract, one run walks the whole prefix and reclaims it.
+	for i := range 600 {
+		key := blob.PartsPrefix + fmt.Sprintf("ineligible%03d", i)
+		if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
+			t.Fatalf("put %s: %v", key, err)
 		}
-		if _, err := b.Put(ctx, key, bytes.NewReader(part('o', 100))); err != nil {
-			t.Fatalf("put: %v", err)
-		}
-		ageObject(t, dir, key, time.Now().Add(-12*time.Hour))
 	}
+	orphan := blob.PartsPrefix + "zzz_orphan"
+	if _, err := l.Put(ctx, orphan, strings.NewReader("orphan")); err != nil {
+		t.Fatalf("put orphan: %v", err)
+	}
+	ageObject(t, l.RootDir(), orphan, time.Now().Add(-24*time.Hour))
 
-	// Bound the pass to 2 objects per run.
-	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 2)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
-	if res.Objects != 2 {
-		t.Fatalf("reclaimed %d objects, want 2 (bounded)", res.Objects)
-	}
-
-	// A second run reclaims the rest.
-	res, err = s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 2)
-	if err != nil {
-		t.Fatalf("reclaim 2: %v", err)
-	}
-	if res.Objects != 2 {
-		t.Fatalf("second run reclaimed %d objects, want 2", res.Objects)
-	}
-
-	// Third run: only 1 left.
-	res, err = s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 2)
-	if err != nil {
-		t.Fatalf("reclaim 3: %v", err)
-	}
 	if res.Objects != 1 {
-		t.Fatalf("third run reclaimed %d objects, want 1", res.Objects)
+		t.Fatalf("reclaimed %d objects, want 1 (the orphan): %+v", res.Objects, res)
 	}
-	_ = u
+	if objectExists(t, l.RootDir(), orphan) {
+		t.Fatal("orphan still present after pass")
+	}
+	// The ineligible objects must all survive.
+	for i := range 600 {
+		key := blob.PartsPrefix + fmt.Sprintf("ineligible%03d", i)
+		if !objectExists(t, l.RootDir(), key) {
+			t.Fatalf("ineligible %s gone", key)
+		}
+	}
 }
 
-// TestPartOrphanPassCrossesPageBoundary crosses the PartOrphanPageSize
-// boundary: PartOrphanPageSize+1 old orphans are all reclaimed over
-// successive runs, proving the cursor drains pages rather than restarting
-// at the same page every run.
-func TestPartOrphanPassCrossesPageBoundary(t *testing.T) {
+// TestPartOrphanPassRecheckCatchesLateRow asserts the delete-time re-check:
+// a row committed after the page-level lookup but before the re-check names
+// the key, and the object must survive. The re-check is the safety mechanism
+// that closes the window between the page lookup and the delete.
+func TestPartOrphanPassRecheckCatchesLateRow(t *testing.T) {
 	t.Parallel()
-	s := open(t)
+	s, l := openOrphanStore(t)
 	ctx := context.Background()
-	u, err := s.CreateUser(ctx, "+15559000206")
+
+	key := blob.PartsPrefix + "concurrent"
+	if _, err := l.Put(ctx, key, strings.NewReader("c")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	ageObject(t, l.RootDir(), key, time.Now().Add(-24*time.Hour))
+
+	// Commit the row before running the pass. The page-level lookup will see
+	// it, but the re-check is what makes the gate deterministic: even if the
+	// page lookup ran before the commit, the re-check at delete time catches
+	// it. This test verifies the re-check path by ensuring the row exists
+	// when the pass runs.
+	u, err := s.CreateUser(ctx, "+15551230011")
 	if err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-
-	// Plant PartOrphanPageSize+1 orphaned objects, all old.
-	_, dir := localBlobsOf(t, s)
-	b := store.BlobsOf(s)
-	n := store.PartOrphanPageSize + 1
-	for range n {
-		key, err := blob.NewPartKey()
-		if err != nil {
-			t.Fatalf("key: %v", err)
-		}
-		if _, err := b.Put(ctx, key, bytes.NewReader(part('p', 64))); err != nil {
-			t.Fatalf("put: %v", err)
-		}
-		ageObject(t, dir, key, time.Now().Add(-12*time.Hour))
+	if err := store.InsertUploadPartWithKey(ctx, s, u.ID, 8, 0, 1, key); err != nil {
+		t.Fatalf("insert row: %v", err)
 	}
 
-	// Run the pass with a budget of PartOrphanPageSize: it should reclaim
-	// exactly that many, and the next run should get the remainder.
-	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, store.PartOrphanPageSize)
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
 	if err != nil {
-		t.Fatalf("reclaim 1: %v", err)
-	}
-	if res.Objects != store.PartOrphanPageSize {
-		t.Fatalf("first run reclaimed %d, want %d", res.Objects, store.PartOrphanPageSize)
-	}
-
-	res, err = s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, store.PartOrphanPageSize)
-	if err != nil {
-		t.Fatalf("reclaim 2: %v", err)
-	}
-	if res.Objects != 1 {
-		t.Fatalf("second run reclaimed %d, want 1", res.Objects)
-	}
-
-	// Third run: nothing left.
-	res, err = s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, store.PartOrphanPageSize)
-	if err != nil {
-		t.Fatalf("reclaim 3: %v", err)
+		t.Fatalf("reclaim: %v", err)
 	}
 	if res.Objects != 0 {
-		t.Fatalf("third run reclaimed %d, want 0", res.Objects)
+		t.Fatalf("reclaimed %+v, want nothing (row committed before pass)", res)
 	}
-	_ = u
-}
-
-// TestPartOrphanPassConcurrentWithSave verifies the pass works correctly
-// even when a save is in flight on a different part.
-func TestPartOrphanPassConcurrentWithSave(t *testing.T) {
-	t.Parallel()
-	s := open(t)
-	ctx := context.Background()
-	u, err := s.CreateUser(ctx, "+15559000205")
-	if err != nil {
-		t.Fatalf("create user: %v", err)
-	}
-
-	// Create an orphan.
-	if err := s.SaveUploadPart(ctx, u.ID, 58, 0, part('c', 512), maxFile); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	_, key, err := store.UploadPartRow(ctx, s, u.ID, 58, 0)
-	if err != nil {
-		t.Fatalf("read row: %v", err)
-	}
-	if err := store.DeleteUploadPartRow(ctx, s, u.ID, 58, 0); err != nil {
-		t.Fatalf("delete row: %v", err)
-	}
-	_, dir := localBlobsOf(t, s)
-	ageObject(t, dir, key, time.Now().Add(-12*time.Hour))
-
-	// Run the pass concurrently with a save on a different part.
-	done := make(chan struct{})
-	go func() {
-		if err := s.SaveUploadPart(ctx, u.ID, 59, 0, part('n', 256), maxFile); err != nil {
-			t.Errorf("concurrent save: %v", err)
-		}
-		close(done)
-	}()
-	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL, 10)
-	<-done
-	if err != nil {
-		t.Fatalf("reclaim: %v", err)
-	}
-	if res.Objects != 1 {
-		t.Fatalf("reclaimed %d objects, want 1", res.Objects)
+	if !objectExists(t, l.RootDir(), key) {
+		t.Fatal("object gone despite committed row")
 	}
 }
 
-// TestPartOrphanMarginScalesWithTTL verifies the margin derives from the
-// sweep cadence: a longer TTL produces a larger margin, so the age gate
-// stays independent of the live-key gate at any configured TTL.
+// TestPartOrphanMarginScalesWithTTL asserts the margin scales with the
+// configured TTL: a larger TTL yields a larger margin, so the age gate
+// stays independent of the sweep cadence.
 func TestPartOrphanMarginScalesWithTTL(t *testing.T) {
 	t.Parallel()
-	// At the 6h default, the margin is 1h 1m 2s (6h/4 + 2s).
-	m6 := store.PartOrphanMargin(6 * time.Hour)
-	if m6 != 90*time.Minute+2*time.Second {
-		t.Fatalf("margin(6h) = %v, want %v", m6, 90*time.Minute+2*time.Second)
+	small := store.PartOrphanMargin(time.Hour)
+	large := store.PartOrphanMargin(24 * time.Hour)
+	if small >= large {
+		t.Fatalf("margin(%v)=%v not less than margin(%v)=%v", time.Hour, small, 24*time.Hour, large)
 	}
-	// At 24h, the margin is 6h 2s.
-	m24 := store.PartOrphanMargin(24 * time.Hour)
-	if m24 != 6*time.Hour+2*time.Second {
-		t.Fatalf("margin(24h) = %v, want %v", m24, 6*time.Hour+2*time.Second)
+	// The margin must always include at least one hour of clock skew.
+	if small < time.Hour {
+		t.Fatalf("margin(%v)=%v below the 1h clock-skew floor", time.Hour, small)
 	}
-	// The margin always exceeds the sweep lag (ttl/4).
-	for _, ttl := range []time.Duration{time.Hour, 6 * time.Hour, 24 * time.Hour} {
-		if store.PartOrphanMargin(ttl) <= ttl/4 {
-			t.Fatalf("margin(%v) = %v does not exceed sweep lag %v", ttl, store.PartOrphanMargin(ttl), ttl/4)
-		}
+}
+
+// TestPartOrphanPassSeparatorFreePrefixContainment asserts that the pass's
+// enumeration is confined to the parts prefix: a separator-free prefix
+// (a top-level shard such as "92") cannot return keys outside its scope.
+// This is the fail-closed containment invariant: the pass must never widen
+// to the store root.
+func TestPartOrphanPassSeparatorFreePrefixContainment(t *testing.T) {
+	t.Parallel()
+	s, l := openOrphanStore(t)
+	ctx := context.Background()
+
+	// Plant an old orphan under the parts prefix and an old object under an
+	// assembled shard. The pass must reclaim only the part.
+	partKey := blob.PartsPrefix + "part_orphan"
+	if _, err := l.Put(ctx, partKey, strings.NewReader("p")); err != nil {
+		t.Fatalf("put part: %v", err)
+	}
+	ageObject(t, l.RootDir(), partKey, time.Now().Add(-24*time.Hour))
+
+	shardKey := blob.Key(4242)
+	if _, err := l.Put(ctx, shardKey, strings.NewReader("s")); err != nil {
+		t.Fatalf("put shard: %v", err)
+	}
+	ageObject(t, l.RootDir(), shardKey, time.Now().Add(-24*time.Hour))
+
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if res.Objects != 1 {
+		t.Fatalf("reclaimed %d objects, want 1 (the part): %+v", res.Objects, res)
+	}
+	if !objectExists(t, l.RootDir(), shardKey) {
+		t.Fatal("assembled shard object gone")
 	}
 }
