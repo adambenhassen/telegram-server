@@ -393,28 +393,27 @@ handed to someone else must ship its source.
 ### What stops it today
 
 A patched Telegram Desktop built as above does **not** reach the server on an
-unmodified `telegramd`. Three things block it, in the order they bite. None is
-an RPC the client could route around, and the first two stop it before any
-handler runs:
+unmodified `telegramd`. Two things block it, in the order they bite. Neither is
+an RPC the client could route around:
 
-1. **Transport obfuscation.** Telegram Desktop always wraps the TCP stream in
-   obfuscated2 — `TcpConnection::prepareConnectionStartPrefix` sends a 64-byte
-   nonce and AES-CTR encrypts everything after it, with no way to turn it off.
-   The codec sniff in `internal/mtproto/accept.go` reads that nonce as a
-   plaintext codec tag, falls through to `Full`, and every frame after it fails
-   as `invalid message length`. gotd already ships the fix as
-   `transport.ObfuscatedListener`; what it needs is a sniff that still accepts
-   the plain codecs the e2e client uses.
-2. **`auth.bindTempAuthKey`.** The client's PFS step. Unimplemented, it answers
+1. **`auth.bindTempAuthKey`.** The client's PFS step. Unimplemented, it answers
    `INPUT_METHOD_INVALID`, and because the client only clears its binder on
    `ENCRYPTED_MESSAGE_INVALID` it then retries without any backoff — measured at
    about 1400 calls a second from one client.
-3. **`config.expires`.** `DefaultConfig` sends `Date: 0, Expires: 0`.
+2. **`config.expires`.** `DefaultConfig` sends `Date: 0, Expires: 0`.
    `Instance::Private::configLoadDone` computes `expires - now`, reads the
    config as already stale, and re-requests it immediately — about 400
    `help.getConfig` calls a second, forever.
 
-With those three worked around locally, the client signs in against this server
+Transport obfuscation used to be the first of these and no longer is. Telegram
+Desktop always wraps the TCP stream in obfuscated2 —
+`TcpConnection::prepareConnectionStartPrefix` sends a 64-byte nonce and AES-CTR
+encrypts everything after it, with no way to turn it off — and the listener now
+tells that nonce apart from a plaintext codec tag and deobfuscates only the
+connections that need it. `sniffFraming` in `internal/mtproto/obfuscated.go`
+carries how, and why one listener can serve both.
+
+With those two worked around locally, the client signs in against this server
 and reaches its main window. MAIN-263 carries the wire-verified inventory of
 what it calls on the way and what breaks after.
 
