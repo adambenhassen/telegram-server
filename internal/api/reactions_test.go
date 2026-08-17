@@ -108,11 +108,29 @@ func TestGetMessagesReactionsReturnsOwnAndOmitsUnreadable(t *testing.T) {
 	p := seedReactionPair(t, s, "+15551340001", "+15551340002", "❤")
 
 	// A conversation A is not part of, whose message ids A may name freely.
+	// local_id is per-owner and starts at 1, so C's FIRST send carries the same
+	// id as A's and the request would dedup to A's own message. C sends three
+	// times and the test names the third, which exists for C and was never
+	// issued to A.
 	c, err := s.CreateUser(ctx, "+15551340003")
 	if err != nil {
 		t.Fatalf("create C: %v", err)
 	}
-	outsider := sendDM(t, s, c.ID, p.b.ID, "not for A", 770002)
+	var outsider store.Message
+	for i := range int64(3) {
+		outsider = sendDM(t, s, c.ID, p.b.ID, "not for A", 770002+i)
+	}
+	// The guard needs its own guard: if this id is also one of A's, the request
+	// below collapses to a single readable id and the assertion proves nothing
+	// about the omission path.
+	owned, err := s.MessagesByOwnerLocalIDs(ctx, p.a.ID, []int64{outsider.LocalID})
+	if err != nil {
+		t.Fatalf("check A's namespace: %v", err)
+	}
+	if len(owned) != 0 {
+		t.Fatalf("outsider local id %d is also one of A's own ids, so the request "+
+			"would dedup to A's message and the test would be vacuous", outsider.LocalID)
+	}
 
 	ups := getReactions(t, s, p.a.ID, api.InputPeerUser(p.a.ID, p.b.ID),
 		int(p.aLocalID), int(outsider.LocalID))
