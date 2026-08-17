@@ -29,6 +29,9 @@ type handlers struct {
 	dcID  int
 	log   *slog.Logger
 	srp   *srp.ChallengeStore
+	// now reads the server clock. help.getConfig stamps its time fields from it
+	// per response, so a long-lived process never serves a config dated at boot.
+	now func() time.Time
 	// logLoginCodes gates the one log call that carries credential material.
 	logLoginCodes bool
 	// maxFileBytes is the per-file upload cap the save handlers enforce.
@@ -155,6 +158,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		dcID:                     dcID,
 		log:                      log,
 		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
+		now:                      time.Now,
 		logLoginCodes:            logLoginCodes,
 		maxFileBytes:             maxFileBytes,
 		blobs:                    blobs,

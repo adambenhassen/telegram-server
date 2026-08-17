@@ -106,6 +106,7 @@ func testHandlers(s *store.Store) *handlers {
 		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
 		maxFileBytes:             TestMaxFileBytes,
 		downloads:                map[int64]bool{},
+		now:                      time.Now,
 		peers:                    pgtest.PeerDeriver(),
 		rateLimitMessageSend:     store.RateLimitConfig{},
 		rateLimitCheckPassword:   store.RateLimitConfig{},
@@ -959,4 +960,32 @@ func HandleGetPassword(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
 // HandleGetPasswordSettings invokes handleGetPasswordSettings on the given handler.
 func HandleGetPasswordSettings(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
 	return h.handleGetPasswordSettings(req)
+}
+
+// ConfigTTL exposes the expiry window help.getConfig advertises.
+const ConfigTTL = configTTL
+
+// GetConfigSeqForTest returns a help.getConfig callable bound to ONE handlers
+// value reading the clock the test supplies, so successive calls can observe the
+// server's clock moving without sleeping through an expiry window.
+func GetConfigSeqForTest(dcID int, host string, port int, now func() time.Time) func() (*tg.Config, error) {
+	h := testHandlers(nil)
+	h.cfg = DefaultConfig(dcID, host, port)
+	h.dcID = dcID
+	h.now = now
+	return func() (*tg.Config, error) {
+		var buf bin.Buffer
+		if err := (&tg.HelpGetConfigRequest{}).Encode(&buf); err != nil {
+			return nil, err
+		}
+		res, err := h.handleGetConfig(&mtproto.Request{Ctx: context.Background(), Buf: &buf})
+		if err != nil {
+			return nil, err
+		}
+		cfg, ok := res.(*tg.Config)
+		if !ok {
+			return nil, fmt.Errorf("help.getConfig returned %T, want *tg.Config", res)
+		}
+		return cfg, nil
+	}
 }
