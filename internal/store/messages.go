@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -153,6 +154,12 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 	// state rows before locking could deadlock two opposite-direction first sends
 	// on the update_state unique-key insert; locking first serializes them.
 	if err = lockOwners(ctx, tx, fromID, toID); err != nil {
+		return Message{}, 0, 0, false, err
+	}
+	// Both rows below carry fileID, so the file's row is locked here and held to
+	// commit. Taken after the advisory locks and before any insert; see
+	// lockFileRefs for why that is the only order this class can be taken in.
+	if err = lockFileRefs(ctx, qtx, fileID); err != nil {
 		return Message{}, 0, 0, false, err
 	}
 	if err = qtx.EnsureUpdateState(ctx, fromID); err != nil {
@@ -693,27 +700,25 @@ func currentPts(ctx context.Context, q *db.Queries, aID, bID int64) (int, int, e
 // other. A chat serializes on its chats row lock instead, which is always taken
 // before any of these and never inside one.
 func lockOwners(ctx context.Context, tx pgx.Tx, ids ...int64) error {
-	seen := make(map[int64]bool, len(ids))
-	var uniq []int64
-	for _, id := range ids {
-		if !seen[id] {
-			seen[id] = true
-			uniq = append(uniq, id)
-		}
-	}
-	for i := 0; i < len(uniq); i++ {
-		for j := i + 1; j < len(uniq); j++ {
-			if uniq[j] < uniq[i] {
-				uniq[i], uniq[j] = uniq[j], uniq[i]
-			}
-		}
-	}
-	for _, id := range uniq {
+	for _, id := range ascendingUnique(ids) {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, id); err != nil {
 			return fmt.Errorf("advisory lock %d: %w", id, err)
 		}
 	}
 	return nil
+}
+
+// ascendingUnique sorts ids ascending and drops duplicates. Every lock helper
+// takes its locks in this order: two transactions reaching for the same pair
+// then queue behind each other on the lower id instead of each holding one and
+// waiting for the other.
+func ascendingUnique(ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := slices.Clone(ids)
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // ForwardSource describes one message to forward, resolved from its source.
@@ -803,6 +808,20 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 	}
 
 	if err = lockOwners(ctx, tx, lockIDs...); err != nil {
+		return nil, nil, err
+	}
+
+	// Every source's file is locked here, before the first insert, rather than
+	// per source inside the loop: one batch is one ascending pass, which a
+	// per-source lock would break into an order the caller chose. The liveness
+	// read the caller did on the source messages happened in another
+	// transaction and decides nothing — this is what the forward is predicated
+	// on. A batch carrying no media takes no lock and issues no query.
+	fileIDs := make([]int64, 0, len(sources))
+	for _, src := range sources {
+		fileIDs = append(fileIDs, src.FileID)
+	}
+	if err = lockFileRefs(ctx, qtx, fileIDs...); err != nil {
 		return nil, nil, err
 	}
 
