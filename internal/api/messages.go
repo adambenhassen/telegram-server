@@ -153,6 +153,9 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	replyToMsgID := int64(0)
 	if replyTo, ok := req.GetReplyTo(); ok {
 		if rep, ok := replyTo.(*tg.InputReplyToMessage); ok && rep.ReplyToMsgID > 0 {
+			if peer, ok := rep.GetReplyToPeerID(); ok && !replyPeerIsDest(peer, peerType, toID, r.UserID) {
+				return nil, errMessageIDInvalid
+			}
 			replyToMsgID = int64(rep.ReplyToMsgID)
 		}
 	}
