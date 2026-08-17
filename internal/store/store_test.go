@@ -34,6 +34,21 @@ func open(t *testing.T) *store.Store {
 	return s
 }
 
+// TestOpenRequiresBlobStore: the part bytes live in the blob backend, so a
+// Store without one has no way to serve an upload. Left to default it would
+// nil-panic on the first saveFilePart of a running server rather than refusing
+// to start, which is the wrong end of the process to find out at.
+func TestOpenRequiresBlobStore(t *testing.T) {
+	t.Parallel()
+	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey())
+	if err == nil {
+		if cerr := s.Close(); cerr != nil {
+			t.Errorf("close: %v", cerr)
+		}
+		t.Fatal("Open with no blob backend succeeded, want a startup failure")
+	}
+}
+
 func TestCreateUserAndLookup(t *testing.T) {
 	t.Parallel()
 	s := open(t)

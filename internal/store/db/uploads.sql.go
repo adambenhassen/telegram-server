@@ -12,7 +12,7 @@ import (
 )
 
 const claimExpiredUploadParts = `-- name: ClaimExpiredUploadParts :many
-SELECT old.blob_key
+SELECT old.user_id, old.file_id, old.part_index, old.blob_key
 FROM upload_parts old
 WHERE old.date < $1
 ORDER BY old.date
@@ -25,37 +25,84 @@ type ClaimExpiredUploadPartsParams struct {
 	Lim  int32
 }
 
-// ClaimExpiredUploadParts claims at most one batch of expired parts, oldest
-// first, returning the blob keys the batch names. The bound is the point:
-// unbounded, this is one statement over every account's expired rows, holding
-// row locks and writing WAL in proportion to whatever accumulated while the
-// sweep was down. The caller repeats it until a pass comes back short.
+type ClaimExpiredUploadPartsRow struct {
+	UserID    int64
+	FileID    int64
+	PartIndex int32
+	BlobKey   string
+}
+
+// ClaimExpiredUploadParts takes at most one batch of expired parts, oldest
+// first, returning each row's primary key and the blob key it names. The bound
+// is the point: unbounded, this is one statement over every account's expired
+// rows, holding row locks and writing WAL in proportion to whatever
+// accumulated while the sweep was down. The caller repeats it until a pass
+// comes back short.
 //
-// SKIP LOCKED because every replica runs this sweep: a batch another replica
-// already holds is its work, and blocking on it would serialise the sweeps
-// into one and re-create the long transaction the bound removes.
-//
-// This only claims: it returns the keys and holds no locks once committed. The
-// byte delete and the conditional row delete run afterwards, outside any
-// transaction, so a hanging storage backend cannot pin the claim's locks.
-func (q *Queries) ClaimExpiredUploadParts(ctx context.Context, arg ClaimExpiredUploadPartsParams) ([]string, error) {
+// It partitions nothing between replicas, and must not be read as if it did.
+// The caller runs it in autocommit, so FOR UPDATE SKIP LOCKED holds its row
+// locks only to the end of the statement: two replicas sweeping at once can
+// and do take the same rows. That is safe rather than merely tolerated —
+// deleting an object twice is a no-op and the conditional row delete below
+// matches at most once — and it is why no durable claim column exists here.
+// SKIP LOCKED stays because it keeps a pass from blocking behind another
+// replica's in-flight statement.
+func (q *Queries) ClaimExpiredUploadParts(ctx context.Context, arg ClaimExpiredUploadPartsParams) ([]ClaimExpiredUploadPartsRow, error) {
 	rows, err := q.db.Query(ctx, claimExpiredUploadParts, arg.Date, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []string
+	var items []ClaimExpiredUploadPartsRow
 	for rows.Next() {
-		var blob_key string
-		if err := rows.Scan(&blob_key); err != nil {
+		var i ClaimExpiredUploadPartsRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.FileID,
+			&i.PartIndex,
+			&i.BlobKey,
+		); err != nil {
 			return nil, err
 		}
-		items = append(items, blob_key)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return items, nil
+}
+
+const deleteUploadPartByKey = `-- name: DeleteUploadPartByKey :execrows
+DELETE FROM upload_parts
+WHERE user_id = $1 AND file_id = $2 AND part_index = $3 AND blob_key = $4
+`
+
+type DeleteUploadPartByKeyParams struct {
+	UserID    int64
+	FileID    int64
+	PartIndex int32
+	BlobKey   string
+}
+
+// DeleteUploadPartByKey drops one claimed row, and only if it still names the
+// key whose bytes the sweep deleted. Both halves matter. The primary key makes
+// it one row: the rows a deploy leaves behind all carry the same empty
+// blob_key, and a delete keyed on blob_key alone would take every one of them
+// on the first claimed key, which is the per-batch bound gone in exactly the
+// case it is needed. The blob_key condition makes it conditional: a re-save
+// that committed in the window between the claim and the byte delete has
+// renamed the row, and its row and its new object both survive.
+func (q *Queries) DeleteUploadPartByKey(ctx context.Context, arg DeleteUploadPartByKeyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUploadPartByKey,
+		arg.UserID,
+		arg.FileID,
+		arg.PartIndex,
+		arg.BlobKey,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteUploadParts = `-- name: DeleteUploadParts :execrows
@@ -73,20 +120,6 @@ func (q *Queries) DeleteUploadParts(ctx context.Context, arg DeleteUploadPartsPa
 		return 0, err
 	}
 	return result.RowsAffected(), nil
-}
-
-const deleteUploadPartsByKey = `-- name: DeleteUploadPartsByKey :exec
-DELETE FROM upload_parts WHERE blob_key = $1
-`
-
-// DeleteUploadPartsByKey drops the one row naming blob_key, if any. The
-// sweep's finalise step uses it per claimed key: the delete is conditional on
-// the row still naming the key the sweep deleted — never blind on the primary
-// key — so a re-save that committed in the window between the claim and the
-// byte delete keeps its row and its new object.
-func (q *Queries) DeleteUploadPartsByKey(ctx context.Context, blobKey string) error {
-	_, err := q.db.Exec(ctx, deleteUploadPartsByKey, blobKey)
-	return err
 }
 
 const fileOutstandingBytes = `-- name: FileOutstandingBytes :one
@@ -134,30 +167,42 @@ func (q *Queries) UploadPartKey(ctx context.Context, arg UploadPartKeyParams) (U
 	return i, err
 }
 
-const uploadPartKeys = `-- name: UploadPartKeys :many
-SELECT blob_key FROM upload_parts WHERE user_id = $1 AND file_id = $2
+const uploadPartRefs = `-- name: UploadPartRefs :many
+SELECT part_index, blob_key, size FROM upload_parts
+WHERE user_id = $1 AND file_id = $2
+ORDER BY part_index
 `
 
-type UploadPartKeysParams struct {
+type UploadPartRefsParams struct {
 	UserID int64
 	FileID int64
 }
 
-// UploadPartKeys lists the blob keys an upload's rows currently name, so the
-// assembly cleanup can delete the bytes before the rows.
-func (q *Queries) UploadPartKeys(ctx context.Context, arg UploadPartKeysParams) ([]string, error) {
-	rows, err := q.db.Query(ctx, uploadPartKeys, arg.UserID, arg.FileID)
+type UploadPartRefsRow struct {
+	PartIndex int32
+	BlobKey   string
+	Size      int64
+}
+
+// UploadPartRefs lists an upload's parts in index order, each with the key its
+// bytes are read back from and the size that read is reconciled against. It is
+// the whole of what assembly needs from Postgres: one statement instead of a
+// key lookup per part on the validation pass and a second one per part on the
+// read pass. The assembly cleanup takes its keys from here too, so the bytes
+// go before the rows.
+func (q *Queries) UploadPartRefs(ctx context.Context, arg UploadPartRefsParams) ([]UploadPartRefsRow, error) {
+	rows, err := q.db.Query(ctx, uploadPartRefs, arg.UserID, arg.FileID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []string
+	var items []UploadPartRefsRow
 	for rows.Next() {
-		var blob_key string
-		if err := rows.Scan(&blob_key); err != nil {
+		var i UploadPartRefsRow
+		if err := rows.Scan(&i.PartIndex, &i.BlobKey, &i.Size); err != nil {
 			return nil, err
 		}
-		items = append(items, blob_key)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -194,12 +239,19 @@ func (q *Queries) UploadPartsSummary(ctx context.Context, arg UploadPartsSummary
 	return i, err
 }
 
-const upsertUploadPart = `-- name: UpsertUploadPart :exec
-INSERT INTO upload_parts (user_id, file_id, part_index, size, blob_key)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (user_id, file_id, part_index)
-DO UPDATE SET size = greatest(upload_parts.size, excluded.size),
-              blob_key = excluded.blob_key
+const upsertUploadPart = `-- name: UpsertUploadPart :one
+WITH superseded AS (
+    SELECT prev.blob_key FROM upload_parts prev
+    WHERE prev.user_id = $1 AND prev.file_id = $2 AND prev.part_index = $3
+), upserted AS (
+    INSERT INTO upload_parts (user_id, file_id, part_index, size, blob_key)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (user_id, file_id, part_index)
+    DO UPDATE SET size = excluded.size,
+                  blob_key = excluded.blob_key
+    RETURNING 1
+)
+SELECT coalesce((SELECT blob_key FROM superseded), '')::text AS superseded_key
 `
 
 type UpsertUploadPartParams struct {
@@ -218,25 +270,37 @@ type UpsertUploadPartParams struct {
 // is an upsert, and the caller re-reads the sums afterwards rather than
 // tracking a delta.
 //
-// The conflict clause is the size rule: the recorded size is never lowered
-// below the size of the object that may still exist at the part's key. A
-// re-save that records a smaller size while the larger object is still there
-// would let the outstanding-byte cap be evaded by shrinking rows, so a
-// smaller size keeps the larger one. The bytes themselves are replaced
-// unconditionally, so the assembled file reflects the retry.
+// The conflict clause is the size rule: the recorded size describes the object
+// the row currently names, and nothing else. Every save draws a fresh key, so
+// the size and the key move together — a row can never claim a size the object
+// it names does not have. Holding a superseded larger size instead would
+// describe an object that is about to be deleted, and the fail-closed read at
+// assembly would then reject a perfectly well-formed upload.
+//
+// The superseded key is what this returns, empty when the part is new. The
+// object it names is unreachable from any row the moment this commits, so the
+// caller deletes it: without that, a client looping saveFilePart on one part
+// grows stored bytes without bound while the row-based caps stay flat.
+//
+// The pre-conflict read is a plain CTE, so it runs against the statement's
+// snapshot and sees the row as it was before the upsert. The INSERT is a
+// data-modifying CTE and executes exactly once whether or not the final SELECT
+// references it.
 //
 // date is deliberately NOT refreshed on conflict: it is what the TTL sweep
 // measures from, so a re-save that moved it would let an account hold an
 // outstanding set alive forever by touching each part every TTL/2.
-func (q *Queries) UpsertUploadPart(ctx context.Context, arg UpsertUploadPartParams) error {
-	_, err := q.db.Exec(ctx, upsertUploadPart,
+func (q *Queries) UpsertUploadPart(ctx context.Context, arg UpsertUploadPartParams) (string, error) {
+	row := q.db.QueryRow(ctx, upsertUploadPart,
 		arg.UserID,
 		arg.FileID,
 		arg.PartIndex,
 		arg.Size,
 		arg.BlobKey,
 	)
-	return err
+	var superseded_key string
+	err := row.Scan(&superseded_key)
+	return superseded_key, err
 }
 
 const userOutstanding = `-- name: UserOutstanding :one

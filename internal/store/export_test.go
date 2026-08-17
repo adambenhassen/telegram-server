@@ -406,17 +406,32 @@ func SetSweepBlobs(s *Store, blobs blob.Store) error {
 
 // ClaimExpiredPartsForTest runs one sweep claim in isolation, so a test can
 // interpose a re-save between the claim and the byte delete.
-func (s *Store) ClaimExpiredPartsForTest(ctx context.Context, cutoff time.Time, batch int) ([]string, error) {
+func (s *Store) ClaimExpiredPartsForTest(ctx context.Context, cutoff time.Time, batch int) ([]db.ClaimExpiredUploadPartsRow, error) {
 	return s.q.ClaimExpiredUploadParts(ctx, db.ClaimExpiredUploadPartsParams{
 		Date: pgtype.Timestamptz{Time: cutoff, Valid: true},
 		Lim:  int32(batch), //nolint:gosec // batch is a test constant
 	})
 }
 
+// ClaimedPartKey reads the blob key off one claimed row, so a test can name the
+// object a pass is about to delete without importing the generated package.
+func ClaimedPartKey(c db.ClaimExpiredUploadPartsRow) string { return c.BlobKey }
+
 // FinaliseExpiredPartsForTest runs one sweep finalise in isolation, against the
-// keys a claim returned.
-func (s *Store) FinaliseExpiredPartsForTest(ctx context.Context, keys []string) error {
-	return s.finaliseExpiredUploadParts(ctx, keys)
+// rows a claim returned, and reports how many it retired.
+func (s *Store) FinaliseExpiredPartsForTest(ctx context.Context, claimed []db.ClaimExpiredUploadPartsRow) (int64, error) {
+	return s.finaliseExpiredUploadParts(ctx, claimed)
+}
+
+// InsertUploadPartWithoutKey writes a parts row carrying the migration's
+// default empty blob_key — the state every part in flight at deploy is left
+// in. No shipped path produces one, and the sweep still has to retire it.
+func InsertUploadPartWithoutKey(ctx context.Context, s *Store, userID, fileID int64, partIndex int32, size int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO upload_parts (user_id, file_id, part_index, size, blob_key)
+		 VALUES ($1, $2, $3, $4, '')`,
+		userID, fileID, partIndex, size)
+	return err
 }
 
 // CountRateLimits returns the number of rate limit rows for a given subject,

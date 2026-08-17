@@ -73,8 +73,13 @@ func partIndexOf(i int) (int32, bool) {
 //     and permanent, so the reverse order is not an option.
 //
 // The recorded size is measured from the payload this call received, never
-// from anything the client declared, and the upsert never lowers it below the
-// size of the object that may still exist at the part's key.
+// from anything the client declared, and it describes the object the row names
+// and no other: every save draws a fresh key, so size and key move together.
+//
+// A re-save therefore leaves the object it replaced named by nothing, and this
+// deletes it once the row commits. Without that, a client retrying one part in
+// a loop grows stored bytes without bound while the row-based caps — which
+// count rows, not objects — stay flat.
 //
 // Lock: one advisory lock on user_id, taken first, so one account's concurrent
 // saves serialise and two of them cannot both read a sum that is under the cap
@@ -106,13 +111,14 @@ func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIn
 	}
 	qtx := s.q.WithTx(tx)
 
-	if err = qtx.UpsertUploadPart(ctx, db.UpsertUploadPartParams{
+	superseded, err := qtx.UpsertUploadPart(ctx, db.UpsertUploadPartParams{
 		UserID:    userID,
 		FileID:    fileID,
 		PartIndex: idx,
 		Size:      size,
 		BlobKey:   key,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("upsert upload part: %w", err)
 	}
 
@@ -143,11 +149,39 @@ func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIn
 	// The row is committed, so the cap holds whatever happens next. The bytes
 	// go in after: a failure here leaves a row with no bytes, which the
 	// assembly's fail-closed check and the sweep both handle.
-	if _, err = s.blobs.Put(ctx, key, bytes.NewReader(payload)); err != nil {
-		s.log.Error("save upload part bytes", "user_id", userID, "file_id", fileID, "part", partIndex, "err", err)
-		return fmt.Errorf("write part bytes: %w", err)
+	_, putErr := s.blobs.Put(ctx, key, bytes.NewReader(payload))
+
+	// The commit moved the row onto the new key, so whatever sits at the old
+	// one is already named by no row. It runs whether or not the write above
+	// succeeded, because the commit orphaned it either way, and a failure is
+	// logged rather than returned: the part itself is in the state its row
+	// describes, and an object no row names is what MAIN-344's age pass over
+	// the parts prefix reclaims.
+	if superseded != "" && superseded != key {
+		if err = s.removePartBytes(ctx, superseded); err != nil {
+			s.log.Error("remove superseded upload part bytes",
+				"user_id", userID, "file_id", fileID, "part", partIndex, "err", err)
+		}
+	}
+
+	if putErr != nil {
+		s.log.Error("save upload part bytes", "user_id", userID, "file_id", fileID, "part", partIndex, "err", putErr)
+		return fmt.Errorf("write part bytes: %w", putErr)
 	}
 	return nil
+}
+
+// removePartBytes deletes one part's object. An empty key is the migration
+// default, carried by every part that was in flight when the payload column
+// went: the row names no object, so there is nothing to delete and that is not
+// a failure. Passing it through would be — the local backend rejects an empty
+// path rather than reporting it absent, and those rows are the oldest in the
+// table, so an error on them would stall the sweep behind them for good.
+func (s *Store) removePartBytes(ctx context.Context, key string) error {
+	if key == "" {
+		return nil
+	}
+	return s.blobs.Remove(ctx, key)
 }
 
 // UploadPartsSummary reports the part count, the highest part index and the
@@ -181,22 +215,60 @@ func (s *Store) UploadPartKey(ctx context.Context, userID, fileID int64, partInd
 	return r.BlobKey, r.Size, true, nil
 }
 
-// UploadPart returns one part's payload, read from the blob store at the key
-// the row records. ok=false when the part is absent. A row whose bytes are
-// gone — the crash window between the row commit and the byte write — is an
-// error, not a short part: the caller's only sane response is to fail closed,
-// and the sweep retires the row on schedule.
+// UploadPartRef names one in-flight part: its index, the key its bytes are
+// read back from and the server-measured size that read is reconciled against.
+type UploadPartRef struct {
+	Index int
+	Key   string
+	Size  int64
+}
+
+// UploadPartRefs returns every part of one in-flight upload in index order,
+// in one statement. Assembly takes both what it validates and what it reads
+// from this, rather than a key lookup per part on each pass.
+func (s *Store) UploadPartRefs(ctx context.Context, userID, fileID int64) ([]UploadPartRef, error) {
+	rows, err := s.q.UploadPartRefs(ctx, db.UploadPartRefsParams{UserID: userID, FileID: fileID})
+	if err != nil {
+		return nil, fmt.Errorf("upload part refs: %w", err)
+	}
+	refs := make([]UploadPartRef, len(rows))
+	for i, r := range rows {
+		refs[i] = UploadPartRef{Index: int(r.PartIndex), Key: r.BlobKey, Size: r.Size}
+	}
+	return refs, nil
+}
+
+// ReadUploadPart returns ref's bytes. It is the one place recorded accounting
+// and stored bytes are compared, and it is fail closed: a row whose bytes are
+// gone or short — the crash window between the row commit and the byte write —
+// is an error, not a short part. The caller's only sane response is to refuse
+// the assembly, and the sweep retires the row on schedule.
+func (s *Store) ReadUploadPart(ctx context.Context, ref UploadPartRef) ([]byte, error) {
+	if ref.Key == "" {
+		// The migration default: a part that was in flight when the payload
+		// column went names no object and can never be assembled.
+		return nil, fmt.Errorf("part %d: row names no stored bytes", ref.Index)
+	}
+	b, err := s.blobs.ReadAt(ctx, ref.Key, 0, ref.Size)
+	if err != nil {
+		return nil, fmt.Errorf("read part bytes: %w", err)
+	}
+	if int64(len(b)) != ref.Size {
+		return nil, fmt.Errorf("part %d: read %d bytes, row records %d", ref.Index, len(b), ref.Size)
+	}
+	return b, nil
+}
+
+// UploadPart returns one part's payload. ok=false when the part is absent;
+// every other failure is ReadUploadPart's, fail closed.
 func (s *Store) UploadPart(ctx context.Context, userID, fileID int64, partIndex int) (payload []byte, ok bool, err error) {
 	key, size, found, err := s.UploadPartKey(ctx, userID, fileID, partIndex)
 	if err != nil || !found {
 		return nil, false, err
 	}
-	b, err := s.blobs.ReadAt(ctx, key, 0, size)
+	b, err := s.ReadUploadPart(ctx, UploadPartRef{Index: partIndex, Key: key, Size: size})
 	if err != nil {
-		return nil, false, fmt.Errorf("read part bytes: %w", err)
-	}
-	if int64(len(b)) != size {
-		return nil, false, fmt.Errorf("part %d: read %d bytes, row records %d", partIndex, len(b), size)
+		return nil, false, err
 	}
 	return b, true, nil
 }
@@ -206,12 +278,12 @@ func (s *Store) UploadPart(ctx context.Context, userID, fileID int64, partIndex 
 // failure deleting them leaves rows that name objects, which the sweep retires
 // on schedule, rather than objects no row names, which nothing reclaims.
 func (s *Store) DeleteUploadParts(ctx context.Context, userID, fileID int64) (int64, error) {
-	keys, err := s.partKeys(ctx, userID, fileID)
+	refs, err := s.UploadPartRefs(ctx, userID, fileID)
 	if err != nil {
 		return 0, err
 	}
-	for _, key := range keys {
-		if err = s.blobs.Remove(ctx, key); err != nil {
+	for _, ref := range refs {
+		if err = s.removePartBytes(ctx, ref.Key); err != nil {
 			s.log.Error("delete upload part bytes", "user_id", userID, "file_id", fileID, "err", err)
 			return 0, fmt.Errorf("delete part bytes: %w", err)
 		}
@@ -229,15 +301,6 @@ func (s *Store) DeleteUploadParts(ctx context.Context, userID, fileID int64) (in
 // own store.
 func (s *Store) PartBlobs() blob.Store { return s.blobs }
 
-// partKeys lists the blob keys an upload's rows currently name.
-func (s *Store) partKeys(ctx context.Context, userID, fileID int64) ([]string, error) {
-	rows, err := s.q.UploadPartKeys(ctx, db.UploadPartKeysParams{UserID: userID, FileID: fileID})
-	if err != nil {
-		return nil, fmt.Errorf("upload part keys: %w", err)
-	}
-	return rows, nil
-}
-
 // ExpiredPartSweepBatch is how many expired parts one sweep pass removes. It
 // bounds the statement, not the retention: SweepExpiredUploadParts repeats
 // passes until one comes back short, so a backlog still drains in one sweep, in
@@ -249,11 +312,18 @@ const ExpiredPartSweepBatch = 1000
 // rows: each pass claims its batch, deletes the claimed objects, and finalises
 // the row delete.
 //
-// It terminates because each pass either comes back short — nothing more to
-// take under this cutoff — or removes exactly batch rows from a finite set the
-// sweep itself never adds to. cutoff is fixed for the whole drain rather than
-// recomputed per pass, so what a sweep retires is decided once, at its start,
-// and a part that expires mid-drain waits for the next one.
+// It terminates on rows actually retired, never on rows claimed. The two
+// differ: a part re-saved between a pass's claim and its finalise has moved
+// onto a new key, the conditional delete spares it, and the pass retires fewer
+// rows than it took. Counting the claim as progress would let an account that
+// re-saves its expired parts on a timer keep every pass full and this loop
+// running for as long as it cared to, since the re-save deliberately does not
+// move the expiry date the claim selects on. A pass that retires fewer than
+// batch rows ends the drain and leaves the remainder to the next sweep.
+//
+// cutoff is fixed for the whole drain rather than recomputed per pass, so what
+// a sweep retires is decided once, at its start, and a part that expires
+// mid-drain waits for the next one.
 //
 // A canceled context surfaces as an error from the pass it interrupts, with the
 // count of what earlier passes already retired: each pass commits on its own,
@@ -273,8 +343,8 @@ func (s *Store) SweepExpiredUploadParts(ctx context.Context, cutoff time.Time, b
 }
 
 // deleteExpiredUploadParts retires up to batch parts stored before cutoff,
-// oldest first, returning the row count. A pass returning batch means there is
-// more to take.
+// oldest first, returning how many rows it actually removed — which is at most
+// how many it claimed, and less when a re-save spared one.
 //
 // cutoff is compared against when a part was first stored, not when it was last
 // written — re-saving a part does not extend its life, or an account could hold
@@ -283,18 +353,20 @@ func (s *Store) SweepExpiredUploadParts(ctx context.Context, cutoff time.Time, b
 // The pass is three steps, and the order is the contract: claim, commit, then
 // the storage work, then finalise.
 //
-//  1. Claim: the SQL takes its FOR UPDATE SKIP LOCKED batch and returns the
-//     keys the batch names. The claim commits on its own, so the row locks are
-//     released before any storage call: a hanging storage backend cannot pin
-//     them.
+//  1. Claim: the SQL takes its bounded batch and returns each row's primary key
+//     and the blob key it names. It commits on its own, so no row lock is held
+//     across a storage call: a hanging storage backend cannot pin one. It also
+//     partitions nothing between replicas, and nothing here assumes it does —
+//     both remaining steps are idempotent under a concurrent duplicate pass.
 //  2. The bytes: each claimed object is deleted. Deleting an absent object is
-//     a no-op, so a crash that left a row without bytes costs nothing here. A
-//     failure here stops the pass with the rows still in place, so the next
-//     pass retries them rather than the bytes becoming unreachable.
-//  3. Finalise: the row delete is conditional on the row still naming the key
-//     the pass deleted, never blind on the primary key, so a re-save that
-//     committed in the window between the claim and the byte delete keeps its
-//     row and its new object.
+//     a no-op, so a crash that left a row without bytes costs nothing here, and
+//     a row the migration left with no key at all names no object to delete. A
+//     failure stops the pass with the rows still in place, so the next pass
+//     retries them rather than the bytes becoming unreachable.
+//  3. Finalise: one delete per claimed row, naming both its primary key and the
+//     blob key the pass deleted. A re-save that committed in the window between
+//     the claim and the byte delete has renamed the row: it is not deleted and
+//     it is not counted.
 func (s *Store) deleteExpiredUploadParts(ctx context.Context, cutoff time.Time, batch int) (int64, error) {
 	// Refused rather than read as "no bound": the unbounded DELETE is exactly
 	// what this parameter exists to prevent, and a caller that computed a zero
@@ -302,49 +374,55 @@ func (s *Store) deleteExpiredUploadParts(ctx context.Context, cutoff time.Time, 
 	if batch <= 0 || batch > math.MaxInt32 {
 		return 0, fmt.Errorf("delete expired upload parts: batch %d out of range", batch)
 	}
-	keys, err := s.q.ClaimExpiredUploadParts(ctx, db.ClaimExpiredUploadPartsParams{
+	claimed, err := s.q.ClaimExpiredUploadParts(ctx, db.ClaimExpiredUploadPartsParams{
 		Date: pgtype.Timestamptz{Time: cutoff, Valid: true},
 		Lim:  int32(batch),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("claim expired upload parts: %w", err)
 	}
-	if len(keys) == 0 {
+	if len(claimed) == 0 {
 		return 0, nil
 	}
-	for _, key := range keys {
-		if err = s.blobs.Remove(ctx, key); err != nil {
+	for _, c := range claimed {
+		if err = s.removePartBytes(ctx, c.BlobKey); err != nil {
 			// The rows still name their objects, so the next pass retries them;
 			// stopping here rather than dropping the rows is what keeps the
 			// bytes reachable.
 			return 0, fmt.Errorf("delete expired part bytes: %w", err)
 		}
 	}
-	if err = s.finaliseExpiredUploadParts(ctx, keys); err != nil {
+	retired, err := s.finaliseExpiredUploadParts(ctx, claimed)
+	if err != nil {
 		return 0, fmt.Errorf("finalise expired upload parts: %w", err)
 	}
-	return int64(len(keys)), nil
+	return retired, nil
 }
 
-// finaliseExpiredUploadParts drops the rows a sweep pass claimed, one
-// conditional delete per key: the row goes only if it still names the key its
-// bytes were deleted under. A re-save that committed in the window between the
-// claim and the byte delete has renamed the row, and its row and its new
-// object both survive.
-func (s *Store) finaliseExpiredUploadParts(ctx context.Context, keys []string) error {
+// finaliseExpiredUploadParts drops the rows a sweep pass claimed and reports
+// how many went. Each delete names one row's primary key and requires it to
+// still carry the blob key whose bytes the pass deleted. The primary key is
+// what makes it one row — the rows a deploy leaves behind all share the empty
+// blob key, and a delete keyed on that alone would take every one of them at
+// once — and the blob key is what makes it conditional, so a re-save that
+// landed in the pass's window keeps both its row and its new object.
+func (s *Store) finaliseExpiredUploadParts(ctx context.Context, claimed []db.ClaimExpiredUploadPartsRow) (int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
+		return 0, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
-	for _, key := range keys {
-		if err = qtx.DeleteUploadPartsByKey(ctx, key); err != nil {
-			return fmt.Errorf("delete expired part rows: %w", err)
+	var retired int64
+	for _, c := range claimed {
+		n, err := qtx.DeleteUploadPartByKey(ctx, db.DeleteUploadPartByKeyParams(c))
+		if err != nil {
+			return 0, fmt.Errorf("delete expired part rows: %w", err)
 		}
+		retired += n
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit: %w", err)
+		return 0, fmt.Errorf("commit: %w", err)
 	}
-	return nil
+	return retired, nil
 }

@@ -148,6 +148,15 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Required rather than defaulted: the part bytes live in the blob backend,
+	// so a Store without one cannot serve an upload at all, and there is no
+	// directory this package could pick on a caller's behalf that would be
+	// right. Left to default it, the miss surfaces as a nil dereference on the
+	// first saveFilePart a running server takes.
+	if s.blobs == nil {
+		pool.Close()
+		return nil, errors.New("store: no blob backend configured; pass WithBlobStore")
+	}
 	if err := s.checkSchema(ctx); err != nil {
 		pool.Close()
 		return nil, err

@@ -548,9 +548,15 @@ var (
 )
 
 // NewPartsReaderForTest builds the streaming reader over an in-flight upload's
-// parts, for the external api_test package.
-func NewPartsReaderForTest(s *store.Store, userID, fileID int64, total int) io.Reader {
-	return &partsReader{ctx: context.Background(), store: s, userID: userID, fileID: fileID, total: total}
+// parts, for the external api_test package. It reads the refs the way assembly
+// does, so the reader under test is fed exactly what the shipped path feeds it.
+func NewPartsReaderForTest(s *store.Store, userID, fileID int64) (io.Reader, error) {
+	ctx := context.Background()
+	refs, err := s.UploadPartRefs(ctx, userID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	return &partsReader{ctx: ctx, store: s, refs: refs}, nil
 }
 
 // EditMessageForTest encodes req and invokes handleEditMessage for the caller.

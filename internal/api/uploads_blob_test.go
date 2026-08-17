@@ -113,6 +113,62 @@ func TestSaveFilePartRoundTripIsByteIdentical(t *testing.T) {
 	}
 }
 
+// TestResaveIsReflectedInAssembledFile is criterion 3 read end to end: the
+// assembled file reflects the retry. The retry is the case that breaks if the
+// recorded size stops describing the object the row names — a part re-saved
+// smaller then has a row claiming more bytes than its object holds, the
+// fail-closed reconciliation at assembly rejects it, and a legal upload can
+// never be sent. The assertion is on the downloadable bytes, not on the part.
+func TestResaveIsReflectedInAssembledFile(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	blobs := newBlobs(t)
+	a, err := s.CreateUser(ctx, "+15551297051")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551297052")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+
+	const fileID = 7006
+	first := bytes.Repeat([]byte{'A'}, 512*1024)
+	second := []byte("tail")
+	saveParts(t, s, a.ID, fileID, first, second)
+
+	// The retry: part 0 comes back far smaller than the bytes already stored
+	// for it.
+	retry := []byte("retried")
+	if _, err := api.SaveFilePartForTest(s, a.ID, &tg.UploadSaveFilePartRequest{
+		FileID: fileID, FilePart: 0, Bytes: retry,
+	}); err != nil {
+		t.Fatalf("re-save part 0: %v", err)
+	}
+
+	enc, err := api.SendMediaForTest(s, a.ID, blobs, api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
+		Peer:     api.InputPeerUser(a.ID, b.ID),
+		Media:    uploadedDocument(fileID, 2, "retry.bin", "application/octet-stream"),
+		RandomID: 63,
+	})
+	if err != nil {
+		t.Fatalf("send media after a shrinking retry: %v", err)
+	}
+	doc := documentOf(t, enc)
+	want := append(append([]byte{}, retry...), second...)
+	if doc.Size != int64(len(want)) {
+		t.Fatalf("size = %d, want %d", doc.Size, len(want))
+	}
+	body, err := blobs.ReadAt(ctx, blob.Key(doc.ID), 0, int64(len(want)))
+	if err != nil {
+		t.Fatalf("read blob: %v", err)
+	}
+	if !bytes.Equal(body, want) {
+		t.Fatalf("assembled file does not reflect the retry: got %q", body)
+	}
+}
+
 // TestUploadPartsIsolatedAcrossAccounts is criterion 7: one account cannot
 // read or overwrite another account's in-flight part, including when both
 // chose the same file_id. The test tries both directions through the RPC
@@ -160,16 +216,16 @@ func TestUploadPartsIsolatedAcrossAccounts(t *testing.T) {
 	}
 
 	// The two parts are separate objects: the keys differ.
-	_, aKey, _, err := s.UploadPartKey(ctx, a.ID, fileID, 0)
-	if err != nil {
-		t.Fatalf("a key: %v", err)
+	aKey, _, ok, err := s.UploadPartKey(ctx, a.ID, fileID, 0)
+	if err != nil || !ok {
+		t.Fatalf("a key: ok=%v err=%v", ok, err)
 	}
-	_, bKey, _, err := s.UploadPartKey(ctx, b.ID, fileID, 0)
-	if err != nil {
-		t.Fatalf("b key: %v", err)
+	bKey, _, ok, err := s.UploadPartKey(ctx, b.ID, fileID, 0)
+	if err != nil || !ok {
+		t.Fatalf("b key: ok=%v err=%v", ok, err)
 	}
-	if aKey == bKey {
-		t.Fatal("two accounts' parts share a blob key: isolation is gone")
+	if aKey == "" || aKey == bKey {
+		t.Fatalf("two accounts' parts share a blob key (%q): isolation is gone", aKey)
 	}
 
 	// a re-saving its part does not touch b's object.

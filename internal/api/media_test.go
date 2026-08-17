@@ -130,7 +130,11 @@ func TestPartsReaderConcatenates(t *testing.T) {
 	}
 	saveParts(t, s, u.ID, 700, []byte("hello "), []byte("wide "), []byte("world"))
 
-	got, err := io.ReadAll(api.NewPartsReaderForTest(s, u.ID, 700, 3))
+	r, err := api.NewPartsReaderForTest(s, u.ID, 700)
+	if err != nil {
+		t.Fatalf("parts reader: %v", err)
+	}
+	got, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -139,7 +143,11 @@ func TestPartsReaderConcatenates(t *testing.T) {
 	}
 
 	// Zero parts is end of stream, not an error and not a spin.
-	empty, err := io.ReadAll(api.NewPartsReaderForTest(s, u.ID, 701, 0))
+	r, err = api.NewPartsReaderForTest(s, u.ID, 701)
+	if err != nil {
+		t.Fatalf("empty parts reader: %v", err)
+	}
+	empty, err := io.ReadAll(r)
 	if err != nil || len(empty) != 0 {
 		t.Errorf("empty read = %q err=%v", empty, err)
 	}

@@ -92,12 +92,15 @@ func TestSaveUploadPartRefusedWritesNothing(t *testing.T) {
 	_ = blobs
 }
 
-// TestUploadPartRecordedSizeNeverLowers is criterion 12: the recorded size is
-// never lowered below the size of the object that may still exist at the
-// part's key. Re-saving a 512 KiB part as 1 byte must not record 1 byte while
-// the 512 KiB object may still be there — that is the sequence that evades
-// the outstanding-byte cap by shrinking rows.
-func TestUploadPartRecordedSizeNeverLowers(t *testing.T) {
+// TestUploadPartRecordedSizeDescribesStoredObject is criterion 12 under key
+// rotation: the recorded size describes the object the row currently names.
+// The failure invariant 12 was written against — record 512 KiB, re-save as 1
+// byte, keep the 512 KiB object — cannot arise here, because a re-save draws a
+// fresh key and the superseded object is deleted once the row commits. Holding
+// the larger size instead would describe an object that no longer exists, and
+// the fail-closed read at assembly would then reject an upload that is
+// perfectly well formed.
+func TestUploadPartRecordedSizeDescribesStoredObject(t *testing.T) {
 	t.Parallel()
 	s := open(t)
 	ctx := context.Background()
@@ -115,37 +118,69 @@ func TestUploadPartRecordedSizeNeverLowers(t *testing.T) {
 		t.Fatalf("re-save small: %v", err)
 	}
 
-	size, _, err := store.UploadPartRow(ctx, s, u.ID, 9, 0)
+	size, key, err := store.UploadPartRow(ctx, s, u.ID, 9, 0)
 	if err != nil {
 		t.Fatalf("read row: %v", err)
 	}
-	if size != int64(len(big)) {
-		t.Fatalf("recorded size after shrink re-save = %d, want %d (the size of the object that may still exist)", size, len(big))
+	if size != 1 {
+		t.Fatalf("recorded size after shrink re-save = %d, want 1 (the size of the object the row names)", size)
 	}
 
-	// The bytes themselves were replaced, so assembly reflects the retry. The
-	// read is at the recorded size: it must see the new bytes at the head, and
-	// the fail-closed check compares the read against the recorded size, which
-	// is the larger one, so the read window is the larger one too.
-	got, err := s.ReadPartBytes(ctx, mustKey(t, s, u.ID, 9, 0))
+	// The bytes are the retry's, whole: a read at the recorded size returns
+	// exactly them, so the fail-closed reconciliation at assembly passes.
+	got, err := s.ReadPartBytes(ctx, key)
 	if err != nil {
 		t.Fatalf("read part bytes: %v", err)
 	}
-	if !bytes.Equal(got[:1], []byte("x")) {
-		t.Fatalf("re-saved payload not at the head of the stored object: got %q", got[:1])
+	if !bytes.Equal(got, []byte("x")) {
+		t.Fatalf("stored object = %q, want the re-saved payload", got)
+	}
+	if _, ok, err := s.UploadPart(ctx, u.ID, 9, 0); err != nil || !ok {
+		t.Fatalf("read part after shrink re-save: ok=%v err=%v (the upload must still assemble)", ok, err)
+	}
+
+	// And the 512 KiB object is gone, so the shrink evades no cap: the
+	// accounting and the bytes on disk agree.
+	_, dir := localBlobsOf(t, s)
+	if n := countPartKeys(t, dir); n != 1 {
+		t.Fatalf("part objects after re-save = %d, want 1 (the superseded object must be deleted)", n)
 	}
 }
 
-func mustKey(t *testing.T, s *store.Store, userID, fileID int64, idx int32) string {
-	t.Helper()
-	_, k, err := store.UploadPartRow(ctx2(), s, userID, fileID, idx)
+// TestResaveDeletesSupersededObject is criterion 5's retry half: a client
+// looping upload.saveFilePart on one part must not grow stored bytes while the
+// row-based caps stay flat. Each re-save rotates the row onto a fresh key, so
+// the object the row stopped naming is unreachable from any row and is deleted
+// once the row commits.
+func TestResaveDeletesSupersededObject(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000108")
 	if err != nil {
-		t.Fatalf("read key: %v", err)
+		t.Fatalf("create user: %v", err)
 	}
-	return k
-}
 
-func ctx2() context.Context { return context.Background() }
+	_, dir := localBlobsOf(t, s)
+	const resaves = 5
+	for i := range resaves {
+		if err := s.SaveUploadPart(ctx, u.ID, 19, 0, part(byte('a'+i), 4096), maxFile); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+		if n := countPartKeys(t, dir); n != 1 {
+			t.Fatalf("after %d saves of one part: %d objects on disk, want 1", i+1, n)
+		}
+	}
+
+	// The accounting never moved, and neither did the bytes it accounts for.
+	parts, _, total, err := s.UploadPartsSummary(ctx, u.ID, 19)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if parts != 1 || total != 4096 {
+		t.Fatalf("after %d re-saves: parts=%d total=%d, want 1/4096", resaves, parts, total)
+	}
+}
 
 // TestUploadPartRowLeadsBytes is criterion 13's create direction, made
 // observable: a row whose bytes never landed is the recoverable state. The
@@ -321,12 +356,12 @@ func TestSweepRacesResaveIsConditionalOnKey(t *testing.T) {
 	}
 
 	// The claim: the sweep's first step, in its own transaction.
-	keys, err := s.ClaimExpiredPartsForTest(ctx, time.Now().Add(time.Hour), sweepBatch)
+	claimed, err := s.ClaimExpiredPartsForTest(ctx, time.Now().Add(time.Hour), sweepBatch)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if len(keys) != 1 || keys[0] != oldKey {
-		t.Fatalf("claim returned %v, want [%s]", keys, oldKey)
+	if len(claimed) != 1 || store.ClaimedPartKey(claimed[0]) != oldKey {
+		t.Fatalf("claim returned %d rows, want the one naming %s", len(claimed), oldKey)
 	}
 
 	// The re-save that lands in the sweep's window: the row now names a new
@@ -348,9 +383,15 @@ func TestSweepRacesResaveIsConditionalOnKey(t *testing.T) {
 	}
 
 	// The finalise: the row delete is conditional on the row still naming the
-	// claimed key, so the re-saved row is spared.
-	if err := s.FinaliseExpiredPartsForTest(ctx, keys); err != nil {
+	// claimed key, so the re-saved row is spared — and it reports nothing
+	// retired, which is what stops the drain instead of letting a client that
+	// re-saves expired parts keep every pass full.
+	retired, err := s.FinaliseExpiredPartsForTest(ctx, claimed)
+	if err != nil {
 		t.Fatalf("finalise: %v", err)
+	}
+	if retired != 0 {
+		t.Fatalf("finalise retired %d rows, want 0: a claim the conditional delete did not match is not a retirement", retired)
 	}
 
 	// The re-save's row and its new object both survive: nothing was
@@ -371,6 +412,88 @@ func TestSweepRacesResaveIsConditionalOnKey(t *testing.T) {
 	}
 	if got := countPartKeys(t, dir); got != 1 {
 		t.Fatalf("part objects after finalise = %d, want 1 (the re-save's)", got)
+	}
+}
+
+// TestSweepRetiresRowsLeftWithoutAKey covers the parts that were in flight
+// when this change deployed: the migration gives their rows the default empty
+// blob_key, so they name no object. They are also the oldest rows in the
+// table, and the sweep takes oldest first, so if the empty key errored the
+// pass every TTL reclamation would be dead from deploy onwards — not just for
+// these rows, but for every row behind them. Deleting no object is not an
+// error; the row is retired on schedule.
+func TestSweepRetiresRowsLeftWithoutAKey(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000109")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	// Two rows the migration left keyless, then one ordinary saved part behind
+	// them: the keyless rows sort first, so they are what a pass hits first.
+	for i := range 2 {
+		if err := store.InsertUploadPartWithoutKey(ctx, s, u.ID, 21, int32(i), 100); err != nil {
+			t.Fatalf("insert keyless row %d: %v", i, err)
+		}
+	}
+	if err := s.SaveUploadPart(ctx, u.ID, 21, 2, part('a', 100), maxFile); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	n, err := s.SweepExpiredUploadParts(ctx, time.Now().Add(time.Hour), sweepBatch)
+	if err != nil {
+		t.Fatalf("sweep over keyless rows: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("sweep retired %d rows, want 3", n)
+	}
+	if parts, _, _, err := s.UploadPartsSummary(ctx, u.ID, 21); err != nil || parts != 0 {
+		t.Fatalf("after sweep: parts=%d err=%v", parts, err)
+	}
+	_, dir := localBlobsOf(t, s)
+	if got := countPartKeys(t, dir); got != 0 {
+		t.Fatalf("part objects after sweep = %d, want 0", got)
+	}
+}
+
+// TestFinaliseDeletesOneRowPerClaimedKey is the per-row bound on the finalise
+// step. The rows the migration left keyless all share one blob_key value, the
+// empty string, so a finalise that identified rows by key alone would delete
+// every one of them on the first claimed key — the batch bound the sweep
+// exists to hold would be gone for exactly the deploy case above. The delete
+// names a row's primary key as well, so a claim of one retires one.
+func TestFinaliseDeletesOneRowPerClaimedKey(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000110")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	for i := range 3 {
+		if err := store.InsertUploadPartWithoutKey(ctx, s, u.ID, 23, int32(i), 100); err != nil {
+			t.Fatalf("insert keyless row %d: %v", i, err)
+		}
+	}
+
+	claimed, err := s.ClaimExpiredPartsForTest(ctx, time.Now().Add(time.Hour), 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claim of 1 returned %d rows", len(claimed))
+	}
+	retired, err := s.FinaliseExpiredPartsForTest(ctx, claimed)
+	if err != nil {
+		t.Fatalf("finalise: %v", err)
+	}
+	if retired != 1 {
+		t.Fatalf("finalise retired %d rows for one claimed key, want 1", retired)
+	}
+	if parts, _, _, err := s.UploadPartsSummary(ctx, u.ID, 23); err != nil || parts != 2 {
+		t.Fatalf("after a one-row finalise: parts=%d err=%v, want 2 left", parts, err)
 	}
 }
 
