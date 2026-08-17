@@ -80,22 +80,38 @@ generates a new 2048-bit RSA key and writes it there (PKCS1 PEM, mode
 same file, so the key (and its fingerprint) stays stable across restarts as
 long as the file persists.
 
-## 2. Get the RSA key fingerprint
+## 2. Get the RSA key identity
 
 At startup the server logs the key it loaded/generated:
 
 ```
-level=INFO msg="server RSA key" fingerprint=<int64> path=server_key.pem
+level=INFO msg="server RSA key" key_id=<64 hex chars in 16 dash-separated groups of 4> fingerprint=<int64> path=server_key.pem
 ```
 
-(`cmd/telegramd/main.go`, right after `rsakey.LoadOrGenerate`). A client
-must be built with this exact public key (read `path`, e.g.
-`server_key.pem`, and derive/embed the PEM) and its fingerprint, since
-gotd-style clients select the RSA key to use for the auth-key handshake by
-fingerprint. Also note the `listening addr=... advertise=... dc=...` log line
-that follows — it confirms the actual bind address, the address clients are
-told to dial, and the DC id the process is using, which may differ from what
-you passed if `TG_LISTEN_ADDR` was left at default.
+(`cmd/telegramd/main.go`, right after `rsakey.LoadOrGenerate`).
+
+- `key_id` is the SHA-256 of the DER SubjectPublicKeyInfo encoding of the
+  public key, hex-encoded as 16 dash-separated groups of 4 characters
+  (e.g. `a1b2-c3d4-e5f6-a7b8-...`). **This is the value to compare out of
+  band** — a client UI that displays the same digest for the key it loaded
+  must render the identical grouped format. The int64 `fingerprint` is the
+  legacy Telegram value; it is retained for clients that still match on it
+  but is too short to be a trustworthy out-of-band check. Byte-level oracle
+  for the digest, against a public key file (SPKI or PKCS#1 PEM — OpenSSL
+  normalises both to SPKI on `-pubin`):
+
+  ```bash
+  openssl pkey -pubin -in server_pub.pem -outform DER | sha256sum
+  ```
+- A client must be built with this exact public key (read `path`, e.g.
+  `server_key.pem`, and derive/embed the PEM) and its fingerprint, since
+  gotd-style clients select the RSA key to use for the auth-key handshake by
+  fingerprint.
+
+Also note the `listening addr=... advertise=... dc=...` log line that
+follows — it confirms the actual bind address, the address clients are told
+to dial, and the DC id the process is using, which may differ from what you
+passed if `TG_LISTEN_ADDR` was left at default.
 
 ## 3. Point a client at this server
 
@@ -268,10 +284,9 @@ on a branch of our fork, deliberately not vendored here: the checkout is
    constants, so the address and the key can change without a rebuild — which
    matters because the build is hours and the server's advertised address is
    not known until it runs.
-2. `api_id` / `api_hash`, passed at cmake time as `TDESKTOP_API_ID` and
-   `TDESKTOP_API_HASH`. `telegramd` never reads either, so any values work; the
-   branch was built with the public test pair `17349` /
-   `344583e45741c457fe1862106095a5eb`.
+2. `api_id` / `api_hash`, cmake options rather than a patch. `telegramd` never
+   reads either, so any values work; the branch was built with
+   `-D TDESKTOP_API_TEST=ON`, which selects upstream's public test pair.
 3. `Telegram/SourceFiles/mtproto/special_config_request.cpp` — the DNS and
    Firebase fallback resolver is skipped whenever a custom DC is configured.
    Left live, a failed connect to our address sends the client resolving
@@ -294,25 +309,57 @@ openssl rsa -in server_key.pem -pubout -RSAPublicKey_out -out server_pub.pem
 ### Build
 
 The upstream Linux build runs in `ghcr.io/telegramdesktop/tdesktop/centos_env`,
-which is published **for linux/amd64 only** — it will not run on an arm64 host.
+which is **published for linux/amd64 only**. The image *definition* is not
+architecture-locked, though: rendering its Dockerfile with `DEBUG=` and `LTO=`
+and building it natively on aarch64 works, and takes about two hours on four
+cores. Everything below was run against such an image, tagged
+`tdesktop:centos_env-arm64`.
+
+Render it from our fork's `dev`, not from upstream. rnnoise v0.2's NEON and
+generic paths in `src/vec.h` include a header rnnoise does not vendor, so they
+compile on no architecture at all — upstream never notices because its AVX/SSE2
+branch never reaches that line, and an aarch64 render from upstream fails there.
+The fix is already merged on the fork as `81f5657`, so nothing has to be applied
+by hand.
+
+Clone with `--recursive`; the build needs all 36 submodules.
 
 ```bash
 docker run --rm -u $(id -u) \
   -v "$PWD:/usr/src/tdesktop" \
   -v "$HOME/.cache/tdesktop-ccache:/var/cache/ccache" \
   -e CONFIG=Debug \
-  ghcr.io/telegramdesktop/tdesktop/centos_env:latest \
+  <image-tag> \
+  env -u CCACHE_DISABLE \
   /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
   -D CMAKE_CONFIGURATION_TYPES=Debug \
-  -D CMAKE_C_FLAGS_DEBUG="-O0" \
-  -D CMAKE_CXX_FLAGS_DEBUG="-O0" \
-  -D TDESKTOP_API_ID=17349 \
-  -D TDESKTOP_API_HASH=344583e45741c457fe1862106095a5eb \
+  -D CMAKE_C_FLAGS_DEBUG="-O0 -fpch-preprocess" \
+  -D CMAKE_CXX_FLAGS_DEBUG="-O0 -fpch-preprocess" \
+  -D TDESKTOP_API_TEST=ON \
   -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
   -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
 ```
 
-The binary lands in `out/Debug/Telegram`. Budget hours for a cold build.
+`-D TDESKTOP_API_TEST=ON` is the public test api id/hash pair, and is enough
+here because the server reads neither. The image sets `CCACHE_DISABLE=true`, so
+`env -u CCACHE_DISABLE` is what makes the ccache mount do anything, and
+`-fpch-preprocess` is what lets ccache hash the build's precompiled headers
+rather than silently missing on every one — both are upstream's own CI line.
+
+The binary lands in `out/Debug/Telegram` and is around 1.2 GB. A cold build is
+2209 targets, roughly an hour on four cores.
+
+Bind mounts do not work from an agent runtime — the Docker daemon resolves `-v`
+paths on its own host, not in the workdir, and silently mounts an empty
+directory. There, create a long-lived container and copy the tree in instead:
+
+```bash
+docker create --name tdbuild --user root -w /work <image-tag> sleep infinity
+docker start tdbuild
+docker cp ./tdesktop tdbuild:/work/tdesktop
+docker exec tdbuild bash -c 'cd /work/tdesktop && env -u CCACHE_DISABLE CONFIG=Debug \
+  ./Telegram/build/docker/centos_env/build.sh <same -D flags as above>'
+```
 
 ### Connect
 
@@ -329,10 +376,47 @@ TDESKTOP_CUSTOM_DC_RSA_KEY_FILE=/path/to/server_pub.pem \
 `-workdir` keeps this profile away from any real Telegram account on the
 machine. The client logs the key it loaded as `MTP Info: using custom public
 RSA key ... fingerprint <int64>`; that number must equal the `fingerprint` the
-server logs at startup, or key exchange fails with no useful client-side error.
+server logs at startup, or key exchange fails with no useful client-side
+error. For the out-of-band check, compare the `key_id` the server logs at
+startup (section 2) against the SHA-256 of the DER SubjectPublicKeyInfo
+encoding of the key file you gave the client — the same value the login
+screen of the tdesktop fork (MAIN-314) renders from `server_pub.pem`.
+
+A mismatched fingerprint is not, however, the failure to expect first: against
+an unmodified server key exchange never completes at all, for reasons that have
+nothing to do with the key. See "What stops it today" below before debugging
+anything here.
 
 Telegram Desktop is GPLv3. Internal use carries no obligation, but any binary
 handed to someone else must ship its source.
+
+### What stops it today
+
+A patched Telegram Desktop built as above does **not** reach the server on an
+unmodified `telegramd`. Three things block it, in the order they bite. None is
+an RPC the client could route around, and the first two stop it before any
+handler runs:
+
+1. **Transport obfuscation.** Telegram Desktop always wraps the TCP stream in
+   obfuscated2 — `TcpConnection::prepareConnectionStartPrefix` sends a 64-byte
+   nonce and AES-CTR encrypts everything after it, with no way to turn it off.
+   The codec sniff in `internal/mtproto/accept.go` reads that nonce as a
+   plaintext codec tag, falls through to `Full`, and every frame after it fails
+   as `invalid message length`. gotd already ships the fix as
+   `transport.ObfuscatedListener`; what it needs is a sniff that still accepts
+   the plain codecs the e2e client uses.
+2. **`auth.bindTempAuthKey`.** The client's PFS step. Unimplemented, it answers
+   `INPUT_METHOD_INVALID`, and because the client only clears its binder on
+   `ENCRYPTED_MESSAGE_INVALID` it then retries without any backoff — measured at
+   about 1400 calls a second from one client.
+3. **`config.expires`.** `DefaultConfig` sends `Date: 0, Expires: 0`.
+   `Instance::Private::configLoadDone` computes `expires - now`, reads the
+   config as already stale, and re-requests it immediately — about 400
+   `help.getConfig` calls a second, forever.
+
+With those three worked around locally, the client signs in against this server
+and reaches its main window. MAIN-263 carries the wire-verified inventory of
+what it calls on the way and what breaks after.
 
 ## Known ceilings
 

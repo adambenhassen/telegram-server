@@ -168,6 +168,46 @@ jobs:
       - name: Check the committed CSS matches the templates
         run: git diff --exit-code internal/admin/assets/dashboard.css
 
+  # internal/store/db is sqlc output that is committed, so a branch can edit a
+  # file under internal/store/queries and never run `make sqlc`. That happened
+  # on MAIN-328: a locking invariant written as a query comment never reached
+  # the Go file a later author reads, and every check stayed green. The second
+  # cost is delayed — the next unrelated `make sqlc` sweeps the stale hunk into
+  # someone else's diff.
+  #
+  # Local repro:
+  #   rm -rf internal/store/db && make sqlc && git status --short internal/store/db
+  #
+  # No database: sqlc reads the schema from migrations/ statically. The version
+  # is whatever tools/go.mod pins, because `make sqlc` builds the binary from
+  # that module rather than installing one on the runner — a sqlc release
+  # cannot turn the repo red on its own.
+  sqlc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Emptied first so the check also catches a generated file that no longer
+      # has a query behind it; regenerating in place would leave that orphan
+      # committed and undetected. Everything in the directory is sqlc output.
+      - name: Regenerate query code
+        run: rm -rf internal/store/db && make sqlc
+
+      # Staged so an added file shows up as a diff rather than as untracked
+      # output git would ignore. The diff is the report: it names every file
+      # that is out of date, and the fix is `make sqlc` and commit the result.
+      - name: Check the committed query code matches the queries
+        run: |
+          git add --all internal/store/db
+          git diff --cached --exit-code internal/store/db
+
   # Drives the admin dashboard through a real browser (test/e2e/admin.spec.ts).
   # Everything the suite needs is started by Playwright's webServer:
   # test/e2e/adminserver builds its own Postgres from the pgtest testcontainers
