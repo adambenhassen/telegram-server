@@ -104,6 +104,9 @@ func run(log *slog.Logger) error {
 		sweepExpiredUploadParts(sweepCtx, st, cfg.UploadPartTTL, log)
 	})
 	sweepWG.Go(func() {
+		reclaimOrphanedPartBytes(sweepCtx, st, cfg.UploadPartTTL, log)
+	})
+	sweepWG.Go(func() {
 		sweepExpiredRateLimits(sweepCtx, st, log)
 	})
 	sweepWG.Go(func() {
@@ -330,6 +333,37 @@ func sweepExpiredUploadParts(ctx context.Context, st *store.Store, ttl time.Dura
 				continue
 			}
 			log.Info("swept expired upload parts", "deleted", n)
+		}
+	}
+}
+
+// reclaimOrphanedPartBytes periodically walks the parts prefix and reclaims
+// objects no row names, older than the part TTL plus a margin. It is the
+// mechanism that bounds the MAIN-341 crash window: a row committed and its
+// bytes lost, or a best-effort cleanup that dropped rows and failed on
+// objects. Without it those bytes are permanent, uncapped, and on a
+// deployment with no backup.
+//
+// The interval matches the row-driven sweep's: the two passes complement
+// each other (rows vs objects) and share the same cadence, so an operator
+// tuning one tunes both.
+func reclaimOrphanedPartBytes(ctx context.Context, st *store.Store, ttl time.Duration, log *slog.Logger) {
+	ticker := time.NewTicker(max(ttl/4, time.Second))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-(ttl + store.PartOrphanMargin))
+			res, err := st.ReclaimOrphanedPartBytes(ctx, cutoff, ttl, store.PartOrphanSweepBatch)
+			if err != nil {
+				log.Error("reclaim orphaned part bytes", "err", err)
+				continue
+			}
+			if res.Objects > 0 {
+				log.Info("reclaimed orphaned part bytes", "objects", res.Objects, "bytes", res.Bytes)
+			}
 		}
 	}
 }

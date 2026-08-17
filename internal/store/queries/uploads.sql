@@ -119,3 +119,13 @@ FOR UPDATE SKIP LOCKED;
 -- name: DeleteUploadPartByKey :execrows
 DELETE FROM upload_parts
 WHERE user_id = $1 AND file_id = $2 AND part_index = $3 AND blob_key = $4;
+
+-- LivePartBlobKeys returns every blob key a parts row still names. The
+-- orphan pass uses this to tell an object no row points at (reclaimable) from
+-- one a live row still does (never touch). A single bounded statement; the
+-- caller batches with OFFSET when the row count is large.
+-- name: LivePartBlobKeys :many
+SELECT blob_key FROM upload_parts
+WHERE blob_key <> ''
+ORDER BY user_id, file_id, part_index
+LIMIT sqlc.arg(lim)::int OFFSET sqlc.arg(off)::int;

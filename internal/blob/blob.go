@@ -12,6 +12,9 @@ import (
 	"io"
 	"os"
 	"path"
+	"sort"
+	"strings"
+	"time"
 )
 
 // ErrNotFound is returned by [Store.ReadAt] for a key that was never stored.
@@ -30,6 +33,23 @@ type Store interface {
 	// Remove deletes key. Deleting a key that is not there is a no-op, so a
 	// caller that races a sweep or a re-save never needs to know which won.
 	Remove(ctx context.Context, key string) error
+	// ListPrefix returns at most limit objects whose keys start with prefix,
+	// each with the size and modification time an age-based pass needs. The
+	// result is a page, not the whole prefix: keys are ordered, a call
+	// returning fewer than limit objects is the last page, and a caller that
+	// walks the prefix repeats the call from where the previous page ended.
+	// An empty prefix lists nothing: the assembled keyspace has no single
+	// prefix, so nothing outside a named prefix is reachable through this.
+	ListPrefix(ctx context.Context, prefix string, limit int) ([]Object, error)
+}
+
+// Object is one entry of a [Store.ListPrefix] page: the key and the two
+// facts an age-based pass decides from, how big the object is and when it
+// last changed.
+type Object struct {
+	Key      string
+	Size     int64
+	Modified time.Time
 }
 
 // Key returns the storage key for a file id, sharded on the id's low byte so
@@ -80,6 +100,95 @@ func NewLocal(dir string) (*Local, error) {
 
 // RootDir reports the directory the store is rooted in.
 func (l *Local) RootDir() string { return l.dir }
+
+// ListPrefix returns up to limit objects under prefix, in key order. The
+// walk is confined to the prefix's own subtree: a sibling of the prefix
+// directory, and a file that merely carries the prefix as a name prefix
+// ("parts" vs "parts/"), are not under it. Keys come back slash-separated,
+// the same form Put and Remove take, so a page feeds straight back into the
+// store. limit must be positive; an empty prefix lists nothing for the reason
+// in the interface.
+//
+// A page is a snapshot: an object written or deleted between pages may appear
+// or vanish, and a caller that deletes what it lists must not care which of
+// the two happened.
+func (l *Local) ListPrefix(_ context.Context, prefix string, limit int) ([]Object, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("blob list: limit %d must be positive", limit)
+	}
+	if prefix == "" {
+		return nil, nil
+	}
+	// Walk the shallowest directory that contains only the prefix, rather than
+	// the store root: an unrelated sibling is not a walk it will error out on,
+	// and the assembled shards are not. A cursor that carries a byte past the
+	// last key (the "last key + 1" form a paged caller resumes with) resolves
+	// to a file or a missing path inside that directory; the walk still
+	// starts at the directory, and the filter below handles the cursor.
+	root := strings.TrimSuffix(prefix, "/")
+	if i := strings.LastIndex(prefix, "/"); i+1 < len(prefix) {
+		root = strings.TrimSuffix(prefix[:i+1], "/")
+	}
+	var all []Object
+	var walk func(p string) error
+	walk = func(p string) error {
+		f, err := l.root.Open(p)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil // the prefix has no objects yet
+			}
+			return err
+		}
+		defer func() { _ = f.Close() }() //nolint:errcheck // read-only close
+		entries, err := f.Readdir(-1)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			child := e.Name()
+			if p != "." {
+				child = p + "/" + child
+			}
+			if e.IsDir() {
+				if err := walk(child); err != nil {
+					return err
+				}
+				continue
+			}
+			all = append(all, Object{Key: child, Size: e.Size(), Modified: e.ModTime()})
+		}
+		return nil
+	}
+	if err := walk(root); err != nil {
+		return nil, fmt.Errorf("blob list: %w", err)
+	}
+	// A prefix that ends in "/" or names a real directory is a containment
+	// filter: only keys under it. A prefix that carries a byte past the last
+	// key is a cursor: keys at or after it, still under the same directory.
+	// The two are told apart by whether the prefix itself is a directory.
+	cursor := false
+	if !strings.HasSuffix(prefix, "/") {
+		if fi, err := l.root.Lstat(prefix); err != nil || !fi.IsDir() {
+			cursor = true
+		}
+	}
+	var out []Object
+	for _, o := range all {
+		if cursor {
+			if o.Key < prefix {
+				continue
+			}
+		} else if !strings.HasPrefix(o.Key, prefix) {
+			continue
+		}
+		out = append(out, o)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
 
 // Put writes r to a temporary file and renames it into place, so a reader
 // never observes a partially written blob. O_EXCL on the temporary file also

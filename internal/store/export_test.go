@@ -563,6 +563,15 @@ func InsertUploadPartWithoutKey(ctx context.Context, s *Store, userID, fileID in
 	return err
 }
 
+// DeleteUploadPartRow drops one part's accounting row directly, leaving its
+// object behind. The crash-window state the orphan pass exists to reclaim.
+func DeleteUploadPartRow(ctx context.Context, s *Store, userID, fileID int64, partIndex int32) error {
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM upload_parts WHERE user_id = $1 AND file_id = $2 AND part_index = $3`,
+		userID, fileID, partIndex)
+	return err
+}
+
 // CountRateLimits returns the number of rate limit rows for a given subject,
 // for tests that need to assert the rate_limits table state.
 func CountRateLimits(ctx context.Context, s *Store, subjectID int64) (int, error) {

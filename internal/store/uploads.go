@@ -552,3 +552,118 @@ func (s *Store) retirePartRows(ctx context.Context, rows []db.DeleteUploadPartBy
 	}
 	return int64(len(retired)), nil
 }
+
+// PartOrphanResult reports what one orphan pass reclaimed.
+type PartOrphanResult struct {
+	// Objects is how many part objects the pass deleted.
+	Objects int
+	// Bytes is the total size of the objects it deleted.
+	Bytes int64
+}
+
+// PartOrphanSweepBatch is how many objects one orphan pass examines. It
+// bounds the enumeration and the live-key set, not the retention: the caller
+// repeats passes until one comes back short.
+const PartOrphanSweepBatch = 500
+
+// PartOrphanMargin is the extra age on top of the part TTL before an
+// unaccounted object is eligible for reclamation. It absorbs clock skew
+// between replicas and the window between a row commit and its byte write.
+const PartOrphanMargin = time.Hour
+
+// ReclaimOrphanedPartBytes walks the parts prefix, reclaims objects older
+// than the cutoff whose key no row still names, and returns what it removed.
+//
+// The pass is safe in a way the row-driven sweep is not: it holds no lock a
+// request path waits on, makes no storage call inside a transaction, and its
+// only interaction with Postgres is a read of the live key set. Two replicas
+// running it at once delete the same object twice, and the second delete is a
+// no-op.
+//
+// cutoff is the earliest an object may be removed. The caller passes
+// now-(TTL+margin); the pass clamps it to that floor so a misconfigured small
+// cutoff cannot reach a live part. A live part is younger than the TTL by
+// definition, and the margin absorbs clock skew between replicas.
+//
+// The pass is bounded per run by limit: it examines at most limit objects and
+// deletes at most limit. A backlog drains over successive runs, the same way
+// the row sweep drains over successive batches.
+func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, partTTL time.Duration, limit int) (PartOrphanResult, error) {
+	if limit <= 0 {
+		return PartOrphanResult{}, fmt.Errorf("reclaim orphaned part bytes: limit %d must be positive", limit)
+	}
+
+	// Floor: the cutoff can never be younger than TTL+margin. A misconfigured
+	// small cutoff is clamped rather than trusted: a live part is younger than
+	// the TTL by definition, so a cutoff above the floor could reach one.
+	floor := time.Now().Add(-(partTTL + PartOrphanMargin))
+	if cutoff.After(floor) {
+		cutoff = floor
+	}
+
+	// The live key set: every blob key a row still names. An object whose key
+	// is in this set is never removed, whatever its age. The read is
+	// autocommit and holds no lock across a storage call.
+	live, err := s.livePartKeys(ctx)
+	if err != nil {
+		return PartOrphanResult{}, fmt.Errorf("live part keys: %w", err)
+	}
+
+	// Walk the parts prefix. Each page is bounded; the pass stops after limit
+	// objects examined, not limit deleted, so a page full of live objects does
+	// not starve the pass.
+	var res PartOrphanResult
+	walk := func(prefix string, remaining *int) error {
+		page, err := s.blobs.ListPrefix(ctx, prefix, PartOrphanSweepBatch)
+		if err != nil {
+			return fmt.Errorf("list part prefix: %w", err)
+		}
+		for _, obj := range page {
+			if *remaining <= 0 {
+				return nil
+			}
+			*remaining--
+			// Age gate: an object younger than cutoff is never removed.
+			if time.Since(obj.Modified) < time.Since(cutoff) {
+				continue
+			}
+			// Live-key gate: an object a row still names is never removed.
+			if live[obj.Key] {
+				continue
+			}
+			if err := s.blobs.Remove(ctx, obj.Key); err != nil {
+				return fmt.Errorf("remove orphaned part %s: %w", obj.Key, err)
+			}
+			res.Objects++
+			res.Bytes += obj.Size
+		}
+		return nil
+	}
+
+	remaining := limit
+	if err := walk(blob.PartsPrefix, &remaining); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+// livePartKeys returns the set of every blob key a parts row still names.
+// The read is autocommit; it holds no row lock and no advisory lock.
+func (s *Store) livePartKeys(ctx context.Context) (map[string]bool, error) {
+	const batch = 1000
+	out := make(map[string]bool)
+	var off int32
+	for {
+		keys, err := s.q.LivePartBlobKeys(ctx, db.LivePartBlobKeysParams{Off: off, Lim: int32(batch)})
+		if err != nil {
+			return nil, err
+		}
+		for _, k := range keys {
+			out[k] = true
+		}
+		if len(keys) < batch {
+			return out, nil
+		}
+		off += int32(batch)
+	}
+}

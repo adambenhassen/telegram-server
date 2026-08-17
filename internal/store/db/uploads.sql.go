@@ -131,6 +131,42 @@ func (q *Queries) FileOutstandingBytes(ctx context.Context, arg FileOutstandingB
 	return column_1, err
 }
 
+const livePartBlobKeys = `-- name: LivePartBlobKeys :many
+SELECT blob_key FROM upload_parts
+WHERE blob_key <> ''
+ORDER BY user_id, file_id, part_index
+LIMIT $2::int OFFSET $1::int
+`
+
+type LivePartBlobKeysParams struct {
+	Off int32
+	Lim int32
+}
+
+// LivePartBlobKeys returns every blob key a parts row still names. The
+// orphan pass uses this to tell an object no row points at (reclaimable) from
+// one a live row still does (never touch). A single bounded statement; the
+// caller batches with OFFSET when the row count is large.
+func (q *Queries) LivePartBlobKeys(ctx context.Context, arg LivePartBlobKeysParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, livePartBlobKeys, arg.Off, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var blob_key string
+		if err := rows.Scan(&blob_key); err != nil {
+			return nil, err
+		}
+		items = append(items, blob_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const uploadPartKey = `-- name: UploadPartKey :one
 SELECT blob_key, size FROM upload_parts WHERE user_id = $1 AND file_id = $2 AND part_index = $3
 `
