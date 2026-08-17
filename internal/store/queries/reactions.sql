@@ -13,6 +13,12 @@ SELECT * FROM message_reactions
 WHERE owner_id = $1 AND local_id = $2
 ORDER BY reactor_id;
 
+-- name: ReactionsByMessages :many
+SELECT * FROM message_reactions
+WHERE owner_id = sqlc.arg(owner_id)
+  AND local_id = ANY(sqlc.arg(local_ids)::bigint[])
+ORDER BY local_id, reactor_id;
+
 -- name: MessagesByOwnerLocalIDs :many
 SELECT * FROM messages
 WHERE owner_id = sqlc.arg(owner_id)

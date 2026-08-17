@@ -314,6 +314,29 @@ func (s *Store) ReactionsByOwnerLocal(ctx context.Context, ownerID, localID int6
 	return reactions, nil
 }
 
+// ReactionsByOwnerLocalIDs returns the reactions on each of the owner's message
+// copies named by localIDs, keyed by local id. It is the batched form of
+// ReactionsByOwnerLocal and orders each message's reactions the same way, so the
+// two render identically. Ids with no reaction are absent from the map rather
+// than present and empty.
+func (s *Store) ReactionsByOwnerLocalIDs(ctx context.Context, ownerID int64, localIDs []int64) (map[int64][]Reaction, error) {
+	if len(localIDs) == 0 {
+		return map[int64][]Reaction{}, nil
+	}
+	rows, err := s.q.ReactionsByMessages(ctx, db.ReactionsByMessagesParams{
+		OwnerID:  ownerID,
+		LocalIds: localIDs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reactions by messages: %w", err)
+	}
+	byMessage := make(map[int64][]Reaction, len(localIDs))
+	for _, r := range rows {
+		byMessage[r.LocalID] = append(byMessage[r.LocalID], reactionFromRow(r))
+	}
+	return byMessage, nil
+}
+
 // MessagesByOwnerLocalIDs returns messages for the given owner and local ids.
 func (s *Store) MessagesByOwnerLocalIDs(ctx context.Context, ownerID int64, localIDs []int64) (map[int64]Message, error) {
 	if len(localIDs) == 0 {

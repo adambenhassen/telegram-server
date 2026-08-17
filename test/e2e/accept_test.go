@@ -149,12 +149,19 @@ func bootAcceptServer(t *testing.T, ctx context.Context, handshake time.Duration
 // step of it does not complete.
 func (s *acceptServer) login(t *testing.T, ctx context.Context, phone string) {
 	t.Helper()
+	s.loginWith(t, ctx, phone, dcs.Plain(dcs.PlainOptions{}))
+}
+
+// loginWith is login with the transport left to the caller, for the tests that
+// are about how the connection is framed rather than about what it carries.
+func (s *acceptServer) loginWith(t *testing.T, ctx context.Context, phone string, resolver dcs.Resolver) {
+	t.Helper()
 
 	client := telegram.NewClient(1, "hash", telegram.Options{
 		DC:         s.dcID,
 		DCList:     dcs.List{Options: []tg.DCOption{{ID: s.dcID, IPAddress: "127.0.0.1", Port: s.port}}},
 		PublicKeys: []telegram.PublicKey{{RSA: &s.key.PublicKey}},
-		Resolver:   dcs.Plain(dcs.PlainOptions{}),
+		Resolver:   resolver,
 	})
 
 	flow := auth.NewFlow(

@@ -185,4 +185,10 @@ var (
 	errPasswordCannotBeRemoved = rpcErr(400, "PASSWORD_HASH_INVALID")
 	// errInputFilterInvalid rejects messages.search with an unsupported filter type.
 	errInputFilterInvalid = rpcErr(400, "INPUT_FILTER_INVALID")
+	// errLimitInvalid rejects a messages.getMessagesReactions id list past the
+	// per-call cap. It is decided on the client's own input, before the peer is
+	// resolved and before any entitlement is checked, so it tells the caller
+	// nothing about the peer they named — an oversized list must not be a
+	// membership probe on a peer type that carries no access hash.
+	errLimitInvalid = rpcErr(400, "LIMIT_INVALID")
 )
