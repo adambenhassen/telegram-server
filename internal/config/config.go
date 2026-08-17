@@ -92,10 +92,21 @@ type Config struct {
 	// Nothing in this build deletes a file, so the value affects a report only.
 	MediaErasureMinAge time.Duration
 	// MediaErasureReportInterval is how often that report runs. Zero disables
-	// it, as a zero limit disables a rate limit. It is a knob rather than a
-	// constant because the report reads the whole files table in bounded
-	// batches and nothing consumes it automatically yet, so an operator who
-	// does not want the read pays nothing for it.
+	// it, as a zero limit disables a rate limit, and zero is the default: the
+	// report is opt-in, and turning it on is a decision made against the size
+	// of a particular deployment's media corpus.
+	//
+	// The reason it is not on by default is measured, not cautious. The
+	// reference predicate's EXISTS sits in the report query's select list, so
+	// the planner cannot lift it into a semi-join; it stays a SubPlan, and no
+	// index on messages leads with file_id. While Postgres can hash that
+	// SubPlan the cost is one scan per batch, but past roughly 300k media
+	// messages it cannot, and the plan flips to one scan of messages per files
+	// row: at 20k files and 300k media messages, one 1000-row batch measures
+	// 2.2s and ~302k shared-buffer hits, so an hourly full walk is tens of
+	// gigabytes of buffer traffic evicting whatever the download path had
+	// cached. An operator turning this on wants either a small corpus or the
+	// index the eraser ticket will decide on.
 	MediaErasureReportInterval time.Duration
 	// RateLimits holds the per-surface rate-limit configurations. Zero limit
 	// disables enforcement for that surface.
@@ -279,7 +290,7 @@ func Load(log *slog.Logger) (Config, error) {
 		UploadPartTTL:       6 * time.Hour,
 		MediaErasureMinAge:  24 * time.Hour,
 
-		MediaErasureReportInterval: time.Hour,
+		MediaErasureReportInterval: 0,
 
 		MaxConnsPerUnboundKey: mtproto.DefaultMaxConnsPerUnboundKey,
 

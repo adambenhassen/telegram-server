@@ -348,12 +348,13 @@ func sweepExpiredUploadParts(ctx context.Context, st *store.Store, ttl time.Dura
 // aggregation for every file a report names — which is why store's candidate
 // type does not carry it at all rather than this line choosing not to print it.
 //
-// Cost: one bounded read per batch, and the reference predicate is an anti-join
-// against messages, whose only index on file_id leads with owner_id. On a large
-// media corpus that is the term that grows, and the answer if it ever shows up
-// in load is an index on messages (file_id) — which belongs with the ticket that
-// decides how often a reclaim runs, not with a report that can simply be turned
-// off by setting the interval to zero.
+// Off unless an operator sets an interval, and that default is why: the
+// reference predicate is a SubPlan the planner cannot lift into a semi-join,
+// and past roughly 300k media messages it stops being hashable and runs once
+// per files row. See MediaErasureReportInterval for the measurement. An index
+// on messages (file_id) is what makes it cheap, and that belongs with the
+// ticket that decides how often a reclaim runs — it buys a write on every send,
+// which is not a cost a report should be quietly incurring.
 func reportMediaErasureCandidates(ctx context.Context, st *store.Store, minAge, interval time.Duration, log *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

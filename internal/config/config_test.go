@@ -988,8 +988,9 @@ func TestLoad_Bootstrap_Disabled(t *testing.T) {
 }
 
 // The media erasure report's two knobs. The cutoff is a duration like any
-// other, but the interval treats zero as a real setting — it turns the report
-// off — so a typo must fail the start by name rather than read as "off".
+// other. The interval defaults to zero, which is off — the report's scan is
+// only affordable on a small media corpus — so the case that matters most is
+// that a typo fails the start by name instead of reading as the default.
 func TestLoadMediaErasureReport(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
@@ -1000,7 +1001,7 @@ func TestLoadMediaErasureReport(t *testing.T) {
 		wantInterval time.Duration
 		wantErrVar   string
 	}{
-		"unset":             {wantMinAge: 24 * time.Hour, wantInterval: time.Hour},
+		"unset":             {wantMinAge: 24 * time.Hour, wantInterval: 0},
 		"override both":     {minAge: "72h", interval: "15m", wantMinAge: 72 * time.Hour, wantInterval: 15 * time.Minute},
 		"report off":        {interval: "0s", wantMinAge: 24 * time.Hour, wantInterval: 0},
 		"age not duration":  {minAge: "soon", wantErrVar: "TG_MEDIA_ERASURE_MIN_AGE"},
