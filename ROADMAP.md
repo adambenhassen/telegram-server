@@ -368,7 +368,7 @@ Secret chats
   embedded in `getHistory` and update payloads; `updateMessageReactions` pushed to
   all entitled peers on change. Reactions are rendered on read paths and pushed on
   change; `messages.getMessagesReactions` refetches reactions for a bounded set of
-  message ids (up to 100) for the caller's own messages in 1:1 and group chats; channel
+  message ids (up to 100) for the caller's own message copies in 1:1 and group chats; channel
   peers are refused.
 - **Pinned messages.** `messages.updatePinnedMessage` pins or unpins a message;
   admin-only in channels; `updatePinnedMessages` pushed to members carrying the
