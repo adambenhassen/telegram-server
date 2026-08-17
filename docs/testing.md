@@ -68,9 +68,12 @@ docker network connect --gw-priority=-100 bridge "$(cat /etc/hostname)"
 `make test` and `make test-db` do this for you via the `docker-bridge` target.
 It is skipped when not running inside a container, it touches only the calling
 container's own network attachments, and it is quiet only about already being
-in the network or about the daemon not owning this container — any other
-failure stops the run rather than letting it die on the timeout above twenty
-minutes later. If you invoke `go test` directly instead of going through `make`,
+in the network, or about a container the daemon does not own when `DOCKER_HOST`
+points at a remote daemon — any other failure stops the run rather than letting
+it die on the timeout above twenty minutes later. On this local socket, "No such
+container" is a hard failure: it means `/etc/hostname` is not this container's
+Docker name (`--hostname`, or pod-style networking), and the join that the tests
+need did not happen. If you invoke `go test` directly instead of going through `make`,
 run that command first; on a DinD daemon you do not need to run anything.
 
 `--gw-priority` is what keeps the join from being felt outside the test run.
