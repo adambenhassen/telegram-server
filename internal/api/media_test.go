@@ -551,6 +551,78 @@ func TestSendMediaEnforcesStorageQuota(t *testing.T) {
 	rpcError(t, err, "STORAGE_CHECK_FAILED")
 }
 
+// A forward whose file row is gone is refused, and reports the invalid message
+// id a deleted source already reports. The source message here is still live
+// and still names the file, so the handler's own liveness read passes and the
+// interlock inside the transaction is the only thing that can refuse.
+//
+// The send paths reject the same state through the same interlock, asserted in
+// the store's own tests: a handler cannot stage it, because handleSendMedia
+// answers a resend from its own read before the send transaction opens, and a
+// first send assembles the file it then references.
+func TestForwardRejectsErasedFile(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	a, err := s.CreateUser(ctx, "+15551296101")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551296102")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+	c, err := s.CreateUser(ctx, "+15551296103")
+	if err != nil {
+		t.Fatalf("user c: %v", err)
+	}
+	peerB := api.InputPeerUser(a.ID, b.ID)
+	peerC := api.InputPeerUser(a.ID, c.ID)
+	saveParts(t, s, a.ID, 565, []byte("eleven byte"))
+	if _, err = api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
+		Peer: peerB, Media: uploadedDocument(565, 1, "doc.txt", "text/plain"), RandomID: 51,
+	}); err != nil {
+		t.Fatalf("seed send: %v", err)
+	}
+	eraseFiles(t, ctx, dsn)
+
+	_, err = api.ForwardMessagesForTest(s, a.ID, &tg.MessagesForwardMessagesRequest{
+		ToPeer: peerC, FromPeer: peerB, ID: []int{1}, RandomID: []int64{52},
+	})
+	rpcError(t, err, "MESSAGE_ID_INVALID")
+
+	msgs, err := s.History(ctx, c.ID, store.PeerTypeUser, a.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("destination holds %d messages, want 0", len(msgs))
+	}
+}
+
+// eraseFiles removes every files row. Nothing in the shipped server deletes one
+// — the eraser is a later stage of M17 — so this is the only way a handler test
+// can reach the state the reference interlock refuses.
+func eraseFiles(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		if cerr := conn.Close(ctx); cerr != nil {
+			t.Errorf("close conn: %v", cerr)
+		}
+	}()
+	tag, err := conn.Exec(ctx, "DELETE FROM files")
+	if err != nil {
+		t.Fatalf("erase files: %v", err)
+	}
+	if tag.RowsAffected() == 0 {
+		t.Fatal("erase files removed nothing — the test is asserting against a file that was never stored")
+	}
+}
+
 // countFiles reports how many files rows exist, for the rejection paths that
 // must not allocate one.
 func countFiles(t *testing.T, ctx context.Context, dsn string) int64 {

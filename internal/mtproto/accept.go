@@ -66,11 +66,26 @@ func (s *Server) clientAddr(sock net.Conn) (netip.Addr, error) {
 
 // detectCodec negotiates the transport of a socket whose address has already
 // been established.
+//
+// Two things are detected, in this order and for the same reason: the framing
+// decides what bytes the codec tag is even in. An obfuscated connection carries
+// its tag encrypted inside the opening header, so the codec cannot be read
+// until the stream has been deobfuscated, and a plaintext one must not be
+// deobfuscated at all. sniffFraming explains how the two are told apart.
 func (s *Server) detectCodec(sock net.Conn) (transport.Conn, error) {
-	// Hand gotd this one socket to negotiate: its Accept owns the failure path
-	// and closes the socket if detection fails, exactly as it did when it held
-	// the listener itself.
-	conn, err := transport.Listen(&singleConn{conn: sock}).Accept()
+	obfuscated, stream, err := sniffFraming(sock)
+	if err != nil {
+		return nil, errors.Join(errors.New("detect framing"), err, stream.Close())
+	}
+	// Hand gotd this one connection to negotiate: its Accept owns the failure
+	// path and closes it if detection fails, exactly as it did when it held the
+	// listener itself. Deobfuscation is a listener in the same shape, so it
+	// stacks underneath without changing who closes what.
+	var ln net.Listener = &singleConn{conn: stream}
+	if obfuscated {
+		ln = transport.ObfuscatedListener(ln)
+	}
+	conn, err := transport.Listen(ln).Accept()
 	if err != nil {
 		return nil, errors.Join(errors.New("detect codec"), err)
 	}

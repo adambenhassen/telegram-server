@@ -236,6 +236,12 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, fileID, 0)
+	// The file this send names is gone: the send wrote nothing, and the caller
+	// hears that rather than an internal error for a state that is theirs to
+	// retry from.
+	if errors.Is(err, store.ErrFileMissing) {
+		return nil, errMediaInvalid
+	}
 	if err != nil {
 		h.log.Error("send media", "user_id", r.UserID, "err", err)
 		return nil, errInternal
@@ -279,6 +285,9 @@ func (h *handlers) sendChatMedia(
 	})
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
+	}
+	if errors.Is(err, store.ErrFileMissing) {
+		return nil, errMediaInvalid
 	}
 	if err != nil {
 		h.log.Error("send chat media", "user_id", r.UserID, "chat_id", chatID, "err", err)

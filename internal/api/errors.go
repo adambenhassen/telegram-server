@@ -76,8 +76,11 @@ var (
 	// outstanding-bytes cap. FLOOD_WAIT is the closest Telegram signal: the
 	// condition clears on its own once the account assembles or its parts expire.
 	errStorageQuota = rpcErr(420, "FLOOD_WAIT_60")
-	// errMediaInvalid rejects a media type M5 does not serve, and an input file
-	// whose parts are missing or inconsistent.
+	// errMediaInvalid rejects a media type M5 does not serve, an input file
+	// whose parts are missing or inconsistent, and a send whose file row is no
+	// longer there to reference. The last of those answers nothing about
+	// another account's files: the id it names came from this caller's own
+	// upload, so it is not the download path's enumeration concern.
 	errMediaInvalid = rpcErr(400, "MEDIA_INVALID")
 	// errFileQuota rejects an upload that would take the account past its total
 	// stored-bytes cap.
@@ -182,4 +185,10 @@ var (
 	errPasswordCannotBeRemoved = rpcErr(400, "PASSWORD_HASH_INVALID")
 	// errInputFilterInvalid rejects messages.search with an unsupported filter type.
 	errInputFilterInvalid = rpcErr(400, "INPUT_FILTER_INVALID")
+	// errLimitInvalid rejects a messages.getMessagesReactions id list past the
+	// per-call cap. It is decided on the client's own input, before the peer is
+	// resolved and before any entitlement is checked, so it tells the caller
+	// nothing about the peer they named — an oversized list must not be a
+	// membership probe on a peer type that carries no access hash.
+	errLimitInvalid = rpcErr(400, "LIMIT_INVALID")
 )

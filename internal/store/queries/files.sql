@@ -51,5 +51,63 @@ WHERE f.id = $1 AND f.access_hash = $2 AND f.stored = true
       )
   );
 
+-- LockFileForReference is the M17 interlock. messages.file_id has no foreign
+-- key and the pool runs at READ COMMITTED, so a reference insert is invisible
+-- to a concurrent reader and no re-read of the reference set can see one in
+-- flight. The files row is therefore the lock object: every path that writes a
+-- non-zero messages.file_id takes this inside the transaction that inserts the
+-- referencing row(s), and an eraser takes the same row FOR UPDATE before
+-- deleting it, so the two orders are the only two possible and each is correct.
+--
+-- Shared, not exclusive: concurrent references to one file are ordinary traffic
+-- and must not serialize behind each other. Returning no row is the fail-closed
+-- branch — the caller aborts rather than writing a reference to a file that is
+-- not there to lock.
+-- name: LockFileForReference :one
+SELECT id FROM files WHERE id = $1 FOR SHARE;
+
 -- name: FilesByIDs :many
 SELECT * FROM files WHERE id = ANY(sqlc.arg(ids)::bigint[]) AND stored = true;
+
+-- name: MaxFileID :one
+SELECT coalesce(max(id), 0)::bigint FROM files;
+
+-- MediaErasureScan classifies one bounded window of files rows: for each row it
+-- reports whether anything live references it, and whether it is past the age
+-- cutoff. It names nothing for deletion; it deletes nothing.
+--
+-- It takes no lock of any kind, and that is a requirement rather than an
+-- omission. files is the terminal lock class — a reference insert takes that
+-- row FOR SHARE and waits for nothing afterwards — so a scan holding one would
+-- put a send, a forward or a download behind a background pass. Naming a
+-- candidate does not require holding it; deciding what an eraser holds, and in
+-- what order, is stage 3's design.
+--
+-- The window is the whole table paged by id rather than a pre-filtered
+-- candidate set, because the caller has to report why each file it did NOT name
+-- was held back. Filtering those out here would make that count unobservable.
+--
+-- The reference predicate is the union the download gate already reads:
+-- non-deleted messages OR non-deleted channel_messages. channel_messages is in
+-- it even though no handler can currently post channel media — omitting it
+-- passes every test that can be written today and starts destroying live
+-- channel media the day channel posts carry a file id.
+--
+-- access_hash is deliberately not selected. It is the unguessable half of a
+-- download credential, and a candidate report is exactly the kind of record
+-- that ends up in log aggregation.
+-- name: MediaErasureScan :many
+SELECT f.id, f.size, f.stored,
+       (f.date < sqlc.arg(older_than)::timestamptz) AS aged,
+       EXISTS (
+           SELECT 1 FROM messages m
+           WHERE m.file_id = f.id AND m.deleted = false
+       ) AS message_ref,
+       EXISTS (
+           SELECT 1 FROM channel_messages cm
+           WHERE cm.file_id = f.id AND cm.deleted = false
+       ) AS channel_ref
+FROM files f
+WHERE f.id > sqlc.arg(after_id) AND f.id <= sqlc.arg(through_id)
+ORDER BY f.id
+LIMIT sqlc.arg(lim)::int;

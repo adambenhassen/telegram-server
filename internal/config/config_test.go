@@ -986,3 +986,54 @@ func TestLoad_Bootstrap_Disabled(t *testing.T) {
 		t.Errorf("BootstrapUsername = %q, want empty", cfg.BootstrapUsername)
 	}
 }
+
+// The media erasure report's two knobs. The cutoff is a duration like any
+// other. The interval defaults to zero, which is off — the report's scan is
+// only affordable on a small media corpus — so the case that matters most is
+// that a typo fails the start by name instead of reading as the default.
+func TestLoadMediaErasureReport(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	tests := map[string]struct {
+		minAge       string
+		interval     string
+		wantMinAge   time.Duration
+		wantInterval time.Duration
+		wantErrVar   string
+	}{
+		"unset":             {wantMinAge: 24 * time.Hour, wantInterval: 0},
+		"override both":     {minAge: "72h", interval: "15m", wantMinAge: 72 * time.Hour, wantInterval: 15 * time.Minute},
+		"report off":        {interval: "0s", wantMinAge: 24 * time.Hour, wantInterval: 0},
+		"age not duration":  {minAge: "soon", wantErrVar: "TG_MEDIA_ERASURE_MIN_AGE"},
+		"age zero":          {minAge: "0s", wantErrVar: "TG_MEDIA_ERASURE_MIN_AGE"},
+		"age negative":      {minAge: "-1h", wantErrVar: "TG_MEDIA_ERASURE_MIN_AGE"},
+		"interval typo":     {interval: "hourly", wantErrVar: "TG_MEDIA_ERASURE_REPORT_INTERVAL"},
+		"interval negative": {interval: "-1h", wantErrVar: "TG_MEDIA_ERASURE_REPORT_INTERVAL"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TG_MEDIA_ERASURE_MIN_AGE", tc.minAge)
+			t.Setenv("TG_MEDIA_ERASURE_REPORT_INTERVAL", tc.interval)
+			cfg, err := config.Load(discardLog())
+			if tc.wantErrVar != "" {
+				if err == nil {
+					t.Fatalf("expected error for %s, got min age %v interval %v",
+						name, cfg.MediaErasureMinAge, cfg.MediaErasureReportInterval)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrVar) {
+					t.Errorf("error %q does not name %s", err, tc.wantErrVar)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.MediaErasureMinAge != tc.wantMinAge {
+				t.Errorf("MediaErasureMinAge = %v, want %v", cfg.MediaErasureMinAge, tc.wantMinAge)
+			}
+			if cfg.MediaErasureReportInterval != tc.wantInterval {
+				t.Errorf("MediaErasureReportInterval = %v, want %v", cfg.MediaErasureReportInterval, tc.wantInterval)
+			}
+		})
+	}
+}

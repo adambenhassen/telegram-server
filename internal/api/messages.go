@@ -153,6 +153,9 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	replyToMsgID := int64(0)
 	if replyTo, ok := req.GetReplyTo(); ok {
 		if rep, ok := replyTo.(*tg.InputReplyToMessage); ok && rep.ReplyToMsgID > 0 {
+			if peer, ok := rep.GetReplyToPeerID(); ok && !replyPeerIsDest(peer, peerType, toID, r.UserID) {
+				return nil, errMessageIDInvalid
+			}
 			replyToMsgID = int64(rep.ReplyToMsgID)
 		}
 	}
@@ -722,7 +725,7 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		randomIDs := make([]int64, len(req.RandomID))
 		copy(randomIDs, req.RandomID)
 		perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
-		if errors.Is(err, store.ErrMessageInvalid) {
+		if errors.Is(err, store.ErrMessageInvalid) || errors.Is(err, store.ErrFileMissing) {
 			return nil, errMessageIDInvalid
 		}
 		if errors.Is(err, store.ErrNotMember) {
@@ -769,7 +772,11 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 	randomIDs := make([]int64, len(req.RandomID))
 	copy(randomIDs, req.RandomID)
 	perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
-	if errors.Is(err, store.ErrMessageInvalid) {
+	// A source whose file row is gone is a source that can no longer be
+	// forwarded, and it reports as the same invalid message id an already
+	// deleted one does — the caller learns nothing new about a file it was
+	// entitled to a moment ago.
+	if errors.Is(err, store.ErrMessageInvalid) || errors.Is(err, store.ErrFileMissing) {
 		return nil, errMessageIDInvalid
 	}
 	if errors.Is(err, store.ErrNotMember) {
@@ -842,6 +849,114 @@ func (h *handlers) handleSendReaction(r *mtproto.Request) (bin.Encoder, error) {
 
 	// messages.sendReaction returns Updates per the Telegram schema.
 	return &tg.Updates{Date: int(time.Now().Unix())}, nil
+}
+
+// maxReactionMessagesPerCall caps the ids one messages.getMessagesReactions may
+// name, matching the channels.getMessages cap.
+const maxReactionMessagesPerCall = 100
+
+// handleGetMessagesReactions serves messages.getMessagesReactions: it returns
+// the current reactions on those of the caller's own message copies that the
+// request names, as one updateMessageReactions each. It is a read — no pts
+// advance, no event-log write, nothing pushed.
+//
+// Ownership is the whole read predicate, and it is the same one the read paths
+// already apply: messages is keyed (owner_id, local_id), so an id naming a
+// conversation the caller is not part of and an id that was never issued both
+// produce no row under (caller, id) and are omitted identically. Nothing here
+// reports an unreadable id, because doing so would answer whether it exists.
+func (h *handlers) handleGetMessagesReactions(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesGetMessagesReactionsRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	// Ordered before peer resolution and before any entitlement check on
+	// purpose: the cap is decided on the caller's own input alone, so an
+	// oversized list is refused identically whether or not the caller may read
+	// the peer they named. Checking it later would make LIMIT_INVALID versus
+	// PEER_ID_INVALID an answer to "am I a member of this chat", on a peer type
+	// that carries no access hash to hold the caller back.
+	if len(req.ID) > maxReactionMessagesPerCall {
+		return nil, errLimitInvalid
+	}
+	peerType, peerID, err := h.inputPeer(req.Peer, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	// Channel posts live in one shared row per post, in a global id namespace,
+	// and carry no reaction rows at all. Routing a channel peer into the
+	// owner-keyed read below would resolve the caller's own local ids in the
+	// wrong namespace. handleSendReaction refuses one for the same reason and
+	// with the same error.
+	if peerType == store.PeerTypeChannel {
+		return nil, errPeerIDInvalid
+	}
+	if peerType == store.PeerTypeChat {
+		if err = h.requireMember(r.Ctx, peerID, r.UserID); err != nil {
+			return nil, err
+		}
+	}
+
+	// Deduplicate after the cap, never before, so repeating one id cannot buy
+	// work past it.
+	localIDs := make([]int64, 0, len(req.ID))
+	seen := make(map[int64]bool, len(req.ID))
+	for _, id := range req.ID {
+		localID := int64(id)
+		if seen[localID] {
+			continue
+		}
+		seen[localID] = true
+		localIDs = append(localIDs, localID)
+	}
+
+	msgs, err := h.store.MessagesByOwnerLocalIDs(r.Ctx, r.UserID, localIDs)
+	if err != nil {
+		h.log.Error("get messages reactions", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	// Everything the reply will not mention is dropped here, before any
+	// reaction is loaded, so the work the call does stays proportional to what
+	// the reply already reveals. The peer is an applied filter and not
+	// decoration: a message the caller owns in another conversation is not the
+	// named peer's and is dropped like an id they cannot read.
+	visible := make([]store.Message, 0, len(localIDs))
+	for _, localID := range localIDs {
+		m, ok := msgs[localID]
+		if !ok || m.Deleted || m.PeerType != peerType || m.PeerID != peerID {
+			continue
+		}
+		visible = append(visible, m)
+	}
+	if len(visible) == 0 {
+		return &tg.Updates{Updates: []tg.UpdateClass{}, Date: int(time.Now().Unix())}, nil
+	}
+
+	visibleIDs := make([]int64, len(visible))
+	for i, m := range visible {
+		visibleIDs[i] = m.LocalID
+	}
+	byMessage, err := h.store.ReactionsByOwnerLocalIDs(r.Ctx, r.UserID, visibleIDs)
+	if err != nil {
+		h.log.Error("get messages reactions load", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	updates := make([]tg.UpdateClass, len(visible))
+	for i, m := range visible {
+		updates[i] = &tg.UpdateMessageReactions{
+			// Derived from the stored row, never echoed from the request.
+			Peer:      peerToTL(m.PeerType, m.PeerID),
+			MsgID:     int(m.LocalID),
+			Reactions: reactionsToTL(byMessage[m.LocalID]),
+		}
+	}
+	// No users: the reply names no reactor, so there is no one to hydrate.
+	return &tg.Updates{Updates: updates, Date: int(time.Now().Unix())}, nil
 }
 
 // notifyReaction emits the cross-replica reaction nudge for userID (best-effort).

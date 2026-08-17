@@ -448,7 +448,11 @@ func (u *Updater) DeliverReactions(ctx context.Context, ownerID, localID, userID
 		return
 	}
 	msg, ok := msgs[localID]
-	if !ok {
+	// A copy its owner soft-deleted is gone from every read surface they have,
+	// so pushing a reaction on it would name a message they cannot open. The
+	// reaction row outlives the delete and is deliberately left in place; only
+	// this owner's push is dropped, and the other parties still get theirs.
+	if !ok || msg.Deleted {
 		return
 	}
 
@@ -459,21 +463,11 @@ func (u *Updater) DeliverReactions(ctx context.Context, ownerID, localID, userID
 		return
 	}
 
-	reactionClasses := make([]tg.ReactionClass, len(reactions))
-	for i, r := range reactions {
-		reactionClasses[i] = &tg.ReactionEmoji{Emoticon: r.Reaction}
-	}
-	mr := &tg.MessageReactions{
-		Results: make([]tg.ReactionCount, len(reactionClasses)),
-	}
-	for i, rc := range reactionClasses {
-		mr.Results[i] = tg.ReactionCount{Reaction: rc, Count: 1}
-	}
 	update := &tg.UpdateShort{
 		Update: &tg.UpdateMessageReactions{
 			Peer:      peerToTL(msg.PeerType, msg.PeerID),
 			MsgID:     int(msg.LocalID),
-			Reactions: *mr,
+			Reactions: reactionsToTL(reactions),
 		},
 		Date: int(time.Now().Unix()),
 	}

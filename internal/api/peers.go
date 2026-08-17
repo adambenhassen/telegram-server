@@ -69,6 +69,31 @@ func (h *handlers) inputPeer(peer tg.InputPeerClass, viewerID int64) (store.Peer
 	return store.PeerTypeUser, id, nil
 }
 
+// replyPeerIsDest reports whether p names the same peer as (destType, destID).
+// selfID is the caller's user id, used to resolve InputPeerSelf. No database
+// access is performed, so a foreign peer's existence cannot be probed.
+//
+// InputPeerUserFromMessage and InputPeerChannelFromMessage always return false.
+// They are "min" peer references resolved via a message context; inputPeer does
+// not accept those forms as destinations, so treating them as a destination
+// match here would be inconsistent with the rest of the send path.
+func replyPeerIsDest(p tg.InputPeerClass, destType store.PeerType, destID, selfID int64) bool {
+	switch v := p.(type) {
+	case *tg.InputPeerEmpty:
+		return true
+	case *tg.InputPeerSelf:
+		return destType == store.PeerTypeUser && destID == selfID
+	case *tg.InputPeerUser:
+		return destType == store.PeerTypeUser && destID == v.UserID
+	case *tg.InputPeerChat:
+		return destType == store.PeerTypeChat && destID == v.ChatID
+	case *tg.InputPeerChannel:
+		return destType == store.PeerTypeChannel && destID == v.ChannelID
+	default:
+		return false
+	}
+}
+
 // inputUserID resolves an InputUserClass to a user id. InputUserSelf is selfID;
 // InputUser is validated against the derived access hash for (viewerID, peer).
 // Anything else is PEER_ID_INVALID.
