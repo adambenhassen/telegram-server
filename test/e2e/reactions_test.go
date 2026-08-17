@@ -29,7 +29,7 @@ func TestReactionsRealtime(t *testing.T) {
 		t.Fatal(err)
 	}
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +343,7 @@ func TestReactionsChatFanout(t *testing.T) {
 		t.Fatal(err)
 	}
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

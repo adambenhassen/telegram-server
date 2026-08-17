@@ -330,7 +330,7 @@ func phoneN(i int) string {
 
 func openSendCodeStore(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey())
+	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

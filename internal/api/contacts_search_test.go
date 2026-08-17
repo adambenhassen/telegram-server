@@ -16,7 +16,7 @@ import (
 func TestContactsSearchUnauthenticated(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestContactsSearchUnauthenticated(t *testing.T) {
 func TestContactsSearchEmptyQuery(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestContactsSearchEmptyQuery(t *testing.T) {
 func TestContactsSearchLimitDefault(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestContactsSearchLimitDefault(t *testing.T) {
 func TestContactsSearchLimitCap(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestContactsSearchLimitCap(t *testing.T) {
 func TestContactsSearchQueryTooLong(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestContactsSearchQueryTooLong(t *testing.T) {
 func TestContactsSearchNoMatch(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

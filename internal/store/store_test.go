@@ -5,13 +5,24 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
+// testBlobs opens a blob store rooted in the test's own temporary directory.
+func testBlobs(tb testing.TB) blob.Store {
+	tb.Helper()
+	b, err := blob.NewLocal(tb.TempDir())
+	if err != nil {
+		tb.Fatalf("blob store: %v", err)
+	}
+	return b
+}
+
 func open(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey())
+	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -21,6 +32,21 @@ func open(t *testing.T) *store.Store {
 		}
 	})
 	return s
+}
+
+// TestOpenRequiresBlobStore: the part bytes live in the blob backend, so a
+// Store without one has no way to serve an upload. Left to default it would
+// nil-panic on the first saveFilePart of a running server rather than refusing
+// to start, which is the wrong end of the process to find out at.
+func TestOpenRequiresBlobStore(t *testing.T) {
+	t.Parallel()
+	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey())
+	if err == nil {
+		if cerr := s.Close(); cerr != nil {
+			t.Errorf("close: %v", cerr)
+		}
+		t.Fatal("Open with no blob backend succeeded, want a startup failure")
+	}
 }
 
 func TestCreateUserAndLookup(t *testing.T) {

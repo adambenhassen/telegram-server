@@ -15,17 +15,16 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
-// partsReader streams an in-flight upload's parts out of Postgres in index
-// order, so assembling a 100 MiB file never holds more than one 512 KiB part in
-// memory at a time.
+// partsReader streams an in-flight upload's parts out of the blob store in
+// index order, so assembling a 100 MiB file never holds more than one 512 KiB
+// part in memory at a time. It carries the refs the assembly already read —
+// one row each, never one part's bytes each — and fetches the bytes as it goes.
 type partsReader struct {
-	ctx    context.Context
-	store  *store.Store
-	userID int64
-	fileID int64
-	total  int
-	next   int
-	buf    []byte
+	ctx   context.Context
+	store *store.Store
+	refs  []store.UploadPartRef
+	next  int
+	buf   []byte
 }
 
 // Read fills b from the current part, fetching the next one when it runs out.
@@ -33,15 +32,12 @@ type partsReader struct {
 // Read return (0, nil) forever.
 func (p *partsReader) Read(b []byte) (int, error) {
 	for len(p.buf) == 0 {
-		if p.next >= p.total {
+		if p.next >= len(p.refs) {
 			return 0, io.EOF
 		}
-		payload, ok, err := p.store.UploadPart(p.ctx, p.userID, p.fileID, p.next)
+		payload, err := p.store.ReadUploadPart(p.ctx, p.refs[p.next])
 		if err != nil {
 			return 0, err
-		}
-		if !ok {
-			return 0, fmt.Errorf("upload part %d missing", p.next)
 		}
 		p.buf = payload
 		p.next++
@@ -393,6 +389,30 @@ func (h *handlers) assembleFile(
 		return store.File{}, errMediaInvalid
 	}
 
+	// One statement for the whole set, and it serves both passes below: the
+	// validation here, and the byte reads the writer makes. Looking each part
+	// up on its own cost a round trip per part on each pass, three per part in
+	// total, for rows this reads once.
+	refs, err := h.store.UploadPartRefs(ctx, userID, clientFileID)
+	if err != nil {
+		h.log.Error("assemble file", "user_id", userID, "err", err)
+		return store.File{}, errInternal
+	}
+	// The refs are ordered by part index, so this re-proves the contiguity the
+	// summary above already established against the rows that will actually be
+	// read, and rejects a part recorded with no bytes before a file row is
+	// allocated for an assembly that cannot finish. The reconciliation of each
+	// recorded size against the bytes read back stays where it was, in the
+	// read itself, and stays fail closed.
+	if len(refs) != parts {
+		return store.File{}, errMediaInvalid
+	}
+	for i, ref := range refs {
+		if ref.Index != i || ref.Size <= 0 {
+			return store.File{}, errMediaInvalid
+		}
+	}
+
 	file, err := h.store.AllocateFile(ctx, userID, total, sanitizeMIME(mimeType), sanitizeFileName(name), h.maxUserStorageBytes)
 	if errors.Is(err, store.ErrStorageQuota) {
 		return store.File{}, errFileQuota
@@ -403,7 +423,7 @@ func (h *handlers) assembleFile(
 	}
 
 	written, err := h.blobs.Put(ctx, blob.Key(file.ID), &partsReader{
-		ctx: ctx, store: h.store, userID: userID, fileID: clientFileID, total: parts,
+		ctx: ctx, store: h.store, refs: refs,
 	})
 	if err != nil {
 		h.log.Error("assemble file", "user_id", userID, "file_id", file.ID, "err", err)

@@ -12,7 +12,7 @@ func TestMetrics_Empty(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestMetrics_WithUsers(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestMetrics_WithChats(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestMetrics_WithChannel(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestMaxPtsGap_Empty(t *testing.T) {
 	t.Parallel()
 
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	st, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

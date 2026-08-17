@@ -22,7 +22,7 @@ import (
 func storeAndEvicts(ctx context.Context, t *testing.T) (*store.Store, *pgx.Conn) {
 	t.Helper()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(ctx, dsn, pgtest.EncKey())
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
