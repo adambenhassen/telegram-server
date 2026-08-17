@@ -404,32 +404,26 @@ test.describe('admin SSE stream', () => {
     const banner = page.locator('#banner-disconnected');
     await expect(banner).toBeHidden();
 
-    const lifecycle = (type: string) =>
-      page.evaluate((t) => {
-        document.dispatchEvent(
-          new CustomEvent('datastar-sse', { detail: { type: t, elId: 'sse-root' } }),
-        );
-      }, type);
-
-    await recordDisconnectState(page);
-    await lifecycle('finished');
-    await expect
-      .poll(() => bannerWasShown(page), { message: 'banner revealed on disconnect' })
-      .toBe(true);
-
-    // The "started" branch adds the "hidden" class synchronously when its event
-    // handler runs. Reading the class in the same evaluate call that dispatches
-    // the event means no data patch can arrive and re-hide the banner between
-    // the dispatch and the assertion. If the started branch is deleted the banner
-    // remains visible immediately after dispatch, even though a later patch would
-    // eventually re-hide it.
-    const bannerHiddenAfterReconnect = await page.evaluate(() => {
+    // Drive both transitions inside a single evaluate so no SSE data patch can
+    // land between them. finished removes "hidden" (banner visible); started adds
+    // it back (banner hidden). Asserting { before: false, after: true } proves the
+    // reconnect branch ran — there is no other transition that satisfies it. A data
+    // patch cannot intervene because JavaScript is single-threaded and no external
+    // event can interleave with a synchronous evaluate.
+    const { before, after } = await page.evaluate(() => {
+      const b = document.getElementById('banner-disconnected');
+      document.dispatchEvent(
+        new CustomEvent('datastar-sse', { detail: { type: 'finished', elId: 'sse-root' } }),
+      );
+      const before = b?.classList.contains('hidden') ?? true;
       document.dispatchEvent(
         new CustomEvent('datastar-sse', { detail: { type: 'started', elId: 'sse-root' } }),
       );
-      return document.getElementById('banner-disconnected')?.classList.contains('hidden') ?? false;
+      const after = b?.classList.contains('hidden') ?? false;
+      return { before, after };
     });
-    expect(bannerHiddenAfterReconnect, 'reconnect re-hides the banner').toBe(true);
+    expect(before, 'finished reveals the banner').toBe(false);
+    expect(after, 'reconnect re-hides the banner').toBe(true);
   });
 });
 
