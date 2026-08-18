@@ -49,20 +49,17 @@ var errMethodNotImplBurst = errors.New("unimplemented-method ceiling")
 // whether the line describing it is emitted at all.
 func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
 	answer := errMethodNotImpl
+	isClose := false
 	switch c.ChargeUnimplemented() {
 	case mtproto.UnimplementedClose:
 		// The burst ends the connection on this call, so no later line on it
-		// comes to carry the sampler's pending count. The drop writes it —
-		// the serve loop flushes the conn before it closes the socket — and
-		// this call is the one it stands for, so it is owed here too.
-		if suppressed, ok := c.LogUnimplemented(); ok {
-			h.log.Warn("method not implemented",
-				"error_code", answer.Code,
-				"error", answer.Message,
-				"suppressed", suppressed,
-			)
-		}
-		return errMethodNotImplBurst
+		// comes to carry the sampler's pending count. The close verdict is
+		// exempt from the interval gate: a connection ends exactly once, so
+		// its line costs at most one line per connection, and it is the one
+		// line that must say what was called rather than being lost behind
+		// the sampler. It consumes the pending count, so the drop's flush
+		// finds nothing left to write.
+		isClose = true
 	case mtproto.UnimplementedFloodWait:
 		answer = errMethodNotImplFlood
 	case mtproto.UnimplementedAnswer:
@@ -70,10 +67,34 @@ func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
 
 	id, err := req.Buf.PeekID()
 	if err != nil {
+		if isClose {
+			if suppressed, ok := c.LogUnimplementedClose(); ok {
+				h.log.Warn("method not implemented: peek id failed",
+					"err", err,
+					"error", errMethodNotImplBurst.Error(),
+					"suppressed", suppressed,
+				)
+			}
+			return errMethodNotImplBurst
+		}
 		if suppressed, ok := c.LogUnimplemented(); ok {
 			h.log.Warn("method not implemented: peek id failed", "err", err, "suppressed", suppressed)
 		}
 		return answer
+	}
+	if isClose {
+		// The line names the error the caller received. On a close the caller
+		// receives no RPC answer at all — the connection ends — so the line
+		// names the non-RPC error that ended it, and carries no error code.
+		if suppressed, ok := c.LogUnimplementedClose(); ok {
+			h.log.Warn("method not implemented",
+				"type_id", fmt.Sprintf("%#x", id),
+				"method", methodName(id),
+				"error", errMethodNotImplBurst.Error(),
+				"suppressed", suppressed,
+			)
+		}
+		return errMethodNotImplBurst
 	}
 	if suppressed, ok := c.LogUnimplemented(); ok {
 		h.log.Warn("method not implemented",
@@ -117,6 +138,28 @@ func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) err
 			answer = errMethodNotImplFlood
 		case mtproto.UnimplementedAnswer:
 		}
+		if isClose {
+			// The close verdict is exempt from the interval gate, the way
+			// handleUnknown does it: a connection ends exactly once, so its
+			// line costs at most one line per connection, and it is the one
+			// line that must say what was called rather than being lost
+			// behind the sampler. It consumes the pending count, so the
+			// drop's flush finds nothing left to write.
+			id, _ := req.Buf.PeekID() //nolint:errcheck // dispatcher already validated the id
+			// The line names the error the caller received. On a close the
+			// caller receives no RPC answer at all — the connection ends —
+			// so the line names the non-RPC error that ended it, and carries
+			// no error code.
+			if suppressed, ok := c.LogUnimplementedClose(); ok {
+				h.log.Warn("method not implemented",
+					"type_id", fmt.Sprintf("%#x", id),
+					"method", methodName(id),
+					"error", errMethodNotImplBurst.Error(),
+					"suppressed", suppressed,
+				)
+			}
+			return errMethodNotImplBurst
+		}
 		if suppressed, ok := c.LogUnimplemented(); ok {
 			id, _ := req.Buf.PeekID() //nolint:errcheck // dispatcher already validated the id
 			h.log.Warn("method not implemented",
@@ -126,9 +169,6 @@ func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) err
 				"error", answer.Message,
 				"suppressed", suppressed,
 			)
-		}
-		if isClose {
-			return errMethodNotImplBurst
 		}
 		return answer
 	}
