@@ -201,18 +201,21 @@ func Scan(ctx context.Context, tree Tree, files Files, tempOlderThan time.Time) 
 		}
 
 		// A class is earned by round-tripping through what the writer
-		// produces, never by where a path sits. Checked ahead of every other
-		// class: the only writer a key under the parts prefix comes from is
-		// NewPartKey, and only what it could have produced is a live upload
-		// part. A part key names no file id, so it is never an orphan
-		// candidate; the writer's temporary file for one is a write in
-		// progress like any other, judged by the age cutoff alone; and
-		// whatever the prefix holds that parses to neither is unexplained,
-		// with its bytes, reported and left alone.
+		// produces, never by where a path sits. The shape check comes before
+		// the suffix check, the same order the blob side keeps: nothing under
+		// the prefix reaches the part or temporary classes unless it is what
+		// NewPartKey could have produced, with or without the writer's
+		// temporary suffix, and everything else is unexplained. A part key
+		// names no file id, so it is never an orphan candidate; the writer's
+		// temporary file for one is a write in progress like any other, judged
+		// by the age cutoff alone.
 		if strings.HasPrefix(e.Key, blob.PartsPrefix) {
 			key, temp := strings.CutSuffix(e.Key, blob.TempSuffix)
-			switch {
-			case temp:
+			if !blob.ParsePartKey(key) {
+				rep.Unexplained.add(Candidate{Key: e.Key, Size: e.Size})
+				return nil
+			}
+			if temp {
 				// A temporary file is a write in progress, not a stored part:
 				// it is judged by the age cutoff alone, in the temporary
 				// class, and only what is past the cutoff is reported.
@@ -222,13 +225,9 @@ func Scan(ctx context.Context, tree Tree, files Files, tempOlderThan time.Time) 
 				}
 				rep.Temps.add(Candidate{Key: e.Key, Size: e.Size})
 				return nil
-			case blob.ParsePartKey(key):
-				rep.Parts.add(Candidate{Key: e.Key, Size: e.Size})
-				return nil
-			default:
-				rep.Unexplained.add(Candidate{Key: e.Key, Size: e.Size})
-				return nil
 			}
+			rep.Parts.add(Candidate{Key: e.Key, Size: e.Size})
+			return nil
 		}
 
 		key, temp := strings.CutSuffix(e.Key, blob.TempSuffix)

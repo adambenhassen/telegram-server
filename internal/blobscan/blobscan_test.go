@@ -235,9 +235,11 @@ func (h hookTree) Walk(ctx context.Context, fn func(blob.Entry) error) error {
 // The hook allocates a real files row as well as writing the blob, which is
 // what makes the test able to fail: the allocation advances the id ceiling, so
 // a scan that read the snapshot after the listing began would see the arriving
-// id under Through and name it an orphan. A test that only wrote the blob
-// pins the id bound but not the order, because nothing moves the ceiling during
-// the walk.
+// id under Through. What catches that reversal is Through and AboveSnapshot,
+// not the orphan class: the hook's row commits, so a reversed read would
+// account for the arriving id rather than name it. A test that only wrote the
+// blob pins the id bound but not the order, because nothing moves the ceiling
+// during the walk.
 func TestScanExcludesBlobWrittenAfterTheSnapshot(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -347,26 +349,58 @@ func TestScanNamesPathsUnderThePartsPrefixTheWriterDidNotProduce(t *testing.T) {
 		t.Fatalf("part key: %v", err)
 	}
 	f.plant(partKey, "part bytes")
+	// A real 32-character key that differs from a valid one only in case: if
+	// ParsePartKey stops checking case, this plant parses and the assertion
+	// below fails, so the test exercises the reason it claims to.
+	upper := "parts/" + strings.ToUpper(partKey[len(blob.PartsPrefix):])
 	for _, rel := range []string{
 		"parts/README",     // not a part key
 		"parts/sub/nested", // an extra path element
-		"parts/" + strings.ToUpper(partKey[len(blob.PartsPrefix):])[:8] + "000000000000000000000000000000", // upper case is not one
+		upper,              // upper case is not one
 	} {
 		f.plant(rel, "x")
 	}
 
 	rep := f.scan(past())
-	for _, want := range []string{"parts/README", "parts/sub", "parts/sub/nested"} {
+	for _, want := range []string{"parts/README", "parts/sub", "parts/sub/nested", upper} {
 		if !has(rep.Unexplained, want) {
 			t.Errorf("%q not reported as unexplained; report = %+v", want, rep.Unexplained.Paths)
 		}
 	}
-	if has(rep.Parts, "parts/README") || has(rep.Parts, "parts/sub/nested") {
+	if has(rep.Parts, "parts/README") || has(rep.Parts, "parts/sub/nested") || has(rep.Parts, upper) {
 		t.Fatalf("a path the writer did not produce was counted as an upload part: %+v", rep.Parts.Paths)
 	}
 	// The part totals carry only what the writer could have produced.
 	if rep.Parts.Count != 1 || rep.Parts.Bytes != int64(len("part bytes")) {
 		t.Fatalf("parts = %d / %d bytes, want 1 / %d; report = %+v", rep.Parts.Count, rep.Parts.Bytes, len("part bytes"), rep)
+	}
+}
+
+// A temporary file whose key is not one the part writer produces is
+// unexplained, with its bytes, and never in the temporary class: a suffix
+// alone does not earn a class the writer could have abandoned, the same
+// order the blob side keeps, where the shape check gates ahead of the temp
+// split. A check that reads the suffix before the shape would name this a
+// reclaimable abandoned write, and a reclaimer that unlinks it destroys a
+// file nobody could recover.
+func TestScanNamesUnparsablePartTempAsUnexplained(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+
+	f.stored(payload) // one real blob, so the tree is not only strange
+	stray := "parts/README" + blob.TempSuffix
+	f.plant(stray, "not a part write")
+	f.age(stray, 30*time.Hour)
+
+	rep := f.scan(time.Now().Add(-24 * time.Hour))
+	if !has(rep.Unexplained, stray) {
+		t.Fatalf("%s not reported as unexplained; report = %+v", stray, rep.Unexplained.Paths)
+	}
+	if has(rep.Temps, stray) || has(rep.Parts, stray) || has(rep.Orphans, stray) {
+		t.Fatalf("a temporary file whose key the writer did not produce was reported as reclaimable: %+v", rep)
+	}
+	if rep.Temps.Count != 0 || rep.TempsInFlight != 0 {
+		t.Fatalf("temporary class or in-flight count is not empty: %+v", rep)
 	}
 }
 
