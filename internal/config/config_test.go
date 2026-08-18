@@ -1037,3 +1037,55 @@ func TestLoadMediaErasureReport(t *testing.T) {
 		})
 	}
 }
+
+// The blob disk report's two knobs, which behave like the media erasure
+// report's: a duration cutoff that must be positive, and an interval that
+// defaults to zero, meaning off. The case that matters most is that a typo
+// fails the start by name rather than reading as the default and leaving an
+// operator believing a report is running.
+func TestLoadBlobScanReport(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	tests := map[string]struct {
+		tempMinAge   string
+		interval     string
+		wantMinAge   time.Duration
+		wantInterval time.Duration
+		wantErrVar   string
+	}{
+		"unset":             {wantMinAge: 24 * time.Hour, wantInterval: 0},
+		"override both":     {tempMinAge: "48h", interval: "30m", wantMinAge: 48 * time.Hour, wantInterval: 30 * time.Minute},
+		"report off":        {interval: "0s", wantMinAge: 24 * time.Hour, wantInterval: 0},
+		"age not duration":  {tempMinAge: "a while", wantErrVar: "TG_BLOB_SCAN_TEMP_MIN_AGE"},
+		"age zero":          {tempMinAge: "0s", wantErrVar: "TG_BLOB_SCAN_TEMP_MIN_AGE"},
+		"age negative":      {tempMinAge: "-1h", wantErrVar: "TG_BLOB_SCAN_TEMP_MIN_AGE"},
+		"interval typo":     {interval: "nightly", wantErrVar: "TG_BLOB_SCAN_REPORT_INTERVAL"},
+		"interval negative": {interval: "-1h", wantErrVar: "TG_BLOB_SCAN_REPORT_INTERVAL"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TG_BLOB_SCAN_TEMP_MIN_AGE", tc.tempMinAge)
+			t.Setenv("TG_BLOB_SCAN_REPORT_INTERVAL", tc.interval)
+			cfg, err := config.Load(discardLog())
+			if tc.wantErrVar != "" {
+				if err == nil {
+					t.Fatalf("expected error for %s, got temp min age %v interval %v",
+						name, cfg.BlobScanTempMinAge, cfg.BlobScanReportInterval)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrVar) {
+					t.Errorf("error %q does not name %s", err, tc.wantErrVar)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.BlobScanTempMinAge != tc.wantMinAge {
+				t.Errorf("BlobScanTempMinAge = %v, want %v", cfg.BlobScanTempMinAge, tc.wantMinAge)
+			}
+			if cfg.BlobScanReportInterval != tc.wantInterval {
+				t.Errorf("BlobScanReportInterval = %v, want %v", cfg.BlobScanReportInterval, tc.wantInterval)
+			}
+		})
+	}
+}

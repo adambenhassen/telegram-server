@@ -11,6 +11,67 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const allocatedFileIDCeiling = `-- name: AllocatedFileIDCeiling :one
+SELECT coalesce(pg_sequence_last_value('files_id_seq'), 0)::bigint
+`
+
+// AllocatedFileIDCeiling is the highest id the files sequence has ever
+// handed out, read from the sequence itself rather than from the rows.
+//
+// The two differ once a row is deleted: max(id) falls below the erased ids
+// while the sequence does not, and the sequence is the bound a pass over the
+// blob store's disk needs. A committed row delete whose unlink was lost
+// leaves its blob at the top of the id space, and a bound that has shrunk
+// below it puts that blob above the snapshot, where nothing names it until a
+// later upload allocates past it. The sequence is an upper bound on every id
+// allocated before the read and never falls below an id whose row was once
+// committed, which is what the classification's snapshot argument requires.
+//
+// pg_sequence_last_value is NULL on a sequence that never advanced, and the
+// coalesce makes the empty table the same zero the row-based query returns.
+func (q *Queries) AllocatedFileIDCeiling(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, allocatedFileIDCeiling)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const existingFileIDs = `-- name: ExistingFileIDs :many
+SELECT id FROM files WHERE id = ANY($1::bigint[])
+`
+
+// ExistingFileIDs answers "which of these ids does the database still account
+// for", for a pass classifying what is on the blob store's disk.
+//
+// stored is deliberately not in the predicate, unlike FilesByIDs. A row with
+// stored = false is an assembly that crashed or one running right now, and its
+// bytes are on their way to that exact key: treating it as unaccounted for
+// would name a live upload's blob, which is the one mistake this classification
+// exists to avoid. Whether an unstored row is itself reclaimable is the files
+// table's question and MediaErasureScan already answers it.
+//
+// No lock and no join. It is one indexed probe per id over the primary key, so
+// a background walk of the tree never puts a send or a download behind it.
+func (q *Queries) ExistingFileIDs(ctx context.Context, ids []int64) ([]int64, error) {
+	rows, err := q.db.Query(ctx, existingFileIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const fileForDownload = `-- name: FileForDownload :one
 SELECT f.id, f.uploader_id, f.access_hash, f.size, f.mime_type, f.file_name, f.stored, f.date FROM files f
 WHERE f.id = $1 AND f.access_hash = $2 AND f.stored = true

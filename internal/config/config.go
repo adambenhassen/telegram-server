@@ -108,6 +108,25 @@ type Config struct {
 	// cached. An operator turning this on wants either a small corpus or the
 	// index the eraser ticket will decide on.
 	MediaErasureReportInterval time.Duration
+	// BlobScanTempMinAge is how old the blob writer's temporary file must be
+	// before the disk report will name it as abandoned. A temporary file is an
+	// upload writing its bytes right now, so this has to exceed the longest
+	// write a client can be part-way through — which nothing in the server
+	// bounds, the same reason MediaErasureMinAge is configurable rather than
+	// derived. Nothing in this build unlinks anything, so the value affects a
+	// report only.
+	BlobScanTempMinAge time.Duration
+	// BlobScanReportInterval is how often the disk report runs. Zero disables
+	// it and is the default, matching the media erasure report: both are
+	// opt-in, and both are turned on against the size of a particular
+	// deployment.
+	//
+	// The cost here is a walk of the blob tree — one stat per path — plus one
+	// primary-key probe per thousand blobs, so it is dominated by the
+	// filesystem rather than by the database, and it scales with the number of
+	// files on disk rather than with the media corpus's reference graph. It
+	// takes no lock and opens no transaction either way.
+	BlobScanReportInterval time.Duration
 	// RateLimits holds the per-surface rate-limit configurations. Zero limit
 	// disables enforcement for that surface.
 	RateLimits RateLimitsConfig
@@ -289,8 +308,10 @@ func Load(log *slog.Logger) (Config, error) {
 		MaxUserStorageBytes: 2 << 30,
 		UploadPartTTL:       6 * time.Hour,
 		MediaErasureMinAge:  24 * time.Hour,
+		BlobScanTempMinAge:  24 * time.Hour,
 
 		MediaErasureReportInterval: 0,
+		BlobScanReportInterval:     0,
 
 		MaxConnsPerUnboundKey: mtproto.DefaultMaxConnsPerUnboundKey,
 
@@ -355,6 +376,26 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_MEDIA_ERASURE_REPORT_INTERVAL must not be negative")
 		}
 		cfg.MediaErasureReportInterval = d
+	}
+	if v := os.Getenv("TG_BLOB_SCAN_TEMP_MIN_AGE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_BLOB_SCAN_TEMP_MIN_AGE must be a duration")
+		}
+		if d <= 0 {
+			return Config{}, errors.New("TG_BLOB_SCAN_TEMP_MIN_AGE must be positive")
+		}
+		cfg.BlobScanTempMinAge = d
+	}
+	if v := os.Getenv("TG_BLOB_SCAN_REPORT_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_BLOB_SCAN_REPORT_INTERVAL must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_BLOB_SCAN_REPORT_INTERVAL must not be negative")
+		}
+		cfg.BlobScanReportInterval = d
 	}
 	if v := os.Getenv("TG_LOG_LOGIN_CODES"); v != "" {
 		on, err := strconv.ParseBool(v)
