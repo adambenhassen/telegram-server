@@ -1104,18 +1104,23 @@ func TestLoadMediaErasureSweep(t *testing.T) {
 		wantDestructive       bool
 		wantErrVar            string
 	}{
-		"unset":             {},
-		"range set":         {min: "30m", max: "90m", wantMin: 30 * time.Minute, wantMax: 90 * time.Minute},
-		"destructive":       {min: "30m", max: "90m", destructive: "true", wantMin: 30 * time.Minute, wantMax: 90 * time.Minute, wantDestructive: true},
-		"destructive alone": {destructive: "true", wantDestructive: true},
-		"min only":          {min: "30m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
-		"max only":          {max: "90m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MIN"},
-		"equal ends":        {min: "30m", max: "30m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
-		"inverted ends":     {min: "90m", max: "30m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
-		"min not duration":  {min: "often", max: "90m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MIN"},
-		"max not duration":  {min: "30m", max: "often", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
-		"min negative":      {min: "-1h", max: "90m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MIN"},
-		"destructive typo":  {destructive: "yes please", wantErrVar: "TG_MEDIA_ERASURE_DESTRUCTIVE"},
+		"unset":       {},
+		"range set":   {min: "30m", max: "90m", wantMin: 30 * time.Minute, wantMax: 90 * time.Minute},
+		"destructive": {min: "30m", max: "90m", destructive: "true", wantMin: 30 * time.Minute, wantMax: 90 * time.Minute, wantDestructive: true},
+		// Destruction asked for with nothing to run it is refused rather than
+		// accepted and inert: an operator who set it is watching for the disk to
+		// come back, and silence from a sweep that was never scheduled reads
+		// exactly like a sweep that found nothing.
+		"destructive alone":     {destructive: "true", wantErrVar: "TG_MEDIA_ERASURE_DESTRUCTIVE"},
+		"destructive off alone": {destructive: "false"},
+		"min only":              {min: "30m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
+		"max only":              {max: "90m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MIN"},
+		"equal ends":            {min: "30m", max: "30m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
+		"inverted ends":         {min: "90m", max: "30m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
+		"min not duration":      {min: "often", max: "90m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MIN"},
+		"max not duration":      {min: "30m", max: "often", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
+		"min negative":          {min: "-1h", max: "90m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MIN"},
+		"destructive typo":      {destructive: "yes please", wantErrVar: "TG_MEDIA_ERASURE_DESTRUCTIVE"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {

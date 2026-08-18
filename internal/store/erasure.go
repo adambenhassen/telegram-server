@@ -190,10 +190,15 @@ func (s *Store) MediaErasureSummary(ctx context.Context, olderThan time.Time, ba
 	return counts, nil
 }
 
-// EraseCounts is what one erasure sweep did and what it declined to do. The
-// four outcome counts partition Considered: every candidate the sweep took up
-// lands in exactly one of them, so "nothing was reclaimed" is distinguishable
-// from "reclaim was refused", and by what.
+// EraseCounts is what one erasure sweep did and what it declined to do.
+//
+// Erased, Contended and Retained partition Considered: every candidate the
+// sweep took up lands in exactly one of those three, so "nothing was reclaimed"
+// is distinguishable from "reclaim was refused", and by what. UnlinkFailed is
+// not a fourth class — it refines Erased, counting the subset whose row went
+// but whose bytes did not. Summing all four over-counts what the sweep took up,
+// which is why the distinction is spelled out here rather than left to be
+// inferred from the field order.
 //
 // It carries no file id and no access hash. An operator needs the size of what
 // moved, not an enumeration of whose media it was, and a sweep summary is
@@ -217,9 +222,11 @@ type EraseCounts struct {
 	// so the channel references it had cleared are still in place.
 	Retained int
 	// UnlinkFailed counts files whose row is committed gone but whose bytes the
-	// blob store would not remove. The bytes are reclaimable and nothing else
-	// names them; the disk reclamation pass is what collects them, which is the
-	// same state a crash between the commit and the unlink leaves behind.
+	// blob store would not remove. They are counted in Erased as well — the
+	// erase happened, the row is gone and the quota is freed — and this is how
+	// many of those left their bytes behind. The bytes are reclaimable and
+	// nothing else names them; the disk reclamation pass is what collects them,
+	// which is the same state a crash between the commit and the unlink leaves.
 	UnlinkFailed int
 }
 

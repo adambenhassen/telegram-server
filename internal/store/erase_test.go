@@ -151,7 +151,7 @@ func TestErasureSweepUnlinksOnlyAfterTheRowCommits(t *testing.T) {
 	var calls int
 	probe := &probeBlobs{
 		Store: store.BlobsOf(s),
-		onRemove: func(key string) {
+		onRemove: func(key string) error {
 			calls++
 			if key != blob.Key(f.ID) {
 				t.Errorf("unlinked key %q, want %q", key, blob.Key(f.ID))
@@ -159,6 +159,7 @@ func TestErasureSweepUnlinksOnlyAfterTheRowCommits(t *testing.T) {
 			if rowPresent(t, s, f.ID) {
 				t.Errorf("blob for file %d unlinked while its files row was still present", f.ID)
 			}
+			return nil
 		},
 	}
 	if err := store.SetPartBlobs(s, probe); err != nil {
@@ -173,16 +174,96 @@ func TestErasureSweepUnlinksOnlyAfterTheRowCommits(t *testing.T) {
 	}
 }
 
-// probeBlobs is a blob store that reports each unlink before performing it.
+// probeBlobs is a blob store that reports each unlink before performing it, and
+// can refuse one. Returning an error from onRemove skips the real unlink, so a
+// test can stand in for a backend that will not delete without also having to
+// fake the bytes staying behind.
 type probeBlobs struct {
 	blob.Store
 
-	onRemove func(key string)
+	onRemove func(key string) error
 }
 
 func (p *probeBlobs) Remove(ctx context.Context, key string) error {
-	p.onRemove(key)
+	if err := p.onRemove(key); err != nil {
+		return err
+	}
 	return p.Store.Remove(ctx, key)
+}
+
+// A blob store that will not remove one file's bytes does not stop the sweep,
+// is counted, and is reported.
+//
+// All three halves matter and none of them is pinned by the other tests. The
+// row is already committed gone by the time the unlink runs, so stopping there
+// would leave the same reclaimable bytes behind AND abandon every candidate
+// after it — which is why the sweep continues. But continuing quietly would be
+// swallowing an error on a pass that destroys data, so the count says how many
+// and the first error is returned once the walk is finished. Discarding that
+// error leaves every other test in this file green.
+//
+// The state this leaves is exactly the state a crash between the commit and the
+// unlink leaves: bytes with no row, which the disk reclamation pass collects.
+func TestErasureSweepCountsAnUnlinkFailureAndKeepsGoing(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	a := mustUser(t, s, "+15559200181")
+	b := mustUser(t, s, "+15559200182")
+
+	// Two candidates. Ids ascend in creation order and the sweep takes them in
+	// that order, so the refused unlink is the one the sweep reaches first and
+	// the second file is downstream of the failure.
+	first := storedFileWithBytes(t, s, a.ID)
+	deletedBothSides(t, s, a, b, first.ID, 1)
+	second := storedFileWithBytes(t, s, a.ID)
+	deletedBothSides(t, s, a, b, second.ID, 2)
+	if first.ID >= second.ID {
+		t.Fatalf("file ids %d and %d are not ascending in creation order", first.ID, second.ID)
+	}
+
+	refused := errors.New("blob backend refused the unlink")
+	probe := &probeBlobs{
+		Store: store.BlobsOf(s),
+		onRemove: func(key string) error {
+			if key == blob.Key(first.ID) {
+				return refused
+			}
+			return nil
+		},
+	}
+	if err := store.SetPartBlobs(s, probe); err != nil {
+		t.Fatalf("swap blobs: %v", err)
+	}
+
+	counts, err := s.SweepMediaErasure(context.Background(), future(), store.ErasureScanBatch)
+	if err == nil {
+		t.Fatal("the sweep reported no error after a refused unlink")
+	}
+	if !errors.Is(err, refused) {
+		t.Errorf("sweep error = %v, want it to wrap the backend's refusal", err)
+	}
+	if !strings.Contains(err.Error(), strconv.FormatInt(first.ID, 10)) {
+		t.Errorf("sweep error %q does not name the file whose bytes were left behind", err)
+	}
+	if counts.UnlinkFailed != 1 {
+		t.Errorf("UnlinkFailed = %d, want 1", counts.UnlinkFailed)
+	}
+	// Both rows went: the failure is downstream of the commit, so it does not
+	// un-erase the file, and UnlinkFailed refines Erased rather than replacing it.
+	if counts.Erased != 2 {
+		t.Errorf("Erased = %d, want 2 — the sweep stopped at the failure", counts.Erased)
+	}
+	if rowPresent(t, s, first.ID) || rowPresent(t, s, second.ID) {
+		t.Error("a files row survived a sweep that reported it erased")
+	}
+	if !blobPresent(t, s, first.ID) {
+		t.Errorf("file %d's bytes are gone, but the backend refused to remove them", first.ID)
+	}
+	// The candidate after the failure was still reached, which is the whole
+	// point of not stopping.
+	if blobPresent(t, s, second.ID) {
+		t.Errorf("file %d was never unlinked: the sweep stopped at the earlier failure", second.ID)
+	}
 }
 
 // Criterion 3, first case: an erase racing a forward of the last live copy.

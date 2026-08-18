@@ -457,6 +457,15 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.MediaErasureDestructive = on
 	}
+	// Refused for the reason a lone interval bound is, and it is the worse of
+	// the two: an operator who set this believes reclamation is running and is
+	// watching for the disk to come back, while nothing is scheduled to run at
+	// all. Silence there reads as "there was nothing to reclaim". Turning
+	// destruction on is the one setting in this file that cannot be quietly
+	// inert.
+	if cfg.MediaErasureDestructive && cfg.MediaErasureIntervalMin == 0 {
+		return Config{}, errors.New("TG_MEDIA_ERASURE_DESTRUCTIVE needs TG_MEDIA_ERASURE_INTERVAL_MIN and TG_MEDIA_ERASURE_INTERVAL_MAX; nothing runs the sweep without them")
+	}
 	if v := os.Getenv("TG_BLOB_SCAN_TEMP_MIN_AGE"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
