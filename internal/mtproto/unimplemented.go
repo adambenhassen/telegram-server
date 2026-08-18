@@ -73,6 +73,12 @@ type unimplementedBudget struct {
 	// operator needs the line that says this is happening, and a window shared
 	// across connections is a window one peer can spend on its own.
 	log logSampler
+	// closeLineWritten is set once the connection-ending verdict has written
+	// its line. The close verdict is exempt from the interval gate, but a
+	// connection ends exactly once, so the line is owed once: the first close
+	// verdict takes it, and any later close verdict on the same conn — which a
+	// test harness can drive past the ceiling — finds nothing left to write.
+	closeLineWritten bool
 }
 
 // charge records one such call at now and reports what it is owed.
@@ -110,6 +116,20 @@ func (b *unimplementedBudget) logFlush(now time.Time) (int64, bool) {
 	return b.log.flush(now)
 }
 
+// logClose reports the suppressed count the connection-ending verdict's line
+// stands for, and whether the line may be emitted. The close verdict is exempt
+// from the interval gate, but the line is owed once per connection: the first
+// close verdict consumes the pending count and takes the line, and any later
+// close verdict on the same conn finds nothing left to write.
+func (b *unimplementedBudget) logClose(now time.Time) (int64, bool) {
+	if b.closeLineWritten {
+		return 0, false
+	}
+	suppressed, _ := b.log.flush(now)
+	b.closeLineWritten = true
+	return suppressed, true
+}
+
 // ChargeUnimplemented records one call to a method this server does not
 // implement on this connection and reports what it is owed. The caller decides
 // what an answer looks like — the error a client sees is the RPC layer's, not
@@ -126,6 +146,20 @@ func (c *Conn) ChargeUnimplemented() UnimplementedVerdict {
 // be emitted now and, when it may, how many lines it stands for.
 func (c *Conn) LogUnimplemented() (int64, bool) {
 	return c.unimplemented.logAllow(c.clock.Now())
+}
+
+// LogUnimplementedClose reports the suppressed count the connection-ending
+// verdict's line stands for, and whether the line may be emitted. The close
+// verdict is exempt from the interval gate: a connection ends exactly once, so
+// its line costs at most one line per connection, never one per call, and it is
+// the one line that must say what was called rather than being lost behind the
+// sampler. It emits at most once per connection — the first close verdict on
+// the conn takes the line, and any later close verdict (the harness can drive
+// past the ceiling) finds nothing left to write. It consumes the pending count
+// the same way the drop's flush does, so a later FlushUnimplementedLog finds
+// nothing left to write.
+func (c *Conn) LogUnimplementedClose() (int64, bool) {
+	return c.unimplemented.logClose(c.clock.Now())
 }
 
 // FlushUnimplementedLog writes the line this connection's not-implemented
