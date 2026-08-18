@@ -2,12 +2,15 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
@@ -185,4 +188,187 @@ func (s *Store) MediaErasureSummary(ctx context.Context, olderThan time.Time, ba
 		after = scan.LastID
 	}
 	return counts, nil
+}
+
+// EraseCounts is what one erasure sweep did and what it declined to do. The
+// four outcome counts partition Considered: every candidate the sweep took up
+// lands in exactly one of them, so "nothing was reclaimed" is distinguishable
+// from "reclaim was refused", and by what.
+//
+// It carries no file id and no access hash. An operator needs the size of what
+// moved, not an enumeration of whose media it was, and a sweep summary is
+// exactly the kind of record that is logged whole.
+type EraseCounts struct {
+	// Considered is how many candidates the sweep's scans named.
+	Considered int
+	// Erased and ErasedBytes count files whose row was removed and whose bytes
+	// were unlinked. The bytes are the row's recorded size, which is also what
+	// the account's quota was carrying for it.
+	Erased      int
+	ErasedBytes int64
+	// Contended counts candidates whose files row another transaction held. A
+	// reference is being written to that file right now, or another replica's
+	// sweep reached it first; either way it is not this pass's, and the next
+	// sweep reads it again.
+	Contended int
+	// Retained counts candidates the erase transaction refused: the file gained
+	// a reference, or stopped meeting the age or stored condition, between the
+	// scan that named it and the exclusive lock. The transaction rolled back,
+	// so the channel references it had cleared are still in place.
+	Retained int
+	// UnlinkFailed counts files whose row is committed gone but whose bytes the
+	// blob store would not remove. The bytes are reclaimable and nothing else
+	// names them; the disk reclamation pass is what collects them, which is the
+	// same state a crash between the commit and the unlink leaves behind.
+	UnlinkFailed int
+}
+
+// eraseOutcome is which of EraseCounts' classes one candidate landed in.
+type eraseOutcome int
+
+const (
+	erased eraseOutcome = iota
+	contended
+	retained
+)
+
+// SweepMediaErasure removes the files nothing live references and unlinks their
+// bytes, walking the files table in windows of at most batch rows.
+//
+// This is the destructive pass. Everything above it in this file names
+// candidates and decides nothing; this is where a name becomes a delete, and
+// the blob volume it unlinks from has no backup and no restore path.
+//
+// olderThan is the age cutoff, fixed for the whole sweep rather than recomputed
+// per window, so what one sweep reclaims is decided once at its start — the
+// same rule the upload-part sweep follows.
+//
+// The upper bound is snapshotted before the walk, for the reason
+// MediaErasureSummary snapshots it: files.id is BIGSERIAL and never reused, so
+// a file uploaded while the sweep runs is above the snapshot and is left to the
+// next one, which is also what makes the walk terminate on a server still
+// accepting uploads.
+//
+// Every replica may run this concurrently. Nothing is partitioned between them
+// and nothing here assumes it is: a row a second sweep already holds is skipped
+// rather than waited on, and an unlink of an already-unlinked key is a no-op.
+//
+// A candidate whose bytes could not be unlinked does not stop the sweep. Its
+// row is already committed gone, so stopping would leave the same reclaimable
+// bytes behind while also abandoning every candidate after it; the count says
+// how many, and the first error is returned once the walk is finished.
+func (s *Store) SweepMediaErasure(ctx context.Context, olderThan time.Time, batch int) (EraseCounts, error) {
+	var counts EraseCounts
+	if batch <= 0 || batch > math.MaxInt32 {
+		return counts, fmt.Errorf("media erasure sweep: batch %d out of range", batch)
+	}
+	through, err := s.q.MaxFileID(ctx)
+	if err != nil {
+		return counts, fmt.Errorf("media erasure sweep: max file id: %w", err)
+	}
+
+	var unlinkErr error
+	for after := int64(0); after < through; {
+		scan, err := s.MediaErasureScan(ctx, olderThan, after, through, batch)
+		if err != nil {
+			return counts, err
+		}
+		// MediaErasureScan orders by id, so the candidates arrive ascending and
+		// are taken in that order. It is the ordering the reference interlock
+		// established for this lock class: a caller holding one files row and
+		// reaching for another can only ever reach upward, so two transactions
+		// naming the same pair cannot hold them the opposite way round.
+		for _, c := range scan.Unreferenced {
+			counts.Considered++
+			out, err := s.eraseCandidate(ctx, c, olderThan)
+			if err != nil {
+				return counts, err
+			}
+			switch out {
+			case contended:
+				counts.Contended++
+			case retained:
+				counts.Retained++
+			case erased:
+				counts.Erased++
+				counts.ErasedBytes += c.Size
+				// Only now, with the row's deletion committed. The reverse
+				// order is the one thing this pass must never do: it leaves a
+				// row the download gate still admits over bytes that are gone,
+				// which is a fourth download outcome, and a crash in that
+				// window makes it permanent.
+				if err := s.blobs.Remove(ctx, blob.Key(c.ID)); err != nil {
+					counts.UnlinkFailed++
+					if unlinkErr == nil {
+						unlinkErr = fmt.Errorf("media erasure sweep: unlink file %d: %w", c.ID, err)
+					}
+				}
+			}
+		}
+		if scan.Done {
+			break
+		}
+		after = scan.LastID
+	}
+	return counts, unlinkErr
+}
+
+// eraseCandidate runs one file's erase transaction: take the row, release the
+// references held by already-deleted channel posts, delete the row. One file
+// per transaction, and the transaction does nothing else.
+//
+// The hold is a chat-wide stall while it lasts. A forward reaches the file
+// interlock holding the destination chat's row lock and up to 200 per-owner
+// advisory locks, so a forward parked on this row parks every other send and
+// membership mutation in that chat behind it. That blocking is the control
+// rather than a defect — it is how a reference insert loses to an erase instead
+// of racing it — but its duration is the whole cost, so nothing that can be
+// done outside the hold is done inside it: the candidate scan, the byte unlink
+// and every filesystem operation are all on the other side of the commit.
+//
+// The one thing that cannot move outside is the reference re-check, and the
+// reason is the ordering, not the cost. See LockFileForErase.
+func (s *Store) eraseCandidate(ctx context.Context, c ErasureCandidate, olderThan time.Time) (eraseOutcome, error) {
+	if s.eraseHook != nil {
+		s.eraseHook(c.ID)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return retained, fmt.Errorf("erase file %d: begin: %w", c.ID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	// No row means the row is contended or already gone. Both are somebody
+	// else's business and neither is an error: a held row is a reference being
+	// written or another replica's sweep, and an absent one is a sweep that
+	// already finished the job.
+	if _, err = qtx.LockFileForErase(ctx, c.ID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return contended, nil
+		}
+		return retained, fmt.Errorf("erase file %d: lock: %w", c.ID, err)
+	}
+	if _, err = qtx.ClearDeletedChannelFileRefs(ctx, &c.ID); err != nil {
+		return retained, fmt.Errorf("erase file %d: clear channel refs: %w", c.ID, err)
+	}
+	n, err := qtx.DeleteUnreferencedFile(ctx, db.DeleteUnreferencedFileParams{
+		ID:        c.ID,
+		OlderThan: pgtype.Timestamptz{Time: olderThan, Valid: true},
+	})
+	if err != nil {
+		return retained, fmt.Errorf("erase file %d: delete: %w", c.ID, err)
+	}
+	if n == 0 {
+		// Rolled back rather than committed, so the channel references cleared
+		// above go back too. A file that survives keeps every record of which
+		// posts named it; committing that half would quietly detach a retained
+		// file from the deleted posts that are the only remaining evidence of
+		// where it went.
+		return retained, nil
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return retained, fmt.Errorf("erase file %d: commit: %w", c.ID, err)
+	}
+	return erased, nil
 }
