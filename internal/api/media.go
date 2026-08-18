@@ -129,8 +129,27 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	// Check for a transport retry before any expensive work.
+	//
+	// A soft-deleted original does not take this branch. MessageByRandomID has
+	// no deleted predicate, so without the check a resend naming a file the
+	// eraser has since removed answers with the original message here and
+	// returns before lockFileRefs is ever reached — and the reply differs by
+	// whether the file row still exists, since a row whose file is gone renders
+	// as a message with no media. That turns one repeated request into a
+	// per-file erasure oracle: the uploader learns which of their files was
+	// erased, and therefore which recipient deleted which media, on demand and
+	// with none of the blunting the randomized sweep interval was accepted as
+	// providing.
+	//
+	// Falling through costs nothing a client can see. resendFileID reads the
+	// same row, so the original's file id is still reused and the upload parts
+	// are still not reassembled; the send path's own dedup decides the reply,
+	// and when the file is gone the interlock refuses it — the same answer as a
+	// file the caller never had. The decision stays with the interlock rather
+	// than a file-existence check here, so there is only one thing to keep in
+	// step.
 	if req.RandomID != 0 {
-		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok {
+		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok && !existing.Deleted {
 			// Retry: return the stored message, at the pts it occupies, without
 			// rate-limiting or file assembly.
 			pts, err := h.store.MessagePts(r.Ctx, r.UserID, existing.LocalID)
