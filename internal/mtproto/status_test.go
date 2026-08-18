@@ -22,12 +22,16 @@ type statusEvent struct {
 }
 
 // statusKeyStore is like bindingKeyStore but also records the status callback
-// invocations so the test can assert the lifecycle sequence.
+// invocations so the test can assert the lifecycle sequence. provisional
+// is the flag the store reports for every lookup, so a test that needs a
+// provisional session sets it once and the serve loop delivers it to the
+// handler on every call.
 type statusKeyStore struct {
-	key    crypto.AuthKey
-	users  []int64
-	n      int
-	events []statusEvent
+	key         crypto.AuthKey
+	users       []int64
+	provisional bool
+	n           int
+	events      []statusEvent
 }
 
 func (s *statusKeyStore) Save(context.Context, crypto.AuthKey) error { return nil }
@@ -36,7 +40,7 @@ func (s *statusKeyStore) Touch(context.Context, [8]byte) error       { return ni
 func (s *statusKeyStore) Get(context.Context, [8]byte) (crypto.AuthKey, int64, bool, bool, error) {
 	userID := s.users[min(s.n, len(s.users)-1)]
 	s.n++
-	return s.key, userID, false, true, nil
+	return s.key, userID, s.provisional, true, nil
 }
 
 func (s *statusKeyStore) OnStatusChange(_ context.Context, userID int64, online bool) {

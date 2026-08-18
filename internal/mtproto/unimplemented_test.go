@@ -72,6 +72,41 @@ func TestServeConnClosesAtUnimplementedCeiling(t *testing.T) {
 	}
 }
 
+// TestServeConnDeliversProvisionalFlagToTheHandler proves the serve loop
+// delivers the store's provisional flag to the handler, so a test that binds a
+// provisional session through the store exercises the gated fallback the way a
+// real connection does. The handler records the flag it sees; the store says
+// the session is provisional, and the handler must see it.
+func TestServeConnDeliversProvisionalFlagToTheHandler(t *testing.T) {
+	t.Parallel()
+	key := rebindTestKey()
+	ks := &statusKeyStore{key: key, users: []int64{7}, provisional: true}
+
+	var gotProvisional []bool
+	h := mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
+		gotProvisional = append(gotProvisional, req.Provisional)
+		return nil
+	})
+	srv := mtproto.New(exchange.PrivateKey{}, 2, ks, h, nil)
+
+	frames := make([][]byte, 2)
+	for i := range frames {
+		frames[i] = statusClientFrame(t, key, 42, int64(i+1)<<32, &tg.AccountRegisterDeviceRequest{})
+	}
+
+	if err := srv.ServeConn(context.Background(), &statusFrameConn{frames: frames}); !errors.Is(err, io.EOF) {
+		t.Fatalf("ServeConn = %v, want EOF", err)
+	}
+	if len(gotProvisional) != 2 {
+		t.Fatalf("handler saw %d calls, want 2", len(gotProvisional))
+	}
+	for i, p := range gotProvisional {
+		if !p {
+			t.Fatalf("call %d: req.Provisional = false, want the store's true", i+1)
+		}
+	}
+}
+
 // TestServeConnFlushesUnimplementedCountOnDrop proves the serve loop's
 // deferred flush carries the sampler's pending count when a burst ends the
 // connection. The drop is the only line a 255-call burst ever gets, and it has
@@ -123,9 +158,10 @@ func TestServeConnFlushesUnimplementedCountOnDrop(t *testing.T) {
 		}
 		return true
 	})
-	// 254 calls were suppressed behind the drop: the flood-band calls the
-	// handler sampled, all past the first line. The ceiling call itself returns
-	// before sampling in this stub, so it is not in the count the drop owes.
+	// 254 calls were suppressed behind the drop: the 63 answer-band calls and
+	// the 191 flood-band calls the handler sampled, all past the first line.
+	// The ceiling call itself returns before sampling in this stub, so it is
+	// not in the count the drop owes.
 	if suppressed != 254 {
 		t.Errorf("drop suppressed = %d, want %d", suppressed, int64(254))
 	}

@@ -216,10 +216,12 @@ func TestUnhandledBudgetSamplesTheLog(t *testing.T) {
 	}
 
 	// The burst ends the connection at the 256th call, and every call after the
-	// first line — the 254 in the flood band and the 45 past the ceiling — is
-	// owed to the drop, not to a later line on this conn. Advance the clock
-	// past the interval and flush the way the serve loop does when it drops the
-	// conn: the line it writes must carry the calls it stands for.
+	// first line is owed to the drop, not to a later line on this conn: the 63
+	// in the answer band, the 191 in the flood band, and the 45 past the
+	// ceiling. Only this harness drives past the ceiling — a real connection
+	// dies on call 256, so production suppresses 255, not 299. Advance the
+	// clock past the interval and flush the way the serve loop does when it
+	// drops the conn: the line it writes must carry the calls it stands for.
 	cl.Advance(11 * time.Second)
 	conn.FlushUnimplementedLog()
 
