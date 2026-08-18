@@ -159,6 +159,11 @@ func TestUnhandledBudgetBandsOnOneConnection(t *testing.T) {
 	t.Parallel()
 	log := slog.New(&captureHandler{})
 	conn := unhandledConn()
+	// The bands are counted inside one charge window, which the conn measures
+	// against its own clock. Hold that clock still: 300 calls are one window
+	// however long the runtime takes to make them, so a stall cannot roll the
+	// window over mid-loop and land the calls in bands the test does not expect.
+	conn.SetClock(&testClock{now: time.Now()})
 	body := registerDeviceBody(t)
 
 	for i := 1; i <= 300; i++ {
@@ -242,13 +247,29 @@ func TestUnhandledBudgetIsPerConnection(t *testing.T) {
 	body := registerDeviceBody(t)
 
 	spent := unhandledConn()
-	for i := range 256 {
-		if err := api.UnhandledForTest(log, spent, body); err == nil {
-			t.Fatalf("call %d: answered with no error", i+1)
+	// One window for the whole loop, whatever the runtime costs: a window that
+	// rolled over mid-loop would leave this connection unspent, and the test
+	// would then be asserting nothing about where the budget lives.
+	spent.SetClock(&testClock{now: time.Now()})
+	// Every call inside the ceiling is answered, whichever band it falls in, so
+	// the connection is still there to charge; the 256th is the one that ends
+	// it. Both halves are asserted by the kind of error, not by whether there
+	// is one: every band returns an error, so "not nil" cannot tell an answer
+	// from a close and would leave the ceiling unpinned.
+	for i := 1; i <= 256; i++ {
+		err := api.UnhandledForTest(log, spent, body)
+		if i < 256 {
+			if rpc := mustRPCError(t, err); rpc.Code != 400 && rpc.Code != 420 {
+				t.Fatalf("call %d: %d %s, want the call answered", i, rpc.Code, rpc.Message)
+			}
+			continue
+		}
+		if err == nil || asRPC(err) {
+			t.Fatalf("call %d: %v, want a non-RPC error that ends the connection", i, err)
 		}
 	}
-	if err := api.UnhandledForTest(log, spent, body); err == nil {
-		t.Fatal("spent connection: answered, want the connection ended")
+	if err := api.UnhandledForTest(log, spent, body); err == nil || asRPC(err) {
+		t.Fatalf("spent connection: %v, want a non-RPC error that ends the connection", err)
 	}
 
 	rpc := mustRPCError(t, api.UnhandledForTest(log, unhandledConn(), body))
