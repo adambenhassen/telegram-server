@@ -35,7 +35,7 @@ func TestOpenRejectsUnmigratedSchema(t *testing.T) {
 
 // TestOpenRejectsPrePartBlobSchema proves the sentinel also catches the state a
 // deployment can be in before the part-blob migration is applied: the template
-// carries the latest schema, so undo the newest migration's artifacts by hand
+// carries the current schema, so undo that migration's artifacts by hand
 // (re-add payload, drop size and blob_key) and Open must fail at startup rather
 // than later, on the first upload query that names a missing column.
 func TestOpenRejectsPrePartBlobSchema(t *testing.T) {
@@ -77,10 +77,31 @@ func TestOpenRejectsPartBlobPayloadNotDropped(t *testing.T) {
 	requireOpenMigrationError(t, ctx, dsn)
 }
 
+// TestOpenRejectsMissingMessageFileIdx proves the sentinel covers an index and
+// not just tables and columns. A missing index shows up in no column check, so
+// without this clause a database that stopped at the part-blob migration opens
+// clean and then plans the per-row Seq Scan the index exists to remove.
+func TestOpenRejectsMissingMessageFileIdx(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `DROP INDEX messages_file_idx`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+
+	requireOpenMigrationError(t, ctx, dsn)
+}
+
 // TestOpenRejectsPartBlobMigrationMissing proves the sentinel catches a
 // migrations/ directory that stops short of the part-blob migration: a fresh
-// database built from every migration file except the newest one must fail
-// Open, not pass it and die on the first upload.
+// database built from every migration file except that one must fail Open, not
+// pass it and die on the first upload.
 func TestOpenRejectsPartBlobMigrationMissing(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
