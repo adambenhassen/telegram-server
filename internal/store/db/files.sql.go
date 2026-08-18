@@ -255,7 +255,7 @@ SELECT f.id, f.size, f.stored,
        (f.date < $1::timestamptz) AS aged,
        EXISTS (
            SELECT 1 FROM messages m
-           WHERE m.file_id = f.id AND m.deleted = false
+           WHERE m.file_id = f.id AND m.file_id <> 0 AND m.deleted = false
        ) AS message_ref,
        EXISTS (
            SELECT 1 FROM channel_messages cm
@@ -307,6 +307,19 @@ type MediaErasureScanRow struct {
 // access_hash is deliberately not selected. It is the unguessable half of a
 // download credential, and a candidate report is exactly the kind of record
 // that ends up in log aggregation.
+//
+// m.file_id <> 0 in the messages arm is redundant against m.file_id = f.id and
+// must not be removed. files.id is BIGSERIAL PRIMARY KEY and never equals the 0
+// sentinel, so the conjunct selects no row differently; it is here because it is
+// the only qual that makes messages_file_idx usable. That index is partial on
+// file_id <> 0, and Postgres uses a partial index only where it can prove the
+// index predicate from the query's own quals — a proof that needs a Const on
+// both sides. f.id is a runtime value from the outer scan, so file_id = f.id
+// proves nothing and the index is discarded in silence: measured, the SubPlan
+// degrades to a per-row Seq Scan of messages, 3.41M buffers for one 1000-row
+// batch against 5.4k with it. The channel_messages arm needs no counterpart
+// because its index is partial on file_id IS NOT NULL, which a strict equality
+// does prove.
 func (q *Queries) MediaErasureScan(ctx context.Context, arg MediaErasureScanParams) ([]MediaErasureScanRow, error) {
 	rows, err := q.db.Query(ctx, mediaErasureScan,
 		arg.OlderThan,

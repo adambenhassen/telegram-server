@@ -89,14 +89,18 @@ func TestOpenRejectsPartBlobMigrationMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read migrations dir: %v", err)
 	}
-	var latest string
+	// Withheld by name, not by sort order. The sentinel this test drives is
+	// upload_parts.blob_key, so the file to hold back is the one that adds it;
+	// keyed on "whichever sorts last", the first migration added after it turns
+	// this into a test that applies the whole schema and asserts nothing.
+	var partBlob string
 	for _, e := range migs {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") && e.Name() > latest {
-			latest = e.Name()
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") && strings.Contains(e.Name(), "upload_parts_blob") {
+			partBlob = e.Name()
 		}
 	}
-	if latest == "" {
-		t.Fatal("no migration files found")
+	if partBlob == "" {
+		t.Fatal("part-blob migration not found")
 	}
 
 	admin, err := pgx.Connect(ctx, pgtest.AdminDSN())
@@ -129,7 +133,7 @@ func TestOpenRejectsPartBlobMigrationMissing(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	for _, e := range migs {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") || e.Name() == latest {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") || e.Name() == partBlob {
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join("..", "..", "migrations", e.Name()))

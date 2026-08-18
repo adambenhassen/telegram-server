@@ -1,0 +1,26 @@
+-- The message-side half of the media reference predicate, which asks per
+-- candidate file whether any non-deleted messages row still names it.
+--
+-- messages_owner_file_idx cannot serve it. That index leads with owner_id for
+-- the download gate, which always knows the owner; a reference check does not,
+-- and with no index leading on file_id the planner hashes the subquery while
+-- the corpus is small and then stops being able to. Past that point the scan's
+-- EXISTS sits in a select list as an unhoistable SubPlan and degrades to a
+-- per-row Seq Scan of messages: measured at 20k files / 300k media messages,
+-- one 1000-row batch reads 3.41M shared buffers, against 5.4k with this index.
+--
+-- Partial on the sentinel: file_id = 0 means "no media", and at that corpus 1.2M
+-- of 1.5M rows are text. Indexing them would put an entry on every text send for
+-- a row the predicate can never select. MediaErasureScan carries an explicit
+-- `m.file_id <> 0` so this predicate is provable there — a partial index is used
+-- only where the planner can prove its predicate from the query's own quals, and
+-- `file_id = f.id` against a runtime f.id proves nothing. See files.sql.
+--
+-- Plain CREATE INDEX, not CONCURRENTLY: it takes SHARE on messages for the
+-- duration of the build, which blocks writes but not reads. CONCURRENTLY would
+-- need `-- atlas:txmode none`, costing this file its rollback, and a failed
+-- build would leave an INVALID index that Postgres ignores in silence — which
+-- degrades the predicate back to a Seq Scan with nothing failing. pgtest and
+-- production apply these same files, so that failure mode would ship into every
+-- test database.
+CREATE INDEX messages_file_idx ON messages (file_id) WHERE file_id <> 0;
