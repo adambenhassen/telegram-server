@@ -94,6 +94,19 @@ func UnhandledForTest(log *slog.Logger, c *mtproto.Conn, body *bin.Buffer) error
 	return h.handleUnknown(c, &mtproto.Request{Ctx: context.Background(), Buf: body})
 }
 
+// GatedUnhandledForTest drives the dispatcher's gated fallback — the one that
+// applies the provisional gate before delegating to the plain fallback — for
+// the external api_test package. req carries the user binding and provisional
+// flag the gate reads, and its body is positioned at its constructor id.
+//
+// c carries the per-connection budget the fallback charges, so a caller
+// driving the bound passes the same conn across calls and one driving a
+// single call passes a fresh one.
+func GatedUnhandledForTest(log *slog.Logger, c *mtproto.Conn, req *mtproto.Request) error {
+	h := &handlers{log: log}
+	return h.handleUnknownGated(c, req)
+}
+
 // TestMaxFileBytes is the per-file upload cap test handlers run with. It is the
 // production default, so MaxFileParts is the same 200 a real server enforces.
 const TestMaxFileBytes int64 = 100 << 20

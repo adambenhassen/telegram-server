@@ -72,6 +72,45 @@ func TestServeConnClosesAtUnimplementedCeiling(t *testing.T) {
 	}
 }
 
+// TestServeConnClosesAtUnimplementedCeilingOnProvisionalSession pins the
+// ticket's case at the serve-loop level: a provisional session driving
+// unimplemented calls is bounded identically to a non-provisional one, so the
+// ceiling call ends the connection the same way. The handler here charges the
+// shared budget the way the real gated fallback does, so the count the serve
+// loop sees is the real one.
+func TestServeConnClosesAtUnimplementedCeilingOnProvisionalSession(t *testing.T) {
+	t.Parallel()
+	key := rebindTestKey()
+	ks := &statusKeyStore{key: key, users: []int64{7}}
+
+	var verdicts []mtproto.UnimplementedVerdict
+	h := mtproto.HandlerFunc(func(c *mtproto.Conn, _ *mtproto.Request) error {
+		v := c.ChargeUnimplemented()
+		verdicts = append(verdicts, v)
+		if v == mtproto.UnimplementedClose {
+			return errCeiling
+		}
+		return nil
+	})
+	srv := mtproto.New(exchange.PrivateKey{}, 2, ks, h, nil)
+
+	const frameCount = 300
+	frames := make([][]byte, frameCount)
+	for i := range frames {
+		frames[i] = statusClientFrame(t, key, 42, int64(i+1)<<32, &tg.AccountRegisterDeviceRequest{})
+	}
+
+	if err := srv.ServeConn(context.Background(), &statusFrameConn{frames: frames}); !errors.Is(err, errCeiling) {
+		t.Fatalf("ServeConn = %v, want %v", err, errCeiling)
+	}
+	if len(verdicts) != 256 {
+		t.Fatalf("dispatched %d calls, want the connection to end on the 256th", len(verdicts))
+	}
+	if got := verdicts[len(verdicts)-1]; got != mtproto.UnimplementedClose {
+		t.Errorf("last verdict = %v, want %v", got, mtproto.UnimplementedClose)
+	}
+}
+
 // TestServeConnFlushesUnimplementedCountOnDrop proves the serve loop's
 // deferred flush carries the sampler's pending count when a burst ends the
 // connection. The drop is the only line a 255-call burst ever gets, and it has
