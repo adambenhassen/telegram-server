@@ -33,16 +33,19 @@ type Store interface {
 	// Remove deletes key. Deleting a key that is not there is a no-op, so a
 	// caller that races a sweep or a re-save never needs to know which won.
 	Remove(ctx context.Context, key string) error
-	// ListPrefix returns the limit smallest keys at or after after within
-	// prefix, each with the size and modification time an age-based pass
-	// needs. Containment is always enforced: every key returned is under
-	// prefix, and a prefix that does not resolve to a containment scope
-	// fails closed rather than widening. after is the resume position, a
-	// separate input from prefix: an empty after starts at the beginning of
-	// the prefix. A page never exceeds limit and is globally ordered by key,
-	// so a caller that walks the prefix passes the last key of each page as
-	// the next after. An empty prefix lists nothing: the assembled keyspace
-	// has no single prefix, so nothing outside a named prefix is reachable
+	// ListPrefix returns keys at or after after within prefix, each with the
+	// size and modification time an age-based pass needs. Containment is
+	// always enforced: every key returned is under prefix, and a prefix that
+	// does not resolve to a containment scope fails closed rather than
+	// widening. after is the resume position, a separate input from prefix:
+	// an empty after starts at the beginning of the prefix. The result is
+	// globally ordered by key. limit bounds the page: a positive limit
+	// returns at most that many keys, and a caller that walks the prefix
+	// passes the last key of each page as the next after. limit of zero
+	// returns every key under the prefix in one call, for a caller that
+	// walks the whole prefix once and chunks its own work. A negative limit
+	// is an error. An empty prefix lists nothing: the assembled keyspace has
+	// no single prefix, so nothing outside a named prefix is reachable
 	// through this.
 	ListPrefix(ctx context.Context, prefix, after string, limit int) ([]Object, error)
 }
@@ -121,8 +124,8 @@ func (l *Local) RootDir() string { return l.dir }
 // the limit smallest are not known until the whole subtree is seen. The parts
 // prefix is flat (one directory), so in practice this is one directory read.
 func (l *Local) ListPrefix(_ context.Context, prefix, after string, limit int) ([]Object, error) {
-	if limit <= 0 {
-		return nil, fmt.Errorf("blob list: limit %d must be positive", limit)
+	if limit < 0 {
+		return nil, fmt.Errorf("blob list: limit %d must be non-negative", limit)
 	}
 	if prefix == "" {
 		return nil, nil
@@ -192,7 +195,7 @@ func (l *Local) ListPrefix(_ context.Context, prefix, after string, limit int) (
 		return nil, fmt.Errorf("blob list: %w", err)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Key < all[j].Key })
-	if len(all) > limit {
+	if limit > 0 && len(all) > limit {
 		all = all[:limit]
 	}
 	return all, nil

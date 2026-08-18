@@ -161,10 +161,15 @@ func TestListPrefixSeparatorFreeFailsClosed(t *testing.T) {
 	}
 
 	// A separator-free prefix naming an existing shard directory returns only
-	// keys under that shard.
+	// keys under that shard. The result must be non-empty: the object under
+	// "92/" was planted above, so an empty result means the walk failed to
+	// find it, and the containment assertion below would pass vacuously.
 	got, err = l.ListPrefix(ctx, "92", "", 100)
 	if err != nil {
 		t.Fatalf("list shard 92: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("shard 92 listed no objects, want at least the planted one")
 	}
 	for _, o := range got {
 		if !strings.HasPrefix(o.Key, "92/") {
@@ -206,5 +211,41 @@ func TestListPrefixAfterResumes(t *testing.T) {
 	}
 	if got[0].Key != blob.PartsPrefix+"d" || got[1].Key != blob.PartsPrefix+"e" {
 		t.Fatalf("got %v, want [parts/d parts/e]", got)
+	}
+}
+
+// TestListPrefixLimitZeroReturnsAll verifies that limit=0 returns every key
+// under the prefix in a single call, for a caller that walks the whole
+// prefix once and chunks its own work.
+func TestListPrefixLimitZeroReturnsAll(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	l, _ := newLocal(t)
+	const n = 10
+	for i := range n {
+		key := blob.PartsPrefix + string(rune('a'+i))
+		if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	got, err := l.ListPrefix(ctx, blob.PartsPrefix, "", 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != n {
+		t.Fatalf("got %d objects, want %d", len(got), n)
+	}
+	// Globally ordered.
+	for i := 1; i < len(got); i++ {
+		if got[i-1].Key >= got[i].Key {
+			t.Fatalf("not in order at %d: %q >= %q", i, got[i-1].Key, got[i].Key)
+		}
+	}
+
+	// A negative limit is an error.
+	_, err = l.ListPrefix(ctx, blob.PartsPrefix, "", -1)
+	if err == nil {
+		t.Fatal("negative limit succeeded, want an error")
 	}
 }

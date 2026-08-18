@@ -561,10 +561,12 @@ type PartOrphanResult struct {
 	Bytes int64
 }
 
-// PartOrphanPageSize is how many objects one ListPrefix call returns. It
-// bounds the memory and the walk depth of a single enumeration page, and the
-// live-key lookup that gates each page.
-const PartOrphanPageSize = 500
+// PartOrphanGateBatch is how many keys one live-key lookup carries. The pass
+// enumerates the whole parts prefix in a single walk and gates the result in
+// batches of this size, so the Postgres round trips are bounded by the batch
+// rather than the prefix, and the enumeration cost is one directory read per
+// run rather than one per page.
+const PartOrphanGateBatch = 500
 
 // PartOrphanMargin is the extra age on top of the part TTL before an
 // unaccounted object is eligible for reclamation. It covers the row sweep's
@@ -582,7 +584,7 @@ func PartOrphanMargin(ttl time.Duration) time.Duration {
 //
 // The pass is safe in a way the row-driven sweep is not: it holds no lock a
 // request path waits on, makes no storage call inside a transaction, and its
-// only interaction with Postgres is a per-page live-key lookup. Two replicas
+// only interaction with Postgres is a batched live-key lookup. Two replicas
 // running it at once delete the same object twice, and the second delete is a
 // no-op.
 //
@@ -592,17 +594,20 @@ func PartOrphanMargin(ttl time.Duration) time.Duration {
 // row sweep's own lag plus one hour of clock skew; the live-key gate carries
 // correctness alone, and this margin is defence in depth.
 //
-// Enumeration reach is decoupled from the delete budget: one run walks the
-// entire parts prefix, so every orphan is examined on every run regardless of
-// where its key sorts and how many ineligible objects precede it. The bound
-// is therefore independent of process uptime and of the store's contents:
-// an unaccounted byte is reclaimed on the first run after it crosses the
-// cutoff, and the residual bound is TTL + margin + one sweep interval.
+// One run walks the entire parts prefix in a single enumeration, so every
+// orphan is examined on every run regardless of where its key sorts and how
+// many ineligible objects precede it. The enumeration cost is one directory
+// read per run, linear in the number of part objects, not quadratic: the
+// live-key gate is chunked over the result rather than driving a re-walk per
+// batch. The bound is therefore independent of process uptime and of the
+// store's contents: an unaccounted byte is reclaimed on the first run after
+// it crosses the cutoff, and the residual bound is TTL + margin + one sweep
+// interval.
 //
-// The live-key gate is bounded by the page, not the table: each enumeration
-// page is gated with one blob_key = ANY($1) lookup over that page's keys, so
-// the memory footprint is the page size and the gate reads row state at
-// delete time rather than at run start.
+// The live-key gate is bounded by the batch, not the table: each batch of
+// PartOrphanGateBatch keys is gated with one blob_key = ANY($1) lookup, so
+// the Postgres round trips scale with the prefix size divided by the batch,
+// and the gate reads row state at run time rather than at a snapshot.
 func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, partTTL time.Duration) (PartOrphanResult, error) {
 	// Floor: the cutoff can never be younger than TTL+margin. A misconfigured
 	// small cutoff is clamped rather than trusted.
@@ -612,19 +617,21 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 		cutoff = floor
 	}
 
+	// One walk of the whole parts prefix. limit=0 returns every key under the
+	// prefix in a single call, so the enumeration cost is one directory read
+	// per run rather than one per gate batch.
+	objects, err := s.blobs.ListPrefix(ctx, blob.PartsPrefix, "", 0)
+	if err != nil {
+		return PartOrphanResult{}, fmt.Errorf("list part prefix: %w", err)
+	}
+
 	var res PartOrphanResult
-	after := ""
-	for {
-		page, err := s.blobs.ListPrefix(ctx, blob.PartsPrefix, after, PartOrphanPageSize)
-		if err != nil {
-			return res, fmt.Errorf("list part prefix: %w", err)
-		}
-		if len(page) == 0 {
-			break
-		}
-		// Gate this page: which of its keys does a row still name?
-		keys := make([]string, len(page))
-		for i, o := range page {
+	// Gate the result in batches: one live-key lookup per batch of keys.
+	for start := 0; start < len(objects); start += PartOrphanGateBatch {
+		end := min(start+PartOrphanGateBatch, len(objects))
+		batch := objects[start:end]
+		keys := make([]string, len(batch))
+		for i, o := range batch {
 			keys[i] = o.Key
 		}
 		liveKeys, err := s.q.LivePartKeys(ctx, keys)
@@ -635,24 +642,13 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 		for _, k := range liveKeys {
 			live[k] = true
 		}
-		for _, obj := range page {
+		for _, obj := range batch {
 			// Age gate: an object younger than cutoff is never removed.
 			if time.Since(obj.Modified) < time.Since(cutoff) {
 				continue
 			}
 			// Live-key gate: an object a row still names is never removed.
 			if live[obj.Key] {
-				continue
-			}
-			// Re-check at delete time: a row committed between the page lookup
-			// and this delete names the key, and the object must survive.
-			// One single-key lookup per object about to be deleted, bounded by
-			// the number of deletes per run.
-			recheck, err := s.q.LivePartKeys(ctx, []string{obj.Key})
-			if err != nil {
-				return res, fmt.Errorf("live part keys recheck: %w", err)
-			}
-			if len(recheck) > 0 {
 				continue
 			}
 			if err := s.blobs.Remove(ctx, obj.Key); err != nil {
@@ -665,10 +661,6 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 			res.Objects++
 			res.Bytes += obj.Size
 		}
-		if len(page) < PartOrphanPageSize {
-			break
-		}
-		after = page[len(page)-1].Key
 	}
 	return res, nil
 }

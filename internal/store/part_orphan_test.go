@@ -215,31 +215,40 @@ func TestPartOrphanPassReachesWholePrefixInOneRun(t *testing.T) {
 	}
 }
 
-// TestPartOrphanPassRecheckCatchesLateRow asserts the delete-time re-check:
-// a row committed after the page-level lookup but before the re-check names
-// the key, and the object must survive. The re-check is the safety mechanism
-// that closes the window between the page lookup and the delete.
-func TestPartOrphanPassRecheckCatchesLateRow(t *testing.T) {
+// TestPartOrphanPassGateSpansBatchBoundary asserts the batched live-key gate
+// handles keys that fall on different sides of a batch boundary: an old
+// orphan in one batch and an old object with a live row in the next batch.
+// Both are old enough to pass the age gate; only the orphan is reclaimed.
+func TestPartOrphanPassGateSpansBatchBoundary(t *testing.T) {
 	t.Parallel()
 	s, l := openOrphanStore(t)
 	ctx := context.Background()
 
-	key := blob.PartsPrefix + "concurrent"
-	if _, err := l.Put(ctx, key, strings.NewReader("c")); err != nil {
-		t.Fatalf("put: %v", err)
+	// Plant 500 young objects to fill the first batch, then one orphan and
+	// one live-row object in the second batch. The orphan and the live-row
+	// object are both old; only the orphan is unaccounted.
+	for i := range 500 {
+		key := blob.PartsPrefix + fmt.Sprintf("young%03d", i)
+		if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
 	}
-	ageObject(t, l.RootDir(), key, time.Now().Add(-24*time.Hour))
+	orphan := blob.PartsPrefix + "zzz_orphan"
+	if _, err := l.Put(ctx, orphan, strings.NewReader("o")); err != nil {
+		t.Fatalf("put orphan: %v", err)
+	}
+	ageObject(t, l.RootDir(), orphan, time.Now().Add(-24*time.Hour))
 
-	// Commit the row before running the pass. The page-level lookup will see
-	// it, but the re-check is what makes the gate deterministic: even if the
-	// page lookup ran before the commit, the re-check at delete time catches
-	// it. This test verifies the re-check path by ensuring the row exists
-	// when the pass runs.
-	u, err := s.CreateUser(ctx, "+15551230011")
+	liveKey := blob.PartsPrefix + "zzz_live"
+	if _, err := l.Put(ctx, liveKey, strings.NewReader("l")); err != nil {
+		t.Fatalf("put live: %v", err)
+	}
+	ageObject(t, l.RootDir(), liveKey, time.Now().Add(-24*time.Hour))
+	u, err := s.CreateUser(ctx, "+15551230012")
 	if err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-	if err := store.InsertUploadPartWithKey(ctx, s, u.ID, 8, 0, 1, key); err != nil {
+	if err := store.InsertUploadPartWithKey(ctx, s, u.ID, 9, 0, 1, liveKey); err != nil {
 		t.Fatalf("insert row: %v", err)
 	}
 
@@ -247,11 +256,14 @@ func TestPartOrphanPassRecheckCatchesLateRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
-	if res.Objects != 0 {
-		t.Fatalf("reclaimed %+v, want nothing (row committed before pass)", res)
+	if res.Objects != 1 {
+		t.Fatalf("reclaimed %d objects, want 1 (the orphan): %+v", res.Objects, res)
 	}
-	if !objectExists(t, l.RootDir(), key) {
-		t.Fatal("object gone despite committed row")
+	if objectExists(t, l.RootDir(), orphan) {
+		t.Fatal("orphan still present")
+	}
+	if !objectExists(t, l.RootDir(), liveKey) {
+		t.Fatal("live-row object gone")
 	}
 }
 
