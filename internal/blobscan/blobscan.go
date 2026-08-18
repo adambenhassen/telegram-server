@@ -183,10 +183,10 @@ func Scan(ctx context.Context, tree Tree, files Files, tempOlderThan time.Time) 
 		switch {
 		case e.Dir:
 			// A directory the layout produces holds blobs and is not itself
-			// one: the shards, and the parts prefix's own directory. The parts
-			// tree is the layout's other keyspace, so everything under it is a
-			// part object, named as such; whatever is not is somebody's, not
-			// ours.
+			// one: the shards, and the parts prefix's own directory. What is
+			// under it earns its class by parsing, not by sitting there: the
+			// files below judge each entry on its own, and a directory that is
+			// not one of these is somebody's, not ours.
 			if blob.IsShard(e.Key) || e.Key == partsDir {
 				return nil
 			}
