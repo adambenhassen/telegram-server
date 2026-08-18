@@ -109,26 +109,26 @@ func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) err
 		// handleUnknown does, so a burst on this path owes the drop the same
 		// count one on the other path does.
 		answer := errAuthKeyUnreg
+		isClose := false
 		switch v := c.ChargeUnimplemented(); v {
 		case mtproto.UnimplementedClose:
-			if suppressed, ok := c.LogUnimplemented(); ok {
-				h.log.Warn("method not implemented",
-					"error_code", answer.Code,
-					"error", answer.Message,
-					"suppressed", suppressed,
-				)
-			}
-			return errMethodNotImplBurst
+			isClose = true
 		case mtproto.UnimplementedFloodWait:
 			answer = errMethodNotImplFlood
 		case mtproto.UnimplementedAnswer:
 		}
 		if suppressed, ok := c.LogUnimplemented(); ok {
+			id, _ := req.Buf.PeekID() //nolint:errcheck // dispatcher already validated the id
 			h.log.Warn("method not implemented",
+				"type_id", fmt.Sprintf("%#x", id),
+				"method", methodName(id),
 				"error_code", answer.Code,
 				"error", answer.Message,
 				"suppressed", suppressed,
 			)
+		}
+		if isClose {
+			return errMethodNotImplBurst
 		}
 		return answer
 	}
