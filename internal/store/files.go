@@ -194,19 +194,33 @@ func lockFileRefs(ctx context.Context, qtx *db.Queries, ids ...int64) error {
 	return nil
 }
 
-// MaxFileID returns the highest file id ever allocated, or zero on an empty
-// table. files.id is BIGSERIAL and never reused, so the value is a snapshot of
-// the id space that stays meaningful after it is read: an id at or below it was
-// allocated before the read, and every id allocated afterwards is above it.
+// MaxFileID returns the highest id among the files rows that exist, or zero
+// on an empty table. It is a ceiling on the rows, not on the id space: once a
+// row is deleted it falls below the erased ids, which is what a row-paging
+// walk like MediaErasureSummary wants and what a disk classification does not.
+func (s *Store) MaxFileID(ctx context.Context) (int64, error) {
+	id, err := s.q.MaxFileID(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("max file id: %w", err)
+	}
+	return id, nil
+}
+
+// AllocatedFileIDCeiling returns the highest file id ever allocated, or zero
+// on an empty table. files.id is BIGSERIAL and the sequence never reuses an id
+// and never falls back, so the value is a snapshot of the id space that stays
+// meaningful after it is read: an id at or below it was allocated before the
+// read, every id allocated afterwards is above it, and it never drops below an
+// id whose row was once committed.
 //
 // That is what makes a pass over the blob store's disk sound. Reading this
 // first and then listing the tree means a blob written during the listing is
 // above the snapshot and therefore out of scope by construction, rather than
 // classified against a table read that predates it.
-func (s *Store) MaxFileID(ctx context.Context) (int64, error) {
-	id, err := s.q.MaxFileID(ctx)
+func (s *Store) AllocatedFileIDCeiling(ctx context.Context) (int64, error) {
+	id, err := s.q.AllocatedFileIDCeiling(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("max file id: %w", err)
+		return 0, fmt.Errorf("allocated file id ceiling: %w", err)
 	}
 	return id, nil
 }

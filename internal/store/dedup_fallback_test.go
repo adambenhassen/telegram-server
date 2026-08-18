@@ -65,7 +65,7 @@ func (l *logSink) lines(t *testing.T) []map[string]any {
 func openLogged(t *testing.T) (*store.Store, *logSink) {
 	t.Helper()
 	sink := &logSink{}
-	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey(),
+	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)),
 		store.WithLogger(slog.New(slog.NewJSONHandler(sink, nil))))
 	if err != nil {
 		t.Fatalf("open: %v", err)

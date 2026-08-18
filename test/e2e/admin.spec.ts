@@ -344,8 +344,17 @@ test.describe('admin SSE stream', () => {
       .poll(() => chipTexts(page), { message: 'chip text after "finished"' })
       .toEqual(expect.arrayContaining([expect.stringMatching(/Disconnected/)]));
 
-    await lifecycle('started');
-    await expect(page.locator('#chip-text')).toHaveText(/Live/);
+    // "started" sets the chip to exactly "● Live · connecting…" — distinct from
+    // the data-patch branch, which calls updateChip() and writes "● Live · updated
+    // Xs ago". Reading synchronously in the same evaluate call blocks any async
+    // patch from landing between the dispatch and the assertion.
+    const chipTextAfterStarted = await page.evaluate(() => {
+      document.dispatchEvent(
+        new CustomEvent('datastar-sse', { detail: { type: 'started', elId: 'sse-root' } }),
+      );
+      return document.getElementById('chip-text')?.textContent ?? '';
+    });
+    expect(chipTextAfterStarted, '"started" sets chip to connecting state').toMatch(/Live · connecting/);
 
     // An error on the stream is the same observable state as a clean close.
     await recordDisconnectState(page);
@@ -395,21 +404,26 @@ test.describe('admin SSE stream', () => {
     const banner = page.locator('#banner-disconnected');
     await expect(banner).toBeHidden();
 
-    const lifecycle = (type: string) =>
-      page.evaluate((t) => {
-        document.dispatchEvent(
-          new CustomEvent('datastar-sse', { detail: { type: t, elId: 'sse-root' } }),
-        );
-      }, type);
-
-    await recordDisconnectState(page);
-    await lifecycle('finished');
-    await expect
-      .poll(() => bannerWasShown(page), { message: 'banner revealed on disconnect' })
-      .toBe(true);
-
-    await lifecycle('started');
-    await expect(banner).toBeHidden();
+    // Drive both transitions inside a single evaluate so no SSE data patch can
+    // land between them. finished removes "hidden" (banner visible); started adds
+    // it back (banner hidden). Asserting { before: false, after: true } proves the
+    // reconnect branch ran — there is no other transition that satisfies it. A data
+    // patch cannot intervene because JavaScript is single-threaded and no external
+    // event can interleave with a synchronous evaluate.
+    const { before, after } = await page.evaluate(() => {
+      const b = document.getElementById('banner-disconnected');
+      document.dispatchEvent(
+        new CustomEvent('datastar-sse', { detail: { type: 'finished', elId: 'sse-root' } }),
+      );
+      const before = b?.classList.contains('hidden') ?? true;
+      document.dispatchEvent(
+        new CustomEvent('datastar-sse', { detail: { type: 'started', elId: 'sse-root' } }),
+      );
+      const after = b?.classList.contains('hidden') ?? false;
+      return { before, after };
+    });
+    expect(before, 'finished reveals the banner').toBe(false);
+    expect(after, 'reconnect re-hides the banner').toBe(true);
   });
 });
 

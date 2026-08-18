@@ -16,7 +16,7 @@ import (
 func TestResolvePhoneUnauthenticated(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestResolvePhoneUnauthenticated(t *testing.T) {
 func TestResolvePhoneInvalidPhone(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestResolvePhoneInvalidPhone(t *testing.T) {
 func TestResolvePhoneMiss(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestResolvePhoneMiss(t *testing.T) {
 func TestResolvePhoneHit(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestResolvePhoneHit(t *testing.T) {
 func TestResolvePhoneQuota(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestResolvePhoneQuota(t *testing.T) {
 func TestResolvePhoneQuotaRetrySamePhone(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestResolvePhoneQuotaRetrySamePhone(t *testing.T) {
 func TestResolvePhoneSelf(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestResolvePhoneSelf(t *testing.T) {
 func TestResolvePhoneNormalization(t *testing.T) {
 	t.Parallel()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(context.Background(), dsn, pgtest.EncKey())
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

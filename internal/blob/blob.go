@@ -5,6 +5,8 @@ package blob
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -36,6 +38,9 @@ type Store interface {
 	// A negative offset or limit is an error: the window comes from the
 	// client and is not trusted.
 	ReadAt(ctx context.Context, key string, offset, limit int64) ([]byte, error)
+	// Remove deletes key. Deleting a key that is not there is a no-op, so a
+	// caller that races a sweep or a re-save never needs to know which won.
+	Remove(ctx context.Context, key string) error
 }
 
 // Key returns the storage key for a file id, sharded on the id's low byte so
@@ -73,8 +78,31 @@ func IsShard(name string) bool {
 	return err == nil && fmt.Sprintf("%02x", b) == name
 }
 
+// PartsPrefix is the key prefix every in-flight upload part lives under. It
+// is statically disjoint from the assembled-blob keyspace: assembled keys are
+// "xx/<id>" with id a positive BIGSERIAL, so they never start with this
+// prefix, and a part key can never be one. No client input contributes to the
+// key: the random suffix is drawn here, and the row that records it is
+// user-scoped, so a key under this prefix is reachable only by the account
+// that owns its row.
+const PartsPrefix = "parts/"
+
+// NewPartKey draws a random key for one in-flight upload part under
+// PartsPrefix. It is not derivable from anything the client names, which is
+// what makes two accounts that chose the same file_id hold disjoint bytes.
+func NewPartKey() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("part key: %w", err)
+	}
+	return PartsPrefix + hex.EncodeToString(buf[:]), nil
+}
+
 // Local stores blobs as files under a directory.
-type Local struct{ root *os.Root }
+type Local struct {
+	root *os.Root
+	dir  string
+}
 
 // NewLocal creates dir if needed and opens it as the root of the store.
 func NewLocal(dir string) (*Local, error) {
@@ -89,8 +117,11 @@ func NewLocal(dir string) (*Local, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open blob root: %w", err)
 	}
-	return &Local{root: root}, nil
+	return &Local{root: root, dir: dir}, nil
 }
+
+// RootDir reports the directory the store is rooted in.
+func (l *Local) RootDir() string { return l.dir }
 
 // Put writes r to a temporary file and renames it into place, so a reader
 // never observes a partially written blob. O_EXCL on the temporary file also
@@ -181,6 +212,19 @@ func (l *Local) Walk(ctx context.Context, fn func(Entry) error) error {
 		}
 		return fn(e)
 	})
+}
+
+// Remove deletes key. Deleting a key that is not there is a no-op, so a
+// caller that races a sweep or a re-save never needs to know which won.
+func (l *Local) Remove(_ context.Context, key string) error {
+	err := l.root.Remove(key)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("blob remove: %w", err)
+	}
+	return nil
 }
 
 // ReadAt returns at most limit bytes of key starting at offset, or ErrNotFound

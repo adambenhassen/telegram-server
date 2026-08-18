@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -25,25 +26,65 @@ func methodName(id uint32) string {
 	return "unknown"
 }
 
+// errMethodNotImplBurst ends a connection that has spent the whole of what one
+// may spend on methods this server does not implement. It is deliberately not
+// an RPC error: a peer past the ceiling is owed no answer, and writing one is
+// the work the bound exists to stop. Returning it takes the connection down
+// through the serve loop, which is where a socket is closed — never here, and
+// never while the budget is being charged.
+var errMethodNotImplBurst = errors.New("unimplemented-method ceiling")
+
 // handleUnknown answers every method with no registered handler, and is the only
 // record of what a client asked this server for and did not get. It names the
 // method as well as its constructor id and the error the caller received: a
 // constructor id alone has to be resolved against the schema by hand before it
 // says anything, and the error is what decides whether the client retries,
 // degrades, or gives up.
-func (h *handlers) handleUnknown(_ *mtproto.Conn, req *mtproto.Request) error {
+//
+// Both of those cost something a caller can ask for as fast as it can write
+// frames, and no bound above here counts them: the pre-auth and per-key caps
+// bound concurrency rather than rate, and every store-backed rate limit is
+// keyed on a method that reaches a registered handler. So the connection's own
+// budget is charged first, and it decides which answer this call gets and
+// whether the line describing it is emitted at all.
+func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
+	answer := errMethodNotImpl
+	switch c.ChargeUnimplemented() {
+	case mtproto.UnimplementedClose:
+		// The burst ends the connection on this call, so no later line on it
+		// comes to carry the sampler's pending count. The drop writes it —
+		// the serve loop flushes the conn before it closes the socket — and
+		// this call is the one it stands for, so it is owed here too.
+		if suppressed, ok := c.LogUnimplemented(); ok {
+			h.log.Warn("method not implemented",
+				"error_code", answer.Code,
+				"error", answer.Message,
+				"suppressed", suppressed,
+			)
+		}
+		return errMethodNotImplBurst
+	case mtproto.UnimplementedFloodWait:
+		answer = errMethodNotImplFlood
+	case mtproto.UnimplementedAnswer:
+	}
+
 	id, err := req.Buf.PeekID()
 	if err != nil {
-		h.log.Warn("method not implemented: peek id failed", "err", err)
-		return errMethodNotImpl
+		if suppressed, ok := c.LogUnimplemented(); ok {
+			h.log.Warn("method not implemented: peek id failed", "err", err, "suppressed", suppressed)
+		}
+		return answer
 	}
-	h.log.Warn("method not implemented",
-		"type_id", fmt.Sprintf("%#x", id),
-		"method", methodName(id),
-		"error_code", errMethodNotImpl.Code,
-		"error", errMethodNotImpl.Message,
-	)
-	return errMethodNotImpl
+	if suppressed, ok := c.LogUnimplemented(); ok {
+		h.log.Warn("method not implemented",
+			"type_id", fmt.Sprintf("%#x", id),
+			"method", methodName(id),
+			"error_code", answer.Code,
+			"error", answer.Message,
+			"suppressed", suppressed,
+		)
+	}
+	return answer
 }
 
 // handleUnknownGated is the fallback handler that applies the provisional gate

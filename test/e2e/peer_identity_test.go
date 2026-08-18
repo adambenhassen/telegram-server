@@ -33,7 +33,7 @@ func TestPeerIdentityStrangerStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +426,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,7 +642,7 @@ func TestPeerIdentityBackfillSpendable(t *testing.T) {
 		t.Fatal(err)
 	}
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -770,7 +770,7 @@ func TestPeerIdentityRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	dsn := pgtest.DSN(t)
-	st, err := store.Open(ctx, dsn, pgtest.EncKey())
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

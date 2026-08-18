@@ -29,6 +29,27 @@ parallelism.
 ## Running the tests from inside a container
 
 This is the case for CI-style containers and for agent runtimes on this repo.
+How the harness reaches Postgres depends on which Docker daemon the container
+talks to, and both cases are handled by `make` with nothing to configure.
+
+### A daemon reached over `DOCKER_HOST` (a DinD sidecar)
+
+There is no bind-mounted `/var/run/docker.sock`; `DOCKER_HOST` points at a
+separate daemon, which is how agent runtimes on this repo are set up. That
+daemon runs the Postgres container in its own network namespace, so its bridge
+addresses are not routable from here and this container is not one of its
+containers — it cannot be joined to anything.
+
+Nothing is needed: `pgtest` probes the bridge address, finds it unreachable and
+connects on the container's published port instead, which testcontainers
+resolves against the daemon's host. `make`'s `docker-bridge` step prints one
+line saying it skipped the join and gets out of the way. Postgres actually
+being unreachable is still a hard failure, from `pgtest` setup, naming the
+host and port it gave up on.
+
+### A bind-mounted host socket
+
+The daemon is the host's and this container is one of its containers.
 A container attached to a user-defined Docker network cannot reach the default
 bridge — the two are isolated — so every DB test fails like this:
 
@@ -47,9 +68,13 @@ docker network connect --gw-priority=-100 bridge "$(cat /etc/hostname)"
 `make test` and `make test-db` do this for you via the `docker-bridge` target.
 It is skipped when not running inside a container, it touches only the calling
 container's own network attachments, and it is quiet only about already being
-in the network — any other failure stops the run rather than letting it die on
-the timeout above twenty minutes later. If you invoke `go test` directly instead
-of going through `make`, run that command first.
+in the network, or about a container the daemon does not own when `DOCKER_HOST`
+points at a remote daemon — any other failure stops the run rather than letting
+it die on the timeout above twenty minutes later. On this local socket, "No such
+container" is a hard failure: it means `/etc/hostname` is not this container's
+Docker name (`--hostname`, or pod-style networking), and the join that the tests
+need did not happen. If you invoke `go test` directly instead of going through `make`,
+run that command first; on a DinD daemon you do not need to run anything.
 
 `--gw-priority` is what keeps the join from being felt outside the test run.
 Plain `docker network connect bridge` also makes the bridge gateway the
@@ -91,6 +116,6 @@ The other way is self-inflicted: changing the container's network attachments
 while a suite is running shifts the bridge address pool under the running
 binaries. Let `make` do it before `go test` starts and leave it alone after.
 
-Requirement: the container must have access to the host Docker socket. Without
-it the harness cannot start Postgres at all, and there is no fallback — the
-suites cannot run locally.
+Requirement: the container must be able to reach a Docker daemon, whether by a
+bind-mounted socket or by `DOCKER_HOST`. Without one the harness cannot start
+Postgres at all, and there is no fallback — the suites cannot run locally.

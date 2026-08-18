@@ -50,7 +50,12 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	ctx := context.Background()
 	dsn := pgtest.DSN(t)
-	s, err := store.Open(ctx, dsn, pgtest.EncKey())
+	dir := filepath.Join(t.TempDir(), "blobs")
+	l, err := blob.NewLocal(dir)
+	if err != nil {
+		t.Fatalf("new local: %v", err)
+	}
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(l))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -59,11 +64,6 @@ func newFixture(t *testing.T) *fixture {
 			t.Errorf("close store: %v", err)
 		}
 	})
-	dir := filepath.Join(t.TempDir(), "blobs")
-	l, err := blob.NewLocal(dir)
-	if err != nil {
-		t.Fatalf("new local: %v", err)
-	}
 	u, err := s.CreateUser(ctx, "+15559170001")
 	if err != nil {
 		t.Fatalf("create user: %v", err)
@@ -231,19 +231,28 @@ func (h hookTree) Walk(ctx context.Context, fn func(blob.Entry) error) error {
 // file that is being uploaded right now. What excludes it is that the snapshot
 // was read before the listing began: an id above it cannot be judged by a table
 // read that predates it, so it is out of scope by construction.
+//
+// The hook allocates a real files row as well as writing the blob, which is
+// what makes the test able to fail: the allocation advances the id ceiling, so
+// a scan that read the snapshot after the listing began would see the arriving
+// id under Through and name it an orphan. A test that only wrote the blob
+// pins the id bound but not the order, because nothing moves the ceiling during
+// the walk.
 func TestScanExcludesBlobWrittenAfterTheSnapshot(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 
 	settled := f.stored(payload)
-	arriving := settled.ID + 7
-	tree := hookTree{inner: f.blobs, before: func() { f.putBlob(arriving, payload) }}
+	tree := hookTree{inner: f.blobs, before: func() {
+		f.allocate(int64(len(payload)))
+		f.putBlob(settled.ID+1, payload)
+	}}
 
 	rep, err := blobscan.Scan(context.Background(), tree, f.store, past())
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	key := blob.Key(arriving)
+	key := blob.Key(settled.ID + 1)
 	if has(rep.Orphans, key) || has(rep.Temps, key) || has(rep.Unexplained, key) {
 		t.Fatalf("blob %s written after the snapshot was reported: %+v", key, rep)
 	}
@@ -255,6 +264,92 @@ func TestScanExcludesBlobWrittenAfterTheSnapshot(t *testing.T) {
 	}
 	if rep.Through != settled.ID {
 		t.Fatalf("Through = %d, want the snapshot %d taken before the walk", rep.Through, settled.ID)
+	}
+}
+
+// The ceiling is on the ids allocated, not on the rows that exist. A blob
+// whose row was committed and then deleted, with nothing allocated after it,
+// sits at the top of the id space: a bound read from the rows has shrunk below
+// it and would park the blob in AboveSnapshot, where nothing names it until a
+// later upload allocates past it. That is the exact state a committed row
+// delete and a lost unlink leave behind, and the class this pass exists for.
+func TestScanNamesOrphanAtTheTopOfTheIDSpace(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+
+	// Two files so the deleted one is not the only row: the row-based bound
+	// would then be the lower id, strictly below the orphan.
+	f.stored(payload)
+	top := f.stored(payload)
+	f.dropRow(top.ID)
+
+	rep := f.scan(past())
+	key := blob.Key(top.ID)
+	if !has(rep.Orphans, key) {
+		t.Fatalf("blob %s at the top of the id space not named an orphan candidate; report = %+v", key, rep)
+	}
+	if rep.Orphans.Count != 1 || rep.Orphans.Bytes != int64(len(payload)) {
+		t.Fatalf("orphans = %d / %d bytes, want 1 / %d; report = %+v", rep.Orphans.Count, rep.Orphans.Bytes, len(payload), rep)
+	}
+	if rep.AboveSnapshot != 0 {
+		t.Fatalf("AboveSnapshot = %d, want 0; the ceiling must not fall below a committed id: %+v", rep.AboveSnapshot, rep)
+	}
+	if rep.Accounted != 1 || rep.Through != top.ID {
+		t.Fatalf("accounted = %d, through = %d; want 1 and %d", rep.Accounted, rep.Through, top.ID)
+	}
+}
+
+// A path under the parts prefix is the layout's other keyspace: it is never
+// unexplained, never an orphan candidate, and it is counted as its own class.
+// The reclaim is the upload-part sweep's, not this pass's, so the class
+// carries the bytes an operator wants to see without claiming anything about
+// them.
+func TestScanCountsUploadPartsAsTheirOwnClass(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+
+	f.stored(payload)
+	partKey, err := blob.NewPartKey()
+	if err != nil {
+		t.Fatalf("part key: %v", err)
+	}
+	f.plant(partKey, "part bytes")
+
+	rep := f.scan(past())
+	if !has(rep.Parts, partKey) {
+		t.Fatalf("%s not counted as an upload part; report = %+v", partKey, rep)
+	}
+	if rep.Parts.Count != 1 || rep.Parts.Bytes != int64(len("part bytes")) {
+		t.Fatalf("parts = %d / %d bytes, want 1 / %d; report = %+v", rep.Parts.Count, rep.Parts.Bytes, len("part bytes"), rep)
+	}
+	if has(rep.Unexplained, partKey) || has(rep.Orphans, partKey) || has(rep.Temps, partKey) {
+		t.Fatalf("an upload part was reported in another class: %+v", rep)
+	}
+	if rep.Unexplained.Count != 0 || rep.Orphans.Count != 0 {
+		t.Fatalf("a tree holding live upload parts claims the layout cannot explain them: %+v", rep)
+	}
+}
+
+// The parts prefix's own directory is the layout, not an unexplained path: a
+// server doing ordinary upload traffic must not warn that it does not explain
+// a path its own writer created.
+func TestScanDoesNotNameThePartsDirectory(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+
+	f.stored(payload)
+	partKey, err := blob.NewPartKey()
+	if err != nil {
+		t.Fatalf("part key: %v", err)
+	}
+	f.plant(partKey, "part bytes")
+
+	rep := f.scan(past())
+	if has(rep.Unexplained, "parts") {
+		t.Fatalf("the parts directory was reported as unexplained: %+v", rep.Unexplained.Paths)
+	}
+	if rep.Unexplained.Count != 0 {
+		t.Fatalf("unexplained = %d, want 0; report = %+v", rep.Unexplained.Count, rep)
 	}
 }
 
@@ -363,6 +458,11 @@ func TestScanTotalsPartitionTheTree(t *testing.T) {
 	f.age(tmp, 30*time.Hour)
 	f.plant("92/notanid", "junk!")
 	f.putBlob(keep.ID+2, payload) // above the snapshot
+	partKey, err := blob.NewPartKey()
+	if err != nil {
+		t.Fatalf("part key: %v", err)
+	}
+	f.plant(partKey, "part bytes") // the layout's other keyspace
 
 	rep := f.scan(time.Now().Add(-24 * time.Hour))
 	if rep.Through != keep.ID {
@@ -374,6 +474,9 @@ func TestScanTotalsPartitionTheTree(t *testing.T) {
 	if rep.Temps.Count != 1 || rep.Temps.Bytes != 4 {
 		t.Errorf("temps = %d / %d bytes, want 1 / 4", rep.Temps.Count, rep.Temps.Bytes)
 	}
+	if rep.Parts.Count != 1 || rep.Parts.Bytes != int64(len("part bytes")) {
+		t.Errorf("parts = %d / %d bytes, want 1 / %d", rep.Parts.Count, rep.Parts.Bytes, len("part bytes"))
+	}
 	if rep.Unexplained.Count != 1 || rep.Unexplained.Bytes != 5 {
 		t.Errorf("unexplained = %d / %d bytes, want 1 / 5", rep.Unexplained.Count, rep.Unexplained.Bytes)
 	}
@@ -381,15 +484,17 @@ func TestScanTotalsPartitionTheTree(t *testing.T) {
 		t.Errorf("accounted = %d, above snapshot = %d; want 1 and 1", rep.Accounted, rep.AboveSnapshot)
 	}
 	// Every path the walk saw lands in exactly one bucket, so a total that does
-	// not add up is visible rather than quiet. Shard directories are the
-	// remainder: they are the layout itself and are reported as nothing.
+	// not add up is visible rather than quiet. Shard directories and the parts
+	// directory are the remainder: they are the layout itself and are reported
+	// as nothing.
 	shards := map[string]bool{"92": true}
 	for _, id := range []int64{a.ID, b.ID, keep.ID, keep.ID + 2} {
 		shards[path.Dir(blob.Key(id))] = true
 	}
-	got := rep.Orphans.Count + rep.Temps.Count + rep.Unexplained.Count + rep.Accounted + rep.AboveSnapshot + rep.TempsInFlight
-	if rep.Walked != got+len(shards) {
-		t.Errorf("walked %d paths, classified %d plus %d shard directories", rep.Walked, got, len(shards))
+	got := rep.Orphans.Count + rep.Temps.Count + rep.Parts.Count + rep.Unexplained.Count +
+		rep.Accounted + rep.AboveSnapshot + rep.TempsInFlight
+	if rep.Walked != got+len(shards)+1 { // +1 for the parts directory
+		t.Errorf("walked %d paths, classified %d plus %d layout directories", rep.Walked, got, len(shards))
 	}
 }
 

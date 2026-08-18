@@ -66,10 +66,11 @@ func (c *Class) add(e Candidate) {
 	}
 }
 
-// Report is what one pass saw. The six outcomes partition Walked: every path
+// Report is what one pass saw. The seven outcomes partition Walked: every path
 // examined lands in exactly one of them, so "nothing to reclaim" is
-// distinguishable from "held back, and by what". Shard directories are the
-// remainder — they are the layout itself and are reported as nothing.
+// distinguishable from "held back, and by what". Shard directories and the
+// parts directory are the remainder — they are the layout itself and are
+// reported as nothing.
 type Report struct {
 	// Through is the highest file id allocated when the walk began. It is the
 	// pass's whole safety argument: it is read before the listing starts, so a
@@ -86,6 +87,11 @@ type Report struct {
 	// cutoff is not optional and why these are counted apart from Orphans —
 	// they are reclaimed by unlinking a path, not by an id having no row.
 	Temps Class
+	// Parts are in-flight upload part objects under the parts prefix. The
+	// layout explains them and this pass never names them as anything else;
+	// they are counted so an operator sees how many live upload bytes the tree
+	// holds, and their reclaim is the upload-part sweep's, not this pass's.
+	Parts Class
 	// Unexplained are paths the blob layout does not produce. Their bytes are
 	// counted so an operator can see the size of what is there, and they are
 	// not reclaimable by anything: they are reported and left alone.
@@ -102,8 +108,8 @@ type Report struct {
 
 // Files is the database half of the classification. [store.Store] satisfies it.
 type Files interface {
-	// MaxFileID returns the highest file id ever allocated.
-	MaxFileID(ctx context.Context) (int64, error)
+	// AllocatedFileIDCeiling returns the highest file id ever allocated.
+	AllocatedFileIDCeiling(ctx context.Context) (int64, error)
 	// ExistingFileIDs returns which of ids have a row, stored or not.
 	ExistingFileIDs(ctx context.Context, ids []int64) (map[int64]struct{}, error)
 }
@@ -137,7 +143,7 @@ type Tree interface {
 // reclaim safe is the interlock on the files row taken by every path that
 // writes a reference, not this classification and not the cutoff.
 func Scan(ctx context.Context, tree Tree, files Files, tempOlderThan time.Time) (Report, error) {
-	through, err := files.MaxFileID(ctx)
+	through, err := files.AllocatedFileIDCeiling(ctx)
 	if err != nil {
 		return Report{}, fmt.Errorf("blob scan: %w", err)
 	}
@@ -170,23 +176,35 @@ func Scan(ctx context.Context, tree Tree, files Files, tempOlderThan time.Time) 
 		return nil
 	}
 
+	partsDir := strings.TrimSuffix(blob.PartsPrefix, "/")
+
 	err = tree.Walk(ctx, func(e blob.Entry) error {
 		rep.Walked++
 		switch {
 		case e.Dir:
 			// A directory the layout produces holds blobs and is not itself
-			// one. Anything else under the root is somebody's, not ours, and
-			// so is whatever it contains: the walk keeps going and reports
-			// each entry rather than assuming the subtree is uniform.
-			if !blob.IsShard(e.Key) {
-				rep.Unexplained.add(Candidate{Key: e.Key})
+			// one: the shards, and the parts prefix's own directory. The parts
+			// tree is the layout's other keyspace, so everything under it is a
+			// part object, named as such; whatever is not is somebody's, not
+			// ours.
+			if blob.IsShard(e.Key) || e.Key == partsDir {
+				return nil
 			}
+			rep.Unexplained.add(Candidate{Key: e.Key})
 			return nil
 		case !e.Regular:
 			// A symlink, socket or device never came from the writer, whatever
 			// it is named. Classifying it by its name would be the one case
 			// where the name is not evidence of anything.
 			rep.Unexplained.add(Candidate{Key: e.Key})
+			return nil
+		}
+
+		// The parts prefix is checked before the id bound and before the key
+		// parses: a part key names no file id at all, so it is never an orphan
+		// candidate and never unexplained, whatever the snapshot says.
+		if strings.HasPrefix(e.Key, blob.PartsPrefix) {
+			rep.Parts.add(Candidate{Key: e.Key, Size: e.Size})
 			return nil
 		}
 

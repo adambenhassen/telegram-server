@@ -72,6 +72,23 @@ SELECT * FROM files WHERE id = ANY(sqlc.arg(ids)::bigint[]) AND stored = true;
 -- name: MaxFileID :one
 SELECT coalesce(max(id), 0)::bigint FROM files;
 
+-- AllocatedFileIDCeiling is the highest id the files sequence has ever
+-- handed out, read from the sequence itself rather than from the rows.
+--
+-- The two differ once a row is deleted: max(id) falls below the erased ids
+-- while the sequence does not, and the sequence is the bound a pass over the
+-- blob store's disk needs. A committed row delete whose unlink was lost
+-- leaves its blob at the top of the id space, and a bound that has shrunk
+-- below it puts that blob above the snapshot, where nothing names it until a
+-- later upload allocates past it. The sequence is an upper bound on every id
+-- allocated before the read and never falls below an id whose row was once
+-- committed, which is what the classification's snapshot argument requires.
+--
+-- pg_sequence_last_value is NULL on a sequence that never advanced, and the
+-- coalesce makes the empty table the same zero the row-based query returns.
+-- name: AllocatedFileIDCeiling :one
+SELECT coalesce(pg_sequence_last_value('files_id_seq'), 0)::bigint;
+
 -- ExistingFileIDs answers "which of these ids does the database still account
 -- for", for a pass classifying what is on the blob store's disk.
 --

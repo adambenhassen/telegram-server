@@ -69,7 +69,12 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("server RSA key", "key_id", keyID, "fingerprint", rsakey.Fingerprint(&key.PublicKey), "path", cfg.RSAKeyPath)
 
-	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log))
+	blobs, err := blob.NewLocal(cfg.BlobDir)
+	if err != nil {
+		return err
+	}
+
+	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log), store.WithBlobStore(blobs))
 	if err != nil {
 		return err
 	}
@@ -121,13 +126,6 @@ func run(log *slog.Logger) error {
 		sweepWG.Wait()
 	}()
 
-	blobs, err := blob.NewLocal(cfg.BlobDir)
-	if err != nil {
-		return err
-	}
-	// Started here rather than with the sweeps above because it is the first
-	// background pass that needs the blob store; sweepCtx and sweepWG already
-	// cover it, so it is cancelled and waited for with the rest.
 	if cfg.BlobScanReportInterval > 0 {
 		sweepWG.Go(func() {
 			reportBlobDisk(sweepCtx, blobs, st, cfg.BlobScanTempMinAge, cfg.BlobScanReportInterval, log)
@@ -406,7 +404,8 @@ func reportMediaErasureCandidates(ctx context.Context, st *store.Store, minAge, 
 // deliberately not counted alongside the reclaimable classes. Something is
 // under the blob root that this server did not put there; that is a question
 // for a person, and a pass that guessed at it would be how an unrelated file
-// gets destroyed.
+// gets destroyed. Upload parts, the layout's other keyspace, are reported as
+// their own class and never as unexplained.
 func reportBlobDisk(ctx context.Context, blobs *blob.Local, st *store.Store, tempMinAge, interval time.Duration, log *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -429,6 +428,8 @@ func reportBlobDisk(ctx context.Context, blobs *blob.Local, st *store.Store, tem
 				"orphan_bytes", rep.Orphans.Bytes,
 				"abandoned_temp", rep.Temps.Count,
 				"abandoned_temp_bytes", rep.Temps.Bytes,
+				"upload_parts", rep.Parts.Count,
+				"upload_part_bytes", rep.Parts.Bytes,
 				"unexplained", rep.Unexplained.Count,
 				"unexplained_bytes", rep.Unexplained.Bytes,
 				"accounted", rep.Accounted,

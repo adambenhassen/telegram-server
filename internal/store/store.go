@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -19,6 +20,9 @@ type Store struct {
 	pool   *pgxpool.Pool
 	q      *db.Queries
 	cipher *keycrypt.Cipher
+	// blobs is the backend in-flight upload part bytes go to; the parts rows
+	// account for them. Every Store owns one.
+	blobs blob.Store
 
 	// log carries the store's own diagnostics: the states a write reaches that
 	// no return value reports. Never nil — Open defaults it to slog.Default(),
@@ -94,6 +98,14 @@ var (
 // Option configures a Store at Open time.
 type Option func(*Store)
 
+// WithBlobStore wires the blob backend the Store uses for in-flight upload
+// part bytes.
+func WithBlobStore(blobs blob.Store) Option {
+	return func(s *Store) {
+		s.blobs = blobs
+	}
+}
+
 // WithLogger routes the store's diagnostics to log instead of slog.Default().
 // It is per-Store rather than a package-level setting so that two Stores in one
 // process — every parallel test in this package — cannot write into each
@@ -136,6 +148,15 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Required rather than defaulted: the part bytes live in the blob backend,
+	// so a Store without one cannot serve an upload at all, and there is no
+	// directory this package could pick on a caller's behalf that would be
+	// right. Left to default it, the miss surfaces as a nil dereference on the
+	// first saveFilePart a running server takes.
+	if s.blobs == nil {
+		pool.Close()
+		return nil, errors.New("store: no blob backend configured; pass WithBlobStore")
+	}
 	if err := s.checkSchema(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -149,11 +170,11 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 //
 // ponytail: presence-check of the newest migration's artifacts, not a version
 // table — pgtest applies raw SQL and has no Atlas revisions table to read. The
-// sentinels track the latest migration (pinned_message_id on chats/channels) plus
-// chat_participants, messages.fanout_id and message_events from the ones
-// before it; update them when a migration adds new schema.
+// sentinels track the latest migration (upload_parts.size and blob_key, with
+// payload dropped) plus the ones before it; update them when a migration adds
+// new schema.
 func (s *Store) checkSchema(ctx context.Context) error {
-	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions bool
+	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
@@ -176,12 +197,18 @@ func (s *Store) checkSchema(ctx context.Context) error {
 		       to_regclass('public.sign_in_fail_calls') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
 		              WHERE table_name = 'users' AND column_name = 'login_mode'),
-		       to_regclass('public.admin_sessions') IS NOT NULL`,
-	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions)
+		       to_regclass('public.admin_sessions') IS NOT NULL,
+		       EXISTS(SELECT 1 FROM information_schema.columns
+		              WHERE table_name = 'upload_parts' AND column_name = 'size'),
+		       EXISTS(SELECT 1 FROM information_schema.columns
+		              WHERE table_name = 'upload_parts' AND column_name = 'blob_key'),
+		       EXISTS(SELECT 1 FROM information_schema.columns
+		                   WHERE table_name = 'upload_parts' AND column_name = 'payload')`,
+	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions {
+	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || hasPartPayload {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil

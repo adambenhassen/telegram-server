@@ -4,13 +4,33 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/clock"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
+
+// testClock is a clock a test advances by hand, so a conn's per-connection
+// sampler can be driven across its interval without waiting for it.
+type testClock struct {
+	now time.Time
+}
+
+func (c *testClock) Now() time.Time { return c.now }
+func (c *testClock) Advance(d time.Duration) {
+	c.now = c.now.Add(d)
+}
+func (c *testClock) Timer(time.Duration) clock.Timer {
+	return clock.System.Timer(time.Second)
+}
+func (c *testClock) Ticker(time.Duration) clock.Ticker {
+	return clock.System.Ticker(time.Second)
+}
 
 // attrs flattens a record's attributes into a key/value map for assertion.
 func attrs(r slog.Record) map[string]string {
@@ -22,24 +42,45 @@ func attrs(r slog.Record) map[string]string {
 	return got
 }
 
+// unhandledConn builds a connection to charge the fallback's per-connection
+// budget against. It never writes: the fallback answers by returning the error,
+// which the RPC layer above it turns into a reply.
+func unhandledConn() *mtproto.Conn {
+	return mtproto.NewTestConn(&fakeTransport{}, testKey())
+}
+
+// registerDeviceBody is a request body positioned at the constructor id of a
+// method this server does not implement.
+func registerDeviceBody(t *testing.T) *bin.Buffer {
+	t.Helper()
+	var buf bin.Buffer
+	if err := (&tg.AccountRegisterDeviceRequest{}).Encode(&buf); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return &buf
+}
+
+// mustRPCError extracts the RPC error a caller would receive, failing when the
+// fallback returned something that never reaches a client.
+func mustRPCError(t *testing.T, err error) *tgerr.Error {
+	t.Helper()
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) {
+		t.Fatalf("err = %v, want an rpc error", err)
+	}
+	return rpc
+}
+
 // TestUnhandledLogsResolvedMethodName covers the one record a client's
 // unsupported call leaves behind. The name matters more than the id: a capture
 // against a real client is a list of method names, and a log line carrying only
 // a constructor id has to be resolved by hand against the schema before it says
 // anything.
 func TestUnhandledLogsResolvedMethodName(t *testing.T) {
-	var buf bin.Buffer
-	if err := (&tg.AccountRegisterDeviceRequest{}).Encode(&buf); err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-
 	h := &captureHandler{}
-	err := api.UnhandledForTest(slog.New(h), &buf)
+	err := api.UnhandledForTest(slog.New(h), unhandledConn(), registerDeviceBody(t))
 
-	var rpc *tgerr.Error
-	if !errors.As(err, &rpc) {
-		t.Fatalf("err = %v, want an rpc error", err)
-	}
+	rpc := mustRPCError(t, err)
 	if rpc.Code != 400 || rpc.Message != "INPUT_METHOD_INVALID" {
 		t.Errorf("returned %d %s, want 400 INPUT_METHOD_INVALID", rpc.Code, rpc.Message)
 	}
@@ -76,7 +117,7 @@ func TestUnhandledLogsUnresolvableID(t *testing.T) {
 	buf.PutID(0xdeadbeef)
 
 	h := &captureHandler{}
-	if err := api.UnhandledForTest(slog.New(h), &buf); err == nil {
+	if err := api.UnhandledForTest(slog.New(h), unhandledConn(), &buf); err == nil {
 		t.Fatal("unknown constructor accepted")
 	}
 	if len(h.records) != 1 {
@@ -96,7 +137,7 @@ func TestUnhandledLogsUnresolvableID(t *testing.T) {
 // than fall through as a success.
 func TestUnhandledRejectsUnreadableBody(t *testing.T) {
 	h := &captureHandler{}
-	if err := api.UnhandledForTest(slog.New(h), &bin.Buffer{}); err == nil {
+	if err := api.UnhandledForTest(slog.New(h), unhandledConn(), &bin.Buffer{}); err == nil {
 		t.Fatal("empty body accepted")
 	}
 	if len(h.records) != 1 {
@@ -104,5 +145,112 @@ func TestUnhandledRejectsUnreadableBody(t *testing.T) {
 	}
 	if h.records[0].Message != "method not implemented: peek id failed" {
 		t.Errorf("message = %q", h.records[0].Message)
+	}
+}
+
+// TestUnhandledBudgetBandsOnOneConnection is the ticket's case end to end
+// through the fallback: a connection that sends 300 calls to a method this
+// server does not implement is answered as it always was for the first 64,
+// told to wait for the next 191, and cut on the 256th. The first band is the
+// one that must not move — it is what a real client's cold start spends — and
+// the error it gets must stay INPUT_METHOD_INVALID rather than anything a
+// client treats as a reason to throw its keys away.
+func TestUnhandledBudgetBandsOnOneConnection(t *testing.T) {
+	t.Parallel()
+	log := slog.New(&captureHandler{})
+	conn := unhandledConn()
+	body := registerDeviceBody(t)
+
+	for i := 1; i <= 300; i++ {
+		err := api.UnhandledForTest(log, conn, body)
+		switch {
+		case i <= 64:
+			rpc := mustRPCError(t, err)
+			if rpc.Code != 400 || rpc.Message != "INPUT_METHOD_INVALID" {
+				t.Fatalf("call %d: %d %s, want 400 INPUT_METHOD_INVALID", i, rpc.Code, rpc.Message)
+			}
+		case i < 256:
+			rpc := mustRPCError(t, err)
+			if rpc.Code != 420 || rpc.Message != "FLOOD_WAIT_30" {
+				t.Fatalf("call %d: %d %s, want 420 FLOOD_WAIT_30", i, rpc.Code, rpc.Message)
+			}
+		default:
+			if err == nil {
+				t.Fatalf("call %d: answered, want the connection ended", i)
+			}
+			var rpc *tgerr.Error
+			if errors.As(err, &rpc) {
+				t.Fatalf("call %d: %d %s, want a non-RPC error that ends the connection", i, rpc.Code, rpc.Message)
+			}
+		}
+	}
+}
+
+// TestUnhandledBudgetSamplesTheLog covers the second cost of the burst. 300
+// calls must not be 300 lines, and the line that is emitted has to say how
+// many it stands for or an operator reading it cannot tell a stray call from a
+// flood.
+func TestUnhandledBudgetSamplesTheLog(t *testing.T) {
+	t.Parallel()
+	h := &captureHandler{}
+	log := slog.New(h)
+	cl := &testClock{now: time.Now()}
+	conn := unhandledConn()
+	conn.SetClock(cl)
+	// The flush writes to the conn's own logger, not the handlers' — point it
+	// at the same capture so the drop's line lands where the test reads it.
+	conn.SetLog(log)
+	body := registerDeviceBody(t)
+
+	const calls = 300
+	for i := range calls {
+		if err := api.UnhandledForTest(log, conn, body); err == nil {
+			t.Fatalf("call %d: answered with no error", i+1)
+		}
+	}
+	if n := len(h.records); n != 1 {
+		t.Fatalf("emitted %d lines inside the interval, want the 1 the sampled path emits", n)
+	}
+	if got := attrs(h.records[0])["suppressed"]; got != "0" {
+		t.Errorf("first line suppressed = %q, want %q", got, "0")
+	}
+
+	// The burst ends the connection at the 256th call, and every call after the
+	// first line — the 254 in the flood band and the 45 past the ceiling — is
+	// owed to the drop, not to a later line on this conn. Advance the clock
+	// past the interval and flush the way the serve loop does when it drops the
+	// conn: the line it writes must carry the calls it stands for.
+	cl.Advance(11 * time.Second)
+	conn.FlushUnimplementedLog()
+
+	if len(h.records) != 2 {
+		t.Fatalf("captured %d records, want the in-interval line and the flush", len(h.records))
+	}
+	if got := attrs(h.records[1])["suppressed"]; got != "299" {
+		t.Errorf("flush suppressed = %q, want %q", got, "299")
+	}
+}
+
+// TestUnhandledBudgetIsPerConnection pins where the counter lives. A budget
+// shared between connections would let one peer's loop refuse everybody else's
+// first such call, which is the flood turned into an outage.
+func TestUnhandledBudgetIsPerConnection(t *testing.T) {
+	t.Parallel()
+	log := slog.New(&captureHandler{})
+	body := registerDeviceBody(t)
+
+	spent := unhandledConn()
+	for i := range 256 {
+		if err := api.UnhandledForTest(log, spent, body); err == nil {
+			t.Fatalf("call %d: answered with no error", i+1)
+		}
+	}
+	if err := api.UnhandledForTest(log, spent, body); err == nil {
+		t.Fatal("spent connection: answered, want the connection ended")
+	}
+
+	rpc := mustRPCError(t, api.UnhandledForTest(log, unhandledConn(), body))
+	if rpc.Code != 400 || rpc.Message != "INPUT_METHOD_INVALID" {
+		t.Errorf("fresh connection: %d %s, want 400 INPUT_METHOD_INVALID", rpc.Code, rpc.Message)
 	}
 }

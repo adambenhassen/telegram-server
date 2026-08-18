@@ -15,12 +15,29 @@ import (
 )
 
 // NewTestConn builds a Conn wired to tconn with a ready session (key + session
-// id set) so tests can exercise Push/SendResult without a full handshake.
+// id set) so tests can exercise Push/SendResult without a full handshake. Its
+// clock is the system clock; tests that need to advance time swap it for a
+// controllable one with SetClock.
 func NewTestConn(tconn transport.Conn, key crypto.AuthKey) *Conn {
 	c := newConn(tconn, crypto.NewServerCipher(crypto.DefaultRand()), proto.NewMessageIDGen(clock.System.Now), clock.System, time.Second, slog.New(slog.DiscardHandler))
 	c.setKey(key)
 	c.setSession(123)
 	return c
+}
+
+// SetClock swaps the connection's time source, which the per-connection
+// budgets and samplers read. It is for tests only: production conns keep the
+// server's clock for the life of the connection.
+func (c *Conn) SetClock(cl clock.Clock) {
+	c.clock = cl
+}
+
+// SetLog swaps the connection's logger, which FlushUnimplementedLog writes to
+// when it drops the conn's not-implemented count. It is for tests only: a test
+// conn is built with a discard logger, and a test that drives the flush needs
+// to see the line it writes.
+func (c *Conn) SetLog(l *slog.Logger) {
+	c.log = l
 }
 
 // SetHandshakeTimeout shortens the bound on transport negotiation so a test

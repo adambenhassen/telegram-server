@@ -6,7 +6,3 @@ var (
 	ContainerOptions = containerOptions
 	WaitAccepting    = waitAccepting
 )
-
-// AdminDSN returns the shared container's admin connection string. Valid only
-// after a successful Prewarm.
-func AdminDSN() string { return adminDSN }
