@@ -214,10 +214,10 @@ func TestListPrefixAfterResumes(t *testing.T) {
 	}
 }
 
-// TestListPrefixLimitZeroReturnsAll verifies that limit=0 returns every key
-// under the prefix in a single call, for a caller that walks the whole
-// prefix once and chunks its own work.
-func TestListPrefixLimitZeroReturnsAll(t *testing.T) {
+// TestListPrefixAllKeysReturnsAll verifies that the AllKeys sentinel returns
+// every key under the prefix in a single call, for a caller that walks the
+// whole prefix once and chunks its own work.
+func TestListPrefixAllKeysReturnsAll(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	l, _ := newLocal(t)
@@ -229,7 +229,7 @@ func TestListPrefixLimitZeroReturnsAll(t *testing.T) {
 		}
 	}
 
-	got, err := l.ListPrefix(ctx, blob.PartsPrefix, "", 0)
+	got, err := l.ListPrefix(ctx, blob.PartsPrefix, "", blob.AllKeys)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -243,9 +243,15 @@ func TestListPrefixLimitZeroReturnsAll(t *testing.T) {
 		}
 	}
 
-	// A negative limit is an error.
-	_, err = l.ListPrefix(ctx, blob.PartsPrefix, "", -1)
+	// Zero is an error: a caller that computed a zero limit has a bug that
+	// must not silently become an unbounded operation.
+	_, err = l.ListPrefix(ctx, blob.PartsPrefix, "", 0)
 	if err == nil {
-		t.Fatal("negative limit succeeded, want an error")
+		t.Fatal("zero limit succeeded, want an error")
+	}
+	// A negative limit other than AllKeys is an error.
+	_, err = l.ListPrefix(ctx, blob.PartsPrefix, "", -2)
+	if err == nil {
+		t.Fatal("negative limit other than AllKeys succeeded, want an error")
 	}
 }

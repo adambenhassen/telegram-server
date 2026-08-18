@@ -617,10 +617,10 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 		cutoff = floor
 	}
 
-	// One walk of the whole parts prefix. limit=0 returns every key under the
+	// One walk of the whole parts prefix. AllKeys returns every key under the
 	// prefix in a single call, so the enumeration cost is one directory read
 	// per run rather than one per gate batch.
-	objects, err := s.blobs.ListPrefix(ctx, blob.PartsPrefix, "", 0)
+	objects, err := s.blobs.ListPrefix(ctx, blob.PartsPrefix, "", blob.AllKeys)
 	if err != nil {
 		return PartOrphanResult{}, fmt.Errorf("list part prefix: %w", err)
 	}
@@ -648,6 +648,15 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 				continue
 			}
 			// Live-key gate: an object a row still names is never removed.
+			// There is no delete-time re-check. The walk snapshot carries it:
+			// a row committed after the walk draws a key from crypto/rand at
+			// commit time, so no object existed at that key when the walk ran,
+			// and it is not in objects and never becomes a delete candidate in
+			// this run. A row committed before the walk is inside the gate's
+			// own statement snapshot. The age gate would only become
+			// load-bearing here if the pass ever learned about keys discovered
+			// after its walk (a re-walk, a merged enumeration, a resumed
+			// cursor); it is not the argument that holds today.
 			if live[obj.Key] {
 				continue
 			}

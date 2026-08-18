@@ -41,14 +41,23 @@ type Store interface {
 	// an empty after starts at the beginning of the prefix. The result is
 	// globally ordered by key. limit bounds the page: a positive limit
 	// returns at most that many keys, and a caller that walks the prefix
-	// passes the last key of each page as the next after. limit of zero
-	// returns every key under the prefix in one call, for a caller that
-	// walks the whole prefix once and chunks its own work. A negative limit
-	// is an error. An empty prefix lists nothing: the assembled keyspace has
-	// no single prefix, so nothing outside a named prefix is reachable
-	// through this.
+	// passes the last key of each page as the next after. The sentinel
+	// AllKeys returns every key under the prefix in one call, for a caller
+	// that walks the whole prefix once and chunks its own work; it is the
+	// only unbounded form and must be named at the call site. Zero and any
+	// other negative value are errors: a caller that computed a zero limit
+	// has a bug that must not silently become an unbounded operation. An
+	// empty prefix lists nothing: the assembled keyspace has no single
+	// prefix, so nothing outside a named prefix is reachable through this.
 	ListPrefix(ctx context.Context, prefix, after string, limit int) ([]Object, error)
 }
+
+// AllKeys is the ListPrefix sentinel for an unbounded page: every key under
+// the prefix in one call. It is the only unbounded form and must be named at
+// the call site; zero and any other negative value are errors, because a
+// caller that computed a zero limit has a bug that must not silently become
+// an unbounded operation feeding a delete loop.
+const AllKeys = -1
 
 // Object is one entry of a [Store.ListPrefix] page: the key and the two
 // facts an age-based pass decides from, how big the object is and when it
@@ -124,8 +133,8 @@ func (l *Local) RootDir() string { return l.dir }
 // the limit smallest are not known until the whole subtree is seen. The parts
 // prefix is flat (one directory), so in practice this is one directory read.
 func (l *Local) ListPrefix(_ context.Context, prefix, after string, limit int) ([]Object, error) {
-	if limit < 0 {
-		return nil, fmt.Errorf("blob list: limit %d must be non-negative", limit)
+	if limit == 0 || (limit < 0 && limit != AllKeys) {
+		return nil, fmt.Errorf("blob list: limit %d must be positive or AllKeys", limit)
 	}
 	if prefix == "" {
 		return nil, nil
