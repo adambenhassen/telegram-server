@@ -162,9 +162,10 @@ func TestServeConnFlushesUnimplementedCountOnDrop(t *testing.T) {
 		}
 		return true
 	})
-	// 254 calls were suppressed behind the drop: the flood-band calls the
-	// handler sampled, all past the first line. The ceiling call itself returns
-	// before sampling in this stub, so it is not in the count the drop owes.
+	// 254 calls were suppressed behind the drop: the 63 answer-band calls and
+	// the 191 flood-band calls the handler sampled, all past the first line.
+	// The ceiling call itself returns before sampling in this stub, so it is
+	// not in the count the drop owes.
 	if suppressed != 254 {
 		t.Errorf("drop suppressed = %d, want %d", suppressed, int64(254))
 	}
