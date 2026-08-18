@@ -227,6 +227,49 @@ func TestParseKeyRefusesAnythingKeyCannotProduce(t *testing.T) {
 	}
 }
 
+// Every key NewPartKey draws parses back, which is what makes the parts class
+// a round trip through the writer rather than a prefix match.
+func TestParsePartKeyRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	for range 32 {
+		k, err := blob.NewPartKey()
+		if err != nil {
+			t.Fatalf("new part key: %v", err)
+		}
+		if !blob.ParsePartKey(k) {
+			t.Fatalf("ParsePartKey(%q) = false for a key the writer drew", k)
+		}
+	}
+}
+
+// Everything NewPartKey does not produce is not a part key. The strictness is
+// the point: whatever acts on this classification treats a path it cannot
+// parse as unexplained, so a spelling that parses loosely is a path getting
+// misfiled as a live upload part.
+func TestParsePartKeyRefusesAnythingTheWriterCannotProduce(t *testing.T) {
+	t.Parallel()
+
+	for name, key := range map[string]string{
+		"empty":          "",
+		"prefix only":    "parts/",
+		"no suffix":      "parts",
+		"too short":      "parts/deadbeef",
+		"too long":       "parts/deadbeef0000000000000000000000000000",
+		"upper case":     "parts/DEADBEEF000000000000000000000000",
+		"non hex":        "parts/zzzzbeef000000000000000000000000",
+		"extra element":  "parts/deadbeef000000000000000000000000/deep",
+		"trailing slash": "parts/deadbeef000000000000000000000000/",
+		"temp file":      "parts/deadbeef000000000000000000000000.tmp",
+		"other prefix":   "partx/deadbeef000000000000000000000000",
+		"leading slash":  "/parts/deadbeef000000000000000000000000",
+	} {
+		if blob.ParsePartKey(key) {
+			t.Errorf("%s: ParsePartKey(%q) = true; want false", name, key)
+		}
+	}
+}
+
 func TestIsShard(t *testing.T) {
 	t.Parallel()
 

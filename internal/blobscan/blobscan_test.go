@@ -299,8 +299,10 @@ func TestScanNamesOrphanAtTheTopOfTheIDSpace(t *testing.T) {
 	}
 }
 
-// A path under the parts prefix is the layout's other keyspace: it is never
-// unexplained, never an orphan candidate, and it is counted as its own class.
+// A path under the parts prefix that the part-key writer could have produced
+// is counted as a live upload part, and nothing else is. The class is earned
+// by round-tripping through NewPartKey, never by where a path sits: a prefix
+// match would count paths the writer never made as in-flight upload bytes.
 // The reclaim is the upload-part sweep's, not this pass's, so the class
 // carries the bytes an operator wants to see without claiming anything about
 // them.
@@ -327,6 +329,101 @@ func TestScanCountsUploadPartsAsTheirOwnClass(t *testing.T) {
 	}
 	if rep.Unexplained.Count != 0 || rep.Orphans.Count != 0 {
 		t.Fatalf("a tree holding live upload parts claims the layout cannot explain them: %+v", rep)
+	}
+}
+
+// A path under the prefix that the writer could not have produced is
+// unexplained, with its bytes, and never in the part totals. A class earned by
+// prefix membership would count these as live in-flight upload bytes while the
+// directory holding them is warn-logged as unexplained, and the report would
+// contradict itself on the same files.
+func TestScanNamesPathsUnderThePartsPrefixTheWriterDidNotProduce(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+
+	f.stored(payload) // one real blob, so the tree is not only strange
+	partKey, err := blob.NewPartKey()
+	if err != nil {
+		t.Fatalf("part key: %v", err)
+	}
+	f.plant(partKey, "part bytes")
+	for _, rel := range []string{
+		"parts/README",     // not a part key
+		"parts/sub/nested", // an extra path element
+		"parts/" + strings.ToUpper(partKey[len(blob.PartsPrefix):])[:8] + "000000000000000000000000000000", // upper case is not one
+	} {
+		f.plant(rel, "x")
+	}
+
+	rep := f.scan(past())
+	for _, want := range []string{"parts/README", "parts/sub", "parts/sub/nested"} {
+		if !has(rep.Unexplained, want) {
+			t.Errorf("%q not reported as unexplained; report = %+v", want, rep.Unexplained.Paths)
+		}
+	}
+	if has(rep.Parts, "parts/README") || has(rep.Parts, "parts/sub/nested") {
+		t.Fatalf("a path the writer did not produce was counted as an upload part: %+v", rep.Parts.Paths)
+	}
+	// The part totals carry only what the writer could have produced.
+	if rep.Parts.Count != 1 || rep.Parts.Bytes != int64(len("part bytes")) {
+		t.Fatalf("parts = %d / %d bytes, want 1 / %d; report = %+v", rep.Parts.Count, rep.Parts.Bytes, len("part bytes"), rep)
+	}
+}
+
+// The writer's abandoned temporary file for a part key is not a live upload
+// part: it is a write in progress like any other, judged by the age cutoff
+// alone, and the report distinguishes it from a path nothing explains. A
+// prefix check ahead of the temporary one would count it as a live part
+// forever. Reclaiming it is MAIN-344's, not this pass's.
+func TestScanHoldsBackFreshPartTempAndNamesTheAbandonedOne(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+
+	f.stored(payload) // keeps the snapshot and gives the tree a real blob
+	partKey, err := blob.NewPartKey()
+	if err != nil {
+		t.Fatalf("part key: %v", err)
+	}
+	f.plant(partKey, "part bytes")
+
+	// A fresh temporary file for a part key: an upload writing its bytes right
+	// now, and the case that matters.
+	fresh := partKey + blob.TempSuffix
+	f.plant(fresh, "half a part")
+
+	rep := f.scan(past())
+	if has(rep.Parts, fresh) || has(rep.Unexplained, fresh) || has(rep.Orphans, fresh) {
+		t.Fatalf("a temporary file written seconds ago was reported: %+v", rep)
+	}
+	if rep.TempsInFlight != 1 {
+		t.Fatalf("TempsInFlight = %d, want 1; the age gate is what held it back: %+v", rep.TempsInFlight, rep)
+	}
+
+	// Past the cutoff it is reported, in the temporary class and no other: it
+	// is an abandoned artefact the writer gave up on, and only the age gate
+	// decided that. The fresh one is aged out too, so the age gate is the only
+	// thing deciding anything in this pass.
+	abandonedKey, err := blob.NewPartKey()
+	if err != nil {
+		t.Fatalf("part key: %v", err)
+	}
+	abandoned := abandonedKey + blob.TempSuffix
+	f.plant(abandoned, "half a part")
+	f.age(abandoned, 30*time.Hour)
+	f.age(fresh, 30*time.Hour)
+
+	rep = f.scan(time.Now().Add(-24 * time.Hour))
+	if rep.Temps.Count != 2 || rep.Temps.Bytes != 2*int64(len("half a part")) {
+		t.Fatalf("temps = %d / %d bytes, want 2 / %d; report = %+v", rep.Temps.Count, rep.Temps.Bytes, 2*len("half a part"), rep)
+	}
+	if !has(rep.Temps, abandoned) {
+		t.Fatalf("%s not named past the cutoff; report = %+v", abandoned, rep)
+	}
+	if has(rep.Parts, abandoned) || has(rep.Unexplained, abandoned) || has(rep.Orphans, abandoned) {
+		t.Fatalf("an abandoned part temporary file was reported in another class: %+v", rep)
+	}
+	if rep.TempsInFlight != 0 {
+		t.Fatalf("TempsInFlight = %d, want 0: %+v", rep.TempsInFlight, rep)
 	}
 }
 

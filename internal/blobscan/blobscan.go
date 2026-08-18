@@ -200,12 +200,35 @@ func Scan(ctx context.Context, tree Tree, files Files, tempOlderThan time.Time) 
 			return nil
 		}
 
-		// The parts prefix is checked before the id bound and before the key
-		// parses: a part key names no file id at all, so it is never an orphan
-		// candidate and never unexplained, whatever the snapshot says.
+		// A class is earned by round-tripping through what the writer
+		// produces, never by where a path sits. Checked ahead of every other
+		// class: the only writer a key under the parts prefix comes from is
+		// NewPartKey, and only what it could have produced is a live upload
+		// part. A part key names no file id, so it is never an orphan
+		// candidate; the writer's temporary file for one is a write in
+		// progress like any other, judged by the age cutoff alone; and
+		// whatever the prefix holds that parses to neither is unexplained,
+		// with its bytes, reported and left alone.
 		if strings.HasPrefix(e.Key, blob.PartsPrefix) {
-			rep.Parts.add(Candidate{Key: e.Key, Size: e.Size})
-			return nil
+			key, temp := strings.CutSuffix(e.Key, blob.TempSuffix)
+			switch {
+			case temp:
+				// A temporary file is a write in progress, not a stored part:
+				// it is judged by the age cutoff alone, in the temporary
+				// class, and only what is past the cutoff is reported.
+				if !e.ModTime.Before(tempOlderThan) {
+					rep.TempsInFlight++
+					return nil
+				}
+				rep.Temps.add(Candidate{Key: e.Key, Size: e.Size})
+				return nil
+			case blob.ParsePartKey(key):
+				rep.Parts.add(Candidate{Key: e.Key, Size: e.Size})
+				return nil
+			default:
+				rep.Unexplained.add(Candidate{Key: e.Key, Size: e.Size})
+				return nil
+			}
 		}
 
 		key, temp := strings.CutSuffix(e.Key, blob.TempSuffix)

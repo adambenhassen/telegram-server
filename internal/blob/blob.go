@@ -98,6 +98,30 @@ func NewPartKey() (string, error) {
 	return PartsPrefix + hex.EncodeToString(buf[:]), nil
 }
 
+// ParsePartKey reports whether key is one NewPartKey could have produced:
+// PartsPrefix, then exactly 32 lower-case hex characters, and nothing after.
+//
+// It is the part-key half of ParseKey and exists for the same reason: a class
+// is earned by round-tripping through what the writer produces, never by where
+// a path sits. A prefix match would count parts/README and parts/sub/nested
+// as in-flight upload bytes, and the report would contradict itself on the
+// same two files while the directory holding them was warn-logged as
+// unexplained. The round trip is through the same 16 bytes NewPartKey draws,
+// so the two cannot drift apart.
+func ParsePartKey(key string) bool {
+	suffix, ok := strings.CutPrefix(key, PartsPrefix)
+	if !ok || len(suffix) != 32 {
+		return false
+	}
+	for i := range suffix {
+		c := suffix[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // Local stores blobs as files under a directory.
 type Local struct {
 	root *os.Root
