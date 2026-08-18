@@ -41,14 +41,12 @@ func gatedConn() (*mtproto.Conn, *fakeTransport) {
 func TestGatedFallbackInsideBudgetKeepsProvisionalAnswer(t *testing.T) {
 	t.Parallel()
 	log := slog.New(&captureHandler{})
-	conn, ft := gatedConn()
+	conn, _ := gatedConn()
 	for i := 1; i <= 64; i++ {
-		if err := api.GatedUnhandledForTest(log, conn, provisionalBody(t)); err != nil {
-			t.Fatalf("call %d: %v, want the answer written to the wire", i, err)
+		rpc := mustRPCError(t, api.GatedUnhandledForTest(log, conn, provisionalBody(t)))
+		if rpc.Code != 401 || rpc.Message != "AUTH_KEY_UNREGISTERED" {
+			t.Fatalf("call %d: %d %s, want 401 AUTH_KEY_UNREGISTERED", i, rpc.Code, rpc.Message)
 		}
-	}
-	if !ft.wasSent() {
-		t.Fatal("the provisional answer never reached the wire")
 	}
 }
 
@@ -66,8 +64,9 @@ func TestGatedFallbackCrossesAllThreeThresholds(t *testing.T) {
 		err := api.GatedUnhandledForTest(log, conn, provisionalBody(t))
 		switch {
 		case i <= 64:
-			if err != nil {
-				t.Fatalf("call %d: %v, want the answer written to the wire", i, err)
+			rpc := mustRPCError(t, err)
+			if rpc.Code != 401 || rpc.Message != "AUTH_KEY_UNREGISTERED" {
+				t.Fatalf("call %d: %d %s, want 401 AUTH_KEY_UNREGISTERED", i, rpc.Code, rpc.Message)
 			}
 		case i < 256:
 			rpc := mustRPCError(t, err)
@@ -106,8 +105,9 @@ func TestGatedFallbackSharesTheBudgetWithNonProvisional(t *testing.T) {
 		switch {
 		case i <= 64:
 			if i%2 == 1 {
-				if err != nil {
-					t.Fatalf("call %d: %v, want the answer written to the wire", i, err)
+				rpc := mustRPCError(t, err)
+				if rpc.Code != 401 || rpc.Message != "AUTH_KEY_UNREGISTERED" {
+					t.Fatalf("call %d: %d %s, want 401 AUTH_KEY_UNREGISTERED", i, rpc.Code, rpc.Message)
 				}
 			} else {
 				rpc := mustRPCError(t, err)
@@ -158,11 +158,13 @@ func TestGatedFallbackSamplesTheLog(t *testing.T) {
 		t.Errorf("first line suppressed = %q, want %q", got, "0")
 	}
 
-	// The burst ends the connection at the 256th call. The provisional path
-	// logs on Answer and Close verdicts but not on FloodWait, so the sampler
-	// sees: call 1 emits (suppressed=0), calls 2-64 drop (63), calls 65-255
-	// are silent (FloodWait, no log call), call 256 drops (64), calls 257-300
-	// drop (44 more, total 108). Advance the clock past the interval and flush
+	// The burst ends the connection at the 256th call, and every call after the
+	// first line is owed to the drop, not to a later line on this conn: the 63
+	// in the answer band, the 191 in the flood band, and the 45 past the
+	// ceiling — the same 299 the non-provisional path owes, because this path
+	// samples on every verdict the way it does. Only this harness drives past
+	// the ceiling — a real connection dies on call 256, so production
+	// suppresses 255, not 299. Advance the clock past the interval and flush
 	// the way the serve loop does when it drops the conn: the line it writes
 	// must carry the calls it stands for.
 	cl.Advance(11 * time.Second)
@@ -171,8 +173,8 @@ func TestGatedFallbackSamplesTheLog(t *testing.T) {
 	if len(h.records) != 2 {
 		t.Fatalf("captured %d records, want the in-interval line and the flush", len(h.records))
 	}
-	if got := attrs(h.records[1])["suppressed"]; got != "108" {
-		t.Errorf("flush suppressed = %q, want %q", got, "108")
+	if got := attrs(h.records[1])["suppressed"]; got != "299" {
+		t.Errorf("flush suppressed = %q, want %q", got, "299")
 	}
 }
 

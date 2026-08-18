@@ -72,42 +72,38 @@ func TestServeConnClosesAtUnimplementedCeiling(t *testing.T) {
 	}
 }
 
-// TestServeConnClosesAtUnimplementedCeilingOnProvisionalSession pins the
-// ticket's case at the serve-loop level: a provisional session driving
-// unimplemented calls is bounded identically to a non-provisional one, so the
-// ceiling call ends the connection the same way. The handler here charges the
-// shared budget the way the real gated fallback does, so the count the serve
-// loop sees is the real one.
-func TestServeConnClosesAtUnimplementedCeilingOnProvisionalSession(t *testing.T) {
+// TestServeConnDeliversProvisionalFlagToTheHandler proves the serve loop
+// delivers the store's provisional flag to the handler, so a test that binds a
+// provisional session through the store exercises the gated fallback the way a
+// real connection does. The handler records the flag it sees; the store says
+// the session is provisional, and the handler must see it.
+func TestServeConnDeliversProvisionalFlagToTheHandler(t *testing.T) {
 	t.Parallel()
 	key := rebindTestKey()
-	ks := &statusKeyStore{key: key, users: []int64{7}}
+	ks := &statusKeyStore{key: key, users: []int64{7}, provisional: true}
 
-	var verdicts []mtproto.UnimplementedVerdict
-	h := mtproto.HandlerFunc(func(c *mtproto.Conn, _ *mtproto.Request) error {
-		v := c.ChargeUnimplemented()
-		verdicts = append(verdicts, v)
-		if v == mtproto.UnimplementedClose {
-			return errCeiling
-		}
+	var gotProvisional []bool
+	h := mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
+		gotProvisional = append(gotProvisional, req.Provisional)
 		return nil
 	})
 	srv := mtproto.New(exchange.PrivateKey{}, 2, ks, h, nil)
 
-	const frameCount = 300
-	frames := make([][]byte, frameCount)
+	frames := make([][]byte, 2)
 	for i := range frames {
 		frames[i] = statusClientFrame(t, key, 42, int64(i+1)<<32, &tg.AccountRegisterDeviceRequest{})
 	}
 
-	if err := srv.ServeConn(context.Background(), &statusFrameConn{frames: frames}); !errors.Is(err, errCeiling) {
-		t.Fatalf("ServeConn = %v, want %v", err, errCeiling)
+	if err := srv.ServeConn(context.Background(), &statusFrameConn{frames: frames}); !errors.Is(err, io.EOF) {
+		t.Fatalf("ServeConn = %v, want EOF", err)
 	}
-	if len(verdicts) != 256 {
-		t.Fatalf("dispatched %d calls, want the connection to end on the 256th", len(verdicts))
+	if len(gotProvisional) != 2 {
+		t.Fatalf("handler saw %d calls, want 2", len(gotProvisional))
 	}
-	if got := verdicts[len(verdicts)-1]; got != mtproto.UnimplementedClose {
-		t.Errorf("last verdict = %v, want %v", got, mtproto.UnimplementedClose)
+	for i, p := range gotProvisional {
+		if !p {
+			t.Fatalf("call %d: req.Provisional = false, want the store's true", i+1)
+		}
 	}
 }
 

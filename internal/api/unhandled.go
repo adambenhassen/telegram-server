@@ -92,12 +92,12 @@ func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
 // definition, so a provisional session gets AUTH_KEY_UNREGISTERED instead of
 // INPUT_METHOD_INVALID.
 //
-// The gate only changes the in-band answer, never the charging: handleUnknown
-// charges the connection's shared unimplemented-method budget for every call,
-// provisional or not, and it is what decides the back-off and the close. A
-// second counter here would let a connection alternate the two paths and get a
-// fresh allowance per path, which is the flood MAIN-350 bounded wearing a
-// different error string.
+// The gate only changes the in-band answer, never the charging: it charges
+// the connection's shared unimplemented-method budget itself, the same counter
+// handleUnknown charges on the non-provisional path, and that counter decides
+// the back-off and the close. A second counter here would let a connection
+// alternate the two paths and get a fresh allowance per path, which is the
+// flood MAIN-350 bounded wearing a different error string.
 func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) error {
 	if req.UserID != 0 && req.Provisional {
 		// Inside the budget the provisional answer keeps its precedence over the
@@ -105,29 +105,32 @@ func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) err
 		// up. Past the budget the connection is on the non-provisional schedule:
 		// the back-off and the close both say what is true about the connection,
 		// not about the session, and a provisional session that loops is the same
-		// loop a non-provisional one is.
+		// loop a non-provisional one is. Every verdict samples the line the way
+		// handleUnknown does, so a burst on this path owes the drop the same
+		// count one on the other path does.
+		answer := errAuthKeyUnreg
 		switch v := c.ChargeUnimplemented(); v {
-		case mtproto.UnimplementedAnswer:
-			if suppressed, ok := c.LogUnimplemented(); ok {
-				h.log.Warn("method not implemented",
-					"error_code", errAuthKeyUnreg.Code,
-					"error", errAuthKeyUnreg.Message,
-					"suppressed", suppressed,
-				)
-			}
-			return c.SendErr(req, errAuthKeyUnreg)
 		case mtproto.UnimplementedClose:
 			if suppressed, ok := c.LogUnimplemented(); ok {
 				h.log.Warn("method not implemented",
-					"error_code", errAuthKeyUnreg.Code,
-					"error", errAuthKeyUnreg.Message,
+					"error_code", answer.Code,
+					"error", answer.Message,
 					"suppressed", suppressed,
 				)
 			}
 			return errMethodNotImplBurst
-		default:
-			return errMethodNotImplFlood
+		case mtproto.UnimplementedFloodWait:
+			answer = errMethodNotImplFlood
+		case mtproto.UnimplementedAnswer:
 		}
+		if suppressed, ok := c.LogUnimplemented(); ok {
+			h.log.Warn("method not implemented",
+				"error_code", answer.Code,
+				"error", answer.Message,
+				"suppressed", suppressed,
+			)
+		}
+		return answer
 	}
 	return h.handleUnknown(c, req)
 }
