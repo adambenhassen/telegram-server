@@ -253,7 +253,9 @@ func TestParsePartKeyRoundTrips(t *testing.T) {
 func TestKeyspacesAreDisjoint(t *testing.T) {
 	t.Parallel()
 
-	ids := []int64{1, 2, 15, 16, 255, 256, 257, 4242, 1 << 20, 1 << 40, math.MaxInt64}
+	edges := []int64{1, 2, 15, 16, 255, 256, 257, 4242, 1 << 20, 1 << 40, math.MaxInt64}
+	ids := make([]int64, 0, len(edges)+512)
+	ids = append(ids, edges...)
 	for i := range 512 {
 		ids = append(ids, int64(i)+1)
 	}
