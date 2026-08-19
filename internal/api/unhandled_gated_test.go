@@ -59,6 +59,11 @@ func TestGatedFallbackCrossesAllThreeThresholds(t *testing.T) {
 	t.Parallel()
 	log := slog.New(&captureHandler{})
 	conn, _ := gatedConn()
+	// The thresholds are counted inside one charge window, which the conn
+	// measures against its own clock. Hold that clock still: 300 calls are one
+	// window however long the runtime takes to make them, so a stall cannot
+	// roll the window over mid-loop and move the calls into other bands.
+	conn.SetClock(&testClock{now: time.Now()})
 
 	for i := 1; i <= 300; i++ {
 		err := api.GatedUnhandledForTest(log, conn, provisionalBody(t))
@@ -92,6 +97,10 @@ func TestGatedFallbackSharesTheBudgetWithNonProvisional(t *testing.T) {
 	t.Parallel()
 	log := slog.New(&captureHandler{})
 	conn, _ := gatedConn()
+	// One window for the whole alternating loop, whatever the runtime costs: a
+	// window that rolled over mid-loop would hand the connection a fresh
+	// allowance, which is the very thing this test says it cannot get.
+	conn.SetClock(&testClock{now: time.Now()})
 	prov := provisionalBody(t)
 	plain := registerDeviceBody(t)
 
