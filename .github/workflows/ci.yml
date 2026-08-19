@@ -329,8 +329,7 @@ jobs:
 
           for attempt in 1 2; do
             status=0
-            if [ "$attempt" -eq 1 ]; then limit=20s; else limit=4m; fi
-            setsid timeout --signal=KILL "$limit" pnpm exec playwright install --with-deps chromium &
+            setsid timeout --signal=KILL 4m pnpm exec playwright install --with-deps chromium &
             pid=$!
             wait "$pid" || status=$?
             if [ "$status" -eq 0 ]; then
