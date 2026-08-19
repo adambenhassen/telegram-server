@@ -281,17 +281,42 @@ jobs:
       # since a stale browser for a newer Playwright is worse than a fresh
       # download.
       - name: Cache Playwright browsers
+        id: playwright-cache
         uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
 
+      # A miss means the next step downloads the browser instead of unpacking a
+      # cached one, which is the difference between a few seconds and a minute
+      # or more. Without this the two are indistinguishable in the log.
+      - name: Report Playwright cache outcome
+        run: echo "playwright browser cache hit=${{ steps.playwright-cache.outputs.cache-hit == 'true' }} key=playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}"
+
       # playwright.config.ts declares no projects, so the suite runs on Chromium
       # alone and there is no reason to download the other two. --with-deps is
       # still needed on a cache hit: the apt libraries it installs live on the
       # runner image, not in the cached browser directory.
+      #
+      # The download has hung here twice, holding the job until its 20-minute
+      # timeout killed it and reported the whole run as cancelled. The install
+      # takes well under a minute either way, so each attempt is bounded at four
+      # and a stalled one is retried once; the step timeout is the backstop if
+      # the bounding itself fails. A step timeout fails the job, so this now
+      # reads as a failure rather than a supersede.
       - name: Install Playwright browsers
-        run: pnpm exec playwright install --with-deps chromium
+        timeout-minutes: 9
+        run: |
+          for attempt in 1 2; do
+            status=0
+            timeout --signal=KILL 4m pnpm exec playwright install --with-deps chromium || status=$?
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            echo "::warning::playwright install attempt $attempt failed (exit $status)"
+          done
+          echo "::error::playwright install failed after 2 attempts"
+          exit 1
 
       # The webServer runs this same package with `go run`, so a compile error
       # would otherwise surface as a 120s webServer timeout with the real error

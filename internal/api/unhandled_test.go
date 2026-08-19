@@ -208,26 +208,28 @@ func TestUnhandledBudgetSamplesTheLog(t *testing.T) {
 			t.Fatalf("call %d: answered with no error", i+1)
 		}
 	}
-	if n := len(h.records); n != 1 {
-		t.Fatalf("emitted %d lines inside the interval, want the 1 the sampled path emits", n)
+	// The sampled path emits the first call's line, and the connection-ending
+	// verdict — exempt from the interval gate — emits exactly one more, the
+	// line that names the call that ended the conn. 300 calls are two lines.
+	if n := len(h.records); n != 2 {
+		t.Fatalf("emitted %d lines, want the 1 the sampled path emits and the close line", n)
 	}
 	if got := attrs(h.records[0])["suppressed"]; got != "0" {
 		t.Errorf("first line suppressed = %q, want %q", got, "0")
 	}
 
-	// The burst ends the connection at the 256th call, and every call after the
-	// first line — the 254 in the flood band and the 45 past the ceiling — is
-	// owed to the drop, not to a later line on this conn. Advance the clock
-	// past the interval and flush the way the serve loop does when it drops the
-	// conn: the line it writes must carry the calls it stands for.
+	// The close line consumed the pending count the sampler held open behind
+	// the first line: the 254 calls the sampler suppressed (calls 2-255; the
+	// close call itself is the one the close line describes, so it is not a
+	// drop). The drop's flush then has nothing left to write — the count
+	// rides on a line that names the call, not on a line that names nothing.
+	if got := attrs(h.records[1])["suppressed"]; got != "254" {
+		t.Errorf("close line suppressed = %q, want %q", got, "254")
+	}
 	cl.Advance(11 * time.Second)
 	conn.FlushUnimplementedLog()
-
 	if len(h.records) != 2 {
-		t.Fatalf("captured %d records, want the in-interval line and the flush", len(h.records))
-	}
-	if got := attrs(h.records[1])["suppressed"]; got != "299" {
-		t.Errorf("flush suppressed = %q, want %q", got, "299")
+		t.Fatalf("captured %d records after the drop, want the two lines and nothing more", len(h.records))
 	}
 }
 

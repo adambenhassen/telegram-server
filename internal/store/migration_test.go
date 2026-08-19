@@ -55,6 +55,28 @@ func TestOpenRejectsPrePartBlobSchema(t *testing.T) {
 	requireOpenMigrationError(t, ctx, dsn)
 }
 
+// TestOpenRejectsPartBlobPayloadNotDropped proves the sentinel's payload clause
+// fires on its own: with the migration's size and blob_key columns already in
+// place, the one thing left is dropping payload. Without that clause the
+// sentinel would see a migrated schema where the part bytes are still in
+// Postgres.
+func TestOpenRejectsPartBlobPayloadNotDropped(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `ALTER TABLE upload_parts ADD COLUMN payload BYTEA NOT NULL DEFAULT ''`); err != nil {
+		t.Fatalf("re-add payload: %v", err)
+	}
+
+	requireOpenMigrationError(t, ctx, dsn)
+}
+
 // TestOpenRejectsPartBlobMigrationMissing proves the sentinel catches a
 // migrations/ directory that stops short of the part-blob migration: a fresh
 // database built from every migration file except the newest one must fail

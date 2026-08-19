@@ -10,15 +10,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // ErrNotFound is returned by [Store.ReadAt] for a key that was never stored.
 var ErrNotFound = errors.New("blob not found")
+
+// TempSuffix is what [Local.Put] appends to a key while the bytes are being
+// written. A path carrying it is a write in progress, not a stored blob, and it
+// is named here rather than spelled inline at both ends: a pass classifying the
+// tree has to recognise the writer's working file, and a second spelling of it
+// is a second place to drift from.
+const TempSuffix = ".tmp"
 
 // Store is the seam an object-storage backend lands on later. It has a single
 // implementation, [Local], on purpose.
@@ -33,44 +41,54 @@ type Store interface {
 	// Remove deletes key. Deleting a key that is not there is a no-op, so a
 	// caller that races a sweep or a re-save never needs to know which won.
 	Remove(ctx context.Context, key string) error
-	// ListPrefix returns keys at or after after within prefix, each with the
-	// size and modification time an age-based pass needs. Containment is
-	// always enforced: every key returned is under prefix, and a prefix that
-	// does not resolve to a containment scope fails closed rather than
-	// widening. after is the resume position, a separate input from prefix:
-	// an empty after starts at the beginning of the prefix. The result is
-	// globally ordered by key. limit bounds the page: a positive limit
-	// returns at most that many keys, and a caller that walks the prefix
-	// passes the last key of each page as the next after. The sentinel
-	// AllKeys returns every key under the prefix in one call, for a caller
-	// that walks the whole prefix once and chunks its own work; it is the
-	// only unbounded form and must be named at the call site. Zero and any
-	// other negative value are errors: a caller that computed a zero limit
-	// has a bug that must not silently become an unbounded operation. An
-	// empty prefix lists nothing: the assembled keyspace has no single
-	// prefix, so nothing outside a named prefix is reachable through this.
-	ListPrefix(ctx context.Context, prefix, after string, limit int) ([]Object, error)
-}
-
-// AllKeys is the ListPrefix sentinel for an unbounded page: every key under
-// the prefix in one call. It is the only unbounded form and must be named at
-// the call site; zero and any other negative value are errors, because a
-// caller that computed a zero limit has a bug that must not silently become
-// an unbounded operation feeding a delete loop.
-const AllKeys = -1
-
-// Object is one entry of a [Store.ListPrefix] page: the key and the two
-// facts an age-based pass decides from, how big the object is and when it
-// last changed.
-type Object struct {
-	Key      string
-	Size     int64
-	Modified time.Time
+	// WalkPrefix calls fn for every entry under prefix, streaming, and stops
+	// at the first error fn returns. Containment is the backend's, not the
+	// caller's: every entry fn sees is under prefix, an empty prefix
+	// enumerates nothing, and a prefix that names no containment scope fails
+	// closed rather than widening. A prefix holding no objects yields nothing
+	// and is not an error.
+	//
+	// It streams because what the caller must hold is then the caller's
+	// choice: an age-based pass batches it into whatever its own gate can
+	// carry, and a remote backend hands its listing over a page at a time
+	// rather than buffering a whole bucket to answer one call.
+	WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error) error
 }
 
 // Key returns the storage key for a file id, sharded on the id's low byte so
 // that no single directory accumulates every blob.
 func Key(id int64) string { return fmt.Sprintf("%02x/%d", id&0xff, id) }
+
+// ParseKey returns the file id key names, and reports whether key is one Key
+// could have produced.
+//
+// It is deliberately strict, because it is how a pass over the tree separates
+// blobs it can reason about from paths it cannot. A padded number, a shard that
+// does not match its id, upper-case hex, an extra path element: none of those
+// come from this package, so none of them is a key, and whatever acts on the
+// classification must treat them as unexplained rather than as blobs. The check
+// is a round trip through Key rather than a second reading of the layout, so
+// the two cannot drift apart.
+func ParseKey(key string) (int64, bool) {
+	_, num, ok := strings.Cut(key, "/")
+	if !ok {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(num, 10, 64)
+	if err != nil || id <= 0 || Key(id) != key {
+		return 0, false
+	}
+	return id, true
+}
+
+// IsShard reports whether name is a shard directory Key's layout produces: an
+// id's low byte, as exactly two lower-case hex digits. It is the directory half
+// of ParseKey and exists for the same reason — a directory under the blob root
+// that no key could live in is something else's, not the store's.
+func IsShard(name string) bool {
+	b, err := strconv.ParseUint(name, 16, 8)
+	return err == nil && fmt.Sprintf("%02x", b) == name
+}
 
 // PartsPrefix is the key prefix every in-flight upload part lives under. It
 // is statically disjoint from the assembled-blob keyspace: assembled keys are
@@ -90,6 +108,30 @@ func NewPartKey() (string, error) {
 		return "", fmt.Errorf("part key: %w", err)
 	}
 	return PartsPrefix + hex.EncodeToString(buf[:]), nil
+}
+
+// ParsePartKey reports whether key is one NewPartKey could have produced:
+// PartsPrefix, then exactly 32 lower-case hex characters, and nothing after.
+//
+// It is the part-key half of ParseKey and exists for the same reason: a class
+// is earned by round-tripping through what the writer produces, never by where
+// a path sits. A prefix match would count parts/README and parts/sub/nested
+// as in-flight upload bytes, and the report would contradict itself on the
+// same two files while the directory holding them was warn-logged as
+// unexplained. The round trip is through the same 16 bytes NewPartKey draws,
+// so the two cannot drift apart.
+func ParsePartKey(key string) bool {
+	suffix, ok := strings.CutPrefix(key, PartsPrefix)
+	if !ok || len(suffix) != 32 {
+		return false
+	}
+	for i := range suffix {
+		c := suffix[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // Local stores blobs as files under a directory.
@@ -117,99 +159,6 @@ func NewLocal(dir string) (*Local, error) {
 // RootDir reports the directory the store is rooted in.
 func (l *Local) RootDir() string { return l.dir }
 
-// ListPrefix returns the limit smallest keys at or after after within
-// prefix, globally ordered by key. Containment is always enforced: every key
-// returned starts with prefix, and a prefix that does not name a directory
-// scope (a file, a missing path, or the empty string) fails closed rather
-// than widening to the store root. after is the resume position, separate
-// from prefix: an empty after starts at the beginning of the prefix, and a
-// non-empty after skips every key that sorts at or below it. A page never
-// exceeds limit.
-//
-// The walk collects every key under the prefix's directory subtree, filters
-// by containment and resume position, sorts globally, and returns the first
-// limit. The walk cannot stop early: for a nested prefix, a directory that
-// sorts late may hold keys that sort before keys in an earlier directory, so
-// the limit smallest are not known until the whole subtree is seen. The parts
-// prefix is flat (one directory), so in practice this is one directory read.
-func (l *Local) ListPrefix(_ context.Context, prefix, after string, limit int) ([]Object, error) {
-	if limit == 0 || (limit < 0 && limit != AllKeys) {
-		return nil, fmt.Errorf("blob list: limit %d must be positive or AllKeys", limit)
-	}
-	if prefix == "" {
-		return nil, nil
-	}
-	// The containment scope is the directory the prefix names. A prefix with
-	// no separator ("92") names a top-level shard directory; one with a
-	// separator ("parts/aaa") names the directory it sits in. A prefix that
-	// does not resolve to a directory fails closed: widening to the store
-	// root would enumerate the assembled keyspace, which is exactly what this
-	// method must not do.
-	scope := strings.TrimSuffix(prefix, "/")
-	if i := strings.LastIndex(prefix, "/"); i >= 0 && i+1 < len(prefix) {
-		scope = strings.TrimSuffix(prefix[:i+1], "/")
-	}
-	fi, err := l.root.Lstat(scope)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil // the prefix has no objects yet
-		}
-		return nil, fmt.Errorf("blob list: %w", err)
-	}
-	if !fi.IsDir() {
-		// A file, not a directory: the prefix names no containment scope.
-		// Fail closed rather than widen to the parent.
-		return nil, fmt.Errorf("blob list: %q is not a directory", scope)
-	}
-	// Collect every object under the scope.
-	var all []Object
-	var walk func(p string) error
-	walk = func(p string) error {
-		f, err := l.root.Open(p)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		defer func() { _ = f.Close() }() //nolint:errcheck // read-only close
-		entries, err := f.Readdir(-1)
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			child := e.Name()
-			if p != "." {
-				child = p + "/" + child
-			}
-			if e.IsDir() {
-				if err := walk(child); err != nil {
-					return err
-				}
-				continue
-			}
-			// Containment: only keys under the caller's prefix.
-			if !strings.HasPrefix(child, prefix) {
-				continue
-			}
-			// Resume: skip keys at or below the after position.
-			if after != "" && child <= after {
-				continue
-			}
-			all = append(all, Object{Key: child, Size: e.Size(), Modified: e.ModTime()})
-		}
-		return nil
-	}
-	if err := walk(scope); err != nil {
-		return nil, fmt.Errorf("blob list: %w", err)
-	}
-	sort.Slice(all, func(i, j int) bool { return all[i].Key < all[j].Key })
-	if limit > 0 && len(all) > limit {
-		all = all[:limit]
-	}
-	return all, nil
-}
-
 // Put writes r to a temporary file and renames it into place, so a reader
 // never observes a partially written blob. O_EXCL on the temporary file also
 // means two concurrent Puts to the same key cannot interleave: the second
@@ -220,7 +169,7 @@ func (l *Local) Put(_ context.Context, key string, r io.Reader) (int64, error) {
 	if err := l.root.MkdirAll(path.Dir(key), 0o700); err != nil {
 		return 0, fmt.Errorf("blob mkdir: %w", err)
 	}
-	tmp := key + ".tmp"
+	tmp := key + TempSuffix
 	f, err := l.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return 0, fmt.Errorf("blob create: %w", err)
@@ -242,6 +191,120 @@ func (l *Local) Put(_ context.Context, key string, r io.Reader) (int64, error) {
 		return 0, fmt.Errorf("blob rename: %w", err)
 	}
 	return n, nil
+}
+
+// Entry is one path found under a store's root by [Local.Walk] or under a key
+// prefix by [Store.WalkPrefix].
+type Entry struct {
+	// Key is the path relative to the store root, slash-separated, so it
+	// compares directly against what Key produces.
+	Key string
+	// Dir reports a directory.
+	Dir bool
+	// Regular reports an ordinary file. A symlink, socket, device or fifo is
+	// neither Dir nor Regular: Put creates none of them, so a caller must not
+	// have to infer that from the name it happens to carry.
+	Regular bool
+	// Size is the byte size of a regular file, and zero for anything else.
+	Size int64
+	// ModTime is when the entry was last written, which is what dates a write
+	// still in progress.
+	ModTime time.Time
+}
+
+// Walk calls fn for every entry under the store root, the root itself excluded,
+// and stops at the first error fn returns. It is read-only and takes no lock:
+// it observes whatever the tree held as it passed, so a blob written into a
+// directory it has already left is simply not seen by this call.
+//
+// An entry that vanishes between being listed and being examined is skipped
+// rather than failed on. Put renames its temporary file into place while a walk
+// may be running, so a path disappearing mid-walk is ordinary traffic, not a
+// fault. Every other error stops the walk and is returned — a walk that quietly
+// skipped an unreadable subtree would report nothing for it, which reads
+// exactly like finding nothing there.
+func (l *Local) Walk(ctx context.Context, fn func(Entry) error) error {
+	return l.walk(ctx, ".", "", fn)
+}
+
+// WalkPrefix calls fn for every entry under prefix, the directory the prefix is
+// contained by excluded, and stops at the first error fn returns. It carries
+// the same read-only, lock-free, vanishing-path semantics as [Local.Walk].
+//
+// Containment is the point of the method and lives here rather than in the
+// caller: every entry fn sees is under prefix, and a prefix that names no
+// containment scope fails closed rather than widening. An empty prefix
+// enumerates nothing — the assembled keyspace has no single prefix, so nothing
+// outside a named prefix is reachable through this — and a prefix that resolves
+// to a file rather than a directory is an error, because widening to that
+// file's parent would enumerate keys the caller never named. A prefix with no
+// objects yet is not an error: it yields nothing.
+//
+// It streams rather than returning a page, so a caller holds only what it
+// chooses to accumulate and the enumeration itself is one directory read per
+// run whatever the prefix holds. That is also what a remote backend's listing
+// natively is — a continuation token, a page at a time — so the shape does not
+// require one to buffer a whole bucket listing to satisfy it.
+func (l *Local) WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error) error {
+	if prefix == "" {
+		return nil
+	}
+	// The containment scope is the directory the prefix names. A prefix with
+	// no separator ("92") names a top-level shard directory; one with a
+	// separator ("parts/aaa") names the directory it sits in. A prefix that
+	// does not resolve to a directory fails closed: widening to the store root
+	// would enumerate the assembled keyspace, which is exactly what this
+	// method must not do.
+	scope := strings.TrimSuffix(prefix, "/")
+	if i := strings.LastIndex(prefix, "/"); i >= 0 && i+1 < len(prefix) {
+		scope = strings.TrimSuffix(prefix[:i+1], "/")
+	}
+	fi, err := l.root.Lstat(scope)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // the prefix has no objects yet
+		}
+		return fmt.Errorf("blob walk: %w", err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("blob walk: %q is not a directory", scope)
+	}
+	return l.walk(ctx, scope, prefix, fn)
+}
+
+// walk is the package's one enumeration: it yields every entry under root
+// except root itself, keeping only those whose key carries prefix. Walk passes
+// the store root and an empty prefix, WalkPrefix passes the prefix's
+// containment scope and the prefix; there is no second traversal to drift from
+// this one.
+func (l *Local) walk(ctx context.Context, root, prefix string, fn func(Entry) error) error {
+	return fs.WalkDir(l.root.FS(), root, func(p string, d fs.DirEntry, err error) error {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil
+		case err != nil:
+			return fmt.Errorf("blob walk %s: %w", p, err)
+		case p == root:
+			return nil
+		case !strings.HasPrefix(p, prefix):
+			return nil
+		}
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("blob walk stat %s: %w", p, err)
+		}
+		e := Entry{Key: p, Dir: d.IsDir(), Regular: info.Mode().IsRegular(), ModTime: info.ModTime()}
+		if e.Regular {
+			e.Size = info.Size()
+		}
+		return fn(e)
+	})
 }
 
 // Remove deletes key. Deleting a key that is not there is a no-op, so a

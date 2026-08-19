@@ -49,20 +49,17 @@ var errMethodNotImplBurst = errors.New("unimplemented-method ceiling")
 // whether the line describing it is emitted at all.
 func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
 	answer := errMethodNotImpl
+	isClose := false
 	switch c.ChargeUnimplemented() {
 	case mtproto.UnimplementedClose:
 		// The burst ends the connection on this call, so no later line on it
-		// comes to carry the sampler's pending count. The drop writes it —
-		// the serve loop flushes the conn before it closes the socket — and
-		// this call is the one it stands for, so it is owed here too.
-		if suppressed, ok := c.LogUnimplemented(); ok {
-			h.log.Warn("method not implemented",
-				"error_code", answer.Code,
-				"error", answer.Message,
-				"suppressed", suppressed,
-			)
-		}
-		return errMethodNotImplBurst
+		// comes to carry the sampler's pending count. The close verdict is
+		// exempt from the interval gate: a connection ends exactly once, so
+		// its line costs at most one line per connection, and it is the one
+		// line that must say what was called rather than being lost behind
+		// the sampler. It consumes the pending count, so the drop's flush
+		// finds nothing left to write.
+		isClose = true
 	case mtproto.UnimplementedFloodWait:
 		answer = errMethodNotImplFlood
 	case mtproto.UnimplementedAnswer:
@@ -70,10 +67,34 @@ func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
 
 	id, err := req.Buf.PeekID()
 	if err != nil {
+		if isClose {
+			if suppressed, ok := c.LogUnimplementedClose(); ok {
+				h.log.Warn("method not implemented: peek id failed",
+					"err", err,
+					"error", errMethodNotImplBurst.Error(),
+					"suppressed", suppressed,
+				)
+			}
+			return errMethodNotImplBurst
+		}
 		if suppressed, ok := c.LogUnimplemented(); ok {
 			h.log.Warn("method not implemented: peek id failed", "err", err, "suppressed", suppressed)
 		}
 		return answer
+	}
+	if isClose {
+		// The line names the error the caller received. On a close the caller
+		// receives no RPC answer at all — the connection ends — so the line
+		// names the non-RPC error that ended it, and carries no error code.
+		if suppressed, ok := c.LogUnimplementedClose(); ok {
+			h.log.Warn("method not implemented",
+				"type_id", fmt.Sprintf("%#x", id),
+				"method", methodName(id),
+				"error", errMethodNotImplBurst.Error(),
+				"suppressed", suppressed,
+			)
+		}
+		return errMethodNotImplBurst
 	}
 	if suppressed, ok := c.LogUnimplemented(); ok {
 		h.log.Warn("method not implemented",
@@ -88,12 +109,68 @@ func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
 }
 
 // handleUnknownGated is the fallback handler that applies the provisional gate
-// before delegating to handleUnknown. Unregistered methods are not in the
-// allow-list by definition, so a provisional session gets AUTH_KEY_UNREGISTERED
-// instead of INPUT_METHOD_INVALID.
+// to handleUnknown. Unregistered methods are not in the allow-list by
+// definition, so a provisional session gets AUTH_KEY_UNREGISTERED instead of
+// INPUT_METHOD_INVALID.
+//
+// The gate only changes the in-band answer, never the charging: it charges
+// the connection's shared unimplemented-method budget itself, the same counter
+// handleUnknown charges on the non-provisional path, and that counter decides
+// the back-off and the close. A second counter here would let a connection
+// alternate the two paths and get a fresh allowance per path, which is the
+// flood MAIN-350 bounded wearing a different error string.
 func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) error {
 	if req.UserID != 0 && req.Provisional {
-		return c.SendErr(req, errAuthKeyUnreg)
+		// Inside the budget the provisional answer keeps its precedence over the
+		// not-implemented one, so the client re-authenticates rather than giving
+		// up. Past the budget the connection is on the non-provisional schedule:
+		// the back-off and the close both say what is true about the connection,
+		// not about the session, and a provisional session that loops is the same
+		// loop a non-provisional one is. Every verdict samples the line the way
+		// handleUnknown does, so a burst on this path owes the drop the same
+		// count one on the other path does.
+		answer := errAuthKeyUnreg
+		isClose := false
+		switch v := c.ChargeUnimplemented(); v {
+		case mtproto.UnimplementedClose:
+			isClose = true
+		case mtproto.UnimplementedFloodWait:
+			answer = errMethodNotImplFlood
+		case mtproto.UnimplementedAnswer:
+		}
+		if isClose {
+			// The close verdict is exempt from the interval gate, the way
+			// handleUnknown does it: a connection ends exactly once, so its
+			// line costs at most one line per connection, and it is the one
+			// line that must say what was called rather than being lost
+			// behind the sampler. It consumes the pending count, so the
+			// drop's flush finds nothing left to write.
+			id, _ := req.Buf.PeekID() //nolint:errcheck // dispatcher already validated the id
+			// The line names the error the caller received. On a close the
+			// caller receives no RPC answer at all — the connection ends —
+			// so the line names the non-RPC error that ended it, and carries
+			// no error code.
+			if suppressed, ok := c.LogUnimplementedClose(); ok {
+				h.log.Warn("method not implemented",
+					"type_id", fmt.Sprintf("%#x", id),
+					"method", methodName(id),
+					"error", errMethodNotImplBurst.Error(),
+					"suppressed", suppressed,
+				)
+			}
+			return errMethodNotImplBurst
+		}
+		if suppressed, ok := c.LogUnimplemented(); ok {
+			id, _ := req.Buf.PeekID() //nolint:errcheck // dispatcher already validated the id
+			h.log.Warn("method not implemented",
+				"type_id", fmt.Sprintf("%#x", id),
+				"method", methodName(id),
+				"error_code", answer.Code,
+				"error", answer.Message,
+				"suppressed", suppressed,
+			)
+		}
+		return answer
 	}
 	return h.handleUnknown(c, req)
 }
