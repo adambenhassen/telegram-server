@@ -3,6 +3,7 @@ package blob_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -85,11 +86,16 @@ func TestWalkPrefix(t *testing.T) {
 	}
 }
 
-// TestWalkPrefixStreamsWithoutBuffering asserts the property the shape exists
-// for: entries arrive one at a time and a caller that stops early stops the
-// walk. A page-returning enumeration would have materialised all of them
-// before the caller saw the first.
-func TestWalkPrefixStreamsWithoutBuffering(t *testing.T) {
+// TestWalkPrefixYieldsEveryEntryAndHonoursCallerStop asserts what the callback
+// shape buys the caller: every entry under the prefix arrives, and a caller
+// that stops mid-walk stops the walk and gets its own error back.
+//
+// It does not prove the traversal avoids buffering — twenty entries against a
+// 512-entry chunk cannot reach that, and no test here can observe the read
+// size. What holds that property is the chunked read in walk, exercised across
+// its boundary by TestWalkPrefixCrossesChunkBoundary and measured as a flat
+// heap in the PR.
+func TestWalkPrefixYieldsEveryEntryAndHonoursCallerStop(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	l, _ := newLocal(t)
@@ -134,6 +140,39 @@ func TestWalkPrefixStreamsWithoutBuffering(t *testing.T) {
 	}
 	if count != 3 {
 		t.Fatalf("callback ran %d times after stopping at 3", count)
+	}
+}
+
+// TestWalkPrefixCrossesChunkBoundary walks directories sized around the read
+// chunk. The traversal reads a fixed number of entries at a time and loops, so
+// the counts either side of that boundary are where a walk stops early or
+// repeats: an off-by-one in the loop's exit condition is invisible at any other
+// size, and the pass built on it would then reclaim part of the prefix and
+// report a clean run.
+func TestWalkPrefixCrossesChunkBoundary(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, n := range []int{511, 512, 513, 1024, 1025} {
+		l, _ := newLocal(t)
+		for i := range n {
+			key := fmt.Sprintf("%s%032x", blob.PartsPrefix, i)
+			if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
+				t.Fatalf("put %s: %v", key, err)
+			}
+		}
+		seen := map[string]bool{}
+		if err := l.WalkPrefix(ctx, blob.PartsPrefix, func(e blob.Entry) error {
+			if seen[e.Key] {
+				t.Fatalf("n=%d: %q yielded twice", n, e.Key)
+			}
+			seen[e.Key] = true
+			return nil
+		}); err != nil {
+			t.Fatalf("n=%d: walk: %v", n, err)
+		}
+		if len(seen) != n {
+			t.Fatalf("n=%d: walked %d entries", n, len(seen))
+		}
 	}
 }
 
