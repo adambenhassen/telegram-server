@@ -277,19 +277,10 @@ func TestPartOrphanPassGateSpansBatchBoundary(t *testing.T) {
 	}
 }
 
-// TestPartOrphanPassKeepsWriterTemporary asserts the pass never unlinks a
-// write in progress. Local.Put writes to key+TempSuffix and renames it into
-// place, so a temporary file is bytes a caller is still handing over: no row
-// ever names it, and age is the only other thing standing between it and a
-// delete. Nothing here may depend on how long a part write can take.
-func TestPartOrphanPassKeepsWriterTemporary(t *testing.T) {
-	t.Parallel()
-	s, l := openOrphanStore(t)
-	ctx := context.Background()
-
-	// The writer's in-flight file for a part key, aged well past the cutoff:
-	// every gate except the temporary-file one would let this through.
-	temp := partKey(0x7e77) + blob.TempSuffix
+// writeTemp plants a writer temporary file for key with the given age.
+func writeTemp(t *testing.T, l *blob.Local, key string, at time.Time) string {
+	t.Helper()
+	temp := key + blob.TempSuffix
 	p := filepath.Join(l.RootDir(), filepath.FromSlash(temp))
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		t.Fatalf("mkdir parts: %v", err)
@@ -297,7 +288,21 @@ func TestPartOrphanPassKeepsWriterTemporary(t *testing.T) {
 	if err := os.WriteFile(p, []byte("half a part"), 0o600); err != nil {
 		t.Fatalf("write temp: %v", err)
 	}
-	ageObject(t, l.RootDir(), temp, time.Now().Add(-72*time.Hour))
+	ageObject(t, l.RootDir(), temp, at)
+	return temp
+}
+
+// TestPartOrphanPassKeepsWriteInProgress asserts the pass never unlinks a write
+// that is still running. Local.Put writes to key+TempSuffix and renames it into
+// place, so a fresh temporary file is bytes a caller is handing over right now,
+// and no row ever names it: the cutoff is the only thing between it and a
+// delete, which is why it is a test and not a comment.
+func TestPartOrphanPassKeepsWriteInProgress(t *testing.T) {
+	t.Parallel()
+	s, l := openOrphanStore(t)
+	ctx := context.Background()
+
+	temp := writeTemp(t, l, partKey(0x7e77), time.Now())
 
 	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
 	if err != nil {
@@ -307,7 +312,63 @@ func TestPartOrphanPassKeepsWriterTemporary(t *testing.T) {
 		t.Fatalf("reclaimed %+v, want nothing (write in progress)", res)
 	}
 	if !objectExists(t, l.RootDir(), temp) {
-		t.Fatal("writer temporary file deleted")
+		t.Fatal("in-flight temporary file deleted")
+	}
+}
+
+// TestPartOrphanPassReclaimsAbandonedTemporary is the other direction. A part
+// is at most MaxPartBytes, so a Put that started before the cutoff is not still
+// running: the temporary is a write that died, no row will ever name it, and
+// nothing else reclaims it. Skipping it would leave exactly the leak this pass
+// exists to close.
+func TestPartOrphanPassReclaimsAbandonedTemporary(t *testing.T) {
+	t.Parallel()
+	s, l := openOrphanStore(t)
+	ctx := context.Background()
+
+	temp := writeTemp(t, l, partKey(0x7e78), time.Now().Add(-72*time.Hour))
+
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if res.Objects != 1 || res.Bytes != 11 {
+		t.Fatalf("reclaimed %+v, want 1 object / 11 bytes (the abandoned temporary)", res)
+	}
+	if objectExists(t, l.RootDir(), temp) {
+		t.Fatal("abandoned temporary still present")
+	}
+}
+
+// TestPartOrphanPassKeepsTemporaryOfLiveRow asserts a temporary is gated on the
+// key it is becoming, not on its own path. No row ever names a ".tmp" path, so
+// reading the path would make the row gate vacuous for temporaries; reading the
+// stripped key keeps AC 3 true for them — an object a row still names is never
+// removed, and the writer's file for that object is part of it.
+func TestPartOrphanPassKeepsTemporaryOfLiveRow(t *testing.T) {
+	t.Parallel()
+	s, l := openOrphanStore(t)
+	ctx := context.Background()
+
+	key := partKey(0x7e79)
+	temp := writeTemp(t, l, key, time.Now().Add(-72*time.Hour))
+	u, err := s.CreateUser(ctx, "+15551230014")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := store.InsertUploadPartWithKey(ctx, s, u.ID, 11, 0, 1, key); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if res.Objects != 0 {
+		t.Fatalf("reclaimed %+v, want nothing (a row still names the key)", res)
+	}
+	if !objectExists(t, l.RootDir(), temp) {
+		t.Fatal("temporary of a live row deleted")
 	}
 }
 
@@ -335,6 +396,9 @@ func TestPartOrphanPassLeavesUnexplainedPaths(t *testing.T) {
 		blob.PartsPrefix + strings.Repeat("a", 33),
 		blob.PartsPrefix + strings.ToUpper(strings.Repeat("ab", 16)),
 		blob.PartsPrefix + "sub/" + strings.Repeat("c", 32),
+		// The temporary branch is not a way around the shape check: stripping
+		// the suffix has to leave a key the writer could have produced.
+		blob.PartsPrefix + "README" + blob.TempSuffix,
 	}
 	for _, key := range unexplained {
 		p := filepath.Join(l.RootDir(), filepath.FromSlash(key))

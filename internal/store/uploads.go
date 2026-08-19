@@ -569,6 +569,16 @@ type PartOrphanResult struct {
 // candidates, not one per object and not one per prefix.
 const PartOrphanGateBatch = 500
 
+// partCandidate is one path the orphan pass may remove. The path and the key
+// are separate because the writer's temporary file is judged as the key it is
+// becoming — the row gate reads key, the unlink takes path — and for a finished
+// object the two are the same string.
+type partCandidate struct {
+	key  string
+	path string
+	size int64
+}
+
 // PartOrphanMargin is the extra age on top of the part TTL before an
 // unaccounted object is eligible for reclamation. It covers the row sweep's
 // own lag (one tick at ttl/4, plus the drain that tick performs) and one
@@ -598,14 +608,20 @@ func PartOrphanMargin(ttl time.Duration) time.Duration {
 //
 // What it acts on is narrower than what it sees, and each exclusion is a
 // separate reason. A directory, a symlink or anything else not a regular file
-// never came from the writer. The writer's temporary file is a write in
-// progress, and unlinking one is destroying bytes a caller is still handing
-// over — no assumption about how long a part write can take belongs in a
-// delete path. What is left has to be a key NewPartKey could have produced:
-// this pass pages candidates by walking paths rather than by reading
-// upload_parts rows, which makes that shape check load-bearing for deletion
-// rather than for a counter, so anything else parked under the prefix is
-// unexplained and is left where it is for [blobscan] to report.
+// never came from the writer. What is left has to be a key NewPartKey could
+// have produced, with or without the writer's temporary suffix: this pass pages
+// candidates by walking paths rather than by reading upload_parts rows, which
+// makes that shape check load-bearing for deletion rather than for a counter,
+// so anything else parked under the prefix is unexplained and is left where it
+// is for [blobscan] to report.
+//
+// A temporary file is judged by the same cutoff as a finished object rather
+// than skipped. Skipping it would leave the bytes of a died-mid-write part
+// reclaimable by nothing, which is the leak this pass exists to close; and a
+// temporary older than TTL plus margin is not a write in progress, because a
+// part is at most MaxPartBytes and a Put that started that long ago is not
+// still running. It is gated on the key it is becoming, so a row that still
+// names that key protects its temporary too.
 //
 // One run streams the entire prefix, so every orphan is examined on every run
 // regardless of where its key sorts and how many ineligible objects precede
@@ -632,7 +648,7 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 	}
 
 	var res PartOrphanResult
-	batch := make([]blob.Entry, 0, PartOrphanGateBatch)
+	batch := make([]partCandidate, 0, PartOrphanGateBatch)
 	// gate resolves one batch of candidates against the rows and removes what
 	// no row names. It is where the only Postgres round trip of the pass is.
 	gate := func() error {
@@ -640,8 +656,8 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 			return nil
 		}
 		keys := make([]string, len(batch))
-		for i, e := range batch {
-			keys[i] = e.Key
+		for i, c := range batch {
+			keys[i] = c.key
 		}
 		liveKeys, err := s.q.LivePartKeys(ctx, keys)
 		if err != nil {
@@ -651,19 +667,19 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 		for _, k := range liveKeys {
 			live[k] = true
 		}
-		for _, e := range batch {
-			if live[e.Key] {
+		for _, c := range batch {
+			if live[c.key] {
 				continue
 			}
-			if err := s.blobs.Remove(ctx, e.Key); err != nil {
+			if err := s.blobs.Remove(ctx, c.path); err != nil {
 				// Log what was already reclaimed before surfacing the error:
 				// the partial result is the operator-visible record of this run.
 				s.log.Info("reclaim orphaned part bytes: partial",
 					"objects", res.Objects, "bytes", res.Bytes, "err", err)
-				return fmt.Errorf("remove orphaned part %s: %w", e.Key, err)
+				return fmt.Errorf("remove orphaned part %s: %w", c.path, err)
 			}
 			res.Objects++
-			res.Bytes += e.Size
+			res.Bytes += c.size
 		}
 		batch = batch[:0]
 		return nil
@@ -674,15 +690,22 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 		if !e.Regular {
 			return nil
 		}
-		key, temp := strings.CutSuffix(e.Key, blob.TempSuffix)
-		if temp || !blob.ParsePartKey(key) {
+		// The writer's temporary file is judged as the key it is becoming: the
+		// suffix comes off, and what is left has to be a key NewPartKey could
+		// have produced, exactly as blobscan reads the same paths.
+		key, _ := strings.CutSuffix(e.Key, blob.TempSuffix)
+		if !blob.ParsePartKey(key) {
 			return nil
 		}
 		// Age gate: an object at or younger than the cutoff is never removed.
+		// It is what separates a write in progress from one that died: a part
+		// is at most MaxPartBytes, so a Put that started before the cutoff is
+		// not still running, and that is the same reasoning the whole pass
+		// rests on rather than a second assumption.
 		if !e.ModTime.Before(cutoff) {
 			return nil
 		}
-		batch = append(batch, e)
+		batch = append(batch, partCandidate{key: key, path: e.Key, size: e.Size})
 		if len(batch) < PartOrphanGateBatch {
 			return nil
 		}
