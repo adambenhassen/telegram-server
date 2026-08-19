@@ -221,6 +221,14 @@ jobs:
     # a hang (a browser that never launches, a webServer that never binds).
     timeout-minutes: 20
 
+    # Narrower than it looks: actions: write is the scope that covers the cache
+    # API, and it is here only so this job can delete an apt cache entry that
+    # turns out not to satisfy the dependency check. contents: read is repeated
+    # because a job-level block replaces the workflow's rather than adding to it.
+    permissions:
+      contents: read
+      actions: write
+
     env:
       # Same reasoning as the ci job: the runner is destroyed at the end of the
       # job, so there is nothing for testcontainers' reaper to reap, and losing
@@ -280,9 +288,19 @@ jobs:
       # the key in its own right: a key that reads `playwright-Linux-1.62.1-...`
       # cannot be satisfied by a browser downloaded for another version, whatever
       # else moved in the lockfile.
+      # Captured into a variable and checked rather than substituted straight
+      # into the echo: the exit status of a command substitution is the echo's,
+      # so a failed `playwright --version` would write an empty segment and the
+      # key would silently stop carrying the version at all.
       - name: Resolve the Playwright version
         id: playwright-version
-        run: echo "version=$(pnpm exec playwright --version | awk '{print $NF}')" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(pnpm exec playwright --version | awk '{print $NF}')
+          if [ -z "$version" ]; then
+            echo "::error::could not resolve the Playwright version"
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
 
       # Browsers land outside the repo and are not covered by the pnpm cache. No
       # restore-keys, since a stale browser for a newer Playwright is worse than
@@ -382,16 +400,30 @@ jobs:
       # dry-run afterwards is the check that it actually worked — if anything is
       # still missing, or dpkg refused, the step falls through to the network
       # path rather than leaving a half-installed runner to fail in the browser.
+      #
+      # An entry that fails that check is deleted, because a cache key is
+      # otherwise written once and never rewritten: without this, a bad entry is
+      # restored and warned about on every subsequent run and the job is back on
+      # the network for good, silently. Deleting it makes the next run miss,
+      # repopulate, and go warm again. It needs actions: write, hence the job's
+      # permissions block; where the token has no such write (a fork PR, which
+      # has no access to these caches anyway) the delete warns and the run still
+      # completes over the network.
       - name: Install the system dependencies from cache
         id: apt-cached-install
         if: steps.apt-cache.outputs.cache-hit == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APT_CACHE_KEY: playwright-apt-${{ steps.playwright-deps.outputs.image }}-${{ hashFiles('apt-packages.txt') }}
         run: |
           if sudo dpkg -i .apt-cache/*.deb && pnpm exec playwright install-deps --dry-run chromium; then
             echo "installed=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "::warning::cached debs did not satisfy the dependencies; falling back to the network install"
-            echo "installed=false" >>"$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "::warning::cached debs did not satisfy the dependencies; falling back to the network install"
+          echo "installed=false" >>"$GITHUB_OUTPUT"
+          gh cache delete "$APT_CACHE_KEY" \
+            || echo "::warning::could not delete the unusable cache entry $APT_CACHE_KEY"
 
       # The cold path, and the only step here that needs the network. Download
       # and install are separate so the debs land in a directory the cache can
@@ -430,7 +462,12 @@ jobs:
             # install and report the attempt as a success.
             set -e
             if [ "$MODE" = "packages" ]; then
-              rm -rf .apt-cache
+              # sudo, because an attempt killed mid-download leaves the
+              # directory owned by _apt and the runner user cannot unlink what
+              # is inside it. As a plain rm this exits 1 under `set -e` and the
+              # second attempt dies before it reaches apt, which would leave the
+              # retry that guards the mirror with one usable attempt.
+              sudo rm -rf .apt-cache
               mkdir -p .apt-cache/partial
               sudo chown -R _apt:root .apt-cache
               sudo apt-get update
@@ -458,10 +495,15 @@ jobs:
           echo "::error::system dependency install failed after 2 attempts"
           exit 1
 
-      # Only after a network install: on the warm path the cache action holds
-      # the entry already, and on the satisfied path there is nothing to save.
+      # After a network install, which is either a miss or an entry that was
+      # just deleted for not satisfying the check; on a working hit the cache
+      # action holds the entry already, and on the satisfied path there is
+      # nothing to save. continue-on-error because the debs are an optimisation:
+      # a failed save costs the next run its warm path and nothing else, and
+      # must not red a job whose suite has yet to run.
       - name: Save the Playwright apt dependencies
-        if: ${{ steps.playwright-deps.outputs.mode == 'packages' && steps.apt-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        if: ${{ steps.playwright-deps.outputs.mode == 'packages' && (steps.apt-cache.outputs.cache-hit != 'true' || steps.apt-cached-install.outputs.installed == 'false') }}
         uses: actions/cache/save@v6.1.0
         with:
           path: .apt-cache/*.deb
