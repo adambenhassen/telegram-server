@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -19,6 +23,43 @@ func allocate(t *testing.T, s *store.Store, uploaderID, size int64) store.File {
 		t.Fatalf("allocate file: %v", err)
 	}
 	return f
+}
+
+// TestFilesRejectsNonPositiveID pins the invariant three readers already depend
+// on and none of them enforce: the download gate's m.file_id = f.id, which with
+// a row at id 0 would read every text message as an entitlement to that file;
+// MediaErasureSummary's walk, which starts at after_id = 0 and so could never
+// classify such a row; and the m.file_id <> 0 conjunct in MediaErasureScan,
+// whose no-op argument holds only while no files row carries the sentinel.
+// BIGSERIAL supplies a default and constrains nothing, so an explicit insert
+// naming id is the way in. AllocateFile never names id, which is why this goes
+// through raw SQL rather than the store API.
+func TestFilesRejectsNonPositiveID(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, pgtest.DSN(t))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	var uploaderID int64
+	if err := conn.QueryRow(ctx, `INSERT INTO users DEFAULT VALUES RETURNING id`).Scan(&uploaderID); err != nil {
+		t.Fatalf("create uploader: %v", err)
+	}
+
+	for _, id := range []int64{0, -1} {
+		_, err := conn.Exec(ctx,
+			`INSERT INTO files (id, uploader_id, access_hash, size, mime_type, file_name)
+			 VALUES ($1, $2, 1, 0, 'text/plain', 'x.txt')`, id, uploaderID)
+		if err == nil {
+			t.Fatalf("insert at files.id = %d must be refused", id)
+		}
+		if !strings.Contains(err.Error(), "files_id_positive") {
+			t.Fatalf("files.id = %d: want a files_id_positive violation, got %v", id, err)
+		}
+	}
 }
 
 func TestAllocateFileReservesUnstoredRow(t *testing.T) {

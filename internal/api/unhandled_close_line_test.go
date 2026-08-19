@@ -66,7 +66,9 @@ func TestUnhandledCloseLineNamesTheCall(t *testing.T) {
 	t.Parallel()
 	h := &captureHandler{}
 	log := slog.New(h)
+	cl := &testClock{now: time.Now()}
 	conn := unhandledConn()
+	conn.SetClock(cl)
 	body := registerDeviceBody(t)
 
 	got, n := driveToClose(t, h, conn, func() error {
@@ -83,12 +85,16 @@ func TestUnhandledCloseLineNamesTheCall(t *testing.T) {
 // TestGatedCloseLineNamesTheCall is the same pin on the provisional path: a
 // provisional burst ends the connection the way a non-provisional one does, so
 // the line it records must stand for the call the way the non-provisional
-// path's line does.
+// path's line does. The clock is frozen for the life of the burst: the close
+// verdict is exempt from the interval gate, so the count it owes is the one
+// the frozen sampler holds open, never one real time let run mid-loop.
 func TestGatedCloseLineNamesTheCall(t *testing.T) {
 	t.Parallel()
 	h := &captureHandler{}
 	log := slog.New(h)
+	cl := &testClock{now: time.Now()}
 	conn, _ := gatedConn()
+	conn.SetClock(cl)
 
 	got, n := driveToClose(t, h, conn, func() error {
 		return api.GatedUnhandledForTest(log, conn, provisionalBody(t))
