@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -561,11 +562,11 @@ type PartOrphanResult struct {
 	Bytes int64
 }
 
-// PartOrphanGateBatch is how many keys one live-key lookup carries. The pass
-// enumerates the whole parts prefix in a single walk and gates the result in
-// batches of this size, so the Postgres round trips are bounded by the batch
-// rather than the prefix, and the enumeration cost is one directory read per
-// run rather than one per page.
+// PartOrphanGateBatch is how many candidate keys one live-key lookup carries,
+// and with it the whole memory footprint of a run: the enumeration streams, so
+// the pass holds a batch rather than a listing, whatever the prefix contains.
+// It bounds the Postgres round trips the same way — one lookup per batch of
+// candidates, not one per object and not one per prefix.
 const PartOrphanGateBatch = 500
 
 // PartOrphanMargin is the extra age on top of the part TTL before an
@@ -579,8 +580,9 @@ func PartOrphanMargin(ttl time.Duration) time.Duration {
 	return ttl/4 + time.Hour
 }
 
-// ReclaimOrphanedPartBytes walks the parts prefix, reclaims objects older
-// than the cutoff whose key no row still names, and returns what it removed.
+// ReclaimOrphanedPartBytes streams the parts prefix, reclaims part objects
+// older than the cutoff whose key no row still names, and returns what it
+// removed.
 //
 // The pass is safe in a way the row-driven sweep is not: it holds no lock a
 // request path waits on, makes no storage call inside a transaction, and its
@@ -594,20 +596,32 @@ func PartOrphanMargin(ttl time.Duration) time.Duration {
 // row sweep's own lag plus one hour of clock skew; the live-key gate carries
 // correctness alone, and this margin is defence in depth.
 //
-// One run walks the entire parts prefix in a single enumeration, so every
-// orphan is examined on every run regardless of where its key sorts and how
-// many ineligible objects precede it. The enumeration cost is one directory
-// read per run, linear in the number of part objects, not quadratic: the
-// live-key gate is chunked over the result rather than driving a re-walk per
-// batch. The bound is therefore independent of process uptime and of the
-// store's contents: an unaccounted byte is reclaimed on the first run after
-// it crosses the cutoff, and the residual bound is TTL + margin + one sweep
-// interval.
+// What it acts on is narrower than what it sees, and each exclusion is a
+// separate reason. A directory, a symlink or anything else not a regular file
+// never came from the writer. The writer's temporary file is a write in
+// progress, and unlinking one is destroying bytes a caller is still handing
+// over — no assumption about how long a part write can take belongs in a
+// delete path. What is left has to be a key NewPartKey could have produced:
+// this pass pages candidates by walking paths rather than by reading
+// upload_parts rows, which makes that shape check load-bearing for deletion
+// rather than for a counter, so anything else parked under the prefix is
+// unexplained and is left where it is for [blobscan] to report.
 //
-// The live-key gate is bounded by the batch, not the table: each batch of
-// PartOrphanGateBatch keys is gated with one blob_key = ANY($1) lookup, so
-// the Postgres round trips scale with the prefix size divided by the batch,
-// and the gate reads row state at run time rather than at a snapshot.
+// One run streams the entire prefix, so every orphan is examined on every run
+// regardless of where its key sorts and how many ineligible objects precede
+// it. The enumeration is one directory read per run, linear in the number of
+// part objects and not quadratic, and the pass holds a batch of candidates
+// rather than a listing. The bound is therefore independent of process uptime
+// and of the store's contents: an unaccounted byte is reclaimed on the first
+// run after it crosses the cutoff, and the residual bound is TTL + margin +
+// one sweep interval.
+//
+// There is no delete-time re-check, and the streaming order is what carries
+// that. A row is committed before its bytes are written (MAIN-341's ordering
+// rule), so any row naming an object the walk observed was committed before
+// that object existed, and the gate query that follows the observation sees
+// it. A row committed after the walk passed a directory draws a fresh key from
+// crypto/rand, so it names no object this run ever saw.
 func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, partTTL time.Duration) (PartOrphanResult, error) {
 	// Floor: the cutoff can never be younger than TTL+margin. A misconfigured
 	// small cutoff is clamped rather than trusted.
@@ -617,59 +631,72 @@ func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, 
 		cutoff = floor
 	}
 
-	// One walk of the whole parts prefix. AllKeys returns every key under the
-	// prefix in a single call, so the enumeration cost is one directory read
-	// per run rather than one per gate batch.
-	objects, err := s.blobs.ListPrefix(ctx, blob.PartsPrefix, "", blob.AllKeys)
-	if err != nil {
-		return PartOrphanResult{}, fmt.Errorf("list part prefix: %w", err)
-	}
-
 	var res PartOrphanResult
-	// Gate the result in batches: one live-key lookup per batch of keys.
-	for start := 0; start < len(objects); start += PartOrphanGateBatch {
-		end := min(start+PartOrphanGateBatch, len(objects))
-		batch := objects[start:end]
+	batch := make([]blob.Entry, 0, PartOrphanGateBatch)
+	// gate resolves one batch of candidates against the rows and removes what
+	// no row names. It is where the only Postgres round trip of the pass is.
+	gate := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
 		keys := make([]string, len(batch))
-		for i, o := range batch {
-			keys[i] = o.Key
+		for i, e := range batch {
+			keys[i] = e.Key
 		}
 		liveKeys, err := s.q.LivePartKeys(ctx, keys)
 		if err != nil {
-			return res, fmt.Errorf("live part keys: %w", err)
+			return fmt.Errorf("live part keys: %w", err)
 		}
 		live := make(map[string]bool, len(liveKeys))
 		for _, k := range liveKeys {
 			live[k] = true
 		}
-		for _, obj := range batch {
-			// Age gate: an object younger than cutoff is never removed.
-			if time.Since(obj.Modified) < time.Since(cutoff) {
+		for _, e := range batch {
+			if live[e.Key] {
 				continue
 			}
-			// Live-key gate: an object a row still names is never removed.
-			// There is no delete-time re-check. The walk snapshot carries it:
-			// a row committed after the walk draws a key from crypto/rand at
-			// commit time, so no object existed at that key when the walk ran,
-			// and it is not in objects and never becomes a delete candidate in
-			// this run. A row committed before the walk is inside the gate's
-			// own statement snapshot. The age gate would only become
-			// load-bearing here if the pass ever learned about keys discovered
-			// after its walk (a re-walk, a merged enumeration, a resumed
-			// cursor); it is not the argument that holds today.
-			if live[obj.Key] {
-				continue
-			}
-			if err := s.blobs.Remove(ctx, obj.Key); err != nil {
+			if err := s.blobs.Remove(ctx, e.Key); err != nil {
 				// Log what was already reclaimed before surfacing the error:
 				// the partial result is the operator-visible record of this run.
 				s.log.Info("reclaim orphaned part bytes: partial",
 					"objects", res.Objects, "bytes", res.Bytes, "err", err)
-				return res, fmt.Errorf("remove orphaned part %s: %w", obj.Key, err)
+				return fmt.Errorf("remove orphaned part %s: %w", e.Key, err)
 			}
 			res.Objects++
-			res.Bytes += obj.Size
+			res.Bytes += e.Size
 		}
+		batch = batch[:0]
+		return nil
+	}
+
+	var gateErr error
+	err := s.blobs.WalkPrefix(ctx, blob.PartsPrefix, func(e blob.Entry) error {
+		if !e.Regular {
+			return nil
+		}
+		key, temp := strings.CutSuffix(e.Key, blob.TempSuffix)
+		if temp || !blob.ParsePartKey(key) {
+			return nil
+		}
+		// Age gate: an object at or younger than the cutoff is never removed.
+		if !e.ModTime.Before(cutoff) {
+			return nil
+		}
+		batch = append(batch, e)
+		if len(batch) < PartOrphanGateBatch {
+			return nil
+		}
+		gateErr = gate()
+		return gateErr
+	})
+	if gateErr != nil {
+		return res, gateErr
+	}
+	if err != nil {
+		return res, fmt.Errorf("walk part prefix: %w", err)
+	}
+	if err := gate(); err != nil {
+		return res, err
 	}
 	return res, nil
 }

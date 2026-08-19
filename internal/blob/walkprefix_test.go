@@ -2,6 +2,7 @@ package blob_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,14 +13,27 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/blob"
 )
 
-// TestListPrefix yields every object under the prefix with its size and age
+// collectPrefix walks a prefix and returns what it yielded, keyed by key.
+func collectPrefix(t *testing.T, l *blob.Local, prefix string) map[string]blob.Entry {
+	t.Helper()
+	got := map[string]blob.Entry{}
+	if err := l.WalkPrefix(context.Background(), prefix, func(e blob.Entry) error {
+		got[e.Key] = e
+		return nil
+	}); err != nil {
+		t.Fatalf("walk %q: %v", prefix, err)
+	}
+	return got
+}
+
+// TestWalkPrefix yields every entry under the prefix with its size and age
 // inputs, and nothing outside it.
-func TestListPrefix(t *testing.T) {
+func TestWalkPrefix(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	l, dir := newLocal(t)
 	// A file named exactly like the prefix's directory ("parts", no slash) is
-	// not under "parts/": the walk must not list it or reach into it. A
+	// not under "parts/": the walk must not yield it or reach into it. A
 	// directory and a file cannot share a name, so the in-prefix objects live
 	// under "parts2/" for this test and the assembled key sits outside both.
 	if err := os.WriteFile(filepath.Join(dir, "parts"), []byte("a file named like the prefix itself"), 0o600); err != nil {
@@ -48,40 +62,38 @@ func TestListPrefix(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	got, err := l.ListPrefix(ctx, prefix, "", 10)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
+	got := collectPrefix(t, l, prefix)
 	if len(got) != len(wantIn) {
-		t.Fatalf("listed %d objects, want %d: %v", len(got), len(wantIn), got)
+		t.Fatalf("walked %d entries, want %d: %v", len(got), len(wantIn), got)
 	}
-	for _, o := range got {
-		if o.Size != wantIn[o.Key] {
-			t.Fatalf("%s size = %d, want %d", o.Key, o.Size, wantIn[o.Key])
+	for _, e := range got {
+		if e.Size != wantIn[e.Key] {
+			t.Fatalf("%s size = %d, want %d", e.Key, e.Size, wantIn[e.Key])
 		}
-		if o.Modified.IsZero() {
-			t.Fatalf("%s has no modification time", o.Key)
+		if !e.Regular || e.Dir {
+			t.Fatalf("%s reported dir=%v regular=%v, want a regular file", e.Key, e.Dir, e.Regular)
+		}
+		if e.ModTime.IsZero() {
+			t.Fatalf("%s has no modification time", e.Key)
 		}
 	}
-	byKey := map[string]blob.Object{}
-	for _, o := range got {
-		byKey[o.Key] = o
-	}
-	if age := time.Since(byKey[old].Modified); age < 50*time.Minute {
+	if age := time.Since(got[old].ModTime); age < 50*time.Minute {
 		t.Fatalf("old object reports age %v, want about an hour", age)
 	}
-	if age := time.Since(byKey[prefix+"bbb"].Modified); age > time.Minute {
+	if age := time.Since(got[prefix+"bbb"].ModTime); age > time.Minute {
 		t.Fatalf("new object reports age %v, want fresh", age)
 	}
 }
 
-// TestListPrefixBounded returns at most limit objects per call and resumes
-// where the previous call stopped, so repeated calls walk the whole prefix.
-func TestListPrefixBounded(t *testing.T) {
+// TestWalkPrefixStreamsWithoutBuffering asserts the property the shape exists
+// for: entries arrive one at a time and a caller that stops early stops the
+// walk. A page-returning enumeration would have materialised all of them
+// before the caller saw the first.
+func TestWalkPrefixStreamsWithoutBuffering(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	l, _ := newLocal(t)
-	const n = 5
+	const n = 20
 	for i := range n {
 		key := blob.PartsPrefix + string(rune('a'+i))
 		if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
@@ -89,56 +101,61 @@ func TestListPrefixBounded(t *testing.T) {
 		}
 	}
 
-	// The caller resumes past the page's last key; a page that returns fewer
-	// than limit objects is the last one.
-	after := ""
+	// The whole prefix, in one streamed pass.
 	var seen []string
-	for {
-		got, err := l.ListPrefix(ctx, blob.PartsPrefix, after, 2)
-		if err != nil {
-			t.Fatalf("list: %v", err)
-		}
-		for _, o := range got {
-			seen = append(seen, o.Key)
-		}
-		if len(got) < 2 {
-			break
-		}
-		after = got[len(got)-1].Key
+	if err := l.WalkPrefix(ctx, blob.PartsPrefix, func(e blob.Entry) error {
+		seen = append(seen, e.Key)
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
 	}
 	sort.Strings(seen)
 	want := make([]string, n)
 	for i := range n {
 		want[i] = blob.PartsPrefix + string(rune('a'+i))
 	}
-	if strings.Join(seen, "") != strings.Join(want, "") {
-		t.Fatalf("paged walk saw %v, want %v", seen, want)
+	if strings.Join(seen, ",") != strings.Join(want, ",") {
+		t.Fatalf("walk saw %v, want %v", seen, want)
+	}
+
+	// Stopping after the third entry stops the walk there: the caller decides
+	// what it holds, and the error it returns is the error it gets back.
+	stop := errors.New("enough")
+	count := 0
+	err := l.WalkPrefix(ctx, blob.PartsPrefix, func(blob.Entry) error {
+		count++
+		if count == 3 {
+			return stop
+		}
+		return nil
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("walk error = %v, want the caller's own error", err)
+	}
+	if count != 3 {
+		t.Fatalf("callback ran %d times after stopping at 3", count)
 	}
 }
 
-// TestListPrefixEmptyPrefix is a no-op: the assembled keyspace has no single
+// TestWalkPrefixEmptyPrefix is a no-op: the assembled keyspace has no single
 // prefix, so nothing enumerates it through this.
-func TestListPrefixEmptyPrefix(t *testing.T) {
+func TestWalkPrefixEmptyPrefix(t *testing.T) {
 	t.Parallel()
 	l, _ := newLocal(t)
 	if _, err := l.Put(context.Background(), blob.Key(4242), strings.NewReader("x")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	got, err := l.ListPrefix(context.Background(), "", "", 10)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("empty prefix listed %d objects, want none", len(got))
+	if got := collectPrefix(t, l, ""); len(got) != 0 {
+		t.Fatalf("empty prefix walked %d entries, want none", len(got))
 	}
 }
 
-// TestListPrefixSeparatorFreeFailsClosed asserts that a separator-free prefix
-// (a top-level shard such as "92") cannot return a key outside its containment
+// TestWalkPrefixSeparatorFreeFailsClosed asserts that a separator-free prefix
+// (a top-level shard such as "92") cannot yield a key outside its containment
 // scope. The prefix names a directory; if that directory does not exist the
-// call returns nothing, and if it does exist only keys under it are returned.
-// A file at the scope path is not a directory, so the call fails closed.
-func TestListPrefixSeparatorFreeFailsClosed(t *testing.T) {
+// walk yields nothing, and if it does exist only keys under it are yielded. A
+// file at the scope path is not a directory, so the call fails closed.
+func TestWalkPrefixSeparatorFreeFailsClosed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	l, dir := newLocal(t)
@@ -150,30 +167,23 @@ func TestListPrefixSeparatorFreeFailsClosed(t *testing.T) {
 		}
 	}
 
-	// A separator-free prefix naming a non-existent shard directory returns
+	// A separator-free prefix naming a non-existent shard directory yields
 	// nothing: it does not widen to the store root.
-	got, err := l.ListPrefix(ctx, "ff", "", 100)
-	if err != nil {
-		t.Fatalf("list non-existent shard: %v", err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("non-existent shard listed %d objects, want 0: %v", len(got), got)
+	if got := collectPrefix(t, l, "ff"); len(got) != 0 {
+		t.Fatalf("non-existent shard walked %d entries, want 0: %v", len(got), got)
 	}
 
-	// A separator-free prefix naming an existing shard directory returns only
+	// A separator-free prefix naming an existing shard directory yields only
 	// keys under that shard. The result must be non-empty: the object under
 	// "92/" was planted above, so an empty result means the walk failed to
 	// find it, and the containment assertion below would pass vacuously.
-	got, err = l.ListPrefix(ctx, "92", "", 100)
-	if err != nil {
-		t.Fatalf("list shard 92: %v", err)
-	}
+	got := collectPrefix(t, l, "92")
 	if len(got) == 0 {
-		t.Fatal("shard 92 listed no objects, want at least the planted one")
+		t.Fatal("shard 92 walked no entries, want at least the planted one")
 	}
-	for _, o := range got {
-		if !strings.HasPrefix(o.Key, "92/") {
-			t.Fatalf("shard 92 returned key outside scope: %q", o.Key)
+	for _, e := range got {
+		if !strings.HasPrefix(e.Key, "92/") {
+			t.Fatalf("shard 92 yielded key outside scope: %q", e.Key)
 		}
 	}
 
@@ -181,77 +191,54 @@ func TestListPrefixSeparatorFreeFailsClosed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "ab"), []byte("a file"), 0o600); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	_, err = l.ListPrefix(ctx, "ab", "", 100)
+	err := l.WalkPrefix(ctx, "ab", func(blob.Entry) error { return nil })
 	if err == nil {
 		t.Fatal("prefix naming a file succeeded, want a fail-closed error")
 	}
 }
 
-// TestListPrefixAfterResumes verifies the after parameter: keys at or below
-// after are skipped, and the page is the limit smallest keys above after
-// within the prefix.
-func TestListPrefixAfterResumes(t *testing.T) {
+// TestWalkPrefixReportsNestedShape asserts the caller can tell what a path is
+// without inferring it from the name: a directory under the prefix is a
+// directory, a file under it is a regular file, and the writer's temporary
+// file is visible as one so a pass acting on the prefix can refuse it.
+func TestWalkPrefixReportsNestedShape(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	l, _ := newLocal(t)
-	for i := range 5 {
-		key := blob.PartsPrefix + string(rune('a'+i))
-		if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
-			t.Fatalf("put %s: %v", key, err)
-		}
+	l, dir := newLocal(t)
+	if _, err := l.Put(ctx, blob.PartsPrefix+"aaaa", strings.NewReader("x")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	// A writer's in-flight temporary file, and a directory nobody's writer
+	// created, both parked under the prefix.
+	tmp := blob.PartsPrefix + "bbbb" + blob.TempSuffix
+	if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(tmp)), []byte("half"), 0o600); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "parts", "nested"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
 	}
 
-	// Resume after "parts/c": should get d and e.
-	got, err := l.ListPrefix(ctx, blob.PartsPrefix, blob.PartsPrefix+"c", 10)
-	if err != nil {
-		t.Fatalf("list: %v", err)
+	got := collectPrefix(t, l, blob.PartsPrefix)
+	if e, ok := got[tmp]; !ok || !e.Regular || e.Size != 4 {
+		t.Fatalf("temporary file reported as %+v (present=%v), want a 4-byte regular file", e, ok)
 	}
-	if len(got) != 2 {
-		t.Fatalf("got %d objects, want 2: %v", len(got), got)
-	}
-	if got[0].Key != blob.PartsPrefix+"d" || got[1].Key != blob.PartsPrefix+"e" {
-		t.Fatalf("got %v, want [parts/d parts/e]", got)
+	if e, ok := got["parts/nested"]; !ok || !e.Dir || e.Regular {
+		t.Fatalf("nested directory reported as %+v (present=%v), want a directory", e, ok)
 	}
 }
 
-// TestListPrefixAllKeysReturnsAll verifies that the AllKeys sentinel returns
-// every key under the prefix in a single call, for a caller that walks the
-// whole prefix once and chunks its own work.
-func TestListPrefixAllKeysReturnsAll(t *testing.T) {
+// TestWalkPrefixStopsOnCancelledContext asserts the walk honours cancellation
+// the same way the whole-tree walk does.
+func TestWalkPrefixStopsOnCancelledContext(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 	l, _ := newLocal(t)
-	const n = 10
-	for i := range n {
-		key := blob.PartsPrefix + string(rune('a'+i))
-		if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
-			t.Fatalf("put %s: %v", key, err)
-		}
+	if _, err := l.Put(context.Background(), blob.PartsPrefix+"aaaa", strings.NewReader("x")); err != nil {
+		t.Fatalf("put: %v", err)
 	}
-
-	got, err := l.ListPrefix(ctx, blob.PartsPrefix, "", blob.AllKeys)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(got) != n {
-		t.Fatalf("got %d objects, want %d", len(got), n)
-	}
-	// Globally ordered.
-	for i := 1; i < len(got); i++ {
-		if got[i-1].Key >= got[i].Key {
-			t.Fatalf("not in order at %d: %q >= %q", i, got[i-1].Key, got[i].Key)
-		}
-	}
-
-	// Zero is an error: a caller that computed a zero limit has a bug that
-	// must not silently become an unbounded operation.
-	_, err = l.ListPrefix(ctx, blob.PartsPrefix, "", 0)
-	if err == nil {
-		t.Fatal("zero limit succeeded, want an error")
-	}
-	// A negative limit other than AllKeys is an error.
-	_, err = l.ListPrefix(ctx, blob.PartsPrefix, "", -2)
-	if err == nil {
-		t.Fatal("negative limit other than AllKeys succeeded, want an error")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := l.WalkPrefix(ctx, blob.PartsPrefix, func(blob.Entry) error { return nil })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("walk error = %v, want context.Canceled", err)
 	}
 }

@@ -17,6 +17,14 @@ import (
 // testTTL is the part TTL the orphan tests run against.
 const testTTL = 6 * time.Hour
 
+// partKey returns the nth key NewPartKey could have produced. The pass acts on
+// part keys and nothing else, so a fixture that is merely under the prefix
+// would test the wrong predicate. Zero padding also makes the numeric order
+// the key order, which is the order the walk yields them in.
+func partKey(n uint64) string {
+	return blob.PartsPrefix + fmt.Sprintf("%032x", n)
+}
+
 // testCutoff returns a cutoff well past the floor for testTTL.
 func testCutoff() time.Time {
 	return time.Now().Add(-(testTTL + store.PartOrphanMargin(testTTL) + time.Hour))
@@ -67,7 +75,7 @@ func TestPartOrphanPassReclaimsCrashWindowObject(t *testing.T) {
 	s, l := openOrphanStore(t)
 	ctx := context.Background()
 
-	key := blob.PartsPrefix + "deadbeef"
+	key := partKey(0xdeadbeef)
 	if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -92,7 +100,7 @@ func TestPartOrphanPassKeepsLiveRowObject(t *testing.T) {
 	s, l := openOrphanStore(t)
 	ctx := context.Background()
 
-	key := blob.PartsPrefix + "liverow"
+	key := partKey(0x11ffe0)
 	if _, err := l.Put(ctx, key, strings.NewReader("y")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -124,7 +132,7 @@ func TestPartOrphanPassFloorClampsCutoff(t *testing.T) {
 	s, l := openOrphanStore(t)
 	ctx := context.Background()
 
-	key := blob.PartsPrefix + "youngish"
+	key := partKey(0x40c)
 	if _, err := l.Put(ctx, key, strings.NewReader("z")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -185,12 +193,12 @@ func TestPartOrphanPassReachesWholePrefixInOneRun(t *testing.T) {
 	// budget, the orphan at position 600 was never examined in one run.
 	// Under the new contract, one run walks the whole prefix and reclaims it.
 	for i := range 600 {
-		key := blob.PartsPrefix + fmt.Sprintf("ineligible%03d", i)
+		key := partKey(uint64(i))
 		if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
 			t.Fatalf("put %s: %v", key, err)
 		}
 	}
-	orphan := blob.PartsPrefix + "zzz_orphan"
+	orphan := partKey(1 << 40)
 	if _, err := l.Put(ctx, orphan, strings.NewReader("orphan")); err != nil {
 		t.Fatalf("put orphan: %v", err)
 	}
@@ -208,7 +216,7 @@ func TestPartOrphanPassReachesWholePrefixInOneRun(t *testing.T) {
 	}
 	// The ineligible objects must all survive.
 	for i := range 600 {
-		key := blob.PartsPrefix + fmt.Sprintf("ineligible%03d", i)
+		key := partKey(uint64(i))
 		if !objectExists(t, l.RootDir(), key) {
 			t.Fatalf("ineligible %s gone", key)
 		}
@@ -216,34 +224,34 @@ func TestPartOrphanPassReachesWholePrefixInOneRun(t *testing.T) {
 }
 
 // TestPartOrphanPassGateSpansBatchBoundary asserts the batched live-key gate
-// handles keys that fall on different sides of a batch boundary: an old
-// orphan in one batch and an old object with a live row in the next batch.
-// Both are old enough to pass the age gate; only the orphan is reclaimed.
+// handles candidates that fall on different sides of a batch boundary. The
+// stream fills one whole batch with orphans, so the gate flushes mid-walk, and
+// the live-row object lands in the batch after that flush. A gate that only
+// ever ran once, or one that dropped what the flush left behind, fails here.
 func TestPartOrphanPassGateSpansBatchBoundary(t *testing.T) {
 	t.Parallel()
 	s, l := openOrphanStore(t)
 	ctx := context.Background()
 
-	// Plant 500 young objects to fill the first batch, then one orphan and
-	// one live-row object in the second batch. The orphan and the live-row
-	// object are both old; only the orphan is unaccounted.
-	for i := range 500 {
-		key := blob.PartsPrefix + fmt.Sprintf("young%03d", i)
+	// Candidates are what the batch carries — the age and shape gates run
+	// before it — so the boundary is only crossed by more than a batch of
+	// genuinely eligible objects.
+	const orphans = store.PartOrphanGateBatch
+	old := time.Now().Add(-24 * time.Hour)
+	for i := range orphans {
+		key := partKey(uint64(i))
 		if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
 			t.Fatalf("put %s: %v", key, err)
 		}
+		ageObject(t, l.RootDir(), key, old)
 	}
-	orphan := blob.PartsPrefix + "zzz_orphan"
-	if _, err := l.Put(ctx, orphan, strings.NewReader("o")); err != nil {
-		t.Fatalf("put orphan: %v", err)
-	}
-	ageObject(t, l.RootDir(), orphan, time.Now().Add(-24*time.Hour))
 
-	liveKey := blob.PartsPrefix + "zzz_live"
+	// Sorts after every orphan above, so it is examined in the second batch.
+	liveKey := partKey(1 << 40)
 	if _, err := l.Put(ctx, liveKey, strings.NewReader("l")); err != nil {
 		t.Fatalf("put live: %v", err)
 	}
-	ageObject(t, l.RootDir(), liveKey, time.Now().Add(-24*time.Hour))
+	ageObject(t, l.RootDir(), liveKey, old)
 	u, err := s.CreateUser(ctx, "+15551230012")
 	if err != nil {
 		t.Fatalf("create user: %v", err)
@@ -256,14 +264,100 @@ func TestPartOrphanPassGateSpansBatchBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
-	if res.Objects != 1 {
-		t.Fatalf("reclaimed %d objects, want 1 (the orphan): %+v", res.Objects, res)
-	}
-	if objectExists(t, l.RootDir(), orphan) {
-		t.Fatal("orphan still present")
+	if res.Objects != orphans {
+		t.Fatalf("reclaimed %d objects, want %d (every orphan): %+v", res.Objects, orphans, res)
 	}
 	if !objectExists(t, l.RootDir(), liveKey) {
 		t.Fatal("live-row object gone")
+	}
+	for i := range orphans {
+		if objectExists(t, l.RootDir(), partKey(uint64(i))) {
+			t.Fatalf("orphan %s still present", partKey(uint64(i)))
+		}
+	}
+}
+
+// TestPartOrphanPassKeepsWriterTemporary asserts the pass never unlinks a
+// write in progress. Local.Put writes to key+TempSuffix and renames it into
+// place, so a temporary file is bytes a caller is still handing over: no row
+// ever names it, and age is the only other thing standing between it and a
+// delete. Nothing here may depend on how long a part write can take.
+func TestPartOrphanPassKeepsWriterTemporary(t *testing.T) {
+	t.Parallel()
+	s, l := openOrphanStore(t)
+	ctx := context.Background()
+
+	// The writer's in-flight file for a part key, aged well past the cutoff:
+	// every gate except the temporary-file one would let this through.
+	temp := partKey(0x7e77) + blob.TempSuffix
+	p := filepath.Join(l.RootDir(), filepath.FromSlash(temp))
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatalf("mkdir parts: %v", err)
+	}
+	if err := os.WriteFile(p, []byte("half a part"), 0o600); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	ageObject(t, l.RootDir(), temp, time.Now().Add(-72*time.Hour))
+
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if res.Objects != 0 {
+		t.Fatalf("reclaimed %+v, want nothing (write in progress)", res)
+	}
+	if !objectExists(t, l.RootDir(), temp) {
+		t.Fatal("writer temporary file deleted")
+	}
+}
+
+// TestPartOrphanPassLeavesUnexplainedPaths asserts the shape gate. The pass
+// pages candidates by walking paths rather than by reading rows, so what
+// separates a part object from anything else parked under the prefix decides
+// what gets deleted. A path NewPartKey could not have produced is not part
+// bytes, is not this pass's to reclaim, and is left for blobscan to report.
+func TestPartOrphanPassLeavesUnexplainedPaths(t *testing.T) {
+	t.Parallel()
+	s, l := openOrphanStore(t)
+	ctx := context.Background()
+
+	// One real orphan, so an empty result cannot make this pass vacuously.
+	orphan := partKey(0xbeef)
+	if _, err := l.Put(ctx, orphan, strings.NewReader("o")); err != nil {
+		t.Fatalf("put orphan: %v", err)
+	}
+	ageObject(t, l.RootDir(), orphan, time.Now().Add(-24*time.Hour))
+
+	// Paths under the prefix the writer cannot have produced: a short name, an
+	// over-long one, upper-case hex, and a file nested a level down.
+	unexplained := []string{
+		blob.PartsPrefix + "README",
+		blob.PartsPrefix + strings.Repeat("a", 33),
+		blob.PartsPrefix + strings.ToUpper(strings.Repeat("ab", 16)),
+		blob.PartsPrefix + "sub/" + strings.Repeat("c", 32),
+	}
+	for _, key := range unexplained {
+		p := filepath.Join(l.RootDir(), filepath.FromSlash(key))
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", key, err)
+		}
+		if err := os.WriteFile(p, []byte("not ours"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", key, err)
+		}
+		ageObject(t, l.RootDir(), key, time.Now().Add(-72*time.Hour))
+	}
+
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if res.Objects != 1 {
+		t.Fatalf("reclaimed %d objects, want 1 (the orphan alone): %+v", res.Objects, res)
+	}
+	for _, key := range unexplained {
+		if !objectExists(t, l.RootDir(), key) {
+			t.Fatalf("unexplained path %s deleted", key)
+		}
 	}
 }
 
@@ -295,11 +389,11 @@ func TestPartOrphanPassSeparatorFreePrefixContainment(t *testing.T) {
 
 	// Plant an old orphan under the parts prefix and an old object under an
 	// assembled shard. The pass must reclaim only the part.
-	partKey := blob.PartsPrefix + "part_orphan"
-	if _, err := l.Put(ctx, partKey, strings.NewReader("p")); err != nil {
+	key := partKey(0x9a17)
+	if _, err := l.Put(ctx, key, strings.NewReader("p")); err != nil {
 		t.Fatalf("put part: %v", err)
 	}
-	ageObject(t, l.RootDir(), partKey, time.Now().Add(-24*time.Hour))
+	ageObject(t, l.RootDir(), key, time.Now().Add(-24*time.Hour))
 
 	shardKey := blob.Key(4242)
 	if _, err := l.Put(ctx, shardKey, strings.NewReader("s")); err != nil {
