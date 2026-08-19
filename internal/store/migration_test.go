@@ -98,6 +98,28 @@ func TestOpenRejectsMissingMessageFileIdx(t *testing.T) {
 	requireOpenMigrationError(t, ctx, dsn)
 }
 
+// TestOpenRejectsMissingPartBlobKeyIdx is the same clause for the index the
+// orphan pass's live-key gate reads. A database stopped one migration short
+// passes every column check, so without this the server starts and each batch
+// of that gate becomes a Seq Scan of upload_parts — the pass keeps working and
+// only its cost changes, which is precisely the failure nothing else reports.
+func TestOpenRejectsMissingPartBlobKeyIdx(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `DROP INDEX upload_parts_blob_key_idx`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+
+	requireOpenMigrationError(t, ctx, dsn)
+}
+
 // TestOpenRejectsPartBlobMigrationMissing proves the sentinel catches a
 // migrations/ directory that stops short of the part-blob migration: a fresh
 // database built from every migration file except that one must fail Open, not
