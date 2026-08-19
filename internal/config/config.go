@@ -80,16 +80,23 @@ type Config struct {
 	// bytes finite at accounts x cap.
 	UploadPartTTL time.Duration
 	// MediaErasureMinAge is how old a file must be before the media erasure
-	// report will name it. It is configurable because nothing in the server
-	// bounds how long an assembly or a send may take, so no constant can be
-	// derived: an operator who sees live files named shortens nothing, they
-	// lengthen this.
+	// report will name it, and before the erasure sweep will remove it.
 	//
-	// It is defence in depth and not the safety control. Every media file is
-	// stored with zero live references for the length of one send, which is why
-	// an age gate is needed at all — but what keeps a live file safe is the
-	// interlock on its files row, taken by every path that writes a reference.
-	// Nothing in this build deletes a file, so the value affects a report only.
+	// The default is 24 hours, and it is a floor rather than a tuned number: it
+	// cannot be derived at all until MAIN-338 lands. Nothing in the server today
+	// bounds how long an assembly or a send may take — there is no per-RPC
+	// deadline and no statement timeout — so there is no quantity to compute a
+	// cutoff from, and 24 hours is chosen for being far longer than any plausible
+	// send rather than for being right. Do not read it as measured. An operator
+	// who sees live files named shortens nothing, they lengthen this.
+	//
+	// It is defence in depth and not the safety control, which matters most
+	// exactly where it looks like the opposite. Every media file on the server is
+	// stored with zero live references for the length of one send, so the
+	// reference predicate alone matches files being sent right now; the age gate
+	// narrows that window but does not close it. What keeps a live file safe is
+	// the interlock on its files row, taken exclusively by the eraser and in
+	// share mode by every path that writes a reference.
 	MediaErasureMinAge time.Duration
 	// MediaErasureReportInterval is how often that report runs. Zero disables
 	// it, as a zero limit disables a rate limit, and zero is the default: the
@@ -108,6 +115,34 @@ type Config struct {
 	// cached. An operator turning this on wants either a small corpus or the
 	// index the eraser ticket will decide on.
 	MediaErasureReportInterval time.Duration
+	// MediaErasureIntervalMin and MediaErasureIntervalMax bound how long the
+	// erasure sweep waits between passes. Each interval is drawn uniformly from
+	// the range; a zero minimum disables the sweep, and zero is the default.
+	//
+	// A range rather than a period, and the range cannot collapse to a point:
+	// both variables are required together and the maximum must exceed the
+	// minimum. That is a security requirement rather than a scheduling
+	// preference. Per-account usage is summed off the files table, so freeing
+	// quota is observable to the uploader — they can fill their quota, send the
+	// file to someone else, delete their own copy, and then poll by attempting an
+	// upload, which fails until the recipient deletes their copy and succeeds
+	// afterwards. That turns another account's private deletion into a receipt,
+	// timed to within one sweep interval. It cannot be removed without giving up
+	// the quota-freeing this milestone exists to deliver, so it is accepted and
+	// blunted: a randomized interval degrades "at 14:32" to "eventually".
+	MediaErasureIntervalMin time.Duration
+	MediaErasureIntervalMax time.Duration
+	// MediaErasureDestructive turns the sweep from a report into a delete. False
+	// is the default and it is the whole shipping posture of this capability:
+	// with it unset the sweep counts what it could reclaim and removes nothing,
+	// which is what a fresh deployment gets.
+	//
+	// Enabling it is a decision about a particular deployment, not a default,
+	// because the blob volume has no backup and no restore path: a file this
+	// removes is gone, and no sequence of operator actions brings it back. Turn
+	// the sweep on in its reporting mode first and read what it says it would
+	// free.
+	MediaErasureDestructive bool
 	// BlobScanTempMinAge is how old the blob writer's temporary file must be
 	// before the disk report will name it as abandoned. A temporary file is an
 	// upload writing its bytes right now, so this has to exceed the longest
@@ -313,6 +348,13 @@ func Load(log *slog.Logger) (Config, error) {
 		MediaErasureReportInterval: 0,
 		BlobScanReportInterval:     0,
 
+		// The sweep is off and non-destructive unless an operator says
+		// otherwise, which is what "ships disabled" means for a pass that
+		// unlinks user bytes from a volume with no backup.
+		MediaErasureIntervalMin: 0,
+		MediaErasureIntervalMax: 0,
+		MediaErasureDestructive: false,
+
 		MaxConnsPerUnboundKey: mtproto.DefaultMaxConnsPerUnboundKey,
 
 		RegistrationMode: RegistrationClosed,
@@ -376,6 +418,53 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_MEDIA_ERASURE_REPORT_INTERVAL must not be negative")
 		}
 		cfg.MediaErasureReportInterval = d
+	}
+	if v := os.Getenv("TG_MEDIA_ERASURE_INTERVAL_MIN"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MIN must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MIN must not be negative")
+		}
+		cfg.MediaErasureIntervalMin = d
+	}
+	if v := os.Getenv("TG_MEDIA_ERASURE_INTERVAL_MAX"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MAX must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MAX must not be negative")
+		}
+		cfg.MediaErasureIntervalMax = d
+	}
+	// Refused rather than defaulted, in both directions. A minimum on its own
+	// would have to fall back to a fixed tick, and the fixed tick is the thing
+	// the range exists to prevent: it is what turns another account's deletion
+	// into a receipt timed to the second. A maximum on its own is a variable the
+	// operator believes is in effect and is not.
+	if (cfg.MediaErasureIntervalMin > 0) != (cfg.MediaErasureIntervalMax > 0) {
+		return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MIN and TG_MEDIA_ERASURE_INTERVAL_MAX must be set together")
+	}
+	if cfg.MediaErasureIntervalMin > 0 && cfg.MediaErasureIntervalMax <= cfg.MediaErasureIntervalMin {
+		return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MAX must be greater than TG_MEDIA_ERASURE_INTERVAL_MIN")
+	}
+	if v := os.Getenv("TG_MEDIA_ERASURE_DESTRUCTIVE"); v != "" {
+		on, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_DESTRUCTIVE must be a boolean")
+		}
+		cfg.MediaErasureDestructive = on
+	}
+	// Refused for the reason a lone interval bound is, and it is the worse of
+	// the two: an operator who set this believes reclamation is running and is
+	// watching for the disk to come back, while nothing is scheduled to run at
+	// all. Silence there reads as "there was nothing to reclaim". Turning
+	// destruction on is the one setting in this file that cannot be quietly
+	// inert.
+	if cfg.MediaErasureDestructive && cfg.MediaErasureIntervalMin == 0 {
+		return Config{}, errors.New("TG_MEDIA_ERASURE_DESTRUCTIVE needs TG_MEDIA_ERASURE_INTERVAL_MIN and TG_MEDIA_ERASURE_INTERVAL_MAX; nothing runs the sweep without them")
 	}
 	if v := os.Getenv("TG_BLOB_SCAN_TEMP_MIN_AGE"); v != "" {
 		d, err := time.ParseDuration(v)

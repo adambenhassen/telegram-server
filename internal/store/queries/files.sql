@@ -159,3 +159,90 @@ FROM files f
 WHERE f.id > sqlc.arg(after_id) AND f.id <= sqlc.arg(through_id)
 ORDER BY f.id
 LIMIT sqlc.arg(lim)::int;
+
+-- LockFileForErase takes one files row exclusively, or reports nothing when
+-- another transaction holds it. It is the eraser's half of the M17 interlock:
+-- LockFileForReference above takes the same row FOR SHARE on every path that
+-- writes a reference, so the two modes conflict and the orders are the only
+-- two possible.
+--
+-- It carries no predicate, and that omission is the safety argument rather than
+-- an oversight. Under READ COMMITTED a statement evaluates its qual and takes
+-- its row locks against one snapshot, so a `WHERE <no live reference> FOR
+-- UPDATE` would decide erasability against a snapshot taken BEFORE the lock was
+-- held — and a forward that committed in between is invisible to it while its
+-- own share lock is already released, so nothing blocks and nothing refuses.
+-- Locking in a statement of its own puts the reference predicate in a later
+-- statement, whose fresh snapshot sees every reference committed before the
+-- lock was taken; every reference not yet committed blocks on the lock and
+-- then fails closed on the missing row. Those two cases are exhaustive.
+--
+-- SKIP LOCKED, not NOWAIT and not a wait: a files row is a terminal lock class
+-- that a forward reaches while already holding the destination chat's row lock
+-- and up to 200 per-owner advisory locks, so an eraser that queued behind a
+-- contended row would hold nothing but would leave itself parked, and an
+-- eraser that waited would be the one parking the chat. A row someone else
+-- holds is somebody's live reference being written; it is not a candidate this
+-- second, and the next sweep will read it again.
+-- name: LockFileForErase :one
+SELECT id, size FROM files WHERE id = $1 FOR UPDATE SKIP LOCKED;
+
+-- ClearDeletedChannelFileRefs releases the file reference held by channel posts
+-- that are already soft-deleted, and only those.
+--
+-- It exists because the foreign key at channel_messages.file_id is RESTRICT and
+-- counts soft-deleted rows: while any channel_messages row names a file, live
+-- or deleted, DELETE FROM files is refused. Measured, not assumed — a file
+-- posted once to a channel and then deleted is unerasable forever without this
+-- statement, and the refusal is raised by the constraint rather than by any
+-- code here.
+--
+-- The `deleted = true` condition is what keeps the constraint a backstop rather
+-- than removing it. Cascade would delete live channel posts and set-null would
+-- turn a live media post into a text post; this clears only rows that are
+-- already tombstones, so a post created in the race window is still named by a
+-- row this statement did not touch, and the DELETE that follows aborts the
+-- whole transaction on the constraint even if every predicate above it missed.
+--
+-- Taken after the files row and never before: files first, then
+-- channel_messages, the same direction a channel media send must take once one
+-- exists (lock the file row, then insert the post). The reverse order is a
+-- deadlock between the eraser and channel media the day channel media ships.
+-- name: ClearDeletedChannelFileRefs :execrows
+UPDATE channel_messages SET file_id = NULL WHERE file_id = $1 AND deleted = true;
+
+-- DeleteUnreferencedFile removes one files row, and only if every condition
+-- that made it a candidate still holds. It is the decision; the scan that named
+-- the file only proposed it.
+--
+-- Every condition is re-evaluated by this statement rather than trusted from
+-- the earlier scan, for the reason finding 2 of the M17 threat model gives:
+-- between naming a candidate and acting on it, a file can gain a reference, and
+-- a SELECT that decided otherwise is a statement about a moment that has
+-- passed. Under READ COMMITTED this statement takes a fresh snapshot, and the
+-- caller already holds the row exclusively, so what it cannot see cannot yet
+-- exist: a reference writer is either committed and visible here, or blocked on
+-- the row lock and about to fail closed on the row being gone.
+--
+-- The age cutoff is repeated here for the same reason and not because the scan
+-- forgot it. It is defence in depth either way — every media file on the server
+-- is stored with zero live references for the length of one send, so the age
+-- gate narrows that window but does not close it, and what actually keeps a
+-- live file safe is the row lock this runs under.
+--
+-- stored = true keeps this statement off not-stored rows entirely: an
+-- unassembled file is a crashed upload or one running right now, it has no
+-- bytes at this key to unlink, and reclaiming it is a different mechanism.
+-- name: DeleteUnreferencedFile :execrows
+DELETE FROM files f
+WHERE f.id = sqlc.arg(id)
+  AND f.stored = true
+  AND f.date < sqlc.arg(older_than)::timestamptz
+  AND NOT EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.file_id = f.id AND m.deleted = false
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM channel_messages cm
+      WHERE cm.file_id = f.id AND cm.deleted = false
+  );

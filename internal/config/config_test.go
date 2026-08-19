@@ -1089,3 +1089,81 @@ func TestLoadBlobScanReport(t *testing.T) {
 		})
 	}
 }
+
+// The erasure sweep's knobs. Two properties matter more than the parsing: the
+// sweep is off and non-destructive with nothing set, and a fixed period is
+// unconfigurable — a range with one end missing, or with both ends equal, is
+// refused by name rather than quietly becoming a tick. The tick is what times
+// another account's deletion to the second for a watching uploader.
+func TestLoadMediaErasureSweep(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	tests := map[string]struct {
+		min, max, destructive string
+		wantMin, wantMax      time.Duration
+		wantDestructive       bool
+		wantErrVar            string
+	}{
+		"unset":       {},
+		"range set":   {min: "30m", max: "90m", wantMin: 30 * time.Minute, wantMax: 90 * time.Minute},
+		"destructive": {min: "30m", max: "90m", destructive: "true", wantMin: 30 * time.Minute, wantMax: 90 * time.Minute, wantDestructive: true},
+		// Destruction asked for with nothing to run it is refused rather than
+		// accepted and inert: an operator who set it is watching for the disk to
+		// come back, and silence from a sweep that was never scheduled reads
+		// exactly like a sweep that found nothing.
+		"destructive alone":     {destructive: "true", wantErrVar: "TG_MEDIA_ERASURE_DESTRUCTIVE"},
+		"destructive off alone": {destructive: "false"},
+		"min only":              {min: "30m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
+		"max only":              {max: "90m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MIN"},
+		"equal ends":            {min: "30m", max: "30m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
+		"inverted ends":         {min: "90m", max: "30m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
+		"min not duration":      {min: "often", max: "90m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MIN"},
+		"max not duration":      {min: "30m", max: "often", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MAX"},
+		"min negative":          {min: "-1h", max: "90m", wantErrVar: "TG_MEDIA_ERASURE_INTERVAL_MIN"},
+		"destructive typo":      {destructive: "yes please", wantErrVar: "TG_MEDIA_ERASURE_DESTRUCTIVE"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TG_MEDIA_ERASURE_INTERVAL_MIN", tc.min)
+			t.Setenv("TG_MEDIA_ERASURE_INTERVAL_MAX", tc.max)
+			t.Setenv("TG_MEDIA_ERASURE_DESTRUCTIVE", tc.destructive)
+			cfg, err := config.Load(discardLog())
+			if tc.wantErrVar != "" {
+				if err == nil {
+					t.Fatalf("expected error for %s, got min %v max %v destructive %v",
+						name, cfg.MediaErasureIntervalMin, cfg.MediaErasureIntervalMax, cfg.MediaErasureDestructive)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrVar) {
+					t.Errorf("error %q does not name %s", err, tc.wantErrVar)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.MediaErasureIntervalMin != tc.wantMin || cfg.MediaErasureIntervalMax != tc.wantMax {
+				t.Errorf("interval range = [%v, %v], want [%v, %v]",
+					cfg.MediaErasureIntervalMin, cfg.MediaErasureIntervalMax, tc.wantMin, tc.wantMax)
+			}
+			if cfg.MediaErasureDestructive != tc.wantDestructive {
+				t.Errorf("MediaErasureDestructive = %v, want %v", cfg.MediaErasureDestructive, tc.wantDestructive)
+			}
+		})
+	}
+}
+
+// The age cutoff a destructive pass runs against defaults to no less than 24
+// hours. It is not a tuned number and cannot be one until a per-RPC deadline
+// exists; this pins the floor so a later reader shortening it has to argue with
+// a test rather than with a comment.
+func TestMediaErasureMinAgeDefaultsToAtLeastADay(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MediaErasureMinAge < 24*time.Hour {
+		t.Errorf("MediaErasureMinAge default = %v, want at least 24h", cfg.MediaErasureMinAge)
+	}
+}
