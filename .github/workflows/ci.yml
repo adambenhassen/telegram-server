@@ -304,16 +304,39 @@ jobs:
       # and a stalled one is retried once; the step timeout is the backstop if
       # the bounding itself fails. A step timeout fails the job, so this now
       # reads as a failure rather than a supersede.
+      #
+      # --with-deps shells out to `sudo apt-get`, so the process holding the
+      # dpkg lock runs as root while the kill from `timeout` comes from the
+      # unprivileged runner user and cannot reach it. The orphan keeps the lock
+      # and the second attempt dies instantly on "Could not get lock", which is
+      # the one failure the retry exists for. Each attempt therefore runs in its
+      # own process group (setsid makes $! the group id, since a background job
+      # here is not already a group leader) and that group is killed as root
+      # afterwards, then the lock is waited on and dpkg repaired before the
+      # retry. Every wait is bounded, so an install that genuinely cannot
+      # succeed still fails in minutes rather than burning the job timeout.
       - name: Install Playwright browsers
-        timeout-minutes: 9
+        timeout-minutes: 10
         run: |
+          reap() {
+            sudo kill -KILL -- "-$1" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1 || break
+              sleep 1
+            done
+            sudo dpkg --configure -a || true
+          }
+
           for attempt in 1 2; do
             status=0
-            timeout --signal=KILL 4m pnpm exec playwright install --with-deps chromium || status=$?
+            setsid timeout --signal=KILL 4m pnpm exec playwright install --with-deps chromium &
+            pid=$!
+            wait "$pid" || status=$?
             if [ "$status" -eq 0 ]; then
               exit 0
             fi
             echo "::warning::playwright install attempt $attempt failed (exit $status)"
+            reap "$pid"
           done
           echo "::error::playwright install failed after 2 attempts"
           exit 1
