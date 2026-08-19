@@ -339,6 +339,11 @@ jobs:
       - name: Determine the missing system dependencies
         id: playwright-deps
         run: |
+          # ImageOS and ImageVersion are set in the runner's environment rather
+          # than the workflow's, so they are readable here but not from the
+          # `env` context an expression in a cache key would use.
+          echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >>"$GITHUB_OUTPUT"
+
           status=0
           pnpm exec playwright install-deps --dry-run chromium >deps-dry-run.txt 2>&1 || status=$?
           cat deps-dry-run.txt
@@ -370,7 +375,7 @@ jobs:
         uses: actions/cache@v6.1.0
         with:
           path: .apt-cache/*.deb
-          key: playwright-apt-${{ env.ImageOS }}-${{ env.ImageVersion }}-${{ hashFiles('apt-packages.txt') }}
+          key: playwright-apt-${{ steps.playwright-deps.outputs.image }}-${{ hashFiles('apt-packages.txt') }}
 
       # The warm path: dpkg installs the whole cached set in one call, which is
       # what lets it resolve the ordering among them, and touches no mirror. The
@@ -460,7 +465,7 @@ jobs:
         uses: actions/cache/save@v6.1.0
         with:
           path: .apt-cache/*.deb
-          key: playwright-apt-${{ env.ImageOS }}-${{ env.ImageVersion }}-${{ hashFiles('apt-packages.txt') }}
+          key: playwright-apt-${{ steps.playwright-deps.outputs.image }}-${{ hashFiles('apt-packages.txt') }}
 
       # Whichever path ran, the browser has to be able to start. This is the
       # same simulation as above and costs a second; it is here so a missing
