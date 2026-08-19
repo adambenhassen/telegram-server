@@ -24,3 +24,20 @@
 -- production apply these same files, so that failure mode would ship into every
 -- test database.
 CREATE INDEX messages_file_idx ON messages (file_id) WHERE file_id <> 0;
+
+-- files.id is never the 0 sentinel, enforced rather than assumed. Three separate
+-- places already read as if this held and none of them checked it: the download
+-- gate's `m.file_id = f.id` in files.sql, which with a row at id 0 would treat
+-- every text message as an entitlement to that file; MediaErasureSummary's walk,
+-- which starts at after_id = 0 and so can never classify such a row; and the
+-- `m.file_id <> 0` conjunct above, whose no-op argument is only sound while no
+-- files row can carry the sentinel. BIGSERIAL supplies a default and constrains
+-- nothing — an explicit insert naming id can still write a 0.
+--
+-- Validated, not NOT VALID: if a deployment somehow holds a violating row the
+-- apply must fail here, loudly, rather than leave a constraint that is on paper
+-- only while the three readers above keep trusting it. ADD CONSTRAINT takes
+-- ACCESS EXCLUSIVE on files for the validating scan, which blocks readers too;
+-- measured at 20k files it is about 4ms, and files carries one row per uploaded
+-- file rather than per message, so it is the small side of this schema.
+ALTER TABLE files ADD CONSTRAINT files_id_positive CHECK (id > 0);
