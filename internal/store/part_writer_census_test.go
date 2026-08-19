@@ -1,12 +1,15 @@
 package store_test
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/printer"
 	"go/token"
 	"io/fs"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -28,14 +31,20 @@ import (
 func TestPartPrefixHasOneBoundedWriter(t *testing.T) {
 	t.Parallel()
 
-	// key expression at each call site, by file, for the callers that exist.
-	want := map[string]string{
-		"internal/api/media.go":     "blob.Key(file.ID)",
-		"internal/store/uploads.go": "key",
+	// Every blob write in the tree, by file, as the key expression it hands
+	// Put. The census counts call sites rather than files: a second write
+	// added to a file already listed here is the likely shape of the change
+	// this pin exists to catch — a streaming part writer lands in
+	// internal/store/uploads.go, which is already a writer — so a file whose
+	// entry merely still matches must not read as unchanged.
+	want := map[string][]string{
+		"internal/api/media.go":     {"blob.Key(file.ID)"},
+		"internal/store/uploads.go": {"key"},
 	}
 
 	fset := token.NewFileSet()
-	got := map[string]string{}
+	got := map[string][]string{}
+	where := map[string][]string{}
 	root := filepath.Join("..", "..")
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -55,6 +64,11 @@ func TestPartPrefixHasOneBoundedWriter(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
 		ast.Inspect(f, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
@@ -69,15 +83,12 @@ func TestPartPrefixHasOneBoundedWriter(t *testing.T) {
 			// direction for a census.
 			var b strings.Builder
 			if err := printer.Fprint(&b, fset, call.Args[1]); err != nil {
-				t.Errorf("print key expression in %s: %v", p, err)
+				t.Errorf("print key expression in %s: %v", rel, err)
 				return false
 			}
-			rel, err := filepath.Rel(root, p)
-			if err != nil {
-				t.Errorf("relative path for %s: %v", p, err)
-				return false
-			}
-			got[filepath.ToSlash(rel)] = b.String()
+			got[rel] = append(got[rel], b.String())
+			where[rel] = append(where[rel], fmt.Sprintf("%s:%d writes %s",
+				rel, fset.Position(call.Pos()).Line, b.String()))
 			return true
 		})
 		return nil
@@ -86,21 +97,25 @@ func TestPartPrefixHasOneBoundedWriter(t *testing.T) {
 		t.Fatalf("walk source tree: %v", err)
 	}
 
-	for file, key := range want {
-		k, ok := got[file]
+	for file, keys := range want {
+		found, ok := got[file]
 		if !ok {
 			t.Errorf("no blob write found in %s; the census is stale, not the invariant", file)
 			continue
 		}
-		if k != key {
-			t.Errorf("%s writes to %s, census says %s — say which prefix it lands under", file, k, key)
+		sort.Strings(found)
+		sort.Strings(keys)
+		if !slices.Equal(found, keys) {
+			t.Errorf("%s writes %v, census says %v — for each one, say which prefix it lands under "+
+				"and whether it is bounded:\n\t%s",
+				file, found, keys, strings.Join(where[file], "\n\t"))
 		}
 	}
-	for file, key := range got {
+	for file, keys := range got {
 		if _, ok := want[file]; !ok {
-			t.Errorf("new blob writer in %s (key %s): if it lands under %q it must be bounded, "+
+			t.Errorf("new blob writer in %s (keys %v): if it lands under %q it must be bounded, "+
 				"because the orphan pass unlinks an aged temporary there as an abandoned write",
-				file, key, "parts/")
+				file, keys, "parts/")
 		}
 	}
 }

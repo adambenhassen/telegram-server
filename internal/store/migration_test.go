@@ -117,6 +117,15 @@ func TestOpenRejectsPartBlobMigrationMissing(t *testing.T) {
 	// withholding a file whose absence is harmless; name would match this
 	// branch's own upload_parts_blob_key_idx just as readily as the column
 	// migration it is named after.
+	//
+	// The discriminator is "blob_key" together with "ADD COLUMN", and it takes
+	// the last match: exactly one file in migrations/ adds a column by that
+	// name today. A future migration that adds another column called blob_key —
+	// on any table — moves the selector onto it, and the sentinel this test
+	// drives is upload_parts.blob_key specifically. Whoever writes that
+	// migration has to narrow this, and the failure will be loud rather than
+	// vacuous: withholding the wrong file leaves the startup sentinel's
+	// conditions satisfied, so Open succeeds and the assertion below fires.
 	var latest string
 	for _, e := range migs {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
