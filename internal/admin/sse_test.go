@@ -702,14 +702,7 @@ func TestSSE_slow_reader_gets_the_latest_snapshot(t *testing.T) {
 	}
 
 	// Never read while the sampler runs, so every fan-out finds the buffer full.
-	deadline := time.Now().Add(2 * time.Second)
-	for sampleNo.Load() < 5 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	produced := sampleNo.Load()
-	if produced < 5 {
-		t.Fatalf("sampler only produced %d snapshots", produced)
-	}
+	waitForSamples(t, &sampleNo, 5, 2*time.Second)
 
 	// Unsubscribing stops further fan-out to this channel under the same lock
 	// fanout takes, so what remains in it is exactly what was queued.
@@ -729,6 +722,14 @@ func TestSSE_slow_reader_gets_the_latest_snapshot(t *testing.T) {
 	if len(queued) != 1 {
 		t.Fatalf("%d payloads queued for a reader that never drained, want 1: a backlog accumulated", len(queued))
 	}
+
+	// Read the count only once the subscription is gone and its buffer drained.
+	// With no clients left the sampler stops, so this is the number of the last
+	// snapshot that could have reached the channel — read before unsubscribing,
+	// it is merely the number of the last sample *entered*, and any sample that
+	// completed in between would leave the comparison below chasing a snapshot
+	// this reader was never queued.
+	produced := sampleNo.Load()
 
 	// The one queued payload is a recent snapshot, not the first that arrived
 	// and then sat there while five more were produced.
@@ -791,12 +792,19 @@ func TestSSE_extra_clients_do_not_wake_the_sampler(t *testing.T) {
 		Interval: time.Hour,
 	})
 
-	_, _, unsubscribe, err := b.SubscribeForTest()
+	first, _, unsubscribe, err := b.SubscribeForTest()
 	if err != nil {
 		t.Fatalf("first subscribe: %v", err)
 	}
 	defer unsubscribe()
-	waitForSamples(t, &samples, 1, 2*time.Second)
+	// What the extra clients below depend on is a *published* snapshot, not a
+	// sampler invocation: the counter is incremented on entry to the sampler,
+	// and rendering and fan-out still have to happen before subscribe hands a
+	// newcomer anything. Waiting on the count lets all five subscribe into the
+	// gap and report no snapshot at once. The first client's payload arrives
+	// from the same fan-out, under the same lock, that stores the snapshot
+	// subscribe reads, so receiving it is exactly the condition being waited on.
+	waitForSnapshot(t, first, 2*time.Second)
 
 	for i := range 5 {
 		_, last, drop, err := b.SubscribeForTest()
@@ -815,7 +823,29 @@ func TestSSE_extra_clients_do_not_wake_the_sampler(t *testing.T) {
 	}
 }
 
-// waitForSamples polls until the sampler has run at least n times.
+// waitForSnapshot blocks until a subscriber is handed a payload, which is the
+// broadcaster's own signal that a snapshot has been published: fanout stores
+// the snapshot and sends it to every subscriber while holding the lock that
+// subscribe takes to read it. A test that needs the published snapshot to exist
+// waits here rather than on the sampler's invocation count, which is incremented
+// before the snapshot is rendered, let alone stored.
+func waitForSnapshot(t *testing.T, ch <-chan []byte, timeout time.Duration) []byte {
+	t.Helper()
+	select {
+	case payload, open := <-ch:
+		if !open {
+			t.Fatal("broadcaster closed before publishing a snapshot")
+		}
+		return payload
+	case <-time.After(timeout):
+		t.Fatalf("no snapshot published within %v", timeout)
+		return nil
+	}
+}
+
+// waitForSamples polls until the sampler has run at least n times. It answers
+// how many times the sampler was entered and nothing else — a test whose next
+// step needs the resulting snapshot to exist wants waitForSnapshot instead.
 func waitForSamples(t *testing.T, samples *atomic.Int64, n int64, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
