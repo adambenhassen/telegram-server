@@ -761,3 +761,114 @@ func TestSendMediaResendAfterErasureIsRefused(t *testing.T) {
 		t.Errorf("files rows = %d, want 0 — the refused resend reassembled the upload", n)
 	}
 }
+
+// deletedOriginalResend runs one arm of the erasure-oracle probe: send media,
+// soft-delete both copies through the shipped delete path, optionally let the
+// erasure sweep past, then resend the byte-identical request. It returns what
+// that second call answered.
+//
+// The two arms differ in exactly one thing — whether the file behind the
+// deleted original still exists — which is the bit an uploader must not be able
+// to read off the reply.
+func deletedOriginalResend(t *testing.T, phoneA, phoneB string, fileID, randomID int64, runSweep bool) (any, error) {
+	t.Helper()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	blobs := newBlobs(t)
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(blobs))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if cerr := s.Close(); cerr != nil {
+			t.Errorf("close: %v", cerr)
+		}
+	})
+	a, err := s.CreateUser(ctx, phoneA)
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, phoneB)
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+	saveParts(t, s, a.ID, fileID, []byte("erasable bytes"))
+
+	req := &tg.MessagesSendMediaRequest{
+		Peer:     api.InputPeerUser(a.ID, b.ID),
+		Media:    uploadedDocument(fileID, 1, "doc.txt", "text/plain"),
+		Message:  "look",
+		RandomID: randomID,
+	}
+	first, err := api.SendMediaForTest(s, a.ID, blobs, api.TestMaxUserStorageBytes, req)
+	if err != nil {
+		t.Fatalf("send media: %v", err)
+	}
+	// The control on the whole probe: before anything is deleted this request
+	// answers with the document. Without it both arms could be refusals for a
+	// reason that has nothing to do with the leak.
+	documentOf(t, first)
+	sent := messageOf(t, first)
+
+	if _, err = s.DeleteMessages(ctx, a.ID, []int64{int64(sent.ID)}, true); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if runSweep {
+		counts, serr := s.SweepMediaErasure(ctx, time.Now().Add(time.Hour), store.ErasureScanBatch)
+		if serr != nil {
+			t.Fatalf("sweep: %v", serr)
+		}
+		if counts.Erased != 1 {
+			t.Fatalf("sweep counts = %+v, want one erased", counts)
+		}
+		if n := countFiles(t, ctx, dsn); n != 0 {
+			t.Fatalf("files rows = %d after the sweep, want 0 — this arm is not the erased one", n)
+		}
+	} else if n := countFiles(t, ctx, dsn); n != 1 {
+		// Without this the two arms could be identical and the comparison below
+		// would be comparing one state with itself.
+		t.Fatalf("files rows = %d without a sweep, want 1 — this arm is not the surviving one", n)
+	}
+	return api.SendMediaForTest(s, a.ID, blobs, api.TestMaxUserStorageBytes, req)
+}
+
+// A resend whose original is soft-deleted answers the same way whether or not
+// the eraser has taken the file behind it.
+//
+// Refusing is not the property — indistinguishability is. Two arms that both
+// fail but fail differently leave the oracle exactly where it was: the uploader
+// still reads off which of their files has been erased, and therefore which
+// recipient deleted which media, from one repeated request. So this compares
+// the two replies against each other rather than each against a constant.
+//
+// The surviving-file arm is the one that carried the leak after the first fix.
+// The handler stopped short-circuiting on a deleted original, but the
+// fall-through reached SendMessage, where the interlock refused only when the
+// file row was gone — and when it survived, the store's own dedup replayed the
+// deleted original and the handler rendered its document.
+func TestSendMediaResendOfDeletedOriginalIsIndistinguishable(t *testing.T) {
+	t.Parallel()
+
+	kept, keptErr := deletedOriginalResend(t, "+15551296211", "+15551296212", 7710, 7711, false)
+	erased, erasedErr := deletedOriginalResend(t, "+15551296221", "+15551296222", 7720, 7721, true)
+
+	if keptErr == nil {
+		t.Fatalf("resend with the file still present returned %#v, want a refusal — the deleted original was replayed", kept)
+	}
+	if erasedErr == nil {
+		t.Fatalf("resend after erasure returned %#v, want a refusal", erased)
+	}
+	rpcError(t, keptErr, "MEDIA_INVALID")
+	rpcError(t, erasedErr, "MEDIA_INVALID")
+
+	// The load-bearing assertion. Anything that distinguishes the two replies —
+	// a different code, a different message, one carrying a payload — is the
+	// oracle still open.
+	if keptErr.Error() != erasedErr.Error() {
+		t.Errorf("the arms answer differently: file present -> %q, file erased -> %q; whether the sweep has run is readable from the reply",
+			keptErr, erasedErr)
+	}
+	if kept != nil || erased != nil {
+		t.Errorf("a refused resend returned a payload: present -> %#v, erased -> %#v", kept, erased)
+	}
+}
