@@ -163,13 +163,13 @@ func (s *Server) handle(c *Conn, req *Request) error {
 		// A handler still running when its request deadline fired is abandoned,
 		// not fatal to the connection: the client gets the same generic INTERNAL
 		// any transient failure produces, and the next frame on this socket
-		// starts a fresh request with a full budget. The reply goes out under a
-		// detached context — the deadline has already spent itself, and the write
-		// timeout is the bound that applies to a socket write.
+		// starts a fresh request with a full budget. The underlying error still
+		// goes to the log first — a defect that happens to coincide with the
+		// timeout must leave a trace — and the reply write detaches from the
+		// spent request context inside SendResult.
 		if errors.Is(req.Ctx.Err(), context.DeadlineExceeded) {
-			reply := *req
-			reply.Ctx = context.WithoutCancel(req.Ctx)
-			return c.SendErr(&reply, errInternalRPC)
+			s.log.Error("rpc abandoned at request deadline", "err", err)
+			return c.SendErr(req, errInternalRPC)
 		}
 		return err
 	}

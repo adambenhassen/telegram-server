@@ -215,12 +215,19 @@ func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int
 }
 
 // SendResult sends msg as the RPC result for req.
+// SendResult sends msg as the RPC result for req.
+//
+// The write runs detached from the request context on purpose. The request
+// deadline bounds the work behind a reply, not the reply itself: a result that
+// finished just as the deadline fired must still reach the client, and a
+// deadline that kills the reply would turn finished work into a dropped
+// connection. What bounds a socket write is conn.writeTimeout, applied below.
 func (c *Conn) SendResult(req *Request, msg bin.Encoder) error {
 	var buf bin.Buffer
 	if err := msg.Encode(&buf); err != nil {
 		return fmt.Errorf("encode result: %w", err)
 	}
-	if err := c.send(req.Ctx, proto.MessageServerResponse, &proto.Result{
+	if err := c.send(context.WithoutCancel(req.Ctx), proto.MessageServerResponse, &proto.Result{
 		RequestMessageID: req.MsgID,
 		Result:           buf.Raw(),
 	}); err != nil {
