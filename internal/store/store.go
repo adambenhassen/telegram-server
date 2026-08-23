@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -70,6 +71,11 @@ type Store struct {
 	// of racing a real one, which on a loaded host closes before the assertion
 	// runs. Scoped to the Store for the reason deniedHook is.
 	now func() time.Time
+
+	// statementTimeout, when non-zero, is applied as a session default on every
+	// pooled connection at connect time. It lives on the Store only so Open can
+	// read it after the options run; see WithStatementTimeout.
+	statementTimeout time.Duration
 }
 
 // Sentinel errors returned by the login-code methods.
@@ -107,6 +113,27 @@ var (
 // Option configures a Store at Open time.
 type Option func(*Store)
 
+// WithStatementTimeout sets the Postgres statement_timeout every connection in
+// the pool runs under: a single SQL statement that runs longer is cancelled by
+// the server, and its transaction rolls back, while the session itself
+// survives. It is the second half of the bound on how long one RPC can hold a
+// transaction open — the per-request deadline in internal/mtproto bounds the
+// handler from the client side; this bounds each statement from the database
+// side, catching a wedged statement even where no request context flows.
+//
+// It is a ceiling on one statement, not on an RPC, and it deliberately applies
+// to everything that shares the pool, sweeps included — which is why the
+// default sits far above any measured legitimate statement, including the
+// media-erasure report's worst measured batch (2.2s at ~300k media messages).
+// Zero disables it.
+func WithStatementTimeout(d time.Duration) Option {
+	return func(s *Store) {
+		if d > 0 {
+			s.statementTimeout = d
+		}
+	}
+}
+
 // WithBlobStore wires the blob backend the Store uses for in-flight upload
 // part bytes.
 func WithBlobStore(blobs blob.Store) Option {
@@ -136,17 +163,7 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	if err != nil {
 		return nil, err
 	}
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping: %w", err)
-	}
 	s := &Store{
-		pool:                   pool,
-		q:                      db.New(pool),
 		cipher:                 cipher,
 		maxChannelParticipants: defaultMaxChannelParticipants,
 		maxChannelsPerUser:     defaultMaxChannelsPerUser,
@@ -157,6 +174,25 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	for _, opt := range opts {
 		opt(s)
 	}
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	// Session default rather than SET per statement: one line at connect, and
+	// every query on the connection carries the ceiling with no per-call cost.
+	if s.statementTimeout > 0 {
+		poolCfg.ConnConfig.RuntimeParams["statement_timeout"] = strconv.FormatInt(s.statementTimeout.Milliseconds(), 10)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+	s.pool = pool
+	s.q = db.New(pool)
 	// Required rather than defaulted: the part bytes live in the blob backend,
 	// so a Store without one cannot serve an upload at all, and there is no
 	// directory this package could pick on a caller's behalf that would be
