@@ -15,6 +15,7 @@ import (
 	"github.com/gotd/td/mt"
 	"github.com/gotd/td/proto"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
@@ -91,6 +92,82 @@ func findResult(t *testing.T, bodies [][]byte, msgID int64) []byte {
 	}
 	t.Fatalf("no RPC result for msg id %d in %d replies", msgID, len(bodies))
 	return nil
+}
+
+// TestRPCDeadlineSurvivingHandlerReplies pins what a handler that finishes
+// after its own deadline owes the client. The deadline abandons the request,
+// never the reply: a handler holding a completed result must see it delivered
+// as a result — not silently swapped for INTERNAL, which would tell the client
+// committed work failed — and a tgerr it returns is answered as itself, since
+// it already carries the method's error surface. In both cases the connection
+// stays up and the next frame on it is served.
+func TestRPCDeadlineSurvivingHandlerReplies(t *testing.T) {
+	t.Parallel()
+	key := rebindTestKey()
+
+	// run drives one connection through a timed-out RPC followed by a ping,
+	// and hands back every decrypted reply in wire order.
+	run := func(t *testing.T, h mtproto.Handler) [][]byte {
+		t.Helper()
+		ks := &statusKeyStore{key: key, users: []int64{0}}
+		srv := mtproto.New(exchange.PrivateKey{}, 2, ks, h, nil)
+		if err := srv.SetRPCDeadline(150 * time.Millisecond); err != nil {
+			t.Fatalf("set rpc deadline: %v", err)
+		}
+		conn := &recordingFrameConn{frames: [][]byte{
+			statusClientFrame(t, key, 42, 1<<32, &tg.AccountRegisterDeviceRequest{}),
+			statusClientFrame(t, key, 42, 2<<32, &mt.PingRequest{PingID: 9}),
+		}}
+		// EOF, not an error: the connection survived the abandoned request.
+		if err := srv.ServeConn(context.Background(), conn); !errors.Is(err, io.EOF) {
+			t.Fatalf("ServeConn = %v, want EOF", err)
+		}
+		return conn.replies(t, key)
+	}
+
+	// pongFor finds the pong answering the trailing ping — the proof the serve
+	// loop kept reading after the deadline fired.
+	pongFor := func(t *testing.T, replies [][]byte) *mt.Pong {
+		t.Helper()
+		for _, body := range replies {
+			p := &mt.Pong{}
+			if err := p.Decode(&bin.Buffer{Buf: body}); err == nil && p.MsgID == 2<<32 {
+				return p
+			}
+		}
+		t.Fatalf("no pong for the post-deadline frame in %d replies", len(replies))
+		return nil
+	}
+
+	t.Run("result", func(t *testing.T) {
+		h := mtproto.HandlerFunc(func(c *mtproto.Conn, req *mtproto.Request) error {
+			<-req.Ctx.Done()
+			return c.SendResult(req, &tg.BoolTrue{})
+		})
+		replies := run(t, h)
+		res := &tg.BoolTrue{}
+		if err := res.Decode(&bin.Buffer{Buf: findResult(t, replies, 1<<32)}); err != nil {
+			t.Fatalf("reply past the deadline is not the handler's result: %v", err)
+		}
+		pongFor(t, replies)
+	})
+
+	t.Run("tgerr", func(t *testing.T) {
+		h := mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
+			<-req.Ctx.Done()
+			return tgerr.New(400, "PEER_ID_INVALID")
+		})
+		replies := run(t, h)
+		e := &mt.RPCError{}
+		if err := e.Decode(&bin.Buffer{Buf: findResult(t, replies, 1<<32)}); err != nil {
+			t.Fatalf("decode rpc error past the deadline: %v", err)
+		}
+		if e.ErrorCode != 400 || e.ErrorMessage != "PEER_ID_INVALID" {
+			t.Fatalf("rpc error = %d %q, want the handler's own 400 PEER_ID_INVALID",
+				e.ErrorCode, e.ErrorMessage)
+		}
+		pongFor(t, replies)
+	})
 }
 
 // TestRPCDeadlineAbandonsWithoutTearingDownConnection proves all three halves
