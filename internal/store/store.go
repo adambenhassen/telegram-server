@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strconv"
 	"time"
 
@@ -207,7 +208,18 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	// pool, so it never sits under the session defaults the pool carries — a
 	// short WithStatementTimeout is a ceiling on request work, and startup must
 	// not fail on a loaded host merely because its own setup query outlived it.
-	setupConn, err := pgx.Connect(ctx, dsn)
+	// The connection derives from the already-parsed pool config rather than
+	// re-parsing the raw DSN: pgx.Connect would read pool_* parameters as
+	// runtime params and Postgres would reject them in a startup packet, so a
+	// DSN tuning the pool through its URL — valid for pgxpool — must be seen by
+	// exactly one parser. The statement ceiling is stripped from the copy so
+	// the setup query stays outside it.
+	setupCfg := *poolCfg.ConnConfig
+	if s.statementTimeout > 0 {
+		setupCfg.RuntimeParams = maps.Clone(poolCfg.ConnConfig.RuntimeParams)
+		delete(setupCfg.RuntimeParams, "statement_timeout")
+	}
+	setupConn, err := pgx.ConnectConfig(ctx, &setupCfg)
 	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("schema check connect: %w", err)
