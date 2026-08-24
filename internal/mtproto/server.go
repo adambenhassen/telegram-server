@@ -29,6 +29,25 @@ import (
 const (
 	defaultReadTimeout  = 30 * time.Second
 	defaultWriteTimeout = 30 * time.Second
+	// DefaultRPCDeadline is the shipped per-RPC deadline. It bounds how long a
+	// single dispatched RPC may run — and therefore how long any transaction it
+	// opens can stay open — before its context is cancelled and the client
+	// answered with a generic INTERNAL error. The connection stays up; the next
+	// frame on it starts a fresh request with a full deadline, so a chunked
+	// upload or download is bounded per chunk, never per logical transfer.
+	//
+	// It is derived from measurement, not chosen. Instrumented dispatch over
+	// this repo's own e2e suite puts the slowest legitimate RPC at 638 ms wall —
+	// messages.sendMessage, which fans an update out to every recipient; the
+	// next slowest are messages.createChat at 359 ms, channels.createChannel at
+	// 344 ms and auth.signIn at 333 ms, and per-part upload saves never crossed
+	// the 20 ms instrumentation floor on local Postgres. 23s is roughly 36 times
+	// that slowest call — headroom for hardware several times slower than the
+	// host it was measured on, under production load — and sits above the 17s
+	// shipped statement timeout (DefaultStatementTimeout in internal/config), so
+	// on a genuinely wedged statement the database cancels first and the failure
+	// stays inside the transaction that caused it.
+	DefaultRPCDeadline = 23 * time.Second
 	// defaultHandshakeTimeout bounds how long an accepted socket may take to
 	// declare its transport. A client that sends nothing is closed after it,
 	// which is what keeps a silent connection from costing the server a slot
@@ -57,6 +76,9 @@ type Server struct {
 	// handshakeTimeout bounds transport negotiation on a freshly accepted
 	// socket, before any frame exists to apply readTimeout to.
 	handshakeTimeout time.Duration
+	// rpcDeadline is the per-request ceiling every dispatched RPC runs under.
+	// Zero disables it, like a zero PreAuth bound disables its cap.
+	rpcDeadline time.Duration
 
 	// proxyV2 is the balancer allowlist when client addresses come from PROXY
 	// protocol v2 headers, and nil when they come from the socket itself.
@@ -138,6 +160,20 @@ func (s *Server) SetPreAuthLimits(l PreAuthLimits) error {
 	return nil
 }
 
+// SetRPCDeadline replaces the per-request ceiling every dispatched RPC runs
+// under. Call it before Serve.
+//
+// Zero turns the deadline off and negative is refused, for the reason
+// SetPreAuthLimits gives: zero and negative say opposite things, and the
+// failure a bound cannot afford is reading a typo as "off".
+func (s *Server) SetRPCDeadline(d time.Duration) error {
+	if d < 0 {
+		return fmt.Errorf("rpc deadline is %s: must not be negative, and 0 disables the ceiling", d)
+	}
+	s.rpcDeadline = d
+	return nil
+}
+
 // SetMaxConnsPerUnboundKey replaces the bound on the concurrent connections one
 // auth key with no signed-in user may hold. Call it before Serve.
 //
@@ -171,6 +207,7 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 		readTimeout:      defaultReadTimeout,
 		writeTimeout:     defaultWriteTimeout,
 		handshakeTimeout: defaultHandshakeTimeout,
+		rpcDeadline:      DefaultRPCDeadline,
 		preAuth:          newPreAuthLimiter(DefaultPreAuthLimits()),
 		unboundKeys:      newUnboundKeyLimiter(DefaultMaxConnsPerUnboundKey),
 		log:              log,

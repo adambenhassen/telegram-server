@@ -75,7 +75,8 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log), store.WithBlobStore(blobs))
+	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log), store.WithBlobStore(blobs),
+		store.WithStatementTimeout(cfg.StatementTimeout))
 	if err != nil {
 		return err
 	}
@@ -165,6 +166,9 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	if err := server.SetMaxConnsPerUnboundKey(cfg.MaxConnsPerUnboundKey); err != nil {
+		return err
+	}
+	if err := server.SetRPCDeadline(cfg.RPCDeadline); err != nil {
 		return err
 	}
 	cfg.WarnPreAuthLifetime(log)

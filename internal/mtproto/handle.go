@@ -13,6 +13,13 @@ import (
 	"github.com/gotd/td/tgerr"
 )
 
+// errInternalRPC is the error a timed-out request is answered with. It is
+// deliberately indistinguishable from any other transient failure: a deadline
+// must not become a new observable outcome class on any path, least of all the
+// download path, where an entitled download of an erased file and a download
+// of a file that never existed have to stay identical.
+var errInternalRPC = tgerr.New(500, "INTERNAL")
+
 // rpcHandle decrypts an encrypted MTProto frame on an established session and
 // dispatches its contents. The connection's auth key must already be set to the
 // key matching the frame's auth key ID, and userID is the user bound to that key
@@ -48,6 +55,16 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID i
 			return err
 		}
 	}
+
+	// Every RPC dispatched from this frame runs under the per-request ceiling,
+	// derived fresh per dispatched message inside handle — so the second entry
+	// of a container starts with a full budget of its own rather than what
+	// remains of the first's, and chunked transfers are bounded per chunk, never
+	// per logical transfer. Past the ceiling, pgx cancels the in-flight
+	// statement server-side, the handler's store calls fail, and handle answers
+	// the client with a generic INTERNAL error while the connection stays up.
+	// The frame context itself stays clean, so the touch and re-reads after
+	// dispatch never inherit what remains of an RPC's budget.
 
 	// Buffer now holds the plaintext message body.
 	b.ResetTo(msg.Data())
@@ -134,10 +151,34 @@ func (s *Server) handle(c *Conn, req *Request) error {
 		return nil
 	}
 
+	// Every dispatched RPC gets its own full ceiling, derived here rather than
+	// once per frame: the entries of a container each start with a complete
+	// budget, so a first RPC that burns its whole deadline cannot spend the
+	// second one's. The frame context stays the parent — outer cancellation
+	// (server shutdown, connection teardown) still reaches everything — and the
+	// service messages above, which cost nothing to run, never consume any of
+	// it.
+	if s.rpcDeadline > 0 {
+		var cancel context.CancelFunc
+		req.Ctx, cancel = context.WithTimeout(req.Ctx, s.rpcDeadline)
+		defer cancel()
+	}
+
 	if err := s.handler.OnMessage(c, req); err != nil {
 		var rpcErr *tgerr.Error
 		if errors.As(err, &rpcErr) {
 			return c.SendErr(req, rpcErr)
+		}
+		// A handler still running when its request deadline fired is abandoned,
+		// not fatal to the connection: the client gets the same generic INTERNAL
+		// any transient failure produces, and the next frame on this socket
+		// starts a fresh request with a full budget. The underlying error still
+		// goes to the log first — a defect that happens to coincide with the
+		// timeout must leave a trace — and the reply write detaches from the
+		// spent request context inside SendResult.
+		if errors.Is(req.Ctx.Err(), context.DeadlineExceeded) {
+			s.log.Error("rpc abandoned at request deadline", "err", err)
+			return c.SendErr(req, errInternalRPC)
 		}
 		return err
 	}
