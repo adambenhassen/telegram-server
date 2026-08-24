@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -202,11 +203,29 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 		pool.Close()
 		return nil, errors.New("store: no blob backend configured; pass WithBlobStore")
 	}
-	if err := s.checkSchema(ctx); err != nil {
+	// The schema check runs on its own throwaway connection rather than the
+	// pool, so it never sits under the session defaults the pool carries — a
+	// short WithStatementTimeout is a ceiling on request work, and startup must
+	// not fail on a loaded host merely because its own setup query outlived it.
+	setupConn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("schema check connect: %w", err)
+	}
+	err = s.checkSchema(ctx, setupConn)
+	if cerr := setupConn.Close(ctx); cerr != nil && err == nil {
+		err = fmt.Errorf("schema check close: %w", cerr)
+	}
+	if err != nil {
 		pool.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// queryRower is the one method of pgxpool.Pool and pgx.Conn checkSchema needs.
+type queryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // checkSchema fails fast when the database has not been migrated to the current
@@ -222,9 +241,9 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 // clean on every column check and then plans a different query — the media
 // reference predicate silently degrades to a per-row Seq Scan of messages —
 // so a missing index is exactly the un-migrated state this is here to refuse.
-func (s *Store) checkSchema(ctx context.Context) error {
+func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
 	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload, hasMessageFileIdx bool
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
 		              WHERE table_name = 'messages' AND column_name = 'fanout_id'),

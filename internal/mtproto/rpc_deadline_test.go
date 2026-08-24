@@ -170,6 +170,101 @@ func TestRPCDeadlineSurvivingHandlerReplies(t *testing.T) {
 	})
 }
 
+// rawBodyFrame encrypts an already-encoded message body the way a real client
+// puts it on the wire, for bodies like a MessageContainer that the test builds
+// byte-for-byte rather than through bin.Encoder.
+func rawBodyFrame(t *testing.T, key crypto.AuthKey, sessionID, msgID int64, body bin.Buffer) []byte {
+	t.Helper()
+	data := crypto.EncryptedMessageData{
+		SessionID:              sessionID,
+		MessageID:              msgID,
+		MessageDataLen:         int32(body.Len()), //nolint:gosec // test data, far below MaxInt32
+		MessageDataWithPadding: body.Copy(),
+	}
+	var b bin.Buffer
+	if err := crypto.NewClientCipher(crypto.DefaultRand()).Encrypt(key, data, &b); err != nil {
+		t.Fatalf("encrypt frame: %v", err)
+	}
+	return b.Copy()
+}
+
+// TestRPCDeadlineFreshBudgetPerContainerEntry pins the per-chunk bound where
+// it is easiest to lose: one encrypted frame carrying a container of two RPCs.
+// The deadline belongs to each dispatched message, not to the frame, so when
+// the first entry burns its whole budget the second still starts with a full
+// one — and both are answered on the wire while the connection lives on.
+func TestRPCDeadlineFreshBudgetPerContainerEntry(t *testing.T) {
+	t.Parallel()
+	key := rebindTestKey()
+	ks := &statusKeyStore{key: key, users: []int64{0}}
+
+	const deadline = 150 * time.Millisecond
+	var mu sync.Mutex
+	var budgets []time.Duration
+	h := mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
+		if dl, ok := req.Ctx.Deadline(); ok {
+			mu.Lock()
+			budgets = append(budgets, time.Until(dl))
+			mu.Unlock()
+		} else {
+			t.Error("request context carries no deadline")
+		}
+		// Burn whatever budget this entry holds.
+		<-req.Ctx.Done()
+		return req.Ctx.Err()
+	})
+	srv := mtproto.New(exchange.PrivateKey{}, 2, ks, h, nil)
+	if err := srv.SetRPCDeadline(deadline); err != nil {
+		t.Fatalf("set rpc deadline: %v", err)
+	}
+
+	msgs := make([]proto.Message, 2)
+	for i := range msgs {
+		var b bin.Buffer
+		if err := (&tg.AccountRegisterDeviceRequest{}).Encode(&b); err != nil {
+			t.Fatalf("encode body: %v", err)
+		}
+		msgs[i] = proto.Message{
+			ID:    1<<32 | int64(i),
+			SeqNo: i + 1,
+			Bytes: b.Len(),
+			Body:  b.Copy(),
+		}
+	}
+	var cbin bin.Buffer
+	if err := (&proto.MessageContainer{Messages: msgs}).Encode(&cbin); err != nil {
+		t.Fatalf("encode container: %v", err)
+	}
+	conn := &recordingFrameConn{frames: [][]byte{
+		rawBodyFrame(t, key, 42, 7<<32, cbin),
+	}}
+	if err := srv.ServeConn(context.Background(), conn); !errors.Is(err, io.EOF) {
+		t.Fatalf("ServeConn = %v, want EOF", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(budgets) != 2 {
+		t.Fatalf("handler saw %d entries, want both container entries dispatched", len(budgets))
+	}
+	if budgets[0] <= 0 || budgets[1] < deadline/2 {
+		t.Fatalf("budgets = %v, want the second entry to start with a fresh full budget (>=%s)",
+			budgets, deadline/2)
+	}
+
+	replies := conn.replies(t, key)
+	for i, msgID := range []int64{1 << 32, 1<<32 + 1} {
+		e := &mt.RPCError{}
+		if err := e.Decode(&bin.Buffer{Buf: findResult(t, replies, msgID)}); err != nil {
+			t.Fatalf("entry %d: decode rpc error: %v", i+1, err)
+		}
+		if e.ErrorCode != 500 || e.ErrorMessage != "INTERNAL" {
+			t.Fatalf("entry %d: rpc error = %d %q, want generic INTERNAL",
+				i+1, e.ErrorCode, e.ErrorMessage)
+		}
+	}
+}
+
 // TestRPCDeadlineAbandonsWithoutTearingDownConnection proves all three halves
 // of the per-request ceiling at once: a handler still running when its request
 // deadline fires gets its context cancelled, the client receives the same
