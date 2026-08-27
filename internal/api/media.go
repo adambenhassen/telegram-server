@@ -129,8 +129,45 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	// Check for a transport retry before any expensive work.
+	//
+	// A resend whose original is soft-deleted is refused outright, and the
+	// refusal is the same one a caller gets for media they never had. It does
+	// not matter here whether the file behind that original still exists, and
+	// the indistinguishability is the point rather than a side effect: answering
+	// differently in the two cases tells the uploader which of their files the
+	// eraser has taken, and therefore which recipient deleted which media, from
+	// one repeated request. That is threat model finding 6 with its accepted
+	// mitigation removed — finding 6 was accepted because a randomized sweep
+	// interval degrades "at 14:32" to "eventually", and a probe that is polled
+	// rather than timed is immune to that.
+	//
+	// Refusing here rather than below is deliberate, and it is a rule about
+	// deleted messages rather than a second opinion about missing files. The
+	// interlock stays the only thing that decides whether a reference may be
+	// written; this decides whether a message the sender themself deleted may be
+	// replayed, which is a different question about a different subject, and the
+	// ticket's rationale for refusing a resend after erasure — "the original the
+	// dedup would replay is a message the sender themself deleted" — was always
+	// true whether or not the sweep had been past. Reading no files row keeps it
+	// that way.
+	//
+	// Falling through instead would leave two answers to one request: the
+	// interlock refuses when the file is gone, but when the file survives the
+	// store's own dedup replays the deleted original and the handler renders its
+	// document. Fixing it in that dedup would change SendMessage for every
+	// caller including the non-media path, which is a far wider blast radius.
+	// Reaching this branch at all means the client deleted the message between
+	// the send and the retry, which is not a transport retry.
 	if req.RandomID != 0 {
-		if existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID); err == nil && ok {
+		existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID)
+		if err != nil {
+			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		if ok && existing.Deleted {
+			return nil, errMediaInvalid
+		}
+		if ok {
 			// Retry: return the stored message, at the pts it occupies, without
 			// rate-limiting or file assembly.
 			pts, err := h.store.MessagePts(r.Ctx, r.UserID, existing.LocalID)
@@ -182,9 +219,6 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 				Users: users,
 				Date:  int(existing.Date.Unix()),
 			}, nil
-		} else if err != nil {
-			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
-			return nil, errInternal
 		}
 	}
 

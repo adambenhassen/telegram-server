@@ -221,6 +221,14 @@ jobs:
     # a hang (a browser that never launches, a webServer that never binds).
     timeout-minutes: 20
 
+    # Narrower than it looks: actions: write is the scope that covers the cache
+    # API, and it is here only so this job can delete an apt cache entry that
+    # turns out not to satisfy the dependency check. contents: read is repeated
+    # because a job-level block replaces the workflow's rather than adding to it.
+    permissions:
+      contents: read
+      actions: write
+
     env:
       # Same reasoning as the ci job: the runner is destroyed at the end of the
       # job, so there is nothing for testcontainers' reaper to reap, and losing
@@ -275,48 +283,256 @@ jobs:
       - name: Install Node dependencies
         run: pnpm install --frozen-lockfile
 
-      # Browsers land outside the repo and are not covered by the pnpm cache.
-      # Keyed on the lockfile because that is what pins the Playwright version,
-      # and a browser build belongs to exactly one of those; no restore-keys,
-      # since a stale browser for a newer Playwright is worse than a fresh
-      # download.
+      # The lockfile hash already changes when the Playwright version changes,
+      # but only the version decides which browser build is correct, so it is in
+      # the key in its own right: a key that reads `playwright-Linux-1.62.1-...`
+      # cannot be satisfied by a browser downloaded for another version, whatever
+      # else moved in the lockfile.
+      # Captured into a variable and checked rather than substituted straight
+      # into the echo: the exit status of a command substitution is the echo's,
+      # so a failed `playwright --version` would write an empty segment and the
+      # key would silently stop carrying the version at all.
+      - name: Resolve the Playwright version
+        id: playwright-version
+        run: |
+          version=$(pnpm exec playwright --version | awk '{print $NF}')
+          if [ -z "$version" ]; then
+            echo "::error::could not resolve the Playwright version"
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      # Browsers land outside the repo and are not covered by the pnpm cache. No
+      # restore-keys, since a stale browser for a newer Playwright is worse than
+      # a fresh download.
       - name: Cache Playwright browsers
         id: playwright-cache
         uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}-${{ hashFiles('pnpm-lock.yaml') }}
 
       # A miss means the next step downloads the browser instead of unpacking a
       # cached one, which is the difference between a few seconds and a minute
       # or more. Without this the two are indistinguishable in the log.
       - name: Report Playwright cache outcome
-        run: echo "playwright browser cache hit=${{ steps.playwright-cache.outputs.cache-hit == 'true' }} key=playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}"
+        run: echo "playwright browser cache hit=${{ steps.playwright-cache.outputs.cache-hit == 'true' }} key=playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}-${{ hashFiles('pnpm-lock.yaml') }}"
 
       # playwright.config.ts declares no projects, so the suite runs on Chromium
-      # alone and there is no reason to download the other two. --with-deps is
-      # still needed on a cache hit: the apt libraries it installs live on the
-      # runner image, not in the cached browser directory.
+      # alone and there is no reason to download the other two. Deliberately not
+      # --with-deps: the apt half is handled separately below so that a cache hit
+      # here means no network at all, rather than a browser unpacked from cache
+      # followed by an `apt-get update` against whatever mirror the runner drew.
       #
       # The download has hung here twice, holding the job until its 20-minute
       # timeout killed it and reported the whole run as cancelled. The install
       # takes well under a minute either way, so each attempt is bounded at four
       # and a stalled one is retried once; the step timeout is the backstop if
-      # the bounding itself fails. A step timeout fails the job, so this now
-      # reads as a failure rather than a supersede.
-      - name: Install Playwright browsers
-        timeout-minutes: 9
+      # the bounding itself fails. Nothing here runs as root, so plain `timeout`
+      # reaches the process it started.
+      - name: Install the Playwright browser
+        timeout-minutes: 10
         run: |
           for attempt in 1 2; do
             status=0
-            timeout --signal=KILL 4m pnpm exec playwright install --with-deps chromium || status=$?
+            timeout --signal=KILL 4m pnpm exec playwright install chromium || status=$?
             if [ "$status" -eq 0 ]; then
               exit 0
             fi
-            echo "::warning::playwright install attempt $attempt failed (exit $status)"
+            echo "::warning::playwright browser install attempt $attempt failed (exit $status)"
           done
-          echo "::error::playwright install failed after 2 attempts"
+          echo "::error::playwright browser install failed after 2 attempts"
           exit 1
+
+      # `playwright install-deps --dry-run` simulates the install against the
+      # local apt lists and prints the packages that are actually missing, which
+      # is both the answer to "does this runner need apt at all" and the exact
+      # set to cache. It is offline: apt-get -s reads the lists on the image.
+      #
+      # Three outcomes, because they need different treatment: `satisfied` when
+      # the image already carries every library, so no apt step runs at all;
+      # `packages` when it prints a list, which is the set cached and installed
+      # below; and `unknown` when the simulation itself failed, which is not a
+      # verdict about the libraries and so falls back to the network path.
+      - name: Determine the missing system dependencies
+        id: playwright-deps
+        run: |
+          # ImageOS and ImageVersion are set in the runner's environment rather
+          # than the workflow's, so they are readable here but not from the
+          # `env` context an expression in a cache key would use.
+          echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >>"$GITHUB_OUTPUT"
+
+          status=0
+          pnpm exec playwright install-deps --dry-run chromium >deps-dry-run.txt 2>&1 || status=$?
+          cat deps-dry-run.txt
+          if [ "$status" -eq 0 ] && grep -q 'All system dependencies are installed' deps-dry-run.txt; then
+            echo "mode=satisfied" >>"$GITHUB_OUTPUT"
+          elif grep -q 'Missing system dependencies' deps-dry-run.txt; then
+            sed -n 's/^  \([^ ]*\)$/\1/p' deps-dry-run.txt | sort >apt-packages.txt
+            if [ ! -s apt-packages.txt ]; then
+              echo "::warning::could not parse the missing dependency list; falling back to the network install"
+              echo "mode=unknown" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "missing packages:"
+            cat apt-packages.txt
+            echo "mode=packages" >>"$GITHUB_OUTPUT"
+          else
+            echo "::warning::could not simulate the dependency install; falling back to the network install"
+            echo "mode=unknown" >>"$GITHUB_OUTPUT"
+          fi
+
+      # The .deb files rather than the installed libraries: /usr/lib is the
+      # runner image's, and restoring a tree over it is how a cache turns into a
+      # broken system. Keyed on the image the packages were resolved against as
+      # well as the packages themselves, so a runner image bump re-downloads
+      # instead of dpkg-installing debs built for the previous one.
+      - name: Cache the Playwright apt dependencies
+        id: apt-cache
+        if: steps.playwright-deps.outputs.mode == 'packages'
+        uses: actions/cache@v6.1.0
+        with:
+          path: .apt-cache/*.deb
+          key: playwright-apt-${{ steps.playwright-deps.outputs.image }}-${{ hashFiles('apt-packages.txt') }}
+
+      # The warm path: dpkg installs the whole cached set in one call, which is
+      # what lets it resolve the ordering among them, and touches no mirror. The
+      # dry-run afterwards is the check that it actually worked — if anything is
+      # still missing, or dpkg refused, the step falls through to the network
+      # path rather than leaving a half-installed runner to fail in the browser.
+      #
+      # An entry that fails that check is deleted, because a cache key is
+      # otherwise written once and never rewritten: without this, a bad entry is
+      # restored and warned about on every subsequent run and the job is back on
+      # the network for good, silently. Deleting it makes the next run miss,
+      # repopulate, and go warm again. It needs actions: write, hence the job's
+      # permissions block; where the token has no such write (a fork PR, which
+      # has no access to these caches anyway) the delete warns and the run still
+      # completes over the network.
+      - name: Install the system dependencies from cache
+        id: apt-cached-install
+        if: steps.apt-cache.outputs.cache-hit == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APT_CACHE_KEY: playwright-apt-${{ steps.playwright-deps.outputs.image }}-${{ hashFiles('apt-packages.txt') }}
+        run: |
+          if sudo dpkg -i .apt-cache/*.deb && pnpm exec playwright install-deps --dry-run chromium; then
+            echo "installed=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::warning::cached debs did not satisfy the dependencies; falling back to the network install"
+          echo "installed=false" >>"$GITHUB_OUTPUT"
+          gh cache delete "$APT_CACHE_KEY" \
+            || echo "::warning::could not delete the unusable cache entry $APT_CACHE_KEY"
+
+      # The cold path, and the only step here that needs the network. Download
+      # and install are separate so the debs land in a directory the cache can
+      # save: apt drops to the _apt user to fetch, hence the ownership, and only
+      # partial/ needs to exist beforehand.
+      #
+      # apt-get runs as root, so a kill from `timeout` comes from the
+      # unprivileged runner user and cannot reach it. An orphan keeps the dpkg
+      # lock and the second attempt dies instantly on "Could not get lock",
+      # which is the one failure the retry exists for. Each attempt therefore
+      # runs in its own process group (setsid makes $! the group id, since a
+      # background job here is not already a group leader) and that group is
+      # killed as root afterwards, then the lock is waited on and dpkg repaired
+      # before the retry. Every wait is bounded, so an install that genuinely
+      # cannot succeed still fails in minutes rather than burning the job
+      # timeout.
+      - name: Install the system dependencies from the network
+        id: apt-network-install
+        if: ${{ steps.playwright-deps.outputs.mode == 'unknown' || (steps.playwright-deps.outputs.mode == 'packages' && steps.apt-cached-install.outputs.installed != 'true') }}
+        timeout-minutes: 10
+        env:
+          MODE: ${{ steps.playwright-deps.outputs.mode }}
+        run: |
+          reap() {
+            sudo kill -KILL -- "-$1" 2>/dev/null || true
+            fuser_path=$(command -v fuser 2>/dev/null) || {
+              echo "::error::fuser is required to wait for the dpkg lock"
+              return 1
+            }
+            probe_status=0
+            sudo "$fuser_path" -V >/dev/null 2>&1 || probe_status=$?
+            if [ "$probe_status" -ne 0 ]; then
+              echo "::error::fuser could not be executed to wait for the dpkg lock (exit $probe_status)"
+              return 1
+            fi
+            for _ in $(seq 1 30); do
+              probe_status=0
+              probe_output=$(sudo "$fuser_path" /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>&1) || probe_status=$?
+              if [ "$probe_status" -eq 0 ]; then
+                sleep 1
+              elif [ "$probe_status" -ne 1 ] || [ -n "$probe_output" ]; then
+                echo "::error::fuser failed while checking the dpkg lock (exit $probe_status): $probe_output"
+                return 1
+              else
+                break
+              fi
+            done
+            sudo dpkg --configure -a || true
+          }
+
+          attempt_install() {
+            # A fresh `bash -c` does not inherit errexit from the step's shell,
+            # so a failed `apt-get update` would otherwise fall through to the
+            # install and report the attempt as a success.
+            set -e
+            if [ "$MODE" = "packages" ]; then
+              # sudo, because an attempt killed mid-download leaves the
+              # directory owned by _apt and the runner user cannot unlink what
+              # is inside it. As a plain rm this exits 1 under `set -e` and the
+              # second attempt dies before it reaches apt, which would leave the
+              # retry that guards the mirror with one usable attempt.
+              sudo rm -rf .apt-cache
+              mkdir -p .apt-cache/partial
+              sudo chown -R _apt:root .apt-cache
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends \
+                -o "Dir::Cache::archives=$PWD/.apt-cache" \
+                $(tr '\n' ' ' <apt-packages.txt)
+              sudo chown -R "$(id -u):$(id -g)" .apt-cache
+            else
+              pnpm exec playwright install-deps chromium
+            fi
+          }
+          export -f attempt_install
+
+          for attempt in 1 2; do
+            status=0
+            setsid timeout --signal=KILL 4m bash -c attempt_install &
+            pid=$!
+            wait "$pid" || status=$?
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            echo "::warning::system dependency install attempt $attempt failed (exit $status)"
+            reap "$pid"
+          done
+          echo "::error::system dependency install failed after 2 attempts"
+          exit 1
+
+      # After a network install, which is either a miss or an entry that was
+      # just deleted for not satisfying the check; on a working hit the cache
+      # action holds the entry already, and on the satisfied path there is
+      # nothing to save. continue-on-error because the debs are an optimisation:
+      # a failed save costs the next run its warm path and nothing else, and
+      # must not red a job whose suite has yet to run.
+      - name: Save the Playwright apt dependencies
+        continue-on-error: true
+        if: ${{ steps.playwright-deps.outputs.mode == 'packages' && (steps.apt-cache.outputs.cache-hit != 'true' || steps.apt-cached-install.outputs.installed == 'false') }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .apt-cache/*.deb
+          key: playwright-apt-${{ steps.playwright-deps.outputs.image }}-${{ hashFiles('apt-packages.txt') }}
+
+      # Whichever path ran, the browser has to be able to start. This is the
+      # same simulation as above and costs a second; it is here so a missing
+      # library is named now rather than as a browser that fails to launch in
+      # the middle of the suite.
+      - name: Verify the Playwright system dependencies
+        run: pnpm exec playwright install-deps --dry-run chromium
 
       # The webServer runs this same package with `go run`, so a compile error
       # would otherwise surface as a 120s webServer timeout with the real error

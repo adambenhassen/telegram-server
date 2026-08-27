@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -74,7 +75,8 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log), store.WithBlobStore(blobs))
+	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey, store.WithLogger(log), store.WithBlobStore(blobs),
+		store.WithStatementTimeout(cfg.StatementTimeout))
 	if err != nil {
 		return err
 	}
@@ -124,6 +126,11 @@ func run(log *slog.Logger) error {
 			reportMediaErasureCandidates(sweepCtx, st, cfg.MediaErasureMinAge, cfg.MediaErasureReportInterval, log)
 		})
 	}
+	if cfg.MediaErasureIntervalMin > 0 {
+		sweepWG.Go(func() {
+			sweepMediaErasure(sweepCtx, st, cfg, log)
+		})
+	}
 	defer func() {
 		cancelSweep()
 		sweepWG.Wait()
@@ -162,6 +169,9 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	if err := server.SetMaxConnsPerUnboundKey(cfg.MaxConnsPerUnboundKey); err != nil {
+		return err
+	}
+	if err := server.SetRPCDeadline(cfg.RPCDeadline); err != nil {
 		return err
 	}
 	cfg.WarnPreAuthLifetime(log)
@@ -473,6 +483,79 @@ func reportBlobDisk(ctx context.Context, blobs *blob.Local, st *store.Store, tem
 			for _, p := range rep.Unexplained.Paths {
 				log.Warn("path under the blob root the layout does not explain", "path", p.Key, "bytes", p.Size)
 			}
+		}
+	}
+}
+
+// sweepMediaErasure periodically reclaims the media nothing live references,
+// until ctx is canceled. It is the one pass in this process that destroys user
+// data, and the blob volume it unlinks from has no backup and no restore path.
+//
+// Two things keep that from being a default. The pass does not run at all
+// unless an operator configures an interval, and even then it removes nothing
+// unless they separately set TG_MEDIA_ERASURE_DESTRUCTIVE: the reporting branch
+// runs the same read-only summary the candidate report runs and logs what a
+// destructive pass would have freed. Enabling destruction on a real deployment
+// is a decision made against that report, not a flag flipped at install.
+//
+// The interval is drawn fresh from the configured range before every wait,
+// never a ticker. A fixed period is what makes another account's deletion
+// observable to the uploader at a known time: usage is summed off the files
+// table, so an uploader sitting at their quota learns that a recipient deleted
+// their copy by retrying an upload, and on a fixed tick they learn when to
+// within a second. The draw does not remove that channel — nothing can, short
+// of not freeing quota — it blunts it to "eventually".
+//
+// It logs aggregates and never a file's access hash, which is the unguessable
+// half of a download credential; the store's counts carry no file id and no
+// hash at all, so there is nothing here to choose not to print.
+func sweepMediaErasure(ctx context.Context, st *store.Store, cfg config.Config, log *slog.Logger) {
+	for {
+		// The wait comes first, so a restart loop cannot turn into a burst of
+		// passes and so the first pass after a deploy is not synchronised
+		// across replicas.
+		wait := cfg.MediaErasureIntervalMin +
+			rand.N(cfg.MediaErasureIntervalMax-cfg.MediaErasureIntervalMin) //nolint:gosec // scheduling jitter, not a secret
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		// The cutoff is read per pass, not per batch: what one sweep reclaims is
+		// decided once at its start, the same rule the upload-part sweep keeps.
+		olderThan := time.Now().Add(-cfg.MediaErasureMinAge)
+		if !cfg.MediaErasureDestructive {
+			c, err := st.MediaErasureSummary(ctx, olderThan, store.ErasureScanBatch)
+			if err != nil {
+				log.Error("media erasure sweep report", "err", err)
+				continue
+			}
+			log.Info("media erasure sweep (reporting; destruction disabled)",
+				"scanned", c.Scanned,
+				"would_erase", c.Unreferenced,
+				"would_free_bytes", c.UnreferencedBytes,
+				"skipped_message_ref", c.SkippedMessageRef,
+				"skipped_channel_ref", c.SkippedChannelRef,
+				"skipped_too_new", c.SkippedTooNew)
+			continue
+		}
+
+		c, err := st.SweepMediaErasure(ctx, olderThan, store.ErasureScanBatch)
+		// Logged before the error is handled rather than after: a sweep that
+		// failed part way through has still committed everything it erased, and
+		// the operator-facing question after a failure is how much went.
+		log.Info("media erasure sweep",
+			"considered", c.Considered,
+			"erased", c.Erased,
+			"erased_bytes", c.ErasedBytes,
+			"contended", c.Contended,
+			"retained", c.Retained,
+			"unlink_failed", c.UnlinkFailed)
+		if err != nil {
+			log.Error("media erasure sweep", "err", err)
 		}
 	}
 }

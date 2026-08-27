@@ -80,16 +80,24 @@ type Config struct {
 	// bytes finite at accounts x cap.
 	UploadPartTTL time.Duration
 	// MediaErasureMinAge is how old a file must be before the media erasure
-	// report will name it. It is configurable because nothing in the server
-	// bounds how long an assembly or a send may take, so no constant can be
-	// derived: an operator who sees live files named shortens nothing, they
-	// lengthen this.
+	// report will name it, and before the erasure sweep will remove it.
 	//
-	// It is defence in depth and not the safety control. Every media file is
-	// stored with zero live references for the length of one send, which is why
-	// an age gate is needed at all — but what keeps a live file safe is the
-	// interlock on its files row, taken by every path that writes a reference.
-	// Nothing in this build deletes a file, so the value affects a report only.
+	// The default is 24 hours, derived from the per-RPC bounds this process
+	// now ships: TG_RPC_DEADLINE (mtproto.DefaultRPCDeadline) caps how long any
+	// single send or assembly can run, and TG_STATEMENT_TIMEOUT caps each
+	// statement it opens server-side. A file's zero-live-reference window is
+	// therefore bounded by those ceilings plus scheduling slack, and 24 hours
+	// sits more than two orders of magnitude above both. An operator who raises
+	// either deadline past what this floor assumes must re-derive it from the
+	// same numbers.
+	//
+	// It is defence in depth and not the safety control, which matters most
+	// exactly where it looks like the opposite. Every media file on the server is
+	// stored with zero live references for the length of one send, so the
+	// reference predicate alone matches files being sent right now; the age gate
+	// narrows that window but does not close it. What keeps a live file safe is
+	// the interlock on its files row, taken exclusively by the eraser and in
+	// share mode by every path that writes a reference.
 	MediaErasureMinAge time.Duration
 	// MediaErasureReportInterval is how often that report runs. Zero disables
 	// it, as a zero limit disables a rate limit, and zero is the default: the
@@ -108,6 +116,34 @@ type Config struct {
 	// cached. An operator turning this on wants either a small corpus or the
 	// index the eraser ticket will decide on.
 	MediaErasureReportInterval time.Duration
+	// MediaErasureIntervalMin and MediaErasureIntervalMax bound how long the
+	// erasure sweep waits between passes. Each interval is drawn uniformly from
+	// the range; a zero minimum disables the sweep, and zero is the default.
+	//
+	// A range rather than a period, and the range cannot collapse to a point:
+	// both variables are required together and the maximum must exceed the
+	// minimum. That is a security requirement rather than a scheduling
+	// preference. Per-account usage is summed off the files table, so freeing
+	// quota is observable to the uploader — they can fill their quota, send the
+	// file to someone else, delete their own copy, and then poll by attempting an
+	// upload, which fails until the recipient deletes their copy and succeeds
+	// afterwards. That turns another account's private deletion into a receipt,
+	// timed to within one sweep interval. It cannot be removed without giving up
+	// the quota-freeing this milestone exists to deliver, so it is accepted and
+	// blunted: a randomized interval degrades "at 14:32" to "eventually".
+	MediaErasureIntervalMin time.Duration
+	MediaErasureIntervalMax time.Duration
+	// MediaErasureDestructive turns the sweep from a report into a delete. False
+	// is the default and it is the whole shipping posture of this capability:
+	// with it unset the sweep counts what it could reclaim and removes nothing,
+	// which is what a fresh deployment gets.
+	//
+	// Enabling it is a decision about a particular deployment, not a default,
+	// because the blob volume has no backup and no restore path: a file this
+	// removes is gone, and no sequence of operator actions brings it back. Turn
+	// the sweep on in its reporting mode first and read what it says it would
+	// free.
+	MediaErasureDestructive bool
 	// BlobScanTempMinAge is how old the blob writer's temporary file must be
 	// before the disk report will name it as abandoned. A temporary file is an
 	// upload writing its bytes right now, so this has to exceed the longest
@@ -146,6 +182,20 @@ type Config struct {
 	// — at the first frame that decrypts under a server-issued key — and hands
 	// over to the per-user connection cap at sign-in. Zero disables it.
 	MaxConnsPerUnboundKey int
+	// RPCDeadline is how long a single dispatched RPC may run before its
+	// context is cancelled and the client answered with a generic INTERNAL
+	// error. The connection survives; the next request starts with a full
+	// budget, so a chunked upload or download is bounded per chunk, never per
+	// logical transfer. It is what puts an upper bound on how long one RPC can
+	// hold a database transaction open — see mtproto.DefaultRPCDeadline for
+	// where the shipped number comes from. Zero disables it.
+	RPCDeadline time.Duration
+	// StatementTimeout is the Postgres statement_timeout every pooled
+	// connection runs under: one SQL statement past it is cancelled server-side
+	// and its transaction rolls back. It is the database-side half of the same
+	// bound RPCDeadline puts on the handler side. See
+	// store.WithStatementTimeout. Zero disables it.
+	StatementTimeout time.Duration
 	// BootstrapUsername is the handle to create at startup. Empty disables
 	// bootstrap. When set, exactly one of BootstrapPassword or
 	// BootstrapPasswordFile must be configured.
@@ -292,6 +342,26 @@ func DefaultRateLimits() RateLimitsConfig {
 // past any file a client can upload and leaves both terms in range.
 const MaxFileBytesLimit int64 = 1 << 40
 
+// DefaultStatementTimeout is the shipped Postgres statement_timeout. It bounds
+// one SQL statement, server-side, on every pooled connection — the database
+// half of the per-RPC ceiling, catching a wedged statement even where no
+// request context flows (a background sweep's query, for instance).
+//
+// The shipped number is derived from measurement rather than chosen. The
+// slowest single statement any code path legitimately runs is the media-erasure
+// report's reference-predicate batch: 2.2s measured at ~300k media messages and
+// ~20k files, where the planner flips to one scan of messages per files row.
+// The slowest full RPC the e2e suite performs — messages.sendMessage — measured
+// 638 ms wall. 17s is roughly eight times the first number and 26 times the
+// second — enough headroom for hardware several times slower than the host
+// either was measured on — and it sits below the RPC deadline so the database
+// aborts a wedged statement before the handler's own budget expires, keeping
+// the failure inside the transaction that caused it. Deliberately not a round
+// number: rounding would suggest it was picked rather than measured. An
+// operator whose erasure corpus outgrows this ceiling will see statement
+// cancellations in the sweep's log, not silent truncation.
+const DefaultStatementTimeout = 17 * time.Second
+
 // Load reads configuration from environment variables, applying defaults. The
 // logger is used only for the auth-key master key, which is the one value Load
 // can create rather than read, and a generated one has to say so.
@@ -313,7 +383,17 @@ func Load(log *slog.Logger) (Config, error) {
 		MediaErasureReportInterval: 0,
 		BlobScanReportInterval:     0,
 
+		// The sweep is off and non-destructive unless an operator says
+		// otherwise, which is what "ships disabled" means for a pass that
+		// unlinks user bytes from a volume with no backup.
+		MediaErasureIntervalMin: 0,
+		MediaErasureIntervalMax: 0,
+		MediaErasureDestructive: false,
+
 		MaxConnsPerUnboundKey: mtproto.DefaultMaxConnsPerUnboundKey,
+
+		RPCDeadline:      mtproto.DefaultRPCDeadline,
+		StatementTimeout: DefaultStatementTimeout,
 
 		RegistrationMode: RegistrationClosed,
 	}
@@ -377,6 +457,53 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.MediaErasureReportInterval = d
 	}
+	if v := os.Getenv("TG_MEDIA_ERASURE_INTERVAL_MIN"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MIN must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MIN must not be negative")
+		}
+		cfg.MediaErasureIntervalMin = d
+	}
+	if v := os.Getenv("TG_MEDIA_ERASURE_INTERVAL_MAX"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MAX must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MAX must not be negative")
+		}
+		cfg.MediaErasureIntervalMax = d
+	}
+	// Refused rather than defaulted, in both directions. A minimum on its own
+	// would have to fall back to a fixed tick, and the fixed tick is the thing
+	// the range exists to prevent: it is what turns another account's deletion
+	// into a receipt timed to the second. A maximum on its own is a variable the
+	// operator believes is in effect and is not.
+	if (cfg.MediaErasureIntervalMin > 0) != (cfg.MediaErasureIntervalMax > 0) {
+		return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MIN and TG_MEDIA_ERASURE_INTERVAL_MAX must be set together")
+	}
+	if cfg.MediaErasureIntervalMin > 0 && cfg.MediaErasureIntervalMax <= cfg.MediaErasureIntervalMin {
+		return Config{}, errors.New("TG_MEDIA_ERASURE_INTERVAL_MAX must be greater than TG_MEDIA_ERASURE_INTERVAL_MIN")
+	}
+	if v := os.Getenv("TG_MEDIA_ERASURE_DESTRUCTIVE"); v != "" {
+		on, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MEDIA_ERASURE_DESTRUCTIVE must be a boolean")
+		}
+		cfg.MediaErasureDestructive = on
+	}
+	// Refused for the reason a lone interval bound is, and it is the worse of
+	// the two: an operator who set this believes reclamation is running and is
+	// watching for the disk to come back, while nothing is scheduled to run at
+	// all. Silence there reads as "there was nothing to reclaim". Turning
+	// destruction on is the one setting in this file that cannot be quietly
+	// inert.
+	if cfg.MediaErasureDestructive && cfg.MediaErasureIntervalMin == 0 {
+		return Config{}, errors.New("TG_MEDIA_ERASURE_DESTRUCTIVE needs TG_MEDIA_ERASURE_INTERVAL_MIN and TG_MEDIA_ERASURE_INTERVAL_MAX; nothing runs the sweep without them")
+	}
 	if v := os.Getenv("TG_BLOB_SCAN_TEMP_MIN_AGE"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -396,6 +523,28 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_BLOB_SCAN_REPORT_INTERVAL must not be negative")
 		}
 		cfg.BlobScanReportInterval = d
+	}
+	// Zero turns a deadline off, like a zero PreAuth bound; negative is refused
+	// rather than read as off, because those two say opposite things.
+	if v := os.Getenv("TG_RPC_DEADLINE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RPC_DEADLINE must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_RPC_DEADLINE must not be negative, and 0 disables the deadline")
+		}
+		cfg.RPCDeadline = d
+	}
+	if v := os.Getenv("TG_STATEMENT_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_STATEMENT_TIMEOUT must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_STATEMENT_TIMEOUT must not be negative, and 0 disables the timeout")
+		}
+		cfg.StatementTimeout = d
 	}
 	if v := os.Getenv("TG_LOG_LOGIN_CODES"); v != "" {
 		on, err := strconv.ParseBool(v)

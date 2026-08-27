@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -55,12 +58,26 @@ type Store struct {
 	// to the Store for the reason deniedHook is.
 	searchPageHook func()
 
+	// eraseHook is a test-only callback fired in SweepMediaErasure between the
+	// scan that names a candidate and the transaction that erases it, carrying
+	// the file id. That gap is where every race this pass has to survive lands —
+	// a forward, a fresh send, a channel post — and it is not otherwise
+	// reachable: a test that raced the sweep from a goroutine would be asserting
+	// on whichever side the scheduler happened to run first. Scoped to the Store
+	// for the reason deniedHook is.
+	eraseHook func(fileID int64)
+
 	// now reads the clock the client-visible rate-limit wait is measured
 	// against. Production always holds time.Now; it is a field so a test can
 	// pin the remainder of an open window to an exact sub-second value instead
 	// of racing a real one, which on a loaded host closes before the assertion
 	// runs. Scoped to the Store for the reason deniedHook is.
 	now func() time.Time
+
+	// statementTimeout, when non-zero, is applied as a session default on every
+	// pooled connection at connect time. It lives on the Store only so Open can
+	// read it after the options run; see WithStatementTimeout.
+	statementTimeout time.Duration
 }
 
 // Sentinel errors returned by the login-code methods.
@@ -98,6 +115,27 @@ var (
 // Option configures a Store at Open time.
 type Option func(*Store)
 
+// WithStatementTimeout sets the Postgres statement_timeout every connection in
+// the pool runs under: a single SQL statement that runs longer is cancelled by
+// the server, and its transaction rolls back, while the session itself
+// survives. It is the second half of the bound on how long one RPC can hold a
+// transaction open — the per-request deadline in internal/mtproto bounds the
+// handler from the client side; this bounds each statement from the database
+// side, catching a wedged statement even where no request context flows.
+//
+// It is a ceiling on one statement, not on an RPC, and it deliberately applies
+// to everything that shares the pool, sweeps included — which is why the
+// default sits far above any measured legitimate statement, including the
+// media-erasure report's worst measured batch (2.2s at ~300k media messages).
+// Zero disables it.
+func WithStatementTimeout(d time.Duration) Option {
+	return func(s *Store) {
+		if d > 0 {
+			s.statementTimeout = d
+		}
+	}
+}
+
 // WithBlobStore wires the blob backend the Store uses for in-flight upload
 // part bytes.
 func WithBlobStore(blobs blob.Store) Option {
@@ -127,17 +165,7 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	if err != nil {
 		return nil, err
 	}
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping: %w", err)
-	}
 	s := &Store{
-		pool:                   pool,
-		q:                      db.New(pool),
 		cipher:                 cipher,
 		maxChannelParticipants: defaultMaxChannelParticipants,
 		maxChannelsPerUser:     defaultMaxChannelsPerUser,
@@ -148,6 +176,25 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	for _, opt := range opts {
 		opt(s)
 	}
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	// Session default rather than SET per statement: one line at connect, and
+	// every query on the connection carries the ceiling with no per-call cost.
+	if s.statementTimeout > 0 {
+		poolCfg.ConnConfig.RuntimeParams["statement_timeout"] = strconv.FormatInt(s.statementTimeout.Milliseconds(), 10)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+	s.pool = pool
+	s.q = db.New(pool)
 	// Required rather than defaulted: the part bytes live in the blob backend,
 	// so a Store without one cannot serve an upload at all, and there is no
 	// directory this package could pick on a caller's behalf that would be
@@ -157,11 +204,40 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 		pool.Close()
 		return nil, errors.New("store: no blob backend configured; pass WithBlobStore")
 	}
-	if err := s.checkSchema(ctx); err != nil {
+	// The schema check runs on its own throwaway connection rather than the
+	// pool, so it never sits under the session defaults the pool carries — a
+	// short WithStatementTimeout is a ceiling on request work, and startup must
+	// not fail on a loaded host merely because its own setup query outlived it.
+	// The connection derives from the already-parsed pool config rather than
+	// re-parsing the raw DSN: pgx.Connect would read pool_* parameters as
+	// runtime params and Postgres would reject them in a startup packet, so a
+	// DSN tuning the pool through its URL — valid for pgxpool — must be seen by
+	// exactly one parser. The statement ceiling is stripped from the copy so
+	// the setup query stays outside it.
+	setupCfg := *poolCfg.ConnConfig
+	if s.statementTimeout > 0 {
+		setupCfg.RuntimeParams = maps.Clone(poolCfg.ConnConfig.RuntimeParams)
+		delete(setupCfg.RuntimeParams, "statement_timeout")
+	}
+	setupConn, err := pgx.ConnectConfig(ctx, &setupCfg)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("schema check connect: %w", err)
+	}
+	err = s.checkSchema(ctx, setupConn)
+	if cerr := setupConn.Close(ctx); cerr != nil && err == nil {
+		err = fmt.Errorf("schema check close: %w", cerr)
+	}
+	if err != nil {
 		pool.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// queryRower is the one method of pgxpool.Pool and pgx.Conn checkSchema needs.
+type queryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // checkSchema fails fast when the database has not been migrated to the current
@@ -170,16 +246,16 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 //
 // ponytail: presence-check of the newest migration's artifacts, not a version
 // table — pgtest applies raw SQL and has no Atlas revisions table to read. The
-// sentinels track the latest migration (messages_file_idx) plus the ones before
-// it; update them when a migration adds new schema.
+// sentinels track the latest migration (upload_parts_blob_key_idx) plus the
+// ones before it; update them when a migration adds new schema.
 //
 // Indexes count as schema here. A database that stops short of one still opens
 // clean on every column check and then plans a different query — the media
 // reference predicate silently degrades to a per-row Seq Scan of messages —
 // so a missing index is exactly the un-migrated state this is here to refuse.
-func (s *Store) checkSchema(ctx context.Context) error {
+func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
 	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload, hasMessageFileIdx, hasPartBlobKeyIdx bool
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
 		              WHERE table_name = 'messages' AND column_name = 'fanout_id'),

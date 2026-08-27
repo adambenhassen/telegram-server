@@ -620,3 +620,74 @@ func WaitForLockWaiters(ctx context.Context, s *Store, n int) error {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// SetEraseHook installs a callback that fires in SweepMediaErasure between the
+// scan naming a candidate and the transaction that erases it, carrying the file
+// id. Every race the eraser has to survive lands in that gap — a forward, a
+// fresh send, a channel post committed after the file was named — and driving
+// it from a goroutine would be asserting on whichever side the scheduler
+// happened to run first. Scoped to the Store so parallel tests each own their
+// own hook without racing.
+func SetEraseHook(s *Store, fn func(fileID int64)) { s.eraseHook = fn }
+
+// FileRowExists reports whether a files row is still there, which is what
+// "erased" means on the row side and what a caller of the download gate can
+// never distinguish from an id that never existed.
+func FileRowExists(ctx context.Context, s *Store, fileID int64) (bool, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM files WHERE id = $1`, fileID).Scan(&n)
+	return n == 1, err
+}
+
+// ChannelPostFileID reads one channel post's file reference. The eraser clears
+// this column on posts it has proved deleted, and rolls that back when the file
+// survives, so both halves are assertions about this value.
+func ChannelPostFileID(ctx context.Context, s *Store, channelID, localID int64) (*int64, error) {
+	var id *int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT file_id FROM channel_messages WHERE channel_id = $1 AND local_id = $2`,
+		channelID, localID).Scan(&id)
+	return id, err
+}
+
+// InsertLiveChannelPost writes a channel_messages row carrying a file id
+// directly, bypassing PostChannelMessage's pts and event bookkeeping. It exists
+// so a test can create a live channel reference from inside the eraser's hook,
+// where the shipped path would deadlock on the very row lock under test.
+func InsertLiveChannelPost(ctx context.Context, s *Store, channelID, localID, fromID, fileID int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO channel_messages (channel_id, local_id, from_id, message, deleted, file_id)
+		 VALUES ($1, $2, $3, 'post', false, $4)`,
+		channelID, localID, fromID, fileID)
+	return err
+}
+
+// SetFileDate rewrites one file's date, the column the age cutoff compares
+// against. It is how a test crosses the cutoff without a wall clock: the sweep
+// takes a cutoff as an argument, but the condition the DELETE re-evaluates
+// inside the exclusive hold can only be reached by changing the row after the
+// scan has already named it.
+func SetFileDate(ctx context.Context, s *Store, fileID int64, at time.Time) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE files SET date = $2 WHERE id = $1`, fileID, at)
+	if err != nil {
+		return err
+	}
+	if n := tag.RowsAffected(); n != 1 {
+		return fmt.Errorf("set file date: %d rows for id %d, want 1", n, fileID)
+	}
+	return nil
+}
+
+// SetFileUnstored clears one file's stored flag, the other condition the DELETE
+// re-evaluates inside the hold. No shipped path moves the flag back, which is
+// exactly why the guard against it has to be provable some other way.
+func SetFileUnstored(ctx context.Context, s *Store, fileID int64) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE files SET stored = false WHERE id = $1`, fileID)
+	if err != nil {
+		return err
+	}
+	if n := tag.RowsAffected(); n != 1 {
+		return fmt.Errorf("set file unstored: %d rows for id %d, want 1", n, fileID)
+	}
+	return nil
+}
