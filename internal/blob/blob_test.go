@@ -243,6 +243,49 @@ func TestParsePartKeyRoundTrips(t *testing.T) {
 	}
 }
 
+// TestKeyspacesAreDisjoint pins half of what the part-orphan pass's temporary
+// class rests on: an assembled blob can never land under the parts prefix, so
+// the only bytes that walk reaches are the bounded writer's. Key's shard is two
+// hex digits and a separator, which cannot spell "parts/", and a part key names
+// no file id — but "cannot" here is a property of the layout, and the pass now
+// deletes on the strength of it, so it is checked rather than read off the
+// format string.
+func TestKeyspacesAreDisjoint(t *testing.T) {
+	t.Parallel()
+
+	edges := []int64{1, 2, 15, 16, 255, 256, 257, 4242, 1 << 20, 1 << 40, math.MaxInt64}
+	ids := make([]int64, 0, len(edges)+512)
+	ids = append(ids, edges...)
+	for i := range 512 {
+		ids = append(ids, int64(i)+1)
+	}
+	for _, id := range ids {
+		k := blob.Key(id)
+		if strings.HasPrefix(k, blob.PartsPrefix) {
+			t.Fatalf("assembled key %q for id %d falls under the parts prefix", k, id)
+		}
+		if blob.ParsePartKey(k) {
+			t.Fatalf("assembled key %q for id %d parses as a part key", k, id)
+		}
+		// The writer's temporary for an assembled key is outside the prefix
+		// too: it is the one write in this tree that can run long, and the
+		// cutoff argument holds only while the pass cannot see it.
+		if strings.HasPrefix(k+blob.TempSuffix, blob.PartsPrefix) {
+			t.Fatalf("assembled temporary %q falls under the parts prefix", k+blob.TempSuffix)
+		}
+	}
+
+	for range 64 {
+		k, err := blob.NewPartKey()
+		if err != nil {
+			t.Fatalf("new part key: %v", err)
+		}
+		if _, ok := blob.ParseKey(k); ok {
+			t.Fatalf("part key %q parses as an assembled key", k)
+		}
+	}
+}
+
 // Everything NewPartKey does not produce is not a part key. The strictness is
 // the point: whatever acts on this classification treats a path it cannot
 // parse as unexplained, so a spelling that parses loosely is a path getting

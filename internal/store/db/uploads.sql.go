@@ -131,6 +131,36 @@ func (q *Queries) FileOutstandingBytes(ctx context.Context, arg FileOutstandingB
 	return column_1, err
 }
 
+const livePartKeys = `-- name: LivePartKeys :many
+SELECT blob_key FROM upload_parts
+WHERE blob_key = ANY($1::text[])
+`
+
+// LivePartKeys reports which of the given blob keys a parts row still names.
+// The orphan pass gates each enumeration page with this: one lookup over the
+// page's at-most-500 keys, so the live-key set is bounded by the page rather
+// than the table, and the gate reads row state at delete time rather than at
+// run start. A key absent from the result is named by no row.
+func (q *Queries) LivePartKeys(ctx context.Context, keys []string) ([]string, error) {
+	rows, err := q.db.Query(ctx, livePartKeys, keys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var blob_key string
+		if err := rows.Scan(&blob_key); err != nil {
+			return nil, err
+		}
+		items = append(items, blob_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const uploadPartKey = `-- name: UploadPartKey :one
 SELECT blob_key, size FROM upload_parts WHERE user_id = $1 AND file_id = $2 AND part_index = $3
 `

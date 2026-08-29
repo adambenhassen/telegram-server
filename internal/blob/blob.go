@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path"
 	"strconv"
@@ -41,6 +40,18 @@ type Store interface {
 	// Remove deletes key. Deleting a key that is not there is a no-op, so a
 	// caller that races a sweep or a re-save never needs to know which won.
 	Remove(ctx context.Context, key string) error
+	// WalkPrefix calls fn for every entry under prefix, streaming, and stops
+	// at the first error fn returns. Containment is the backend's, not the
+	// caller's: every entry fn sees is under prefix, an empty prefix
+	// enumerates nothing, and a prefix that names no containment scope fails
+	// closed rather than widening. A prefix holding no objects yields nothing
+	// and is not an error.
+	//
+	// It streams because what the caller must hold is then the caller's
+	// choice: an age-based pass batches it into whatever its own gate can
+	// carry, and a remote backend hands its listing over a page at a time
+	// rather than buffering a whole bucket to answer one call.
+	WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error) error
 }
 
 // Key returns the storage key for a file id, sharded on the id's low byte so
@@ -181,7 +192,8 @@ func (l *Local) Put(_ context.Context, key string, r io.Reader) (int64, error) {
 	return n, nil
 }
 
-// Entry is one path found under a store's root by [Local.Walk].
+// Entry is one path found under a store's root by [Local.Walk] or under a key
+// prefix by [Store.WalkPrefix].
 type Entry struct {
 	// Key is the path relative to the store root, slash-separated, so it
 	// compares directly against what Key produces.
@@ -211,31 +223,122 @@ type Entry struct {
 // skipped an unreadable subtree would report nothing for it, which reads
 // exactly like finding nothing there.
 func (l *Local) Walk(ctx context.Context, fn func(Entry) error) error {
-	return fs.WalkDir(l.root.FS(), ".", func(p string, d fs.DirEntry, err error) error {
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			return nil
-		case err != nil:
-			return fmt.Errorf("blob walk %s: %w", p, err)
-		case p == ".":
-			return nil
+	return l.walk(ctx, ".", "", fn)
+}
+
+// WalkPrefix calls fn for every entry under prefix, the directory the prefix is
+// contained by excluded, and stops at the first error fn returns. It carries
+// the same read-only, lock-free, vanishing-path semantics as [Local.Walk].
+//
+// Containment is the point of the method and lives here rather than in the
+// caller: every entry fn sees is under prefix, and a prefix that names no
+// containment scope fails closed rather than widening. An empty prefix
+// enumerates nothing — the assembled keyspace has no single prefix, so nothing
+// outside a named prefix is reachable through this — and a prefix that resolves
+// to a file rather than a directory is an error, because widening to that
+// file's parent would enumerate keys the caller never named. A prefix with no
+// objects yet is not an error: it yields nothing.
+//
+// It streams rather than returning a page, so a caller holds only what it
+// chooses to accumulate, and it streams underneath too: the directory is read a
+// chunk at a time, so neither side of the call holds a listing whose size is the
+// prefix's. That is also what a remote backend's listing natively is — a
+// continuation token, a page at a time — so the shape does not require one to
+// buffer a whole bucket listing to satisfy it.
+func (l *Local) WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error) error {
+	if prefix == "" {
+		return nil
+	}
+	// The containment scope is the directory the prefix names. A prefix with
+	// no separator ("92") names a top-level shard directory; one with a
+	// separator ("parts/aaa") names the directory it sits in. A prefix that
+	// does not resolve to a directory fails closed: widening to the store root
+	// would enumerate the assembled keyspace, which is exactly what this
+	// method must not do.
+	scope := strings.TrimSuffix(prefix, "/")
+	if i := strings.LastIndex(prefix, "/"); i >= 0 && i+1 < len(prefix) {
+		scope = strings.TrimSuffix(prefix[:i+1], "/")
+	}
+	fi, err := l.root.Lstat(scope)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // the prefix has no objects yet
 		}
+		return fmt.Errorf("blob walk: %w", err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("blob walk: %q is not a directory", scope)
+	}
+	return l.walk(ctx, scope, prefix, fn)
+}
+
+// walkChunk is how many directory entries one read pulls in. It is what keeps
+// the traversal's own footprint off the size of the directory it is reading: a
+// flat prefix holding hundreds of thousands of objects is read a chunk at a
+// time, so a streamed enumeration is streamed all the way down rather than
+// handing the caller one entry at a time out of a listing it already holds.
+const walkChunk = 512
+
+// walk is the package's one enumeration: it yields every entry under dir except
+// dir itself, keeping only those whose key carries prefix, and descends into
+// every directory it finds. Walk passes the store root and an empty prefix,
+// WalkPrefix passes the prefix's containment scope and the prefix; there is no
+// second traversal to drift from this one.
+//
+// Entries arrive in directory order rather than sorted: sorting a directory
+// means reading all of it first, which is the footprint this exists to avoid,
+// and no caller of either walk depends on the order it sees.
+func (l *Local) walk(ctx context.Context, dir, prefix string, fn func(Entry) error) error {
+	f, err := l.root.Open(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // a directory that vanished mid-walk is ordinary traffic
+	}
+	if err != nil {
+		return fmt.Errorf("blob walk %s: %w", dir, err)
+	}
+	defer func() { _ = f.Close() }() //nolint:errcheck // read-only close
+
+	for {
 		if err = ctx.Err(); err != nil {
 			return err
 		}
-		info, err := d.Info()
-		if errors.Is(err, fs.ErrNotExist) {
+		entries, err := f.ReadDir(walkChunk)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("blob walk %s: %w", dir, err)
+		}
+		for _, d := range entries {
+			child := d.Name()
+			if dir != "." {
+				child = dir + "/" + child
+			}
+			if strings.HasPrefix(child, prefix) {
+				info, err := d.Info()
+				if errors.Is(err, os.ErrNotExist) {
+					continue // vanished between the read and the stat
+				}
+				if err != nil {
+					return fmt.Errorf("blob walk stat %s: %w", child, err)
+				}
+				e := Entry{Key: child, Dir: d.IsDir(), Regular: info.Mode().IsRegular(), ModTime: info.ModTime()}
+				if e.Regular {
+					e.Size = info.Size()
+				}
+				if err = fn(e); err != nil {
+					return err
+				}
+			}
+			// Descent is not gated on the prefix: a directory that does not
+			// carry it can still hold keys that do.
+			if d.IsDir() {
+				if err = l.walk(ctx, child, prefix, fn); err != nil {
+					return err
+				}
+			}
+		}
+		if len(entries) < walkChunk {
 			return nil
 		}
-		if err != nil {
-			return fmt.Errorf("blob walk stat %s: %w", p, err)
-		}
-		e := Entry{Key: p, Dir: d.IsDir(), Regular: info.Mode().IsRegular(), ModTime: info.ModTime()}
-		if e.Regular {
-			e.Size = info.Size()
-		}
-		return fn(e)
-	})
+	}
 }
 
 // Remove deletes key. Deleting a key that is not there is a no-op, so a

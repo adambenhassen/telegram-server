@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -551,4 +552,174 @@ func (s *Store) retirePartRows(ctx context.Context, rows []db.DeleteUploadPartBy
 		}
 	}
 	return int64(len(retired)), nil
+}
+
+// PartOrphanResult reports what one orphan pass reclaimed.
+type PartOrphanResult struct {
+	// Objects is how many part objects the pass deleted.
+	Objects int
+	// Bytes is the total size of the objects it deleted.
+	Bytes int64
+}
+
+// PartOrphanGateBatch is how many candidate keys one live-key lookup carries,
+// and with it the whole memory footprint of a run: the enumeration streams, so
+// the pass holds a batch rather than a listing, whatever the prefix contains.
+// It bounds the Postgres round trips the same way — one lookup per batch of
+// candidates, not one per object and not one per prefix.
+const PartOrphanGateBatch = 500
+
+// partCandidate is one path the orphan pass may remove. The path and the key
+// are separate because the writer's temporary file is judged as the key it is
+// becoming — the row gate reads key, the unlink takes path — and for a finished
+// object the two are the same string.
+type partCandidate struct {
+	key  string
+	path string
+	size int64
+}
+
+// PartOrphanMargin is the extra age on top of the part TTL before an
+// unaccounted object is eligible for reclamation. It covers the row sweep's
+// own lag (one tick at ttl/4, plus the drain that tick performs) and one
+// hour of clock skew between replicas and between the local clock and the
+// object store's clock on a remote backend. The live-key gate carries
+// correctness alone; this margin is defence in depth, not the safety
+// control.
+func PartOrphanMargin(ttl time.Duration) time.Duration {
+	return ttl/4 + time.Hour
+}
+
+// ReclaimOrphanedPartBytes streams the parts prefix, reclaims part objects
+// older than the cutoff whose key no row still names, and returns what it
+// removed.
+//
+// The pass is safe in a way the row-driven sweep is not: it holds no lock a
+// request path waits on, makes no storage call inside a transaction, and its
+// only interaction with Postgres is a batched live-key lookup. Two replicas
+// running it at once delete the same object twice, and the second delete is a
+// no-op.
+//
+// cutoff is the earliest an object may be removed. The caller passes
+// now-(TTL+margin); the pass clamps it to that floor so a misconfigured small
+// cutoff cannot reach a live part. The margin (PartOrphanMargin) covers the
+// row sweep's own lag plus one hour of clock skew; the live-key gate carries
+// correctness alone, and this margin is defence in depth.
+//
+// What it acts on is narrower than what it sees, and each exclusion is a
+// separate reason. A directory, a symlink or anything else not a regular file
+// never came from the writer. What is left has to be a key NewPartKey could
+// have produced, with or without the writer's temporary suffix: this pass pages
+// candidates by walking paths rather than by reading upload_parts rows, which
+// makes that shape check load-bearing for deletion rather than for a counter,
+// so anything else parked under the prefix is unexplained and is left where it
+// is for [blobscan] to report.
+//
+// A temporary file is judged by the same cutoff as a finished object rather
+// than skipped. Skipping it would leave the bytes of a died-mid-write part
+// reclaimable by nothing, which is the leak this pass exists to close; and a
+// temporary older than TTL plus margin is not a write in progress, because a
+// part is at most MaxPartBytes and a Put that started that long ago is not
+// still running. It is gated on the key it is becoming, so a row that still
+// names that key protects its temporary too.
+//
+// One run streams the entire prefix, so every orphan is examined on every run
+// regardless of where its key sorts and how many ineligible objects precede
+// it. The enumeration is one directory read per run, linear in the number of
+// part objects and not quadratic, and the pass holds a batch of candidates
+// rather than a listing. The bound is therefore independent of process uptime
+// and of the store's contents: an unaccounted byte is reclaimed on the first
+// run after it crosses the cutoff, and the residual bound is TTL + margin +
+// one sweep interval.
+//
+// There is no delete-time re-check, and the streaming order is what carries
+// that. A row is committed before its bytes are written (MAIN-341's ordering
+// rule), so any row naming an object the walk observed was committed before
+// that object existed, and the gate query that follows the observation sees
+// it. A row committed after the walk passed a directory draws a fresh key from
+// crypto/rand, so it names no object this run ever saw.
+func (s *Store) ReclaimOrphanedPartBytes(ctx context.Context, cutoff time.Time, partTTL time.Duration) (PartOrphanResult, error) {
+	// Floor: the cutoff can never be younger than TTL+margin. A misconfigured
+	// small cutoff is clamped rather than trusted.
+	margin := PartOrphanMargin(partTTL)
+	floor := time.Now().Add(-(partTTL + margin))
+	if cutoff.After(floor) {
+		cutoff = floor
+	}
+
+	var res PartOrphanResult
+	batch := make([]partCandidate, 0, PartOrphanGateBatch)
+	// gate resolves one batch of candidates against the rows and removes what
+	// no row names. It is where the only Postgres round trip of the pass is.
+	gate := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		keys := make([]string, len(batch))
+		for i, c := range batch {
+			keys[i] = c.key
+		}
+		liveKeys, err := s.q.LivePartKeys(ctx, keys)
+		if err != nil {
+			return fmt.Errorf("live part keys: %w", err)
+		}
+		live := make(map[string]bool, len(liveKeys))
+		for _, k := range liveKeys {
+			live[k] = true
+		}
+		for _, c := range batch {
+			if live[c.key] {
+				continue
+			}
+			if err := s.blobs.Remove(ctx, c.path); err != nil {
+				// Log what was already reclaimed before surfacing the error:
+				// the partial result is the operator-visible record of this run.
+				s.log.Info("reclaim orphaned part bytes: partial",
+					"objects", res.Objects, "bytes", res.Bytes, "err", err)
+				return fmt.Errorf("remove orphaned part %s: %w", c.path, err)
+			}
+			res.Objects++
+			res.Bytes += c.size
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	var gateErr error
+	err := s.blobs.WalkPrefix(ctx, blob.PartsPrefix, func(e blob.Entry) error {
+		if !e.Regular {
+			return nil
+		}
+		// The writer's temporary file is judged as the key it is becoming: the
+		// suffix comes off, and what is left has to be a key NewPartKey could
+		// have produced, exactly as blobscan reads the same paths.
+		key, _ := strings.CutSuffix(e.Key, blob.TempSuffix)
+		if !blob.ParsePartKey(key) {
+			return nil
+		}
+		// Age gate: an object at or younger than the cutoff is never removed.
+		// It is what separates a write in progress from one that died: a part
+		// is at most MaxPartBytes, so a Put that started before the cutoff is
+		// not still running, and that is the same reasoning the whole pass
+		// rests on rather than a second assumption.
+		if !e.ModTime.Before(cutoff) {
+			return nil
+		}
+		batch = append(batch, partCandidate{key: key, path: e.Key, size: e.Size})
+		if len(batch) < PartOrphanGateBatch {
+			return nil
+		}
+		gateErr = gate()
+		return gateErr
+	})
+	if gateErr != nil {
+		return res, gateErr
+	}
+	if err != nil {
+		return res, fmt.Errorf("walk part prefix: %w", err)
+	}
+	if err := gate(); err != nil {
+		return res, err
+	}
+	return res, nil
 }

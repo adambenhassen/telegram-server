@@ -119,3 +119,12 @@ FOR UPDATE SKIP LOCKED;
 -- name: DeleteUploadPartByKey :execrows
 DELETE FROM upload_parts
 WHERE user_id = $1 AND file_id = $2 AND part_index = $3 AND blob_key = $4;
+
+-- LivePartKeys reports which of the given blob keys a parts row still names.
+-- The orphan pass gates each enumeration page with this: one lookup over the
+-- page's at-most-500 keys, so the live-key set is bounded by the page rather
+-- than the table, and the gate reads row state at delete time rather than at
+-- run start. A key absent from the result is named by no row.
+-- name: LivePartKeys :many
+SELECT blob_key FROM upload_parts
+WHERE blob_key = ANY(sqlc.arg(keys)::text[]);

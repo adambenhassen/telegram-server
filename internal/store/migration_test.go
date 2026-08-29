@@ -98,6 +98,28 @@ func TestOpenRejectsMissingMessageFileIdx(t *testing.T) {
 	requireOpenMigrationError(t, ctx, dsn)
 }
 
+// TestOpenRejectsMissingPartBlobKeyIdx is the same clause for the index the
+// orphan pass's live-key gate reads. A database stopped one migration short
+// passes every column check, so without this the server starts and each batch
+// of that gate becomes a Seq Scan of upload_parts — the pass keeps working and
+// only its cost changes, which is precisely the failure nothing else reports.
+func TestOpenRejectsMissingPartBlobKeyIdx(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `DROP INDEX upload_parts_blob_key_idx`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+
+	requireOpenMigrationError(t, ctx, dsn)
+}
+
 // TestOpenRejectsPartBlobMigrationMissing proves the sentinel catches a
 // migrations/ directory that stops short of the part-blob migration: a fresh
 // database built from every migration file except that one must fail Open, not
@@ -110,17 +132,36 @@ func TestOpenRejectsPartBlobMigrationMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read migrations dir: %v", err)
 	}
-	// Withheld by name, not by sort order. The sentinel this test drives is
-	// upload_parts.blob_key, so the file to hold back is the one that adds it;
-	// keyed on "whichever sorts last", the first migration added after it turns
-	// this into a test that applies the whole schema and asserts nothing.
-	var partBlob string
+	// The sentinel guards against a migrations/ directory that stops short of
+	// the part-blob migration: the one that adds the blob_key column. Find it
+	// by what it does rather than by position or by name. Position would let an
+	// index-only migration added after it shift the "latest", leaving the test
+	// withholding a file whose absence is harmless; name would match this
+	// branch's own upload_parts_blob_key_idx just as readily as the column
+	// migration it is named after.
+	//
+	// The discriminator is "blob_key" together with "ADD COLUMN", and it takes
+	// the last match: exactly one file in migrations/ adds a column by that
+	// name today. A future migration that adds another column called blob_key —
+	// on any table — moves the selector onto it, and the sentinel this test
+	// drives is upload_parts.blob_key specifically. Whoever writes that
+	// migration has to narrow this, and the failure will be loud rather than
+	// vacuous: withholding the wrong file leaves the startup sentinel's
+	// conditions satisfied, so Open succeeds and the assertion below fires.
+	var latest string
 	for _, e := range migs {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") && strings.Contains(e.Name(), "upload_parts_blob") {
-			partBlob = e.Name()
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("..", "..", "migrations", e.Name()))
+		if err != nil {
+			t.Fatalf("read migration %s: %v", e.Name(), err)
+		}
+		if strings.Contains(string(b), "blob_key") && strings.Contains(string(b), "ADD COLUMN") {
+			latest = e.Name()
 		}
 	}
-	if partBlob == "" {
+	if latest == "" {
 		t.Fatal("part-blob migration not found")
 	}
 
@@ -154,7 +195,15 @@ func TestOpenRejectsPartBlobMigrationMissing(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 	for _, e := range migs {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") || e.Name() == partBlob {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		// Skip the part-blob migration and every migration that comes after
+		// it: they may depend on the blob_key column it adds, and one of them
+		// does — upload_parts_blob_key_idx indexes that column, so applying it
+		// without the column is an error rather than a schema short of the
+		// sentinel.
+		if e.Name() >= latest {
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join("..", "..", "migrations", e.Name()))

@@ -117,11 +117,12 @@ type Files interface {
 // Tree is the blob half: enumeration of what is actually on the store.
 // [blob.Local] satisfies it.
 //
-// It is a local interface rather than a method on blob.Store because
-// enumeration is only defined on the local backend today. When the store grows
-// prefix enumeration for a remote backend, this is what it lands on, and the
-// pass keeps working — a classifier that walked a directory that an object
-// store leaves empty would report zero orphans and look healthy.
+// It is a local interface rather than a method on blob.Store because what this
+// pass needs is the whole tree, and blob.Store's enumeration is prefix-scoped:
+// containment lives in the primitive there, and the assembled keyspace has no
+// single prefix to name. A remote backend therefore has to satisfy this
+// separately before it can be classified — a classifier that walked a directory
+// that an object store leaves empty would report zero orphans and look healthy.
 type Tree interface {
 	Walk(ctx context.Context, fn func(blob.Entry) error) error
 }
