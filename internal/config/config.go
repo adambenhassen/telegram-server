@@ -145,12 +145,11 @@ type Config struct {
 	// free.
 	MediaErasureDestructive bool
 	// BlobScanTempMinAge is how old the blob writer's temporary file must be
-	// before the disk report will name it as abandoned. A temporary file is an
-	// upload writing its bytes right now, so this has to exceed the longest
-	// write a client can be part-way through — which nothing in the server
-	// bounds, the same reason MediaErasureMinAge is configurable rather than
-	// derived. Nothing in this build unlinks anything, so the value affects a
-	// report only.
+	// before the disk report or assembled-blob reclaim will name it as
+	// abandoned. A temporary file is an upload writing its bytes right now, so
+	// this has to exceed the longest write a client can be part-way through —
+	// which nothing in the server bounds, the same reason MediaErasureMinAge is
+	// configurable rather than derived.
 	BlobScanTempMinAge time.Duration
 	// BlobScanReportInterval is how often the disk report runs. Zero disables
 	// it and is the default, matching the media erasure report: both are

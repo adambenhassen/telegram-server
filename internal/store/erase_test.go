@@ -667,6 +667,120 @@ func TestErasureSweepRefusesAFileThatStopsBeingStored(t *testing.T) {
 	}
 }
 
+// A row written before assembly can be left not-stored after a crash. Once it
+// is past the same generous cutoff as the ordinary eraser, the row and any
+// bytes the assembly did manage to write are reclaimed together.
+func TestErasureSweepReclaimsAnOldUnassembledFile(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15559200141")
+	b := mustUser(t, s, "+15559200142")
+
+	f := storedFileWithBytes(t, s, a.ID)
+	deletedBothSides(t, s, a, b, f.ID, 1)
+	if err := store.SetFileUnstored(ctx, s, f.ID); err != nil {
+		t.Fatalf("clear stored: %v", err)
+	}
+
+	counts := sweep(t, s, future())
+	if counts.UnassembledErased != 1 || counts.UnassembledErasedBytes != f.Size {
+		t.Fatalf("counts = %+v, want one unassembled file and %d bytes erased", counts, f.Size)
+	}
+	if rowPresent(t, s, f.ID) {
+		t.Errorf("not-stored files row %d survived the sweep", f.ID)
+	}
+	if blobPresent(t, s, f.ID) {
+		t.Errorf("bytes for not-stored file %d survived the sweep", f.ID)
+	}
+}
+
+// The stored flag is re-evaluated by the conditional DELETE, not trusted from
+// the scan. This is the exact crash-versus-live-assembly interleaving: the
+// file is named while not-stored, then assembly completes before the erase
+// transaction takes the row.
+func TestErasureSweepRetainsUnassembledFileThatBecomesStored(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15559200151")
+	b := mustUser(t, s, "+15559200152")
+
+	f := storedFileWithBytes(t, s, a.ID)
+	deletedBothSides(t, s, a, b, f.ID, 1)
+	if err := store.SetFileUnstored(ctx, s, f.ID); err != nil {
+		t.Fatalf("clear stored: %v", err)
+	}
+
+	var completed bool
+	store.SetEraseHook(s, func(fileID int64) {
+		if fileID != f.ID || completed {
+			return
+		}
+		completed = true
+		if err := s.MarkFileStored(ctx, f.ID); err != nil {
+			t.Errorf("complete assembly: %v", err)
+		}
+	})
+
+	counts := sweep(t, s, future())
+	if !completed {
+		t.Fatal("the hook never fired, so the stored transition was not exercised")
+	}
+	if counts.UnassembledRetained != 1 || counts.UnassembledErased != 0 {
+		t.Fatalf("counts = %+v, want one retained unassembled candidate", counts)
+	}
+	if !rowPresent(t, s, f.ID) || !blobPresent(t, s, f.ID) {
+		t.Errorf("file %d was reclaimed after assembly completed", f.ID)
+	}
+}
+
+// A not-stored candidate also has to lose to a reference created after the
+// scan. The conditional DELETE is the final gate for both reclaim classes;
+// checking it only for stored rows would destroy an assembly that a live post
+// began naming in the same gap.
+func TestErasureSweepAbortsUnassembledOnReferenceCreatedInTheWindow(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15559200161")
+	b := mustUser(t, s, "+15559200162")
+
+	f := storedFileWithBytes(t, s, a.ID)
+	chID, postLocal, err := store.SeedChannelPost(ctx, s, a.ID, b.ID, f.ID)
+	if err != nil {
+		t.Fatalf("seed channel post: %v", err)
+	}
+	if err := store.SetChannelPostDeleted(ctx, s, chID, postLocal); err != nil {
+		t.Fatalf("delete channel post: %v", err)
+	}
+	if err := store.SetFileUnstored(ctx, s, f.ID); err != nil {
+		t.Fatalf("clear stored: %v", err)
+	}
+
+	var posted bool
+	store.SetEraseHook(s, func(fileID int64) {
+		if fileID != f.ID || posted {
+			return
+		}
+		posted = true
+		if err := store.InsertLiveChannelPost(ctx, s, chID, postLocal+1000, a.ID, f.ID); err != nil {
+			t.Errorf("insert live channel post: %v", err)
+		}
+	})
+
+	counts := sweep(t, s, future())
+	if !posted {
+		t.Fatal("the hook never fired, so the reference race was not exercised")
+	}
+	if counts.UnassembledErased != 0 || counts.UnassembledRetained != 1 {
+		t.Fatalf("counts = %+v, want one retained unassembled candidate", counts)
+	}
+	if !rowPresent(t, s, f.ID) || !blobPresent(t, s, f.ID) {
+		t.Errorf("not-stored file %d was reclaimed despite a live reference", f.ID)
+	}
+}
+
 // The sweep's own age gate: a cutoff no file has reached erases nothing, which
 // is the gate the operator actually sets.
 func TestErasureSweepErasesNothingBeforeTheCutoff(t *testing.T) {

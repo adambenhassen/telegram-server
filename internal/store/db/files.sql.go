@@ -69,6 +69,39 @@ func (q *Queries) ClearDeletedChannelFileRefs(ctx context.Context, fileID *int64
 	return result.RowsAffected(), nil
 }
 
+const deleteUnassembledFile = `-- name: DeleteUnassembledFile :execrows
+DELETE FROM files f
+WHERE f.id = $1
+  AND f.stored = false
+  AND f.date < $2::timestamptz
+  AND NOT EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.file_id = f.id AND m.file_id <> 0 AND m.deleted = false
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM channel_messages cm
+      WHERE cm.file_id = f.id AND cm.deleted = false
+  )
+`
+
+type DeleteUnassembledFileParams struct {
+	ID        int64
+	OlderThan pgtype.Timestamptz
+}
+
+// DeleteUnassembledFile is the crashed-assembly half of the row-driven
+// reclaim. It repeats every condition after the exclusive row lock rather
+// than trusting the scan: a live assembly can finish, or a reference can be
+// created, in the gap. The caller unlinks the exact key only after this row
+// deletion commits.
+func (q *Queries) DeleteUnassembledFile(ctx context.Context, arg DeleteUnassembledFileParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUnassembledFile, arg.ID, arg.OlderThan)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteUnreferencedFile = `-- name: DeleteUnreferencedFile :execrows
 DELETE FROM files f
 WHERE f.id = $1
@@ -153,6 +186,22 @@ func (q *Queries) ExistingFileIDs(ctx context.Context, ids []int64) ([]int64, er
 		return nil, err
 	}
 	return items, nil
+}
+
+const fileExistsForBlob = `-- name: FileExistsForBlob :one
+SELECT EXISTS (SELECT 1 FROM files WHERE id = $1)
+`
+
+// FileExistsForBlob is the final database check before an assembled blob with
+// no row may be reclaimed. It deliberately sees stored and not-stored rows:
+// the latter are live upload assemblies and are a different class only in the
+// row-driven pass. A plain existence probe does not wait on a row lock, so an
+// eraser never parks upload, send or download traffic behind this check.
+func (q *Queries) FileExistsForBlob(ctx context.Context, id int64) (bool, error) {
+	row := q.db.QueryRow(ctx, fileExistsForBlob, id)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const fileForDownload = `-- name: FileForDownload :one

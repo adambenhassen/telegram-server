@@ -228,6 +228,17 @@ type EraseCounts struct {
 	// nothing else names them; the disk reclamation pass is what collects them,
 	// which is the same state a crash between the commit and the unlink leaves.
 	UnlinkFailed int
+
+	// The unassembled fields are the same outcomes for rows whose stored flag
+	// was false at scan time. They are separate from the ordinary fields so an
+	// operator can distinguish completed media reclaimed from crashed upload
+	// rows reclaimed, even though both remove a files row and its exact key.
+	UnassembledConsidered   int
+	UnassembledErased       int
+	UnassembledErasedBytes  int64
+	UnassembledContended    int
+	UnassembledRetained     int
+	UnassembledUnlinkFailed int
 }
 
 // eraseOutcome is which of EraseCounts' classes one candidate landed in.
@@ -287,7 +298,7 @@ func (s *Store) SweepMediaErasure(ctx context.Context, olderThan time.Time, batc
 		// naming the same pair cannot hold them the opposite way round.
 		for _, c := range scan.Unreferenced {
 			counts.Considered++
-			out, err := s.eraseCandidate(ctx, c, olderThan)
+			out, err := s.eraseCandidate(ctx, c, olderThan, true)
 			if err != nil {
 				return counts, err
 			}
@@ -308,6 +319,34 @@ func (s *Store) SweepMediaErasure(ctx context.Context, olderThan time.Time, batc
 					counts.UnlinkFailed++
 					if unlinkErr == nil {
 						unlinkErr = fmt.Errorf("media erasure sweep: unlink file %d: %w", c.ID, err)
+					}
+				}
+			}
+		}
+		// Not-stored rows are a separate reclaim class, but they use the same
+		// row interlock and the same row-first ordering. The scan can only say
+		// what the flag was before this gap; DeleteUnassembledFile decides again
+		// under the exclusive hold so an assembly that completes is retained.
+		for _, c := range scan.Unassembled {
+			counts.Considered++
+			counts.UnassembledConsidered++
+			out, err := s.eraseCandidate(ctx, c, olderThan, false)
+			if err != nil {
+				return counts, err
+			}
+			switch out {
+			case contended:
+				counts.UnassembledContended++
+			case retained:
+				counts.UnassembledRetained++
+			case erased:
+				counts.UnassembledErased++
+				counts.UnassembledErasedBytes += c.Size
+				if err := s.blobs.Remove(ctx, blob.Key(c.ID)); err != nil {
+					counts.UnlinkFailed++
+					counts.UnassembledUnlinkFailed++
+					if unlinkErr == nil {
+						unlinkErr = fmt.Errorf("media erasure sweep: unlink unassembled file %d: %w", c.ID, err)
 					}
 				}
 			}
@@ -335,7 +374,7 @@ func (s *Store) SweepMediaErasure(ctx context.Context, olderThan time.Time, batc
 //
 // The one thing that cannot move outside is the reference re-check, and the
 // reason is the ordering, not the cost. See LockFileForErase.
-func (s *Store) eraseCandidate(ctx context.Context, c ErasureCandidate, olderThan time.Time) (eraseOutcome, error) {
+func (s *Store) eraseCandidate(ctx context.Context, c ErasureCandidate, olderThan time.Time, stored bool) (eraseOutcome, error) {
 	if s.eraseHook != nil {
 		s.eraseHook(c.ID)
 	}
@@ -359,10 +398,18 @@ func (s *Store) eraseCandidate(ctx context.Context, c ErasureCandidate, olderTha
 	if _, err = qtx.ClearDeletedChannelFileRefs(ctx, &c.ID); err != nil {
 		return retained, fmt.Errorf("erase file %d: clear channel refs: %w", c.ID, err)
 	}
-	n, err := qtx.DeleteUnreferencedFile(ctx, db.DeleteUnreferencedFileParams{
-		ID:        c.ID,
-		OlderThan: pgtype.Timestamptz{Time: olderThan, Valid: true},
-	})
+	var n int64
+	if stored {
+		n, err = qtx.DeleteUnreferencedFile(ctx, db.DeleteUnreferencedFileParams{
+			ID:        c.ID,
+			OlderThan: pgtype.Timestamptz{Time: olderThan, Valid: true},
+		})
+	} else {
+		n, err = qtx.DeleteUnassembledFile(ctx, db.DeleteUnassembledFileParams{
+			ID:        c.ID,
+			OlderThan: pgtype.Timestamptz{Time: olderThan, Valid: true},
+		})
+	}
 	if err != nil {
 		return retained, fmt.Errorf("erase file %d: delete: %w", c.ID, err)
 	}

@@ -104,6 +104,14 @@ SELECT coalesce(pg_sequence_last_value('files_id_seq'), 0)::bigint;
 -- name: ExistingFileIDs :many
 SELECT id FROM files WHERE id = ANY(sqlc.arg(ids)::bigint[]);
 
+-- FileExistsForBlob is the final database check before an assembled blob with
+-- no row may be reclaimed. It deliberately sees stored and not-stored rows:
+-- the latter are live upload assemblies and are a different class only in the
+-- row-driven pass. A plain existence probe does not wait on a row lock, so an
+-- eraser never parks upload, send or download traffic behind this check.
+-- name: FileExistsForBlob :one
+SELECT EXISTS (SELECT 1 FROM files WHERE id = $1);
+
 -- MediaErasureScan classifies one bounded window of files rows: for each row it
 -- reports whether anything live references it, and whether it is past the age
 -- cutoff. It names nothing for deletion; it deletes nothing.
@@ -241,6 +249,25 @@ WHERE f.id = sqlc.arg(id)
   AND NOT EXISTS (
       SELECT 1 FROM messages m
       WHERE m.file_id = f.id AND m.deleted = false
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM channel_messages cm
+      WHERE cm.file_id = f.id AND cm.deleted = false
+  );
+
+-- DeleteUnassembledFile is the crashed-assembly half of the row-driven
+-- reclaim. It repeats every condition after the exclusive row lock rather
+-- than trusting the scan: a live assembly can finish, or a reference can be
+-- created, in the gap. The caller unlinks the exact key only after this row
+-- deletion commits.
+-- name: DeleteUnassembledFile :execrows
+DELETE FROM files f
+WHERE f.id = sqlc.arg(id)
+  AND f.stored = false
+  AND f.date < sqlc.arg(older_than)::timestamptz
+  AND NOT EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.file_id = f.id AND m.file_id <> 0 AND m.deleted = false
   )
   AND NOT EXISTS (
       SELECT 1 FROM channel_messages cm
