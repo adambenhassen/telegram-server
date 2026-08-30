@@ -55,10 +55,11 @@ func chatFromRow(r db.Chat) Chat {
 	}
 }
 
-// CreateChat creates a chat owned by creatorID with the creator and memberIDs as
-// participants, all in one transaction. Duplicate ids in memberIDs and creatorID
-// appearing in memberIDs are deduped rather than rejected. ErrChatFull if the
-// deduped member count exceeds maxChatParticipants; no rows are written then.
+// CreateChat creates a chat owned by creatorID with the creator and each
+// unblocked memberID as participants, all in one transaction. Duplicate ids in
+// memberIDs and creatorID appearing in memberIDs are deduped rather than
+// rejected. ErrChatFull if the deduped requested member count exceeds
+// maxChatParticipants; no rows are written then.
 func (s *Store) CreateChat(ctx context.Context, creatorID int64, title string, memberIDs []int64) (Chat, error) {
 	// The cap bounds the allocation, not just the transaction: memberIDs arrives
 	// from a client vector and is only capped at the transport frame size, so
@@ -87,8 +88,31 @@ func (s *Store) CreateChat(ctx context.Context, creatorID int64, title string, m
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
-	// No chats row lock here: the chat does not exist yet, so there is nothing to
-	// race against its member set.
+	// There is no chats row lock here: the chat does not exist yet. The same
+	// sorted owner locks used by BlockUser are the serialization point for the
+	// directed block check below. They are taken before any participant row is
+	// written, so a block that committed before this pass cannot be missed.
+	if err := lockOwners(ctx, tx, members...); err != nil {
+		return Chat{}, err
+	}
+	filtered := members[:0]
+	for _, id := range members {
+		if id != creatorID {
+			blocked, err := qtx.IsBlocked(ctx, db.IsBlockedParams{
+				BlockerID: id,
+				BlockedID: creatorID,
+			})
+			if err != nil {
+				return Chat{}, fmt.Errorf("check blocked invitee %d: %w", id, err)
+			}
+			if blocked {
+				continue
+			}
+		}
+		filtered = append(filtered, id)
+	}
+	members = filtered
+
 	row, err := qtx.InsertChat(ctx, db.InsertChatParams{Title: title, CreatorID: creatorID})
 	if err != nil {
 		return Chat{}, fmt.Errorf("insert chat: %w", err)
@@ -313,6 +337,20 @@ func (s *Store) AddChatUser(ctx context.Context, chatID, target, callerID int64)
 	// cap's business.
 	if !m.seen[target] && len(m.members) >= maxChatParticipants {
 		return false, Message{}, nil, ErrChatFull
+	}
+	if !m.seen[target] {
+		blocked, err := m.qtx.IsBlocked(ctx, db.IsBlockedParams{
+			BlockerID: target,
+			BlockedID: callerID,
+		})
+		if err != nil {
+			return false, Message{}, nil, fmt.Errorf("check blocked caller: %w", err)
+		}
+		if blocked {
+			// A blocked add is the same refusal as every other add the caller
+			// cannot make. Nothing has been written in this transaction yet.
+			return false, Message{}, nil, ErrNotMember
+		}
 	}
 	n, err := m.qtx.InsertChatParticipantIfAbsent(ctx, db.InsertChatParticipantIfAbsentParams{
 		ChatID: chatID, UserID: target, InviterID: callerID,

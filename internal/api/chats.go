@@ -63,6 +63,32 @@ func (h *handlers) resolveInvitees(ctx context.Context, users []tg.InputUserClas
 	return members, missing, nil
 }
 
+// addMissingCreatedChatInvitees reports valid invitees that the store filtered
+// before inserting the chat. The participant read is after CreateChat commits,
+// so the response reflects the durable membership set and keeps blocked users
+// out of both the chat and its success vector.
+func (h *handlers) addMissingCreatedChatInvitees(ctx context.Context, chatID int64, memberIDs []int64, missing []tg.MissingInvitee) ([]tg.MissingInvitee, error) {
+	participants, err := h.store.Participants(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+	present := make(map[int64]bool, len(participants))
+	for _, participant := range participants {
+		present[participant.UserID] = true
+	}
+	reported := make(map[int64]bool, len(missing))
+	for _, invitee := range missing {
+		reported[invitee.UserID] = true
+	}
+	for _, id := range memberIDs {
+		if !present[id] && !reported[id] {
+			missing = append(missing, tg.MissingInvitee{UserID: id})
+			reported[id] = true
+		}
+	}
+	return missing, nil
+}
+
 // chatUpdate builds the envelope a chat mutation returns to its caller: the
 // caller's own copy of the service message, at the caller's own new pts, plus
 // the users and the chat the client needs to render it.
@@ -148,6 +174,11 @@ func (h *handlers) handleCreateChat(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	if err != nil {
 		h.log.Error("create chat", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	missing, err = h.addMissingCreatedChatInvitees(r.Ctx, chat.ID, members, missing)
+	if err != nil {
+		h.log.Error("create chat: inspect participants", "chat_id", chat.ID, "err", err)
 		return nil, errInternal
 	}
 

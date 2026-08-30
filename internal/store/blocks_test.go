@@ -1,0 +1,214 @@
+package store_test
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"testing"
+
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/adambenhassen/telegram-server/internal/store"
+)
+
+func TestBlockUserIsDirectedAndIdempotent(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	blocker := mustUser(t, s, "+15551500001")
+	blocked := mustUser(t, s, "+15551500002")
+	other := mustUser(t, s, "+15551500003")
+
+	changed, err := s.BlockUser(ctx, blocker.ID, blocked.ID)
+	if err != nil || !changed {
+		t.Fatalf("block: changed=%v err=%v", changed, err)
+	}
+	changed, err = s.BlockUser(ctx, blocker.ID, blocked.ID)
+	if err != nil || changed {
+		t.Fatalf("duplicate block: changed=%v err=%v, want false/nil", changed, err)
+	}
+
+	blockedState, err := s.IsBlocked(ctx, blocker.ID, blocked.ID)
+	if err != nil || !blockedState {
+		t.Fatalf("directed block state: blocked=%v err=%v", blockedState, err)
+	}
+	reverseState, err := s.IsBlocked(ctx, blocked.ID, blocker.ID)
+	if err != nil || reverseState {
+		t.Fatalf("reverse block state: blocked=%v err=%v, want false/nil", reverseState, err)
+	}
+
+	page, err := s.BlockedUsers(ctx, blocker.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("blocked list: %v", err)
+	}
+	if page.Total != 1 || len(page.Users) != 1 || page.Users[0].UserID != blocked.ID {
+		t.Fatalf("blocked list = %+v, want only %d", page, blocked.ID)
+	}
+	page, err = s.BlockedUsers(ctx, blocker.ID, 1, 100)
+	if err != nil {
+		t.Fatalf("empty blocked page: %v", err)
+	}
+	if page.Total != 1 || len(page.Users) != 0 {
+		t.Fatalf("empty blocked page = %+v, want total 1", page)
+	}
+	page, err = s.BlockedUsers(ctx, other.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("other blocked list: %v", err)
+	}
+	if page.Total != 0 || len(page.Users) != 0 {
+		t.Fatalf("other blocked list = %+v, want empty", page)
+	}
+
+	changed, err = s.UnblockUser(ctx, blocker.ID, blocked.ID)
+	if err != nil || !changed {
+		t.Fatalf("unblock: changed=%v err=%v", changed, err)
+	}
+	changed, err = s.UnblockUser(ctx, blocker.ID, blocked.ID)
+	if err != nil || changed {
+		t.Fatalf("duplicate unblock: changed=%v err=%v, want false/nil", changed, err)
+	}
+	blockedState, err = s.IsBlocked(ctx, blocker.ID, blocked.ID)
+	if err != nil || blockedState {
+		t.Fatalf("unblocked state: blocked=%v err=%v, want false/nil", blockedState, err)
+	}
+}
+
+func TestBlockedUsersSurviveStoreReopen(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	blocker := mustUser(t, s, "+15551500101")
+	blocked := mustUser(t, s, "+15551500102")
+	if _, err := s.BlockUser(ctx, blocker.ID, blocked.ID); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s, err = store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = s.Close() }() //nolint:errcheck // best-effort close
+	page, err := s.BlockedUsers(ctx, blocker.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("blocked list after reopen: %v", err)
+	}
+	if page.Total != 1 || len(page.Users) != 1 || page.Users[0].UserID != blocked.ID {
+		t.Fatalf("blocked list after reopen = %+v, want only %d", page, blocked.ID)
+	}
+}
+
+func TestBlockedAddDoesNotWriteAndUnblockAllowsIt(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	caller := mustUser(t, s, "+15551500201")
+	target := mustUser(t, s, "+15551500202")
+	member := mustUser(t, s, "+15551500203")
+	chat := chatWith(t, s, caller, member)
+
+	if _, err := s.BlockUser(ctx, target.ID, caller.ID); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	wantParticipants := participantIDs(t, s, chat.ID)
+	wantVersion := chatVersion(t, s, chat.ID)
+	wantPts := ptsOf(t, s, caller.ID)
+	wantEvents := len(eventsOf(t, s, caller.ID, 0))
+
+	added, sender, perOwner, err := s.AddChatUser(ctx, chat.ID, target.ID, caller.ID)
+	if !errors.Is(err, store.ErrNotMember) {
+		t.Fatalf("blocked add: added=%v sender=%+v perOwner=%+v err=%v, want ErrNotMember", added, sender, perOwner, err)
+	}
+	if added || perOwner != nil || sender.LocalID != 0 || sender.FanoutID != 0 {
+		t.Fatalf("blocked add result: added=%v sender=%+v perOwner=%+v, want no-op", added, sender, perOwner)
+	}
+	if got := participantIDs(t, s, chat.ID); !reflect.DeepEqual(got, wantParticipants) {
+		t.Errorf("participants after blocked add = %v, want %v", got, wantParticipants)
+	}
+	if got := chatVersion(t, s, chat.ID); got != wantVersion {
+		t.Errorf("version after blocked add = %d, want %d", got, wantVersion)
+	}
+	if got := ptsOf(t, s, caller.ID); got != wantPts {
+		t.Errorf("caller pts after blocked add = %d, want %d", got, wantPts)
+	}
+	if got := len(eventsOf(t, s, caller.ID, 0)); got != wantEvents {
+		t.Errorf("caller events after blocked add = %d, want %d", got, wantEvents)
+	}
+
+	changed, err := s.UnblockUser(ctx, target.ID, caller.ID)
+	if err != nil || !changed {
+		t.Fatalf("unblock: changed=%v err=%v", changed, err)
+	}
+	added, _, perOwner, err = s.AddChatUser(ctx, chat.ID, target.ID, caller.ID)
+	if err != nil || !added || len(perOwner) != 3 {
+		t.Fatalf("unblocked add: added=%v perOwner=%+v err=%v", added, perOwner, err)
+	}
+}
+
+func TestBlockedAddCoversAbsentAndFormerMemberWithoutRemovingExistingMembership(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	caller := mustUser(t, s, "+15551500301")
+	target := mustUser(t, s, "+15551500302")
+	other := mustUser(t, s, "+15551500303")
+	absentChat := chatWith(t, s, caller, other)
+	formerChat := chatWith(t, s, caller, target)
+	keptChat := chatWith(t, s, caller, target)
+	if removed, _, _, err := s.RemoveChatUser(ctx, formerChat.ID, target.ID, caller.ID); err != nil || !removed {
+		t.Fatalf("remove former member: removed=%v err=%v", removed, err)
+	}
+	if _, err := s.BlockUser(ctx, target.ID, caller.ID); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+
+	for name, chat := range map[string]store.Chat{"absent": absentChat, "former": formerChat} {
+		before := participantIDs(t, s, chat.ID)
+		added, _, perOwner, err := s.AddChatUser(ctx, chat.ID, target.ID, caller.ID)
+		if !errors.Is(err, store.ErrNotMember) {
+			t.Errorf("%s add: err=%v, want ErrNotMember", name, err)
+		}
+		if added || perOwner != nil {
+			t.Errorf("%s add: added=%v perOwner=%+v, want no-op", name, added, perOwner)
+		}
+		if got := participantIDs(t, s, chat.ID); !reflect.DeepEqual(got, before) {
+			t.Errorf("%s participants = %v, want %v", name, got, before)
+		}
+	}
+
+	// Blocking does not remove an already-established membership, and the
+	// existing-member path remains a true no-op.
+	if got := participantIDs(t, s, keptChat.ID); len(got) != 2 {
+		t.Fatalf("kept chat participants = %v, want caller and target", got)
+	}
+	added, _, perOwner, err := s.AddChatUser(ctx, keptChat.ID, target.ID, caller.ID)
+	if err != nil || added || perOwner != nil {
+		t.Fatalf("already-member add after block: added=%v perOwner=%+v err=%v", added, perOwner, err)
+	}
+}
+
+func TestCreateChatSkipsBlockedInvitee(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551500401")
+	blocked := mustUser(t, s, "+15551500402")
+	member := mustUser(t, s, "+15551500403")
+	if _, err := s.BlockUser(ctx, blocked.ID, creator.ID); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	chat, err := s.CreateChat(ctx, creator.ID, "Filtered", []int64{blocked.ID, member.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	got := participantIDs(t, s, chat.ID)
+	want := []int64{creator.ID, member.ID}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("participants = %v, want %v", got, want)
+	}
+}
