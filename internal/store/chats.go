@@ -90,7 +90,12 @@ func (s *Store) CreateChat(ctx context.Context, creatorID int64, title string, m
 
 	// There is no chats row lock here: the chat does not exist yet. The block
 	// check runs in this transaction before any participant row is written, so a
-	// block committed before this check cannot be missed.
+	// block committed before this check cannot be missed. Two accepted residuals
+	// are recorded on the issue rather than closed here: a block committing
+	// after this read may lose, because closing the window would need owner
+	// advisory locks that any caller could hold for a transaction by naming 200
+	// arbitrary ids; and a blocked invitee is reported as a MissingInvitee, which
+	// a creator who already resolved that invitee can read as a block.
 	filtered := members[:0]
 	for _, id := range members {
 		if id != creatorID {
