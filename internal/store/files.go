@@ -149,7 +149,7 @@ func (s *Store) AllocateAndCompleteFile(
 				err = releaseErr
 				return
 			}
-			err = fmt.Errorf("%w; %v", err, releaseErr)
+			err = fmt.Errorf("%w; %w", err, releaseErr)
 		}
 	}()
 
@@ -298,7 +298,7 @@ func (c *fileAssemblyClaim) release() error {
 	if err := conn.QueryRow(context.Background(), `SELECT pg_advisory_unlock($1)`, c.key).Scan(&released); err != nil {
 		raw := conn.Hijack()
 		if closeErr := raw.Close(context.Background()); closeErr != nil {
-			return fmt.Errorf("file assembly claim: unlock: %w; close: %v", err, closeErr)
+			return fmt.Errorf("file assembly claim: unlock: %w; close: %w", err, closeErr)
 		}
 		return nil
 	}
