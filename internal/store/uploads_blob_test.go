@@ -556,7 +556,7 @@ func TestSaveUploadPartUsesBlobOperationTimeout(t *testing.T) {
 	}
 	deadline := <-probe.seen
 	remaining := time.Until(deadline)
-	if remaining < timeout-time.Second {
+	if remaining < timeout-time.Second || remaining > timeout+time.Second {
 		t.Fatalf("blob operation deadline has %s remaining, want close to %s", remaining, timeout)
 	}
 }

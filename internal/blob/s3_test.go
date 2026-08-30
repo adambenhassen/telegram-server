@@ -517,10 +517,14 @@ func TestS3ReadAtBoundsUnexpectedFullResponse(t *testing.T) {
 	)
 	var sent atomic.Int64
 	var gotRange string
+	var rangeMu sync.Mutex
 	done := make(chan struct{})
+	var doneOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer close(done)
+		defer doneOnce.Do(func() { close(done) })
+		rangeMu.Lock()
 		gotRange = r.Header.Get("Range")
+		rangeMu.Unlock()
 		w.Header().Set("Content-Length", strconv.Itoa(bodyBytes))
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
@@ -559,8 +563,11 @@ func TestS3ReadAtBoundsUnexpectedFullResponse(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not observe the response connection closing")
 	}
-	if gotRange != "bytes=0-3" {
-		t.Fatalf("Range = %q, want bytes=0-3", gotRange)
+	rangeMu.Lock()
+	got := gotRange
+	rangeMu.Unlock()
+	if got != "bytes=0-3" {
+		t.Fatalf("Range = %q, want bytes=0-3", got)
 	}
 	if got := sent.Load(); got >= bodyBytes/2 {
 		t.Fatalf("unexpected full response sent %d bytes, want less than %d", got, bodyBytes/2)
