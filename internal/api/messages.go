@@ -559,7 +559,8 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 // revoke flag decides the scope: false deletes only the caller's copy of each
 // message (for a chat message that is the caller's own fan-out row, for a
 // user-peer message their own row), true deletes for everyone the message
-// reaches (both 1:1 sides, or every current member's chat copy, author only).
+// reaches (both 1:1 sides, or every current member's chat copy, author or chat
+// creator only).
 func (h *handlers) handleDeleteMessages(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesDeleteMessagesRequest
 	if err := req.Decode(r.Buf); err != nil {
