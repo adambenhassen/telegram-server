@@ -324,13 +324,14 @@ func (s *Store) SweepMediaErasure(ctx context.Context, olderThan time.Time, batc
 			}
 		}
 		// Not-stored rows are a separate reclaim class, but they use the same
-		// row interlock and the same row-first ordering. The scan can only say
-		// what the flag was before this gap; DeleteUnassembledFile decides again
-		// under the exclusive hold so an assembly that completes or gains a live
-		// reference is retained. That re-check does not cover an assembly still
-		// between AllocateFile and MarkFileStored: the server assembles from a
-		// fully buffered parts set, so no client can pace that window. MAIN-338
-		// is the follow-up that will put a bound on it.
+		// row interlock and the same row-first ordering. A live assembly holds
+		// the row FOR SHARE from before Put through MarkFileStored's commit, so
+		// LockFileForErase skips it rather than queueing behind it. If the
+		// assembly's connection dies, the lock dies with it and the row becomes
+		// reclaimable. DeleteUnassembledFile still decides again under an
+		// exclusive hold, so an assembly that completes or gains a live
+		// reference is retained. Age is an additional gate, not the safety
+		// control; MAIN-338 remains the follow-up for assembly duration policy.
 		for _, c := range scan.Unassembled {
 			counts.UnassembledConsidered++
 			out, err := s.eraseCandidate(ctx, c, olderThan, false)

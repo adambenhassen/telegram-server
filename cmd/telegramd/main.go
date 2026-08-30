@@ -622,6 +622,8 @@ func sweepMediaErasurePass(ctx context.Context, st *store.Store, cfg config.Conf
 		"temp_unlink_attempts", b.TempUnlinkAttempts,
 		"temp_unlink_attempted_bytes", b.TempUnlinkAttemptedBytes,
 		"temp_in_flight", b.TempInFlight,
+		"temp_contended", b.TempContended,
+		"temp_retained", b.TempRetained,
 		"temp_unlink_failed", b.TempUnlinkFailed,
 		"above_snapshot", b.AboveSnapshot,
 		"unexplained", b.Unexplained,

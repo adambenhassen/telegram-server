@@ -403,9 +403,9 @@ func inputFileParts(f tg.InputFileClass) (id int64, parts int, name string, err 
 // assembleFile turns an in-flight upload into a stored file. The order is the
 // contract: the files row is created before the bytes are written and marked
 // stored only after, so a crash between them leaves a row that no download can
-// resolve rather than a file id serving whatever is at its key. Nothing cleans
-// that row up — M5 has no deleter — so it stays counted against the uploader's
-// quota, which is honest about what was consumed.
+// resolve rather than a file id serving whatever is at its key. The assembly
+// transaction takes the files row's shared interlock before Put and holds it
+// through the stored transition's commit, so the eraser skips a live upload.
 func (h *handlers) assembleFile(
 	ctx context.Context, userID, clientFileID int64, parts int, name, mimeType string,
 ) (store.File, error) {
@@ -456,22 +456,23 @@ func (h *handlers) assembleFile(
 		return store.File{}, errInternal
 	}
 
-	written, err := h.blobs.Put(ctx, blob.Key(file.ID), &partsReader{
-		ctx: ctx, store: h.store, refs: refs,
+	var written int64
+	err = h.store.CompleteFileAssembly(ctx, file.ID, func() error {
+		var err error
+		written, err = h.blobs.Put(ctx, blob.Key(file.ID), &partsReader{
+			ctx: ctx, store: h.store, refs: refs,
+		})
+		if err != nil {
+			return err
+		}
+		// A mismatch means the parts changed under the read, so the blob does
+		// not hold the file the row describes and must not be marked stored.
+		if written != total {
+			return fmt.Errorf("wrote %d bytes, expected %d", written, total)
+		}
+		return nil
 	})
 	if err != nil {
-		h.log.Error("assemble file", "user_id", userID, "file_id", file.ID, "err", err)
-		return store.File{}, errInternal
-	}
-	// A mismatch means the parts changed under the read, so the blob does not
-	// hold the file the row describes and must not be marked stored.
-	if written != total {
-		h.log.Error("assemble file", "user_id", userID, "file_id", file.ID,
-			"err", fmt.Errorf("wrote %d bytes, expected %d", written, total))
-		return store.File{}, errInternal
-	}
-
-	if err = h.store.MarkFileStored(ctx, file.ID); err != nil {
 		h.log.Error("assemble file", "user_id", userID, "file_id", file.ID, "err", err)
 		return store.File{}, errInternal
 	}

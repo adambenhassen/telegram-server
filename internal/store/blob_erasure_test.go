@@ -165,6 +165,12 @@ func TestBlobErasureSweepReclaimsOwnedClassesAndLeavesParts(t *testing.T) {
 	}
 	accounted := storedFileWithBytes(t, s, a.ID)
 	oldTemp := storedFile(t, s, a.ID)
+	if err := store.SetFileUnstored(ctx, s, oldTemp.ID); err != nil {
+		t.Fatalf("clear temporary's stored flag: %v", err)
+	}
+	if err := store.SetFileDate(ctx, s, oldTemp.ID, time.Now().Add(-2*time.Hour)); err != nil {
+		t.Fatalf("age temporary's row: %v", err)
+	}
 	oldTempKey := blob.Key(oldTemp.ID) + blob.TempSuffix
 	plantBlobErasureObject(t, s, oldTempKey, "old temp", time.Now().Add(-2*time.Hour))
 	youngTemp := storedFile(t, s, a.ID)
@@ -208,8 +214,8 @@ func TestBlobErasureSweepReclaimsOwnedClassesAndLeavesParts(t *testing.T) {
 	if counts.OrphanRetained != 1 || !blobPresent(t, s, accounted.ID) {
 		t.Fatalf("accounted blob was reclaimed: counts = %+v", counts)
 	}
-	if !rowPresent(t, s, oldTemp.ID) {
-		t.Errorf("temporary cleanup removed the files row for %d", oldTemp.ID)
+	if rowPresent(t, s, oldTemp.ID) {
+		t.Errorf("temporary cleanup left the absent files row for %d", oldTemp.ID)
 	}
 	if blobPresent(t, s, orphan.ID) || blobErasureObjectExists(t, s, oldTempKey) {
 		t.Fatal("owned reclaimable bytes survived the destructive pass")

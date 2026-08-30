@@ -83,12 +83,12 @@ type Config struct {
 	// report will name it, and before the erasure sweep will remove it.
 	//
 	// The default is 24 hours, deliberately generous while MAIN-338 remains
-	// open: the server does not yet bound how long an assembly may run. This
-	// cutoff is therefore load-bearing for an assembly still between AllocateFile
-	// and MarkFileStored, and an operator must keep it above the longest
-	// legitimate buffered assembly. The conditional delete still protects the
-	// separate race where a candidate finishes or gains a reference after the
-	// scan, but it cannot protect a live mid-Put row whose stored flag is false.
+	// open. It is an additional retention gate for crashed or unassembled rows,
+	// not the live-assembly safety control: assembly holds the files row FOR
+	// SHARE before Put through the MarkFileStored commit, and the eraser skips a
+	// held row. A process crash releases the lock and leaves the row reclaimable;
+	// a smaller cutoff may reclaim that crashed state sooner without deleting a
+	// live assembly.
 	MediaErasureMinAge time.Duration
 	// MediaErasureReportInterval is how often that report runs. Zero disables
 	// it, as a zero limit disables a rate limit, and zero is the default: the
@@ -137,10 +137,11 @@ type Config struct {
 	MediaErasureDestructive bool
 	// BlobScanTempMinAge is how old the blob writer's temporary file must be
 	// before the disk report or assembled-blob reclaim will name it as
-	// abandoned. A temporary file is an upload writing its bytes right now, so
-	// this has to exceed the longest write a client can be part-way through —
-	// which nothing in the server bounds, the same reason MediaErasureMinAge is
-	// configurable rather than derived.
+	// abandoned. Age is an additional retention gate, not the live-assembly
+	// safety control: the assembly holds the files row FOR SHARE before Put and
+	// the reclaim path skips a held row. The default remains 24 hours while
+	// MAIN-338 is open, and the value stays configurable for crash-retention
+	// policy.
 	BlobScanTempMinAge time.Duration
 	// BlobScanReportInterval is how often the disk report runs. Zero disables
 	// it and is the default, matching the media erasure report: both are

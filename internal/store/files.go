@@ -145,6 +145,44 @@ func (s *Store) MarkFileStored(ctx context.Context, fileID int64) error {
 	return nil
 }
 
+// CompleteFileAssembly holds the files row's shared interlock while put runs
+// and while MarkFileStored commits. AllocateFile must already have committed
+// the row before this method is called. A live assembly therefore makes the
+// eraser's FOR UPDATE SKIP LOCKED miss the row, while a process that dies
+// releases the lock and leaves its not-stored row reclaimable.
+//
+// This transaction takes only the files row lock. Reference-creating
+// transactions take their chat row and owner advisory locks before the same
+// shared files-row lock, and the eraser takes no lock after its exclusive files
+// row lock, so this assembly hold adds no cycle to the existing ordering.
+func (s *Store) CompleteFileAssembly(ctx context.Context, fileID int64, put func() error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin file assembly: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	qtx := s.q.WithTx(tx)
+	if err := lockFileRefs(ctx, qtx, fileID); err != nil {
+		return err
+	}
+	if err := put(); err != nil {
+		return err
+	}
+
+	n, err := qtx.MarkFileStored(ctx, fileID)
+	if err != nil {
+		return fmt.Errorf("mark file stored: %w", err)
+	}
+	if n == 0 {
+		return ErrFileNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit file assembly: %w", err)
+	}
+	return nil
+}
+
 // FileForDownload resolves a download request to a file the caller is entitled
 // to read. Every rejection is ErrFileNotFound.
 func (s *Store) FileForDownload(ctx context.Context, fileID, accessHash, callerID int64) (File, error) {
@@ -171,7 +209,9 @@ func (s *Store) FileForDownload(ctx context.Context, fileID, accessHash, callerI
 // takes: the chats row lock and the per-owner advisory locks are both already
 // held by the time any caller gets here, and none of them is ever taken after.
 // A transaction holding a files row therefore waits for nothing else in this
-// server, which is what makes a cycle through it impossible. Within the class
+// server, which is what makes a cycle through it impossible. Assembly takes
+// this same shared lock after AllocateFile's advisory-lock transaction has
+// committed and takes nothing else while the blob Put runs. Within the class
 // the ids are taken ascending, so a caller naming several files cannot hold one
 // and wait for another a second caller holds the other way round — the same
 // rule lockOwners follows, and the one an eraser has to follow too.

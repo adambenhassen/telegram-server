@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -133,6 +135,65 @@ func TestMarkFileStoredIsOnce(t *testing.T) {
 	}
 	if err := s.MarkFileStored(ctx, f.ID+(1<<40)); !errors.Is(err, store.ErrFileNotFound) {
 		t.Fatalf("absent id: want ErrFileNotFound, got %v", err)
+	}
+}
+
+// The eraser's exclusive row lock can win the race before assembly starts its
+// shared hold. Assembly must wait for that decision rather than writing bytes
+// first and discovering after the fact that the row was removed. Releasing the
+// controlled eraser hold without deleting models the conditional delete's
+// retained outcome; once the row is available, the upload must complete.
+func TestCompleteFileAssemblySurvivesEraserRowLockFirst(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15559100025")
+	f := allocate(t, s, u.ID, 11)
+
+	hold, err := store.HoldFileRow(ctx, s, f.ID)
+	if err != nil {
+		t.Fatalf("hold file row: %v", err)
+	}
+	defer hold.Release()
+
+	const body = "assembled"
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- s.CompleteFileAssembly(ctx, f.ID, func() error {
+			close(started)
+			_, err := store.BlobsOf(s).Put(ctx, blob.Key(f.ID), bytes.NewReader([]byte(body)))
+			return err
+		})
+	}()
+
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		t.Fatalf("wait for assembly to block: %v", err)
+	}
+	select {
+	case <-started:
+		t.Fatal("assembly wrote bytes before acquiring the file row lock")
+	default:
+	}
+
+	hold.Release()
+	if err := <-done; err != nil {
+		t.Fatalf("complete assembly after eraser released the row: %v", err)
+	}
+
+	var stored bool
+	if err := store.StorePool(s).QueryRow(ctx, "SELECT stored FROM files WHERE id = $1", f.ID).Scan(&stored); err != nil {
+		t.Fatalf("read stored flag: %v", err)
+	}
+	if !stored {
+		t.Fatal("assembly returned successfully without marking the row stored")
+	}
+	got, err := store.BlobsOf(s).ReadAt(ctx, blob.Key(f.ID), 0, int64(len(body)))
+	if err != nil {
+		t.Fatalf("read assembled bytes: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("assembled bytes = %q, want %q", got, body)
 	}
 }
 

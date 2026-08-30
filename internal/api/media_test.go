@@ -6,7 +6,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,6 +92,53 @@ func newBlobs(t *testing.T) blob.Store {
 		t.Fatalf("blob store: %v", err)
 	}
 	return b
+}
+
+type blockingAssembledPut struct {
+	blob.Store
+
+	key         string
+	started     chan struct{}
+	release     chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (b *blockingAssembledPut) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
+	if strings.HasPrefix(key, blob.PartsPrefix) {
+		return b.Store.Put(ctx, key, r)
+	}
+	b.key = key
+	return b.Store.Put(ctx, key, &blockingReader{
+		Reader:  r,
+		ctx:     ctx,
+		started: b.started,
+		release: b.release,
+		once:    &b.startOnce,
+	})
+}
+
+func (b *blockingAssembledPut) unblock() {
+	b.releaseOnce.Do(func() { close(b.release) })
+}
+
+type blockingReader struct {
+	io.Reader
+
+	ctx     context.Context
+	started chan<- struct{}
+	release <-chan struct{}
+	once    *sync.Once
+}
+
+func (r *blockingReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	select {
+	case <-r.release:
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	}
+	return r.Reader.Read(p)
 }
 
 // messageOf returns the message the first updateNewMessage in enc carries,
@@ -870,5 +919,100 @@ func TestSendMediaResendOfDeletedOriginalIsIndistinguishable(t *testing.T) {
 	}
 	if kept != nil || erased != nil {
 		t.Errorf("a refused resend returned a payload: present -> %#v, erased -> %#v", kept, erased)
+	}
+}
+
+// A live assembled Put may outlive an intentionally tiny temporary cutoff.
+// Its file-row shared hold must make the blob sweep skip the temporary rather
+// than unlinking the open path out from under Local.Put.
+func TestAssembledPutSurvivesSmallTempCutoff(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	plain := newBlobs(t)
+	blobs := &blockingAssembledPut{
+		Store:   plain,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	defer blobs.unblock()
+
+	s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(blobs))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+
+	a, err := s.CreateUser(ctx, "+15551296301")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551296302")
+	if err != nil {
+		t.Fatalf("create recipient: %v", err)
+	}
+	const clientFileID = 7730
+	const body = "a live assembled upload"
+	if _, err := api.SaveFilePartBlobsForTest(s, blobs, a.ID, &tg.UploadSaveFilePartRequest{
+		FileID: clientFileID, FilePart: 0, Bytes: []byte(body),
+	}); err != nil {
+		t.Fatalf("save part: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := api.SendMediaForTest(s, a.ID, blobs, api.TestMaxUserStorageBytes,
+			&tg.MessagesSendMediaRequest{
+				Peer:     api.InputPeerUser(a.ID, b.ID),
+				Media:    uploadedDocument(clientFileID, 1, "live.txt", "text/plain"),
+				Message:  "live",
+				RandomID: clientFileID,
+			})
+		done <- err
+	}()
+
+	<-blobs.started
+	local, ok := plain.(*blob.Local)
+	if !ok {
+		t.Fatalf("blob backend = %T, want *blob.Local", plain)
+	}
+	tempPath := filepath.Join(local.RootDir(), filepath.FromSlash(blobs.key+blob.TempSuffix))
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(tempPath, old, old); err != nil {
+		t.Fatalf("age live temporary: %v", err)
+	}
+
+	mediaCounts, err := s.SweepMediaErasure(ctx, time.Now().Add(time.Hour), store.ErasureScanBatch)
+	if err != nil {
+		t.Fatalf("media sweep: %v", err)
+	}
+	if mediaCounts.UnassembledConsidered != 1 || mediaCounts.UnassembledContended != 1 || mediaCounts.UnassembledErased != 0 {
+		t.Fatalf("media sweep counts = %+v, want one contended unassembled row and no erase", mediaCounts)
+	}
+
+	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("blob sweep: %v", err)
+	}
+	if counts.TempConsidered != 1 || counts.TempContended != 1 || counts.TempUnlinkAttempts != 0 {
+		t.Fatalf("temp sweep counts = %+v, want one contended candidate and no unlink", counts)
+	}
+	if _, err := os.Stat(tempPath); err != nil {
+		t.Fatalf("live temporary after sweep: %v", err)
+	}
+
+	blobs.unblock()
+	if err := <-done; err != nil {
+		t.Fatalf("send after small-cutoff sweep: %v", err)
+	}
+	got, err := blobs.ReadAt(ctx, blobs.key, 0, int64(len(body)))
+	if err != nil {
+		t.Fatalf("read assembled bytes: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("assembled bytes = %q, want %q", got, body)
 	}
 }

@@ -2,11 +2,16 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
 // BlobErasureGateBatch bounds the ids held between a prefix walk and the
@@ -49,10 +54,10 @@ func (r *BlobErasureReport) addUnexplained(e blob.Entry) {
 // BlobEraseCounts is what one destructive assembled-blob pass did. The unlink
 // attempt counts are scoped to this worker: Remove is idempotent, so concurrent
 // passes may both report an attempt even though only one physically removes an
-// object. Temporary files and id-based orphans are separate because the former
-// are reclaimed by mtime alone while the latter require the files-row absence
-// transaction. Unexplained paths and fresh temporary files are retained and
-// reported.
+// object. Temporary files and id-based orphans are separate because temporary
+// files require an age gate followed by the files-row interlock, while orphans
+// require the files-row absence transaction. Unexplained paths, fresh
+// temporary files and contended rows are retained and reported.
 type BlobEraseCounts struct {
 	Through int64
 
@@ -66,6 +71,8 @@ type BlobEraseCounts struct {
 	TempUnlinkAttempts       int
 	TempUnlinkAttemptedBytes int64
 	TempInFlight             int
+	TempContended            int
+	TempRetained             int
 	TempUnlinkFailed         int
 
 	AboveSnapshot    int
@@ -101,9 +108,10 @@ func walkAssembledBlobPrefixes(ctx context.Context, blobs blob.Store, fn func(bl
 	return nil
 }
 
-// walkBlobTemps is deliberately a pass of its own. A temporary path is an
-// in-progress write and is judged by mtime alone; it must never be folded into
-// the id-based row-absence pass.
+// walkBlobTemps is deliberately a pass of its own. Mtime is only the age gate
+// that names a temporary candidate; the destructive callback must apply the
+// files-row interlock before deciding whether the path is reclaimable. A
+// temporary is never folded into the id-based assembled-blob pass.
 func walkBlobTemps(ctx context.Context, blobs blob.Store, through int64, olderThan time.Time, onCandidate func(blobErasureCandidate) error, addUnexplained func(blob.Entry), addAbove func(), addInFlight func()) error {
 	return walkAssembledBlobPrefixes(ctx, blobs, func(e blob.Entry) error {
 		if !e.Regular || !strings.HasSuffix(e.Key, blob.TempSuffix) {
@@ -226,11 +234,22 @@ func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (
 	if err := walkBlobTemps(ctx, s.blobs, through, tempOlderThan,
 		func(c blobErasureCandidate) error {
 			counts.TempConsidered++
-			if err := s.blobs.Remove(ctx, c.key); err != nil {
-				counts.TempUnlinkFailed++
-				if firstErr == nil {
-					firstErr = fmt.Errorf("blob erasure sweep: unlink temporary %q: %w", c.key, err)
+			removed, contended, unlinkFailed, err := s.reclaimTempBlob(ctx, c, tempOlderThan)
+			if err != nil {
+				if unlinkFailed {
+					counts.TempUnlinkFailed++
 				}
+				if firstErr == nil {
+					firstErr = err
+				}
+				return nil
+			}
+			if contended {
+				counts.TempContended++
+				return nil
+			}
+			if !removed {
+				counts.TempRetained++
 				return nil
 			}
 			counts.TempUnlinkAttempts++
@@ -294,6 +313,63 @@ func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (
 		return counts, err
 	}
 	return counts, firstErr
+}
+
+// reclaimTempBlob applies the row interlock to an aged assembled temporary.
+// A live assembly holds the row FOR SHARE from before Put through the stored
+// transition's commit, so LockFileForErase skips it rather than waiting. If
+// the row is absent, the absence decision is committed before Remove; if the
+// row is present but not reclaimable, the transaction rolls back and the temp
+// stays for a later pass. Database failures are kept separate from unlink
+// failures for the worker-local counters.
+func (s *Store) reclaimTempBlob(ctx context.Context, c blobErasureCandidate, olderThan time.Time) (removed, contended, unlinkFailed bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, false, false, fmt.Errorf("blob erasure: check temporary %q: begin: %w", c.key, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	if _, err := qtx.LockFileForErase(ctx, c.id); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return false, false, false, fmt.Errorf("blob erasure: check temporary %q: lock: %w", c.key, err)
+		}
+		exists, err := qtx.FileExistsForBlob(ctx, c.id)
+		if err != nil {
+			return false, false, false, fmt.Errorf("blob erasure: check temporary %q: existence: %w", c.key, err)
+		}
+		if exists {
+			return false, true, false, nil
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, false, false, fmt.Errorf("blob erasure: check temporary %q: commit absence: %w", c.key, err)
+		}
+		if err := s.blobs.Remove(ctx, c.key); err != nil {
+			return false, false, true, fmt.Errorf("blob erasure: unlink temporary %q: %w", c.key, err)
+		}
+		return true, false, false, nil
+	}
+
+	if _, err := qtx.ClearDeletedChannelFileRefs(ctx, &c.id); err != nil {
+		return false, false, false, fmt.Errorf("blob erasure: check temporary %q: clear channel refs: %w", c.key, err)
+	}
+	n, err := qtx.DeleteUnassembledFile(ctx, db.DeleteUnassembledFileParams{
+		ID:        c.id,
+		OlderThan: pgtype.Timestamptz{Time: olderThan, Valid: true},
+	})
+	if err != nil {
+		return false, false, false, fmt.Errorf("blob erasure: check temporary %q: delete row: %w", c.key, err)
+	}
+	if n == 0 {
+		return false, false, false, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, false, false, fmt.Errorf("blob erasure: check temporary %q: commit row: %w", c.key, err)
+	}
+	if err := s.blobs.Remove(ctx, c.key); err != nil {
+		return false, false, true, fmt.Errorf("blob erasure: unlink temporary %q: %w", c.key, err)
+	}
+	return true, false, false, nil
 }
 
 // reclaimOrphanBlob performs the final no-row check in a transaction, commits

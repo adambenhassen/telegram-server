@@ -1152,10 +1152,9 @@ func TestLoadMediaErasureSweep(t *testing.T) {
 	}
 }
 
-// The age cutoff a destructive pass runs against defaults to no less than 24
-// hours. It is not a tuned number and cannot be one until a per-RPC deadline
-// exists; this pins the floor so a later reader shortening it has to argue with
-// a test rather than with a comment.
+// The not-stored age cutoff defaults to a 24-hour floor while MAIN-338 remains
+// open. The row interlock makes a live assembly safe even below that value; the
+// floor is a deliberate crash-retention default, not the safety control.
 func TestMediaErasureMinAgeDefaultsToAtLeastADay(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
