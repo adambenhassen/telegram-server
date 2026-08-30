@@ -88,13 +88,9 @@ func (s *Store) CreateChat(ctx context.Context, creatorID int64, title string, m
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
-	// There is no chats row lock here: the chat does not exist yet. The same
-	// sorted owner locks used by BlockUser are the serialization point for the
-	// directed block check below. They are taken before any participant row is
-	// written, so a block that committed before this pass cannot be missed.
-	if err := lockOwners(ctx, tx, members...); err != nil {
-		return Chat{}, err
-	}
+	// There is no chats row lock here: the chat does not exist yet. The block
+	// check runs in this transaction before any participant row is written, so a
+	// block committed before this check cannot be missed.
 	filtered := members[:0]
 	for _, id := range members {
 		if id != creatorID {

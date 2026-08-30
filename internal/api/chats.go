@@ -66,7 +66,9 @@ func (h *handlers) resolveInvitees(ctx context.Context, users []tg.InputUserClas
 // addMissingCreatedChatInvitees reports valid invitees that the store filtered
 // before inserting the chat. The participant read is after CreateChat commits,
 // so the response reflects the durable membership set and keeps blocked users
-// out of both the chat and its success vector.
+// out of both the chat and its success vector. The existing MissingInvitee
+// shape intentionally remains: a creator with a previously resolved invitee
+// can infer a block from this result, which is an accepted create-time residual.
 func (h *handlers) addMissingCreatedChatInvitees(ctx context.Context, chatID int64, memberIDs []int64, missing []tg.MissingInvitee) ([]tg.MissingInvitee, error) {
 	participants, err := h.store.Participants(ctx, chatID)
 	if err != nil {

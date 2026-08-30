@@ -118,8 +118,10 @@ func TestBlockedAddDoesNotWriteAndUnblockAllowsIt(t *testing.T) {
 	}
 	wantParticipants := participantIDs(t, s, chat.ID)
 	wantVersion := chatVersion(t, s, chat.ID)
-	wantPts := ptsOf(t, s, caller.ID)
-	wantEvents := len(eventsOf(t, s, caller.ID, 0))
+	wantCallerPts := ptsOf(t, s, caller.ID)
+	wantCallerEvents := len(eventsOf(t, s, caller.ID, 0))
+	wantTargetPts := ptsOf(t, s, target.ID)
+	wantTargetEvents := len(eventsOf(t, s, target.ID, 0))
 
 	added, sender, perOwner, err := s.AddChatUser(ctx, chat.ID, target.ID, caller.ID)
 	if !errors.Is(err, store.ErrNotMember) {
@@ -134,11 +136,17 @@ func TestBlockedAddDoesNotWriteAndUnblockAllowsIt(t *testing.T) {
 	if got := chatVersion(t, s, chat.ID); got != wantVersion {
 		t.Errorf("version after blocked add = %d, want %d", got, wantVersion)
 	}
-	if got := ptsOf(t, s, caller.ID); got != wantPts {
-		t.Errorf("caller pts after blocked add = %d, want %d", got, wantPts)
+	if got := ptsOf(t, s, caller.ID); got != wantCallerPts {
+		t.Errorf("caller pts after blocked add = %d, want %d", got, wantCallerPts)
 	}
-	if got := len(eventsOf(t, s, caller.ID, 0)); got != wantEvents {
-		t.Errorf("caller events after blocked add = %d, want %d", got, wantEvents)
+	if got := len(eventsOf(t, s, caller.ID, 0)); got != wantCallerEvents {
+		t.Errorf("caller events after blocked add = %d, want %d", got, wantCallerEvents)
+	}
+	if got := ptsOf(t, s, target.ID); got != wantTargetPts {
+		t.Errorf("target pts after blocked add = %d, want %d", got, wantTargetPts)
+	}
+	if got := len(eventsOf(t, s, target.ID, 0)); got != wantTargetEvents {
+		t.Errorf("target events after blocked add = %d, want %d", got, wantTargetEvents)
 	}
 
 	changed, err := s.UnblockUser(ctx, target.ID, caller.ID)
@@ -239,5 +247,28 @@ func TestCreateChatSkipsBlockedInvitee(t *testing.T) {
 	want := []int64{creator.ID, member.ID}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("participants = %v, want %v", got, want)
+	}
+}
+
+func TestCreateChatDoesNotTakeOwnerLock(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551500411")
+	invitee := mustUser(t, s, "+15551500412")
+
+	release, err := store.HoldOwnerLock(ctx, s, invitee.ID)
+	if err != nil {
+		t.Fatalf("hold invitee owner lock: %v", err)
+	}
+	defer release()
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	chat, err := s.CreateChat(callCtx, creator.ID, "No owner lock", []int64{invitee.ID})
+	if err != nil {
+		t.Fatalf("create chat under held owner lock: %v", err)
+	}
+	if got := participantIDs(t, s, chat.ID); !reflect.DeepEqual(got, []int64{creator.ID, invitee.ID}) {
+		t.Fatalf("participants = %v, want creator and invitee", got)
 	}
 }

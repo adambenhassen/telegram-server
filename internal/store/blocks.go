@@ -87,10 +87,9 @@ func (s *Store) UnblockUser(ctx context.Context, blockerID, blockedID int64) (ch
 	return n > 0, nil
 }
 
-// IsBlocked reports whether blockerID has blocked blockedID. It is also used
-// inside the chat membership transaction, where the query runs through that
-// transaction's db.Queries value so the check shares its lock ordering and
-// snapshot.
+// IsBlocked reports whether blockerID has blocked blockedID for callers that
+// need a direct store read. Membership enforcement uses the transaction-scoped
+// db.Queries.IsBlocked query directly.
 func (s *Store) IsBlocked(ctx context.Context, blockerID, blockedID int64) (bool, error) {
 	blocked, err := s.q.IsBlocked(ctx, db.IsBlockedParams{
 		BlockerID: blockerID,
