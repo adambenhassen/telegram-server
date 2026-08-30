@@ -14,19 +14,13 @@ import (
 func TestAssemblyConcurrencyLeavesPoolHeadroom(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	dsn := pgtest.DSN(t) + "&pool_max_conns=4"
-	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	s := openAssemblyStore(t, 4)
 	if got := s.AssemblyConcurrencyLimit(); got != 1 {
-		t.Fatalf("assembly concurrency limit = %d, want 1 from pool_max_conns=4 and headroom=%d", got, store.AssemblyConnectionHeadroom)
+		t.Fatalf("assembly concurrency limit = %d, want 1 from pool_max_conns=4", got)
 	}
-	t.Cleanup(func() {
-		if err := s.Close(); err != nil {
-			t.Errorf("close: %v", err)
-		}
-	})
+	if got := int(store.StorePool(s).Config().MaxConns) - s.AssemblyConcurrencyLimit(); got != 3 {
+		t.Fatalf("assembly pool headroom = %d, want 3 from pool_max_conns=4", got)
+	}
 
 	assemblyUser, err := s.CreateUser(ctx, "+15559100301")
 	if err != nil {
@@ -160,15 +154,52 @@ func TestAssemblyConcurrencyLeavesPoolHeadroom(t *testing.T) {
 	}
 }
 
+func TestAssemblyConcurrencyScalesWithPool(t *testing.T) {
+	t.Parallel()
+	small := openAssemblyStore(t, 4)
+	large := openAssemblyStore(t, 100)
+
+	largeMax := int(store.StorePool(large).Config().MaxConns)
+	smallLimit := small.AssemblyConcurrencyLimit()
+	largeLimit := large.AssemblyConcurrencyLimit()
+	if largeLimit <= smallLimit {
+		t.Fatalf("large-pool assembly limit = %d, small-pool limit = %d, want the cap to scale with MaxConns", largeLimit, smallLimit)
+	}
+	if largeLimit*2 > largeMax {
+		t.Fatalf("large-pool assembly limit = %d of %d connections, want at most half reserved for assemblies", largeLimit, largeMax)
+	}
+	if largeMax-largeLimit < largeMax/2 {
+		t.Fatalf("large-pool request headroom = %d of %d connections, want at least half", largeMax-largeLimit, largeMax)
+	}
+	if got := large.AssemblyPoolHeadroom(); got != largeMax-largeLimit {
+		t.Fatalf("reported large-pool headroom = %d, want %d", got, largeMax-largeLimit)
+	}
+}
+
 func TestOpenRefusesPoolWithoutAssemblyHeadroom(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	dsn := pgtest.DSN(t) + fmt.Sprintf("&pool_max_conns=%d", store.AssemblyConnectionHeadroom)
+	dsn := pgtest.DSN(t) + "&pool_max_conns=1"
 	_, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
 	if err == nil {
 		t.Fatal("Open succeeded without the reserved assembly headroom")
 	}
-	if got := err.Error(); got != "store: pool max connections 3 must exceed assembly headroom 3" {
+	if got := err.Error(); got != "store: pool max connections 1 must leave one connection for non-assembly work" {
 		t.Fatalf("Open error = %q, want explicit headroom failure", got)
 	}
+}
+
+func openAssemblyStore(t *testing.T, maxConns int) *store.Store {
+	t.Helper()
+	dsn := pgtest.DSN(t) + fmt.Sprintf("&pool_max_conns=%d", maxConns)
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatalf("open with pool_max_conns=%d: %v", maxConns, err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	return s
 }

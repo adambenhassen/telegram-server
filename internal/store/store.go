@@ -88,9 +88,10 @@ type Store struct {
 
 	// assemblySlots bounds the number of connections an in-flight assembled
 	// upload may pin. Open sizes it from the pool's configured maximum after
-	// reserving AssemblyConnectionHeadroom for ordinary request paths.
-	assemblySlots chan struct{}
-	assemblyLimit int
+	// reserving the non-assembly share of the pool for ordinary request paths.
+	assemblySlots    chan struct{}
+	assemblyLimit    int
+	assemblyHeadroom int
 }
 
 // Sentinel errors returned by the login-code methods.
@@ -128,10 +129,9 @@ var (
 // Option configures a Store at Open time.
 type Option func(*Store)
 
-// AssemblyConnectionHeadroom is the number of pool connections reserved for
-// ordinary request paths while assembled uploads hold their session claims.
-// The reservation covers a send, a download, and an auth call concurrently.
-const AssemblyConnectionHeadroom = 3
+// assemblyPoolShareDivisor keeps in-flight assemblies to at most one quarter
+// of the configured pool, with the one-slot floor applied at small pool sizes.
+const assemblyPoolShareDivisor = 4
 
 // WithStatementTimeout sets the Postgres statement_timeout every connection in
 // the pool runs under: a single SQL statement that runs longer is cancelled by
@@ -198,11 +198,12 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	assemblyLimit := int(poolCfg.MaxConns) - AssemblyConnectionHeadroom
-	if assemblyLimit < 1 {
-		return nil, fmt.Errorf("store: pool max connections %d must exceed assembly headroom %d", poolCfg.MaxConns, AssemblyConnectionHeadroom)
+	if poolCfg.MaxConns < 2 {
+		return nil, fmt.Errorf("store: pool max connections %d must leave one connection for non-assembly work", poolCfg.MaxConns)
 	}
+	assemblyLimit := max(1, int(poolCfg.MaxConns)/assemblyPoolShareDivisor)
 	s.assemblyLimit = assemblyLimit
+	s.assemblyHeadroom = int(poolCfg.MaxConns) - assemblyLimit
 	s.assemblySlots = make(chan struct{}, assemblyLimit)
 	// Session default rather than SET per statement: one line at connect, and
 	// every query on the connection carries the ceiling with no per-call cost.
@@ -262,6 +263,10 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 // AssemblyConcurrencyLimit returns the startup-derived cap on in-flight
 // assembled uploads. It is surfaced for the command's startup diagnostic.
 func (s *Store) AssemblyConcurrencyLimit() int { return s.assemblyLimit }
+
+// AssemblyPoolHeadroom returns the number of pool connections left for ordinary
+// request paths while every assembly slot is occupied.
+func (s *Store) AssemblyPoolHeadroom() int { return s.assemblyHeadroom }
 
 // queryRower is the one method of pgxpool.Pool and pgx.Conn checkSchema needs.
 type queryRower interface {
