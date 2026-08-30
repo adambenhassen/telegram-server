@@ -223,8 +223,10 @@ func (s *Store) BlobErasureSummary(ctx context.Context, tempOlderThan time.Time)
 
 // SweepBlobErasure reclaims assembled blobs whose ids are at or below a
 // sequence snapshot and have no files row, plus temporary files old enough to
-// be abandoned. It never enumerates the parts prefix.
-func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (BlobEraseCounts, error) {
+// be abandoned. tempOlderThan gates temporary-file mtime; unassembledOlderThan
+// is the independent files-row age cutoff. It never enumerates the parts
+// prefix.
+func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan, unassembledOlderThan time.Time) (BlobEraseCounts, error) {
 	through, err := s.AllocatedFileIDCeiling(ctx)
 	if err != nil {
 		return BlobEraseCounts{}, fmt.Errorf("blob erasure sweep: ceiling: %w", err)
@@ -234,7 +236,7 @@ func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (
 	if err := walkBlobTemps(ctx, s.blobs, through, tempOlderThan,
 		func(c blobErasureCandidate) error {
 			counts.TempConsidered++
-			removed, contended, unlinkFailed, err := s.reclaimTempBlob(ctx, c, tempOlderThan)
+			removed, contended, unlinkFailed, err := s.reclaimTempBlob(ctx, c, unassembledOlderThan)
 			if err != nil {
 				if unlinkFailed {
 					counts.TempUnlinkFailed++
@@ -322,9 +324,10 @@ func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (
 // gets the row first, the nonblocking claim try retains it. If the row is
 // absent, the absence decision is committed before Remove; if the row is
 // present but not reclaimable, the transaction rolls back and the temp stays
-// for a later pass. Database failures are kept separate from unlink failures
-// for the worker-local counters.
-func (s *Store) reclaimTempBlob(ctx context.Context, c blobErasureCandidate, olderThan time.Time) (removed, contended, unlinkFailed bool, err error) {
+// for a later pass. unassembledOlderThan is intentionally separate from the
+// mtime cutoff that found the candidate. Database failures are kept separate
+// from unlink failures for the worker-local counters.
+func (s *Store) reclaimTempBlob(ctx context.Context, c blobErasureCandidate, unassembledOlderThan time.Time) (removed, contended, unlinkFailed bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, false, false, fmt.Errorf("blob erasure: check temporary %q: begin: %w", c.key, err)
@@ -368,7 +371,7 @@ func (s *Store) reclaimTempBlob(ctx context.Context, c blobErasureCandidate, old
 	}
 	n, err := qtx.DeleteUnassembledFile(ctx, db.DeleteUnassembledFileParams{
 		ID:        c.id,
-		OlderThan: pgtype.Timestamptz{Time: olderThan, Valid: true},
+		OlderThan: pgtype.Timestamptz{Time: unassembledOlderThan, Valid: true},
 	})
 	if err != nil {
 		return false, false, false, fmt.Errorf("blob erasure: check temporary %q: delete row: %w", c.key, err)

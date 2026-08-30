@@ -195,7 +195,8 @@ func TestBlobErasureSweepReclaimsOwnedClassesAndLeavesParts(t *testing.T) {
 			t.Errorf("restore blob backend: %v", err)
 		}
 	}()
-	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Hour))
+	cutoff := time.Now().Add(-time.Hour)
+	counts, err := s.SweepBlobErasure(ctx, cutoff, cutoff)
 	if err != nil {
 		t.Fatalf("blob erasure sweep: %v", err)
 	}
@@ -269,7 +270,8 @@ func TestBlobErasureSweepLeavesBlobWrittenAfterSnapshot(t *testing.T) {
 		}
 	}()
 
-	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Hour))
+	cutoff := time.Now().Add(-time.Hour)
+	counts, err := s.SweepBlobErasure(ctx, cutoff, cutoff)
 	if err != nil {
 		t.Fatalf("blob erasure sweep: %v", err)
 	}
@@ -319,7 +321,8 @@ func TestBlobErasureSweepReclaimsInterruptedMediaUnlink(t *testing.T) {
 		t.Fatalf("restore blob backend: %v", err)
 	}
 
-	blobCounts, err := s.SweepBlobErasure(context.Background(), time.Now().Add(-time.Hour))
+	cutoff := time.Now().Add(-time.Hour)
+	blobCounts, err := s.SweepBlobErasure(context.Background(), cutoff, cutoff)
 	if err != nil {
 		t.Fatalf("blob erasure sweep: %v", err)
 	}
@@ -357,7 +360,8 @@ func TestBlobErasureSweepDoesNotCountDatabaseFailureAsUnlinkFailure(t *testing.T
 		}
 	}()
 
-	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Hour))
+	cutoff := time.Now().Add(-time.Hour)
+	counts, err := s.SweepBlobErasure(ctx, cutoff, cutoff)
 	if err == nil {
 		t.Fatal("sweep reported no database error after cancellation")
 	}
@@ -397,7 +401,8 @@ func TestBlobErasureSweepCommitsNoRowDecisionBeforeRemove(t *testing.T) {
 		}
 	}()
 
-	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Hour))
+	cutoff := time.Now().Add(-time.Hour)
+	counts, err := s.SweepBlobErasure(ctx, cutoff, cutoff)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -440,7 +445,8 @@ func TestBlobErasureSweepConcurrentPassesRemoveEachBlobOnce(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 2 {
 		wg.Go(func() {
-			counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Hour))
+			cutoff := time.Now().Add(-time.Hour)
+			counts, err := s.SweepBlobErasure(ctx, cutoff, cutoff)
 			results <- result{counts: counts, err: err}
 		})
 	}

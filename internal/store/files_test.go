@@ -180,7 +180,8 @@ func TestAllocateAndCompleteFileSurvivesEraserRowLockFirst(t *testing.T) {
 		t.Fatalf("plant temporary: %v", err)
 	}
 
-	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(time.Hour))
+	cutoff := time.Now().Add(time.Hour)
+	counts, err := s.SweepBlobErasure(ctx, cutoff, cutoff)
 	if err != nil {
 		t.Fatalf("blob sweep: %v", err)
 	}
@@ -201,6 +202,79 @@ func TestAllocateAndCompleteFileSurvivesEraserRowLockFirst(t *testing.T) {
 	}
 	if result.file.ID != fileID || !result.file.Stored {
 		t.Fatalf("completed file = %+v, want id %d stored", result.file, fileID)
+	}
+	got, err := store.BlobsOf(s).ReadAt(ctx, blob.Key(fileID), 0, int64(len(body)))
+	if err != nil {
+		t.Fatalf("read assembled bytes: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("assembled bytes = %q, want %q", got, body)
+	}
+}
+
+// Media erasure can take the files row before assembly takes its shared hold.
+// The session claim still makes that ordering safe: the eraser's try-lock must
+// commit a no-op and let the assembly complete.
+func TestMediaErasureSkipsClaimedAssembly(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15559100026")
+
+	const body = "assembled after media eraser"
+	claimed := make(chan int64)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAssembly := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAssembly()
+	store.SetAssemblyClaimHook(s, func(fileID int64) {
+		claimed <- fileID
+		<-release
+	})
+	defer store.SetAssemblyClaimHook(s, nil)
+
+	type assemblyResult struct {
+		file store.File
+		err  error
+	}
+	done := make(chan assemblyResult, 1)
+	go func() {
+		file, err := s.AllocateAndCompleteFile(ctx, u.ID, int64(len(body)), "text/plain", "hello.txt", bigQuota, func(file store.File) error {
+			_, err := store.BlobsOf(s).Put(ctx, blob.Key(file.ID), bytes.NewReader([]byte(body)))
+			return err
+		})
+		done <- assemblyResult{file: file, err: err}
+	}()
+
+	var fileID int64
+	select {
+	case fileID = <-claimed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("assembly did not reach its held claim")
+	}
+
+	counts, err := s.SweepMediaErasure(ctx, time.Now().Add(time.Hour), store.ErasureScanBatch)
+	if err != nil {
+		t.Fatalf("media erasure sweep: %v", err)
+	}
+	if counts.UnassembledConsidered != 1 || counts.UnassembledContended != 1 || counts.UnassembledErased != 0 {
+		t.Fatalf("media erasure counts = %+v, want one claim-contended row and no erase", counts)
+	}
+	if !rowPresent(t, s, fileID) {
+		t.Fatalf("media erasure removed claimed file row %d", fileID)
+	}
+
+	releaseAssembly()
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("assembly after media erasure: %v", result.err)
+		}
+		if result.file.ID != fileID || !result.file.Stored {
+			t.Fatalf("completed file = %+v, want id %d stored", result.file, fileID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("assembly did not complete after media erasure released the claim hook")
 	}
 	got, err := store.BlobsOf(s).ReadAt(ctx, blob.Key(fileID), 0, int64(len(body)))
 	if err != nil {

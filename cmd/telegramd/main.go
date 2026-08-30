@@ -599,7 +599,9 @@ func sweepMediaErasurePass(ctx context.Context, st *store.Store, cfg config.Conf
 	}
 
 	c, err := st.SweepMediaErasure(ctx, olderThan, store.ErasureScanBatch)
-	b, blobErr := st.SweepBlobErasure(ctx, tempOlderThan)
+	// The blob sweep uses tempOlderThan only for temporary mtime; its row
+	// deletion receives the media cutoff independently.
+	b, blobErr := st.SweepBlobErasure(ctx, tempOlderThan, olderThan)
 	// Logged before the error is handled rather than after: a sweep that
 	// failed part way through has still committed everything it erased, and
 	// the operator-facing question after a failure is how much went.

@@ -993,7 +993,8 @@ func TestAssembledPutSurvivesSmallTempCutoff(t *testing.T) {
 		t.Fatalf("media sweep counts = %+v, want one contended unassembled row and no erase", mediaCounts)
 	}
 
-	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Minute))
+	cutoff := time.Now().Add(-time.Minute)
+	counts, err := s.SweepBlobErasure(ctx, cutoff, cutoff)
 	if err != nil {
 		t.Fatalf("blob sweep: %v", err)
 	}
