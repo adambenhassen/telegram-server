@@ -764,6 +764,134 @@ func TestS3WalkPrefixPagesAndConfinesEntries(t *testing.T) {
 	}
 }
 
+func TestS3CheckVerifiesConfiguredBucket(t *testing.T) {
+	t.Parallel()
+	var method string
+	var query url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		query = r.URL.Query()
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, `<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`); err != nil {
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+	store, err := blob.NewS3(blob.S3Config{
+		Endpoint:          server.URL,
+		Bucket:            "test-bucket",
+		Prefix:            "tenant/",
+		AccessKeyID:       "access",
+		SecretAccessKey:   "secret",
+		AllowInsecureHTTP: true,
+		MaxAttempts:       1,
+	})
+	if err != nil {
+		t.Fatalf("new S3 store: %v", err)
+	}
+	if err := store.Check(context.Background()); err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if method != http.MethodGet {
+		t.Fatalf("check method = %q, want GET", method)
+	}
+	if query.Get("list-type") != "2" || query.Get("prefix") != "tenant/" || query.Get("max-keys") != "1" {
+		t.Fatalf("check query = %v, want list-type=2 prefix=tenant/ max-keys=1", query)
+	}
+}
+
+func TestS3CheckRejectsNonS3SuccessResponse(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, "healthy"); err != nil {
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+	store, err := blob.NewS3(blob.S3Config{
+		Endpoint:          server.URL,
+		Bucket:            "test-bucket",
+		Prefix:            "tenant/",
+		AccessKeyID:       "access",
+		SecretAccessKey:   "secret",
+		AllowInsecureHTTP: true,
+		MaxAttempts:       1,
+	})
+	if err != nil {
+		t.Fatalf("new S3 store: %v", err)
+	}
+	if err := store.Check(context.Background()); err == nil {
+		t.Fatal("check accepted a successful non-S3 response")
+	}
+}
+
+func TestS3CheckHidesEndpointFailureDetails(t *testing.T) {
+	t.Parallel()
+	const secret = "secret-value"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusForbidden)
+		if _, err := io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>secret-value</Message></Error>`); err != nil {
+			return
+		}
+	}))
+	endpoint := server.URL
+	t.Cleanup(server.Close)
+	store, err := blob.NewS3(blob.S3Config{
+		Endpoint:          endpoint,
+		Bucket:            "test-bucket",
+		Prefix:            "tenant/",
+		AccessKeyID:       "access",
+		SecretAccessKey:   secret,
+		AllowInsecureHTTP: true,
+		MaxAttempts:       1,
+	})
+	if err != nil {
+		t.Fatalf("new S3 store: %v", err)
+	}
+	err = store.Check(context.Background())
+	if err == nil {
+		t.Fatal("check succeeded against a closed endpoint")
+	}
+	for _, forbidden := range []string{secret, "test-bucket", endpoint} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("check error %q contains %q", err, forbidden)
+		}
+	}
+}
+
+func TestS3WalkEnumeratesConfiguredNamespace(t *testing.T) {
+	t.Parallel()
+	server := newListingServer(t)
+	store, err := blob.NewS3(blob.S3Config{
+		Endpoint:          server.URL,
+		Bucket:            "test-bucket",
+		Prefix:            "tenant/",
+		AccessKeyID:       "access",
+		SecretAccessKey:   "secret",
+		AllowInsecureHTTP: true,
+		MaxAttempts:       1,
+	})
+	if err != nil {
+		t.Fatalf("new S3 store: %v", err)
+	}
+	var got []blob.Entry
+	if err := store.Walk(context.Background(), func(e blob.Entry) error {
+		got = append(got, e)
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(got) != 2 || got[0].Key != "parts/aaa" || got[1].Key != "parts/bbb" {
+		t.Fatalf("walk entries = %+v, want two ordered entries relative to tenant/", got)
+	}
+	if len(server.queries) != 2 || server.queries[0].Get("prefix") != "tenant/" {
+		t.Fatalf("walk queries = %v, want configured namespace", server.queries)
+	}
+}
+
 func TestS3WalkPrefixEmptyAndFileScope(t *testing.T) {
 	t.Parallel()
 	server := newListingServer(t)

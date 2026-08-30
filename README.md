@@ -118,12 +118,48 @@ The server refuses to start without a database and a master key:
 | `TG_LISTEN_ADDR` | `:2443` | Address the MTProto listener binds |
 | `TG_RSA_KEY_PATH` | `server_key.pem` | Server RSA private key; generated on first start |
 | `TG_BLOB_DIR` | `blobs` | Where uploaded file bodies are written |
+| `TG_BLOB_S3_ENDPOINT` | *(unset)* | Enables the S3-compatible blob backend; requires the other `TG_BLOB_S3_*` settings below |
+| `TG_BLOB_S3_BUCKET` | *(unset)* | Private bucket containing blobs |
+| `TG_BLOB_S3_PREFIX` | *(unset)* | Required non-root prefix assigned to this server |
+| `TG_BLOB_S3_REGION` | `us-east-1` | SigV4 signing region |
+| `TG_BLOB_S3_ACCESS_KEY_ID` | *(unset)* | Operations-only object-store access key |
+| `TG_BLOB_S3_SECRET_ACCESS_KEY` | *(unset)* | Raw secret accepted only for compose or CI secret injection; prefer the file form |
+| `TG_BLOB_S3_SECRET_ACCESS_KEY_FILE` | *(unset)* | Preferred file containing the object-store secret; the file is read at startup |
+| `TG_BLOB_S3_CA_PATH` | *(unset)* | PEM bundle for a private endpoint CA; TLS verification remains enabled |
+| `TG_BLOB_S3_ALLOW_INSECURE_HTTP` | `false` | Explicit loopback/compose-only plaintext opt-in; startup warns when enabled |
 | `TG_DC_ID` | `2` | DC id the server advertises |
 | `TG_BOOTSTRAP_USERNAME` | *(unset)* | Seed a username/password operator account at startup; requires exactly one of `TG_BOOTSTRAP_PASSWORD` or `TG_BOOTSTRAP_PASSWORD_FILE` |
 | `TG_BOOTSTRAP_PASSWORD_FILE` | *(unset)* | File (mode 0600) the bootstrap password is read from. Prefer it over `TG_BOOTSTRAP_PASSWORD`: an env value stays visible in `/proc/<pid>/environ`, orchestrator inspect output and crash dumps for the life of the process |
 | `TG_REGISTRATION` | `closed` | `open` allows `auth.signUp` to create accounts |
 | `TG_LOG_LOGIN_CODES` | `false` | Write phone-mode login codes to the log; with it off, phone-number sign-in cannot complete (username/password sign-in is unaffected) |
 | `TG_ADMIN_LISTEN_ADDR` | *(unset)* | Enables the admin HTTP server; requires `TG_ADMIN_TOKEN_HASH` (SHA-256 hex of the operator token) |
+
+### Object-store backend
+
+With all `TG_BLOB_S3_*` variables unset, uploaded blobs use the local
+filesystem at `TG_BLOB_DIR`, exactly as before. Setting any object-store
+variable selects S3 mode and requires an endpoint, bucket, non-empty prefix,
+access key, and exactly one secret source. The server validates the S3 client
+and lists the configured namespace before it opens for service; a failed check
+stops startup and never falls back to local storage.
+
+Use `TG_BLOB_S3_SECRET_ACCESS_KEY_FILE` for the secret. The file should be
+readable by the server process and contain only the secret, optionally followed
+by a newline. The raw `TG_BLOB_S3_SECRET_ACCESS_KEY` form is accepted for
+compose or CI secret injection only; do not put it in a developer shell,
+checked-in environment file, command line, or ordinary process environment.
+
+The access key must be scoped to operations on this one bucket and this one
+prefix: list, get, put, and delete objects below the prefix only. Do not grant
+bucket-root, wildcard, ACL, or policy-management permissions. The server does
+not set object ACLs; keep the bucket private. Existing local blobs are not
+migrated when S3 mode is enabled.
+
+HTTPS certificate verification is always enabled. Set
+`TG_BLOB_S3_CA_PATH` only when the endpoint uses a private CA bundle. Plaintext
+HTTP is rejected unless `TG_BLOB_S3_ALLOW_INSECURE_HTTP=true` is explicitly
+set for a loopback or compose-only endpoint; startup logs a warning when this
+escape hatch is used. There is no TLS verification bypass setting.
 
 A minimal run against a local Postgres, seeding an operator account you can
 sign in to with username + password:

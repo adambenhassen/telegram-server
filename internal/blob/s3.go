@@ -50,9 +50,7 @@ var (
 	errS3MissingListPage = errors.New("object store listing stopped without a continuation token")
 )
 
-// S3Config describes an S3-compatible endpoint. This implementation is not
-// wired into server configuration; the follow-up selection ticket owns that
-// construction. Tests and future callers can construct it directly.
+// S3Config describes an S3-compatible endpoint.
 type S3Config struct {
 	Endpoint string
 	Bucket   string
@@ -93,8 +91,8 @@ type S3 struct {
 }
 
 // NewS3 validates cfg and constructs an S3-compatible blob store. It does not
-// contact the endpoint or create a bucket. Startup validation and backend
-// selection belong to the follow-up configuration ticket.
+// contact the endpoint or create a bucket. Call Check before serving requests
+// when startup must fail before the first blob operation.
 func NewS3(cfg S3Config) (*S3, error) {
 	endpoint, err := url.Parse(cfg.Endpoint)
 	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" || endpoint.User != nil ||
@@ -183,6 +181,28 @@ func NewS3(cfg S3Config) (*S3, error) {
 // OperationTimeout reports the configured bound for one S3 operation,
 // including its bounded retries.
 func (s *S3) OperationTimeout() time.Duration { return s.operationTimeout }
+
+// Check verifies that the configured credentials can list the configured
+// bucket namespace. It is intended for startup and performs no object writes.
+// The response body is drained without exposing endpoint or credential details
+// in the returned error.
+func (s *S3) Check(ctx context.Context) error {
+	query := encodeS3Query([]s3Query{
+		{key: "list-type", value: "2"},
+		{key: "prefix", value: s.prefix},
+		{key: "max-keys", value: "1"},
+	})
+	opCtx, cancel := context.WithTimeout(ctx, s.operationTimeout)
+	defer cancel()
+	truncated, next, err := s.listPage(opCtx, query, s.prefix, "", func(Entry) error { return nil })
+	if err != nil {
+		return s.operationError("check", err)
+	}
+	if truncated && next == "" {
+		return s.operationError("check", nil)
+	}
+	return nil
+}
 
 func loadS3Roots(path string) (*x509.CertPool, error) {
 	roots, err := x509.SystemCertPool()
@@ -477,6 +497,17 @@ func (s *S3) Remove(ctx context.Context, key string) (retErr error) {
 	return nil
 }
 
+// Walk enumerates every object in the configured namespace. Unlike
+// WalkPrefix, this is deliberately not part of blob.Store: it is the full-tree
+// view needed by the read-only classifier, while ordinary callers only receive
+// containment-scoped enumeration.
+func (s *S3) Walk(ctx context.Context, fn func(Entry) error) error {
+	if fn == nil {
+		return s.operationError("walk", errS3UnscopedPrefix)
+	}
+	return s.walkList(ctx, s.prefix, "", fn)
+}
+
 // WalkPrefix pages ListObjectsV2 results and invokes fn for each object without
 // retaining the bucket listing. A separator-free prefix gets the same
 // containment treatment as Local: an exact object at that name is a file and
@@ -510,6 +541,10 @@ func (s *S3) WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error
 		listPrefix = remotePrefix + "/"
 	}
 
+	return s.walkList(ctx, listPrefix, prefix, fn)
+}
+
+func (s *S3) walkList(ctx context.Context, listPrefix, localPrefix string, fn func(Entry) error) error {
 	var token string
 	for {
 		query := encodeS3Query([]s3Query{
@@ -519,7 +554,7 @@ func (s *S3) WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error
 			{key: "continuation-token", value: token},
 		})
 		pageCtx, pageCancel := context.WithTimeout(ctx, s.operationTimeout)
-		truncated, next, pageErr := s.listPage(pageCtx, query, listPrefix, prefix, fn)
+		truncated, next, pageErr := s.listPage(pageCtx, query, listPrefix, localPrefix, fn)
 		pageCancel()
 		if pageErr != nil {
 			return pageErr
@@ -600,6 +635,7 @@ func (s *S3) listPage(ctx context.Context, query, remotePrefix, localPrefix stri
 	decoder := xml.NewDecoder(io.LimitReader(resp.Body, s3MaxListBytes))
 	var count int
 	var page s3ListPage
+	var listingRoot bool
 	for {
 		token, tokenErr := decoder.Token()
 		if errors.Is(tokenErr, io.EOF) {
@@ -613,6 +649,8 @@ func (s *S3) listPage(ctx context.Context, query, remotePrefix, localPrefix stri
 			continue
 		}
 		switch start.Name.Local {
+		case "ListBucketResult":
+			listingRoot = true
 		case "IsTruncated":
 			if decodeErr := decoder.DecodeElement(&page.truncated, &start); decodeErr != nil {
 				return false, "", s.operationError("walk", decodeErr)
@@ -662,6 +700,9 @@ func (s *S3) listPage(ctx context.Context, query, remotePrefix, localPrefix stri
 				}
 			}
 		}
+	}
+	if !listingRoot {
+		return false, "", s.operationError("walk", errS3Operation)
 	}
 	return page.truncated, page.next, nil
 }

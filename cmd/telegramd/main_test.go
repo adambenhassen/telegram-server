@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +20,81 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 	"github.com/jackc/pgx/v5"
 )
+
+func TestNewBlobStoreDefaultsToLocal(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(t.TempDir(), "blobs")
+	got, err := newBlobStore(context.Background(), config.Config{BlobDir: root}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("new blob store: %v", err)
+	}
+	local, ok := got.(*blob.Local)
+	if !ok {
+		t.Fatalf("blob store type = %T, want *blob.Local", got)
+	}
+	if local.RootDir() != root {
+		t.Fatalf("local root = %q, want %q", local.RootDir(), root)
+	}
+}
+
+func TestNewBlobStoreChecksConfiguredS3AtStartup(t *testing.T) {
+	t.Parallel()
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Query().Get("list-type") != "2" {
+			t.Errorf("startup request = %s %s, want S3 bucket listing", r.Method, r.URL)
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, `<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	got, err := newBlobStore(context.Background(), config.Config{BlobS3: &blob.S3Config{
+		Endpoint:          server.URL,
+		Bucket:            "test-bucket",
+		Prefix:            "tenant/",
+		AccessKeyID:       "access",
+		SecretAccessKey:   "secret",
+		AllowInsecureHTTP: true,
+		MaxAttempts:       1,
+	}}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("new blob store: %v", err)
+	}
+	if _, ok := got.(*blob.S3); !ok {
+		t.Fatalf("blob store type = %T, want *blob.S3", got)
+	}
+	if requests != 1 {
+		t.Fatalf("startup requests = %d, want 1", requests)
+	}
+}
+
+func TestNewBlobStoreDoesNotFallBackWhenS3IsUnreachable(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	endpoint := server.URL
+	server.Close()
+	root := filepath.Join(t.TempDir(), "blobs")
+	_, err := newBlobStore(context.Background(), config.Config{BlobDir: root, BlobS3: &blob.S3Config{
+		Endpoint:          endpoint,
+		Bucket:            "test-bucket",
+		Prefix:            "tenant/",
+		AccessKeyID:       "access",
+		SecretAccessKey:   "secret",
+		AllowInsecureHTTP: true,
+		MaxAttempts:       1,
+		OperationTimeout:  100 * time.Millisecond,
+	}}, slog.New(slog.DiscardHandler))
+	if err == nil || !strings.Contains(err.Error(), "startup") {
+		t.Fatalf("new blob store error = %v, want startup failure", err)
+	}
+	if _, statErr := os.Stat(root); !os.IsNotExist(statErr) {
+		t.Fatalf("local fallback created %q, stat error = %v", root, statErr)
+	}
+}
 
 type commandRemoveProbe struct {
 	blob.Store
