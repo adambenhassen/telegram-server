@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -504,6 +505,65 @@ func TestS3ReadAtLimitsResponseBodyToRequestedWindow(t *testing.T) {
 	}
 	if gotRange != "bytes=7-10" {
 		t.Fatalf("Range = %q, want bytes=7-10", gotRange)
+	}
+}
+
+func TestS3ReadAtBoundsUnexpectedFullResponse(t *testing.T) {
+	t.Parallel()
+	const (
+		bodyBytes = 1 << 20
+		chunkSize = 1 << 10
+		chunkWait = time.Millisecond
+	)
+	var sent atomic.Int64
+	var gotRange string
+	done := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		gotRange = r.Header.Get("Range")
+		w.Header().Set("Content-Length", strconv.Itoa(bodyBytes))
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		chunk := bytes.Repeat([]byte("x"), chunkSize)
+		for sent.Load() < bodyBytes {
+			n, err := w.Write(chunk)
+			sent.Add(int64(n))
+			if err != nil {
+				return
+			}
+			flusher.Flush()
+			time.Sleep(chunkWait)
+		}
+	}))
+	t.Cleanup(server.Close)
+	store, err := blob.NewS3(blob.S3Config{
+		Endpoint:          server.URL,
+		Bucket:            "test-bucket",
+		Prefix:            "tenant/",
+		AccessKeyID:       "access",
+		SecretAccessKey:   "secret",
+		AllowInsecureHTTP: true,
+		MaxAttempts:       1,
+	})
+	if err != nil {
+		t.Fatalf("new S3 store: %v", err)
+	}
+	if _, err := store.ReadAt(context.Background(), "parts/full-response", 0, 4); err == nil {
+		t.Fatal("full response accepted for ranged read")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not observe the response connection closing")
+	}
+	if gotRange != "bytes=0-3" {
+		t.Fatalf("Range = %q, want bytes=0-3", gotRange)
+	}
+	if got := sent.Load(); got >= bodyBytes/2 {
+		t.Fatalf("unexpected full response sent %d bytes, want less than %d", got, bodyBytes/2)
 	}
 }
 

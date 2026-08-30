@@ -36,6 +36,7 @@ const (
 	s3Service         = "s3"
 	s3MaxAttempts     = 10
 	s3MaxErrorBytes   = 16 * 1024
+	s3MaxDrainBytes   = 16 * 1024
 	s3MaxListBytes    = 16 * 1024 * 1024
 	s3ListPageSize    = 1000
 )
@@ -862,7 +863,7 @@ func waitS3Retry(ctx context.Context, attempt int) error {
 }
 
 func drainBody(body io.Reader) error {
-	_, readErr := io.Copy(io.Discard, body)
+	_, readErr := io.Copy(io.Discard, io.LimitReader(body, s3MaxDrainBytes))
 	return readErr
 }
 
