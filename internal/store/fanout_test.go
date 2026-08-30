@@ -359,10 +359,22 @@ func TestChatCreatorCanRevokeDeleteEveryCurrentCopy(t *testing.T) {
 	c := mustUser(t, s, "+15551290183")
 	chat := chatWith(t, s, a, b, c)
 
+	// A prior 1:1 message advances only A and C's local id spaces. B's chat
+	// message is therefore local 1 for B and local 2 for A and C.
+	send(t, s, a, c, "unrelated", 1)
 	sender, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: b.ID, Text: "moderate", RandomID: 1})
 	if sender.LocalID != 1 {
 		t.Fatalf("sender local id = %d, want 1", sender.LocalID)
 	}
+	creatorCopy, ok := msgOpt(t, s, a.ID, 2)
+	if !ok || creatorCopy.LocalID != 2 || creatorCopy.FromID != b.ID {
+		t.Fatalf("creator copy = ok:%v %+v, want B's message at local id 2", ok, creatorCopy)
+	}
+	memberCopy, ok := msgOpt(t, s, c.ID, 2)
+	if !ok || memberCopy.LocalID != 2 || memberCopy.FromID != b.ID {
+		t.Fatalf("member copy = ok:%v %+v, want B's message at local id 2", ok, memberCopy)
+	}
+	targetLocal := map[int64]int64{a.ID: 2, b.ID: 1, c.ID: 2}
 
 	if err := store.RemoveChatParticipant(ctx, s, chat.ID, b.ID); err != nil {
 		t.Fatalf("remove author: %v", err)
@@ -370,35 +382,36 @@ func TestChatCreatorCanRevokeDeleteEveryCurrentCopy(t *testing.T) {
 
 	// A non-creator member cannot revoke-delete another member's message, even
 	// after that author has left the chat.
-	if _, err := s.DeleteMessages(ctx, c.ID, []int64{sender.LocalID}, true); !errors.Is(err, store.ErrMessageInvalid) {
+	if _, err := s.DeleteMessages(ctx, c.ID, []int64{memberCopy.LocalID}, true); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("member revoke delete: want ErrMessageInvalid, got %v", err)
 	}
+	wantPts := map[int64]int{a.ID: 2, b.ID: 1, c.ID: 2}
 	for _, u := range []store.User{a, b, c} {
-		if m, ok := msgOpt(t, s, u.ID, sender.LocalID); !ok || m.Deleted {
+		if m, ok := msgOpt(t, s, u.ID, targetLocal[u.ID]); !ok || m.Deleted {
 			t.Fatalf("rejected delete changed owner %d copy: ok=%v %+v", u.ID, ok, m)
 		}
-		if got := ptsOf(t, s, u.ID); got != 1 {
-			t.Fatalf("rejected delete moved owner %d pts to %d, want 1", u.ID, got)
+		if got := ptsOf(t, s, u.ID); got != wantPts[u.ID] {
+			t.Fatalf("rejected delete moved owner %d pts to %d, want %d", u.ID, got, wantPts[u.ID])
 		}
-		if ev := eventsOf(t, s, u.ID, 1); len(ev) != 0 {
+		if ev := eventsOf(t, s, u.ID, wantPts[u.ID]); len(ev) != 0 {
 			t.Fatalf("rejected delete added owner %d events: %+v", u.ID, ev)
 		}
 	}
 
 	// The creator can moderate the message after its author leaves. The current
 	// member set is A and C, so B's retained copy must remain frozen.
-	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}, true)
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{creatorCopy.LocalID}, true)
 	if err != nil {
 		t.Fatalf("creator revoke delete: %v", err)
 	}
-	if len(perOwner) != 2 || perOwner[a.ID] != 2 || perOwner[c.ID] != 2 {
-		t.Fatalf("perOwner = %+v, want A and C at pts 2", perOwner)
+	if len(perOwner) != 2 || perOwner[a.ID] != 3 || perOwner[c.ID] != 3 {
+		t.Fatalf("perOwner = %+v, want A and C at pts 3", perOwner)
 	}
 	for _, u := range []store.User{a, c} {
-		if m, ok := msgOpt(t, s, u.ID, sender.LocalID); !ok || !m.Deleted {
+		if m, ok := msgOpt(t, s, u.ID, creatorCopy.LocalID); !ok || !m.Deleted {
 			t.Errorf("current owner %d copy not deleted: ok=%v %+v", u.ID, ok, m)
 		}
-		if ev := eventsOf(t, s, u.ID, 1); len(ev) != 1 || ev[0].Type != store.EventDelete {
+		if ev := eventsOf(t, s, u.ID, wantPts[u.ID]); len(ev) != 1 || ev[0].Type != store.EventDelete {
 			t.Errorf("owner %d delete events = %+v", u.ID, ev)
 		}
 	}
