@@ -658,8 +658,7 @@ func (s *Server) runExchange(ctx context.Context, tconn transport.Conn, first *b
 
 	key, err := s.exchange(ctx, exchangeConn{Conn: bc})
 	if err != nil {
-		var exErr *exchange.ServerExchangeError
-		if errors.As(err, &exErr) {
+		if exErr, ok := errors.AsType[*exchange.ServerExchangeError](err); ok {
 			// Report the failure to the client and close quietly, matching
 			// gotd tgtest: a bad handshake is not a server-side error.
 			if sendErr := s.sendProtoError(ctx, bc, exErr.Code); sendErr != nil {

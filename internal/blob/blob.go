@@ -66,11 +66,10 @@ func ValidateKey(key string) error {
 // is a second place to drift from.
 const TempSuffix = ".tmp"
 
-// Store is the seam an object-storage backend lands on later. It has a single
-// implementation, [Local], on purpose. Every method taking a key rejects an
-// invalid key with [ErrInvalidKey] before doing backend work. WalkPrefix takes
-// a containment prefix instead, whose empty-prefix no-op semantics are
-// deliberately separate from key validation.
+// Store is the backend-independent seam implemented by [Local] and [S3]. Every
+// method taking a key rejects an invalid key with [ErrInvalidKey] before doing
+// backend work. WalkPrefix takes a containment prefix instead, whose
+// empty-prefix no-op semantics are deliberately separate from key validation.
 type Store interface {
 	// Put stores r under key and returns the number of bytes written.
 	Put(ctx context.Context, key string, r io.Reader) (int64, error)
@@ -94,6 +93,14 @@ type Store interface {
 	// carry, and a remote backend hands its listing over a page at a time
 	// rather than buffering a whole bucket to answer one call.
 	WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error) error
+}
+
+// OperationTimeoutProvider is optionally implemented by stores that bound one
+// backend operation. Callers that perform post-commit work can use the bound
+// without coupling themselves to a concrete backend; stores without an
+// operation deadline need not implement it.
+type OperationTimeoutProvider interface {
+	OperationTimeout() time.Duration
 }
 
 // Key returns the storage key for a file id, sharded on the id's low byte so
@@ -200,11 +207,12 @@ func NewLocal(dir string) (*Local, error) {
 func (l *Local) RootDir() string { return l.dir }
 
 // Put writes r to a temporary file and renames it into place, so a reader
-// never observes a partially written blob. O_EXCL on the temporary file also
-// means two concurrent Puts to the same key cannot interleave: the second
-// fails instead of corrupting the first. Keys come from freshly allocated file
-// ids today, so that collision does not arise; the flag keeps it impossible if
-// that ever changes.
+// never observes a partially written blob. Local's O_EXCL temporary-file
+// guard is a local-only concurrent-write guarantee: two concurrent Puts to the
+// same key cannot interleave, and the second fails instead of corrupting the
+// first. A remote backend may provide last-writer-wins semantics instead. Keys
+// come from freshly allocated file ids today, so that collision does not arise;
+// the flag keeps it impossible if that ever changes.
 func (l *Local) Put(_ context.Context, key string, r io.Reader) (int64, error) {
 	if err := ValidateKey(key); err != nil {
 		return 0, err
@@ -417,6 +425,9 @@ func (l *Local) ReadAt(_ context.Context, key string, offset, limit int64) ([]by
 	}
 	if offset < 0 || limit < 0 {
 		return nil, fmt.Errorf("blob read: negative window offset=%d limit=%d", offset, limit)
+	}
+	if limit == 0 {
+		return []byte{}, nil
 	}
 
 	f, err := l.root.Open(key)
