@@ -95,6 +95,14 @@ type Store interface {
 	WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error) error
 }
 
+// OperationTimeoutProvider is optionally implemented by stores that bound one
+// backend operation. Callers that perform post-commit work can use the bound
+// without coupling themselves to a concrete backend; stores without an
+// operation deadline need not implement it.
+type OperationTimeoutProvider interface {
+	OperationTimeout() time.Duration
+}
+
 // Key returns the storage key for a file id, sharded on the id's low byte so
 // that no single directory accumulates every blob.
 func Key(id int64) string { return fmt.Sprintf("%02x/%d", id&0xff, id) }
@@ -199,11 +207,12 @@ func NewLocal(dir string) (*Local, error) {
 func (l *Local) RootDir() string { return l.dir }
 
 // Put writes r to a temporary file and renames it into place, so a reader
-// never observes a partially written blob. O_EXCL on the temporary file also
-// means two concurrent Puts to the same key cannot interleave: the second
-// fails instead of corrupting the first. Keys come from freshly allocated file
-// ids today, so that collision does not arise; the flag keeps it impossible if
-// that ever changes.
+// never observes a partially written blob. Local's O_EXCL temporary-file
+// guard is a local-only concurrent-write guarantee: two concurrent Puts to the
+// same key cannot interleave, and the second fails instead of corrupting the
+// first. A remote backend may provide last-writer-wins semantics instead. Keys
+// come from freshly allocated file ids today, so that collision does not arise;
+// the flag keeps it impossible if that ever changes.
 func (l *Local) Put(_ context.Context, key string, r io.Reader) (int64, error) {
 	if err := ValidateKey(key); err != nil {
 		return 0, err

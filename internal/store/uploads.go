@@ -35,6 +35,11 @@ var ErrTooManyParts = errors.New("too many upload parts")
 // MaxPartBytes is the protocol maximum for one upload.saveFilePart part.
 const MaxPartBytes = 512 * 1024
 
+// uploadBlobOperationTimeout bounds post-commit blob work for a backend that
+// does not expose its own operation bound. A backend with a configured bound
+// takes precedence through blob.OperationTimeoutProvider.
+const uploadBlobOperationTimeout = 5 * time.Minute
+
 // MinPartBytesForRowCap is the smallest part size real clients choose. The
 // per-user row cap is derived from it so that a client using ordinary part
 // sizes is never rejected by the row cap before the byte cap.
@@ -47,6 +52,15 @@ func partIndexOf(i int) (int32, bool) {
 		return 0, false
 	}
 	return int32(i), true
+}
+
+func (s *Store) blobOperationTimeout() time.Duration {
+	if bounded, ok := s.blobs.(blob.OperationTimeoutProvider); ok {
+		if timeout := bounded.OperationTimeout(); timeout > 0 {
+			return timeout
+		}
+	}
+	return uploadBlobOperationTimeout
 }
 
 // SaveUploadPart writes one part of an in-flight upload, enforcing the per-file
@@ -159,7 +173,7 @@ func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIn
 	// byte work still has to finish its cleanup. Keep request values while
 	// replacing cancellation with a backend-sized bound: WithoutCancel alone
 	// would let a remote store hang forever.
-	blobCtx, blobCancel := context.WithTimeout(context.WithoutCancel(ctx), blob.DefaultS3OperationTimeout)
+	blobCtx, blobCancel := context.WithTimeout(context.WithoutCancel(ctx), s.blobOperationTimeout())
 	defer blobCancel()
 
 	// The row is committed, so the cap holds whatever happens next. The bytes

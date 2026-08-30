@@ -179,6 +179,10 @@ func NewS3(cfg S3Config) (*S3, error) {
 	}, nil
 }
 
+// OperationTimeout reports the configured bound for one S3 operation,
+// including its bounded retries.
+func (s *S3) OperationTimeout() time.Duration { return s.operationTimeout }
+
 func loadS3Roots(path string) (*x509.CertPool, error) {
 	roots, err := x509.SystemCertPool()
 	if err != nil || roots == nil {
@@ -339,7 +343,9 @@ func (b *s3Body) rewind() error {
 
 // Put stores r under key and returns its known length. The request carries that
 // length directly, so a large assembled object is streamed to the transport
-// and is never buffered just to determine Content-Length.
+// and is never buffered just to determine Content-Length. Same-key writes use
+// the remote store's last-writer-wins semantics and may replace an existing
+// object.
 func (s *S3) Put(ctx context.Context, key string, r io.Reader) (n int64, retErr error) {
 	remote, err := s.scopedKey(key)
 	if err != nil {
@@ -485,15 +491,15 @@ func (s *S3) WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error
 	if fn == nil {
 		return s.operationError("walk", errS3UnscopedPrefix)
 	}
-	opCtx, cancel := context.WithTimeout(ctx, s.operationTimeout)
-	defer cancel()
 	listPrefix := remotePrefix
 	if !strings.Contains(prefix, "/") && !strings.HasSuffix(prefix, "/") {
 		exact, err := s.scopedKey(prefix)
 		if err != nil {
 			return err
 		}
-		exists, err := s.objectExists(opCtx, exact)
+		probeCtx, probeCancel := context.WithTimeout(ctx, s.operationTimeout)
+		exists, err := s.objectExists(probeCtx, exact)
+		probeCancel()
 		if err != nil {
 			return s.operationError("walk", err)
 		}
@@ -511,7 +517,9 @@ func (s *S3) WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error
 			{key: "max-keys", value: strconv.Itoa(s3ListPageSize)},
 			{key: "continuation-token", value: token},
 		})
-		truncated, next, pageErr := s.listPage(opCtx, query, listPrefix, prefix, fn)
+		pageCtx, pageCancel := context.WithTimeout(ctx, s.operationTimeout)
+		truncated, next, pageErr := s.listPage(pageCtx, query, listPrefix, prefix, fn)
+		pageCancel()
 		if pageErr != nil {
 			return pageErr
 		}

@@ -48,12 +48,29 @@ func TestStoreConformance(t *testing.T) {
 			key := blob.PartsPrefix + "round-trip"
 			want := []byte("0123456789abcdef")
 
-			n, err := store.Put(ctx, key, bytes.NewReader(want))
-			if err != nil {
-				t.Fatalf("put: %v", err)
+			objects := []struct {
+				name string
+				key  string
+				body []byte
+			}{
+				{name: "round-trip", key: key, body: want},
+				{name: "zero-byte", key: blob.PartsPrefix + "zero-byte"},
 			}
-			if n != int64(len(want)) {
-				t.Fatalf("put returned %d bytes, want %d", n, len(want))
+			for _, object := range objects {
+				n, err := store.Put(ctx, object.key, bytes.NewReader(object.body))
+				if err != nil {
+					t.Fatalf("put %s: %v", object.name, err)
+				}
+				if n != int64(len(object.body)) {
+					t.Fatalf("put %s returned %d bytes, want %d", object.name, n, len(object.body))
+				}
+			}
+			zero, err := store.ReadAt(ctx, objects[1].key, 0, 1)
+			if err != nil {
+				t.Fatalf("read zero-byte object: %v", err)
+			}
+			if len(zero) != 0 {
+				t.Fatalf("read zero-byte object = %d bytes, want 0", len(zero))
 			}
 
 			tests := []struct {
@@ -116,12 +133,13 @@ func TestStoreConformance(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("walk: %v", err)
 			}
-			if len(entries) != 2 {
-				t.Fatalf("walk yielded %d entries, want 2: %+v", len(entries), entries)
+			if len(entries) != 3 {
+				t.Fatalf("walk yielded %d entries, want 3: %+v", len(entries), entries)
 			}
 			for key, wantSize := range map[string]int64{
-				blob.PartsPrefix + "aaa": 1,
-				blob.PartsPrefix + "bbb": 2,
+				blob.PartsPrefix + "aaa":       1,
+				blob.PartsPrefix + "bbb":       2,
+				blob.PartsPrefix + "zero-byte": 0,
 			} {
 				if entries[key].Size != wantSize {
 					t.Fatalf("walk %q size = %d, want %d", key, entries[key].Size, wantSize)
@@ -749,8 +767,12 @@ func TestS3WalkPrefixTreatsEmptyHead404AsMissingObject(t *testing.T) {
 	}
 }
 
-func TestS3WalkPrefixHasOneOperationDeadline(t *testing.T) {
+func TestS3WalkPrefixUsesPerPageDeadlines(t *testing.T) {
 	t.Parallel()
+	const (
+		pages    = 4
+		pageWait = 40 * time.Millisecond
+	)
 	var page int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -759,17 +781,16 @@ func TestS3WalkPrefixHasOneOperationDeadline(t *testing.T) {
 		}
 		current := page
 		page++
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(pageWait)
 		w.Header().Set("Content-Type", "application/xml")
-		if current == 0 {
-			w.WriteHeader(http.StatusOK)
-			if _, err := io.WriteString(w, `<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>`); err != nil {
-				return
-			}
-			return
-		}
 		w.WriteHeader(http.StatusOK)
-		if _, err := io.WriteString(w, `<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`); err != nil {
+		truncated := current+1 < pages
+		token := ""
+		if truncated {
+			token = fmt.Sprintf("<NextContinuationToken>page-%d</NextContinuationToken>", current+1)
+		}
+		body := fmt.Sprintf(`<ListBucketResult><IsTruncated>%t</IsTruncated>%s</ListBucketResult>`, truncated, token)
+		if _, err := io.WriteString(w, body); err != nil {
 			return
 		}
 	}))
@@ -782,13 +803,25 @@ func TestS3WalkPrefixHasOneOperationDeadline(t *testing.T) {
 		SecretAccessKey:   "secret",
 		AllowInsecureHTTP: true,
 		MaxAttempts:       1,
-		OperationTimeout:  150 * time.Millisecond,
+		OperationTimeout:  100 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("new S3 store: %v", err)
 	}
-	if err := store.WalkPrefix(context.Background(), blob.PartsPrefix, func(blob.Entry) error { return nil }); err == nil {
-		t.Fatal("walk exceeded its operation deadline")
+	var entries int
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := store.WalkPrefix(ctx, blob.PartsPrefix, func(blob.Entry) error {
+		entries++
+		return nil
+	}); err != nil {
+		t.Fatalf("walk across %d pages: %v", pages, err)
+	}
+	if entries != 0 {
+		t.Fatalf("walk yielded %d entries, want 0", entries)
+	}
+	if page != pages {
+		t.Fatalf("walk requested %d pages, want %d", page, pages)
 	}
 }
 

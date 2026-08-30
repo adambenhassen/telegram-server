@@ -530,6 +530,37 @@ func TestCancelledSaveCleansObjectAfterResave(t *testing.T) {
 	}
 }
 
+// TestSaveUploadPartUsesBlobOperationTimeout keeps the detached cleanup bound
+// tied to the configured backend rather than to one concrete backend's
+// default. A backend selected with a longer operation bound must be allowed to
+// finish its Put after the request has gone away.
+func TestSaveUploadPartUsesBlobOperationTimeout(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	plain := store.BlobsOf(s)
+	const timeout = 2 * time.Minute
+	probe := &operationTimeoutProbe{
+		Store:   plain,
+		timeout: timeout,
+		seen:    make(chan time.Time, 1),
+	}
+	if err := store.SetPartBlobs(s, probe); err != nil {
+		t.Fatalf("install timeout probe: %v", err)
+	}
+	u, err := s.CreateUser(context.Background(), "+15559000115")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := s.SaveUploadPart(context.Background(), u.ID, 32, 0, []byte("payload"), maxFile); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	deadline := <-probe.seen
+	remaining := time.Until(deadline)
+	if remaining < timeout-time.Second {
+		t.Fatalf("blob operation deadline has %s remaining, want close to %s", remaining, timeout)
+	}
+}
+
 // TestAssemblyCleanupRacingResaveLeavesNoUnnamedObject is the same invariant
 // through the other door. The assembly cleanup reads the part set, deletes
 // those objects, then retires the rows; a save that commits inside that window
@@ -629,6 +660,25 @@ type cancelDuringPutBlobs struct {
 	firstStarted chan struct{}
 	releaseFirst chan struct{}
 	once         sync.Once
+}
+
+type operationTimeoutProbe struct {
+	blob.Store
+
+	timeout time.Duration
+	seen    chan time.Time
+}
+
+func (b *operationTimeoutProbe) OperationTimeout() time.Duration { return b.timeout }
+
+func (b *operationTimeoutProbe) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		b.seen <- time.Time{}
+	} else {
+		b.seen <- deadline
+	}
+	return b.Store.Put(ctx, key, r)
 }
 
 func (b *cancelDuringPutBlobs) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
