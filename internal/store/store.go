@@ -83,7 +83,11 @@ type Store struct {
 	// assemblyClaimUnlockHook is a test-only replacement for the claim unlock
 	// operation. It controls a stalled cleanup without exposing a production
 	// callback or a fake database connection.
-	assemblyClaimUnlockHook func(context.Context) (bool, error)
+	assemblyClaimUnlockHook func(context.Context, *pgx.Conn, int64) (bool, error)
+
+	// assemblyClaimDiscardHook is a test-only callback fired immediately before
+	// an assembly claim connection is hijacked and closed.
+	assemblyClaimDiscardHook func()
 
 	// now reads the clock the client-visible rate-limit wait is measured
 	// against. Production always holds time.Now; it is a field so a test can

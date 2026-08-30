@@ -156,9 +156,10 @@ func (s *Store) AllocateAndCompleteFile(
 		return File{}, fmt.Errorf("allocate file: acquire connection: %w", err)
 	}
 	claim := fileAssemblyClaim{
-		conn:       conn,
-		scan:       s.assemblyClaimScanHook,
-		unlockHook: s.assemblyClaimUnlockHook,
+		conn:        conn,
+		scan:        s.assemblyClaimScanHook,
+		unlockHook:  s.assemblyClaimUnlockHook,
+		discardHook: s.assemblyClaimDiscardHook,
 	}
 	defer func() {
 		// The claim cleanup may have to wait for a database operation or discard
@@ -278,12 +279,13 @@ func allocateFileTx(
 // transaction commits while the claim remains held, and the connection stays
 // checked out until the blob Put and MarkFileStored commit finish.
 type fileAssemblyClaim struct {
-	conn       *pgxpool.Conn
-	key        int64
-	held       bool
-	discard    bool
-	scan       func(fileID int64, row pgx.Row, acquired *bool) error
-	unlockHook func(context.Context) (bool, error)
+	conn        *pgxpool.Conn
+	key         int64
+	held        bool
+	discard     bool
+	scan        func(fileID int64, row pgx.Row, acquired *bool) error
+	unlockHook  func(context.Context, *pgx.Conn, int64) (bool, error)
+	discardHook func()
 }
 
 const assemblyClaimUnlockTimeout = time.Second
@@ -324,7 +326,7 @@ type fileAssemblyUnlockResult struct {
 
 func (c *fileAssemblyClaim) unlock(ctx context.Context, conn *pgx.Conn) (bool, error) {
 	if c.unlockHook != nil {
-		return c.unlockHook(ctx)
+		return c.unlockHook(ctx, conn, c.key)
 	}
 	var released bool
 	err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, c.key).Scan(&released)
@@ -336,6 +338,13 @@ func discardFileAssemblyConnection(conn *pgxpool.Conn) error {
 	ctx, cancel := context.WithTimeout(context.Background(), assemblyClaimUnlockTimeout)
 	defer cancel()
 	return raw.Close(ctx)
+}
+
+func (c *fileAssemblyClaim) discardConnection(conn *pgxpool.Conn) error {
+	if c.discardHook != nil {
+		c.discardHook()
+	}
+	return discardFileAssemblyConnection(conn)
 }
 
 // release unlocks the session claim before returning the connection to the
@@ -353,7 +362,7 @@ func (c *fileAssemblyClaim) release() error {
 		return nil
 	}
 	if c.discard {
-		if err := discardFileAssemblyConnection(conn); err != nil {
+		if err := c.discardConnection(conn); err != nil {
 			return fmt.Errorf("file assembly claim: discard: %w", err)
 		}
 		return nil
@@ -371,7 +380,7 @@ func (c *fileAssemblyClaim) release() error {
 	select {
 	case result := <-result:
 		if result.err != nil {
-			if closeErr := discardFileAssemblyConnection(conn); closeErr != nil {
+			if closeErr := c.discardConnection(conn); closeErr != nil {
 				return fmt.Errorf("file assembly claim: unlock: %w; close: %w", result.err, closeErr)
 			}
 			return nil
@@ -383,7 +392,11 @@ func (c *fileAssemblyClaim) release() error {
 		conn.Release()
 		return nil
 	case <-unlockCtx.Done():
-		if closeErr := discardFileAssemblyConnection(conn); closeErr != nil {
+		// pgx cancellation and this select race at the deadline. Join the
+		// operation before hijacking its connection; otherwise Close can run
+		// concurrently with the query on the same *pgx.Conn.
+		<-result
+		if closeErr := c.discardConnection(conn); closeErr != nil {
 			return fmt.Errorf("file assembly claim: unlock: %w; close: %w", unlockCtx.Err(), closeErr)
 		}
 		return nil

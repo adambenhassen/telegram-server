@@ -351,9 +351,13 @@ func SetAssemblyClaimScanHook(s *Store, fn func(fileID int64, row pgx.Row, acqui
 // SetAssemblyClaimUnlockHook replaces one assembly claim unlock for tests. It
 // is used to hold cleanup past its deadline and prove that the assembly slot is
 // released before the cleanup path finishes.
-func SetAssemblyClaimUnlockHook(s *Store, fn func(context.Context) (bool, error)) {
+func SetAssemblyClaimUnlockHook(s *Store, fn func(context.Context, *pgx.Conn, int64) (bool, error)) {
 	s.assemblyClaimUnlockHook = fn
 }
+
+// SetAssemblyClaimDiscardHook installs a test seam that runs immediately
+// before an assembly claim connection is hijacked and closed.
+func SetAssemblyClaimDiscardHook(s *Store, fn func()) { s.assemblyClaimDiscardHook = fn }
 
 // EraseFileRow deletes one files row. Nothing in the shipped server deletes one
 // — the eraser is a later stage of M17 — so this is the only way a test can

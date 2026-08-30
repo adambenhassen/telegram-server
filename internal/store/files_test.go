@@ -297,22 +297,29 @@ func TestStalledAssemblyClaimUnlockDoesNotStrandSlot(t *testing.T) {
 	secondUser := mustUser(t, s, "+15559100028")
 
 	unlockStarted := make(chan struct{})
-	allowUnlock := make(chan struct{})
+	unlockFinished := make(chan struct{})
 	var unlockCalls atomic.Int32
-	var closeUnlockOnce sync.Once
-	closeUnlock := func() { closeUnlockOnce.Do(func() { close(allowUnlock) }) }
-	defer closeUnlock()
-	store.SetAssemblyClaimUnlockHook(s, func(ctx context.Context) (bool, error) {
+	var discardedWhileUnlocking atomic.Bool
+	store.SetAssemblyClaimDiscardHook(s, func() {
+		select {
+		case <-unlockFinished:
+		default:
+			discardedWhileUnlocking.Store(true)
+		}
+	})
+	defer store.SetAssemblyClaimDiscardHook(s, nil)
+	store.SetAssemblyClaimUnlockHook(s, func(ctx context.Context, conn *pgx.Conn, key int64) (bool, error) {
 		if unlockCalls.Add(1) == 1 {
 			close(unlockStarted)
-			select {
-			case <-ctx.Done():
-				return false, ctx.Err()
-			case <-allowUnlock:
-				return false, errors.New("test unlock stalled")
-			}
+			queryCtx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
+			defer cancel()
+			_, err := conn.Exec(queryCtx, `SELECT pg_sleep(10)`)
+			close(unlockFinished)
+			return false, err
 		}
-		return false, errors.New("test unlock cleanup")
+		var released bool
+		err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, key).Scan(&released)
+		return released, err
 	})
 	defer store.SetAssemblyClaimUnlockHook(s, nil)
 
@@ -341,7 +348,6 @@ func TestStalledAssemblyClaimUnlockDoesNotStrandSlot(t *testing.T) {
 	select {
 	case <-secondReady:
 	case <-time.After(750 * time.Millisecond):
-		closeUnlock()
 		<-firstDone
 		<-secondDone
 		t.Fatal("second assembly did not reach Put while first unlock was stalled")
@@ -354,6 +360,9 @@ func TestStalledAssemblyClaimUnlockDoesNotStrandSlot(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("first assembly remained blocked in claim cleanup")
+	}
+	if discardedWhileUnlocking.Load() {
+		t.Fatal("claim connection was discarded while unlock query was still in flight")
 	}
 	select {
 	case err := <-secondDone:
