@@ -93,13 +93,24 @@ The server listens on `127.0.0.1:2443`. The stack enables
 `TG_LOG_LOGIN_CODES`, so phone-mode login codes appear in
 `docker compose logs telegramd`; a first phone-mode sign-in auto-registers the
 account, so that is all a gotd client needs to get in. Username/password
-accounts are a different story on this stack: `docker-compose.yml` does not
-forward the `TG_BOOTSTRAP_*` variables and `TG_REGISTRATION` keeps its `closed`
-default, so setting them in `.env` does nothing (compose passthrough tracked in
-MAIN-306). To seed a username/password operator account, use the local run
-below. `docker compose down` keeps the volumes
-(rows, RSA identity, auth-key master key); `down -v` destroys them and every
-client has to re-handshake. `.env.example` documents each variable.
+accounts are also supported here: set the `TG_BOOTSTRAP_*` variables in `.env`
+if you want a username/password operator account. `docker compose down` keeps
+the local volumes (rows, RSA identity, auth-key master key, and filesystem
+blobs); `down -v` destroys them and every client has to re-handshake.
+`.env.example` documents each variable.
+
+To run the same stack with the S3-compatible RustFS backend, use the tracked
+local-only overlay. It starts RustFS, creates the `telegram` bucket, and
+selects a separate named RustFS data volume in one command:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.rustfs.yml up
+```
+
+The overlay uses fixed throwaway credentials and loopback-only plaintext HTTP.
+Use the same two files with `down` when stopping it; `down -v` also destroys
+the RustFS data volume. Do not copy this overlay's endpoint, credentials, or
+HTTP setting into a deployment.
 
 ## Build and run locally
 
@@ -153,8 +164,13 @@ checked-in environment file, command line, or ordinary process environment.
 The access key must be scoped to operations on this one bucket and this one
 prefix: list, get, put, and delete objects below the prefix only. Do not grant
 bucket-root, wildcard, ACL, or policy-management permissions. The server does
-not set object ACLs; keep the bucket private. Existing local blobs are not
-migrated when S3 mode is enabled.
+not set object ACLs; keep the bucket private.
+
+Switching a deployment that already has local filesystem blobs to S3 is a
+manual data move. There is no automated migration path: copy and verify the
+existing objects into the configured bucket and prefix before switching the
+backend. RustFS has no backup in this project; its named volume is persistence,
+not a backup or restore mechanism.
 
 HTTPS certificate verification is always enabled. Set
 `TG_BLOB_S3_CA_PATH` only when the endpoint uses a private CA bundle. Plaintext

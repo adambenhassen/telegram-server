@@ -1,0 +1,67 @@
+# Local-only RustFS overlay for docker-compose.yml.
+#
+#   cp .env.example .env && chmod 600 .env
+#   docker compose -f docker-compose.yml -f docker-compose.rustfs.yml up
+#
+# This overlay is intentionally a separate file: the base command keeps using
+# the local filesystem backend, while this command starts RustFS and selects
+# the S3-compatible backend. All credentials below are fixed throwaway values
+# for loopback development only. Do not expose this HTTP endpoint or reuse
+# these credentials outside this local stack.
+
+services:
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.12
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_ACCESS_KEY: TELEGRAMDLOCAL
+      RUSTFS_SECRET_KEY: TELEGRAMDLOCALSECRET
+      RUSTFS_OBS_LOGGER_LEVEL: warn
+    ports:
+      # The S3 API is loopback-only and is plaintext solely for this local
+      # overlay. The telegramd container uses the private compose network.
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - rustfsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/health/ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  # RustFS starts with no buckets. This one-shot uses the standard S3 client
+  # only to create the local bucket; telegramd still owns every blob operation.
+  rustfs-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    entrypoint: ["/bin/sh", "-ec"]
+    command: >-
+      mc alias set local http://rustfs:9000 "$${RUSTFS_ACCESS_KEY}" "$${RUSTFS_SECRET_KEY}" &&
+      mc mb --ignore-existing local/telegram
+    environment:
+      # These are the same non-production values used by the RustFS service.
+      RUSTFS_ACCESS_KEY: TELEGRAMDLOCAL
+      RUSTFS_SECRET_KEY: TELEGRAMDLOCALSECRET
+    depends_on:
+      rustfs:
+        condition: service_healthy
+
+  telegramd:
+    environment:
+      # This is an explicit loopback/compose-only HTTP opt-in. Deployments
+      # must use HTTPS and leave TG_BLOB_S3_ALLOW_INSECURE_HTTP unset.
+      TG_BLOB_S3_ENDPOINT: http://rustfs:9000
+      TG_BLOB_S3_BUCKET: telegram
+      TG_BLOB_S3_PREFIX: telegramd/
+      TG_BLOB_S3_REGION: us-east-1
+      TG_BLOB_S3_ACCESS_KEY_ID: TELEGRAMDLOCAL
+      TG_BLOB_S3_SECRET_ACCESS_KEY: TELEGRAMDLOCALSECRET
+      TG_BLOB_S3_ALLOW_INSECURE_HTTP: "true"
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+
+volumes:
+  rustfsdata:
