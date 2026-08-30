@@ -1,15 +1,19 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -133,6 +137,285 @@ func TestMarkFileStoredIsOnce(t *testing.T) {
 	}
 	if err := s.MarkFileStored(ctx, f.ID+(1<<40)); !errors.Is(err, store.ErrFileNotFound) {
 		t.Fatalf("absent id: want ErrFileNotFound, got %v", err)
+	}
+}
+
+// The allocation claim exists before the row is visible. If the eraser gets
+// the files row first, its nonblocking claim check commits a no-op and retains
+// the row; assembly then completes normally. This drives the real blob sweep,
+// including its commit path, rather than a test-only row lock that rolls back.
+func TestAllocateAndCompleteFileSurvivesEraserRowLockFirst(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15559100025")
+
+	const body = "assembled"
+	claimed := make(chan int64)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAssembly := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAssembly()
+	store.SetAssemblyClaimHook(s, func(fileID int64) {
+		claimed <- fileID
+		<-release
+	})
+	defer store.SetAssemblyClaimHook(s, nil)
+
+	type assemblyResult struct {
+		file store.File
+		err  error
+	}
+	done := make(chan assemblyResult, 1)
+	go func() {
+		file, err := s.AllocateAndCompleteFile(ctx, u.ID, int64(len(body)), "text/plain", "hello.txt", bigQuota, func(file store.File) error {
+			_, err := store.BlobsOf(s).Put(ctx, blob.Key(file.ID), bytes.NewReader([]byte(body)))
+			return err
+		})
+		done <- assemblyResult{file: file, err: err}
+	}()
+
+	fileID := <-claimed
+	tempKey := blob.Key(fileID) + blob.TempSuffix
+	if _, err := store.BlobsOf(s).Put(ctx, tempKey, bytes.NewReader([]byte("pending"))); err != nil {
+		t.Fatalf("plant temporary: %v", err)
+	}
+
+	cutoff := time.Now().Add(time.Hour)
+	counts, err := s.SweepBlobErasure(ctx, cutoff, cutoff)
+	if err != nil {
+		t.Fatalf("blob sweep: %v", err)
+	}
+	if counts.TempConsidered != 1 || counts.TempContended != 1 || counts.TempUnlinkAttempts != 0 {
+		t.Fatalf("blob sweep counts = %+v, want one claim-contended candidate and no unlink", counts)
+	}
+	if _, err := store.BlobsOf(s).ReadAt(ctx, tempKey, 0, 1); err != nil {
+		t.Fatalf("claim-contended temporary was removed: %v", err)
+	}
+	if err := store.BlobsOf(s).Remove(ctx, tempKey); err != nil {
+		t.Fatalf("remove planted temporary: %v", err)
+	}
+
+	releaseAssembly()
+	result := <-done
+	if result.err != nil {
+		t.Fatalf("complete assembly after eraser committed its no-op: %v", result.err)
+	}
+	if result.file.ID != fileID || !result.file.Stored {
+		t.Fatalf("completed file = %+v, want id %d stored", result.file, fileID)
+	}
+	got, err := store.BlobsOf(s).ReadAt(ctx, blob.Key(fileID), 0, int64(len(body)))
+	if err != nil {
+		t.Fatalf("read assembled bytes: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("assembled bytes = %q, want %q", got, body)
+	}
+}
+
+// Media erasure can take the files row before assembly takes its shared hold.
+// The session claim still makes that ordering safe: the eraser's try-lock must
+// commit a no-op and let the assembly complete.
+func TestMediaErasureSkipsClaimedAssembly(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15559100026")
+
+	const body = "assembled after media eraser"
+	claimed := make(chan int64)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAssembly := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAssembly()
+	store.SetAssemblyClaimHook(s, func(fileID int64) {
+		claimed <- fileID
+		<-release
+	})
+	defer store.SetAssemblyClaimHook(s, nil)
+
+	type assemblyResult struct {
+		file store.File
+		err  error
+	}
+	done := make(chan assemblyResult, 1)
+	go func() {
+		file, err := s.AllocateAndCompleteFile(ctx, u.ID, int64(len(body)), "text/plain", "hello.txt", bigQuota, func(file store.File) error {
+			_, err := store.BlobsOf(s).Put(ctx, blob.Key(file.ID), bytes.NewReader([]byte(body)))
+			return err
+		})
+		done <- assemblyResult{file: file, err: err}
+	}()
+
+	var fileID int64
+	select {
+	case fileID = <-claimed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("assembly did not reach its held claim")
+	}
+
+	counts, err := s.SweepMediaErasure(ctx, time.Now().Add(time.Hour), store.ErasureScanBatch)
+	if err != nil {
+		t.Fatalf("media erasure sweep: %v", err)
+	}
+	if counts.UnassembledConsidered != 1 || counts.UnassembledContended != 1 || counts.UnassembledErased != 0 {
+		t.Fatalf("media erasure counts = %+v, want one claim-contended row and no erase", counts)
+	}
+	if !rowPresent(t, s, fileID) {
+		t.Fatalf("media erasure removed claimed file row %d", fileID)
+	}
+
+	releaseAssembly()
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("assembly after media erasure: %v", result.err)
+		}
+		if result.file.ID != fileID || !result.file.Stored {
+			t.Fatalf("completed file = %+v, want id %d stored", result.file, fileID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("assembly did not complete after media erasure released the claim hook")
+	}
+	got, err := store.BlobsOf(s).ReadAt(ctx, blob.Key(fileID), 0, int64(len(body)))
+	if err != nil {
+		t.Fatalf("read assembled bytes: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("assembled bytes = %q, want %q", got, body)
+	}
+}
+
+// A stalled claim cleanup must not keep the assembly slot occupied. The first
+// unlock waits for its bounded context, while the second assembly proves that
+// the slot is released before that cleanup path can finish.
+func TestStalledAssemblyClaimUnlockDoesNotStrandSlot(t *testing.T) {
+	t.Parallel()
+	s := openAssemblyStore(t, 4)
+	ctx := context.Background()
+	firstUser := mustUser(t, s, "+15559100027")
+	secondUser := mustUser(t, s, "+15559100028")
+
+	unlockStarted := make(chan struct{})
+	unlockFinished := make(chan struct{})
+	var unlockCalls atomic.Int32
+	var discardedWhileUnlocking atomic.Bool
+	store.SetAssemblyClaimDiscardHook(s, func() {
+		select {
+		case <-unlockFinished:
+		default:
+			discardedWhileUnlocking.Store(true)
+		}
+	})
+	defer store.SetAssemblyClaimDiscardHook(s, nil)
+	store.SetAssemblyClaimUnlockHook(s, func(ctx context.Context, conn *pgx.Conn, key int64) (bool, error) {
+		if unlockCalls.Add(1) == 1 {
+			close(unlockStarted)
+			queryCtx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
+			defer cancel()
+			_, err := conn.Exec(queryCtx, `SELECT pg_sleep(10)`)
+			close(unlockFinished)
+			return false, err
+		}
+		var released bool
+		err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, key).Scan(&released)
+		return released, err
+	})
+	defer store.SetAssemblyClaimUnlockHook(s, nil)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := s.AllocateAndCompleteFile(ctx, firstUser.ID, 1, "application/octet-stream", "first.bin", bigQuota, func(store.File) error {
+			return nil
+		})
+		firstDone <- err
+	}()
+	select {
+	case <-unlockStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first assembly did not enter stalled unlock cleanup")
+	}
+
+	secondReady := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := s.AllocateAndCompleteFile(ctx, secondUser.ID, 1, "application/octet-stream", "second.bin", bigQuota, func(store.File) error {
+			close(secondReady)
+			return nil
+		})
+		secondDone <- err
+	}()
+	select {
+	case <-secondReady:
+	case <-time.After(750 * time.Millisecond):
+		<-firstDone
+		<-secondDone
+		t.Fatal("second assembly did not reach Put while first unlock was stalled")
+	}
+
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first assembly: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first assembly remained blocked in claim cleanup")
+	}
+	if discardedWhileUnlocking.Load() {
+		t.Fatal("claim connection was discarded while unlock query was still in flight")
+	}
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second assembly: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second assembly did not finish after the slot was released")
+	}
+}
+
+// If the result of pg_try_advisory_lock becomes ambiguous after PostgreSQL has
+// taken the session lock, the connection must be discarded rather than pooled.
+// The direct unlock below observes the session state from the next pooled
+// connection and fails if the claimed connection was returned for reuse.
+func TestAmbiguousAssemblyClaimDiscardsConnection(t *testing.T) {
+	t.Parallel()
+	s := openAssemblyStore(t, 2)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15559100029")
+	ambiguous := errors.New("test ambiguous claim result")
+	var fileID int64
+	store.SetAssemblyClaimScanHook(s, func(id int64, row pgx.Row, acquired *bool) error {
+		fileID = id
+		if err := row.Scan(acquired); err != nil {
+			return err
+		}
+		return ambiguous
+	})
+	defer store.SetAssemblyClaimScanHook(s, nil)
+
+	_, err := s.AllocateAndCompleteFile(ctx, u.ID, 1, "application/octet-stream", "ambiguous.bin", bigQuota, func(store.File) error {
+		return errors.New("assembly callback ran after ambiguous claim")
+	})
+	if !errors.Is(err, ambiguous) {
+		t.Fatalf("ambiguous claim: want sentinel error, got %v", err)
+	}
+	if fileID == 0 {
+		t.Fatal("ambiguous claim hook did not observe a file id")
+	}
+
+	conn, err := store.StorePool(s).Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire probe connection: %v", err)
+	}
+	var unlocked bool
+	if err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, -fileID).Scan(&unlocked); err != nil {
+		conn.Release()
+		t.Fatalf("probe advisory unlock: %v", err)
+	}
+	conn.Release()
+	if unlocked {
+		t.Fatalf("ambiguous claim for file %d remained held on a pooled connection", fileID)
 	}
 }
 

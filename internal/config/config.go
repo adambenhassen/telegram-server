@@ -82,22 +82,13 @@ type Config struct {
 	// MediaErasureMinAge is how old a file must be before the media erasure
 	// report will name it, and before the erasure sweep will remove it.
 	//
-	// The default is 24 hours, derived from the per-RPC bounds this process
-	// now ships: TG_RPC_DEADLINE (mtproto.DefaultRPCDeadline) caps how long any
-	// single send or assembly can run, and TG_STATEMENT_TIMEOUT caps each
-	// statement it opens server-side. A file's zero-live-reference window is
-	// therefore bounded by those ceilings plus scheduling slack, and 24 hours
-	// sits more than two orders of magnitude above both. An operator who raises
-	// either deadline past what this floor assumes must re-derive it from the
-	// same numbers.
-	//
-	// It is defence in depth and not the safety control, which matters most
-	// exactly where it looks like the opposite. Every media file on the server is
-	// stored with zero live references for the length of one send, so the
-	// reference predicate alone matches files being sent right now; the age gate
-	// narrows that window but does not close it. What keeps a live file safe is
-	// the interlock on its files row, taken exclusively by the eraser and in
-	// share mode by every path that writes a reference.
+	// The default is 24 hours, deliberately generous while MAIN-338 remains
+	// open. It is an additional retention gate for crashed or unassembled rows,
+	// not the live-assembly safety control: assembly holds the files row FOR
+	// SHARE before Put through the MarkFileStored commit, and the eraser skips a
+	// held row. A process crash releases the lock and leaves the row reclaimable;
+	// a smaller cutoff may reclaim that crashed state sooner without deleting a
+	// live assembly.
 	MediaErasureMinAge time.Duration
 	// MediaErasureReportInterval is how often that report runs. Zero disables
 	// it, as a zero limit disables a rate limit, and zero is the default: the
@@ -145,12 +136,12 @@ type Config struct {
 	// free.
 	MediaErasureDestructive bool
 	// BlobScanTempMinAge is how old the blob writer's temporary file must be
-	// before the disk report will name it as abandoned. A temporary file is an
-	// upload writing its bytes right now, so this has to exceed the longest
-	// write a client can be part-way through — which nothing in the server
-	// bounds, the same reason MediaErasureMinAge is configurable rather than
-	// derived. Nothing in this build unlinks anything, so the value affects a
-	// report only.
+	// before the disk report or assembled-blob reclaim will name it as
+	// abandoned. Age is an additional retention gate, not the live-assembly
+	// safety control: the assembly holds the files row FOR SHARE before Put and
+	// the reclaim path skips a held row. The default remains 24 hours while
+	// MAIN-338 is open, and the value stays configurable for crash-retention
+	// policy.
 	BlobScanTempMinAge time.Duration
 	// BlobScanReportInterval is how often the disk report runs. Zero disables
 	// it and is the default, matching the media erasure report: both are

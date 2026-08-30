@@ -67,6 +67,28 @@ type Store struct {
 	// for the reason deniedHook is.
 	eraseHook func(fileID int64)
 
+	// assemblyClaimHook is a test-only callback fired after an assembly's
+	// allocation transaction commits with its session claim held and before the
+	// completion transaction takes the files row lock. It controls the reverse
+	// ordering where the eraser gets the row first without exposing that seam to
+	// production callers.
+	assemblyClaimHook func(fileID int64)
+
+	// assemblyClaimScanHook is a test-only replacement for the claim result
+	// scan. It can consume a result and then return an error, modeling the
+	// ambiguous case where PostgreSQL may have taken the session lock but the
+	// caller never receives a usable result.
+	assemblyClaimScanHook func(fileID int64, row pgx.Row, acquired *bool) error
+
+	// assemblyClaimUnlockHook is a test-only replacement for the claim unlock
+	// operation. It controls a stalled cleanup without exposing a production
+	// callback or a fake database connection.
+	assemblyClaimUnlockHook func(context.Context, *pgx.Conn, int64) (bool, error)
+
+	// assemblyClaimDiscardHook is a test-only callback fired immediately before
+	// an assembly claim connection is hijacked and closed.
+	assemblyClaimDiscardHook func()
+
 	// now reads the clock the client-visible rate-limit wait is measured
 	// against. Production always holds time.Now; it is a field so a test can
 	// pin the remainder of an open window to an exact sub-second value instead
@@ -78,6 +100,13 @@ type Store struct {
 	// pooled connection at connect time. It lives on the Store only so Open can
 	// read it after the options run; see WithStatementTimeout.
 	statementTimeout time.Duration
+
+	// assemblySlots bounds the number of connections an in-flight assembled
+	// upload may pin. Open sizes it from the pool's configured maximum after
+	// reserving the non-assembly share of the pool for ordinary request paths.
+	assemblySlots    chan struct{}
+	assemblyLimit    int
+	assemblyHeadroom int
 }
 
 // Sentinel errors returned by the login-code methods.
@@ -114,6 +143,10 @@ var (
 
 // Option configures a Store at Open time.
 type Option func(*Store)
+
+// assemblyPoolShareDivisor keeps in-flight assemblies to at most one quarter
+// of the configured pool, with the one-slot floor applied at small pool sizes.
+const assemblyPoolShareDivisor = 4
 
 // WithStatementTimeout sets the Postgres statement_timeout every connection in
 // the pool runs under: a single SQL statement that runs longer is cancelled by
@@ -180,6 +213,13 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	if poolCfg.MaxConns < 2 {
+		return nil, fmt.Errorf("store: pool max connections %d must leave one connection for non-assembly work", poolCfg.MaxConns)
+	}
+	assemblyLimit := max(1, int(poolCfg.MaxConns)/assemblyPoolShareDivisor)
+	s.assemblyLimit = assemblyLimit
+	s.assemblyHeadroom = int(poolCfg.MaxConns) - assemblyLimit
+	s.assemblySlots = make(chan struct{}, assemblyLimit)
 	// Session default rather than SET per statement: one line at connect, and
 	// every query on the connection carries the ceiling with no per-call cost.
 	if s.statementTimeout > 0 {
@@ -234,6 +274,14 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	}
 	return s, nil
 }
+
+// AssemblyConcurrencyLimit returns the startup-derived cap on in-flight
+// assembled uploads. It is surfaced for the command's startup diagnostic.
+func (s *Store) AssemblyConcurrencyLimit() int { return s.assemblyLimit }
+
+// AssemblyPoolHeadroom returns the number of pool connections left for ordinary
+// request paths while every assembly slot is occupied.
+func (s *Store) AssemblyPoolHeadroom() int { return s.assemblyHeadroom }
 
 // queryRower is the one method of pgxpool.Pool and pgx.Conn checkSchema needs.
 type queryRower interface {

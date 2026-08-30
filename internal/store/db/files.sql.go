@@ -69,6 +69,43 @@ func (q *Queries) ClearDeletedChannelFileRefs(ctx context.Context, fileID *int64
 	return result.RowsAffected(), nil
 }
 
+const deleteUnassembledFile = `-- name: DeleteUnassembledFile :execrows
+DELETE FROM files f
+WHERE f.id = $1
+  AND f.stored = false
+  AND f.date < $2::timestamptz
+  AND NOT EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.file_id = f.id AND m.file_id <> 0 AND m.deleted = false
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM channel_messages cm
+      WHERE cm.file_id = f.id AND cm.deleted = false
+  )
+`
+
+type DeleteUnassembledFileParams struct {
+	ID        int64
+	OlderThan pgtype.Timestamptz
+}
+
+// DeleteUnassembledFile is the crashed-assembly half of the row-driven
+// reclaim. The caller takes the files row FOR UPDATE SKIP LOCKED first and
+// tests the assembly claim without waiting, so a live assembly holding the
+// claim and the same row FOR SHARE from before Put through MarkFileStored's
+// commit is retained whether it arrived before or after the eraser's row lock.
+// This statement repeats every reclaim condition under that exclusive hold: a
+// completed assembly or a new live reference retains the row. Age is an
+// additional gate, not the safety control. The caller unlinks the exact key
+// only after this row deletion commits.
+func (q *Queries) DeleteUnassembledFile(ctx context.Context, arg DeleteUnassembledFileParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUnassembledFile, arg.ID, arg.OlderThan)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteUnreferencedFile = `-- name: DeleteUnreferencedFile :execrows
 DELETE FROM files f
 WHERE f.id = $1
@@ -153,6 +190,22 @@ func (q *Queries) ExistingFileIDs(ctx context.Context, ids []int64) ([]int64, er
 		return nil, err
 	}
 	return items, nil
+}
+
+const fileExistsForBlob = `-- name: FileExistsForBlob :one
+SELECT EXISTS (SELECT 1 FROM files WHERE id = $1)
+`
+
+// FileExistsForBlob is the final database check before an assembled blob with
+// no row may be reclaimed. It deliberately sees stored and not-stored rows:
+// the latter are live upload assemblies and are a different class only in the
+// row-driven pass. A plain existence probe does not wait on a row lock, so an
+// eraser never parks upload, send or download traffic behind this check.
+func (q *Queries) FileExistsForBlob(ctx context.Context, id int64) (bool, error) {
+	row := q.db.QueryRow(ctx, fileExistsForBlob, id)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const fileForDownload = `-- name: FileForDownload :one
@@ -320,6 +373,14 @@ type LockFileForEraseRow struct {
 // eraser that waited would be the one parking the chat. A row someone else
 // holds is somebody's live reference being written; it is not a candidate this
 // second, and the next sweep will read it again.
+//
+// Assembly has one additional interlock because the row is not visible until
+// allocation commits: it holds a session advisory claim before that commit,
+// then takes this row FOR SHARE before Put and holds it through
+// MarkFileStored's commit. The eraser tests that claim with a nonblocking
+// transaction advisory try-lock after this row lock. If it got the row first,
+// the failed try-lock makes it commit a no-op and retain the row; it never
+// waits on the connection carrying the blob Put.
 func (q *Queries) LockFileForErase(ctx context.Context, id int64) (LockFileForEraseRow, error) {
 	row := q.db.QueryRow(ctx, lockFileForErase, id)
 	var i LockFileForEraseRow

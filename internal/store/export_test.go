@@ -334,6 +334,31 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 // connection independent of the Store's query layer.
 func StorePool(s *Store) *pgxpool.Pool { return s.pool }
 
+// SetAssemblyClaimHook installs the test seam that runs after allocation has
+// committed with its session claim held and before the completion transaction
+// takes the files row lock. It controls the eraser-first ordering without
+// exposing a production callback.
+func SetAssemblyClaimHook(s *Store, fn func(fileID int64)) { s.assemblyClaimHook = fn }
+
+// SetAssemblyClaimScanHook replaces one assembly claim result scan for tests.
+// The hook receives the live row, so it can consume a successful PostgreSQL
+// result and then return an error to model an ambiguous acquire. The claim must
+// discard that connection rather than return it to the pool.
+func SetAssemblyClaimScanHook(s *Store, fn func(fileID int64, row pgx.Row, acquired *bool) error) {
+	s.assemblyClaimScanHook = fn
+}
+
+// SetAssemblyClaimUnlockHook replaces one assembly claim unlock for tests. It
+// is used to hold cleanup past its deadline and prove that the assembly slot is
+// released before the cleanup path finishes.
+func SetAssemblyClaimUnlockHook(s *Store, fn func(context.Context, *pgx.Conn, int64) (bool, error)) {
+	s.assemblyClaimUnlockHook = fn
+}
+
+// SetAssemblyClaimDiscardHook installs a test seam that runs immediately
+// before an assembly claim connection is hijacked and closed.
+func SetAssemblyClaimDiscardHook(s *Store, fn func()) { s.assemblyClaimDiscardHook = fn }
+
 // EraseFileRow deletes one files row. Nothing in the shipped server deletes one
 // — the eraser is a later stage of M17 — so this is the only way a test can
 // reach the state the reference interlock fails closed on.

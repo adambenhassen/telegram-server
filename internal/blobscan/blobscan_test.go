@@ -404,6 +404,26 @@ func TestScanNamesUnparsablePartTempAsUnexplained(t *testing.T) {
 	}
 }
 
+// An assembled-looking temporary still has to round-trip through the file-key
+// parser before the age gate can make it reclaimable. This closes the coverage
+// gap for a malformed path under an otherwise valid shard.
+func TestScanNamesUnparsableAssembledTempAsUnexplained(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+
+	const stray = "92/notanid.tmp"
+	f.plant(stray, "not an assembled write")
+	f.age(stray, 30*time.Hour)
+
+	rep := f.scan(time.Now().Add(-24 * time.Hour))
+	if !has(rep.Unexplained, stray) {
+		t.Fatalf("%s not reported as unexplained; report = %+v", stray, rep.Unexplained.Paths)
+	}
+	if has(rep.Temps, stray) || has(rep.Orphans, stray) {
+		t.Fatalf("malformed assembled temp was reported as reclaimable: %+v", rep)
+	}
+}
+
 // The writer's abandoned temporary file for a part key is not a live upload
 // part: it is a write in progress like any other, judged by the age cutoff
 // alone, and the report distinguishes it from a path nothing explains. A

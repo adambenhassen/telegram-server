@@ -104,6 +104,14 @@ SELECT coalesce(pg_sequence_last_value('files_id_seq'), 0)::bigint;
 -- name: ExistingFileIDs :many
 SELECT id FROM files WHERE id = ANY(sqlc.arg(ids)::bigint[]);
 
+-- FileExistsForBlob is the final database check before an assembled blob with
+-- no row may be reclaimed. It deliberately sees stored and not-stored rows:
+-- the latter are live upload assemblies and are a different class only in the
+-- row-driven pass. A plain existence probe does not wait on a row lock, so an
+-- eraser never parks upload, send or download traffic behind this check.
+-- name: FileExistsForBlob :one
+SELECT EXISTS (SELECT 1 FROM files WHERE id = $1);
+
 -- MediaErasureScan classifies one bounded window of files rows: for each row it
 -- reports whether anything live references it, and whether it is past the age
 -- cutoff. It names nothing for deletion; it deletes nothing.
@@ -184,6 +192,14 @@ LIMIT sqlc.arg(lim)::int;
 -- eraser that waited would be the one parking the chat. A row someone else
 -- holds is somebody's live reference being written; it is not a candidate this
 -- second, and the next sweep will read it again.
+--
+-- Assembly has one additional interlock because the row is not visible until
+-- allocation commits: it holds a session advisory claim before that commit,
+-- then takes this row FOR SHARE before Put and holds it through
+-- MarkFileStored's commit. The eraser tests that claim with a nonblocking
+-- transaction advisory try-lock after this row lock. If it got the row first,
+-- the failed try-lock makes it commit a no-op and retain the row; it never
+-- waits on the connection carrying the blob Put.
 -- name: LockFileForErase :one
 SELECT id, size FROM files WHERE id = $1 FOR UPDATE SKIP LOCKED;
 
@@ -241,6 +257,29 @@ WHERE f.id = sqlc.arg(id)
   AND NOT EXISTS (
       SELECT 1 FROM messages m
       WHERE m.file_id = f.id AND m.deleted = false
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM channel_messages cm
+      WHERE cm.file_id = f.id AND cm.deleted = false
+  );
+
+-- DeleteUnassembledFile is the crashed-assembly half of the row-driven
+-- reclaim. The caller takes the files row FOR UPDATE SKIP LOCKED first and
+-- tests the assembly claim without waiting, so a live assembly holding the
+-- claim and the same row FOR SHARE from before Put through MarkFileStored's
+-- commit is retained whether it arrived before or after the eraser's row lock.
+-- This statement repeats every reclaim condition under that exclusive hold: a
+-- completed assembly or a new live reference retains the row. Age is an
+-- additional gate, not the safety control. The caller unlinks the exact key
+-- only after this row deletion commits.
+-- name: DeleteUnassembledFile :execrows
+DELETE FROM files f
+WHERE f.id = sqlc.arg(id)
+  AND f.stored = false
+  AND f.date < sqlc.arg(older_than)::timestamptz
+  AND NOT EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.file_id = f.id AND m.file_id <> 0 AND m.deleted = false
   )
   AND NOT EXISTS (
       SELECT 1 FROM channel_messages cm
