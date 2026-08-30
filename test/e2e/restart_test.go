@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,14 +160,52 @@ func TestRestartPersistence(t *testing.T) {
 }
 
 // mustListen binds a TCP listener on addr, failing the test on error.
-// testBlobs opens a blob store rooted in the test's own temporary directory.
+// testBlobs selects the local backend by default and the S3 backend when the
+// CI object-store gate supplies TG_BLOB_S3_ENDPOINT.
 func testBlobs(t *testing.T) blob.Store {
 	t.Helper()
+	if endpoint := os.Getenv("TG_BLOB_S3_ENDPOINT"); endpoint != "" {
+		remote, err := blob.NewS3(blob.S3Config{
+			Endpoint:          endpoint,
+			Bucket:            os.Getenv("TG_BLOB_S3_BUCKET"),
+			Prefix:            testBlobPrefix(t),
+			Region:            os.Getenv("TG_BLOB_S3_REGION"),
+			AccessKeyID:       os.Getenv("TG_BLOB_S3_ACCESS_KEY_ID"),
+			SecretAccessKey:   os.Getenv("TG_BLOB_S3_SECRET_ACCESS_KEY"),
+			AllowInsecureHTTP: os.Getenv("TG_BLOB_S3_ALLOW_INSECURE_HTTP") == "true",
+			OperationTimeout:  10 * time.Second,
+			MaxAttempts:       3,
+		})
+		if err != nil {
+			t.Fatalf("S3 blob store: %v", err)
+		}
+		if err := remote.Check(context.Background()); err != nil {
+			t.Fatalf("S3 blob store check: %v", err)
+		}
+		return remote
+	}
 	b, err := blob.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
 	}
 	return b
+}
+
+func testBlobPrefix(t *testing.T) string {
+	t.Helper()
+	root := strings.Trim(os.Getenv("TG_BLOB_S3_PREFIX"), "/")
+	if root == "" {
+		root = "e2e"
+	}
+	scope := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, t.Name())
+	return root + "/" + strings.Trim(scope, "-") + "/"
 }
 
 func mustListen(t *testing.T, ctx context.Context, addr string) net.Listener {
@@ -184,10 +224,7 @@ func bootServer(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int
 	t.Helper()
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	// Sign-in here reads the code off the log, so the gated line must be on.
-	blobs, err := blob.NewLocal(t.TempDir())
-	if err != nil {
-		t.Fatalf("blob store: %v", err)
-	}
+	blobs := testBlobs(t)
 	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 

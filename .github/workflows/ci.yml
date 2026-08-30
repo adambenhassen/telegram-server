@@ -712,9 +712,10 @@ jobs:
   # runs — the gate that stops it rotting.
   compose:
     runs-on: ubuntu-latest
-    # Two boots on top of the image build, which is the slow part at roughly a
-    # minute; this only catches a hang before it burns six hours.
-    timeout-minutes: 20
+    # Two filesystem boots plus one RustFS boot on top of the image build, which
+    # is the slow part at roughly a minute; this only catches a hang before it
+    # burns six hours.
+    timeout-minutes: 30
 
     # Same reason as the docker job: the cache backend is the Actions API, and a
     # job-level block replaces the workflow-level contents: read entirely.
@@ -722,8 +723,19 @@ jobs:
       contents: read
       actions: write
 
+    env:
+      # The remote media gate below uses the same testcontainers Postgres
+      # harness as `make test`; the runner is disposable, so its reaper only
+      # adds a way to kill the shared test database mid-suite.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+
     steps:
       - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
 
       # Compose builds with the default builder, which cannot read type=gha, so
       # the image is built here instead and loaded into the daemon under the tag
@@ -975,6 +987,165 @@ jobs:
           # the assertions above it, so ask again at the end.
           assert_running "after the migrate assertions"
 
+      - name: Boot RustFS and exercise the object-store backend
+        run: |
+          compose() {
+            docker compose -f docker-compose.yml -f docker-compose.rustfs.yml "$@"
+          }
+
+          # Stop the filesystem scenario before reusing the published ports.
+          # Its named volumes are intentionally left in place; the object-store
+          # scenario must not need to destroy the normal local state to start.
+          docker compose down
+          compose up -d
+
+          # RustFS has a real readiness endpoint, unlike the distroless
+          # telegramd image. Check it directly so a failed dependency cannot be
+          # mistaken for an S3 authentication failure below.
+          for _ in $(seq 60); do
+            if compose exec -T rustfs wget -q -O /dev/null http://127.0.0.1:9000/health/ready; then
+              break
+            fi
+            sleep 1
+          done
+          if ! compose exec -T rustfs wget -q -O /dev/null http://127.0.0.1:9000/health/ready; then
+            compose ps -a
+            compose logs rustfs
+            echo "RustFS never became ready"
+            exit 1
+          fi
+
+          wait_listening() {
+            for _ in $(seq 60); do
+              if compose logs telegramd 2>&1 | grep -q 'msg=listening'; then
+                if [ -z "$(compose ps --status running -q telegramd)" ]; then
+                  compose ps -a
+                  compose logs telegramd
+                  echo "telegramd logged msg=listening then stopped"
+                  return 1
+                fi
+                return 0
+              fi
+              sleep 1
+            done
+            compose ps -a
+            compose logs
+            echo "telegramd never reached msg=listening"
+            return 1
+          }
+          wait_listening
+          compose logs telegramd
+
+          # A successful start proves that the server selected S3 and passed
+          # its authenticated namespace check. The warning also records why
+          # this CI-only endpoint is allowed to use HTTP.
+          if ! compose logs telegramd 2>&1 | grep -q 'blob S3 endpoint is using plaintext HTTP'; then
+            echo "telegramd did not select the documented loopback HTTP S3 endpoint"
+            exit 1
+          fi
+
+          # Seed one known object for the negative public-access checks and a
+          # second object whose content is checked only after a RustFS restart.
+          # The initializer creates the bucket but never rewrites either object.
+          compose run --rm --no-deps --entrypoint /bin/sh rustfs-init -ec \
+            'mc alias set local http://rustfs:9000 "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" >/dev/null &&
+             printf security-check | mc pipe local/telegram/security-check &&
+             printf rustfs-durability-canary | mc pipe local/telegram/durability-check'
+
+          authenticated_mc() {
+            script=$1
+            compose run --rm --no-deps --entrypoint /bin/sh rustfs-init -ec "$script"
+          }
+
+          # First prove that both targets exist with credentials. The mc
+          # endpoint is the same RustFS bucket and object path as the loopback
+          # URLs below; only the compose-internal hostname differs.
+          got=$(authenticated_mc \
+            'mc alias set local http://rustfs:9000 "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" >/dev/null &&
+             mc cat local/telegram/security-check')
+          [ "$got" = security-check ] \
+            || { echo "authenticated GET did not return the seeded object"; exit 1; }
+
+          listed=$(authenticated_mc \
+            'mc alias set local http://rustfs:9000 "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" >/dev/null &&
+             mc ls local/telegram')
+          case "$listed" in
+            *security-check*) ;;
+            *)
+              echo "authenticated LIST did not return the seeded object"
+              printf '%s\n' "$listed"
+              exit 1
+              ;;
+          esac
+
+          assert_forbidden() {
+            name=$1
+            url=$2
+            # BusyBox wget writes -S response headers to stderr. Redirect that
+            # stream into stdout while discarding the body, then inspect the
+            # actual HTTP status rather than treating every request failure as
+            # an access-control result.
+            response=$(compose exec -T rustfs sh -c \
+              'wget -S -O /dev/null "$1" 2>&1 >/dev/null' rustfs-wget "$url" 2>&1) || true
+            status=$(printf '%s\n' "$response" \
+              | sed -n 's/.*HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' \
+              | tail -1)
+            if [ "$status" != 403 ]; then
+              echo "$name returned HTTP ${status:-unknown}, want 403"
+              printf '%s\n' "$response"
+              return 1
+            fi
+          }
+
+          # These requests deliberately contain no Authorization header. A
+          # public GET leaks the known object; a public LIST leaks every key in
+          # the bucket. Both must return the access-denied status against the
+          # RustFS deployment we run.
+          assert_forbidden "unauthenticated GET" \
+            "http://127.0.0.1:9000/telegram/security-check"
+          assert_forbidden "unauthenticated LIST" \
+            "http://127.0.0.1:9000/telegram?list-type=2"
+
+          # The media E2E path uses the same S3 backend for parts, assembly and
+          # download. The prefix is per-test, so the three parallel tests do
+          # not share keys; these are fixed CI credentials, never repository
+          # secrets.
+          TG_BLOB_S3_ENDPOINT=http://127.0.0.1:9000 \
+          TG_BLOB_S3_BUCKET=telegram \
+          TG_BLOB_S3_PREFIX=ci/ \
+          TG_BLOB_S3_REGION=us-east-1 \
+          TG_BLOB_S3_ACCESS_KEY_ID=TELEGRAMDLOCAL \
+          TG_BLOB_S3_SECRET_ACCESS_KEY=TELEGRAMDLOCALSECRET \
+          TG_BLOB_S3_ALLOW_INSECURE_HTTP=true \
+            go test -race -count=1 -timeout 15m ./test/e2e -run '^TestMediaRoundTrip$'
+
+          rustfs_volume() {
+            cid=$(compose ps -q rustfs)
+            [ -n "$cid" ] || { echo "no RustFS container" >&2; return 1; }
+            docker inspect "$cid" \
+              --format '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "/data")}}{{.Name}}{{end}}{{end}}'
+          }
+
+          rustfs_before=$(rustfs_volume)
+          [ -n "$rustfs_before" ] || { echo "RustFS data is not on a named volume"; exit 1; }
+          echo "RustFS data volume=$rustfs_before"
+
+          # `down` without -v is the durability contract. The initializer only
+          # verifies the bucket still exists; it cannot recreate the canary.
+          compose down
+          compose up -d
+          wait_listening
+          rustfs_after=$(rustfs_volume)
+          [ "$rustfs_before" = "$rustfs_after" ] \
+            || { echo "RustFS data volume changed: $rustfs_before -> $rustfs_after"; exit 1; }
+
+          canary=$(compose run --rm --no-deps --entrypoint /bin/sh rustfs-init -ec \
+            'mc alias set local http://rustfs:9000 "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" >/dev/null && mc cat local/telegram/durability-check')
+          [ "$canary" = rustfs-durability-canary ] \
+            || { echo "RustFS object did not survive docker compose down: read $canary"; exit 1; }
+
       - name: Tear down
         if: always()
-        run: docker compose down -v
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.rustfs.yml down -v
+          docker compose down -v

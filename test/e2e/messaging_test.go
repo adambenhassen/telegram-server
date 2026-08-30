@@ -18,7 +18,6 @@ import (
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
@@ -228,10 +227,7 @@ func bootServerWithLimits(
 	t.Helper()
 	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
 	// Sign-in here reads the code off the log, so the gated line must be on.
-	blobs, err := blob.NewLocal(t.TempDir())
-	if err != nil {
-		t.Fatalf("blob store: %v", err)
-	}
+	blobs := testBlobs(t)
 	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 

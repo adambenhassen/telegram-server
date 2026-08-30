@@ -81,6 +81,23 @@ unless `TG_BLOB_S3_ALLOW_INSECURE_HTTP=true` is explicitly set for a loopback
 or compose-only endpoint; startup logs a warning when this escape hatch is
 used. There is no TLS verification bypass setting.
 
+For local development, copy `.env.example` to `.env` and run:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.rustfs.yml up
+```
+
+The overlay starts RustFS, creates the `telegram` bucket, and uses fixed
+throwaway credentials with loopback-only plaintext HTTP. It is not a deployment
+example. Use the same two files for `down`; `down -v` removes the RustFS data
+volume too.
+
+Switching an existing deployment from the local filesystem to S3 is a manual
+data move. There is no automated migration path, and this project provides no
+backup for the blob store. Copy and verify existing objects in the configured
+bucket and prefix before changing the backend; a named volume is persistence,
+not a backup or restore mechanism.
+
 ### What the pre-auth bounds do and do not cover
 
 The three `TG_*PREAUTH*` settings bound connections that have not authenticated:
