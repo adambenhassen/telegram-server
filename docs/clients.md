@@ -33,8 +33,8 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_AUTHKEY_ENC_KEY`| *(required)*     | 64 hex chars (32 bytes) — master key that encrypts auth keys at rest; must stay stable, or persisted sessions can no longer be decrypted |
 | `TG_AUTHKEY_ENC_KEY_FILE`| *(unset)*   | Path the master key is read from when `TG_AUTHKEY_ENC_KEY` is empty, and generated into (0600) on first start when that file does not exist. One of the two must be set — with neither, startup fails. A generated key is a dev key and the server logs a warning saying so |
 | `TG_RSA_KEY_PATH`   | `server_key.pem` | Path to the server's RSA private key        |
-| `TG_BLOB_DIR`       | `blobs`           | Local filesystem blob root; used when all `TG_BLOB_S3_*` variables are unset |
-| `TG_BLOB_S3_ENDPOINT` | *(unset)*       | Enables the S3-compatible blob backend; setting any `TG_BLOB_S3_*` variable selects it and requires the complete configuration |
+| `TG_BLOB_DIR`       | `blobs`           | Local filesystem blob root; used when all `TG_BLOB_S3_*` variables are unset or empty |
+| `TG_BLOB_S3_ENDPOINT` | *(unset)*       | Enables the S3-compatible blob backend; setting any non-empty `TG_BLOB_S3_*` variable selects it and requires the complete configuration |
 | `TG_BLOB_S3_BUCKET` | *(unset)*         | Private bucket containing blobs |
 | `TG_BLOB_S3_PREFIX` | *(unset)*         | Required non-root prefix assigned to this server |
 | `TG_BLOB_S3_REGION` | `us-east-1`       | SigV4 signing region |
@@ -55,10 +55,11 @@ Configuration is read from environment variables in `internal/config/config.go`:
 
 ### Object-store backend
 
-With all `TG_BLOB_S3_*` variables unset, uploaded blobs use the local
+With all `TG_BLOB_S3_*` variables unset or empty, uploaded blobs use the local
 filesystem at `TG_BLOB_DIR`, exactly as before. Setting any object-store
-variable selects S3 mode and requires an endpoint, bucket, non-empty prefix,
-access key, and exactly one secret source. The server validates the S3 client
+variable to a non-empty value selects S3 mode and requires an endpoint, bucket,
+non-empty prefix, access key, and exactly one secret source. The server validates
+the S3 client
 and lists the configured namespace before it opens for service; a failed check
 stops startup and never falls back to local storage.
 

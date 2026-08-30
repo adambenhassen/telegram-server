@@ -71,8 +71,8 @@ type Config struct {
 	// repository and outside anything a future HTTP surface serves statically.
 	BlobDir string
 	// BlobS3 selects the S3-compatible blob backend when any TG_BLOB_S3_*
-	// setting is present. A nil value keeps the local filesystem backend as the
-	// default. The secret is resolved during Load so startup can reject a
+	// setting is non-empty. A nil value keeps the local filesystem backend as
+	// the default. The secret is resolved during Load so startup can reject a
 	// missing or unreadable credential before serving requests.
 	BlobS3 *blob.S3Config
 	// MaxUserStorageBytes caps the total size of one account's uploaded files.
@@ -903,7 +903,7 @@ func loadBlobS3Config() (*blob.S3Config, error) {
 
 func blobS3Configured() bool {
 	for _, name := range blobS3ConfigEnvNames {
-		if _, ok := os.LookupEnv(name); ok {
+		if os.Getenv(name) != "" {
 			return true
 		}
 	}

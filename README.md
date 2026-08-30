@@ -118,7 +118,7 @@ The server refuses to start without a database and a master key:
 | `TG_LISTEN_ADDR` | `:2443` | Address the MTProto listener binds |
 | `TG_RSA_KEY_PATH` | `server_key.pem` | Server RSA private key; generated on first start |
 | `TG_BLOB_DIR` | `blobs` | Where uploaded file bodies are written |
-| `TG_BLOB_S3_ENDPOINT` | *(unset)* | Enables the S3-compatible blob backend; requires the other `TG_BLOB_S3_*` settings below |
+| `TG_BLOB_S3_ENDPOINT` | *(unset)* | Enables the S3-compatible blob backend when non-empty; requires the other `TG_BLOB_S3_*` settings below |
 | `TG_BLOB_S3_BUCKET` | *(unset)* | Private bucket containing blobs |
 | `TG_BLOB_S3_PREFIX` | *(unset)* | Required non-root prefix assigned to this server |
 | `TG_BLOB_S3_REGION` | `us-east-1` | SigV4 signing region |
@@ -136,10 +136,11 @@ The server refuses to start without a database and a master key:
 
 ### Object-store backend
 
-With all `TG_BLOB_S3_*` variables unset, uploaded blobs use the local
+With all `TG_BLOB_S3_*` variables unset or empty, uploaded blobs use the local
 filesystem at `TG_BLOB_DIR`, exactly as before. Setting any object-store
-variable selects S3 mode and requires an endpoint, bucket, non-empty prefix,
-access key, and exactly one secret source. The server validates the S3 client
+variable to a non-empty value selects S3 mode and requires an endpoint, bucket,
+non-empty prefix, access key, and exactly one secret source. The server validates
+the S3 client
 and lists the configured namespace before it opens for service; a failed check
 stops startup and never falls back to local storage.
 

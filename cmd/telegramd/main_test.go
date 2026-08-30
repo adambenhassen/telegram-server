@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,9 +40,9 @@ func TestNewBlobStoreDefaultsToLocal(t *testing.T) {
 
 func TestNewBlobStoreChecksConfiguredS3AtStartup(t *testing.T) {
 	t.Parallel()
-	var requests int
+	var requests atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
+		requests.Add(1)
 		if r.Method != http.MethodGet || r.URL.Query().Get("list-type") != "2" {
 			t.Errorf("startup request = %s %s, want S3 bucket listing", r.Method, r.URL)
 		}
@@ -67,8 +68,8 @@ func TestNewBlobStoreChecksConfiguredS3AtStartup(t *testing.T) {
 	if _, ok := got.(*blob.S3); !ok {
 		t.Fatalf("blob store type = %T, want *blob.S3", got)
 	}
-	if requests != 1 {
-		t.Fatalf("startup requests = %d, want 1", requests)
+	if requests.Load() != 1 {
+		t.Fatalf("startup requests = %d, want 1", requests.Load())
 	}
 }
 

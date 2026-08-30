@@ -57,6 +57,25 @@ func TestLoadBlobS3UnsetUsesLocalDefault(t *testing.T) {
 	}
 }
 
+func TestLoadBlobS3EmptySettingsKeepLocalDefault(t *testing.T) {
+	for _, name := range blobS3EnvNames {
+		t.Run(name, func(t *testing.T) {
+			clearBlobS3Env(t)
+			t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+			t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+			t.Setenv(name, "")
+
+			cfg, err := config.Load(discardLog())
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.BlobS3 != nil {
+				t.Fatalf("BlobS3 = %+v, want nil for empty %s", cfg.BlobS3, name)
+			}
+		})
+	}
+}
+
 func TestLoadBlobS3FromSecretFile(t *testing.T) {
 	clearBlobS3Env(t)
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
