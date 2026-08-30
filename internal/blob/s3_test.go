@@ -187,21 +187,31 @@ func TestStoreConformance(t *testing.T) {
 	}
 }
 
-type minioHarness struct {
-	once      sync.Once
-	endpoint  string
-	namespace string
-	err       error
+func TestMinioHarnessDoesNotReuseContainer(t *testing.T) {
+	t.Parallel()
+
+	// A fixed-name reusable container can belong to another test process and
+	// carry its image, credentials, or lifecycle state. Each harness must own a
+	// fresh endpoint instead.
+	first := newMinioHarness(t).endpoint
+	second := newMinioHarness(t).endpoint
+	if first == second {
+		t.Fatalf("MinIO harness reused endpoint %q across independent setups", first)
+	}
 }
 
-var sharedMinio minioHarness
+type minioHarness struct {
+	endpoint  string
+	namespace string
+	container testcontainers.Container
+}
 
 func newMinioStore(t *testing.T) *blob.S3 {
 	t.Helper()
-	endpoint := sharedMinioEndpoint(t)
-	prefix := "conformance/" + sharedMinio.namespace + "/" + strings.NewReplacer("/", "-", "_", "-").Replace(t.Name()) + "/"
+	harness := newMinioHarness(t)
+	prefix := "conformance/" + harness.namespace + "/" + strings.NewReplacer("/", "-", "_", "-").Replace(t.Name()) + "/"
 	store, err := blob.NewS3(blob.S3Config{
-		Endpoint:          endpoint,
+		Endpoint:          harness.endpoint,
 		Bucket:            "blob-conformance",
 		Prefix:            prefix,
 		Region:            "us-east-1",
@@ -217,65 +227,141 @@ func newMinioStore(t *testing.T) *blob.S3 {
 	return store
 }
 
-func sharedMinioEndpoint(t *testing.T) string {
+func newMinioHarness(t *testing.T) *minioHarness {
 	t.Helper()
-	sharedMinio.once.Do(func() {
-		ctx := context.Background()
-		container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Image:        "minio/minio:latest",
-				Name:         "tg-test-s3",
-				ExposedPorts: []string{"9000/tcp"},
-				Env: map[string]string{
-					"MINIO_ROOT_USER":     "minioadmin",
-					"MINIO_ROOT_PASSWORD": "minioadmin",
-				},
-				Cmd:        []string{"server", "/data"},
-				WaitingFor: wait.ForHTTP("/minio/health/live").WithPort("9000/tcp"),
+	ctx := context.Background()
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "minio/minio:latest",
+			ExposedPorts: []string{"9000/tcp"},
+			Env: map[string]string{
+				"MINIO_ROOT_USER":     "minioadmin",
+				"MINIO_ROOT_PASSWORD": "minioadmin",
 			},
-			Started: true,
-			Reuse:   true,
-		})
-		if err != nil {
-			sharedMinio.err = err
-			return
+			Cmd:        []string{"server", "/data"},
+			WaitingFor: wait.ForHTTP("/minio/health/ready").WithPort("9000/tcp"),
+		},
+		Started: true,
+	})
+	if err != nil {
+		if container != nil {
+			logMinioFailure(t, container, "")
+			if cleanupErr := container.Terminate(context.Background()); cleanupErr != nil {
+				t.Logf("MinIO cleanup after startup failure: %v", cleanupErr)
+			}
 		}
-		host, err := container.Host(ctx)
-		if err != nil {
-			sharedMinio.err = err
-			return
-		}
-		port, err := container.MappedPort(ctx, "9000/tcp")
-		if err != nil {
-			sharedMinio.err = err
-			return
-		}
-		sharedMinio.endpoint = "http://" + net.JoinHostPort(host, port.Port())
-		sharedMinio.namespace = "run-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		t.Fatalf("start MinIO container: %v", err)
+	}
 
-		admin, err := blob.NewS3(blob.S3Config{
-			Endpoint:          sharedMinio.endpoint,
-			Bucket:            "blob-conformance",
-			Prefix:            "conformance/",
-			Region:            "us-east-1",
-			AccessKeyID:       "minioadmin",
-			SecretAccessKey:   "minioadmin",
-			AllowInsecureHTTP: true,
-			OperationTimeout:  10 * time.Second,
-			MaxAttempts:       3,
-		})
-		if err != nil {
-			sharedMinio.err = err
-			return
+	harness := &minioHarness{container: container}
+	t.Cleanup(func() {
+		if t.Failed() {
+			logMinioFailure(t, harness.container, harness.endpoint)
 		}
-		if err := blob.CreateBucketForTest(ctx, admin); err != nil {
-			sharedMinio.err = err
+		if err := harness.container.Terminate(context.Background()); err != nil {
+			t.Errorf("terminate MinIO container: %v", err)
 		}
 	})
-	if sharedMinio.err != nil {
-		t.Fatalf("MinIO harness: %v", sharedMinio.err)
+
+	host, err := container.Host(ctx)
+	if err != nil {
+		t.Fatalf("get MinIO host: %v", err)
 	}
-	return sharedMinio.endpoint
+	port, err := container.MappedPort(ctx, "9000/tcp")
+	if err != nil {
+		t.Fatalf("get MinIO port: %v", err)
+	}
+	harness.endpoint = "http://" + net.JoinHostPort(host, port.Port())
+	harness.namespace = "run-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+
+	admin, err := blob.NewS3(blob.S3Config{
+		Endpoint:          harness.endpoint,
+		Bucket:            "blob-conformance",
+		Prefix:            "conformance/",
+		Region:            "us-east-1",
+		AccessKeyID:       "minioadmin",
+		SecretAccessKey:   "minioadmin",
+		AllowInsecureHTTP: true,
+		OperationTimeout:  10 * time.Second,
+		MaxAttempts:       3,
+	})
+	if err != nil {
+		t.Fatalf("new MinIO admin store: %v", err)
+	}
+	if err := blob.CreateBucketForTest(ctx, admin); err != nil {
+		t.Fatalf("create MinIO bucket: %v", err)
+	}
+	return harness
+}
+
+func logMinioFailure(t *testing.T, container testcontainers.Container, endpoint string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	state, err := container.State(ctx)
+	if err != nil {
+		t.Logf("MinIO failure cause: unable to inspect container: %v", err)
+	} else {
+		cause := "MinIO was running; the S3 operation failed after readiness"
+		switch {
+		case state.OOMKilled:
+			cause = "MinIO container was killed by the OOM killer"
+		case state.Status != "running":
+			cause = "MinIO container stopped before the S3 operation completed"
+		case state.Error != "":
+			cause = "MinIO container reported a runtime error"
+		}
+		t.Logf("MinIO failure cause: %s (status=%s exit_code=%d oom_killed=%t error=%q)",
+			cause, state.Status, state.ExitCode, state.OOMKilled, redactMinioDiagnostic(state.Error))
+	}
+
+	if endpoint != "" {
+		logMinioHealth(t, ctx, endpoint)
+	}
+	logs, err := container.Logs(ctx)
+	if err != nil {
+		t.Logf("MinIO failure diagnostics: unable to read container logs: %v", err)
+		return
+	}
+	data, readErr := io.ReadAll(io.LimitReader(logs, 16*1024))
+	closeErr := logs.Close()
+	if readErr != nil {
+		t.Logf("MinIO failure diagnostics: unable to read complete container logs: %v", readErr)
+	}
+	if closeErr != nil {
+		t.Logf("MinIO failure diagnostics: unable to close container logs: %v", closeErr)
+	}
+	if len(data) > 0 {
+		t.Logf("MinIO container logs:\n%s", redactMinioDiagnostic(string(data)))
+	}
+}
+
+func logMinioHealth(t *testing.T, ctx context.Context, endpoint string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/minio/health/ready", nil)
+	if err != nil {
+		t.Logf("MinIO failure cause: health probe could not be created")
+		return
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Logf("MinIO failure cause: readiness probe was unavailable (%T)", err)
+		return
+	}
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		t.Logf("MinIO failure diagnostics: readiness probe body close failed: %v", closeErr)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		t.Logf("MinIO failure cause: readiness probe returned HTTP %s", resp.Status)
+		return
+	}
+	t.Logf("MinIO failure diagnostics: readiness probe returned HTTP %s while the container was running", resp.Status)
+}
+
+func redactMinioDiagnostic(value string) string {
+	return strings.ReplaceAll(value, "minioadmin", "<redacted>")
 }
 
 func writeS3Error(w http.ResponseWriter, status int, code string) {
