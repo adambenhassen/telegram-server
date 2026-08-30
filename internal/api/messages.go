@@ -1101,8 +1101,9 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 // unpins a message in a group chat or channel, stores the pinned message id
 // durably, and pushes updatePinnedMessages to all members.
 //
-// For chats: any member may pin (the chat is small and has no admin role). For
-// channels: only an admin (role >= 1) may pin. Non-admin callers get
+// For chats: only the creator may pin (basic chats have no role column, so the
+// creator is the sole privileged member). For channels: only an admin (role >= 1)
+// may pin. Non-admin callers get
 // CHAT_ADMIN_REQUIRED.
 //
 // Pinning the currently pinned message is idempotent: returns success without
