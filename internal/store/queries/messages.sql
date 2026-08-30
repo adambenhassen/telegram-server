@@ -36,8 +36,16 @@ LIMIT sqlc.arg(lim)::int;
 -- name: SetEditedText :exec
 UPDATE messages SET message = $3, edit_date = now() WHERE owner_id = $1 AND local_id = $2;
 
--- name: SetDeleted :exec
-UPDATE messages SET deleted = true WHERE owner_id = $1 AND local_id = $2;
+-- SetDeleted marks one owner-local message deleted and reports how many rows
+-- it changed. The `AND NOT deleted` predicate is the whole point: it makes the
+-- write the authority on whether the row was already gone, so a caller decides
+-- under the same serialisation as the update rather than off a `deleted` flag
+-- read before the per-owner locks. A second delete of the same row — a repeat
+-- self-delete, or a revoke walk resuming after a concurrent self-delete landed
+-- on the copy it is about to touch — changes zero rows instead of silently
+-- re-marking a row that is already deleted.
+-- name: SetDeleted :execrows
+UPDATE messages SET deleted = true WHERE owner_id = $1 AND local_id = $2 AND NOT deleted;
 
 -- name: SearchMessages :many
 SELECT * FROM messages

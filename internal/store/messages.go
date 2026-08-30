@@ -508,19 +508,22 @@ func editChatMessage(ctx context.Context, tx pgx.Tx, qtx *db.Queries, pre db.Mes
 
 // DeleteMessages marks the given owner-local messages deleted, emitting one
 // delete event per message per affected owner. It fails closed
-// (ErrMessageInvalid, no changes) if any id is absent. Returns the resulting
-// pts per affected user (owner and peers) for the caller to notify.
+// (ErrMessageInvalid, no changes) if any id is absent or already deleted.
+// Returns the resulting pts per affected user (owner and peers) for the caller
+// to notify.
 //
-// revoke controls a user-peer message: true soft-deletes both the owner row and
-// the mirror row and bumps both users' pts, false deletes only the caller's row
-// and bumps only the caller's pts, leaving the peer's row, pts and event log
-// untouched. The chat fan-out path ignores revoke: a chat delete always walks
-// every current member's copy, which is the only delete a chat message has.
-//
-// A chat message deletes every per-member copy of its fan-out instead of one
-// mirror row, so only its author may delete it and a service message may not be
-// deleted at all; the caller must also still be a member of every chat the batch
-// touches. A batch may span several chats and both peer types.
+// revoke controls which side of a delete a message has. For a user-peer message
+// true soft-deletes both the owner row and the mirror row and bumps both users'
+// pts, false deletes only the caller's row and bumps only the caller's pts,
+// leaving the peer's row, pts and event log untouched. For a chat message
+// false deletes only the caller's copy and bumps only the caller's pts: any
+// member may clear any message from their own view, including one they did not
+// write, and a caller who has left the chat may clear a retained copy. True
+// walks every current member's copy of the fan-out, so only the author may
+// take it, a service message may not be deleted at all, and the caller must
+// still be a member of every chat the batch touches. A batch may span several
+// chats and both peer types; each message behaves per the rule for its own
+// peer type.
 func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []int64, revoke bool) (map[int64]int, error) {
 	if len(localIDs) == 0 {
 		return map[int64]int{}, nil
@@ -533,8 +536,11 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 	qtx := s.q.WithTx(tx)
 
 	// Load every target first; a missing id fails the whole batch (fail closed).
-	// A chat target brings its whole fan-out along: every copy is deleted, so
-	// every copy's owner is locked and notified.
+	// Whether a target is already deleted is deliberately NOT decided here: this
+	// read is taken before lockOwners, so it is a snapshot a concurrent delete
+	// can overtake. The SetDeleted write below is the authority — its
+	// AND NOT deleted predicate and row count decide, under the same
+	// serialisation as the write, whether the row was already gone.
 	msgs := make([]db.Message, 0, len(localIDs))
 	owners := map[int64]bool{ownerID: true}
 	chats := map[int64]bool{}
@@ -549,7 +555,19 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 		}
 		msgs = append(msgs, m)
 		if PeerType(m.PeerType) == PeerTypeChat {
-			// Author only, service messages never, exactly as an edit. A chat
+			if !revoke {
+				// Self-only: the caller clears their own copy. No author check —
+				// the write below touches only this row — and no membership
+				// requirement, since a removed member keeps their retained copies
+				// and may clear them. The service-message guard stays: an
+				// announcement is server-authored and no member may destroy it,
+				// even from their own view.
+				if m.ActionType != 0 {
+					return nil, ErrMessageInvalid
+				}
+				continue
+			}
+			// Author only, service messages never, exactly as an edit. A revoke
 			// delete walks the same copy set an edit does, so without this a
 			// member deletes any message she holds a copy of out of every other
 			// member's history, and the edit path's service-message guard buys
@@ -569,6 +587,14 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 			continue
 		}
 		owners[m.PeerID] = true
+	}
+
+	// Test hook: fires after the fan-out copies are read (the snapshot the walk
+	// will act on) and before the per-owner locks are taken. That is the window
+	// a concurrent self-delete commits in while the walk is blocked on an owner
+	// lock — the overlap the walk's already-deleted check has to survive.
+	if s.deleteWalkHook != nil {
+		s.deleteWalkHook()
 	}
 
 	lockIDs := make([]int64, 0, len(owners))
@@ -593,6 +619,31 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 	perOwner := map[int64]int{}
 	for _, m := range msgs {
 		if PeerType(m.PeerType) == PeerTypeChat {
+			if len(fanouts[m.FanoutID]) == 0 {
+				// Self-only target: delete the caller's copy and nothing else.
+				// The membership read above never ran for it, and no other
+				// owner's row, pts or event log is touched. The write's row count
+				// is the authority on whether the copy was already gone: a
+				// concurrent self-delete that committed while this call waited on
+				// the owner lock changes zero rows, and the batch fails closed
+				// exactly as an unknown id would.
+				n, e := qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: ownerID, LocalID: m.LocalID})
+				if e != nil {
+					return nil, fmt.Errorf("delete own copy: %w", e)
+				}
+				if n == 0 {
+					return nil, ErrMessageInvalid
+				}
+				pts, e := qtx.BumpPtsOnly(ctx, ownerID)
+				if e != nil {
+					return nil, fmt.Errorf("bump own copy: %w", e)
+				}
+				if e = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: ownerID, Pts: pts, Type: int16(EventDelete), LocalID: m.LocalID}); e != nil {
+					return nil, fmt.Errorf("own copy delete event: %w", e)
+				}
+				perOwner[ownerID] = int(pts)
+				continue
+			}
 			for _, c := range fanouts[m.FanoutID] {
 				// Same rule as an edit: a member removed after the send keeps
 				// their copy, so the delete and its event stop at the current
@@ -600,8 +651,17 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 				if !members[m.PeerID][c.OwnerID] {
 					continue
 				}
-				if err = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: c.OwnerID, LocalID: c.LocalID}); err != nil {
-					return nil, fmt.Errorf("delete copy %d: %w", c.OwnerID, err)
+				// The write is the authority on whether the copy was already
+				// cleared: a self-delete that committed while this walk waited on
+				// the owner's lock changes zero rows, and the walk skips it rather
+				// than bumping the owner's pts a second time or emitting a second
+				// event for a row that is already gone from their view.
+				n, e := qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: c.OwnerID, LocalID: c.LocalID})
+				if e != nil {
+					return nil, fmt.Errorf("delete copy %d: %w", c.OwnerID, e)
+				}
+				if n == 0 {
+					continue
 				}
 				pts, e := qtx.BumpPtsOnly(ctx, c.OwnerID)
 				if e != nil {
@@ -614,8 +674,15 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 			}
 			continue
 		}
-		if err = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: ownerID, LocalID: m.LocalID}); err != nil {
-			return nil, fmt.Errorf("delete owner row: %w", err)
+		// The caller's own row is the named target: the write's row count is the
+		// authority on whether it was already deleted, and zero rows fails the
+		// batch closed rather than bumping the owner's pts for a gone row.
+		n, e := qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: ownerID, LocalID: m.LocalID})
+		if e != nil {
+			return nil, fmt.Errorf("delete owner row: %w", e)
+		}
+		if n == 0 {
+			return nil, ErrMessageInvalid
 		}
 		ownerPts, e := qtx.BumpPtsOnly(ctx, ownerID)
 		if e != nil {
@@ -628,8 +695,16 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 		if !revoke {
 			continue
 		}
-		if err = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: m.PeerID, LocalID: m.PeerLocalID}); err != nil {
-			return nil, fmt.Errorf("delete mirror row: %w", err)
+		// The mirror is the peer's own copy. If the peer already cleared it with
+		// a self-delete that committed while this revoke waited on their lock, the
+		// write changes zero rows and the peer's pts and event log stay put — no
+		// second bump or event for a row that is already gone.
+		n, e = qtx.SetDeleted(ctx, db.SetDeletedParams{OwnerID: m.PeerID, LocalID: m.PeerLocalID})
+		if e != nil {
+			return nil, fmt.Errorf("delete mirror row: %w", e)
+		}
+		if n == 0 {
+			continue
 		}
 		peerPts, e := qtx.BumpPtsOnly(ctx, m.PeerID)
 		if e != nil {

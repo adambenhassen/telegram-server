@@ -58,6 +58,16 @@ type Store struct {
 	// to the Store for the reason deniedHook is.
 	searchPageHook func()
 
+	// deleteWalkHook is a test-only callback fired in DeleteMessages after the
+	// fan-out copies are read and before the per-owner locks are taken. That gap
+	// is where a concurrent self-delete that committed while the walk waited on
+	// an owner lock lands — the window the walk's already-deleted check has to
+	// survive — and it is not otherwise reachable deterministically: a test that
+	// raced the walk from a goroutine would be asserting on whichever side the
+	// scheduler happened to run first.
+	// Scoped to the Store for the reason searchPageHook is.
+	deleteWalkHook func()
+
 	// eraseHook is a test-only callback fired in SweepMediaErasure between the
 	// scan that names a candidate and the transaction that erases it, carrying
 	// the file id. That gap is where every race this pass has to survive lands —

@@ -76,6 +76,12 @@ func AgeRateLimitWindow(ctx context.Context, s *Store, subjectID int64, surface 
 // their own hook without racing.
 func SetSearchPageHook(s *Store, fn func()) { s.searchPageHook = fn }
 
+// SetDeleteWalkHook installs the callback DeleteMessages fires after the fan-out
+// copies are read and before the per-owner locks are taken. Tests use it to
+// commit a competing self-delete in the window the walk's already-deleted check
+// exists to close. Scoped to the Store for the reason SetSearchPageHook is.
+func SetDeleteWalkHook(s *Store, fn func()) { s.deleteWalkHook = fn }
+
 const (
 	ListenerBackoffMin = listenerBackoffMin
 	ListenerBackoffMax = listenerBackoffMax
