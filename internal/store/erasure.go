@@ -211,10 +211,10 @@ type EraseCounts struct {
 	// the account's quota was carrying for it.
 	Erased      int
 	ErasedBytes int64
-	// Contended counts candidates whose files row another transaction held. A
-	// reference is being written to that file right now, or another replica's
-	// sweep reached it first; either way it is not this pass's, and the next
-	// sweep reads it again.
+	// Contended counts candidates whose files row or assembly claim another
+	// transaction held. A reference or assembly is using that file right now,
+	// or another replica's sweep reached it first; either way it is not this
+	// pass's, and the next sweep reads it again.
 	Contended int
 	// Retained counts candidates the erase transaction refused: the file gained
 	// a reference, or stopped meeting the age or stored condition, between the
@@ -324,14 +324,16 @@ func (s *Store) SweepMediaErasure(ctx context.Context, olderThan time.Time, batc
 			}
 		}
 		// Not-stored rows are a separate reclaim class, but they use the same
-		// row interlock and the same row-first ordering. A live assembly holds
-		// the row FOR SHARE from before Put through MarkFileStored's commit, so
-		// LockFileForErase skips it rather than queueing behind it. If the
-		// assembly's connection dies, the lock dies with it and the row becomes
-		// reclaimable. DeleteUnassembledFile still decides again under an
-		// exclusive hold, so an assembly that completes or gains a live
-		// reference is retained. Age is an additional gate, not the safety
-		// control; MAIN-338 remains the follow-up for assembly duration policy.
+		// row-first interlock. A live assembly holds a session claim from before
+		// allocation commits, then holds the row FOR SHARE from before Put through
+		// MarkFileStored's commit. LockFileForErase skips a row already under that
+		// shared hold; if the eraser gets the row first, its nonblocking claim try
+		// fails and it commits a no-op, so the upload proceeds. If the assembly's
+		// connection dies, the session claim and row lock die with it and the row
+		// becomes reclaimable. DeleteUnassembledFile still decides again under an
+		// exclusive hold, so an assembly that completes or gains a live reference
+		// is retained. Age is an additional gate, not the safety control;
+		// MAIN-338 remains the follow-up for assembly duration policy.
 		for _, c := range scan.Unassembled {
 			counts.UnassembledConsidered++
 			out, err := s.eraseCandidate(ctx, c, olderThan, false)
@@ -397,6 +399,16 @@ func (s *Store) eraseCandidate(ctx context.Context, c ErasureCandidate, olderTha
 			return contended, nil
 		}
 		return retained, fmt.Errorf("erase file %d: lock: %w", c.ID, err)
+	}
+	claimed, err := tryFileAssemblyClaim(ctx, tx, c.ID)
+	if err != nil {
+		return retained, fmt.Errorf("erase file %d: assembly claim: %w", c.ID, err)
+	}
+	if !claimed {
+		if err := tx.Commit(ctx); err != nil {
+			return retained, fmt.Errorf("erase file %d: contended commit: %w", c.ID, err)
+		}
+		return contended, nil
 	}
 	if _, err = qtx.ClearDeletedChannelFileRefs(ctx, &c.ID); err != nil {
 		return retained, fmt.Errorf("erase file %d: clear channel refs: %w", c.ID, err)

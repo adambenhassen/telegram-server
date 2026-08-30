@@ -67,6 +67,13 @@ type Store struct {
 	// for the reason deniedHook is.
 	eraseHook func(fileID int64)
 
+	// assemblyClaimHook is a test-only callback fired after an assembly's
+	// allocation transaction commits with its session claim held and before the
+	// completion transaction takes the files row lock. It controls the reverse
+	// ordering where the eraser gets the row first without exposing that seam to
+	// production callers.
+	assemblyClaimHook func(fileID int64)
+
 	// now reads the clock the client-visible rate-limit wait is measured
 	// against. Production always holds time.Now; it is a field so a test can
 	// pin the remainder of an open window to an exact sub-second value instead

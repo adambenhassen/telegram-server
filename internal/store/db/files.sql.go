@@ -90,13 +90,14 @@ type DeleteUnassembledFileParams struct {
 }
 
 // DeleteUnassembledFile is the crashed-assembly half of the row-driven
-// reclaim. The caller takes the files row FOR UPDATE SKIP LOCKED first, so a
-// live assembly holding the same row FOR SHARE from before Put through
-// MarkFileStored's commit is skipped rather than queued behind. This statement
-// repeats every reclaim condition under that exclusive hold: a completed
-// assembly or a new live reference retains the row. Age is an additional gate,
-// not the safety control. The caller unlinks the exact key only after this row
-// deletion commits.
+// reclaim. The caller takes the files row FOR UPDATE SKIP LOCKED first and
+// tests the assembly claim without waiting, so a live assembly holding the
+// claim and the same row FOR SHARE from before Put through MarkFileStored's
+// commit is retained whether it arrived before or after the eraser's row lock.
+// This statement repeats every reclaim condition under that exclusive hold: a
+// completed assembly or a new live reference retains the row. Age is an
+// additional gate, not the safety control. The caller unlinks the exact key
+// only after this row deletion commits.
 func (q *Queries) DeleteUnassembledFile(ctx context.Context, arg DeleteUnassembledFileParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteUnassembledFile, arg.ID, arg.OlderThan)
 	if err != nil {
@@ -372,6 +373,14 @@ type LockFileForEraseRow struct {
 // eraser that waited would be the one parking the chat. A row someone else
 // holds is somebody's live reference being written; it is not a candidate this
 // second, and the next sweep will read it again.
+//
+// Assembly has one additional interlock because the row is not visible until
+// allocation commits: it holds a session advisory claim before that commit,
+// then takes this row FOR SHARE before Put and holds it through
+// MarkFileStored's commit. The eraser tests that claim with a nonblocking
+// transaction advisory try-lock after this row lock. If it got the row first,
+// the failed try-lock makes it commit a no-op and retain the row; it never
+// waits on the connection carrying the blob Put.
 func (q *Queries) LockFileForErase(ctx context.Context, id int64) (LockFileForEraseRow, error) {
 	row := q.db.QueryRow(ctx, lockFileForErase, id)
 	var i LockFileForEraseRow

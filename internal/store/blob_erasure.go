@@ -315,13 +315,15 @@ func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (
 	return counts, firstErr
 }
 
-// reclaimTempBlob applies the row interlock to an aged assembled temporary.
-// A live assembly holds the row FOR SHARE from before Put through the stored
-// transition's commit, so LockFileForErase skips it rather than waiting. If
-// the row is absent, the absence decision is committed before Remove; if the
-// row is present but not reclaimable, the transaction rolls back and the temp
-// stays for a later pass. Database failures are kept separate from unlink
-// failures for the worker-local counters.
+// reclaimTempBlob applies the assembly claim and files-row interlock to an aged
+// assembled temporary. A live assembly holds its session claim from before the
+// allocation commit and the row FOR SHARE from before Put through the stored
+// transition's commit, so LockFileForErase either skips it or, when the eraser
+// gets the row first, the nonblocking claim try retains it. If the row is
+// absent, the absence decision is committed before Remove; if the row is
+// present but not reclaimable, the transaction rolls back and the temp stays
+// for a later pass. Database failures are kept separate from unlink failures
+// for the worker-local counters.
 func (s *Store) reclaimTempBlob(ctx context.Context, c blobErasureCandidate, olderThan time.Time) (removed, contended, unlinkFailed bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -348,6 +350,17 @@ func (s *Store) reclaimTempBlob(ctx context.Context, c blobErasureCandidate, old
 			return false, false, true, fmt.Errorf("blob erasure: unlink temporary %q: %w", c.key, err)
 		}
 		return true, false, false, nil
+	}
+
+	claimed, err := tryFileAssemblyClaim(ctx, tx, c.id)
+	if err != nil {
+		return false, false, false, fmt.Errorf("blob erasure: check temporary %q: assembly claim: %w", c.key, err)
+	}
+	if !claimed {
+		if err := tx.Commit(ctx); err != nil {
+			return false, false, false, fmt.Errorf("blob erasure: check temporary %q: contended commit: %w", c.key, err)
+		}
+		return false, true, false, nil
 	}
 
 	if _, err := qtx.ClearDeletedChannelFileRefs(ctx, &c.id); err != nil {

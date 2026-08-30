@@ -334,6 +334,12 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 // connection independent of the Store's query layer.
 func StorePool(s *Store) *pgxpool.Pool { return s.pool }
 
+// SetAssemblyClaimHook installs the test seam that runs after allocation has
+// committed with its session claim held and before the completion transaction
+// takes the files row lock. It controls the eraser-first ordering without
+// exposing a production callback.
+func SetAssemblyClaimHook(s *Store, fn func(fileID int64)) { s.assemblyClaimHook = fn }
+
 // EraseFileRow deletes one files row. Nothing in the shipped server deletes one
 // — the eraser is a later stage of M17 — so this is the only way a test can
 // reach the state the reference interlock fails closed on.

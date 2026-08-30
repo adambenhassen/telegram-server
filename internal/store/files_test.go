@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,57 +139,70 @@ func TestMarkFileStoredIsOnce(t *testing.T) {
 	}
 }
 
-// The eraser's exclusive row lock can win the race before assembly starts its
-// shared hold. Assembly must wait for that decision rather than writing bytes
-// first and discovering after the fact that the row was removed. Releasing the
-// controlled eraser hold without deleting models the conditional delete's
-// retained outcome; once the row is available, the upload must complete.
-func TestCompleteFileAssemblySurvivesEraserRowLockFirst(t *testing.T) {
+// The allocation claim exists before the row is visible. If the eraser gets
+// the files row first, its nonblocking claim check commits a no-op and retains
+// the row; assembly then completes normally. This drives the real blob sweep,
+// including its commit path, rather than a test-only row lock that rolls back.
+func TestAllocateAndCompleteFileSurvivesEraserRowLockFirst(t *testing.T) {
 	t.Parallel()
 	s := open(t)
 	ctx := context.Background()
 	u := mustUser(t, s, "+15559100025")
-	f := allocate(t, s, u.ID, 11)
-
-	hold, err := store.HoldFileRow(ctx, s, f.ID)
-	if err != nil {
-		t.Fatalf("hold file row: %v", err)
-	}
-	defer hold.Release()
 
 	const body = "assembled"
-	started := make(chan struct{})
-	done := make(chan error, 1)
+	claimed := make(chan int64)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAssembly := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAssembly()
+	store.SetAssemblyClaimHook(s, func(fileID int64) {
+		claimed <- fileID
+		<-release
+	})
+	defer store.SetAssemblyClaimHook(s, nil)
+
+	type assemblyResult struct {
+		file store.File
+		err  error
+	}
+	done := make(chan assemblyResult, 1)
 	go func() {
-		done <- s.CompleteFileAssembly(ctx, f.ID, func() error {
-			close(started)
-			_, err := store.BlobsOf(s).Put(ctx, blob.Key(f.ID), bytes.NewReader([]byte(body)))
+		file, err := s.AllocateAndCompleteFile(ctx, u.ID, int64(len(body)), "text/plain", "hello.txt", bigQuota, func(file store.File) error {
+			_, err := store.BlobsOf(s).Put(ctx, blob.Key(file.ID), bytes.NewReader([]byte(body)))
 			return err
 		})
+		done <- assemblyResult{file: file, err: err}
 	}()
 
-	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
-		t.Fatalf("wait for assembly to block: %v", err)
-	}
-	select {
-	case <-started:
-		t.Fatal("assembly wrote bytes before acquiring the file row lock")
-	default:
+	fileID := <-claimed
+	tempKey := blob.Key(fileID) + blob.TempSuffix
+	if _, err := store.BlobsOf(s).Put(ctx, tempKey, bytes.NewReader([]byte("pending"))); err != nil {
+		t.Fatalf("plant temporary: %v", err)
 	}
 
-	hold.Release()
-	if err := <-done; err != nil {
-		t.Fatalf("complete assembly after eraser released the row: %v", err)
+	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("blob sweep: %v", err)
+	}
+	if counts.TempConsidered != 1 || counts.TempContended != 1 || counts.TempUnlinkAttempts != 0 {
+		t.Fatalf("blob sweep counts = %+v, want one claim-contended candidate and no unlink", counts)
+	}
+	if _, err := store.BlobsOf(s).ReadAt(ctx, tempKey, 0, 1); err != nil {
+		t.Fatalf("claim-contended temporary was removed: %v", err)
+	}
+	if err := store.BlobsOf(s).Remove(ctx, tempKey); err != nil {
+		t.Fatalf("remove planted temporary: %v", err)
 	}
 
-	var stored bool
-	if err := store.StorePool(s).QueryRow(ctx, "SELECT stored FROM files WHERE id = $1", f.ID).Scan(&stored); err != nil {
-		t.Fatalf("read stored flag: %v", err)
+	releaseAssembly()
+	result := <-done
+	if result.err != nil {
+		t.Fatalf("complete assembly after eraser committed its no-op: %v", result.err)
 	}
-	if !stored {
-		t.Fatal("assembly returned successfully without marking the row stored")
+	if result.file.ID != fileID || !result.file.Stored {
+		t.Fatalf("completed file = %+v, want id %d stored", result.file, fileID)
 	}
-	got, err := store.BlobsOf(s).ReadAt(ctx, blob.Key(f.ID), 0, int64(len(body)))
+	got, err := store.BlobsOf(s).ReadAt(ctx, blob.Key(fileID), 0, int64(len(body)))
 	if err != nil {
 		t.Fatalf("read assembled bytes: %v", err)
 	}

@@ -404,8 +404,10 @@ func inputFileParts(f tg.InputFileClass) (id int64, parts int, name string, err 
 // contract: the files row is created before the bytes are written and marked
 // stored only after, so a crash between them leaves a row that no download can
 // resolve rather than a file id serving whatever is at its key. The assembly
+// claim is acquired before the allocation commits, then the completion
 // transaction takes the files row's shared interlock before Put and holds it
-// through the stored transition's commit, so the eraser skips a live upload.
+// through the stored transition's commit, so the eraser cannot reclaim a live
+// upload even with a small cutoff.
 func (h *handlers) assembleFile(
 	ctx context.Context, userID, clientFileID int64, parts int, name, mimeType string,
 ) (store.File, error) {
@@ -447,17 +449,8 @@ func (h *handlers) assembleFile(
 		}
 	}
 
-	file, err := h.store.AllocateFile(ctx, userID, total, sanitizeMIME(mimeType), sanitizeFileName(name), h.maxUserStorageBytes)
-	if errors.Is(err, store.ErrStorageQuota) {
-		return store.File{}, errFileQuota
-	}
-	if err != nil {
-		h.log.Error("assemble file", "user_id", userID, "err", err)
-		return store.File{}, errInternal
-	}
-
 	var written int64
-	err = h.store.CompleteFileAssembly(ctx, file.ID, func() error {
+	file, err := h.store.AllocateAndCompleteFile(ctx, userID, total, sanitizeMIME(mimeType), sanitizeFileName(name), h.maxUserStorageBytes, func(file store.File) error {
 		var err error
 		written, err = h.blobs.Put(ctx, blob.Key(file.ID), &partsReader{
 			ctx: ctx, store: h.store, refs: refs,
@@ -472,6 +465,9 @@ func (h *handlers) assembleFile(
 		}
 		return nil
 	})
+	if errors.Is(err, store.ErrStorageQuota) {
+		return store.File{}, errFileQuota
+	}
 	if err != nil {
 		h.log.Error("assemble file", "user_id", userID, "file_id", file.ID, "err", err)
 		return store.File{}, errInternal
