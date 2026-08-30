@@ -153,6 +153,56 @@ func TestChatUserUnknownTargetIsPeerIDInvalid(t *testing.T) {
 	}
 }
 
+func TestDeleteChatUserNonCreatorIsPeerIDInvalid(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator := chatUser(t, s, 85)
+	member := chatUser(t, s, 86)
+	target := chatUser(t, s, 87)
+	chat, err := s.CreateChat(ctx, creator.ID, "Members", []int64{member.ID, target.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+
+	_, err = api.DeleteChatUserForTest(s, member.ID, &tg.MessagesDeleteChatUserRequest{
+		ChatID: chat.ID,
+		UserID: api.InputUser(member.ID, target.ID),
+	})
+	wantRPC(t, err, "PEER_ID_INVALID")
+	if got := apiParticipants(t, s, chat.ID); len(got) != 3 {
+		t.Fatalf("participants = %v, want unchanged 3", got)
+	}
+	for _, u := range []store.User{creator, member, target} {
+		if got := apiPts(t, s, u.ID); got != 0 {
+			t.Errorf("owner %d pts = %d, want 0", u.ID, got)
+		}
+	}
+}
+
+func TestDeleteChatUserCannotRemoveCreator(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator := chatUser(t, s, 88)
+	member := chatUser(t, s, 89)
+	chat, err := s.CreateChat(ctx, creator.ID, "Members", []int64{member.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+
+	for _, caller := range []store.User{creator, member} {
+		_, err = api.DeleteChatUserForTest(s, caller.ID, &tg.MessagesDeleteChatUserRequest{
+			ChatID: chat.ID,
+			UserID: api.InputUser(caller.ID, creator.ID),
+		})
+		wantRPC(t, err, "PEER_ID_INVALID")
+	}
+	if got := apiParticipants(t, s, chat.ID); len(got) != 2 {
+		t.Fatalf("participants = %v, want unchanged 2", got)
+	}
+}
+
 // A full chat reports USERS_TOO_MUCH, not the generic INTERNAL a dropped
 // ErrChatFull mapping would produce.
 func TestAddChatUserAtCapIsUsersTooMuch(t *testing.T) {
@@ -238,9 +288,10 @@ func TestAddChatUserAnnouncesToEveryMember(t *testing.T) {
 		t.Fatalf("create chat: %v", err)
 	}
 
-	enc, err := api.AddChatUserForTest(s, a.ID, &tg.MessagesAddChatUserRequest{
+	// Adding remains open to every member, not just the creator.
+	enc, err := api.AddChatUserForTest(s, b.ID, &tg.MessagesAddChatUserRequest{
 		ChatID:   chat.ID,
-		UserID:   api.InputUser(a.ID, c.ID),
+		UserID:   api.InputUser(b.ID, c.ID),
 		FwdLimit: 100,
 	})
 	if err != nil {
@@ -314,9 +365,9 @@ func TestDeleteChatUserAnnouncesToRemainingAndRemoved(t *testing.T) {
 		t.Fatalf("chat send: %v", err)
 	}
 
-	enc, err := api.DeleteChatUserForTest(s, b.ID, &tg.MessagesDeleteChatUserRequest{
+	enc, err := api.DeleteChatUserForTest(s, a.ID, &tg.MessagesDeleteChatUserRequest{
 		ChatID:        chat.ID,
-		UserID:        api.InputUser(b.ID, c.ID),
+		UserID:        api.InputUser(a.ID, c.ID),
 		RevokeHistory: true,
 	})
 	if err != nil {

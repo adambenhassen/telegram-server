@@ -174,12 +174,13 @@ func (h *handlers) handleCreateChat(r *mtproto.Request) (bin.Encoder, error) {
 // handleEditChatTitle serves messages.editChatTitle: one store call renames the
 // chat and announces the rename atomically.
 //
-// There is no membership check here on purpose. The store re-checks the caller
-// inside its own transaction under the chats row lock, and that is the
-// authorization boundary; a check here would run in a different transaction and
-// the gap between the two is exactly what an attacker removed from the chat
-// mid-call would ride. store.ErrNotMember covers both "not a member" and "no
-// such chat", and both must stay one wire error so chat ids are not enumerable.
+// There is no authorization check here on purpose. The store re-checks the
+// caller's membership and creator authority inside its own transaction under the
+// chats row lock, and that is the authorization boundary; a check here would run
+// in a different transaction and the gap between the two is exactly what an
+// attacker removed from the chat mid-call would ride. store.ErrNotMember covers
+// both "not a member" and "no such chat", as well as denied creator authority,
+// and all must stay one wire error so chat ids are not enumerable.
 func (h *handlers) handleEditChatTitle(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesEditChatTitleRequest
 	if err := req.Decode(r.Buf); err != nil {

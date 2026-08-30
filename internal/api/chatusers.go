@@ -118,9 +118,10 @@ func (h *handlers) handleAddChatUser(r *mtproto.Request) (bin.Encoder, error) {
 	return &tg.MessagesInvitedUsers{Updates: ups}, nil
 }
 
-// handleDeleteChatUser serves messages.deleteChatUser. target == caller is a
-// member leaving, and is allowed. The removed user is in perOwner, so they are
-// nudged too: the announcement is how their client learns it is out.
+// handleDeleteChatUser serves messages.deleteChatUser. A non-creator may only
+// target itself; the creator may remove another member, but the creator is never
+// removable. The removed user is in perOwner, so they are nudged too: the
+// announcement is how their client learns it is out.
 //
 // RevokeHistory is accepted and ignored — under two-sided storage the removed
 // member owns their copies of past messages, their dialog row and their pts, and

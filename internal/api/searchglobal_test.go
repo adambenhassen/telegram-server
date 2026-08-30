@@ -435,13 +435,13 @@ func TestSearchGlobalPaginatesPastAChatTheCallerLeft(t *testing.T) {
 
 	// The chat hit is newer than the 1:1 one, so a limit of 1 serves the chat
 	// copy first and the dm is what the next page has to reach.
-	full := globalSlice(t, mustSearchGlobal(t, s, d.caller.ID, "deadline"))
+	full := globalSlice(t, mustSearchGlobal(t, s, d.other.ID, "deadline"))
 	texts := globalTexts(t, full)
-	if len(texts) != 3 {
-		t.Fatalf("baseline hits = %v, want 3", texts)
+	if len(texts) != 2 {
+		t.Fatalf("baseline hits = %v, want 2", texts)
 	}
 
-	if _, _, _, err := s.RemoveChatUser(ctx, d.chat.ID, d.caller.ID, d.caller.ID); err != nil {
+	if _, _, _, err := s.RemoveChatUser(ctx, d.chat.ID, d.other.ID, d.other.ID); err != nil {
 		t.Fatalf("remove from chat: %v", err)
 	}
 
@@ -455,7 +455,7 @@ func TestSearchGlobalPaginatesPastAChatTheCallerLeft(t *testing.T) {
 		Limit:      1,
 	}
 	for range len(texts) + 1 {
-		enc, err := api.SearchGlobalForTest(s, d.caller.ID, req)
+		enc, err := api.SearchGlobalForTest(s, d.other.ID, req)
 		if err != nil {
 			t.Fatalf("page after removal: %v", err)
 		}
@@ -476,7 +476,7 @@ func TestSearchGlobalPaginatesPastAChatTheCallerLeft(t *testing.T) {
 			Q:          "deadline",
 			Filter:     &tg.InputMessagesFilterEmpty{},
 			OffsetRate: rate,
-			OffsetPeer: inputPeerFor(t, d.caller.ID, last.PeerID),
+			OffsetPeer: inputPeerFor(t, d.other.ID, last.PeerID),
 			OffsetID:   last.ID,
 			Limit:      1,
 		}

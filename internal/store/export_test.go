@@ -121,6 +121,21 @@ func HoldChatRowLock(ctx context.Context, s *Store, chatID int64) (release func(
 	return func() { _ = tx.Rollback(ctx) }, nil //nolint:errcheck // nothing to commit
 }
 
+// HoldOwnerLock takes one per-owner advisory lock in a transaction of its own
+// and holds it until release is called. It is how a test asserts that an
+// authorization refusal does NOT take participant owner locks before returning.
+func HoldOwnerLock(ctx context.Context, s *Store, ownerID int64) (release func(), err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockOwners(ctx, tx, ownerID); err != nil {
+		_ = tx.Rollback(ctx) //nolint:errcheck // best effort on the error path
+		return nil, err
+	}
+	return func() { _ = tx.Rollback(ctx) }, nil //nolint:errcheck // nothing to commit
+}
+
 // HoldChannelRowLock takes channelID's channels row lock in a transaction of
 // its own and holds it until release is called. It mirrors HoldChatRowLock for
 // the channel mutation path.

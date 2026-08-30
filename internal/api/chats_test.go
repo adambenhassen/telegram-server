@@ -405,9 +405,9 @@ func TestHandleEditChatTitleRenamesAndAnnounces(t *testing.T) {
 	}
 	chatID := createChatForTest(t, s, creator.ID, "Team", member.ID)
 
-	// The rename's caller is put one pts ahead of the other member first: with
-	// both sitting at the same pts, an assertion on the reply's Pts would pass
-	// even if it carried the wrong member's.
+	// The other member is put one pts ahead of the creator first: with both
+	// sitting at the same pts, an assertion on the reply's Pts would pass even
+	// if it carried the wrong member's.
 	bystander, err := s.CreateUser(ctx, "+15551292403")
 	if err != nil {
 		t.Fatalf("bystander: %v", err)
@@ -421,7 +421,7 @@ func TestHandleEditChatTitleRenamesAndAnnounces(t *testing.T) {
 		t.Fatalf("chat before: %v", err)
 	}
 
-	enc, err := api.EditChatTitleForTest(s, member.ID, &tg.MessagesEditChatTitleRequest{
+	enc, err := api.EditChatTitleForTest(s, creator.ID, &tg.MessagesEditChatTitleRequest{
 		ChatID: chatID, Title: "Team 2",
 	})
 	if err != nil {
@@ -451,8 +451,8 @@ func TestHandleEditChatTitleRenamesAndAnnounces(t *testing.T) {
 		t.Fatalf("stored title = %q, want Team 2", after.Title)
 	}
 
-	// The reply carries the caller's own pts and nobody else's: the caller is at
-	// 3 after the create, the warmup send and the rename; the other member at 2.
+	// The reply carries the creator's own pts and nobody else's: the creator is at
+	// 2 after the create and rename; the other member is at 3 after the warmup.
 	if len(ups.Updates) != 1 {
 		t.Fatalf("updates = %d, want 1", len(ups.Updates))
 	}
@@ -460,12 +460,12 @@ func TestHandleEditChatTitleRenamesAndAnnounces(t *testing.T) {
 	if !ok {
 		t.Fatalf("update type = %T, want *tg.UpdateNewMessage", ups.Updates[0])
 	}
-	if newMsg.Pts != 3 || newMsg.PtsCount != 1 {
-		t.Fatalf("pts = %d count = %d, want the caller's own 3 and 1", newMsg.Pts, newMsg.PtsCount)
+	if newMsg.Pts != 2 || newMsg.PtsCount != 1 {
+		t.Fatalf("pts = %d count = %d, want the creator's own 2 and 1", newMsg.Pts, newMsg.PtsCount)
 	}
 
 	// Both members hold an edit-title service message: the creator's is their
-	// second local id, the caller's their third.
+	// second local id, the other member's their third.
 	for uid, localID := range map[int64]int64{creator.ID: 2, member.ID: 3} {
 		m, ok, err := s.MessageByOwnerLocal(ctx, uid, localID)
 		if err != nil || !ok {
@@ -565,6 +565,44 @@ func TestHandleEditChatTitleNonMember(t *testing.T) {
 	}
 	if c.Title != "Team" {
 		t.Fatalf("title = %q, want Team", c.Title)
+	}
+}
+
+func TestHandleEditChatTitleNonCreator(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292801")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551292802")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	chatID := createChatForTest(t, s, creator.ID, "Team", member.ID)
+	beforePts := map[int64]int{
+		creator.ID: apiPts(t, s, creator.ID),
+		member.ID:  apiPts(t, s, member.ID),
+	}
+
+	_, err = api.EditChatTitleForTest(s, member.ID, &tg.MessagesEditChatTitleRequest{
+		ChatID: chatID, Title: "Hijacked",
+	})
+	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("non-creator: got %s, want PEER_ID_INVALID", msg)
+	}
+	c, _, err := s.ChatByID(ctx, chatID)
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if c.Title != "Team" {
+		t.Fatalf("title = %q, want Team", c.Title)
+	}
+	for _, u := range []store.User{creator, member} {
+		if got := apiPts(t, s, u.ID); got != beforePts[u.ID] {
+			t.Errorf("owner %d pts = %d, want unchanged %d", u.ID, got, beforePts[u.ID])
+		}
 	}
 }
 

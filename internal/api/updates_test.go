@@ -487,9 +487,9 @@ func TestLoadChatsNonMemberForbidden(t *testing.T) {
 		t.Fatalf("forbidden chat = %+v, want id %d empty title", f, chat.ID)
 	}
 
-	// A rename by a remaining member must not reach the outsider: the live title
+	// A rename by the creator must not reach the outsider: the live title
 	// is a writable channel into an account that is no longer in the chat.
-	if _, _, _, err := s.SetChatTitle(context.Background(), chat.ID, users[1].ID, "renamed"); err != nil {
+	if _, _, _, err := s.SetChatTitle(context.Background(), chat.ID, users[0].ID, "renamed"); err != nil {
 		t.Fatalf("set chat title: %v", err)
 	}
 	after, err := api.LoadChatsForTest(s, []int64{chat.ID}, users[2].ID)

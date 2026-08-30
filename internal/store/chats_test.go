@@ -222,6 +222,96 @@ func TestRemoveChatUserNotAMemberChangesNothing(t *testing.T) {
 	}
 }
 
+func TestRemoveChatUserRequiresCreatorForOtherMembers(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551273101")
+	member := mustUser(t, s, "+15551273102")
+	target := mustUser(t, s, "+15551273103")
+	chat := chatWith(t, s, creator, member, target)
+
+	removed, _, perOwner, err := s.RemoveChatUser(ctx, chat.ID, target.ID, member.ID)
+	if !errors.Is(err, store.ErrNotMember) {
+		t.Fatalf("member removing another member: err = %v, want ErrNotMember", err)
+	}
+	if removed || perOwner != nil {
+		t.Fatalf("rejected removal: removed=%v perOwner=%+v, want false/nil", removed, perOwner)
+	}
+	if got := participantIDs(t, s, chat.ID); len(got) != 3 {
+		t.Fatalf("participants = %v, want unchanged 3", got)
+	}
+	if v := chatVersion(t, s, chat.ID); v != chat.Version {
+		t.Errorf("version = %d, want unchanged %d", v, chat.Version)
+	}
+	for _, u := range []store.User{creator, member, target} {
+		if got := ptsOf(t, s, u.ID); got != 0 {
+			t.Errorf("owner %d pts = %d, want 0", u.ID, got)
+		}
+		if ev := eventsOf(t, s, u.ID, 0); len(ev) != 0 {
+			t.Errorf("owner %d events = %+v, want none", u.ID, ev)
+		}
+	}
+}
+
+func TestRemoveChatUserCannotRemoveCreator(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551273201")
+	member := mustUser(t, s, "+15551273202")
+	chat := chatWith(t, s, creator, member)
+
+	for _, caller := range []store.User{creator, member} {
+		removed, _, perOwner, err := s.RemoveChatUser(ctx, chat.ID, creator.ID, caller.ID)
+		if !errors.Is(err, store.ErrNotMember) {
+			t.Errorf("caller %d removing creator: err = %v, want ErrNotMember", caller.ID, err)
+		}
+		if removed || perOwner != nil {
+			t.Errorf("caller %d rejected removal: removed=%v perOwner=%+v, want false/nil", caller.ID, removed, perOwner)
+		}
+	}
+	if got := participantIDs(t, s, chat.ID); len(got) != 2 {
+		t.Fatalf("participants = %v, want unchanged 2", got)
+	}
+	if v := chatVersion(t, s, chat.ID); v != chat.Version {
+		t.Errorf("version = %d, want unchanged %d", v, chat.Version)
+	}
+	for _, u := range []store.User{creator, member} {
+		if got := ptsOf(t, s, u.ID); got != 0 {
+			t.Errorf("owner %d pts = %d, want 0", u.ID, got)
+		}
+		if ev := eventsOf(t, s, u.ID, 0); len(ev) != 0 {
+			t.Errorf("owner %d events = %+v, want none", u.ID, ev)
+		}
+	}
+}
+
+func TestRemoveChatUserAllowsMemberSelfLeaveButNotCreatorSelfLeave(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551273301")
+	member := mustUser(t, s, "+15551273302")
+	chat := chatWith(t, s, creator, member)
+
+	removed, _, _, err := s.RemoveChatUser(ctx, chat.ID, creator.ID, creator.ID)
+	if !errors.Is(err, store.ErrNotMember) {
+		t.Fatalf("creator self-removal: err = %v, want ErrNotMember", err)
+	}
+	if removed {
+		t.Fatal("creator self-removal succeeded")
+	}
+
+	removed, _, _, err = s.RemoveChatUser(ctx, chat.ID, member.ID, member.ID)
+	if err != nil || !removed {
+		t.Fatalf("member self-removal: removed=%v err=%v, want true/nil", removed, err)
+	}
+	if got := participantIDs(t, s, chat.ID); len(got) != 1 || got[0] != creator.ID {
+		t.Fatalf("participants = %v, want only creator %d", got, creator.ID)
+	}
+}
+
 // TestRemoveChatUserSelfLeave is the F4 exception: the announcement's sender is
 // no longer a member by the time the fan-out runs, and it must still be written.
 func TestRemoveChatUserSelfLeave(t *testing.T) {
@@ -232,21 +322,21 @@ func TestRemoveChatUserSelfLeave(t *testing.T) {
 	b := mustUser(t, s, "+15551273022")
 	chat := chatWith(t, s, a, b)
 
-	removed, sender, perOwner, err := s.RemoveChatUser(ctx, chat.ID, a.ID, a.ID)
+	removed, sender, perOwner, err := s.RemoveChatUser(ctx, chat.ID, b.ID, b.ID)
 	if err != nil || !removed {
 		t.Fatalf("self-removal: removed=%v err=%v", removed, err)
 	}
-	if got := participantIDs(t, s, chat.ID); len(got) != 1 || got[0] != b.ID {
-		t.Fatalf("participants = %v, want only %d", got, b.ID)
+	if got := participantIDs(t, s, chat.ID); len(got) != 1 || got[0] != a.ID {
+		t.Fatalf("participants = %v, want only %d", got, a.ID)
 	}
 	if len(perOwner) != 2 {
 		t.Fatalf("perOwner = %+v, want the remaining member and the leaver", perOwner)
 	}
-	if sender.OwnerID != a.ID || !sender.Out {
+	if sender.OwnerID != b.ID || !sender.Out {
 		t.Fatalf("leaver got no own copy: %+v", sender)
 	}
 	for _, u := range []store.User{a, b} {
-		assertService(t, s, u.ID, 1, sender.FanoutID, store.ChatActionDeleteUser, a.ID)
+		assertService(t, s, u.ID, 1, sender.FanoutID, store.ChatActionDeleteUser, b.ID)
 	}
 }
 
@@ -277,6 +367,38 @@ func TestSetChatTitleAnnouncesToEveryMember(t *testing.T) {
 	stored, ok, err := s.ChatByID(ctx, chat.ID)
 	if err != nil || !ok || stored.Title != "Renamed" {
 		t.Fatalf("stored chat = %+v ok=%v err=%v", stored, ok, err)
+	}
+}
+
+func TestSetChatTitleRequiresCreator(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551274101")
+	member := mustUser(t, s, "+15551274102")
+	chat := chatWith(t, s, creator, member)
+
+	got, _, perOwner, err := s.SetChatTitle(ctx, chat.ID, member.ID, "Hijacked")
+	if !errors.Is(err, store.ErrNotMember) {
+		t.Fatalf("member rename: err = %v, want ErrNotMember", err)
+	}
+	if got != (store.Chat{}) || perOwner != nil {
+		t.Fatalf("rejected rename: chat=%+v perOwner=%+v, want zero/nil", got, perOwner)
+	}
+	stored, ok, err := s.ChatByID(ctx, chat.ID)
+	if err != nil || !ok {
+		t.Fatalf("chat by id: ok=%v err=%v", ok, err)
+	}
+	if stored.Title != chat.Title || stored.Version != chat.Version {
+		t.Fatalf("chat after rejected rename = %+v, want unchanged %+v", stored, chat)
+	}
+	for _, u := range []store.User{creator, member} {
+		if got := ptsOf(t, s, u.ID); got != 0 {
+			t.Errorf("owner %d pts = %d, want 0", u.ID, got)
+		}
+		if ev := eventsOf(t, s, u.ID, 0); len(ev) != 0 {
+			t.Errorf("owner %d events = %+v, want none", u.ID, ev)
+		}
 	}
 }
 
@@ -373,6 +495,55 @@ func TestChatMutationsRejectNonMemberBeforeTheRowLock(t *testing.T) {
 	}
 	if got := participantIDs(t, s, chat.ID); len(got) != 2 {
 		t.Errorf("participants = %v, want unchanged 2", got)
+	}
+}
+
+func TestChatMutationAuthorityRefusalDoesNotTakeOwnerLock(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551276101")
+	member := mustUser(t, s, "+15551276102")
+	target := mustUser(t, s, "+15551276103")
+	chat := chatWith(t, s, creator, member, target)
+
+	ownerID := min(creator.ID, member.ID, target.ID)
+	release, err := store.HoldOwnerLock(ctx, s, ownerID)
+	if err != nil {
+		t.Fatalf("hold owner lock: %v", err)
+	}
+	defer release()
+
+	cases := []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{
+			name: "rename",
+			call: func(callCtx context.Context) error {
+				_, _, _, err := s.SetChatTitle(callCtx, chat.ID, member.ID, "Hijacked")
+				return err
+			},
+		},
+		{
+			name: "remove another member",
+			call: func(callCtx context.Context) error {
+				_, _, _, err := s.RemoveChatUser(callCtx, chat.ID, target.ID, member.ID)
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The generous deadline avoids turning scheduler load into a false
+			// refusal failure. Without the fix, the held owner lock keeps this
+			// call blocked until the deadline.
+			callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			if err := tc.call(callCtx); !errors.Is(err, store.ErrNotMember) {
+				t.Fatalf("authority refusal under a held owner lock: want ErrNotMember, got %v", err)
+			}
+		})
 	}
 }
 
