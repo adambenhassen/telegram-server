@@ -556,8 +556,10 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 
 // handleDeleteMessages serves messages.deleteMessages: marks the caller's ids
 // deleted, nudges every affected user, and returns affected pts. The client's
-// revoke flag decides whether a user-peer delete also removes the peer's copy
-// (revoke=true) or only the caller's (revoke=false, the client default).
+// revoke flag decides the scope: false deletes only the caller's copy of each
+// message (for a chat message that is the caller's own fan-out row, for a
+// user-peer message their own row), true deletes for everyone the message
+// reaches (both 1:1 sides, or every current member's chat copy, author only).
 func (h *handlers) handleDeleteMessages(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesDeleteMessagesRequest
 	if err := req.Decode(r.Buf); err != nil {

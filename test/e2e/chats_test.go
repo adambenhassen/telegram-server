@@ -547,15 +547,16 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	}
 	noCancel()
 
-	// F1: C tries deleteMessages → MESSAGE_ID_INVALID.
+	// F1: C's revoke delete still fails — a removed member may not take the
+	// message out of the current members' history.
 	var delErr error
 	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
-		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{cMsgID}})
+		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{Revoke: true, ID: []int{cMsgID}})
 		delErr = err
 		return nil
 	})
 	if delErr == nil {
-		t.Fatal("C deleteMessages should fail")
+		t.Fatal("C revoke deleteMessages should fail")
 	}
 	if errors.As(delErr, &tgErr) {
 		if tgErr.Message != "MESSAGE_ID_INVALID" {
@@ -572,6 +573,25 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	case <-noDelCtx.Done():
 	}
 	noDelCancel()
+
+	// Self-only delete: C may still clear the retained copy from its own view.
+	// It succeeds, and A's copy — and A's update stream — are untouched.
+	var selfDelErr error
+	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{cMsgID}})
+		selfDelErr = err
+		return nil
+	})
+	if selfDelErr != nil {
+		t.Fatalf("C self-only deleteMessages: %v", selfDelErr)
+	}
+	noSelfDelCtx, noSelfDelCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	select {
+	case <-collA.delMsg:
+		t.Error("A should not receive a delete for C's self-only delete")
+	case <-noSelfDelCtx.Done():
+	}
+	noSelfDelCancel()
 
 	// F6: C's getDialogs lists chat as chatForbidden.
 	checkForbidden := func(ctx context.Context, c *tg.Client) error {

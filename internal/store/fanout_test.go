@@ -295,10 +295,11 @@ func TestDeleteChatMessageEveryCopy(t *testing.T) {
 	}
 }
 
-// TestDeleteChatMessageIsAuthorOnly matches the delete path to the edit path. A
-// chat delete walks the same copy set an edit does, so a member deleting someone
-// else's message would destroy it for every member, and the edit path's
-// service-message guard would buy nothing if the announcement stayed deletable.
+// TestDeleteChatMessageIsAuthorOnly matches the revoke delete path to the edit
+// path. A chat revoke delete walks the same copy set an edit does, so without
+// the author check a member would destroy any message she holds a copy of out
+// of every other member's history, and the edit path's service-message guard
+// would buy nothing if the announcement stayed deletable.
 func TestDeleteChatMessageIsAuthorOnly(t *testing.T) {
 	t.Parallel()
 	s := open(t)
@@ -368,11 +369,28 @@ func TestRemovedMemberCannotEditOrDeleteChatMessage(t *testing.T) {
 	if _, _, err := s.EditMessage(ctx, a.ID, sender.LocalID, "hijacked"); !errors.Is(err, store.ErrMessageInvalid) {
 		t.Fatalf("removed member edit: want ErrMessageInvalid, got %v", err)
 	}
+	// A removed member may no longer revoke-delete: the message would leave
+	// every current member's history, and the caller is out of it.
 	if _, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}, true); !errors.Is(err, store.ErrMessageInvalid) {
-		t.Fatalf("removed member delete: want ErrMessageInvalid, got %v", err)
+		t.Fatalf("removed member revoke delete: want ErrMessageInvalid, got %v", err)
+	}
+	// ...but may still clear the retained copy from its own view, and only its
+	// own row may move.
+	perOwner, err := s.DeleteMessages(ctx, a.ID, []int64{sender.LocalID}, false)
+	if err != nil {
+		t.Fatalf("removed member self-only delete: %v", err)
+	}
+	if len(perOwner) != 1 || perOwner[a.ID] != 2 {
+		t.Fatalf("perOwner = %+v, want only a at pts 2", perOwner)
+	}
+	if m, ok := msgOpt(t, s, a.ID, 1); !ok || !m.Deleted {
+		t.Fatalf("a's retained copy not deleted: ok=%v %+v", ok, m)
 	}
 
 	for _, u := range []store.User{a, b, c} {
+		if u.ID == a.ID {
+			continue
+		}
 		m, ok := msgOpt(t, s, u.ID, 1)
 		if !ok {
 			t.Fatalf("owner %d lost its copy", u.ID)
@@ -386,6 +404,9 @@ func TestRemovedMemberCannotEditOrDeleteChatMessage(t *testing.T) {
 		if ev := eventsOf(t, s, u.ID, 0); len(ev) != 1 {
 			t.Errorf("owner %d events = %+v, want still one", u.ID, ev)
 		}
+	}
+	if ev := eventsOf(t, s, a.ID, 1); len(ev) != 1 || ev[0].Type != store.EventDelete {
+		t.Errorf("a delete event = %+v", ev)
 	}
 }
 
@@ -738,6 +759,263 @@ func TestEditRejectsChatServiceMessage(t *testing.T) {
 		if !ok || m.Text != "New title" || m.EditDate != nil {
 			t.Errorf("owner %d service row moved: ok=%v %+v", u.ID, ok, m)
 		}
+	}
+}
+
+// TestDeleteChatMessageSelfOnly is the self-only half of the chat delete
+// decision: revoke=false deletes the caller's copy and nothing else. The caller
+// may not be the author, and the author may have left the chat; what the caller
+// may not do is touch a second member's row, pts or event log.
+func TestDeleteChatMessageSelfOnly(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551290131")
+	b := mustUser(t, s, "+15551290132")
+	c := mustUser(t, s, "+15551290133")
+	chat := chatWith(t, s, a, b, c)
+
+	sender, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: b.ID, Text: "mine", RandomID: 1})
+
+	// c holds an inbound copy of b's message at its own local id.
+	cCopy, ok := msgOpt(t, s, c.ID, 1)
+	if !ok || cCopy.LocalID != sender.LocalID {
+		t.Fatalf("c copy = ok:%v %+v, want local id %d", ok, cCopy, sender.LocalID)
+	}
+
+	perOwner, err := s.DeleteMessages(ctx, c.ID, []int64{cCopy.LocalID}, false)
+	if err != nil {
+		t.Fatalf("self-only delete: %v", err)
+	}
+	if len(perOwner) != 1 || perOwner[c.ID] != 2 {
+		t.Fatalf("perOwner = %+v, want only c at pts 2", perOwner)
+	}
+
+	m, ok := msgOpt(t, s, c.ID, 1)
+	if !ok || !m.Deleted {
+		t.Fatalf("c copy not deleted: ok=%v %+v", ok, m)
+	}
+	if ev := eventsOf(t, s, c.ID, 1); len(ev) != 1 || ev[0].Type != store.EventDelete {
+		t.Fatalf("c delete event = %+v", ev)
+	}
+
+	for _, u := range []store.User{a, b} {
+		m, ok := msgOpt(t, s, u.ID, 1)
+		if !ok || m.Deleted {
+			t.Errorf("owner %d copy moved: ok=%v %+v", u.ID, ok, m)
+		}
+		if got := ptsOf(t, s, u.ID); got != 1 {
+			t.Errorf("owner %d pts = %d, want unchanged 1", u.ID, got)
+		}
+		if ev := eventsOf(t, s, u.ID, 0); len(ev) != 1 || ev[0].Type != store.EventNewMessage {
+			t.Errorf("owner %d events = %+v, want only the original send", u.ID, ev)
+		}
+	}
+
+	// The second self-delete of the same id fails closed: the row is gone from
+	// the caller's view, so the batch must reject it exactly as a missing id.
+	if _, err := s.DeleteMessages(ctx, c.ID, []int64{cCopy.LocalID}, false); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("repeat self-only delete: want ErrMessageInvalid, got %v", err)
+	}
+	if got := ptsOf(t, s, c.ID); got != 2 {
+		t.Errorf("c pts = %d after rejected repeat, want unchanged 2", got)
+	}
+
+	// The author still deletes for everyone, and the delete reaches the remaining
+	// members but not c's already-deleted row: a second event for c would put
+	// two events at one pts.
+	perOwner, err = s.DeleteMessages(ctx, b.ID, []int64{sender.LocalID}, true)
+	if err != nil {
+		t.Fatalf("author revoke delete: %v", err)
+	}
+	// c's copy is already deleted, so the walk skips it: no second bump and no
+	// second event for c, whose log must stay one event per pts.
+	if len(perOwner) != 2 || perOwner[a.ID] != 2 || perOwner[b.ID] != 2 {
+		t.Fatalf("perOwner = %+v, want a and b at pts 2", perOwner)
+	}
+	for _, u := range []store.User{a, b} {
+		if m, ok := msgOpt(t, s, u.ID, 1); !ok || !m.Deleted {
+			t.Errorf("owner %d copy not deleted: ok=%v %+v", u.ID, ok, m)
+		}
+	}
+	if ev := eventsOf(t, s, c.ID, 2); len(ev) != 0 {
+		t.Errorf("c events after the author's delete = %+v, want none", ev)
+	}
+}
+
+// TestDeleteChatMessageSelfOnlyByDepartedAuthor covers the two departure cases
+// in one test: a member may clear a retained copy of a message whose author has
+// left the chat, and a caller who has left the chat may clear their own retained
+// copy. A service message stays undeletable through the self-only path for
+// everyone, member or not.
+func TestDeleteChatMessageSelfOnlyByDepartedAuthor(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551290141")
+	b := mustUser(t, s, "+15551290142")
+	c := mustUser(t, s, "+15551290143")
+	chat := chatWith(t, s, a, b, c)
+
+	// Local id 1 is a's message for every member; local id 2 is the title
+	// service message, outgoing for a.
+	aMsg, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: a.ID, Text: "from a", RandomID: 1})
+	service, _ := sendChat(t, s, store.FanOut{
+		ChatID: chat.ID, FromID: a.ID, Text: "New title", Action: store.ChatActionEditTitle,
+	})
+	if aMsg.LocalID != 1 || service.LocalID != 2 {
+		t.Fatalf("local ids = %d/%d, want 1/2", aMsg.LocalID, service.LocalID)
+	}
+
+	// Both a and b leave; c stays and holds a retained copy of a's message.
+	// A bare removal bumps no pts.
+	if err := store.RemoveChatParticipant(ctx, s, chat.ID, a.ID); err != nil {
+		t.Fatalf("remove a: %v", err)
+	}
+	if err := store.RemoveChatParticipant(ctx, s, chat.ID, b.ID); err != nil {
+		t.Fatalf("remove b: %v", err)
+	}
+
+	// c clears its own copy of a's message: the author is gone, the caller is
+	// still a member, and only c's row may move.
+	perOwner, err := s.DeleteMessages(ctx, c.ID, []int64{1}, false)
+	if err != nil {
+		t.Fatalf("departed-author self delete: %v", err)
+	}
+	if len(perOwner) != 1 || perOwner[c.ID] != 3 {
+		t.Fatalf("perOwner = %+v, want only c at pts 3", perOwner)
+	}
+	if m, ok := msgOpt(t, s, c.ID, 1); !ok || !m.Deleted {
+		t.Fatalf("c copy of a's message not deleted: ok=%v %+v", ok, m)
+	}
+	for _, u := range []store.User{a, b} {
+		if m, ok := msgOpt(t, s, u.ID, 1); !ok || m.Deleted {
+			t.Errorf("owner %d retained copy moved: ok=%v %+v", u.ID, ok, m)
+		}
+		if got := ptsOf(t, s, u.ID); got != 2 {
+			t.Errorf("owner %d pts = %d, want unchanged 2", u.ID, got)
+		}
+	}
+
+	// The service message is undeletable through this path: for c, a member,
+	// and for a, whose own copy is outgoing and who has left the chat.
+	if _, err := s.DeleteMessages(ctx, c.ID, []int64{2}, false); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("member self-deleting a service message: want ErrMessageInvalid, got %v", err)
+	}
+	if _, err := s.DeleteMessages(ctx, a.ID, []int64{service.LocalID}, false); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("departed author self-deleting a service message: want ErrMessageInvalid, got %v", err)
+	}
+
+	// A caller who has left the chat may clear their own retained copy of
+	// a's message.
+	perOwner, err = s.DeleteMessages(ctx, b.ID, []int64{1}, false)
+	if err != nil {
+		t.Fatalf("departed member self delete: %v", err)
+	}
+	if len(perOwner) != 1 || perOwner[b.ID] != 3 {
+		t.Fatalf("perOwner = %+v, want only b at pts 3", perOwner)
+	}
+	if m, ok := msgOpt(t, s, b.ID, 1); !ok || !m.Deleted {
+		t.Fatalf("b retained copy not deleted: ok=%v %+v", ok, m)
+	}
+	// a's retained copy is untouched; c's copy was already cleared by c's own
+	// self-delete above, and neither of them moved again.
+	if m, ok := msgOpt(t, s, a.ID, 1); !ok || m.Deleted {
+		t.Errorf("a retained copy moved: ok=%v %+v", ok, m)
+	}
+	if got := ptsOf(t, s, a.ID); got != 2 {
+		t.Errorf("a pts = %d, want unchanged 2", got)
+	}
+	if m, ok := msgOpt(t, s, c.ID, 1); !ok || !m.Deleted {
+		t.Errorf("c copy state changed: ok=%v %+v", ok, m)
+	}
+	if got := ptsOf(t, s, c.ID); got != 3 {
+		t.Errorf("c pts = %d, want unchanged 3", got)
+	}
+}
+
+// TestDeleteMessagesSelfOnlyAcrossPeerTypes mixes the two peer types in one
+// batch under revoke=false: the 1:1 target deletes only the caller's row, the
+// chat target deletes only the caller's copy, and a missing id still fails the
+// whole batch with no changes.
+func TestDeleteMessagesSelfOnlyAcrossPeerTypes(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15551290151")
+	b := mustUser(t, s, "+15551290152")
+	c := mustUser(t, s, "+15551290153")
+	chat := chatWith(t, s, a, b, c)
+
+	private := send(t, s, a, b, "private", 1)
+	group, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: a.ID, Text: "group", RandomID: 2})
+
+	// Local ids are per-owner: a's space carries the 1:1 row first (private =
+	// 1, group = 2), while c's space is chat-only (group = 1).
+	if group.LocalID != 2 {
+		t.Fatalf("group message local id = %d, want 2", group.LocalID)
+	}
+	cGroup, ok := msgOpt(t, s, c.ID, 1)
+	if !ok || cGroup.FanoutID != group.FanoutID {
+		t.Fatalf("c chat copy = ok:%v %+v, want fanout %d", ok, cGroup, group.FanoutID)
+	}
+
+	// c's batch names its own chat copy and an unknown id: it fails closed with
+	// nothing changed.
+	if _, err := s.DeleteMessages(ctx, c.ID, []int64{1, 999}, false); !errors.Is(err, store.ErrMessageInvalid) {
+		t.Fatalf("batch with a missing id: want ErrMessageInvalid, got %v", err)
+	}
+	if m, ok := msgOpt(t, s, c.ID, 1); !ok || m.Deleted {
+		t.Fatal("failed batch deleted the chat copy anyway")
+	}
+	if got := ptsOf(t, s, c.ID); got != 1 {
+		t.Errorf("c pts = %d after rejected batch, want 1", got)
+	}
+
+	// c clears the chat copy self-only, and a clears its own 1:1 row self-only:
+	// each message behaves per the rule for its own peer type.
+	perOwner, err := s.DeleteMessages(ctx, c.ID, []int64{1}, false)
+	if err != nil {
+		t.Fatalf("c self-only chat delete: %v", err)
+	}
+	if len(perOwner) != 1 || perOwner[c.ID] != 2 {
+		t.Fatalf("perOwner = %+v, want only c at pts 2", perOwner)
+	}
+	if m, ok := msgOpt(t, s, c.ID, 1); !ok || !m.Deleted {
+		t.Fatalf("c chat copy not deleted: ok=%v %+v", ok, m)
+	}
+	for _, u := range []store.User{a, b} {
+		if m, ok := msgOpt(t, s, u.ID, 2); !ok || m.Deleted {
+			t.Errorf("owner %d chat copy moved: ok=%v %+v", u.ID, ok, m)
+		}
+		if got := ptsOf(t, s, u.ID); got != 2 {
+			t.Errorf("owner %d pts = %d, want unchanged 2", u.ID, got)
+		}
+	}
+
+	perOwner, err = s.DeleteMessages(ctx, a.ID, []int64{private.LocalID}, false)
+	if err != nil {
+		t.Fatalf("a self-only 1:1 delete: %v", err)
+	}
+	if len(perOwner) != 1 || perOwner[a.ID] != 3 {
+		t.Fatalf("perOwner = %+v, want only a at pts 3", perOwner)
+	}
+	if m, ok := msgOpt(t, s, a.ID, private.LocalID); !ok || !m.Deleted {
+		t.Fatalf("a 1:1 row not deleted: ok=%v %+v", ok, m)
+	}
+	if m, ok := msgOpt(t, s, b.ID, private.PeerLocalID); !ok || m.Deleted {
+		t.Errorf("b 1:1 mirror moved: ok=%v %+v", ok, m)
+	}
+	// b also holds the chat copy (local 2); neither of b's rows moved and the
+	// mirror's pts is unchanged.
+	if m, ok := msgOpt(t, s, b.ID, 2); !ok || m.Deleted {
+		t.Errorf("b chat copy moved: ok=%v %+v", ok, m)
+	}
+	if got := ptsOf(t, s, b.ID); got != 2 {
+		t.Errorf("b pts = %d, want unchanged 2", got)
+	}
+	if ev := eventsOf(t, s, b.ID, 0); len(ev) != 2 {
+		t.Errorf("b events = %+v, want the two sends", ev)
 	}
 }
 
