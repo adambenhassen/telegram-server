@@ -498,6 +498,51 @@ func TestChatMutationsRejectNonMemberBeforeTheRowLock(t *testing.T) {
 	}
 }
 
+func TestChatMutationAuthorityRefusalDoesNotTakeOwnerLock(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551276101")
+	member := mustUser(t, s, "+15551276102")
+	chat := chatWith(t, s, creator, member)
+
+	ownerID := min(creator.ID, member.ID)
+	release, err := store.HoldOwnerLock(ctx, s, ownerID)
+	if err != nil {
+		t.Fatalf("hold owner lock: %v", err)
+	}
+	defer release()
+
+	cases := []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{
+			name: "rename",
+			call: func(callCtx context.Context) error {
+				_, _, _, err := s.SetChatTitle(callCtx, chat.ID, member.ID, "Hijacked")
+				return err
+			},
+		},
+		{
+			name: "remove creator",
+			call: func(callCtx context.Context) error {
+				_, _, _, err := s.RemoveChatUser(callCtx, chat.ID, creator.ID, member.ID)
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			if err := tc.call(callCtx); !errors.Is(err, store.ErrNotMember) {
+				t.Fatalf("authority refusal under a held owner lock: want ErrNotMember, got %v", err)
+			}
+		})
+	}
+}
+
 // TestChatMutationsCommitMembershipWithTheirAnnouncement is F5. The failure it
 // guards against is a membership change committing without its service message:
 // an add whose fan-out is lost leaves a member no client ever saw join, and a

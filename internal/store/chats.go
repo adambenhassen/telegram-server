@@ -18,8 +18,9 @@ import (
 // ids only — never pass a chat id, or chat 7 and user 7 falsely serialise.
 //
 // CreateChat does not take it — the chat does not exist yet. The fan-out in
-// fanout.go takes it, and so does beginChatMutation below, which is the single
-// prelude every membership mutation runs.
+// fanout.go takes it, and every membership mutation acquires it after
+// beginChatMutation's row-lock prelude and its operation-specific authority
+// check, before any write or fan-out.
 
 // maxChatParticipants caps a basic chat at Telegram's own limit. It is what
 // bounds the fan-out transaction: one send to a full chat writes 200 message
@@ -143,8 +144,8 @@ func (s *Store) IsMember(ctx context.Context, chatID, userID int64) (bool, error
 }
 
 // chatMutation is the open transaction a membership change runs in: the chats
-// row locked FOR UPDATE, the member set read under that lock, and every advisory
-// lock the transaction will need already held.
+// row locked FOR UPDATE and the member set read under that lock. Its operation
+// acquires the needed advisory locks after checking operation-specific authority.
 type chatMutation struct {
 	tx        pgx.Tx
 	qtx       *db.Queries
@@ -168,19 +169,16 @@ type chatMutation struct {
 // mutation so RemoveChatUser and SetChatTitle make their authority decisions
 // under the same lock as their writes.
 //
-// Liveness: extra names every user the transaction will touch beyond the current
-// member set — the user being added, or the user being removed and therefore
-// carried as the announcement's Extra. Everything is acquired in ONE sorted
-// lockOwners pass, before any mutation and before the fan-out. Ascending order is
-// only deadlock-free when a transaction takes its whole set in one pass: split
-// into "lock the removed user, then lock the remaining members", two removals in
-// two chats sharing two members deadlock, since the second call can want an id
-// below one the first already holds. Downstream acquisitions — removeParticipant's
-// and fanOut's own — are then subsets of what is already held, and advisory locks
-// are re-entrant, so they cost nothing.
+// No owner advisory lock is taken here. The operation-specific authority checks
+// must run first, so a refused member cannot hold a lock set proportional to
+// the chat size. An authorized operation then calls chatMutation.lockOwners
+// once with every owner it will touch, including any added or removed user,
+// before mutation and fan-out. Taking that whole set in one sorted pass is what
+// keeps concurrent removals from deadlocking; removeParticipant and fanOut only
+// reacquire subsets of the already-held set.
 //
 // The caller owns the transaction from here: it must roll back or commit.
-func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64, extra ...int64) (*chatMutation, error) {
+func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64) (*chatMutation, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin: %w", err)
@@ -247,11 +245,15 @@ func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64, e
 		return nil, ErrNotMember
 	}
 
-	if err = lockOwners(ctx, tx, append(append([]int64(nil), m.members...), extra...)...); err != nil {
-		return nil, err
-	}
 	ok = true
 	return m, nil
+}
+
+// lockOwners acquires every owner lock this mutation will touch in one sorted
+// pass. Callers must invoke it only after their operation-specific authority
+// checks and before any write or fan-out.
+func (m *chatMutation) lockOwners(ctx context.Context, extra ...int64) error {
+	return lockOwners(ctx, m.tx, append(append([]int64(nil), m.members...), extra...)...)
 }
 
 // removeParticipant deletes one chat_participants row and takes that user's
@@ -279,7 +281,7 @@ func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64, e
 // Advisory locks here are pg_advisory_xact_lock, held to commit, so the order of
 // the delete and the announcement within the transaction does not matter. The
 // caller must have acquired U along with every other owner in one sorted
-// lockOwners pass — see beginChatMutation — because two acquisitions in one
+// lockOwners pass — see chatMutation.lockOwners — because two acquisitions in one
 // transaction is what reintroduces deadlock. The acquisition here is that set's
 // subset and re-entrant; it is kept so the invariant holds for any future caller.
 func removeParticipant(ctx context.Context, tx pgx.Tx, qtx *db.Queries, chatID, userID int64) (bool, error) {
@@ -297,11 +299,14 @@ func removeParticipant(ctx context.Context, tx pgx.Tx, qtx *db.Queries, chatID, 
 // added=false means target was already a member: nothing was written, no service
 // message was emitted, and chats.version did not move.
 func (s *Store) AddChatUser(ctx context.Context, chatID, target, callerID int64) (added bool, sender Message, perOwner map[int64]int, err error) {
-	m, err := s.beginChatMutation(ctx, chatID, callerID, target)
+	m, err := s.beginChatMutation(ctx, chatID, callerID)
 	if err != nil {
 		return false, Message{}, nil, err
 	}
 	defer func() { _ = m.tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	if err = m.lockOwners(ctx, target); err != nil {
+		return false, Message{}, nil, err
+	}
 
 	// Counting under the chats row lock is what stops two concurrent adds both
 	// seeing 199. An add of an existing member changes no count, so it is not the
@@ -348,7 +353,7 @@ func (s *Store) AddChatUser(ctx context.Context, chatID, target, callerID int64)
 // is, by the time it is written, deliberately not a member. The creator is never
 // removable, including by the creator itself.
 func (s *Store) RemoveChatUser(ctx context.Context, chatID, target, callerID int64) (removed bool, sender Message, perOwner map[int64]int, err error) {
-	m, err := s.beginChatMutation(ctx, chatID, callerID, target)
+	m, err := s.beginChatMutation(ctx, chatID, callerID)
 	if err != nil {
 		return false, Message{}, nil, err
 	}
@@ -358,6 +363,9 @@ func (s *Store) RemoveChatUser(ctx context.Context, chatID, target, callerID int
 	// creator is never removable, including by the creator itself.
 	if target == m.creatorID || (callerID != m.creatorID && target != callerID) {
 		return false, Message{}, nil, ErrNotMember
+	}
+	if err = m.lockOwners(ctx, target); err != nil {
+		return false, Message{}, nil, err
 	}
 
 	removed, err = removeParticipant(ctx, m.tx, m.qtx, chatID, target)
@@ -400,6 +408,9 @@ func (s *Store) SetChatTitle(ctx context.Context, chatID, callerID int64, title 
 
 	if callerID != m.creatorID {
 		return Chat{}, Message{}, nil, ErrNotMember
+	}
+	if err = m.lockOwners(ctx); err != nil {
+		return Chat{}, Message{}, nil, err
 	}
 
 	row, err := m.qtx.SetChatTitle(ctx, db.SetChatTitleParams{ID: chatID, Title: title})
@@ -464,6 +475,9 @@ func (s *Store) SetChatPinnedMessage(ctx context.Context, chatID, callerID int64
 		return Chat{}, nil, err
 	}
 	defer func() { _ = m.tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	if err = m.lockOwners(ctx); err != nil {
+		return Chat{}, nil, err
+	}
 
 	// Validate the pinned message under the chats row lock so a concurrent
 	// delete cannot slip between the check and the mutation.
