@@ -187,6 +187,110 @@ func TestBlockedAddRefusalDoesNotTakeOwnerLock(t *testing.T) {
 	}
 }
 
+func TestBlockedAddRefusesAfterConcurrentBlockCommits(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	// BlockUser locks ids in ascending order. Creating target first makes its
+	// lock the first one both operations reach.
+	target := mustUser(t, s, "+15551500261")
+	caller := mustUser(t, s, "+15551500262")
+	if target.ID >= caller.ID {
+		t.Fatalf("user ids = %d/%d, want target below caller", target.ID, caller.ID)
+	}
+	chat := chatWith(t, s, caller)
+	wantParticipants := participantIDs(t, s, chat.ID)
+	wantVersion := chatVersion(t, s, chat.ID)
+	wantCallerPts := ptsOf(t, s, caller.ID)
+	wantCallerEvents := len(eventsOf(t, s, caller.ID, 0))
+	wantTargetPts := ptsOf(t, s, target.ID)
+	wantTargetEvents := len(eventsOf(t, s, target.ID, 0))
+
+	// Holding the caller lock lets BlockUser acquire target's lock, then park
+	// before its insert. AddChatUser starts after that point, reads no committed
+	// block, and parks on target's lock held by the in-flight block.
+	releaseCaller, err := store.HoldOwnerLock(ctx, s, caller.ID)
+	if err != nil {
+		t.Fatalf("hold caller owner lock: %v", err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			releaseCaller()
+		}
+	}()
+	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	type blockResult struct {
+		changed bool
+		err     error
+	}
+	blockDone := make(chan blockResult, 1)
+	go func() {
+		changed, err := s.BlockUser(callCtx, target.ID, caller.ID)
+		blockDone <- blockResult{changed: changed, err: err}
+	}()
+	if err := store.WaitForLockWaiters(callCtx, s, 1); err != nil {
+		t.Fatalf("block did not park on caller lock: %v", err)
+	}
+
+	type addResult struct {
+		added    bool
+		sender   store.Message
+		perOwner map[int64]int
+		err      error
+	}
+	addDone := make(chan addResult, 1)
+	go func() {
+		added, sender, perOwner, err := s.AddChatUser(callCtx, chat.ID, target.ID, caller.ID)
+		addDone <- addResult{added: added, sender: sender, perOwner: perOwner, err: err}
+	}()
+	if err := store.WaitForLockWaiters(callCtx, s, 2); err != nil {
+		t.Fatalf("add did not park behind the uncommitted block: %v", err)
+	}
+	select {
+	case result := <-addDone:
+		t.Fatalf("add returned before the block committed: %+v", result)
+	default:
+	}
+
+	// Releasing caller lets BlockUser acquire its second lock, commit the block,
+	// and release target. The queued add then acquires the same sorted set and
+	// must re-read the now-committed predicate before inserting.
+	releaseCaller()
+	released = true
+	block := <-blockDone
+	if block.err != nil || !block.changed {
+		t.Fatalf("concurrent block: changed=%v err=%v", block.changed, block.err)
+	}
+	result := <-addDone
+	if !errors.Is(result.err, store.ErrNotMember) {
+		t.Fatalf("add after concurrent block: added=%v sender=%+v perOwner=%+v err=%v, want ErrNotMember", result.added, result.sender, result.perOwner, result.err)
+	}
+	if result.added || result.perOwner != nil || result.sender.LocalID != 0 || result.sender.FanoutID != 0 {
+		t.Fatalf("add after concurrent block result: added=%v sender=%+v perOwner=%+v, want no-op", result.added, result.sender, result.perOwner)
+	}
+	if got := participantIDs(t, s, chat.ID); !reflect.DeepEqual(got, wantParticipants) {
+		t.Errorf("participants after concurrent blocked add = %v, want %v", got, wantParticipants)
+	}
+	if got := chatVersion(t, s, chat.ID); got != wantVersion {
+		t.Errorf("version after concurrent blocked add = %d, want %d", got, wantVersion)
+	}
+	if got := ptsOf(t, s, caller.ID); got != wantCallerPts {
+		t.Errorf("caller pts after concurrent blocked add = %d, want %d", got, wantCallerPts)
+	}
+	if got := len(eventsOf(t, s, caller.ID, 0)); got != wantCallerEvents {
+		t.Errorf("caller events after concurrent blocked add = %d, want %d", got, wantCallerEvents)
+	}
+	if got := ptsOf(t, s, target.ID); got != wantTargetPts {
+		t.Errorf("target pts after concurrent blocked add = %d, want %d", got, wantTargetPts)
+	}
+	if got := len(eventsOf(t, s, target.ID, 0)); got != wantTargetEvents {
+		t.Errorf("target events after concurrent blocked add = %d, want %d", got, wantTargetEvents)
+	}
+}
+
 func TestBlockedAddCoversAbsentAndFormerMemberWithoutRemovingExistingMembership(t *testing.T) {
 	t.Parallel()
 	s := open(t)

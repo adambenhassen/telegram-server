@@ -344,6 +344,20 @@ func (s *Store) AddChatUser(ctx context.Context, chatID, target, callerID int64)
 	if err = m.lockOwners(ctx, target); err != nil {
 		return false, Message{}, nil, err
 	}
+	if !m.seen[target] {
+		blocked, err := m.qtx.IsBlocked(ctx, db.IsBlockedParams{
+			BlockerID: target,
+			BlockedID: callerID,
+		})
+		if err != nil {
+			return false, Message{}, nil, fmt.Errorf("recheck blocked caller: %w", err)
+		}
+		if blocked {
+			// A block that committed while this add waited for its owner locks
+			// has the same uniform refusal as the pre-lock check.
+			return false, Message{}, nil, ErrNotMember
+		}
+	}
 
 	// Counting under the chats row lock is what stops two concurrent adds both
 	// seeing 199. An add of an existing member changes no count, so it is not the
