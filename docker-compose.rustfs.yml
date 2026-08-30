@@ -37,9 +37,10 @@ services:
   rustfs-init:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     entrypoint: ["/bin/sh", "-ec"]
-    command: >-
-      mc alias set local http://rustfs:9000 "$${RUSTFS_ACCESS_KEY}" "$${RUSTFS_SECRET_KEY}" &&
-      mc mb --ignore-existing local/telegram
+    command:
+      - >-
+        mc alias set local http://rustfs:9000 "$${RUSTFS_ACCESS_KEY}" "$${RUSTFS_SECRET_KEY}" &&
+        mc mb --ignore-existing local/telegram
     environment:
       # These are the same non-production values used by the RustFS service.
       RUSTFS_ACCESS_KEY: TELEGRAMDLOCAL

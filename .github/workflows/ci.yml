@@ -1052,21 +1052,58 @@ jobs:
              printf security-check | mc pipe local/telegram/security-check &&
              printf rustfs-durability-canary | mc pipe local/telegram/durability-check'
 
-          assert_private() {
+          authenticated_mc() {
+            script=$1
+            compose run --rm --no-deps --entrypoint /bin/sh rustfs-init -ec "$script"
+          }
+
+          # First prove that both targets exist with credentials. The mc
+          # endpoint is the same RustFS bucket and object path as the loopback
+          # URLs below; only the compose-internal hostname differs.
+          got=$(authenticated_mc \
+            'mc alias set local http://rustfs:9000 "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" >/dev/null &&
+             mc cat local/telegram/security-check')
+          [ "$got" = security-check ] \
+            || { echo "authenticated GET did not return the seeded object"; exit 1; }
+
+          listed=$(authenticated_mc \
+            'mc alias set local http://rustfs:9000 "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" >/dev/null &&
+             mc ls local/telegram')
+          case "$listed" in
+            *security-check*) ;;
+            *)
+              echo "authenticated LIST did not return the seeded object"
+              printf '%s\n' "$listed"
+              exit 1
+              ;;
+          esac
+
+          assert_forbidden() {
             name=$1
             url=$2
-            if compose exec -T rustfs wget -q -O /dev/null "$url"; then
-              echo "$name unexpectedly succeeded without credentials"
+            # BusyBox wget writes -S response headers to stderr. Redirect that
+            # stream into stdout while discarding the body, then inspect the
+            # actual HTTP status rather than treating every request failure as
+            # an access-control result.
+            response=$(compose exec -T rustfs sh -c \
+              'wget -S -O /dev/null "$1" 2>&1 >/dev/null' rustfs-wget "$url" 2>&1) || true
+            status=$(printf '%s\n' "$response" \
+              | sed -n 's/.*HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' \
+              | tail -1)
+            if [ "$status" != 403 ]; then
+              echo "$name returned HTTP ${status:-unknown}, want 403"
+              printf '%s\n' "$response"
               return 1
             fi
           }
 
           # These requests deliberately contain no Authorization header. A
-          # public GET leaks a known object; a public LIST leaks every key in
-          # the bucket. Both must fail against the RustFS deployment we run.
-          assert_private "unauthenticated GET" \
+          # public GET leaks the known object; a public LIST leaks every key in
+          # the bucket. Both must return the access-denied status against the
+          # RustFS deployment we run.
+          assert_forbidden "unauthenticated GET" \
             "http://127.0.0.1:9000/telegram/security-check"
-          assert_private "unauthenticated LIST" \
+          assert_forbidden "unauthenticated LIST" \
             "http://127.0.0.1:9000/telegram?list-type=2"
 
           # The media E2E path uses the same S3 backend for parts, assembly and
@@ -1080,7 +1117,7 @@ jobs:
           TG_BLOB_S3_ACCESS_KEY_ID=TELEGRAMDLOCAL \
           TG_BLOB_S3_SECRET_ACCESS_KEY=TELEGRAMDLOCALSECRET \
           TG_BLOB_S3_ALLOW_INSECURE_HTTP=true \
-            go test -race -count=1 -timeout 15m ./test/e2e -run '^TestMedia'
+            go test -race -count=1 -timeout 15m ./test/e2e -run '^TestMediaRoundTrip$'
 
           rustfs_volume() {
             cid=$(compose ps -q rustfs)
