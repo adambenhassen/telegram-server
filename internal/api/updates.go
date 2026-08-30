@@ -225,9 +225,8 @@ func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
 //
 // AccessHash is derived for (viewerID, c.ID) so only the viewer can use it.
 // The forbidden form carries an empty title on purpose, the rule M6 settled for
-// ChatForbidden: the row keeps changing after someone leaves, and any remaining
-// member may rename it, so serving the live title would leave a writable channel
-// into a client that is no longer entitled to it.
+// ChatForbidden: the row still changes after someone leaves, but the client is
+// no longer entitled to its live metadata.
 //
 // M7 stores no username, participants count or admin rights, so none is ever set
 // here. store.Channel.Version has no wire counterpart either: unlike tg.Chat, the
@@ -616,8 +615,8 @@ func (h *handlers) entitledUserIDs(ctx context.Context, viewerID int64, ids []in
 // tg.ChatForbidden carries the id and an empty title and nothing else, which is
 // what tells a client to stop rendering the chat as active. The title is blanked
 // deliberately: the live row keeps changing after removal, and the creator may
-// rename the chat, so serving it would leave a writable
-// channel into an account that was ejected.
+// rename the chat, so serving it would leave a writable channel into an account
+// that was ejected.
 //
 // The membership check is one query per chat per batch. A batch references very
 // few distinct chats, so it stays a straight loop with no cache.
