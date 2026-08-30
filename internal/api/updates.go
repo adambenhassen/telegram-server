@@ -615,8 +615,8 @@ func (h *handlers) entitledUserIDs(ctx context.Context, viewerID int64, ids []in
 // copies survive removal by design — so it must not keep serving live metadata.
 // tg.ChatForbidden carries the id and an empty title and nothing else, which is
 // what tells a client to stop rendering the chat as active. The title is blanked
-// deliberately: the live row keeps changing after removal, and any remaining
-// member may rename the chat freely, so serving it would leave a writable
+// deliberately: the live row keeps changing after removal, and the creator may
+// rename the chat, so serving it would leave a writable
 // channel into an account that was ejected.
 //
 // The membership check is one query per chat per batch. A batch references very
