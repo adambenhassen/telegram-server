@@ -82,22 +82,13 @@ type Config struct {
 	// MediaErasureMinAge is how old a file must be before the media erasure
 	// report will name it, and before the erasure sweep will remove it.
 	//
-	// The default is 24 hours, derived from the per-RPC bounds this process
-	// now ships: TG_RPC_DEADLINE (mtproto.DefaultRPCDeadline) caps how long any
-	// single send or assembly can run, and TG_STATEMENT_TIMEOUT caps each
-	// statement it opens server-side. A file's zero-live-reference window is
-	// therefore bounded by those ceilings plus scheduling slack, and 24 hours
-	// sits more than two orders of magnitude above both. An operator who raises
-	// either deadline past what this floor assumes must re-derive it from the
-	// same numbers.
-	//
-	// It is defence in depth and not the safety control, which matters most
-	// exactly where it looks like the opposite. Every media file on the server is
-	// stored with zero live references for the length of one send, so the
-	// reference predicate alone matches files being sent right now; the age gate
-	// narrows that window but does not close it. What keeps a live file safe is
-	// the interlock on its files row, taken exclusively by the eraser and in
-	// share mode by every path that writes a reference.
+	// The default is 24 hours, deliberately generous while MAIN-338 remains
+	// open: the server does not yet bound how long an assembly may run. This
+	// cutoff is therefore load-bearing for an assembly still between AllocateFile
+	// and MarkFileStored, and an operator must keep it above the longest
+	// legitimate buffered assembly. The conditional delete still protects the
+	// separate race where a candidate finishes or gains a reference after the
+	// scan, but it cannot protect a live mid-Put row whose stored flag is false.
 	MediaErasureMinAge time.Duration
 	// MediaErasureReportInterval is how often that report runs. Zero disables
 	// it, as a zero limit disables a rate limit, and zero is the default: the

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,6 +56,40 @@ type blobErasureWalkHook struct {
 
 	called bool
 	before func()
+}
+
+type cancelAfterFirstRemoveBlobs struct {
+	blob.Store
+
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (b *cancelAfterFirstRemoveBlobs) Remove(ctx context.Context, key string) error {
+	if err := b.Store.Remove(ctx, key); err != nil {
+		return err
+	}
+	b.once.Do(b.cancel)
+	return nil
+}
+
+type serializedRemoveBlobs struct {
+	blob.Store
+
+	mu      sync.Mutex
+	removed map[string]int
+}
+
+func (b *serializedRemoveBlobs) Remove(ctx context.Context, key string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, err := b.ReadAt(ctx, key, 0, 1); errors.Is(err, blob.ErrNotFound) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	b.removed[key]++
+	return b.Store.Remove(ctx, key)
 }
 
 func (w *blobErasureWalkHook) WalkPrefix(ctx context.Context, prefix string, fn func(blob.Entry) error) error {
@@ -161,10 +196,10 @@ func TestBlobErasureSweepReclaimsOwnedClassesAndLeavesParts(t *testing.T) {
 	if err := store.SetPartBlobs(s, recorder.Store); err != nil {
 		t.Fatalf("restore blob backend: %v", err)
 	}
-	if counts.OrphanErased != 1 || counts.OrphanErasedBytes != int64(len(blobBody)) {
+	if counts.OrphanUnlinkAttempts != 1 || counts.OrphanUnlinkAttemptedBytes != int64(len(blobBody)) {
 		t.Fatalf("orphan erase counts = %+v, want one orphan and %d bytes", counts, len(blobBody))
 	}
-	if counts.TempErased != 1 || counts.TempErasedBytes != int64(len("old temp")) {
+	if counts.TempUnlinkAttempts != 1 || counts.TempUnlinkAttemptedBytes != int64(len("old temp")) {
 		t.Fatalf("temp erase counts = %+v, want one abandoned temp", counts)
 	}
 	if counts.TempInFlight != 1 || counts.Unexplained != 1 {
@@ -232,7 +267,7 @@ func TestBlobErasureSweepLeavesBlobWrittenAfterSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("blob erasure sweep: %v", err)
 	}
-	if counts.OrphanErased != 1 || counts.AboveSnapshot != 1 {
+	if counts.OrphanUnlinkAttempts != 1 || counts.AboveSnapshot != 1 {
 		t.Fatalf("counts = %+v, want old orphan erased and one post-snapshot blob held back", counts)
 	}
 	if blobPresent(t, s, orphan.ID) {
@@ -282,7 +317,151 @@ func TestBlobErasureSweepReclaimsInterruptedMediaUnlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("blob erasure sweep: %v", err)
 	}
-	if blobCounts.OrphanErased != 1 || blobPresent(t, s, f.ID) {
+	if blobCounts.OrphanUnlinkAttempts != 1 || blobPresent(t, s, f.ID) {
 		t.Fatalf("orphan follow-up counts = %+v, blob still present=%v", blobCounts, blobPresent(t, s, f.ID))
+	}
+}
+
+// Database failures are not unlink failures. Cancelling after the first
+// successful remove makes the next candidate fail at transaction begin; only
+// the first object was handed to the blob backend.
+func TestBlobErasureSweepDoesNotCountDatabaseFailureAsUnlinkFailure(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := mustUser(t, s, "+15559201006")
+
+	first := storedFileWithBytes(t, s, a.ID)
+	if err := store.EraseFileRow(ctx, s, first.ID); err != nil {
+		t.Fatalf("erase first row: %v", err)
+	}
+	second := storedFileWithBytes(t, s, a.ID)
+	if err := store.EraseFileRow(ctx, s, second.ID); err != nil {
+		t.Fatalf("erase second row: %v", err)
+	}
+
+	probe := &cancelAfterFirstRemoveBlobs{Store: store.BlobsOf(s), cancel: cancel}
+	if err := store.SetPartBlobs(s, probe); err != nil {
+		t.Fatalf("swap blobs: %v", err)
+	}
+	defer func() {
+		if err := store.SetPartBlobs(s, probe.Store); err != nil {
+			t.Errorf("restore blob backend: %v", err)
+		}
+	}()
+
+	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Hour))
+	if err == nil {
+		t.Fatal("sweep reported no database error after cancellation")
+	}
+	if counts.OrphanUnlinkFailed != 0 {
+		t.Fatalf("OrphanUnlinkFailed = %d, want 0 for a database error", counts.OrphanUnlinkFailed)
+	}
+	if counts.OrphanUnlinkAttempts != 1 {
+		t.Fatalf("OrphanUnlinkAttempts = %d, want only the first object removed", counts.OrphanUnlinkAttempts)
+	}
+	if blobPresent(t, s, first.ID) == blobPresent(t, s, second.ID) {
+		t.Fatalf("both orphan blobs have the same post-failure state: first=%v second=%v", blobPresent(t, s, first.ID), blobPresent(t, s, second.ID))
+	}
+}
+
+// Committing the no-row decision before Remove makes a cancellation in the
+// backend callback harmless to the database transaction. The current order
+// removes the bytes first, then loses the commit and misreports that as an
+// unlink failure.
+func TestBlobErasureSweepCommitsNoRowDecisionBeforeRemove(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := mustUser(t, s, "+15559201007")
+	f := storedFileWithBytes(t, s, a.ID)
+	if err := store.EraseFileRow(ctx, s, f.ID); err != nil {
+		t.Fatalf("erase row: %v", err)
+	}
+
+	probe := &cancelAfterFirstRemoveBlobs{Store: store.BlobsOf(s), cancel: cancel}
+	if err := store.SetPartBlobs(s, probe); err != nil {
+		t.Fatalf("swap blobs: %v", err)
+	}
+	defer func() {
+		if err := store.SetPartBlobs(s, probe.Store); err != nil {
+			t.Errorf("restore blob backend: %v", err)
+		}
+	}()
+
+	counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if counts.OrphanUnlinkAttempts != 1 || counts.OrphanUnlinkFailed != 0 {
+		t.Fatalf("counts = %+v, want one successful unlink and no failure", counts)
+	}
+	if blobPresent(t, s, f.ID) {
+		t.Fatalf("orphan blob %d survived the committed reclaim", f.ID)
+	}
+}
+
+// Two workers may race on a rowless object because there is no row to lock.
+// Remove is idempotent, so the serialized backend models the one physical
+// deletion while each worker reports only its own successful Remove attempt.
+func TestBlobErasureSweepConcurrentPassesRemoveEachBlobOnce(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15559201008")
+	f := storedFileWithBytes(t, s, a.ID)
+	if err := store.EraseFileRow(ctx, s, f.ID); err != nil {
+		t.Fatalf("erase row: %v", err)
+	}
+
+	probe := &serializedRemoveBlobs{Store: store.BlobsOf(s), removed: make(map[string]int)}
+	if err := store.SetPartBlobs(s, probe); err != nil {
+		t.Fatalf("swap blobs: %v", err)
+	}
+	defer func() {
+		if err := store.SetPartBlobs(s, probe.Store); err != nil {
+			t.Errorf("restore blob backend: %v", err)
+		}
+	}()
+
+	type result struct {
+		counts store.BlobEraseCounts
+		err    error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Go(func() {
+			counts, err := s.SweepBlobErasure(ctx, time.Now().Add(-time.Hour))
+			results <- result{counts: counts, err: err}
+		})
+	}
+	wg.Wait()
+	close(results)
+
+	var seen, attempts int
+	for got := range results {
+		if got.err != nil {
+			t.Fatalf("concurrent sweep: %v", got.err)
+		}
+		if got.counts.OrphanUnlinkAttempts > 1 {
+			t.Fatalf("OrphanUnlinkAttempts = %d, want at most one per worker", got.counts.OrphanUnlinkAttempts)
+		}
+		attempts += got.counts.OrphanUnlinkAttempts
+		seen++
+	}
+	if seen != 2 {
+		t.Fatalf("received %d sweep results, want 2", seen)
+	}
+	if attempts == 0 {
+		t.Fatal("neither worker reported an unlink attempt")
+	}
+	if probe.removed[blob.Key(f.ID)] != 1 {
+		t.Fatalf("physical removes for %q = %d, want 1", blob.Key(f.ID), probe.removed[blob.Key(f.ID)])
+	}
+	if blobPresent(t, s, f.ID) {
+		t.Fatalf("orphan blob %d survived concurrent passes", f.ID)
 	}
 }

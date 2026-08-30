@@ -46,24 +46,27 @@ func (r *BlobErasureReport) addUnexplained(e blob.Entry) {
 	}
 }
 
-// BlobEraseCounts is what one destructive assembled-blob pass did. Temporary
-// files and id-based orphans are separate because the former are reclaimed by
-// mtime alone while the latter require the files-row absence transaction.
-// Unexplained paths and fresh temporary files are retained and reported.
+// BlobEraseCounts is what one destructive assembled-blob pass did. The unlink
+// attempt counts are scoped to this worker: Remove is idempotent, so concurrent
+// passes may both report an attempt even though only one physically removes an
+// object. Temporary files and id-based orphans are separate because the former
+// are reclaimed by mtime alone while the latter require the files-row absence
+// transaction. Unexplained paths and fresh temporary files are retained and
+// reported.
 type BlobEraseCounts struct {
 	Through int64
 
-	OrphanConsidered   int
-	OrphanErased       int
-	OrphanErasedBytes  int64
-	OrphanRetained     int
-	OrphanUnlinkFailed int
+	OrphanConsidered           int
+	OrphanUnlinkAttempts       int
+	OrphanUnlinkAttemptedBytes int64
+	OrphanRetained             int
+	OrphanUnlinkFailed         int
 
-	TempConsidered   int
-	TempErased       int
-	TempErasedBytes  int64
-	TempInFlight     int
-	TempUnlinkFailed int
+	TempConsidered           int
+	TempUnlinkAttempts       int
+	TempUnlinkAttemptedBytes int64
+	TempInFlight             int
+	TempUnlinkFailed         int
 
 	AboveSnapshot    int
 	Unexplained      int
@@ -230,8 +233,8 @@ func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (
 				}
 				return nil
 			}
-			counts.TempErased++
-			counts.TempErasedBytes += c.size
+			counts.TempUnlinkAttempts++
+			counts.TempUnlinkAttemptedBytes += c.size
 			return nil
 		}, counts.addUnexplained,
 		func() { counts.AboveSnapshot++ },
@@ -258,9 +261,11 @@ func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (
 				counts.OrphanRetained++
 				continue
 			}
-			removed, err := s.reclaimOrphanBlob(ctx, c)
+			removed, unlinkFailed, err := s.reclaimOrphanBlob(ctx, c)
 			if err != nil {
-				counts.OrphanUnlinkFailed++
+				if unlinkFailed {
+					counts.OrphanUnlinkFailed++
+				}
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -270,8 +275,8 @@ func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (
 				counts.OrphanRetained++
 				continue
 			}
-			counts.OrphanErased++
-			counts.OrphanErasedBytes += c.size
+			counts.OrphanUnlinkAttempts++
+			counts.OrphanUnlinkAttemptedBytes += c.size
 		}
 		pending = pending[:0]
 		return nil
@@ -291,31 +296,32 @@ func (s *Store) SweepBlobErasure(ctx context.Context, tempOlderThan time.Time) (
 	return counts, firstErr
 }
 
-// reclaimOrphanBlob performs the final no-row check in a transaction and only
-// then removes the object. The transaction carries no row lock and the storage
-// call is the only operation in it after the check: uploads, sends and
-// downloads do not wait on a files-row interlock for this class. File ids are
-// never reused, so a committed absence remains the same decision after the
-// short transaction completes.
-func (s *Store) reclaimOrphanBlob(ctx context.Context, c blobErasureCandidate) (bool, error) {
+// reclaimOrphanBlob performs the final no-row check in a transaction, commits
+// that decision, and only then removes the object. The transaction carries no
+// row lock, and uploads, sends and downloads do not wait on a files-row
+// interlock for this class. File ids are never reused, so a committed absence
+// remains the same decision after the short transaction completes. The second
+// result distinguishes a storage unlink failure from a database failure for
+// the operator-facing counters.
+func (s *Store) reclaimOrphanBlob(ctx context.Context, c blobErasureCandidate) (removed, unlinkFailed bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("blob erasure: check %q: begin: %w", c.key, err)
+		return false, false, fmt.Errorf("blob erasure: check %q: begin: %w", c.key, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 
 	exists, err := s.q.WithTx(tx).FileExistsForBlob(ctx, c.id)
 	if err != nil {
-		return false, fmt.Errorf("blob erasure: check %q: %w", c.key, err)
+		return false, false, fmt.Errorf("blob erasure: check %q: %w", c.key, err)
 	}
 	if exists {
-		return false, nil
-	}
-	if err := s.blobs.Remove(ctx, c.key); err != nil {
-		return false, fmt.Errorf("blob erasure: unlink %q: %w", c.key, err)
+		return false, false, nil
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("blob erasure: check %q: commit: %w", c.key, err)
+		return false, false, fmt.Errorf("blob erasure: check %q: commit: %w", c.key, err)
 	}
-	return true, nil
+	if err := s.blobs.Remove(ctx, c.key); err != nil {
+		return false, true, fmt.Errorf("blob erasure: unlink %q: %w", c.key, err)
+	}
+	return true, false, nil
 }

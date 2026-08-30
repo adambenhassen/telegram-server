@@ -257,9 +257,12 @@ WHERE f.id = sqlc.arg(id)
 
 -- DeleteUnassembledFile is the crashed-assembly half of the row-driven
 -- reclaim. It repeats every condition after the exclusive row lock rather
--- than trusting the scan: a live assembly can finish, or a reference can be
--- created, in the gap. The caller unlinks the exact key only after this row
--- deletion commits.
+-- than trusting the scan: an assembly can finish, or a reference can be
+-- created, in the gap. That check does not protect an assembly still between
+-- AllocateFile and MarkFileStored; assembly is server-side over a fully
+-- buffered parts set, so no client paces that window. MAIN-338 will put a
+-- bound on it. The caller unlinks the exact key only after this row deletion
+-- commits.
 -- name: DeleteUnassembledFile :execrows
 DELETE FROM files f
 WHERE f.id = sqlc.arg(id)

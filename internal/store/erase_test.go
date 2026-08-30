@@ -687,11 +687,70 @@ func TestErasureSweepReclaimsAnOldUnassembledFile(t *testing.T) {
 	if counts.UnassembledErased != 1 || counts.UnassembledErasedBytes != f.Size {
 		t.Fatalf("counts = %+v, want one unassembled file and %d bytes erased", counts, f.Size)
 	}
+	if counts.Considered != 0 {
+		t.Fatalf("Considered = %d, want 0 for the stored class; unassembled candidates have their own counter", counts.Considered)
+	}
+	if counts.UnassembledConsidered != 1 {
+		t.Fatalf("UnassembledConsidered = %d, want 1", counts.UnassembledConsidered)
+	}
 	if rowPresent(t, s, f.ID) {
 		t.Errorf("not-stored files row %d survived the sweep", f.ID)
 	}
 	if blobPresent(t, s, f.ID) {
 		t.Errorf("bytes for not-stored file %d survived the sweep", f.ID)
+	}
+}
+
+// An unlink failure for a not-stored row belongs only to the unassembled
+// counters. The ordinary fields describe stored media and must remain a
+// partition of that class rather than silently absorbing this one.
+func TestErasureSweepCountsUnassembledUnlinkFailureSeparately(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	a := mustUser(t, s, "+15559200146")
+
+	f := storedFileWithBytes(t, s, a.ID)
+	if err := store.SetFileUnstored(ctx, s, f.ID); err != nil {
+		t.Fatalf("clear stored: %v", err)
+	}
+	refused := errors.New("unassembled blob backend refused the unlink")
+	probe := &probeBlobs{
+		Store: store.BlobsOf(s),
+		onRemove: func(key string) error {
+			if key != blob.Key(f.ID) {
+				t.Errorf("unlinked key %q, want %q", key, blob.Key(f.ID))
+			}
+			return refused
+		},
+	}
+	if err := store.SetPartBlobs(s, probe); err != nil {
+		t.Fatalf("swap blobs: %v", err)
+	}
+	defer func() {
+		if err := store.SetPartBlobs(s, probe.Store); err != nil {
+			t.Errorf("restore blob backend: %v", err)
+		}
+	}()
+
+	counts, err := s.SweepMediaErasure(ctx, future(), store.ErasureScanBatch)
+	if err == nil || !errors.Is(err, refused) {
+		t.Fatalf("sweep error = %v, want the unlink refusal", err)
+	}
+	if counts.UnlinkFailed != 0 {
+		t.Fatalf("UnlinkFailed = %d, want 0 for an unassembled row", counts.UnlinkFailed)
+	}
+	if counts.UnassembledUnlinkFailed != 1 {
+		t.Fatalf("UnassembledUnlinkFailed = %d, want 1", counts.UnassembledUnlinkFailed)
+	}
+	if counts.UnassembledErased != 1 || counts.Considered != 0 {
+		t.Fatalf("counts = %+v, want one unassembled erase and no stored-class erase", counts)
+	}
+	if rowPresent(t, s, f.ID) {
+		t.Errorf("not-stored files row %d survived the sweep", f.ID)
+	}
+	if !blobPresent(t, s, f.ID) {
+		t.Errorf("file %d's bytes disappeared despite the refused unlink", f.ID)
 	}
 }
 

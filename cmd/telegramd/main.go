@@ -545,87 +545,95 @@ func sweepMediaErasure(ctx context.Context, st *store.Store, cfg config.Config, 
 		case <-timer.C:
 		}
 
-		// The cutoff is read per pass, not per batch: what one sweep reclaims is
-		// decided once at its start, the same rule the upload-part sweep keeps.
-		now := time.Now()
-		olderThan := now.Add(-cfg.MediaErasureMinAge)
-		tempOlderThan := now.Add(-cfg.BlobScanTempMinAge)
-		if !cfg.MediaErasureDestructive {
-			c, err := st.MediaErasureSummary(ctx, olderThan, store.ErasureScanBatch)
-			if err != nil {
-				log.Error("media erasure sweep report", "err", err)
-			}
-			b, blobErr := st.BlobErasureSummary(ctx, tempOlderThan)
-			if blobErr != nil {
-				log.Error("blob erasure sweep report", "err", blobErr)
-			}
-			if err != nil || blobErr != nil {
-				continue
-			}
-			log.Info("media erasure sweep (reporting; destruction disabled)",
-				"scanned", c.Scanned,
-				"would_erase", c.Unreferenced,
-				"would_free_bytes", c.UnreferencedBytes,
-				"would_erase_unassembled", c.Unassembled,
-				"would_free_unassembled_bytes", c.UnassembledBytes,
-				"skipped_message_ref", c.SkippedMessageRef,
-				"skipped_channel_ref", c.SkippedChannelRef,
-				"skipped_too_new", c.SkippedTooNew,
-				"would_erase_blob_orphans", b.Orphans,
-				"would_free_blob_orphan_bytes", b.OrphanBytes,
-				"would_erase_abandoned_temp", b.AbandonedTemps,
-				"would_free_abandoned_temp_bytes", b.AbandonedTempBytes,
-				"blob_accounted", b.Accounted,
-				"blob_above_snapshot", b.AboveSnapshot,
-				"blob_temp_in_flight", b.TempsInFlight,
-				"blob_unexplained", b.Unexplained,
-				"blob_unexplained_bytes", b.UnexplainedBytes)
-			for _, p := range b.UnexplainedPaths {
-				log.Warn("path under the assembled blob tree the layout does not explain", "path", p)
-			}
-			continue
-		}
+		sweepMediaErasurePass(ctx, st, cfg, log)
+	}
+}
 
-		c, err := st.SweepMediaErasure(ctx, olderThan, store.ErasureScanBatch)
-		b, blobErr := st.SweepBlobErasure(ctx, tempOlderThan)
-		// Logged before the error is handled rather than after: a sweep that
-		// failed part way through has still committed everything it erased, and
-		// the operator-facing question after a failure is how much went.
-		log.Info("media erasure sweep",
-			"considered", c.Considered,
-			"erased", c.Erased,
-			"erased_bytes", c.ErasedBytes,
-			"contended", c.Contended,
-			"retained", c.Retained,
-			"unlink_failed", c.UnlinkFailed,
-			"unassembled_considered", c.UnassembledConsidered,
-			"unassembled_erased", c.UnassembledErased,
-			"unassembled_erased_bytes", c.UnassembledErasedBytes,
-			"unassembled_contended", c.UnassembledContended,
-			"unassembled_retained", c.UnassembledRetained,
-			"unassembled_unlink_failed", c.UnassembledUnlinkFailed,
-			"blob_orphan_considered", b.OrphanConsidered,
-			"blob_orphan_erased", b.OrphanErased,
-			"blob_orphan_erased_bytes", b.OrphanErasedBytes,
-			"blob_orphan_retained", b.OrphanRetained,
-			"blob_orphan_unlink_failed", b.OrphanUnlinkFailed,
-			"temp_considered", b.TempConsidered,
-			"temp_erased", b.TempErased,
-			"temp_erased_bytes", b.TempErasedBytes,
-			"temp_in_flight", b.TempInFlight,
-			"temp_unlink_failed", b.TempUnlinkFailed,
-			"above_snapshot", b.AboveSnapshot,
-			"unexplained", b.Unexplained,
-			"unexplained_bytes", b.UnexplainedBytes)
+// sweepMediaErasurePass runs one reporting or destructive pass. Keeping the
+// deployment decision at this command boundary makes it testable without
+// waiting on the background interval and keeps the off-switch ahead of every
+// operation that can unlink bytes.
+func sweepMediaErasurePass(ctx context.Context, st *store.Store, cfg config.Config, log *slog.Logger) {
+	// The cutoff is read per pass, not per batch: what one sweep reclaims is
+	// decided once at its start, the same rule the upload-part sweep keeps.
+	now := time.Now()
+	olderThan := now.Add(-cfg.MediaErasureMinAge)
+	tempOlderThan := now.Add(-cfg.BlobScanTempMinAge)
+	if !cfg.MediaErasureDestructive {
+		c, err := st.MediaErasureSummary(ctx, olderThan, store.ErasureScanBatch)
 		if err != nil {
-			log.Error("media erasure sweep", "err", err)
+			log.Error("media erasure sweep report", "err", err)
 		}
+		b, blobErr := st.BlobErasureSummary(ctx, tempOlderThan)
 		if blobErr != nil {
-			log.Error("blob erasure sweep", "err", blobErr)
+			log.Error("blob erasure sweep report", "err", blobErr)
 		}
+		if err != nil || blobErr != nil {
+			return
+		}
+		log.Info("media erasure sweep (reporting; destruction disabled)",
+			"scanned", c.Scanned,
+			"would_erase", c.Unreferenced,
+			"would_free_bytes", c.UnreferencedBytes,
+			"would_erase_unassembled", c.Unassembled,
+			"would_free_unassembled_bytes", c.UnassembledBytes,
+			"skipped_message_ref", c.SkippedMessageRef,
+			"skipped_channel_ref", c.SkippedChannelRef,
+			"skipped_too_new", c.SkippedTooNew,
+			"would_erase_blob_orphans", b.Orphans,
+			"would_free_blob_orphan_bytes", b.OrphanBytes,
+			"would_erase_abandoned_temp", b.AbandonedTemps,
+			"would_free_abandoned_temp_bytes", b.AbandonedTempBytes,
+			"blob_accounted", b.Accounted,
+			"blob_above_snapshot", b.AboveSnapshot,
+			"blob_temp_in_flight", b.TempsInFlight,
+			"blob_unexplained", b.Unexplained,
+			"blob_unexplained_bytes", b.UnexplainedBytes)
 		for _, p := range b.UnexplainedPaths {
 			log.Warn("path under the assembled blob tree the layout does not explain", "path", p)
 		}
+		return
+	}
+
+	c, err := st.SweepMediaErasure(ctx, olderThan, store.ErasureScanBatch)
+	b, blobErr := st.SweepBlobErasure(ctx, tempOlderThan)
+	// Logged before the error is handled rather than after: a sweep that
+	// failed part way through has still committed everything it erased, and
+	// the operator-facing question after a failure is how much went.
+	log.Info("media erasure sweep",
+		"considered", c.Considered,
+		"erased", c.Erased,
+		"erased_bytes", c.ErasedBytes,
+		"contended", c.Contended,
+		"retained", c.Retained,
+		"unlink_failed", c.UnlinkFailed,
+		"unassembled_considered", c.UnassembledConsidered,
+		"unassembled_erased", c.UnassembledErased,
+		"unassembled_erased_bytes", c.UnassembledErasedBytes,
+		"unassembled_contended", c.UnassembledContended,
+		"unassembled_retained", c.UnassembledRetained,
+		"unassembled_unlink_failed", c.UnassembledUnlinkFailed,
+		"blob_orphan_considered", b.OrphanConsidered,
+		"blob_orphan_unlink_attempts", b.OrphanUnlinkAttempts,
+		"blob_orphan_unlink_attempted_bytes", b.OrphanUnlinkAttemptedBytes,
+		"blob_orphan_retained", b.OrphanRetained,
+		"blob_orphan_unlink_failed", b.OrphanUnlinkFailed,
+		"temp_considered", b.TempConsidered,
+		"temp_unlink_attempts", b.TempUnlinkAttempts,
+		"temp_unlink_attempted_bytes", b.TempUnlinkAttemptedBytes,
+		"temp_in_flight", b.TempInFlight,
+		"temp_unlink_failed", b.TempUnlinkFailed,
+		"above_snapshot", b.AboveSnapshot,
+		"unexplained", b.Unexplained,
+		"unexplained_bytes", b.UnexplainedBytes)
+	if err != nil {
+		log.Error("media erasure sweep", "err", err)
+	}
+	if blobErr != nil {
+		log.Error("blob erasure sweep", "err", blobErr)
+	}
+	for _, p := range b.UnexplainedPaths {
+		log.Warn("path under the assembled blob tree the layout does not explain", "path", p)
 	}
 }
 
