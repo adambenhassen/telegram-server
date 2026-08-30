@@ -340,6 +340,21 @@ func StorePool(s *Store) *pgxpool.Pool { return s.pool }
 // exposing a production callback.
 func SetAssemblyClaimHook(s *Store, fn func(fileID int64)) { s.assemblyClaimHook = fn }
 
+// SetAssemblyClaimScanHook replaces one assembly claim result scan for tests.
+// The hook receives the live row, so it can consume a successful PostgreSQL
+// result and then return an error to model an ambiguous acquire. The claim must
+// discard that connection rather than return it to the pool.
+func SetAssemblyClaimScanHook(s *Store, fn func(fileID int64, row pgx.Row, acquired *bool) error) {
+	s.assemblyClaimScanHook = fn
+}
+
+// SetAssemblyClaimUnlockHook replaces one assembly claim unlock for tests. It
+// is used to hold cleanup past its deadline and prove that the assembly slot is
+// released before the cleanup path finishes.
+func SetAssemblyClaimUnlockHook(s *Store, fn func(context.Context) (bool, error)) {
+	s.assemblyClaimUnlockHook = fn
+}
+
 // EraseFileRow deletes one files row. Nothing in the shipped server deletes one
 // — the eraser is a later stage of M17 — so this is the only way a test can
 // reach the state the reference interlock fails closed on.

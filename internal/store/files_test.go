@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -282,6 +283,130 @@ func TestMediaErasureSkipsClaimedAssembly(t *testing.T) {
 	}
 	if string(got) != body {
 		t.Fatalf("assembled bytes = %q, want %q", got, body)
+	}
+}
+
+// A stalled claim cleanup must not keep the assembly slot occupied. The first
+// unlock waits for its bounded context, while the second assembly proves that
+// the slot is released before that cleanup path can finish.
+func TestStalledAssemblyClaimUnlockDoesNotStrandSlot(t *testing.T) {
+	t.Parallel()
+	s := openAssemblyStore(t, 4)
+	ctx := context.Background()
+	firstUser := mustUser(t, s, "+15559100027")
+	secondUser := mustUser(t, s, "+15559100028")
+
+	unlockStarted := make(chan struct{})
+	allowUnlock := make(chan struct{})
+	var unlockCalls atomic.Int32
+	var closeUnlockOnce sync.Once
+	closeUnlock := func() { closeUnlockOnce.Do(func() { close(allowUnlock) }) }
+	defer closeUnlock()
+	store.SetAssemblyClaimUnlockHook(s, func(ctx context.Context) (bool, error) {
+		if unlockCalls.Add(1) == 1 {
+			close(unlockStarted)
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-allowUnlock:
+				return false, errors.New("test unlock stalled")
+			}
+		}
+		return false, errors.New("test unlock cleanup")
+	})
+	defer store.SetAssemblyClaimUnlockHook(s, nil)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := s.AllocateAndCompleteFile(ctx, firstUser.ID, 1, "application/octet-stream", "first.bin", bigQuota, func(store.File) error {
+			return nil
+		})
+		firstDone <- err
+	}()
+	select {
+	case <-unlockStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first assembly did not enter stalled unlock cleanup")
+	}
+
+	secondReady := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := s.AllocateAndCompleteFile(ctx, secondUser.ID, 1, "application/octet-stream", "second.bin", bigQuota, func(store.File) error {
+			close(secondReady)
+			return nil
+		})
+		secondDone <- err
+	}()
+	select {
+	case <-secondReady:
+	case <-time.After(750 * time.Millisecond):
+		closeUnlock()
+		<-firstDone
+		<-secondDone
+		t.Fatal("second assembly did not reach Put while first unlock was stalled")
+	}
+
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first assembly: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first assembly remained blocked in claim cleanup")
+	}
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second assembly: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second assembly did not finish after the slot was released")
+	}
+}
+
+// If the result of pg_try_advisory_lock becomes ambiguous after PostgreSQL has
+// taken the session lock, the connection must be discarded rather than pooled.
+// The direct unlock below observes the session state from the next pooled
+// connection and fails if the claimed connection was returned for reuse.
+func TestAmbiguousAssemblyClaimDiscardsConnection(t *testing.T) {
+	t.Parallel()
+	s := openAssemblyStore(t, 2)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15559100029")
+	ambiguous := errors.New("test ambiguous claim result")
+	var fileID int64
+	store.SetAssemblyClaimScanHook(s, func(id int64, row pgx.Row, acquired *bool) error {
+		fileID = id
+		if err := row.Scan(acquired); err != nil {
+			return err
+		}
+		return ambiguous
+	})
+	defer store.SetAssemblyClaimScanHook(s, nil)
+
+	_, err := s.AllocateAndCompleteFile(ctx, u.ID, 1, "application/octet-stream", "ambiguous.bin", bigQuota, func(store.File) error {
+		return errors.New("assembly callback ran after ambiguous claim")
+	})
+	if !errors.Is(err, ambiguous) {
+		t.Fatalf("ambiguous claim: want sentinel error, got %v", err)
+	}
+	if fileID == 0 {
+		t.Fatal("ambiguous claim hook did not observe a file id")
+	}
+
+	conn, err := store.StorePool(s).Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire probe connection: %v", err)
+	}
+	var unlocked bool
+	if err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, -fileID).Scan(&unlocked); err != nil {
+		conn.Release()
+		t.Fatalf("probe advisory unlock: %v", err)
+	}
+	conn.Release()
+	if unlocked {
+		t.Fatalf("ambiguous claim for file %d remained held on a pooled connection", fileID)
 	}
 }
 

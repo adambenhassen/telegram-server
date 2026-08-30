@@ -138,17 +138,33 @@ func (s *Store) AllocateAndCompleteFile(
 	}
 	select {
 	case s.assemblySlots <- struct{}{}:
-		defer func() { <-s.assemblySlots }()
 	case <-ctx.Done():
 		return File{}, fmt.Errorf("allocate file: wait for assembly slot: %w", ctx.Err())
 	}
+	slotReleased := false
+	releaseSlot := func() {
+		if slotReleased {
+			return
+		}
+		slotReleased = true
+		<-s.assemblySlots
+	}
+	defer releaseSlot()
 
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return File{}, fmt.Errorf("allocate file: acquire connection: %w", err)
 	}
-	claim := fileAssemblyClaim{conn: conn}
+	claim := fileAssemblyClaim{
+		conn:       conn,
+		scan:       s.assemblyClaimScanHook,
+		unlockHook: s.assemblyClaimUnlockHook,
+	}
 	defer func() {
+		// The claim cleanup may have to wait for a database operation or discard
+		// a wedged session. Free the assembly slot first so request traffic and
+		// another assembly are never queued behind that cleanup.
+		releaseSlot()
 		if releaseErr := claim.release(); releaseErr != nil {
 			if err == nil {
 				file = File{}
@@ -262,10 +278,15 @@ func allocateFileTx(
 // transaction commits while the claim remains held, and the connection stays
 // checked out until the blob Put and MarkFileStored commit finish.
 type fileAssemblyClaim struct {
-	conn *pgxpool.Conn
-	key  int64
-	held bool
+	conn       *pgxpool.Conn
+	key        int64
+	held       bool
+	discard    bool
+	scan       func(fileID int64, row pgx.Row, acquired *bool) error
+	unlockHook func(context.Context) (bool, error)
 }
+
+const assemblyClaimUnlockTimeout = time.Second
 
 // fileAssemblyLockKey occupies the negative half of the one-argument advisory
 // lock space. files.id is constrained positive, as are the user ids passed to
@@ -275,7 +296,18 @@ func fileAssemblyLockKey(fileID int64) int64 { return -fileID }
 func (c *fileAssemblyClaim) acquire(ctx context.Context, fileID int64) error {
 	c.key = fileAssemblyLockKey(fileID)
 	var acquired bool
-	if err := c.conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, c.key).Scan(&acquired); err != nil {
+	row := c.conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, c.key)
+	scan := c.scan
+	if scan == nil {
+		scan = func(_ int64, row pgx.Row, acquired *bool) error {
+			return row.Scan(acquired)
+		}
+	}
+	if err := scan(fileID, row, &acquired); err != nil {
+		// A session advisory lock survives transaction rollback. An error while
+		// consuming this result therefore makes the connection unsafe to pool,
+		// even though held has not yet been recorded.
+		c.discard = true
 		return fmt.Errorf("file assembly claim: acquire: %w", err)
 	}
 	if !acquired {
@@ -283,6 +315,27 @@ func (c *fileAssemblyClaim) acquire(ctx context.Context, fileID int64) error {
 	}
 	c.held = true
 	return nil
+}
+
+type fileAssemblyUnlockResult struct {
+	released bool
+	err      error
+}
+
+func (c *fileAssemblyClaim) unlock(ctx context.Context, conn *pgx.Conn) (bool, error) {
+	if c.unlockHook != nil {
+		return c.unlockHook(ctx)
+	}
+	var released bool
+	err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, c.key).Scan(&released)
+	return released, err
+}
+
+func discardFileAssemblyConnection(conn *pgxpool.Conn) error {
+	raw := conn.Hijack()
+	ctx, cancel := context.WithTimeout(context.Background(), assemblyClaimUnlockTimeout)
+	defer cancel()
+	return raw.Close(ctx)
 }
 
 // release unlocks the session claim before returning the connection to the
@@ -295,25 +348,46 @@ func (c *fileAssemblyClaim) release() error {
 		return nil
 	}
 	c.conn = nil
-	if !c.held {
+	if !c.held && !c.discard {
 		conn.Release()
 		return nil
 	}
-
-	var released bool
-	if err := conn.QueryRow(context.Background(), `SELECT pg_advisory_unlock($1)`, c.key).Scan(&released); err != nil {
-		raw := conn.Hijack()
-		if closeErr := raw.Close(context.Background()); closeErr != nil {
-			return fmt.Errorf("file assembly claim: unlock: %w; close: %w", err, closeErr)
+	if c.discard {
+		if err := discardFileAssemblyConnection(conn); err != nil {
+			return fmt.Errorf("file assembly claim: discard: %w", err)
 		}
 		return nil
 	}
-	if !released {
+
+	unlockCtx, cancel := context.WithTimeout(context.Background(), assemblyClaimUnlockTimeout)
+	defer cancel()
+	result := make(chan fileAssemblyUnlockResult, 1)
+	rawConn := conn.Conn()
+	go func() {
+		released, err := c.unlock(unlockCtx, rawConn)
+		result <- fileAssemblyUnlockResult{released: released, err: err}
+	}()
+
+	select {
+	case result := <-result:
+		if result.err != nil {
+			if closeErr := discardFileAssemblyConnection(conn); closeErr != nil {
+				return fmt.Errorf("file assembly claim: unlock: %w; close: %w", result.err, closeErr)
+			}
+			return nil
+		}
+		if !result.released {
+			conn.Release()
+			return fmt.Errorf("file assembly claim: key %d was not held", c.key)
+		}
 		conn.Release()
-		return fmt.Errorf("file assembly claim: key %d was not held", c.key)
+		return nil
+	case <-unlockCtx.Done():
+		if closeErr := discardFileAssemblyConnection(conn); closeErr != nil {
+			return fmt.Errorf("file assembly claim: unlock: %w; close: %w", unlockCtx.Err(), closeErr)
+		}
+		return nil
 	}
-	conn.Release()
-	return nil
 }
 
 // tryFileAssemblyClaim is the eraser's nonblocking half of the assembly

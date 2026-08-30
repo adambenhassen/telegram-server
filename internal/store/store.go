@@ -74,6 +74,17 @@ type Store struct {
 	// production callers.
 	assemblyClaimHook func(fileID int64)
 
+	// assemblyClaimScanHook is a test-only replacement for the claim result
+	// scan. It can consume a result and then return an error, modeling the
+	// ambiguous case where PostgreSQL may have taken the session lock but the
+	// caller never receives a usable result.
+	assemblyClaimScanHook func(fileID int64, row pgx.Row, acquired *bool) error
+
+	// assemblyClaimUnlockHook is a test-only replacement for the claim unlock
+	// operation. It controls a stalled cleanup without exposing a production
+	// callback or a fake database connection.
+	assemblyClaimUnlockHook func(context.Context) (bool, error)
+
 	// now reads the clock the client-visible rate-limit wait is measured
 	// against. Production always holds time.Now; it is a field so a test can
 	// pin the remainder of an open window to an exact sub-second value instead
