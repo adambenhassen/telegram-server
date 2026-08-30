@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -147,6 +148,34 @@ func TestBlockedAddDoesNotWriteAndUnblockAllowsIt(t *testing.T) {
 	added, _, perOwner, err = s.AddChatUser(ctx, chat.ID, target.ID, caller.ID)
 	if err != nil || !added || len(perOwner) != 3 {
 		t.Fatalf("unblocked add: added=%v perOwner=%+v err=%v", added, perOwner, err)
+	}
+}
+
+func TestBlockedAddRefusalDoesNotTakeOwnerLock(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	caller := mustUser(t, s, "+15551500251")
+	target := mustUser(t, s, "+15551500252")
+	member := mustUser(t, s, "+15551500253")
+	chat := chatWith(t, s, caller, member)
+	if _, err := s.BlockUser(ctx, target.ID, caller.ID); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+
+	release, err := store.HoldOwnerLock(ctx, s, target.ID)
+	if err != nil {
+		t.Fatalf("hold target owner lock: %v", err)
+	}
+	defer release()
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	added, _, perOwner, err := s.AddChatUser(callCtx, chat.ID, target.ID, caller.ID)
+	if !errors.Is(err, store.ErrNotMember) {
+		t.Fatalf("blocked add under held owner lock: added=%v perOwner=%+v err=%v, want ErrNotMember", added, perOwner, err)
+	}
+	if added || perOwner != nil {
+		t.Fatalf("blocked add under held owner lock: added=%v perOwner=%+v, want no-op", added, perOwner)
 	}
 }
 

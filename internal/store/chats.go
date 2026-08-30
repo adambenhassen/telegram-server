@@ -328,16 +328,9 @@ func (s *Store) AddChatUser(ctx context.Context, chatID, target, callerID int64)
 		return false, Message{}, nil, err
 	}
 	defer func() { _ = m.tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
-	if err = m.lockOwners(ctx, target); err != nil {
-		return false, Message{}, nil, err
-	}
-
-	// Counting under the chats row lock is what stops two concurrent adds both
-	// seeing 199. An add of an existing member changes no count, so it is not the
-	// cap's business.
-	if !m.seen[target] && len(m.members) >= maxChatParticipants {
-		return false, Message{}, nil, ErrChatFull
-	}
+	// Blocking is an authority decision, so a refused add must return before
+	// taking any owner advisory lock. The authorized path below takes its full
+	// owner set once, in the existing sorted order.
 	if !m.seen[target] {
 		blocked, err := m.qtx.IsBlocked(ctx, db.IsBlockedParams{
 			BlockerID: target,
@@ -351,6 +344,16 @@ func (s *Store) AddChatUser(ctx context.Context, chatID, target, callerID int64)
 			// cannot make. Nothing has been written in this transaction yet.
 			return false, Message{}, nil, ErrNotMember
 		}
+	}
+	if err = m.lockOwners(ctx, target); err != nil {
+		return false, Message{}, nil, err
+	}
+
+	// Counting under the chats row lock is what stops two concurrent adds both
+	// seeing 199. An add of an existing member changes no count, so it is not the
+	// cap's business.
+	if !m.seen[target] && len(m.members) >= maxChatParticipants {
+		return false, Message{}, nil, ErrChatFull
 	}
 	n, err := m.qtx.InsertChatParticipantIfAbsent(ctx, db.InsertChatParticipantIfAbsentParams{
 		ChatID: chatID, UserID: target, InviterID: callerID,
