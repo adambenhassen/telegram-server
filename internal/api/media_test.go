@@ -208,6 +208,13 @@ func TestPartsReaderConcatenates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parts reader: %v", err)
 	}
+	sized, ok := r.(interface{ Size() int64 })
+	if !ok {
+		t.Fatal("parts reader does not expose its known size")
+	}
+	if sized.Size() != int64(len("hello wide world")) {
+		t.Fatalf("parts reader size = %d, want %d", sized.Size(), len("hello wide world"))
+	}
 	got, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatalf("read: %v", err)

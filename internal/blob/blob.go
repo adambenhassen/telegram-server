@@ -1,6 +1,12 @@
 // Package blob stores opaque byte ranges at server-chosen keys. It knows
 // nothing about files, users or media: callers pick the key and own whatever
 // the bytes mean, including any encryption applied above this layer.
+//
+// Every operation that addresses a key enforces the same lexical contract:
+// keys are at most 1024 bytes, use slash-separated non-empty segments, and
+// contain only ASCII letters, digits, '.', '_' or '-'. A segment cannot be
+// "." or "..". This validation is the backend-independent safety floor.
+// [Local] adds OS-level confinement through [os.Root] on top of it.
 package blob
 
 import (
@@ -17,8 +23,41 @@ import (
 	"time"
 )
 
-// ErrNotFound is returned by [Store.ReadAt] for a key that was never stored.
-var ErrNotFound = errors.New("blob not found")
+var (
+	// ErrNotFound is returned by [Store.ReadAt] for a key that was never stored.
+	ErrNotFound = errors.New("blob not found")
+	// ErrInvalidKey is returned by key operations when a key violates the
+	// package's lexical contract. It is distinct from [ErrNotFound], so a
+	// malformed key cannot be mistaken for a missing object.
+	ErrInvalidKey = errors.New("invalid blob key")
+)
+
+const maxKeyBytes = 1024
+
+// ValidateKey checks the backend-independent key contract. It returns
+// [ErrInvalidKey] for every rejected key, so backends and callers can make the
+// same distinction without depending on backend-specific error text.
+func ValidateKey(key string) error {
+	if len(key) == 0 || len(key) > maxKeyBytes {
+		return ErrInvalidKey
+	}
+
+	for segment := range strings.SplitSeq(key, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return ErrInvalidKey
+		}
+		for i := range segment {
+			c := segment[i]
+			if (c < 'a' || c > 'z') &&
+				(c < 'A' || c > 'Z') &&
+				(c < '0' || c > '9') &&
+				c != '.' && c != '_' && c != '-' {
+				return ErrInvalidKey
+			}
+		}
+	}
+	return nil
+}
 
 // TempSuffix is what [Local.Put] appends to a key while the bytes are being
 // written. A path carrying it is a write in progress, not a stored blob, and it
@@ -27,8 +66,10 @@ var ErrNotFound = errors.New("blob not found")
 // is a second place to drift from.
 const TempSuffix = ".tmp"
 
-// Store is the seam an object-storage backend lands on later. It has a single
-// implementation, [Local], on purpose.
+// Store is the backend-independent seam implemented by [Local] and [S3]. Every
+// method taking a key rejects an invalid key with [ErrInvalidKey] before doing
+// backend work. WalkPrefix takes a containment prefix instead, whose
+// empty-prefix no-op semantics are deliberately separate from key validation.
 type Store interface {
 	// Put stores r under key and returns the number of bytes written.
 	Put(ctx context.Context, key string, r io.Reader) (int64, error)
@@ -52,6 +93,14 @@ type Store interface {
 	// carry, and a remote backend hands its listing over a page at a time
 	// rather than buffering a whole bucket to answer one call.
 	WalkPrefix(ctx context.Context, prefix string, fn func(Entry) error) error
+}
+
+// OperationTimeoutProvider is optionally implemented by stores that bound one
+// backend operation. Callers that perform post-commit work can use the bound
+// without coupling themselves to a concrete backend; stores without an
+// operation deadline need not implement it.
+type OperationTimeoutProvider interface {
+	OperationTimeout() time.Duration
 }
 
 // Key returns the storage key for a file id, sharded on the id's low byte so
@@ -145,9 +194,8 @@ func NewLocal(dir string) (*Local, error) {
 		return nil, fmt.Errorf("blob dir: %w", err)
 	}
 	// Every path operation goes through this *os.Root handle, which confines
-	// it to dir at the OS level: a key containing ".." or an absolute path
-	// fails inside the standard library rather than reaching the filesystem.
-	// That is why this package validates no keys of its own.
+	// it to dir at the OS level even if a future caller or filesystem change
+	// presents a path the lexical validator does not cover.
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, fmt.Errorf("open blob root: %w", err)
@@ -159,12 +207,16 @@ func NewLocal(dir string) (*Local, error) {
 func (l *Local) RootDir() string { return l.dir }
 
 // Put writes r to a temporary file and renames it into place, so a reader
-// never observes a partially written blob. O_EXCL on the temporary file also
-// means two concurrent Puts to the same key cannot interleave: the second
-// fails instead of corrupting the first. Keys come from freshly allocated file
-// ids today, so that collision does not arise; the flag keeps it impossible if
-// that ever changes.
+// never observes a partially written blob. Local's O_EXCL temporary-file
+// guard is a local-only concurrent-write guarantee: two concurrent Puts to the
+// same key cannot interleave, and the second fails instead of corrupting the
+// first. A remote backend may provide last-writer-wins semantics instead. Keys
+// come from freshly allocated file ids today, so that collision does not arise;
+// the flag keeps it impossible if that ever changes.
 func (l *Local) Put(_ context.Context, key string, r io.Reader) (int64, error) {
+	if err := ValidateKey(key); err != nil {
+		return 0, err
+	}
 	if err := l.root.MkdirAll(path.Dir(key), 0o700); err != nil {
 		return 0, fmt.Errorf("blob mkdir: %w", err)
 	}
@@ -344,6 +396,9 @@ func (l *Local) walk(ctx context.Context, dir, prefix string, fn func(Entry) err
 // Remove deletes key. Deleting a key that is not there is a no-op, so a
 // caller that races a sweep or a re-save never needs to know which won.
 func (l *Local) Remove(_ context.Context, key string) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	err := l.root.Remove(key)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -365,8 +420,14 @@ func (l *Local) Remove(_ context.Context, key string) error {
 // blob rather than against limit, so a huge limit over a small blob cannot
 // turn into a huge allocation.
 func (l *Local) ReadAt(_ context.Context, key string, offset, limit int64) ([]byte, error) {
+	if err := ValidateKey(key); err != nil {
+		return nil, err
+	}
 	if offset < 0 || limit < 0 {
 		return nil, fmt.Errorf("blob read: negative window offset=%d limit=%d", offset, limit)
+	}
+	if limit == 0 {
+		return []byte{}, nil
 	}
 
 	f, err := l.root.Open(key)

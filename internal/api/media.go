@@ -25,6 +25,21 @@ type partsReader struct {
 	refs  []store.UploadPartRef
 	next  int
 	buf   []byte
+	size  int64
+}
+
+// Size reports the byte count already established by the upload-part rows.
+// S3-compatible stores use it to set Content-Length without reading the
+// streaming reader into a second whole-file buffer.
+func (p *partsReader) Size() int64 {
+	if p.size != 0 {
+		return p.size
+	}
+	var size int64
+	for _, ref := range p.refs {
+		size += ref.Size
+	}
+	return size
 }
 
 // Read fills b from the current part, fetching the next one when it runs out.
@@ -453,7 +468,7 @@ func (h *handlers) assembleFile(
 	file, err := h.store.AllocateAndCompleteFile(ctx, userID, total, sanitizeMIME(mimeType), sanitizeFileName(name), h.maxUserStorageBytes, func(file store.File) error {
 		var err error
 		written, err = h.blobs.Put(ctx, blob.Key(file.ID), &partsReader{
-			ctx: ctx, store: h.store, refs: refs,
+			ctx: ctx, store: h.store, refs: refs, size: total,
 		})
 		if err != nil {
 			return err
