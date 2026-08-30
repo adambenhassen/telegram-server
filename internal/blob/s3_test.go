@@ -33,18 +33,41 @@ import (
 func TestStoreConformance(t *testing.T) {
 	t.Parallel()
 
-	factories := map[string]func(*testing.T) blob.Store{
-		"local": func(t *testing.T) blob.Store {
+	type conformanceBackend struct {
+		store blob.Store
+		seed  func(string, []byte) error
+	}
+	factories := map[string]func(*testing.T) conformanceBackend{
+		"local": func(t *testing.T) conformanceBackend {
 			t.Helper()
-			l, _ := newLocal(t)
-			return l
+			l, dir := newLocal(t)
+			return conformanceBackend{
+				store: l,
+				seed: func(key string, body []byte) error {
+					filename := filepath.Join(dir, filepath.FromSlash(key))
+					if err := os.MkdirAll(filepath.Dir(filename), 0o700); err != nil {
+						return err
+					}
+					return os.WriteFile(filename, body, 0o600)
+				},
+			}
 		},
-		"s3": newMinioStore,
+		"s3": func(t *testing.T) conformanceBackend {
+			t.Helper()
+			store := newMinioStore(t)
+			return conformanceBackend{
+				store: store,
+				seed: func(key string, body []byte) error {
+					return blob.PutRawObjectForTest(context.Background(), store, key, body)
+				},
+			}
+		},
 	}
 	for name, makeStore := range factories {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			store := makeStore(t)
+			backend := makeStore(t)
+			store := backend.store
 			ctx := context.Background()
 			key := blob.PartsPrefix + "round-trip"
 			want := []byte("0123456789abcdef")
@@ -121,6 +144,10 @@ func TestStoreConformance(t *testing.T) {
 			if _, err := store.Put(ctx, "scope-file", strings.NewReader("scope")); err != nil {
 				t.Fatalf("put scope file: %v", err)
 			}
+			const invalidKey = blob.PartsPrefix + "foo bar"
+			if err := backend.seed(invalidKey, nil); err != nil {
+				t.Fatalf("seed %s: %v", invalidKey, err)
+			}
 			entries := map[string]blob.Entry{}
 			if err := store.WalkPrefix(ctx, blob.PartsPrefix, func(entry blob.Entry) error {
 				if !strings.HasPrefix(entry.Key, blob.PartsPrefix) {
@@ -134,13 +161,14 @@ func TestStoreConformance(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("walk: %v", err)
 			}
-			if len(entries) != 3 {
-				t.Fatalf("walk yielded %d entries, want 3: %+v", len(entries), entries)
+			if len(entries) != 4 {
+				t.Fatalf("walk yielded %d entries, want 4: %+v", len(entries), entries)
 			}
 			for key, wantSize := range map[string]int64{
 				blob.PartsPrefix + "aaa":       1,
 				blob.PartsPrefix + "bbb":       2,
 				blob.PartsPrefix + "zero-byte": 0,
+				invalidKey:                     0,
 			} {
 				if entries[key].Size != wantSize {
 					t.Fatalf("walk %q size = %d, want %d", key, entries[key].Size, wantSize)
@@ -168,7 +196,7 @@ type minioHarness struct {
 
 var sharedMinio minioHarness
 
-func newMinioStore(t *testing.T) blob.Store {
+func newMinioStore(t *testing.T) *blob.S3 {
 	t.Helper()
 	endpoint := sharedMinioEndpoint(t)
 	prefix := "conformance/" + sharedMinio.namespace + "/" + strings.NewReplacer("/", "-", "_", "-").Replace(t.Name()) + "/"

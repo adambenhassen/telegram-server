@@ -634,9 +634,11 @@ func (s *S3) listPage(ctx context.Context, query, remotePrefix, localPrefix stri
 				return false, "", s.operationError("walk", errS3Operation)
 			}
 			localKey, ok := strings.CutPrefix(object.Key, s.prefix)
-			if !ok || !strings.HasPrefix(localKey, localPrefix) || ValidateKey(localKey) != nil {
+			if !ok || !strings.HasPrefix(localKey, localPrefix) {
 				return false, "", s.operationError("walk", errS3Operation)
 			}
+			// Match Local.WalkPrefix: an in-scope object is an entry even when
+			// its key is not one this package would create.
 			modTime, parseErr := time.Parse(time.RFC3339Nano, object.LastModified)
 			if parseErr != nil {
 				return false, "", s.operationError("walk", parseErr)
