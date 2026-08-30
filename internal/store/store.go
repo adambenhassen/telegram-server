@@ -85,6 +85,12 @@ type Store struct {
 	// pooled connection at connect time. It lives on the Store only so Open can
 	// read it after the options run; see WithStatementTimeout.
 	statementTimeout time.Duration
+
+	// assemblySlots bounds the number of connections an in-flight assembled
+	// upload may pin. Open sizes it from the pool's configured maximum after
+	// reserving AssemblyConnectionHeadroom for ordinary request paths.
+	assemblySlots chan struct{}
+	assemblyLimit int
 }
 
 // Sentinel errors returned by the login-code methods.
@@ -121,6 +127,11 @@ var (
 
 // Option configures a Store at Open time.
 type Option func(*Store)
+
+// AssemblyConnectionHeadroom is the number of pool connections reserved for
+// ordinary request paths while assembled uploads hold their session claims.
+// The reservation covers a send, a download, and an auth call concurrently.
+const AssemblyConnectionHeadroom = 3
 
 // WithStatementTimeout sets the Postgres statement_timeout every connection in
 // the pool runs under: a single SQL statement that runs longer is cancelled by
@@ -187,6 +198,12 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	assemblyLimit := int(poolCfg.MaxConns) - AssemblyConnectionHeadroom
+	if assemblyLimit < 1 {
+		return nil, fmt.Errorf("store: pool max connections %d must exceed assembly headroom %d", poolCfg.MaxConns, AssemblyConnectionHeadroom)
+	}
+	s.assemblyLimit = assemblyLimit
+	s.assemblySlots = make(chan struct{}, assemblyLimit)
 	// Session default rather than SET per statement: one line at connect, and
 	// every query on the connection carries the ceiling with no per-call cost.
 	if s.statementTimeout > 0 {
@@ -241,6 +258,10 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	}
 	return s, nil
 }
+
+// AssemblyConcurrencyLimit returns the startup-derived cap on in-flight
+// assembled uploads. It is surfaced for the command's startup diagnostic.
+func (s *Store) AssemblyConcurrencyLimit() int { return s.assemblyLimit }
 
 // queryRower is the one method of pgxpool.Pool and pgx.Conn checkSchema needs.
 type queryRower interface {

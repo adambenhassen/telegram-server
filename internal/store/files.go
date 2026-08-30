@@ -136,6 +136,12 @@ func (s *Store) AllocateAndCompleteFile(
 	if put == nil {
 		return File{}, errors.New("allocate file: nil assembly callback")
 	}
+	select {
+	case s.assemblySlots <- struct{}{}:
+		defer func() { <-s.assemblySlots }()
+	case <-ctx.Done():
+		return File{}, fmt.Errorf("allocate file: wait for assembly slot: %w", ctx.Err())
+	}
 
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
@@ -304,7 +310,7 @@ func (c *fileAssemblyClaim) release() error {
 	}
 	if !released {
 		conn.Release()
-		return fmt.Errorf("file assembly claim: key %d was not held", -c.key)
+		return fmt.Errorf("file assembly claim: key %d was not held", c.key)
 	}
 	conn.Release()
 	return nil

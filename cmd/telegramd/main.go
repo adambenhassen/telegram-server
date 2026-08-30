@@ -80,6 +80,9 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	log.Info("file assembly concurrency bound",
+		"limit", st.AssemblyConcurrencyLimit(),
+		"reserved_pool_connections", store.AssemblyConnectionHeadroom)
 	defer func() {
 		if cerr := st.Close(); cerr != nil {
 			log.Error("store close", "err", cerr)
