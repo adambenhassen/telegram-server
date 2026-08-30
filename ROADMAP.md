@@ -203,10 +203,18 @@ Secret chats
   `PEER_ID_INVALID`.
 - Four RPCs: `messages.createChat`, `messages.addChatUser`,
   `messages.deleteChatUser`, `messages.editChatTitle`.
+- Basic-chat administration is creator-only: only the creator may rename the
+  chat, remove another member, or pin/unpin it; any member may add users subject
+  to the directed block list or leave, and the creator cannot be removed. Basic
+  chats carry no role column and deliberately do not reuse the channel role
+  model; delegated and fine-grained rights remain deferred.
 - Fan-out: a send to a chat writes one message row, one event, and one `pts`
   bump per member in a single transaction under sorted advisory locks, all
   sharing one `fanout_id`. Edit and delete walk the `fanout_id` copy set; only
-  the author may delete, and service messages cannot be deleted.
+  the author may delete for everyone while still a member, a caller may delete
+  only their own copy, and the creator may moderate any non-service message for
+  all current members, including after its author leaves. Service messages
+  cannot be deleted. The 1:1 deletion posture is unchanged.
 - Service messages for chat create, member add, member remove, and title change;
   written in the same mutation transaction.
 - 200-member cap enforced at create and add time; bounds the advisory-lock set
@@ -551,11 +559,15 @@ Tracked so shortcuts don't rot into "later means never".
   (single-writer invariant), not an explicit resync response. — M4.
 - **`seq` on update envelopes.** Minimal; gotd relies on `pts` for dedup, so `seq`
   is not yet a meaningful per-user counter. — M4.
-- **Chat admin rights.** Any member may add or remove any member, including the
-  chat's creator. `ChatAdminRights` is not stored or enforced; `revoke_history`,
-  `fwd_limit`, chat photos, and invite links are not implemented. `revoke_history`
-  and `fwd_limit` are accepted and ignored, so a removed member keeps their own
-  copies of past messages and a new member sees no history before they joined. — M6
+- **Chat admin rights.** Basic chats carry no role column and deliberately do not
+  reuse the channel role model. The creator is the sole privileged member for
+  renames, removing another member, and pinning; any member may add users subject
+  to the directed block list or leave, and the creator cannot be removed.
+  Delegated admins and fine-grained `ChatAdminRights`/`ChatBannedRights` remain
+  deferred. `revoke_history`, `fwd_limit`, chat photos, and invite links are not
+  implemented. `revoke_history` and `fwd_limit` are accepted and ignored, so a
+  removed member keeps their own copies of past messages and a new member sees
+  no history before they joined. — M6
 - **Removed-member history access.** A removed member's dialog returns
   `ChatForbidden`; their retained message rows and `pts` are reachable through
   `updates.getDifference` replay and through `messages.searchGlobal` (the owned
@@ -574,21 +586,24 @@ Tracked so shortcuts don't rot into "later means never".
 - **`messages.getChats`, `messages.getFullChat`, `messages.migrateChat`.** Not
   implemented. A client learns a chat's title and version from the `Chats` list
   on updates and dialogs, and cannot fetch the participant list. — M6
-- **No control over who may add you to a group.** Any account can create a chat
-  and add any user id it can name, giving it a push channel into that user's
-  update stream until they leave, and nothing stops it re-adding them. The check
-  needs contacts or a block list, neither of which exists yet. — M6
-- **Chat message deletion has three gaps and they are one decision.** Chat
-  deletion is closed to the author, service messages cannot be deleted at all,
-  and an author who has left the chat can no longer delete their own messages.
-  Fail-closed, and three things follow. `messages.deleteMessages` has no `revoke`
-  flag, so every delete that is allowed is a delete-for-everyone. A member cannot
-  clear anyone else's message from their own view. And a message left behind by a
-  departed member is permanent: there is no moderation path, so the creator
-  cannot remove abusive content. 1:1 keeps its existing posture, where either
-  side deletes both copies. Whoever picks this up decides author-delete,
-  self-only delete and creator moderation together across both peer types —
-  deciding them one at a time is how the two peer types diverge. — M6
+- **Directed block list for group adds.** `contacts.block`, `contacts.unblock`
+  and `contacts.getBlocked` persist a directed relationship in Postgres. If T
+  blocks A, A cannot create a new membership edge for T in a basic group, and
+  chat creation filters blocked invitees before it writes participants. Blocking
+  does not remove existing memberships or erase history, and it governs group
+  adds only. The create-time check is not locked with the block write, so a block
+  that commits after the check can still let that target be added once; the
+  filtered target is returned as `MissingInvitee`, which a creator who already
+  resolved it can recognize as a block. — M6
+- **Chat message deletion.** The author may still revoke-delete a non-service
+  message for every current member while the author remains a member. With
+  `revoke=false`, a caller may clear a non-service message from their own copy,
+  including a retained copy after leaving, without affecting other copies. With
+  `revoke=true`, the creator may moderate any non-service message for all current
+  members, including one whose author has left. Service messages remain
+  undeletable by everyone. A member removed before moderation keeps their frozen
+  copy; 1:1 deletion is unchanged (`revoke=true` still deletes both copies,
+  `revoke=false` only the caller's). — M6
 - **A difference batch fetches the participant list once per create event.**
   `maxDiffEvents` caps a batch at 500 events, not at payload size, so 500
   `ChatActionCreate` rows in one `updates.getDifference` mean 500 `IsMember`
@@ -714,6 +729,13 @@ Tracked so shortcuts don't rot into "later means never".
 - **Secret-chat messages are permanently non-indexable.** The server stores encrypted blobs
   without inspecting plaintext, so full-text indexing of secret-chat content is not possible by
   design and will not be added. — M13
+
+- **Open account-issuance bound for public exposure.** The shipped per-IP
+  `auth.signUp` limit (default 5/hour) is defence in depth only and does not
+  survive address rotation. No bound that holds against an attacker controlling
+  many source addresses and receiving codes at scale has been chosen or
+  evidenced. `TG_REGISTRATION` stays `closed` until that bound is chosen and
+  evidenced. — M16, M19
 
 ### M16 — Username/password authentication
 
