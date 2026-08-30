@@ -66,11 +66,10 @@ func ValidateKey(key string) error {
 // is a second place to drift from.
 const TempSuffix = ".tmp"
 
-// Store is the seam an object-storage backend lands on later. It has a single
-// implementation, [Local], on purpose. Every method taking a key rejects an
-// invalid key with [ErrInvalidKey] before doing backend work. WalkPrefix takes
-// a containment prefix instead, whose empty-prefix no-op semantics are
-// deliberately separate from key validation.
+// Store is the backend-independent seam implemented by [Local] and [S3]. Every
+// method taking a key rejects an invalid key with [ErrInvalidKey] before doing
+// backend work. WalkPrefix takes a containment prefix instead, whose
+// empty-prefix no-op semantics are deliberately separate from key validation.
 type Store interface {
 	// Put stores r under key and returns the number of bytes written.
 	Put(ctx context.Context, key string, r io.Reader) (int64, error)
@@ -417,6 +416,9 @@ func (l *Local) ReadAt(_ context.Context, key string, offset, limit int64) ([]by
 	}
 	if offset < 0 || limit < 0 {
 		return nil, fmt.Errorf("blob read: negative window offset=%d limit=%d", offset, limit)
+	}
+	if limit == 0 {
+		return []byte{}, nil
 	}
 
 	f, err := l.root.Open(key)

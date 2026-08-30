@@ -155,11 +155,17 @@ func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIn
 	if err = tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
+	// The request may be canceled after the accounting row commits, but the
+	// byte work still has to finish its cleanup. Keep request values while
+	// replacing cancellation with a backend-sized bound: WithoutCancel alone
+	// would let a remote store hang forever.
+	blobCtx, blobCancel := context.WithTimeout(context.WithoutCancel(ctx), blob.DefaultS3OperationTimeout)
+	defer blobCancel()
 
 	// The row is committed, so the cap holds whatever happens next. The bytes
 	// go in after: a failure here leaves a row with no bytes, which the
 	// assembly's fail-closed check and the sweep both handle.
-	_, putErr := s.blobs.Put(ctx, key, bytes.NewReader(payload))
+	_, putErr := s.blobs.Put(blobCtx, key, bytes.NewReader(payload))
 
 	// The commit moved the row onto the new key, so whatever sits at the old
 	// one is already named by no row. It runs whether or not the write above
@@ -167,7 +173,7 @@ func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIn
 	// logged rather than returned: the part itself is in the state its row
 	// describes.
 	if superseded != "" && superseded != key {
-		if err = s.removePartBytes(ctx, superseded); err != nil {
+		if err = s.removePartBytes(blobCtx, superseded); err != nil {
 			s.log.Error("remove superseded upload part bytes",
 				"user_id", userID, "file_id", fileID, "part", partIndex, "err", err)
 		}
@@ -185,7 +191,7 @@ func (s *Store) SaveUploadPart(ctx context.Context, userID, fileID int64, partIn
 	// so that save's delete of our key runs after this write and collects it;
 	// if it does not, we collect it here.
 	if putErr == nil {
-		if err = s.dropUnnamedPartBytes(ctx, userID, fileID, partIndex, key); err != nil {
+		if err = s.dropUnnamedPartBytes(blobCtx, userID, fileID, partIndex, key); err != nil {
 			s.log.Error("drop unnamed upload part bytes",
 				"user_id", userID, "file_id", fileID, "part", partIndex, "err", err)
 		}

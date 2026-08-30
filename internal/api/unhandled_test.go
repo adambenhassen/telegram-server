@@ -183,8 +183,7 @@ func TestUnhandledBudgetBandsOnOneConnection(t *testing.T) {
 			if err == nil {
 				t.Fatalf("call %d: answered, want the connection ended", i)
 			}
-			var rpc *tgerr.Error
-			if errors.As(err, &rpc) {
+			if rpc, ok := errors.AsType[*tgerr.Error](err); ok {
 				t.Fatalf("call %d: %d %s, want a non-RPC error that ends the connection", i, rpc.Code, rpc.Message)
 			}
 		}

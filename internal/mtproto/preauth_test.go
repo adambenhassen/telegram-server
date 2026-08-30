@@ -416,14 +416,18 @@ func dripFrame(ctx context.Context, conn transport.Conn) error {
 	}
 	var in bin.Buffer
 	err := conn.Recv(ctx, &in)
-	var protoErr *codec.ProtocolErr
-	if errors.As(err, &protoErr) {
+	if hasProtocolError(err) {
 		return nil
 	}
 	if err == nil {
 		return nil
 	}
 	return err
+}
+
+func hasProtocolError(err error) bool {
+	protoErr, ok := errors.AsType[*codec.ProtocolErr](err)
+	return ok && protoErr != nil
 }
 
 // probeServed opens a connection, negotiates a codec and sends a frame the

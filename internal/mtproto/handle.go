@@ -165,8 +165,7 @@ func (s *Server) handle(c *Conn, req *Request) error {
 	}
 
 	if err := s.handler.OnMessage(c, req); err != nil {
-		var rpcErr *tgerr.Error
-		if errors.As(err, &rpcErr) {
+		if rpcErr, ok := errors.AsType[*tgerr.Error](err); ok {
 			return c.SendErr(req, rpcErr)
 		}
 		// A handler still running when its request deadline fired is abandoned,

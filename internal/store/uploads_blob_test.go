@@ -475,6 +475,61 @@ func TestConcurrentResavesLeaveNoUnnamedObject(t *testing.T) {
 	}
 }
 
+// TestCancelledSaveCleansObjectAfterResave covers the request-disconnect
+// variant of the same race. The first save commits its row, then its blob
+// backend cancels the request context and pauses before landing the object.
+// A second save supersedes the row and removes the first key while it is still
+// absent. When the first object finally lands, its cleanup must use a detached
+// bounded context or the canceled request prevents the row re-read and leaves
+// bytes that no row names.
+func TestCancelledSaveCleansObjectAfterResave(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u, err := s.CreateUser(requestCtx, "+15559000114")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	plain, dir := localBlobsOf(t, s)
+	gate := &cancelDuringPutBlobs{
+		Store:        plain,
+		cancel:       cancel,
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	if err := store.SetPartBlobs(s, gate); err != nil {
+		t.Fatalf("install blob gate: %v", err)
+	}
+
+	var firstErr error
+	var first sync.WaitGroup
+	first.Go(func() {
+		firstErr = s.SaveUploadPart(requestCtx, u.ID, 31, 0, part('a', 512*1024), maxFile)
+	})
+	<-gate.firstStarted
+
+	secondErr := s.SaveUploadPart(context.Background(), u.ID, 31, 0, part('b', 512*1024), maxFile)
+	if secondErr != nil {
+		close(gate.releaseFirst)
+		first.Wait()
+		t.Fatalf("second save: %v", secondErr)
+	}
+	close(gate.releaseFirst)
+	first.Wait()
+	if firstErr != nil {
+		t.Fatalf("canceled first save: %v", firstErr)
+	}
+	if !errors.Is(requestCtx.Err(), context.Canceled) {
+		t.Fatalf("request context = %v, want canceled", requestCtx.Err())
+	}
+
+	assertEveryPartObjectIsNamed(t, s, dir, "canceled save")
+	if n := countPartKeys(t, dir); n != 1 {
+		t.Fatalf("part objects after canceled resave = %d, want 1", n)
+	}
+}
+
 // TestAssemblyCleanupRacingResaveLeavesNoUnnamedObject is the same invariant
 // through the other door. The assembly cleanup reads the part set, deletes
 // those objects, then retires the rows; a save that commits inside that window
@@ -565,6 +620,28 @@ type latencyBlobs struct {
 
 func newLatencyBlobs(inner blob.Store, put, remove time.Duration) *latencyBlobs {
 	return &latencyBlobs{Store: inner, put: put, remove: remove, started: make(chan struct{})}
+}
+
+type cancelDuringPutBlobs struct {
+	blob.Store
+
+	cancel       context.CancelFunc
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	once         sync.Once
+}
+
+func (b *cancelDuringPutBlobs) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
+	first := false
+	b.once.Do(func() {
+		first = true
+		b.cancel()
+		close(b.firstStarted)
+	})
+	if first {
+		<-b.releaseFirst
+	}
+	return b.Store.Put(ctx, key, r)
 }
 
 func (l *latencyBlobs) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
