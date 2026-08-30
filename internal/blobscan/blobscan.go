@@ -17,6 +17,7 @@ package blobscan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -114,17 +115,29 @@ type Files interface {
 	ExistingFileIDs(ctx context.Context, ids []int64) (map[int64]struct{}, error)
 }
 
-// Tree is the blob half: enumeration of what is actually on the store.
-// [blob.Local] satisfies it.
+// Tree is the blob half: enumeration of what is actually on the configured
+// store. [blob.Local] and [blob.S3] satisfy it.
 //
 // It is a local interface rather than a method on blob.Store because what this
 // pass needs is the whole tree, and blob.Store's enumeration is prefix-scoped:
 // containment lives in the primitive there, and the assembled keyspace has no
 // single prefix to name. A remote backend therefore has to satisfy this
-// separately before it can be classified — a classifier that walked a directory
-// that an object store leaves empty would report zero orphans and look healthy.
+// separately before it can be classified: a classifier that walked a directory
+// an object store leaves empty would report zero orphans and look healthy.
 type Tree interface {
 	Walk(ctx context.Context, fn func(blob.Entry) error) error
+}
+
+// ScanStore classifies the configured blob store. Full-tree enumeration is
+// intentionally a separate capability from blob.Store's scoped WalkPrefix;
+// refusing a backend without it is safer than returning an empty report that
+// could be mistaken for a healthy store.
+func ScanStore(ctx context.Context, blobs blob.Store, files Files, tempOlderThan time.Time) (Report, error) {
+	tree, ok := blobs.(Tree)
+	if !ok {
+		return Report{}, errors.New("blob scan: configured blob store does not support full-tree enumeration")
+	}
+	return Scan(ctx, tree, files, tempOlderThan)
 }
 
 // Scan classifies every path under the blob tree against the files table.

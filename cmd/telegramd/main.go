@@ -70,7 +70,7 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("server RSA key", "key_id", keyID, "fingerprint", rsakey.Fingerprint(&key.PublicKey), "path", cfg.RSAKeyPath)
 
-	blobs, err := blob.NewLocal(cfg.BlobDir)
+	blobs, err := newBlobStore(ctx, cfg, log)
 	if err != nil {
 		return err
 	}
@@ -281,6 +281,24 @@ func run(log *slog.Logger) error {
 	return server.Serve(ctx, ln)
 }
 
+func newBlobStore(ctx context.Context, cfg config.Config, log *slog.Logger) (blob.Store, error) {
+	if cfg.BlobS3 == nil {
+		return blob.NewLocal(cfg.BlobDir)
+	}
+	s3cfg := *cfg.BlobS3
+	// NewS3 emits the plaintext warning while it constructs the client, so
+	// the logger must be selected before construction rather than after it.
+	s3cfg.Logger = log
+	remote, err := blob.NewS3(s3cfg)
+	if err != nil {
+		return nil, fmt.Errorf("object store configuration is invalid; check TG_BLOB_S3_* settings: %w", err)
+	}
+	if err := remote.Check(ctx); err != nil {
+		return nil, fmt.Errorf("object store startup check failed: %w", err)
+	}
+	return remote, nil
+}
+
 // trustClientAddr applies the configured client-address source to the server.
 //
 // The switch is exhaustive on purpose and has no permissive default: config
@@ -475,7 +493,7 @@ func reportMediaErasureCandidates(ctx context.Context, st *store.Store, minAge, 
 // for a person, and a pass that guessed at it would be how an unrelated file
 // gets destroyed. Upload parts, the layout's other keyspace, are reported as
 // their own class and never as unexplained.
-func reportBlobDisk(ctx context.Context, blobs *blob.Local, st *store.Store, tempMinAge, interval time.Duration, log *slog.Logger) {
+func reportBlobDisk(ctx context.Context, blobs blob.Store, st *store.Store, tempMinAge, interval time.Duration, log *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -485,7 +503,7 @@ func reportBlobDisk(ctx context.Context, blobs *blob.Local, st *store.Store, tem
 		case <-ticker.C:
 			// The cutoff is read per pass, the same way a sweep's is: what a
 			// report holds back is decided once, at its start.
-			rep, err := blobscan.Scan(ctx, blobs, st, time.Now().Add(-tempMinAge))
+			rep, err := blobscan.ScanStore(ctx, blobs, st, time.Now().Add(-tempMinAge))
 			if err != nil {
 				log.Error("blob disk report", "err", err)
 				continue

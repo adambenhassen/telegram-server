@@ -33,6 +33,16 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_AUTHKEY_ENC_KEY`| *(required)*     | 64 hex chars (32 bytes) — master key that encrypts auth keys at rest; must stay stable, or persisted sessions can no longer be decrypted |
 | `TG_AUTHKEY_ENC_KEY_FILE`| *(unset)*   | Path the master key is read from when `TG_AUTHKEY_ENC_KEY` is empty, and generated into (0600) on first start when that file does not exist. One of the two must be set — with neither, startup fails. A generated key is a dev key and the server logs a warning saying so |
 | `TG_RSA_KEY_PATH`   | `server_key.pem` | Path to the server's RSA private key        |
+| `TG_BLOB_DIR`       | `blobs`           | Local filesystem blob root; used when all `TG_BLOB_S3_*` variables are unset or empty |
+| `TG_BLOB_S3_ENDPOINT` | *(unset)*       | Enables the S3-compatible blob backend; setting any non-empty `TG_BLOB_S3_*` variable selects it and requires the complete configuration |
+| `TG_BLOB_S3_BUCKET` | *(unset)*         | Private bucket containing blobs |
+| `TG_BLOB_S3_PREFIX` | *(unset)*         | Required non-root prefix assigned to this server |
+| `TG_BLOB_S3_REGION` | `us-east-1`       | SigV4 signing region |
+| `TG_BLOB_S3_ACCESS_KEY_ID` | *(unset)* | Operations-only key scoped to this bucket and prefix |
+| `TG_BLOB_S3_SECRET_ACCESS_KEY` | *(unset)* | Raw secret accepted only for compose or CI secret injection; prefer the file form |
+| `TG_BLOB_S3_SECRET_ACCESS_KEY_FILE` | *(unset)* | Preferred file containing the object-store secret; read at startup |
+| `TG_BLOB_S3_CA_PATH` | *(unset)*        | PEM bundle for a private endpoint CA; TLS verification remains enabled |
+| `TG_BLOB_S3_ALLOW_INSECURE_HTTP` | `false` | Explicit loopback/compose-only plaintext opt-in; startup warns when enabled |
 | `TG_DC_ID`          | `2`              | DC id this server advertises as `ThisDC`    |
 | `TG_LOG_LOGIN_CODES`| `false`          | Write issued login codes to the log in cleartext. Off by default; with it off no code is delivered anywhere and sign-in cannot complete. A non-boolean value fails startup |
 | `TG_REGISTRATION`   | `closed`         | Controls whether `auth.signUp` creates new accounts. `closed` (default) rejects all registration RPCs; `open` allows them. An unrecognized value fails startup. Sign-in for accounts that already exist is unaffected by this setting |
@@ -42,6 +52,34 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_PREAUTH_LIFETIME`| `2m`          | How long a connection may stay unauthenticated, measured from accept. Past it the socket is closed whatever it is sending, which is the only bound that reaches a peer that stays inside every deadline by dripping one small frame per read timeout. It ends at the first frame that decrypts under a key the server issued, so a client between key exchange and sign-in — waiting on a human reading a code — is not cut off. Do not set it below a minute: gotd applies a 60s timeout per read inside key exchange, a shorter ceiling starts cutting handshakes that are merely slow, and the server warns at startup if you do. `0` disables it; a negative or unparseable duration fails startup |
 | `TG_MAX_CONNS_PER_UNBOUND_KEY`| `8`  | Concurrent connections one auth key with nobody signed in on it may hold. It is the analogue, for keys with no user, of the per-user connection cap, and it covers the population between the two: the `TG_*PREAUTH*` bounds end at the first frame that decrypts under a server-issued key, and the per-user cap counts only signed-in sessions, so a key that completed one exchange and never signed in used to be counted by neither. A connection is charged only once one of its frames has decrypted, never on the auth key id alone — that id is on the wire in cleartext, and charging on it would let anyone who reads one fill a stranger's budget. The default is small because the legitimate holder of such a key is one client waiting on a human to read a login code, holding one connection; more keys, not more connections per key, is what a real population grows by, and each new key costs a key exchange that the pre-auth bounds already price. Past the cap the frame in hand is answered and the socket is then closed. `0` disables it; a negative or non-integer value fails startup |
 | `TG_CLIENT_ADDR_PROXY_CIDRS`| *(unset)* | Comma-separated addresses or CIDRs (`10.0.0.0/8, 192.0.2.7`) of the balancers a PROXY protocol v2 header is accepted from. An IPv4-mapped entry takes its IPv4 meaning (`::ffff:192.0.2.0/120` is `192.0.2.0/24`), since peer addresses are matched unmapped; one too short to name an IPv4 network fails startup rather than starting and matching nothing. Required by, and only read in, `TG_CLIENT_ADDR_TRUST=proxy-v2`: an empty list there fails startup, and a list set in `socket` mode does too, since it means the balancer is in place but every client is being keyed on its address. Both directions then fail closed — a connection from a listed balancer without a valid v2 header is dropped rather than served on the balancer's address, and a header from anywhere else is dropped rather than believed. Only v2: the v1 text form is refused. An address is read only from `PROXY` over `AF_INET`/`AF_INET6` with the `STREAM` transport; the two headers that name no client — the `LOCAL` command a health check sends, and `AF_UNSPEC` — connect but carry no address and so cannot call `auth.sendCode`; every other family or transport is refused. Keep this list to the balancer addresses, not a VPC or subnet range: a connection whose header names no client is charged to no bucket, so anything inside an allowlisted CIDR can send a `LOCAL`/`AF_UNSPEC` header and sit outside `TG_MAX_PREAUTH_CONNS_PER_IP` entirely — with `10.0.0.0/8` that is every workload in the network, with the balancer's own addresses it is the balancer |
+
+### Object-store backend
+
+With all `TG_BLOB_S3_*` variables unset or empty, uploaded blobs use the local
+filesystem at `TG_BLOB_DIR`, exactly as before. Setting any object-store
+variable to a non-empty value selects S3 mode and requires an endpoint, bucket,
+non-empty prefix, access key, and exactly one secret source. The server validates
+the S3 client
+and lists the configured namespace before it opens for service; a failed check
+stops startup and never falls back to local storage.
+
+Use `TG_BLOB_S3_SECRET_ACCESS_KEY_FILE` for the secret. The file should be
+readable by the server process and contain only the secret, optionally followed
+by a newline. The raw `TG_BLOB_S3_SECRET_ACCESS_KEY` form is accepted for
+compose or CI secret injection only; do not put it in a developer shell,
+checked-in environment file, command line, or ordinary process environment.
+
+The access key must be scoped to operations on this one bucket and this one
+prefix: list, get, put, and delete objects below the prefix only. Do not grant
+bucket-root, wildcard, ACL, or policy-management permissions. The server does
+not set object ACLs; keep the bucket private. Existing local blobs are not
+migrated when S3 mode is enabled.
+
+HTTPS certificate verification is always enabled. Set `TG_BLOB_S3_CA_PATH`
+only when the endpoint uses a private CA bundle. Plaintext HTTP is rejected
+unless `TG_BLOB_S3_ALLOW_INSECURE_HTTP=true` is explicitly set for a loopback
+or compose-only endpoint; startup logs a warning when this escape hatch is
+used. There is no TLS verification bypass setting.
 
 ### What the pre-auth bounds do and do not cover
 

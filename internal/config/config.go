@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -69,6 +70,11 @@ type Config struct {
 	// BlobDir is where uploaded file bodies are stored. It must be outside the
 	// repository and outside anything a future HTTP surface serves statically.
 	BlobDir string
+	// BlobS3 selects the S3-compatible blob backend when any TG_BLOB_S3_*
+	// setting is non-empty. A nil value keeps the local filesystem backend as
+	// the default. The secret is resolved during Load so startup can reject a
+	// missing or unreadable credential before serving requests.
+	BlobS3 *blob.S3Config
 	// MaxUserStorageBytes caps the total size of one account's uploaded files.
 	// M5 ships no blob deleter, so nothing decrements this: it is a lifetime
 	// quota per account, not a live one, and it is the number that decides
@@ -817,6 +823,13 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, adminErr
 	}
 	cfg.AdminTokenHash = os.Getenv("TG_ADMIN_TOKEN_HASH")
+	if blobS3Configured() {
+		blobS3, err := loadBlobS3Config()
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.BlobS3 = blobS3
+	}
 
 	if cfg.PostgresDSN == "" {
 		return Config{}, errors.New("TG_POSTGRES_DSN is required")
@@ -834,6 +847,99 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+var blobS3ConfigEnvNames = [...]string{
+	"TG_BLOB_S3_ENDPOINT",
+	"TG_BLOB_S3_BUCKET",
+	"TG_BLOB_S3_PREFIX",
+	"TG_BLOB_S3_REGION",
+	"TG_BLOB_S3_ACCESS_KEY_ID",
+	"TG_BLOB_S3_SECRET_ACCESS_KEY",
+	"TG_BLOB_S3_SECRET_ACCESS_KEY_FILE",
+	"TG_BLOB_S3_CA_PATH",
+	"TG_BLOB_S3_ALLOW_INSECURE_HTTP",
+}
+
+func loadBlobS3Config() (*blob.S3Config, error) {
+	endpoint, err := requiredBlobS3Value("TG_BLOB_S3_ENDPOINT")
+	if err != nil {
+		return nil, err
+	}
+	bucket, err := requiredBlobS3Value("TG_BLOB_S3_BUCKET")
+	if err != nil {
+		return nil, err
+	}
+	prefix, err := requiredBlobS3Value("TG_BLOB_S3_PREFIX")
+	if err != nil {
+		return nil, err
+	}
+	accessKey, err := requiredBlobS3Value("TG_BLOB_S3_ACCESS_KEY_ID")
+	if err != nil {
+		return nil, err
+	}
+	secret, err := loadBlobS3Secret()
+	if err != nil {
+		return nil, err
+	}
+	allowInsecureHTTP := false
+	if raw := os.Getenv("TG_BLOB_S3_ALLOW_INSECURE_HTTP"); raw != "" {
+		allowInsecureHTTP, err = strconv.ParseBool(raw)
+		if err != nil {
+			return nil, errors.New("TG_BLOB_S3_ALLOW_INSECURE_HTTP must be a boolean")
+		}
+	}
+	return &blob.S3Config{
+		Endpoint:          endpoint,
+		Bucket:            bucket,
+		Prefix:            prefix,
+		Region:            envOr("TG_BLOB_S3_REGION", "us-east-1"),
+		AccessKeyID:       accessKey,
+		SecretAccessKey:   secret,
+		CAPath:            os.Getenv("TG_BLOB_S3_CA_PATH"),
+		AllowInsecureHTTP: allowInsecureHTTP,
+	}, nil
+}
+
+func blobS3Configured() bool {
+	for _, name := range blobS3ConfigEnvNames {
+		if os.Getenv(name) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func requiredBlobS3Value(name string) (string, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return "", fmt.Errorf("%s is required when object-store configuration is enabled", name)
+	}
+	return value, nil
+}
+
+func loadBlobS3Secret() (string, error) {
+	secret := os.Getenv("TG_BLOB_S3_SECRET_ACCESS_KEY")
+	secretFile := os.Getenv("TG_BLOB_S3_SECRET_ACCESS_KEY_FILE")
+	if secret != "" && secretFile != "" {
+		return "", errors.New("TG_BLOB_S3_SECRET_ACCESS_KEY and TG_BLOB_S3_SECRET_ACCESS_KEY_FILE are both set: use only one")
+	}
+	if secret != "" {
+		return secret, nil
+	}
+	if secretFile == "" {
+		return "", errors.New("TG_BLOB_S3_SECRET_ACCESS_KEY or TG_BLOB_S3_SECRET_ACCESS_KEY_FILE is required when object-store configuration is enabled")
+	}
+	data, err := os.ReadFile(secretFile) // #nosec G304,G703 -- operator-configured secret path.
+	if err != nil {
+		return "", fmt.Errorf("TG_BLOB_S3_SECRET_ACCESS_KEY_FILE: read secret file: %w", err)
+	}
+	secret = strings.TrimSpace(string(data))
+	clear(data)
+	if secret == "" {
+		return "", errors.New("TG_BLOB_S3_SECRET_ACCESS_KEY_FILE is empty")
+	}
+	return secret, nil
 }
 
 // preAuthLimits resolves the bounds on what an unauthenticated connection may
