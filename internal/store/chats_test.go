@@ -504,9 +504,10 @@ func TestChatMutationAuthorityRefusalDoesNotTakeOwnerLock(t *testing.T) {
 	ctx := context.Background()
 	creator := mustUser(t, s, "+15551276101")
 	member := mustUser(t, s, "+15551276102")
-	chat := chatWith(t, s, creator, member)
+	target := mustUser(t, s, "+15551276103")
+	chat := chatWith(t, s, creator, member, target)
 
-	ownerID := min(creator.ID, member.ID)
+	ownerID := min(creator.ID, member.ID, target.ID)
 	release, err := store.HoldOwnerLock(ctx, s, ownerID)
 	if err != nil {
 		t.Fatalf("hold owner lock: %v", err)
@@ -525,16 +526,19 @@ func TestChatMutationAuthorityRefusalDoesNotTakeOwnerLock(t *testing.T) {
 			},
 		},
 		{
-			name: "remove creator",
+			name: "remove another member",
 			call: func(callCtx context.Context) error {
-				_, _, _, err := s.RemoveChatUser(callCtx, chat.ID, creator.ID, member.ID)
+				_, _, _, err := s.RemoveChatUser(callCtx, chat.ID, target.ID, member.ID)
 				return err
 			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			// The generous deadline avoids turning scheduler load into a false
+			// refusal failure. Without the fix, the held owner lock keeps this
+			// call blocked until the deadline.
+			callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 			if err := tc.call(callCtx); !errors.Is(err, store.ErrNotMember) {
 				t.Fatalf("authority refusal under a held owner lock: want ErrNotMember, got %v", err)
