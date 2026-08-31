@@ -124,7 +124,7 @@ func TestSignInUsernameUnknownCodeWriteIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i, code := range []string{"first-secret", "second-secret"} {
+	for i, code := range []string{"first-secret", "12345"} {
 		res, err := api.SignInForTestWithLimits(s, [8]byte{byte(i + 1)}, netip.MustParseAddr("10.0.0.12"), store.RateLimitConfig{}, &tg.AuthSignInRequest{
 			PhoneNumber:   "idempotent",
 			PhoneCodeHash: hash,

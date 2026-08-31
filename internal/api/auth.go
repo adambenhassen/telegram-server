@@ -54,6 +54,18 @@ func capPhoneCode(code string) string {
 	return code[:end]
 }
 
+func isGeneratedCode(code string) bool {
+	if len(code) != 5 {
+		return false
+	}
+	for i := range code {
+		if code[i] < '0' || code[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func newSentCode(hash string) *tg.AuthSentCode {
 	return &tg.AuthSentCode{
 		Type:          &tg.AuthSentCodeTypeSMS{Length: 5},
@@ -355,15 +367,17 @@ func (h *handlers) handleSignInUsername(r *mtproto.Request, username, phoneCodeH
 		return nil, errInternal
 	}
 
-	// Unknown username: persist the caller's code for invite admission, then
-	// return authorizationSignUpRequired. No user is created and no auth key is
-	// bound here. A row disappearing after hash validation is still reported as
-	// signUpRequired to preserve the existing return behavior.
+	// Unknown username: persist a non-generated caller code for invite admission,
+	// then return authorizationSignUpRequired. No user is created and no auth key
+	// is bound here. A row disappearing after hash validation is still reported
+	// as signUpRequired to preserve the existing return behavior.
 	if !ok {
-		phoneCode = capPhoneCode(phoneCode)
-		if err := h.store.SetCodeForUsername(r.Ctx, username, phoneCodeHash, phoneCode); err != nil && !errors.Is(err, store.ErrCodeInvalid) {
-			h.log.Error("sign in: store username code", "err", err)
-			return nil, errInternal
+		if !isGeneratedCode(phoneCode) {
+			phoneCode = capPhoneCode(phoneCode)
+			if err := h.store.SetCodeForUsername(r.Ctx, username, phoneCodeHash, phoneCode); err != nil && !errors.Is(err, store.ErrCodeInvalid) {
+				h.log.Error("sign in: store username code", "err", err)
+				return nil, errInternal
+			}
 		}
 		return &tg.AuthAuthorizationSignUpRequired{}, nil
 	}

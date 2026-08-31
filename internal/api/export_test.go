@@ -27,11 +27,12 @@ import (
 
 // Test-only aliases exposing unexported helpers to the external api_test package.
 var (
-	ValidatePhone    = validatePhone
-	ValidateUsername = validateUsername
-	VerifyToRPC      = verifyToRPC
-	NewSentCode      = newSentCode
-	SelfRevocation   = selfRevocation
+	ValidatePhone          = validatePhone
+	ValidateUsername       = validateUsername
+	VerifyToRPC            = verifyToRPC
+	NewSentCode            = newSentCode
+	SelfRevocation         = selfRevocation
+	IsGeneratedCodeForTest = isGeneratedCode
 )
 
 // SendCodeForTest invokes handleSendCode for a request arriving from addr,
