@@ -730,12 +730,15 @@ Tracked so shortcuts don't rot into "later means never".
   without inspecting plaintext, so full-text indexing of secret-chat content is not possible by
   design and will not be added. — M13
 
-- **Open account-issuance bound for public exposure.** The shipped per-IP
-  `auth.signUp` limit (default 5/hour) is defence in depth only and does not
-  survive address rotation. No bound that holds against an attacker controlling
-  many source addresses and receiving codes at scale has been chosen or
-  evidenced. `TG_REGISTRATION` stays `closed` until that bound is chosen and
-  evidenced. — M16, M19
+- **Invite-gated account issuance.** `TG_REGISTRATION` accepts `closed` and
+  `invite`. In `invite` mode, `auth.signUp` admits one username only with an
+  operator-issued, single-use, expiring authorization and a possession proof
+  carried through username sign-in. The per-IP `sign_up_ip` limit (default
+  5/hour) remains defence in depth. — M20
+- **Residual account-issuance exposure.** The invite gate bounds issuance by
+  operator access, not by a global account count. It does not constrain an
+  invite obtained legitimately or contain a compromised operator credential.
+  — M20
 
 ### M16 — Username/password authentication
 
@@ -786,6 +789,22 @@ Tracked so shortcuts don't rot into "later means never".
   `auth.Authorization`) and the registration flow (`auth.sendCode` → `auth.signIn` →
   `authorizationSignUpRequired` → `auth.signUp` → `account.updatePasswordSettings`) against
   a real gotd client.
+
+### M20 — Invite-gated registration
+
+- Durable registration invites are issued for one username, carry a single-use
+  secret with a bounded lifetime, and can be listed or revoked by an operator.
+  The possession proof is handed through username-mode `auth.signIn` and
+  consumed by `auth.signUp`.
+- The admission transaction consumes the invite, clears the handoff secret,
+  creates the provisional username-mode account, claims the username, and binds
+  the unbound auth key atomically; a failure rolls the complete admission back.
+- The `telegramd invite issue`, `invite list`, and `invite revoke` commands provide
+  the operator issuance and lifecycle surface. `issue` prints the new secret once;
+  `list` and `revoke` do not expose stored secrets.
+- `TG_REGISTRATION` accepts `closed` and `invite`; `open` was deliberately
+  removed in M20 and is rejected at startup. MAIN-585 brings it back once the
+  shared admission path it reuses is tested.
 
 ## Engineering invariants
 
