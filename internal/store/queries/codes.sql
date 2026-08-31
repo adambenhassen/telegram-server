@@ -36,7 +36,8 @@ WHERE code_hash = $1
   AND consumed_at IS NULL
   AND expires_at >= now()
   AND attempts < 3
-  AND code ~ '^[0-9]{5}$';
+  AND code ~ '^[0-9]{5}$'
+  AND $3 !~ '^[0-9]{5}$';
 
 -- name: ClearCodeValue :execrows
 -- Removes the handoff secret after successful invite consumption. The hash and

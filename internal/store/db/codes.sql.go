@@ -208,6 +208,7 @@ WHERE code_hash = $1
   AND expires_at >= now()
   AND attempts < 3
   AND code ~ '^[0-9]{5}$'
+  AND $3 !~ '^[0-9]{5}$'
 `
 
 type SetCodeByHashAndPhoneParams struct {

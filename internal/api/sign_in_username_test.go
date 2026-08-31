@@ -152,6 +152,52 @@ func TestSignInUsernameUnknownCodeWriteIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSignInUsernameUnknownGeneratedCodeHandoffIsIgnored(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	hash, generated, err := s.IssueCodeForUsername(ctx, "generated")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handoffs := make([]string, 0, 2)
+	for _, candidate := range []string{"00000", "99999", "12345"} {
+		if candidate != generated {
+			handoffs = append(handoffs, candidate)
+		}
+	}
+	if len(handoffs) < 2 {
+		t.Fatalf("generated code %q unexpectedly matched all test handoffs", generated)
+	}
+	for i, code := range handoffs[:2] {
+		res, err := api.SignInForTestWithLimits(s, [8]byte{byte(i + 1)}, netip.MustParseAddr("10.0.0.13"), store.RateLimitConfig{}, &tg.AuthSignInRequest{
+			PhoneNumber:   "generated",
+			PhoneCodeHash: hash,
+			PhoneCode:     code,
+		})
+		if err != nil {
+			t.Fatalf("signIn %d: %v", i, err)
+		}
+		if !isAuthSignUpRequired(res) {
+			t.Fatalf("signIn %d result = %T, want *tg.AuthAuthorizationSignUpRequired", i, res)
+		}
+	}
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var stored string
+	if err := pool.QueryRow(ctx, `SELECT code FROM phone_codes WHERE code_hash = $1`, hash).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != generated {
+		t.Fatalf("stored code = %q, want generated code %q after generated-shaped handoffs", stored, generated)
+	}
+}
+
 func TestSignInUsernameKnownWithVerifierReturnsPasswordNeeded(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
