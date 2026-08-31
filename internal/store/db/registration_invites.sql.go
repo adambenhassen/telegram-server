@@ -15,14 +15,20 @@ const consumeRegistrationInvite = `-- name: ConsumeRegistrationInvite :execrows
 UPDATE registration_invites
 SET state = 'consumed', consumed_at = clock_timestamp()
 WHERE id = $1
+  AND secret_digest = $2
   AND state = 'issued'
   AND expires_at > clock_timestamp()
 `
 
+type ConsumeRegistrationInviteParams struct {
+	ID           int64
+	SecretDigest []byte
+}
+
 // Guard the state transition as well as taking the row lock above: if expiry
 // passes while the caller is comparing the secret, the update refuses.
-func (q *Queries) ConsumeRegistrationInvite(ctx context.Context, id int64) (int64, error) {
-	result, err := q.db.Exec(ctx, consumeRegistrationInvite, id)
+func (q *Queries) ConsumeRegistrationInvite(ctx context.Context, arg ConsumeRegistrationInviteParams) (int64, error) {
+	result, err := q.db.Exec(ctx, consumeRegistrationInvite, arg.ID, arg.SecretDigest)
 	if err != nil {
 		return 0, err
 	}
@@ -144,20 +150,54 @@ func (q *Queries) ListRegistrationInvites(ctx context.Context) ([]ListRegistrati
 }
 
 const liveRegistrationInviteForUpdate = `-- name: LiveRegistrationInviteForUpdate :one
-SELECT id, handle, secret_digest, issued_at, expires_at, state, consumed_at, revoked_at
-FROM registration_invites
-WHERE handle = lower($1)
-  AND state = 'issued'
-ORDER BY id DESC
-LIMIT 1
-FOR UPDATE
+WITH locked AS MATERIALIZED (
+    SELECT id, handle, secret_digest, issued_at, expires_at, state, consumed_at, revoked_at
+    FROM registration_invites
+    WHERE handle = lower($1)
+      AND state = 'issued'
+    ORDER BY id DESC
+    LIMIT 1
+    FOR UPDATE
+)
+SELECT id, handle, secret_digest, issued_at, expires_at, state, consumed_at, revoked_at,
+       true AS found,
+       expires_at > clock_timestamp() AS live
+FROM locked
+UNION ALL
+SELECT 0::bigint,
+       lower($1)::text,
+       decode(repeat('00', 64), 'hex')::bytea,
+       NULL::timestamptz,
+       NULL::timestamptz,
+       'expired'::text,
+       NULL::timestamptz,
+       NULL::timestamptz,
+       false,
+       false
+WHERE NOT EXISTS (SELECT 1 FROM locked)
 `
+
+type LiveRegistrationInviteForUpdateRow struct {
+	ID           int64
+	Handle       string
+	SecretDigest []byte
+	IssuedAt     pgtype.Timestamptz
+	ExpiresAt    pgtype.Timestamptz
+	State        string
+	ConsumedAt   pgtype.Timestamptz
+	RevokedAt    pgtype.Timestamptz
+	Found        bool
+	Live         bool
+}
 
 // The row lock is the decision boundary shared with consume and revoke. A
 // caller holds it for its transaction, so a rollback cannot consume the row.
-func (q *Queries) LiveRegistrationInviteForUpdate(ctx context.Context, handle string) (RegistrationInvite, error) {
+// The MATERIALIZED CTE makes the outer database-clock check run after the
+// selected row has been locked. The synthetic row keeps absent and terminal
+// handles on the same one-row query path as an issued or expired handle.
+func (q *Queries) LiveRegistrationInviteForUpdate(ctx context.Context, handle string) (LiveRegistrationInviteForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, liveRegistrationInviteForUpdate, handle)
-	var i RegistrationInvite
+	var i LiveRegistrationInviteForUpdateRow
 	err := row.Scan(
 		&i.ID,
 		&i.Handle,
@@ -167,6 +207,8 @@ func (q *Queries) LiveRegistrationInviteForUpdate(ctx context.Context, handle st
 		&i.State,
 		&i.ConsumedAt,
 		&i.RevokedAt,
+		&i.Found,
+		&i.Live,
 	)
 	return i, err
 }
@@ -185,23 +227,6 @@ func (q *Queries) LockRegistrationInvite(ctx context.Context, id int64) (int64, 
 	var id_2 int64
 	err := row.Scan(&id_2)
 	return id_2, err
-}
-
-const registrationInviteIsLive = `-- name: RegistrationInviteIsLive :one
-SELECT expires_at > clock_timestamp()
-FROM registration_invites
-WHERE id = $1
-  AND state = 'issued'
-`
-
-// This check runs after the handle row is locked. Keeping it as a separate
-// statement means a waiter cannot use a clock value captured before it
-// acquired the row lock to admit an invite that expired while it waited.
-func (q *Queries) RegistrationInviteIsLive(ctx context.Context, id int64) (bool, error) {
-	row := q.db.QueryRow(ctx, registrationInviteIsLive, id)
-	var column_1 bool
-	err := row.Scan(&column_1)
-	return column_1, err
 }
 
 const revokeRegistrationInvite = `-- name: RevokeRegistrationInvite :execrows

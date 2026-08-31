@@ -463,3 +463,219 @@ func TestRevokeAndConsumeInviteRowOrderChoosesOneWinner(t *testing.T) {
 		t.Fatalf("verify after revoke race: err = %v, want ErrInviteInvalid", err)
 	}
 }
+
+func TestVerifyInviteUsesUniformDatabaseOperations(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	expired, expiredSecret, err := s.IssueInvite(ctx, "uniform-expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong, wrongSecret, err := s.IssueInvite(ctx, "uniform-wrong")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, rightSecret, err := s.IssueInvite(ctx, "uniform-right")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StorePool(s).Exec(ctx,
+		`UPDATE registration_invites
+		    SET issued_at = clock_timestamp() - interval '2 seconds',
+		        expires_at = clock_timestamp() - interval '1 second'
+		  WHERE id = $1`, expired.ID,
+	); err != nil {
+		t.Fatalf("expire invite: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		handle string
+		secret string
+	}{
+		{name: "missing", handle: "uniform-missing", secret: "missing"},
+		{name: "expired", handle: expired.Handle, secret: expiredSecret},
+		{name: "wrong secret", handle: wrong.Handle, secret: wrongSecret + "x"},
+		{name: "right secret", handle: right.Handle, secret: rightSecret},
+	}
+	accesses := make([]int64, 0, len(cases))
+	for _, tc := range cases {
+		before, err := store.RegistrationInviteTableAccesses(ctx, s)
+		if err != nil {
+			t.Fatalf("%s: read access baseline: %v", tc.name, err)
+		}
+		got := s.VerifyInvite(ctx, tc.handle, tc.secret)
+		if tc.name == "right secret" {
+			if got != nil {
+				t.Fatalf("%s: verify: %v", tc.name, got)
+			}
+		} else if !errors.Is(got, store.ErrInviteInvalid) {
+			t.Fatalf("%s: verify error = %v, want ErrInviteInvalid", tc.name, got)
+		}
+		after, err := store.RegistrationInviteTableAccesses(ctx, s)
+		if err != nil {
+			t.Fatalf("%s: read access result: %v", tc.name, err)
+		}
+		accesses = append(accesses, after-before)
+	}
+	for i, got := range accesses {
+		if got != 1 {
+			t.Errorf("case %s table accesses = %d, want 1", cases[i].name, got)
+		}
+	}
+}
+
+func TestConsumeInviteUsesUniformDatabaseOperations(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+
+	expired, expiredSecret, err := s.IssueInvite(ctx, "consume-uniform-expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong, wrongSecret, err := s.IssueInvite(ctx, "consume-uniform-wrong")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, rightSecret, err := s.IssueInvite(ctx, "consume-uniform-right")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StorePool(s).Exec(ctx,
+		`UPDATE registration_invites
+		    SET issued_at = clock_timestamp() - interval '2 seconds',
+		        expires_at = clock_timestamp() - interval '1 second'
+		  WHERE id = $1`, expired.ID,
+	); err != nil {
+		t.Fatalf("expire invite: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		handle string
+		secret string
+	}{
+		{name: "missing", handle: "consume-uniform-missing", secret: "missing"},
+		{name: "expired", handle: expired.Handle, secret: expiredSecret},
+		{name: "wrong secret", handle: wrong.Handle, secret: wrongSecret + "x"},
+		{name: "right secret", handle: right.Handle, secret: rightSecret},
+	}
+	for _, tc := range cases {
+		before, err := store.RegistrationInviteTableAccesses(ctx, s)
+		if err != nil {
+			t.Fatalf("%s: read access baseline: %v", tc.name, err)
+		}
+		tx, err := store.StorePool(s).Begin(ctx)
+		if err != nil {
+			t.Fatalf("%s: begin: %v", tc.name, err)
+		}
+		got := s.ConsumeInvite(ctx, tx, tc.handle, tc.secret)
+		if got == nil {
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatalf("%s: commit: %v", tc.name, err)
+			}
+		} else if err := tx.Rollback(ctx); err != nil {
+			t.Fatalf("%s: rollback: %v", tc.name, err)
+		}
+		if tc.name == "right secret" {
+			if got != nil {
+				t.Fatalf("%s: consume error = %v, want success", tc.name, got)
+			}
+		} else if !errors.Is(got, store.ErrInviteInvalid) {
+			t.Fatalf("%s: consume error = %v, want ErrInviteInvalid", tc.name, got)
+		}
+		after, err := store.RegistrationInviteTableAccesses(ctx, s)
+		if err != nil {
+			t.Fatalf("%s: read access result: %v", tc.name, err)
+		}
+		if got := after - before; got != 2 {
+			t.Errorf("case %s table accesses = %d, want 2", tc.name, got)
+		}
+	}
+}
+
+func TestInviteExpiryIsCheckedAfterRowLockAcquisition(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	invite, secret, err := s.IssueInvite(ctx, "lock-clock-verify", 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := store.StorePool(s).Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lockedID int64
+	if err := blocker.QueryRow(ctx,
+		`SELECT id FROM registration_invites WHERE id = $1 FOR UPDATE`, invite.ID,
+	).Scan(&lockedID); err != nil {
+		if rollbackErr := blocker.Rollback(ctx); rollbackErr != nil {
+			t.Errorf("rollback blocker: %v", rollbackErr)
+		}
+		t.Fatal(err)
+	}
+	verifyDone := make(chan error, 1)
+	go func() { verifyDone <- s.VerifyInvite(ctx, invite.Handle, secret) }()
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		if rollbackErr := blocker.Rollback(ctx); rollbackErr != nil {
+			t.Errorf("rollback blocker: %v", rollbackErr)
+		}
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-verifyDone; !errors.Is(err, store.ErrInviteInvalid) {
+		t.Fatalf("verify after lock-held expiry: err = %v, want ErrInviteInvalid", err)
+	}
+
+	invite, secret, err = s.IssueInvite(ctx, "lock-clock-consume", 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker, err = store.StorePool(s).Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blocker.QueryRow(ctx,
+		`SELECT id FROM registration_invites WHERE id = $1 FOR UPDATE`, invite.ID,
+	).Scan(&lockedID); err != nil {
+		if rollbackErr := blocker.Rollback(ctx); rollbackErr != nil {
+			t.Errorf("rollback blocker: %v", rollbackErr)
+		}
+		t.Fatal(err)
+	}
+	consumeDone := make(chan error, 1)
+	go func() {
+		tx, err := store.StorePool(s).Begin(ctx)
+		if err != nil {
+			consumeDone <- err
+			return
+		}
+		err = s.ConsumeInvite(ctx, tx, invite.Handle, secret)
+		if rollbackErr := tx.Rollback(ctx); err == nil && rollbackErr != nil {
+			err = rollbackErr
+		}
+		consumeDone <- err
+	}()
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		if rollbackErr := blocker.Rollback(ctx); rollbackErr != nil {
+			t.Errorf("rollback blocker: %v", rollbackErr)
+		}
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-consumeDone; !errors.Is(err, store.ErrInviteInvalid) {
+		t.Fatalf("consume after lock-held expiry: err = %v, want ErrInviteInvalid", err)
+	}
+}

@@ -161,32 +161,17 @@ func (s *Store) VerifyInvite(ctx context.Context, handle, secret string) error {
 // released without committing a read-only transaction.
 func (s *Store) verifyInviteTx(ctx context.Context, tx pgx.Tx, handle, secret string) error {
 	row, err := s.liveInviteForUpdate(ctx, tx, handle)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Compare against a fixed-size zero digest so the missing-row path still
-		// performs the same constant-time digest comparison operation.
-		var zero [sha256.Size]byte
-		_ = inviteSecretMatches(secret, zero[:])
-		return ErrInviteInvalid
-	}
 	if err != nil {
 		return fmt.Errorf("verify invite: load: %w", err)
 	}
-	live, err := s.q.WithTx(tx).RegistrationInviteIsLive(ctx, row.ID)
-	if err != nil {
-		return fmt.Errorf("verify invite: check expiry: %w", err)
-	}
-	if !live {
-		var zero [sha256.Size]byte
-		_ = inviteSecretMatches(secret, zero[:])
-		return ErrInviteInvalid
-	}
-	if !inviteSecretMatches(secret, row.SecretDigest) {
+	matches := inviteSecretMatches(secret, row.SecretDigest)
+	if !row.Found || !row.Live || !matches {
 		return ErrInviteInvalid
 	}
 	return nil
 }
 
-func (s *Store) liveInviteForUpdate(ctx context.Context, tx pgx.Tx, handle string) (db.RegistrationInvite, error) {
+func (s *Store) liveInviteForUpdate(ctx context.Context, tx pgx.Tx, handle string) (db.LiveRegistrationInviteForUpdateRow, error) {
 	return s.q.WithTx(tx).LiveRegistrationInviteForUpdate(ctx, strings.ToLower(handle))
 }
 
@@ -213,34 +198,33 @@ func (s *Store) ConsumeInvite(ctx context.Context, tx pgx.Tx, handle, secret str
 	}
 	qtx := s.q.WithTx(tx)
 	row, err := s.liveInviteForUpdate(ctx, tx, handle)
-	if errors.Is(err, pgx.ErrNoRows) {
-		var zero [sha256.Size]byte
-		_ = inviteSecretMatches(secret, zero[:])
-		return ErrInviteInvalid
-	}
 	if err != nil {
 		return fmt.Errorf("consume invite: load: %w", err)
 	}
-	live, err := qtx.RegistrationInviteIsLive(ctx, row.ID)
-	if err != nil {
-		return fmt.Errorf("consume invite: check expiry: %w", err)
+	matches := inviteSecretMatches(secret, row.SecretDigest)
+	eligible := row.Found && row.Live && matches
+	digest := row.SecretDigest
+	if !eligible {
+		digest = nonMatchingInviteDigest(digest)
 	}
-	if !live {
-		var zero [sha256.Size]byte
-		_ = inviteSecretMatches(secret, zero[:])
-		return ErrInviteInvalid
-	}
-	if !inviteSecretMatches(secret, row.SecretDigest) {
-		return ErrInviteInvalid
-	}
-	changed, err := qtx.ConsumeRegistrationInvite(ctx, row.ID)
+	changed, err := qtx.ConsumeRegistrationInvite(ctx, db.ConsumeRegistrationInviteParams{
+		ID:           row.ID,
+		SecretDigest: digest,
+	})
 	if err != nil {
 		return fmt.Errorf("consume invite: compare-and-swap: %w", err)
 	}
-	if changed != 1 {
+	if !eligible || changed != 1 {
 		return ErrInviteInvalid
 	}
 	return nil
+}
+
+func nonMatchingInviteDigest(stored []byte) []byte {
+	digest := make([]byte, sha256.Size)
+	copy(digest, stored)
+	digest[0] ^= 0xff
+	return digest
 }
 
 // RevokeInvite marks a live invite revoked. It is idempotent for an absent,

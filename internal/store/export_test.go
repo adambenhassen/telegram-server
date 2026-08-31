@@ -355,6 +355,27 @@ func HoldInviteRowLock(ctx context.Context, s *Store, hash string) (release func
 // connection independent of the Store's query layer.
 func StorePool(s *Store) *pgxpool.Pool { return s.pool }
 
+// RegistrationInviteTableAccesses reports table/index scans recorded for the
+// invite table. Tests use the per-database counter to prove that validation
+// paths perform the same database work for present and absent handles.
+func RegistrationInviteTableAccesses(ctx context.Context, s *Store) (int64, error) {
+	for _, c := range s.pool.AcquireAllIdle(ctx) {
+		_, err := c.Exec(ctx, `SELECT pg_stat_force_next_flush()`)
+		c.Release()
+		if err != nil {
+			return 0, err
+		}
+	}
+	var scans int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT coalesce(seq_scan, 0) + coalesce(idx_scan, 0)
+		   FROM pg_stat_user_tables WHERE relname = 'registration_invites'`).Scan(&scans)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return scans, err
+}
+
 // SetAssemblyClaimHook installs the test seam that runs after allocation has
 // committed with its session claim held and before the completion transaction
 // takes the files row lock. It controls the eraser-first ordering without
