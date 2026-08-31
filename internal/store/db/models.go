@@ -208,6 +208,17 @@ type RateLimit struct {
 	ExpiresAt   pgtype.Timestamptz
 }
 
+type RegistrationInvite struct {
+	ID           int64
+	Handle       string
+	SecretDigest []byte
+	IssuedAt     pgtype.Timestamptz
+	ExpiresAt    pgtype.Timestamptz
+	State        string
+	ConsumedAt   pgtype.Timestamptz
+	RevokedAt    pgtype.Timestamptz
+}
+
 type SecretChat struct {
 	ID             int32
 	AdminID        int64
