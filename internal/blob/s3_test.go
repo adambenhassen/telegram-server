@@ -200,6 +200,15 @@ func TestMinioHarnessDoesNotReuseContainer(t *testing.T) {
 	}
 }
 
+func TestMinioHarnessCleanupFailureDoesNotFailTest(t *testing.T) {
+	t.Parallel()
+
+	harness := newMinioHarness(t)
+	if err := harness.container.Terminate(context.Background()); err != nil {
+		t.Fatalf("pre-cleanup MinIO container termination: %v", err)
+	}
+}
+
 type minioHarness struct {
 	endpoint  string
 	namespace string
@@ -259,7 +268,7 @@ func newMinioHarness(t *testing.T) *minioHarness {
 			logMinioFailure(t, harness.container, harness.endpoint)
 		}
 		if err := harness.container.Terminate(context.Background()); err != nil {
-			t.Errorf("terminate MinIO container: %v", err)
+			t.Logf("terminate MinIO container %s: %v", harness.container.GetContainerID(), err)
 		}
 	})
 
