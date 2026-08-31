@@ -5,11 +5,13 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -17,6 +19,11 @@ import (
 var (
 	phoneRE    = regexp.MustCompile(`^\+?[0-9]{5,15}$`)
 	usernameRE = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{4,31}$`)
+)
+
+const (
+	maxPhoneCodeBytes       = 256
+	maxSignUpNameCodePoints = 64
 )
 
 func validatePhone(phone string) error {
@@ -28,6 +35,35 @@ func validatePhone(phone string) error {
 
 func validateUsername(username string) bool {
 	return usernameRE.MatchString(username)
+}
+
+func validateSignUpName(name string) bool {
+	return utf8.ValidString(name) &&
+		!strings.ContainsRune(name, '\x00') &&
+		utf8.RuneCountInString(name) <= maxSignUpNameCodePoints
+}
+
+func capPhoneCode(code string) string {
+	if len(code) <= maxPhoneCodeBytes {
+		return code
+	}
+	end := maxPhoneCodeBytes
+	for end > 0 && !utf8.RuneStart(code[end]) {
+		end--
+	}
+	return code[:end]
+}
+
+func isGeneratedCode(code string) bool {
+	if len(code) != 5 {
+		return false
+	}
+	for i := range code {
+		if code[i] < '0' || code[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func newSentCode(hash string) *tg.AuthSentCode {
@@ -54,18 +90,58 @@ func verifyToRPC(err error) *tgerr.Error {
 	}
 }
 
-// handleSignUp serves auth.signUp. Account creation remains closed until the
-// invite admission path is implemented.
+// handleSignUp serves auth.signUp. Account creation is admitted only when the
+// configured mode is invite and the store can commit the complete admission
+// transaction.
 func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthSignUpRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
 
-	// Invite admission is not implemented yet, so signUp remains closed in
-	// every registration mode. Keep this gate before all validation and storage
-	// work so the fail-closed state cannot create partial account state.
-	return nil, errInputRequestInvalid
+	// Keep the closed gate before validation and storage work. The only supported
+	// admission mode is invite-backed registration.
+	if h.registrationMode != config.RegistrationInvite {
+		return nil, errInputRequestInvalid
+	}
+	if !validateUsername(req.PhoneNumber) {
+		return nil, errInputRequestInvalid
+	}
+	if !validateSignUpName(req.FirstName) || !validateSignUpName(req.LastName) {
+		return nil, errInputRequestInvalid
+	}
+	username := strings.ToLower(req.PhoneNumber)
+
+	// Charge the per-network budget before any invite, username, or code-state
+	// lookup. A refused request therefore costs the same token regardless of
+	// whether its identifier is known or its code hash is valid.
+	if err := h.checkAndChargeRateLimitIP(r, "sign_up_ip", h.rateLimitSignUpIP); err != nil {
+		return nil, err
+	}
+
+	user, err := h.store.AdmitUsername(
+		r.Ctx,
+		username,
+		req.PhoneCodeHash,
+		mtproto.AuthKeyIDInt64(r.AuthKeyID),
+		req.FirstName,
+		req.LastName,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrCodeInvalid),
+			errors.Is(err, store.ErrCodeExpired),
+			errors.Is(err, store.ErrCodeExhausted),
+			errors.Is(err, store.ErrInviteInvalid),
+			errors.Is(err, store.ErrUsernameOccupied),
+			errors.Is(err, store.ErrAuthKeyNotFound):
+			return nil, errInputRequestInvalid
+		default:
+			h.log.Error("sign up: admit username", "err", err)
+			return nil, errInternal
+		}
+	}
+	return &tg.AuthAuthorization{User: userTL(user)}, nil
 }
 
 func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
@@ -198,7 +274,7 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	if isUsername {
-		return h.handleSignInUsername(r, input, req.PhoneCodeHash)
+		return h.handleSignInUsername(r, input, req.PhoneCodeHash, req.PhoneCode)
 	}
 
 	return h.handleSignInPhone(r, req)
@@ -264,8 +340,9 @@ func (h *handlers) handleSignInPhone(r *mtproto.Request, req tg.AuthSignInReques
 
 // handleSignInUsername is the username-mode signIn path. It validates the code
 // hash (not the code value), resolves the user from the usernames table, and
-// branches on login_mode and verifier presence.
-func (h *handlers) handleSignInUsername(r *mtproto.Request, username, phoneCodeHash string) (bin.Encoder, error) {
+// branches on login_mode and verifier presence. For an unknown username it
+// stores the caller's code on the phone-code row for the following signUp.
+func (h *handlers) handleSignInUsername(r *mtproto.Request, username, phoneCodeHash, phoneCode string) (bin.Encoder, error) {
 	// Validate the code hash. In username mode the code field is ignored — only
 	// the hash is validated.
 	if err := h.store.CheckCodeHash(r.Ctx, username, phoneCodeHash); err != nil {
@@ -290,9 +367,18 @@ func (h *handlers) handleSignInUsername(r *mtproto.Request, username, phoneCodeH
 		return nil, errInternal
 	}
 
-	// Unknown username: return authorizationSignUpRequired. No user is created,
-	// no auth key is bound.
+	// Unknown username: persist a non-generated caller code for invite admission,
+	// then return authorizationSignUpRequired. No user is created and no auth key
+	// is bound here. A row disappearing after hash validation is still reported
+	// as signUpRequired to preserve the existing return behavior.
 	if !ok {
+		if !isGeneratedCode(phoneCode) {
+			phoneCode = capPhoneCode(phoneCode)
+			if err := h.store.SetCodeForUsername(r.Ctx, username, phoneCodeHash, phoneCode); err != nil && !errors.Is(err, store.ErrCodeInvalid) {
+				h.log.Error("sign in: store username code", "err", err)
+				return nil, errInternal
+			}
+		}
 		return &tg.AuthAuthorizationSignUpRequired{}, nil
 	}
 

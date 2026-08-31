@@ -21,7 +21,7 @@ func FloodWaitError(seconds int) *tgerr.Error {
 }
 
 var (
-	// errInputRequestInvalid rejects auth.signUp before invite admission exists.
+	// errInputRequestInvalid is the uniform semantic refusal for auth.signUp.
 	errInputRequestInvalid = rpcErr(400, "INPUT_REQUEST_INVALID")
 	errPhoneInvalid        = rpcErr(400, "PHONE_NUMBER_INVALID")
 	errCodeInvalid         = rpcErr(400, "PHONE_CODE_INVALID")

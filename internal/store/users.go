@@ -420,8 +420,9 @@ func (s *Store) SearchContacts(ctx context.Context, ownerID int64, query string,
 
 // ClaimUsername claims a username for a user: inserts into the usernames table
 // and updates users.username in one transaction. It bypasses the login_mode guard
-// that UpdateUsername enforces, so it is used only by tests and the auth.signUp
-// handler. PK conflict returns ErrUsernameOccupied.
+// that UpdateUsername enforces, so it is used only by tests; account admission
+// uses the transaction-bound qtx method directly. PK conflict returns
+// ErrUsernameOccupied.
 func (s *Store) ClaimUsername(ctx context.Context, userID int64, handle string) error {
 	xHandle := strings.ToLower(handle)
 	tx, err := s.pool.Begin(ctx)

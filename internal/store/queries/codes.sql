@@ -22,10 +22,29 @@ SELECT * FROM phone_codes WHERE code_hash = $1;
 -- name: GetCodeByHashAndPhone :one
 -- Looks up a code row by hash AND phone binding. Used by username-mode signIn
 -- to validate the hash alone (without the code value) while confirming the hash
--- was issued for the expected identifier. Returns only the columns needed for
--- the hash validity check.
-SELECT code_hash, phone, consumed_at, expires_at, attempts FROM phone_codes
+-- was issued for the expected identifier. Returns the hash-check fields and
+-- the code value that auth.signUp consumes as the invite secret.
+SELECT code_hash, phone, code, consumed_at, expires_at, attempts FROM phone_codes
 WHERE code_hash = $1 AND phone = $2;
+
+-- name: SetCodeByHashAndPhone :execrows
+-- Stores the caller-supplied username signIn code on the exact live code row.
+-- The guards keep a concurrent consume or expiry from rewriting terminal state.
+UPDATE phone_codes SET code = $3
+WHERE code_hash = $1
+  AND phone = $2
+  AND consumed_at IS NULL
+  AND expires_at >= now()
+  AND attempts < 3
+  AND code ~ '^[0-9]{5}$'
+  AND $3 !~ '^[0-9]{5}$';
+
+-- name: ClearCodeValue :execrows
+-- Removes the handoff secret after successful invite consumption. The hash and
+-- phone binding scope the update to the exact admission code row.
+UPDATE phone_codes SET code = ''
+WHERE code_hash = $1
+  AND phone = $2;
 
 -- name: IncrementCodeAttempts :exec
 -- Scoped to the exact issued code by its hash so a concurrent resend (new hash)

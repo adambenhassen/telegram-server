@@ -105,6 +105,21 @@ func (q *Queries) DeleteAuthKey(ctx context.Context, id int64) error {
 	return err
 }
 
+const lockUnboundAuthKey = `-- name: LockUnboundAuthKey :one
+SELECT id FROM auth_keys
+WHERE id = $1 AND user_id IS NULL AND pending_user_id IS NULL
+FOR UPDATE
+`
+
+// Locks the key admission will bind, rejecting keys already authorized or
+// carrying a pending password challenge.
+func (q *Queries) LockUnboundAuthKey(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRow(ctx, lockUnboundAuthKey, id)
+	var id_2 int64
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const promotePendingUser = `-- name: PromotePendingUser :execrows
 UPDATE auth_keys
 SET user_id = $2, pending_user_id = NULL
