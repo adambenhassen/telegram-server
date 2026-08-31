@@ -375,8 +375,8 @@ func TestUsernamePasswordSignIn(t *testing.T) {
 	}
 }
 
-// TestUsernamePasswordSignUp proves that invite mode does not admit a new
-// username until the invite admission path is implemented.
+// TestUsernamePasswordSignUp proves the invite-backed username registration
+// flow against a real gotd client and leaves the new account provisional.
 func TestUsernamePasswordSignUp(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -410,6 +410,10 @@ func TestUsernamePasswordSignUp(t *testing.T) {
 
 	const username = "signup_test_user"
 	const firstName = "SignUp"
+	_, inviteSecret, err := st.IssueInvite(ctx, username)
+	if err != nil {
+		t.Fatalf("issue invite: %v", err)
+	}
 
 	client := newUsernameClient(port, key, dcID, nil)
 	if err := client.Run(ctx, func(ctx context.Context) error {
@@ -422,7 +426,7 @@ func TestUsernamePasswordSignUp(t *testing.T) {
 		}
 
 		// Step 2: auth.signIn → authorizationSignUpRequired.
-		resp, err := signInUsername(ctx, api, username, hash, "")
+		resp, err := signInUsername(ctx, api, username, hash, inviteSecret)
 		if err != nil {
 			// gotd returns SIGN_UP_REQUIRED as a tg error.
 			if !isSignUpRequired(err) {
@@ -435,13 +439,17 @@ func TestUsernamePasswordSignUp(t *testing.T) {
 			}
 		}
 
-		// Step 3: auth.signUp → INPUT_REQUEST_INVALID.
-		_, err = signUpUsername(ctx, api, username, hash, firstName, "")
-		if err == nil {
-			return errors.New("signUp: expected INPUT_REQUEST_INVALID, got success")
+		// Step 3: auth.signUp → auth.Authorization with the provisional user.
+		resp, err = signUpUsername(ctx, api, username, hash, firstName, "")
+		if err != nil {
+			return fmt.Errorf("signUp: %w", err)
 		}
-		if !isInputRequestInvalid(err) {
-			return fmt.Errorf("signUp: expected INPUT_REQUEST_INVALID, got %w", err)
+		authz, ok := resp.(*tg.AuthAuthorization)
+		if !ok {
+			return fmt.Errorf("signUp: unexpected response type %T, want AuthAuthorization", resp)
+		}
+		if user, ok := authz.User.(*tg.User); !ok || user.ID == 0 {
+			return fmt.Errorf("signUp: authorization user = %T, want non-zero tg.User", authz.User)
 		}
 
 		return nil
