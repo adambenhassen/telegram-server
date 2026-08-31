@@ -28,7 +28,7 @@ type RegistrationMode string
 
 const (
 	RegistrationClosed RegistrationMode = "closed"
-	RegistrationOpen   RegistrationMode = "open"
+	RegistrationInvite RegistrationMode = "invite"
 )
 
 // Config holds server configuration.
@@ -273,7 +273,7 @@ type RateLimitsConfig struct {
 	// the cost being bounded.
 	GetPasswordIP store.RateLimitConfig
 	// SignUpIP limits auth.signUp calls per client network. Applied only when
-	// TG_REGISTRATION=open; no-op in closed mode.
+	// TG_REGISTRATION=invite; no-op in closed mode.
 	SignUpIP store.RateLimitConfig
 	// PasswordProof limits account.getPasswordSettings and
 	// account.updatePasswordSettings (the proof-required path) per account, on
@@ -1402,8 +1402,8 @@ func registrationMode(raw string) RegistrationMode {
 		return RegistrationClosed
 	case RegistrationMode(raw) == RegistrationClosed:
 		return RegistrationClosed
-	case RegistrationMode(raw) == RegistrationOpen:
-		return RegistrationOpen
+	case RegistrationMode(raw) == RegistrationInvite:
+		return RegistrationInvite
 	}
 	return RegistrationMode(raw)
 }
@@ -1413,10 +1413,10 @@ func registrationMode(raw string) RegistrationMode {
 // operator names a mode this build does not implement.
 func (c Config) ValidateRegistrationMode() error {
 	switch c.RegistrationMode {
-	case RegistrationClosed, RegistrationOpen:
+	case RegistrationClosed, RegistrationInvite:
 		return nil
 	}
-	return fmt.Errorf("TG_REGISTRATION must be unset, %q, or %q; got %q", RegistrationClosed, RegistrationOpen, c.RegistrationMode)
+	return fmt.Errorf("TG_REGISTRATION must be unset, %q, or %q; got %q", RegistrationClosed, RegistrationInvite, c.RegistrationMode)
 }
 
 // validateBootstrap checks that bootstrap env vars are consistent.

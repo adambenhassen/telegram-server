@@ -50,6 +50,7 @@ func TestPinnedChat(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB, phoneC = "+15551297001", "+15551297002", "+15551297003"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneC)
 
 	collA, collB, collC := newUpdateCollector(), newUpdateCollector(), newUpdateCollector()
 	clientA, clientB, clientC :=
@@ -414,6 +415,7 @@ func TestPinnedChannel(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551298001", "+15551298002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	clientA, clientB :=

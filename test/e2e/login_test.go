@@ -89,6 +89,9 @@ func TestClientLogin(t *testing.T) {
 	})
 
 	phone := "+15551230000"
+	if _, err := st.CreateUser(ctx, phone); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
 	flow := auth.NewFlow(
 		auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
 			func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {

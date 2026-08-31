@@ -91,6 +91,7 @@ func TestRestartPersistence(t *testing.T) {
 	client := newClient(port)
 
 	phone := "+15551239999"
+	seedPhoneUsers(t, ctx, st, phone)
 	flow := auth.NewFlow(
 		auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
 			func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {

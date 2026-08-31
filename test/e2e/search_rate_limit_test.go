@@ -85,6 +85,7 @@ func TestSearchRateLimitE2E(t *testing.T) {
 
 	const phoneA = "+15551297001"
 	const phoneB = "+15551297002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	clientA, clientB := newClient(), newClient()
 	aCmds, bCmds := make(chan command), make(chan command)

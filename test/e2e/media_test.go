@@ -76,6 +76,7 @@ func bootMediaEnv(t *testing.T, ctx context.Context, phones ...string) []*mediaC
 		}
 	})
 	for _, phone := range phones {
+		seedPhoneUsers(t, ctx, st, phone)
 		mc := &mediaClient{
 			cmds:  make(chan command),
 			coll:  newUpdateCollector(),

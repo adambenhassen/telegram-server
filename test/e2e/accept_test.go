@@ -89,6 +89,7 @@ type acceptServer struct {
 	dcID  int
 	key   *rsa.PrivateKey
 	codes *codeSink
+	store *store.Store
 }
 
 // bootAcceptServer starts a server on a loopback port and stops it with the
@@ -142,7 +143,7 @@ func bootAcceptServer(t *testing.T, ctx context.Context, handshake time.Duration
 		}
 	})
 
-	return &acceptServer{addr: addr.String(), port: addr.Port, dcID: dcID, key: key, codes: codes}
+	return &acceptServer{addr: addr.String(), port: addr.Port, dcID: dcID, key: key, codes: codes, store: st}
 }
 
 // login runs a full client login against the server, failing the test if any
@@ -156,6 +157,7 @@ func (s *acceptServer) login(t *testing.T, ctx context.Context, phone string) {
 // are about how the connection is framed rather than about what it carries.
 func (s *acceptServer) loginWith(t *testing.T, ctx context.Context, phone string, resolver dcs.Resolver) {
 	t.Helper()
+	seedPhoneUsers(t, ctx, s.store, phone)
 
 	client := telegram.NewClient(1, "hash", telegram.Options{
 		DC:         s.dcID,

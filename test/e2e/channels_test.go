@@ -190,6 +190,7 @@ func TestChannelsLifecycle(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551295001", "+15551295002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	aCmds, bCmds := make(chan command), make(chan command)
@@ -342,6 +343,7 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551295011", "+15551295012"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)
@@ -446,6 +448,7 @@ func TestChannelsMegagroup(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551295021", "+15551295022"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)
@@ -527,6 +530,7 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneC = "+15551295031", "+15551295032"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneC)
 
 	aCmds, cCmds := make(chan command), make(chan command)
 	aID, cID := make(chan int64, 1), make(chan int64, 1)
@@ -627,6 +631,7 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB, phoneD = "+15551295041", "+15551295042", "+15551295043"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneD)
 
 	sessA := &session.StorageMemory{}
 	sessB := &session.StorageMemory{}
@@ -889,6 +894,7 @@ func TestChannelsBan(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551295051", "+15551295052"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	collB := newUpdateCollector()
 	aCmds, bCmds := make(chan command), make(chan command)
@@ -1099,6 +1105,7 @@ func TestChannelsCrossReplica(t *testing.T) {
 	t.Cleanup(bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln2))
 
 	const phoneA, phoneB = "+15551295061", "+15551295062"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	sessA := &session.StorageMemory{}
 

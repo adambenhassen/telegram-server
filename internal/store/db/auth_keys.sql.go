@@ -96,27 +96,6 @@ func (q *Queries) BindAuthKeyUser(ctx context.Context, arg BindAuthKeyUserParams
 	return result.RowsAffected(), nil
 }
 
-const bindAuthKeyUserForSignUp = `-- name: BindAuthKeyUserForSignUp :execrows
-UPDATE auth_keys SET user_id = $2 WHERE id = $1 AND user_id IS NULL AND pending_user_id IS NULL
-`
-
-type BindAuthKeyUserForSignUpParams struct {
-	ID     int64
-	UserID *int64
-}
-
-// Binds an auth key to a user only when the key is unbound (user_id IS NULL)
-// and not mid-2FA (pending_user_id IS NULL). Used exclusively by SignUpUsernameUser
-// so signup cannot rebind an already-authorized session. The shared BindAuthKeyUser
-// has no such guard — signIn relies on its unconditional rebinding behaviour.
-func (q *Queries) BindAuthKeyUserForSignUp(ctx context.Context, arg BindAuthKeyUserForSignUpParams) (int64, error) {
-	result, err := q.db.Exec(ctx, bindAuthKeyUserForSignUp, arg.ID, arg.UserID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const deleteAuthKey = `-- name: DeleteAuthKey :exec
 DELETE FROM auth_keys WHERE id = $1
 `

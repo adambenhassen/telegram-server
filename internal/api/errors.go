@@ -21,15 +21,13 @@ func FloodWaitError(seconds int) *tgerr.Error {
 }
 
 var (
-	// errInputRequestInvalid rejects auth.signUp when registration is closed.
+	// errInputRequestInvalid rejects auth.signUp before invite admission exists.
 	errInputRequestInvalid = rpcErr(400, "INPUT_REQUEST_INVALID")
-	// errFirstNameInvalid rejects auth.signUp with an empty or malformed display name.
-	errFirstNameInvalid = rpcErr(400, "FIRSTNAME_INVALID")
-	errPhoneInvalid     = rpcErr(400, "PHONE_NUMBER_INVALID")
-	errCodeInvalid      = rpcErr(400, "PHONE_CODE_INVALID")
-	errCodeExpired      = rpcErr(400, "PHONE_CODE_EXPIRED")
-	errInternal         = rpcErr(500, "INTERNAL")
-	errMethodNotImpl    = rpcErr(400, "INPUT_METHOD_INVALID")
+	errPhoneInvalid        = rpcErr(400, "PHONE_NUMBER_INVALID")
+	errCodeInvalid         = rpcErr(400, "PHONE_CODE_INVALID")
+	errCodeExpired         = rpcErr(400, "PHONE_CODE_EXPIRED")
+	errInternal            = rpcErr(500, "INTERNAL")
+	errMethodNotImpl       = rpcErr(400, "INPUT_METHOD_INVALID")
 	// errMethodNotImplFlood answers a call to an unimplemented method past what
 	// one connection may spend on them in a window. FLOOD_WAIT is the signal a
 	// client already backs off on, and it says what is true: the condition

@@ -50,6 +50,7 @@ func TestReactionsRealtime(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551285001", "+15551285002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	clientA, clientB :=
@@ -281,6 +282,7 @@ func TestReactionsRealtime(t *testing.T) {
 	// 8. C (not a party to the conversation) cannot react.
 	var cUserID int64
 	const phoneC = "+15551285003"
+	seedPhoneUsers(t, ctx, st, phoneC)
 	collC := newUpdateCollector()
 	clientC := createClient(addr.Port, key, dcID, collC, nil)
 	cCmds := make(chan command)
@@ -364,6 +366,7 @@ func TestReactionsChatFanout(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB, phoneC = "+15551286001", "+15551286002", "+15551286003"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneC)
 
 	collA, collB, collC := newUpdateCollector(), newUpdateCollector(), newUpdateCollector()
 	clientA, clientB, clientC :=

@@ -45,7 +45,7 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_BLOB_S3_ALLOW_INSECURE_HTTP` | `false` | Explicit loopback/compose-only plaintext opt-in; startup warns when enabled |
 | `TG_DC_ID`          | `2`              | DC id this server advertises as `ThisDC`    |
 | `TG_LOG_LOGIN_CODES`| `false`          | Write issued login codes to the log in cleartext. Off by default; with it off no code is delivered anywhere and sign-in cannot complete. A non-boolean value fails startup |
-| `TG_REGISTRATION`   | `closed`         | Controls whether `auth.signUp` creates new accounts. `closed` (default) rejects all registration RPCs; `open` allows them. An unrecognized value fails startup. Sign-in for accounts that already exist is unaffected by this setting |
+| `TG_REGISTRATION`   | `closed`         | Accepted values are `closed` and `invite`. Both reject `auth.signUp` until invite admission is implemented. An unrecognized value fails startup. Sign-in for accounts that already exist is unaffected by this setting |
 | `TG_CLIENT_ADDR_TRUST`| `socket`       | Where the address a per-IP limit is keyed on comes from: `socket` or `proxy-v2`. Any other value fails startup by name. `socket` is the connection's own peer address and assumes one peer address is one client, which fails from either end: behind a proxy or an L4 load balancer every peer address is the balancer's, so one bucket holds every client and the per-IP cap becomes a global one; behind a carrier NAT one address covers thousands of mobile subscribers, who then spend each other's budget. The server warns about both once at startup while any per-IP limit is on. `proxy-v2` takes the address from a PROXY protocol v2 header and is what to run behind an L4 load balancer; it needs `TG_CLIENT_ADDR_PROXY_CIDRS` and emits no such warning, because the misconfiguration it warns about fails the start instead |
 | `TG_MAX_PREAUTH_CONNS`| `1024`       | Concurrent connections that have not authenticated yet, process-wide. Checked on the accept loop, so a socket past the cap is closed before it costs a goroutine, a deadline or a read — refusing is cheaper than accepting, which is what makes the cap shed load rather than apply it. `0` disables it; a negative or non-integer value fails startup |
 | `TG_MAX_PREAUTH_CONNS_PER_IP`| `64`    | The same, per client network, so one peer cannot spend the process-wide cap alone and lock everybody else out. Keyed on the network the per-IP rate limits already use — an address for IPv4, a **/64** for IPv6, since a host on a routed v6 allocation mints addresses inside its own /64 for free — and on the address `TG_CLIENT_ADDR_TRUST` names, which in `proxy-v2` mode is the one the balancer reports and never the socket peer. A connection carrying no address at all (a `LOCAL` health check, or a socket peer the transport could not report) is charged to nothing and stays bounded by the other two. It is a concurrency cap and not a rate: a handshake takes milliseconds, so 64 at once is hundreds of new sessions a second from one network, which leaves room for a carrier NAT or a corporate egress. `0` disables it; a negative or non-integer value fails startup |
@@ -216,9 +216,10 @@ Anyone who can read the server's output can therefore sign in as any account
 that has no 2FA cloud password. Turn the flag on for development against fake
 numbers only.
 
-On a successful `auth.signIn`, the phone number is auto-registered as a new
-user if it hasn't been seen before (`store.CreateUser`) — there is no
-separate registration step or admin approval.
+On a successful `auth.signIn`, the phone number must already belong to an
+existing user. A correctly coded unknown phone is rejected with
+`PHONE_CODE_INVALID`, just like an invalid code, and neither an account nor an
+auth-key binding is created.
 
 ## 5. Username-mode accounts
 
@@ -258,11 +259,12 @@ denied.
 
 ### 5b. Registering a new account
 
-Registration requires `TG_REGISTRATION=open`. With the default `closed` value,
-`auth.signUp` is rejected at the RPC boundary and new accounts cannot be created
-through the sign-up flow (existing accounts are unaffected).
+New accounts cannot currently be created through `auth.signUp`. Both
+`TG_REGISTRATION=closed` (the default) and `TG_REGISTRATION=invite` reject the
+RPC at the boundary with `INPUT_REQUEST_INVALID`; `invite` is reserved for the
+invite admission path. Existing accounts are unaffected.
 
-Once `TG_REGISTRATION=open`:
+Account creation through the future invite path will use:
 
 ```
 1. auth.sendCode(phone_number=<username>)
@@ -287,9 +289,10 @@ provisional and the next sign-in attempt (section 5a step 2) will fail with an
 internal error — the only exits are `account.updatePasswordSettings` to set the
 password, or `auth.logOut` to remove the key.
 
-A username that already exists returns `USERNAME_OCCUPIED` from `auth.signUp`.
-There is no re-registration path: once a username is claimed it cannot be
-reclaimed by starting a new sign-up flow.
+When invite admission is implemented, a username that already exists will
+continue to return `USERNAME_OCCUPIED` from `auth.signUp`. There is no
+re-registration path: once a username is claimed it cannot be reclaimed by
+starting a new sign-up flow.
 
 ### 5c. Seed account at startup (TG_BOOTSTRAP_USERNAME)
 

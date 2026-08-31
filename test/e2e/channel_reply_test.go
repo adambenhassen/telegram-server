@@ -48,6 +48,7 @@ func TestChannelReplyPersisted(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551296001", "+15551296002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 	addr := tcpPort(t, ln)
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	aCmds, bCmds := make(chan command), make(chan command)

@@ -91,10 +91,10 @@ docker compose up
 
 The server listens on `127.0.0.1:2443`. The stack enables
 `TG_LOG_LOGIN_CODES`, so phone-mode login codes appear in
-`docker compose logs telegramd`; a first phone-mode sign-in auto-registers the
-account, so that is all a gotd client needs to get in. Username/password
-accounts are also supported here: set the `TG_BOOTSTRAP_*` variables in `.env`
-if you want a username/password operator account. `docker compose down` keeps
+`docker compose logs telegramd`; phone-mode accounts must already exist because
+sign-in no longer creates unknown accounts. Username/password accounts are also
+supported here: set the `TG_BOOTSTRAP_*` variables in `.env` if you want a
+username/password operator account. `docker compose down` keeps
 the local volumes (rows, RSA identity, auth-key master key, and filesystem
 blobs); `down -v` destroys them and every client has to re-handshake.
 `.env.example` documents each variable.
@@ -141,7 +141,7 @@ The server refuses to start without a database and a master key:
 | `TG_DC_ID` | `2` | DC id the server advertises |
 | `TG_BOOTSTRAP_USERNAME` | *(unset)* | Seed a username/password operator account at startup; requires exactly one of `TG_BOOTSTRAP_PASSWORD` or `TG_BOOTSTRAP_PASSWORD_FILE` |
 | `TG_BOOTSTRAP_PASSWORD_FILE` | *(unset)* | File (mode 0600) the bootstrap password is read from. Prefer it over `TG_BOOTSTRAP_PASSWORD`: an env value stays visible in `/proc/<pid>/environ`, orchestrator inspect output and crash dumps for the life of the process |
-| `TG_REGISTRATION` | `closed` | `open` allows `auth.signUp` to create accounts |
+| `TG_REGISTRATION` | `closed` | Accepted values are `closed` and `invite`; both currently reject `auth.signUp` until invite admission is implemented |
 | `TG_LOG_LOGIN_CODES` | `false` | Write phone-mode login codes to the log; with it off, phone-number sign-in cannot complete (username/password sign-in is unaffected) |
 | `TG_ADMIN_LISTEN_ADDR` | *(unset)* | Enables the admin HTTP server; requires `TG_ADMIN_TOKEN_HASH` (SHA-256 hex of the operator token) |
 

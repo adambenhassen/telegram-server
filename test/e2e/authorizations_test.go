@@ -73,6 +73,7 @@ func TestSessionManagement(t *testing.T) {
 	}
 
 	phone := "+15551235555"
+	seedPhoneUsers(t, ctx, st, phone)
 	flow := auth.NewFlow(
 		auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
 			func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {
@@ -269,6 +270,7 @@ func TestResetAuthorizationCrossUserRejected(t *testing.T) {
 
 	// User A logs in; capture the auth key bound to A.
 	phoneA := "+15551236666"
+	seedPhoneUsers(t, ctx, st, phoneA)
 	sessA := &session.StorageMemory{}
 	login(sessA, phoneA)
 	userA, ok, err := st.UserByPhone(ctx, phoneA)
@@ -286,6 +288,7 @@ func TestResetAuthorizationCrossUserRejected(t *testing.T) {
 
 	// User B logs in on a different phone (a distinct user) with its own session.
 	phoneB := "+15551236667"
+	seedPhoneUsers(t, ctx, st, phoneB)
 	sessB := &session.StorageMemory{}
 	login(sessB, phoneB)
 

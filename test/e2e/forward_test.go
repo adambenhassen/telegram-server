@@ -71,6 +71,7 @@ func TestForward1to1(t *testing.T) {
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	clientA, clientB := newClient(collA), newClient(collB)
 	const phoneA, phoneB = "+15551290001", "+15551290002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)
@@ -204,6 +205,7 @@ func TestForwardToGroup(t *testing.T) {
 	collA, collB, collC := newUpdateCollector(), newUpdateCollector(), newUpdateCollector()
 	clientA, clientB, clientC := newClient(collA), newClient(collB), newClient(collC)
 	const phoneA, phoneB, phoneC = "+15551291001", "+15551291002", "+15551291003"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneC)
 
 	aCmds, bCmds, cCmds := make(chan command), make(chan command), make(chan command)
 	aID, bID, cID := make(chan int64, 1), make(chan int64, 1), make(chan int64, 1)
@@ -374,6 +376,7 @@ func TestForwardAuthRejection(t *testing.T) {
 	collA, collB, collC := newUpdateCollector(), newUpdateCollector(), newUpdateCollector()
 	clientA, clientB, clientC := newClient(collA), newClient(collB), newClient(collC)
 	const phoneA, phoneB, phoneC = "+15551292001", "+15551292002", "+15551292003"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneC)
 
 	aCmds, bCmds, cCmds := make(chan command), make(chan command), make(chan command)
 	aID, bID, cID := make(chan int64, 1), make(chan int64, 1), make(chan int64, 1)
@@ -505,6 +508,7 @@ func TestForwardDedup(t *testing.T) {
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	clientA, clientB := newClient(collA), newClient(collB)
 	const phoneA, phoneB = "+15551293001", "+15551293002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)
@@ -643,6 +647,7 @@ func TestForwardMultiID(t *testing.T) {
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	clientA, clientB := newClient(collA), newClient(collB)
 	const phoneA, phoneB = "+15551293001", "+15551293002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)
@@ -777,6 +782,7 @@ func TestForwardFromChannel(t *testing.T) {
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	clientA, clientB := newClient(collA), newClient(collB)
 	const phoneA, phoneB = "+15551294001", "+15551294002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)

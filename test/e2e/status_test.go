@@ -127,6 +127,7 @@ func TestStatusOnlineRoundTrip(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15559001001", "+15559001002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 	sessA := &session.StorageMemory{}
 
 	// B stays connected and collects status pushes.
@@ -262,6 +263,7 @@ func TestStatusExplicitUpdateStatus(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15559002001", "+15559002002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	aCmds, bCmds := make(chan command), make(chan command)
@@ -364,6 +366,7 @@ func TestStatusGetDialogsCarriesOnline(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15559003001", "+15559003002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)
@@ -476,6 +479,7 @@ func TestStatusNeverConnected(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneB, phoneC = "+15559004001", "+15559004002"
+	seedPhoneUsers(t, ctx, st, phoneB, phoneC)
 
 	bCmds := make(chan command)
 	bID := make(chan int64, 1)
@@ -567,6 +571,7 @@ func TestStatusSelfRecently(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA = "+15559005001"
+	seedPhoneUsers(t, ctx, st, phoneA)
 	aCmds := make(chan command)
 	aID := make(chan int64, 1)
 	errA := make(chan error, 1)
@@ -643,6 +648,7 @@ func TestStatusNoCrossContamination(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB, phoneD = "+15559007001", "+15559007002", "+15559007004"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneD)
 
 	// B has a dialog with A (should receive pushes); D shares no dialog with A.
 	collB, collD := newUpdateCollector(), newUpdateCollector()

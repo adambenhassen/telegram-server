@@ -5,13 +5,11 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -30,17 +28,6 @@ func validatePhone(phone string) error {
 
 func validateUsername(username string) bool {
 	return usernameRE.MatchString(username)
-}
-
-// validDisplayName checks that the display name is storable text and does not
-// contain runes that could be used for spoofing: C0/C1 control characters and
-// bidi override/isolate marks. These characters let an attacker craft a name
-// that visually masquerades as another user or service in peer lists.
-func validDisplayName(s string) bool {
-	if !utf8.ValidString(s) || strings.ContainsRune(s, 0) {
-		return false
-	}
-	return !strings.ContainsFunc(s, isDangerousRune)
 }
 
 func newSentCode(hash string) *tg.AuthSentCode {
@@ -67,82 +54,18 @@ func verifyToRPC(err error) *tgerr.Error {
 	}
 }
 
-// handleSignUp serves auth.signUp for username-mode registration.
-// It creates a provisional account with the given username and binds the
-// auth key with provisional=true.
+// handleSignUp serves auth.signUp. Account creation remains closed until the
+// invite admission path is implemented.
 func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthSignUpRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
 
-	// Registration closed: reject immediately without touching state.
-	if h.registrationMode != config.RegistrationOpen {
-		return nil, errInputRequestInvalid
-	}
-
-	// Input: req.PhoneNumber is the username; req.PhoneCodeHash is the hash
-	// from a prior sendCode; req.FirstName/LastName are the display name.
-	//
-	// The username must match the username pattern — not the phone regex.
-	// A phone-number format means the client called the wrong method.
-	username := req.PhoneNumber
-	if !validateUsername(username) {
-		return nil, errPhoneInvalid
-	}
-	username = strings.ToLower(username)
-
-	// Reserved handles must never be claimed.
-	if reservedUsernames[username] {
-		return nil, errPhoneInvalid
-	}
-
-	// Per-IP rate limit: charged before any identifier-dependent work.
-	if err := h.checkAndChargeRateLimitIP(r, "sign_up_ip", h.rateLimitSignUpIP); err != nil {
-		return nil, err
-	}
-
-	// Validate display names: must be valid text with a reasonable length cap.
-	// Bidi override and C0/C1 control characters are rejected to prevent
-	// display-name spoofing (extension/identity spoof in peer lists).
-	firstName, lastName := req.FirstName, req.LastName
-	if firstName == "" || !validDisplayName(firstName) || len(firstName) > 255 {
-		return nil, errFirstNameInvalid
-	}
-	if lastName != "" && (!validDisplayName(lastName) || len(lastName) > 255) {
-		return nil, errFirstNameInvalid
-	}
-
-	// Hash-only verification: same check as signIn's username path.
-	if err := h.store.CheckCodeHash(r.Ctx, username, req.PhoneCodeHash); err != nil {
-		rpc := verifyToRPC(err)
-		if rpc == errCodeExpired {
-			// Username path returns PHONE_CODE_INVALID for expired hashes.
-			rpc = errCodeInvalid
-		}
-		if rpc == errInternal {
-			h.log.Error("sign up: check code hash", "err", err)
-			return nil, errInternal
-		}
-		return nil, rpc
-	}
-
-	// Create the user, claim the username, and bind the auth key — all in one
-	// transaction. A failed bind rolls back the account and claim.
-	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
-	user, err := h.store.SignUpUsernameUser(r.Ctx, username, firstName, lastName, keyID)
-	if err != nil {
-		if errors.Is(err, store.ErrUsernameOccupied) {
-			return nil, errUsernameOccupied
-		}
-		if errors.Is(err, store.ErrAuthKeyNotFound) {
-			return nil, errAuthKeyUnreg
-		}
-		h.log.Error("sign up: create user", "err", err)
-		return nil, errInternal
-	}
-
-	return &tg.AuthAuthorization{User: userTL(user)}, nil
+	// Invite admission is not implemented yet, so signUp remains closed in
+	// every registration mode. Keep this gate before all validation and storage
+	// work so the fail-closed state cannot create partial account state.
+	return nil, errInputRequestInvalid
 }
 
 func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
@@ -281,13 +204,16 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 	return h.handleSignInPhone(r, req)
 }
 
-// handleSignInPhone is the phone-mode signIn path, unchanged from before.
+// handleSignInPhone is the phone-mode signIn path. It only authorizes an
+// existing phone-mode account; unknown phones are indistinguishable from bad
+// codes to the caller.
 func (h *handlers) handleSignInPhone(r *mtproto.Request, req tg.AuthSignInRequest) (bin.Encoder, error) {
 	code, _ := req.GetPhoneCode()
 
 	// AttemptSignIn atomically checks the per-IP failure budget, verifies the
-	// code, and charges on failure — all within a single Postgres transaction
-	// protected by an advisory lock. Correct codes never touch the counter.
+	// code, requires an existing account, and charges on failure — all within a
+	// single Postgres transaction protected by an advisory lock. Correct codes
+	// for existing accounts never touch the counter.
 	rateLimited, err := h.store.AttemptSignIn(r.Ctx, r.ClientAddr, req.PhoneNumber, req.PhoneCodeHash, code, h.rateLimitSignInFailIP)
 	if rateLimited != nil {
 		return nil, FloodWaitError(int(rateLimited.Wait / time.Second))
@@ -301,10 +227,13 @@ func (h *handlers) handleSignInPhone(r *mtproto.Request, req tg.AuthSignInReques
 		return nil, rpc
 	}
 
-	user, err := h.store.CreateUser(r.Ctx, req.PhoneNumber)
+	user, ok, err := h.store.UserByPhone(r.Ctx, req.PhoneNumber)
 	if err != nil {
-		h.log.Error("create user", "err", err)
+		h.log.Error("sign in: lookup phone", "err", err)
 		return nil, errInternal
+	}
+	if !ok {
+		return nil, errCodeInvalid
 	}
 	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)
 

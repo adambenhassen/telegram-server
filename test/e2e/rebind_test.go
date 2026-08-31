@@ -75,6 +75,7 @@ func TestRebindStopsPushToPreviousUser(t *testing.T) {
 	// victim holds the connection under test; sender pushes messages at it;
 	// taker signs in over the victim's own connection and takes its key.
 	const phoneVictim, phoneSender, phoneTaker = "+15551290001", "+15551290002", "+15551290003"
+	seedPhoneUsers(t, ctx, st, phoneVictim, phoneSender, phoneTaker)
 	collVictim, collSender := newUpdateCollector(), newUpdateCollector()
 	victim, sender := newClient(collVictim), newClient(collSender)
 

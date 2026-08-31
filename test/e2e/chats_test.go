@@ -148,6 +148,7 @@ func TestChatsRealtime(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB, phoneC, phoneD = "+15551290001", "+15551290002", "+15551290003", "+15551290004"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneC, phoneD)
 
 	collA, collB, collC, collD := newUpdateCollector(), newUpdateCollector(), newUpdateCollector(), newUpdateCollector()
 	clientA, clientB, clientC, clientD :=
@@ -432,6 +433,7 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneC = "+15551291001", "+15551291002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneC)
 
 	collA, collC := newUpdateCollector(), newUpdateCollector()
 	clientA, clientC :=
@@ -778,6 +780,7 @@ func TestChatsOfflineBackfill(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551292001", "+15551292002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	sessA, sessB := &session.StorageMemory{}, &session.StorageMemory{}
 
@@ -952,6 +955,7 @@ func TestChatsCrossReplica(t *testing.T) {
 	t.Cleanup(bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln2))
 
 	const phoneA, phoneB = "+15551293001", "+15551293002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	// B connects to server 2 and collects pushes.
 	collB := newUpdateCollector()
