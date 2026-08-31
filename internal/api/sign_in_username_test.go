@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/gotd/td/bin"
@@ -76,6 +77,78 @@ func TestSignInUsernameUnknownReturnsSignUpRequired(t *testing.T) {
 	after := countUsers(t, dsn)
 	if after != before {
 		t.Errorf("users table grew from %d to %d — signIn must not create a user for unknown username", before, after)
+	}
+}
+
+func TestSignInUsernameUnknownCodeIsBounded(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	hash, _, err := s.IssueCodeForUsername(ctx, "bounded")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := api.SignInForTestWithLimits(s, [8]byte{1}, netip.MustParseAddr("10.0.0.11"), store.RateLimitConfig{}, &tg.AuthSignInRequest{
+		PhoneNumber:   "bounded",
+		PhoneCodeHash: hash,
+		PhoneCode:     strings.Repeat("x", 512),
+	})
+	if err != nil {
+		t.Fatalf("signIn with unknown username: %v", err)
+	}
+	if !isAuthSignUpRequired(res) {
+		t.Fatalf("result = %T, want *tg.AuthAuthorizationSignUpRequired", res)
+	}
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var code string
+	if err := pool.QueryRow(ctx, `SELECT code FROM phone_codes WHERE code_hash = $1`, hash).Scan(&code); err != nil {
+		t.Fatal(err)
+	}
+	if len([]byte(code)) > 256 {
+		t.Fatalf("stored code length = %d bytes, want at most 256", len([]byte(code)))
+	}
+}
+
+func TestSignInUsernameUnknownCodeWriteIsIdempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	hash, _, err := s.IssueCodeForUsername(ctx, "idempotent")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, code := range []string{"first-secret", "second-secret"} {
+		res, err := api.SignInForTestWithLimits(s, [8]byte{byte(i + 1)}, netip.MustParseAddr("10.0.0.12"), store.RateLimitConfig{}, &tg.AuthSignInRequest{
+			PhoneNumber:   "idempotent",
+			PhoneCodeHash: hash,
+			PhoneCode:     code,
+		})
+		if err != nil {
+			t.Fatalf("signIn %d: %v", i, err)
+		}
+		if !isAuthSignUpRequired(res) {
+			t.Fatalf("signIn %d result = %T, want *tg.AuthAuthorizationSignUpRequired", i, res)
+		}
+	}
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var code string
+	if err := pool.QueryRow(ctx, `SELECT code FROM phone_codes WHERE code_hash = $1`, hash).Scan(&code); err != nil {
+		t.Fatal(err)
+	}
+	if code != "first-secret" {
+		t.Fatalf("stored code = %q, want first-secret", code)
 	}
 }
 

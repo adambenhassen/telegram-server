@@ -35,7 +35,15 @@ WHERE code_hash = $1
   AND phone = $2
   AND consumed_at IS NULL
   AND expires_at >= now()
-  AND attempts < 3;
+  AND attempts < 3
+  AND code ~ '^[0-9]{5}$';
+
+-- name: ClearCodeValue :execrows
+-- Removes the handoff secret after successful invite consumption. The hash and
+-- phone binding scope the update to the exact admission code row.
+UPDATE phone_codes SET code = ''
+WHERE code_hash = $1
+  AND phone = $2;
 
 -- name: IncrementCodeAttempts :exec
 -- Scoped to the exact issued code by its hash so a concurrent resend (new hash)

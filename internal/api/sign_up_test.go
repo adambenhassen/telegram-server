@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -113,6 +114,76 @@ func TestSignUpInviteAdmissionCreatesProvisionalAccount(t *testing.T) {
 	}
 	if len(invites) != 1 || invites[0].ID != invite.ID || invites[0].State != store.InviteConsumed {
 		t.Fatalf("invites = %#v, want invite %d consumed", invites, invite.ID)
+	}
+	if err := conn.QueryRow(ctx, `SELECT code FROM phone_codes WHERE code_hash = $1`, hash).Scan(&storedCode); err != nil {
+		t.Fatalf("read cleared code handoff: %v", err)
+	}
+	if storedCode != "" {
+		t.Fatalf("stored code after admission = %q, want empty", storedCode)
+	}
+}
+
+func TestSignUpRejectsOverlongOrNulDisplayNames(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	addr := netip.MustParseAddr("10.0.0.10")
+	limits := store.RateLimitConfig{}
+	cases := []struct {
+		handle    string
+		firstName string
+		lastName  string
+	}{
+		{handle: "longfirst", firstName: strings.Repeat("a", 65), lastName: "Valid"},
+		{handle: "longlast", firstName: "Valid", lastName: strings.Repeat("界", 65)},
+		{handle: "nulname", firstName: "Bad\x00Name", lastName: "Valid"},
+	}
+
+	for i, tc := range cases {
+		invite, secret, err := s.IssueInvite(ctx, tc.handle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash, _, err := s.IssueCodeForUsername(ctx, tc.handle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyID := int64(i + 1)
+		if err := s.SaveAuthKey(ctx, keyID, make([]byte, 256)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := api.SignInForTestWithLimits(s, [8]byte{byte(i + 1)}, addr, limits, &tg.AuthSignInRequest{
+			PhoneNumber:   tc.handle,
+			PhoneCodeHash: hash,
+			PhoneCode:     secret,
+		}); err != nil {
+			t.Fatalf("signIn %q: %v", tc.handle, err)
+		}
+
+		_, err = api.SignUpForTest(s, [8]byte{byte(i + 1)}, addr, limits, config.RegistrationInvite, &tg.AuthSignUpRequest{
+			PhoneNumber:   tc.handle,
+			PhoneCodeHash: hash,
+			FirstName:     tc.firstName,
+			LastName:      tc.lastName,
+		})
+		if !isInputRequestInvalid(err) {
+			t.Fatalf("signUp %q: expected INPUT_REQUEST_INVALID, got %v", tc.handle, err)
+		}
+
+		key, ok, err := s.AuthKeyByID(ctx, keyID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok || key.UserID != 0 || key.PendingUserID != 0 {
+			t.Fatalf("signUp %q changed auth key: %#v found=%v", tc.handle, key, ok)
+		}
+		invites, err := s.ListInvites(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(invites) != i+1 || invites[i].ID != invite.ID || invites[i].State != store.InviteIssued {
+			t.Fatalf("signUp %q changed invite state: %#v", tc.handle, invites)
+		}
 	}
 }
 

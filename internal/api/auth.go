@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -20,6 +21,11 @@ var (
 	usernameRE = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{4,31}$`)
 )
 
+const (
+	maxPhoneCodeBytes       = 256
+	maxSignUpNameCodePoints = 64
+)
+
 func validatePhone(phone string) error {
 	if !phoneRE.MatchString(phone) {
 		return errPhoneInvalid
@@ -29,6 +35,23 @@ func validatePhone(phone string) error {
 
 func validateUsername(username string) bool {
 	return usernameRE.MatchString(username)
+}
+
+func validateSignUpName(name string) bool {
+	return utf8.ValidString(name) &&
+		!strings.ContainsRune(name, '\x00') &&
+		utf8.RuneCountInString(name) <= maxSignUpNameCodePoints
+}
+
+func capPhoneCode(code string) string {
+	if len(code) <= maxPhoneCodeBytes {
+		return code
+	}
+	end := maxPhoneCodeBytes
+	for end > 0 && !utf8.RuneStart(code[end]) {
+		end--
+	}
+	return code[:end]
 }
 
 func newSentCode(hash string) *tg.AuthSentCode {
@@ -70,6 +93,9 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInputRequestInvalid
 	}
 	if !validateUsername(req.PhoneNumber) {
+		return nil, errInputRequestInvalid
+	}
+	if !validateSignUpName(req.FirstName) || !validateSignUpName(req.LastName) {
 		return nil, errInputRequestInvalid
 	}
 	username := strings.ToLower(req.PhoneNumber)
@@ -334,6 +360,7 @@ func (h *handlers) handleSignInUsername(r *mtproto.Request, username, phoneCodeH
 	// bound here. A row disappearing after hash validation is still reported as
 	// signUpRequired to preserve the existing return behavior.
 	if !ok {
+		phoneCode = capPhoneCode(phoneCode)
 		if err := h.store.SetCodeForUsername(r.Ctx, username, phoneCodeHash, phoneCode); err != nil && !errors.Is(err, store.ErrCodeInvalid) {
 			h.log.Error("sign in: store username code", "err", err)
 			return nil, errInternal

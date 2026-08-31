@@ -11,6 +11,27 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const clearCodeValue = `-- name: ClearCodeValue :execrows
+UPDATE phone_codes SET code = ''
+WHERE code_hash = $1
+  AND phone = $2
+`
+
+type ClearCodeValueParams struct {
+	CodeHash string
+	Phone    string
+}
+
+// Removes the handoff secret after successful invite consumption. The hash and
+// phone binding scope the update to the exact admission code row.
+func (q *Queries) ClearCodeValue(ctx context.Context, arg ClearCodeValueParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearCodeValue, arg.CodeHash, arg.Phone)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const consumeCode = `-- name: ConsumeCode :execrows
 UPDATE phone_codes SET consumed_at = now()
 WHERE phone = $1
@@ -186,6 +207,7 @@ WHERE code_hash = $1
   AND consumed_at IS NULL
   AND expires_at >= now()
   AND attempts < 3
+  AND code ~ '^[0-9]{5}$'
 `
 
 type SetCodeByHashAndPhoneParams struct {

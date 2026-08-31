@@ -42,6 +42,14 @@ func (s *Store) AdmitUsername(ctx context.Context, handle, phoneCodeHash string,
 	if err := s.ConsumeInvite(ctx, tx, handle, codeRow.Code); err != nil {
 		return User{}, err
 	}
+	if rows, err := qtx.ClearCodeValue(ctx, db.ClearCodeValueParams{
+		CodeHash: phoneCodeHash,
+		Phone:    handle,
+	}); err != nil {
+		return User{}, fmt.Errorf("admit username: clear code value: %w", err)
+	} else if rows != 1 {
+		return User{}, ErrCodeInvalid
+	}
 
 	u, err := qtx.CreateUsernameUser(ctx, db.CreateUsernameUserParams{
 		FirstName: firstName,
