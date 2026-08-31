@@ -61,9 +61,6 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
-	if err := h.checkAndChargeRateLimitIP(r, "sign_up_ip", h.rateLimitSignUpIP); err != nil {
-		return nil, err
-	}
 
 	// Invite admission is not implemented yet, so signUp remains closed in
 	// every registration mode. Keep this gate before all validation and storage

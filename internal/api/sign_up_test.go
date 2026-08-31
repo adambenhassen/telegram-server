@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/netip"
 	"testing"
-	"time"
 
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
@@ -82,33 +81,5 @@ func TestSignUpGatePrecedesRequestValidation(t *testing.T) {
 		if !isInputRequestInvalid(err) {
 			t.Fatalf("empty signUp with %q registration: expected INPUT_REQUEST_INVALID, got %v", mode, err)
 		}
-	}
-}
-
-func TestSignUpRateLimitAppliesToClosedAndInvite(t *testing.T) {
-	t.Parallel()
-
-	for _, mode := range []config.RegistrationMode{
-		config.RegistrationClosed,
-		config.RegistrationInvite,
-	} {
-		t.Run(string(mode), func(t *testing.T) {
-			t.Parallel()
-			s := openStore(t)
-			addr := netip.MustParseAddr("10.0.0.3")
-			limits := store.RateLimitConfig{Limit: 1, Window: time.Hour}
-			request := &tg.AuthSignUpRequest{
-				PhoneNumber:   "alice",
-				PhoneCodeHash: "hash",
-				FirstName:     "Alice",
-			}
-
-			if _, err := api.SignUpForTest(s, [8]byte{1}, addr, limits, mode, request); !isInputRequestInvalid(err) {
-				t.Fatalf("first signUp: expected INPUT_REQUEST_INVALID, got %v", err)
-			}
-			if _, err := api.SignUpForTest(s, [8]byte{1}, addr, limits, mode, request); !isFloodWait(err) {
-				t.Fatalf("second signUp: expected FLOOD_WAIT, got %v", err)
-			}
-		})
 	}
 }

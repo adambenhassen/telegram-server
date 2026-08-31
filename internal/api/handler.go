@@ -89,8 +89,8 @@ type handlers struct {
 	// rateLimitGetPasswordIP limits account.getPassword calls per client network,
 	// but only for unauthenticated callers (pending state).
 	rateLimitGetPasswordIP store.RateLimitConfig
-	// rateLimitSignUpIP limits auth.signUp calls per client network before the
-	// registration gate, in both closed and invite modes.
+	// rateLimitSignUpIP limits auth.signUp calls per client network. It remains
+	// configured for the future invite admission path.
 	rateLimitSignUpIP store.RateLimitConfig
 	// rateLimitPasswordProof limits account.getPasswordSettings and
 	// account.updatePasswordSettings (proof-required path) per account, on one
