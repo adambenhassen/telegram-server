@@ -26,6 +26,9 @@ type Store struct {
 	// blobs is the backend in-flight upload part bytes go to; the parts rows
 	// account for them. Every Store owns one.
 	blobs blob.Store
+	// withoutBlobStore permits database-only callers such as the invite operator
+	// commands to open the Store without initializing an upload backend.
+	withoutBlobStore bool
 
 	// log carries the store's own diagnostics: the states a write reaches that
 	// no return value reports. Never nil — Open defaults it to slog.Default(),
@@ -187,6 +190,15 @@ func WithBlobStore(blobs blob.Store) Option {
 	}
 }
 
+// WithoutBlobStore opens a Store for database-only operations that never touch
+// upload or media blobs. It is deliberately opt-in; the server path still
+// refuses to start without a configured blob backend.
+func WithoutBlobStore() Option {
+	return func(s *Store) {
+		s.withoutBlobStore = true
+	}
+}
+
 // WithLogger routes the store's diagnostics to log instead of slog.Default().
 // It is per-Store rather than a package-level setting so that two Stores in one
 // process — every parallel test in this package — cannot write into each
@@ -250,7 +262,7 @@ func Open(ctx context.Context, dsn string, encKey []byte, opts ...Option) (*Stor
 	// directory this package could pick on a caller's behalf that would be
 	// right. Left to default it, the miss surfaces as a nil dereference on the
 	// first saveFilePart a running server takes.
-	if s.blobs == nil {
+	if s.blobs == nil && !s.withoutBlobStore {
 		pool.Close()
 		return nil, errors.New("store: no blob backend configured; pass WithBlobStore")
 	}

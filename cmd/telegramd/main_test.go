@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -238,5 +240,128 @@ func TestMediaErasureUsesSeparateTempAndRowCutoffs(t *testing.T) {
 	}
 	if _, err := l.ReadAt(ctx, key, 0, 1); err != nil {
 		t.Fatalf("short temporary cutoff removed the temporary: %v", err)
+	}
+}
+
+func TestRunInviteCommandIssueAndList(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", pgtest.DSN(t))
+	t.Setenv("TG_AUTHKEY_ENC_KEY", strings.Repeat("00", 32))
+	t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", "")
+	t.Setenv("TG_REGISTRATION", "open")
+	blobDir := filepath.Join(t.TempDir(), "blobs")
+	rsaKeyPath := filepath.Join(t.TempDir(), "server-key.pem")
+	t.Setenv("TG_BLOB_DIR", blobDir)
+	t.Setenv("TG_RSA_KEY_PATH", rsaKeyPath)
+
+	log := slog.New(slog.DiscardHandler)
+	var stdout, stderr bytes.Buffer
+	if err := runInviteCommand([]string{"issue", "Alice", "--lifetime", "48h"}, log, &stdout, &stderr); err != nil {
+		t.Fatalf("issue command: %v", err)
+	}
+	secret := strings.TrimSpace(stdout.String())
+	if len(secret) != 64 {
+		t.Fatalf("secret = %q, want 64 characters", secret)
+	}
+	if strings.Trim(secret, "0123456789abcdef") != "" {
+		t.Fatalf("secret = %q, want lowercase hex", secret)
+	}
+	if !strings.Contains(stderr.String(), "Invite issued: id=") || !strings.Contains(stderr.String(), "handle=alice") {
+		t.Fatalf("issue metadata = %q, want id and canonical handle", stderr.String())
+	}
+	if strings.Contains(stderr.String(), secret) {
+		t.Fatal("issue metadata contains the secret")
+	}
+	var id int64
+	if _, err := fmt.Sscanf(stderr.String(), "Invite issued: id=%d", &id); err != nil {
+		t.Fatalf("issue metadata = %q, parse id: %v", stderr.String(), err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := runInviteCommand([]string{"list"}, log, &stdout, &stderr); err != nil {
+		t.Fatalf("list command: %v", err)
+	}
+	if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) {
+		t.Fatal("list output contains the secret")
+	}
+	for _, want := range []string{"ID", "HANDLE", "STATE", "ISSUED", "EXPIRES", "alice", "issued"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("list output = %q, missing %q", stdout.String(), want)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("list stderr = %q, want empty", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	err := runInviteCommand([]string{"issue", "alice"}, log, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "alice") {
+		t.Fatalf("duplicate issue error = %v, want an error naming alice", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("duplicate issue stdout = %q, want empty", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := runInviteCommand([]string{"revoke", strconv.FormatInt(id, 10)}, log, &stdout, &stderr); err != nil {
+		t.Fatalf("revoke command: %v", err)
+	}
+	if stdout.Len() != 0 || stderr.String() != fmt.Sprintf("Revoked: id=%d\n", id) {
+		t.Fatalf("revoke output = stdout %q stderr %q", stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := runInviteCommand([]string{"list"}, log, &stdout, &stderr); err != nil {
+		t.Fatalf("list after revoke: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "revoked") {
+		t.Fatalf("list after revoke = %q, missing revoked state", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("list after revoke stderr = %q, want empty", stderr.String())
+	}
+
+	if _, err := os.Stat(blobDir); !os.IsNotExist(err) {
+		t.Fatalf("invite command initialized blob dir, stat error = %v", err)
+	}
+	if _, err := os.Stat(rsaKeyPath); !os.IsNotExist(err) {
+		t.Fatalf("invite command initialized RSA key, stat error = %v", err)
+	}
+}
+
+func TestParseInviteIssueArgs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		args     []string
+		handle   string
+		lifetime time.Duration
+		wantErr  bool
+	}{
+		{name: "default", args: []string{"Alice"}, handle: "Alice"},
+		{name: "explicit", args: []string{"alice", "--lifetime", "48h"}, handle: "alice", lifetime: 48 * time.Hour},
+		{name: "missing handle", wantErr: true},
+		{name: "unknown option", args: []string{"alice", "--other", "48h"}, wantErr: true},
+		{name: "invalid duration", args: []string{"alice", "--lifetime", "later"}, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			handle, lifetime, err := parseInviteIssueArgs(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("parse succeeded, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if handle != tc.handle || lifetime != tc.lifetime {
+				t.Fatalf("parse = handle %q lifetime %s, want %q %s", handle, lifetime, tc.handle, tc.lifetime)
+			}
+		})
 	}
 }

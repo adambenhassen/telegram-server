@@ -3,7 +3,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/gotd/td/exchange"
@@ -31,7 +34,7 @@ import (
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(log); err != nil {
+	if err := runCommand(os.Args[1:], log, os.Stdout, os.Stderr); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
 	}
@@ -43,6 +46,164 @@ const sweepInterval = 5 * time.Minute
 // adminShutdownTimeout bounds how long the admin server waits for in-flight
 // requests to finish before it gives up.
 const adminShutdownTimeout = 5 * time.Second
+
+func runCommand(args []string, log *slog.Logger, stdout, stderr io.Writer) error {
+	switch {
+	case len(args) == 0:
+		return run(log)
+	case args[0] == "serve":
+		if len(args) != 1 {
+			return errors.New("serve takes no arguments")
+		}
+		return run(log)
+	case args[0] == "invite":
+		return runInviteCommand(args[1:], log, stdout, stderr)
+	default:
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func runInviteCommand(args []string, log *slog.Logger, stdout, stderr io.Writer) (err error) {
+	if len(args) == 0 {
+		return inviteUsageError()
+	}
+
+	var (
+		handle   string
+		lifetime time.Duration
+		id       int64
+	)
+	switch args[0] {
+	case "issue":
+		handle, lifetime, err = parseInviteIssueArgs(args[1:])
+		if err != nil {
+			return err
+		}
+	case "list":
+		if len(args) != 1 {
+			return inviteUsageError()
+		}
+	case "revoke":
+		if len(args) != 2 {
+			return inviteUsageError()
+		}
+		id, err = strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid invite id %q: %w", args[1], err)
+		}
+	default:
+		return inviteUsageError()
+	}
+
+	cfg, err := config.Load(log)
+	if err != nil {
+		return err
+	}
+
+	// Invite commands deliberately do not validate TG_REGISTRATION or initialize
+	// any of the server's listeners, keys, blob backends, or sweeps.
+	ctx := context.Background()
+	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey,
+		store.WithLogger(log),
+		store.WithStatementTimeout(cfg.StatementTimeout),
+		store.WithoutBlobStore(),
+	)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer func() {
+		if closeErr := st.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close store: %w", closeErr))
+		}
+	}()
+
+	switch args[0] {
+	case "issue":
+		var (
+			invite store.RegistrationInvite
+			secret string
+		)
+		if lifetime == 0 {
+			invite, secret, err = st.IssueInvite(ctx, handle)
+		} else {
+			invite, secret, err = st.IssueInvite(ctx, handle, lifetime)
+		}
+		if err != nil {
+			return fmt.Errorf("issue invite for %q: %w", strings.ToLower(handle), err)
+		}
+		if _, err := fmt.Fprintln(stdout, secret); err != nil {
+			return fmt.Errorf("write invite secret: %w", err)
+		}
+		return writeInviteIssued(stderr, invite)
+	case "list":
+		invites, err := st.ListInvites(ctx)
+		if err != nil {
+			return err
+		}
+		return writeInviteList(stdout, invites)
+	case "revoke":
+		if err := st.RevokeInvite(ctx, id); err != nil {
+			return fmt.Errorf("revoke invite %d: %w", id, err)
+		}
+		if _, err := fmt.Fprintf(stderr, "Revoked: id=%d\n", id); err != nil {
+			return fmt.Errorf("write revoke confirmation: %w", err)
+		}
+		return nil
+	default:
+		return inviteUsageError()
+	}
+}
+
+func parseInviteIssueArgs(args []string) (string, time.Duration, error) {
+	if len(args) == 0 {
+		return "", 0, inviteUsageError()
+	}
+	if len(args) == 1 {
+		return args[0], 0, nil
+	}
+	if len(args) != 3 || args[1] != "--lifetime" {
+		return "", 0, inviteUsageError()
+	}
+	handle := args[0]
+	lifetime, err := time.ParseDuration(args[2])
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid invite lifetime %q: %w", args[2], err)
+	}
+	return handle, lifetime, nil
+}
+
+func inviteUsageError() error {
+	return errors.New("usage: telegramd invite issue <handle> [--lifetime <duration>] | telegramd invite list | telegramd invite revoke <id>")
+}
+
+func writeInviteIssued(w io.Writer, invite store.RegistrationInvite) error {
+	if _, err := fmt.Fprintf(w, "Invite issued: id=%d handle=%s expires=%s\n", invite.ID, invite.Handle, invite.ExpiresAt.Format(time.RFC3339)); err != nil {
+		return fmt.Errorf("write invite metadata: %w", err)
+	}
+	return nil
+}
+
+func writeInviteList(w io.Writer, invites []store.RegistrationInvite) error {
+	table := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(table, "ID\tHANDLE\tSTATE\tISSUED\tEXPIRES"); err != nil {
+		return fmt.Errorf("write invite list: %w", err)
+	}
+	for _, invite := range invites {
+		if _, err := fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\n",
+			invite.ID,
+			invite.Handle,
+			invite.State,
+			invite.IssuedAt.Format(time.RFC3339),
+			invite.ExpiresAt.Format(time.RFC3339),
+		); err != nil {
+			return fmt.Errorf("write invite list: %w", err)
+		}
+	}
+	if err := table.Flush(); err != nil {
+		return fmt.Errorf("write invite list: %w", err)
+	}
+	return nil
+}
 
 func run(log *slog.Logger) error {
 	cfg, err := config.Load(log)
