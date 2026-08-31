@@ -12,11 +12,12 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
-// AdmitUsername consumes the invite secret stored in the username's phone-code
-// row and creates the provisional account in the same transaction. Every
+// AdmitUsername verifies the username's phone-code hash and creates the
+// provisional account in the same transaction. When requireInvite is true, it
+// also consumes the invite secret stored in the phone-code row. Every
 // account-side write is rolled back when any later step fails, including the
-// invite consumption.
-func (s *Store) AdmitUsername(ctx context.Context, handle, phoneCodeHash string, authKeyID int64, firstName, lastName string) (User, error) {
+// invite consumption when required.
+func (s *Store) AdmitUsername(ctx context.Context, handle, phoneCodeHash string, authKeyID int64, firstName, lastName string, requireInvite bool) (User, error) {
 	handle = strings.ToLower(handle)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -39,8 +40,10 @@ func (s *Store) AdmitUsername(ctx context.Context, handle, phoneCodeHash string,
 		return User{}, err
 	}
 
-	if err := s.ConsumeInvite(ctx, tx, handle, codeRow.Code); err != nil {
-		return User{}, err
+	if requireInvite {
+		if err := s.ConsumeInvite(ctx, tx, handle, codeRow.Code); err != nil {
+			return User{}, err
+		}
 	}
 	if rows, err := qtx.ClearCodeValue(ctx, db.ClearCodeValueParams{
 		CodeHash: phoneCodeHash,
