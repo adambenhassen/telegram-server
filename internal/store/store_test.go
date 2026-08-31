@@ -49,6 +49,17 @@ func TestOpenRequiresBlobStore(t *testing.T) {
 	}
 }
 
+func TestOpenAllowsExplicitDatabaseOnlyStore(t *testing.T) {
+	t.Parallel()
+	s, err := store.Open(context.Background(), pgtest.DSN(t), pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("Open database-only store: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
 func TestCreateUserAndLookup(t *testing.T) {
 	t.Parallel()
 	s := open(t)
