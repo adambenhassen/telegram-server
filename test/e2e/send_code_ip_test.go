@@ -89,7 +89,9 @@ func TestClientLoginUnderDefaultRateLimits(t *testing.T) {
 
 	// Two accounts from the one loopback address: a shared-NAT population is
 	// meant to be delayed at worst, never locked out at the first user.
-	for _, phone := range []string{"+15551270001", "+15551270002"} {
+	phones := []string{"+15551270001", "+15551270002"}
+	seedPhoneUsers(t, ctx, st, phones...)
+	for _, phone := range phones {
 		client := telegram.NewClient(1, "hash", telegram.Options{
 			DC:         dcID,
 			DCList:     dcs.List{Options: []tg.DCOption{{ID: dcID, IPAddress: "127.0.0.1", Port: addr.Port}}},

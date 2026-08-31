@@ -247,6 +247,9 @@ func TestSignInUsernamePhonePathUnchanged(t *testing.T) {
 	s := openStore(t)
 
 	phone := "+15551296901"
+	if _, err := s.CreateUser(ctx, phone); err != nil {
+		t.Fatal(err)
+	}
 	hash, code, err := s.IssueCode(ctx, phone)
 	if err != nil {
 		t.Fatal(err)

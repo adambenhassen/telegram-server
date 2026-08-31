@@ -207,18 +207,6 @@ func isAuthKeyUnregistered(err error) bool {
 	return tgErr.Message == "AUTH_KEY_UNREGISTERED"
 }
 
-// isUsernameOccupied checks if the error is USERNAME_OCCUPIED.
-func isUsernameOccupied(err error) bool {
-	if err == nil {
-		return false
-	}
-	var tgErr *tgerr.Error
-	if !errors.As(err, &tgErr) {
-		return false
-	}
-	return tgErr.Message == "USERNAME_OCCUPIED"
-}
-
 // isInputRequestInvalid checks if the error is INPUT_REQUEST_INVALID.
 func isInputRequestInvalid(err error) bool {
 	if err == nil {
@@ -282,31 +270,6 @@ func seedUsernameUser(t *testing.T, ctx context.Context, st *store.Store, userna
 	return user.ID
 }
 
-// setPasswordViaAPI calls account.updatePasswordSettings to set a new password
-// on the current session. It works for both provisional and authorized sessions.
-// For provisional accounts (no existing password), CurrentAlgo is nil, so it
-// uses NewAlgo from the password response instead.
-func setPasswordViaAPI(ctx context.Context, api *tg.Client, password string) error {
-	pwd, err := api.AccountGetPassword(ctx)
-	if err != nil {
-		return fmt.Errorf("getPassword: %w", err)
-	}
-	// NewAlgo is always present (server always includes salts for new passwords).
-	algo, ok := pwd.NewAlgo.(*tg.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow)
-	if !ok {
-		return fmt.Errorf("unexpected new_algo type: %T", pwd.NewAlgo)
-	}
-	newHash, err := auth.NewPasswordHash([]byte(password), algo)
-	if err != nil {
-		return fmt.Errorf("newPasswordHash: %w", err)
-	}
-	_, err = api.AccountUpdatePasswordSettings(ctx, &tg.AccountUpdatePasswordSettingsRequest{
-		Password:    &tg.InputCheckPasswordEmpty{},
-		NewSettings: tg.AccountPasswordInputSettings{NewAlgo: algo, NewPasswordHash: newHash},
-	})
-	return err
-}
-
 // testComputeSRPVerifier generates fresh salts and computes the SRP verifier
 // for the given password, mirroring the logic in store.computeSRPVerifier.
 func testComputeSRPVerifier(password []byte) (verifier, salt1, salt2 []byte, err error) {
@@ -366,7 +329,7 @@ func TestUsernamePasswordSignIn(t *testing.T) {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
 	port := addr.Port
-	stop := bootServerWithRegMode(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationOpen)
+	stop := bootServerWithRegMode(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationInvite)
 	t.Cleanup(stop)
 
 	const username = "signintest1"
@@ -412,10 +375,8 @@ func TestUsernamePasswordSignIn(t *testing.T) {
 	}
 }
 
-// TestUsernamePasswordSignUp proves the full username/password sign-up flow:
-// sendCode with unknown username, signIn returns authorizationSignUpRequired,
-// signUp creates a provisional session, updatePasswordSettings sets the SRP
-// verifier, then a fresh client re-signs in with the full sign-in path.
+// TestUsernamePasswordSignUp proves that invite mode does not admit a new
+// username until the invite admission path is implemented.
 func TestUsernamePasswordSignUp(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -444,16 +405,13 @@ func TestUsernamePasswordSignUp(t *testing.T) {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
 	port := addr.Port
-	stop := bootServerWithRegMode(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationOpen)
+	stop := bootServerWithRegMode(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationInvite)
 	t.Cleanup(stop)
 
 	const username = "signup_test_user"
-	const password = "signuppassword"
 	const firstName = "SignUp"
 
-	// Phase 1: sign up.
-	sess1 := &session.StorageMemory{}
-	client := newUsernameClient(port, key, dcID, sess1)
+	client := newUsernameClient(port, key, dcID, nil)
 	if err := client.Run(ctx, func(ctx context.Context) error {
 		api := client.API()
 
@@ -477,184 +435,18 @@ func TestUsernamePasswordSignUp(t *testing.T) {
 			}
 		}
 
-		// Step 3: auth.signUp → provisional session.
-		resp, err = signUpUsername(ctx, api, username, hash, firstName, "")
-		if err != nil {
-			return fmt.Errorf("signUp: %w", err)
-		}
-		authResp, ok := resp.(*tg.AuthAuthorization)
-		if !ok {
-			return fmt.Errorf("signUp: unexpected response type %T, want AuthAuthorization", resp)
-		}
-		if authResp.User == nil {
-			return errors.New("signUp: no user in response")
-		}
-
-		// Step 4: account.updatePasswordSettings to set the SRP verifier.
-		if err := setPasswordViaAPI(ctx, api, password); err != nil {
-			return fmt.Errorf("updatePasswordSettings: %w", err)
-		}
-
-		return nil
-	}); err != nil {
-		t.Fatalf("sign-up phase: %v", err)
-	}
-
-	// Verify user exists and has password.
-	_, ok, verr := st.UserByUsernameWithLoginMode(ctx, username)
-	if verr != nil || !ok {
-		t.Fatalf("user by username: ok=%v err=%v", ok, verr)
-	}
-
-	// Phase 2: re-sign in with a fresh client session.
-	client2 := newUsernameClient(port, key, dcID, nil)
-	if err := client2.Run(ctx, func(ctx context.Context) error {
-		api := client2.API()
-
-		// Step 1: auth.sendCode with username.
-		hash, err := sendCodeUsername(ctx, api, username)
-		if err != nil {
-			return fmt.Errorf("sendCode: %w", err)
-		}
-
-		// Step 2: auth.signIn → SESSION_PASSWORD_NEEDED.
-		_, err = signInUsername(ctx, api, username, hash, "")
-		if !isSessionPasswordNeeded(err) {
-			return fmt.Errorf("signIn: expected SESSION_PASSWORD_NEEDED, got %w", err)
-		}
-
-		// Step 3: checkPassword with the password set during sign-up.
-		if err := checkPasswordUsername(ctx, api, password); err != nil {
-			return fmt.Errorf("checkPassword: %w", err)
-		}
-
-		// Step 4: verify authorized.
-		s, err := client2.Auth().Status(ctx)
-		if err != nil {
-			return err
-		}
-		if !s.Authorized {
-			return errors.New("not authorized after re-sign-in")
-		}
-
-		return nil
-	}); err != nil {
-		t.Fatalf("re-sign-in phase: %v", err)
-	}
-}
-
-// TestProvisionalGate proves that immediately after auth.signUp (before
-// updatePasswordSettings), a call to users.getUsers returns AUTH_KEY_UNREGISTERED.
-// After updatePasswordSettings, the same call succeeds.
-func TestProvisionalGate(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if cerr := st.Close(); cerr != nil {
-			t.Errorf("store close: %v", cerr)
-		}
-	})
-
-	const dcID = 2
-	codes := newCodeSink()
-	ln := mustListen(t, ctx, "127.0.0.1:0")
-	addr, ok := ln.Addr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("listener addr type = %T", ln.Addr())
-	}
-	port := addr.Port
-	stop := bootServerWithRegMode(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationOpen)
-	t.Cleanup(stop)
-
-	const username = "provisional_gate_user"
-	const password = "gatepassword"
-	const firstName = "Gate"
-
-	// Phase 1: sign up without setting a password (provisional account).
-	sess1 := &session.StorageMemory{}
-	client := newUsernameClient(port, key, dcID, sess1)
-	var userID int64
-	if err := client.Run(ctx, func(ctx context.Context) error {
-		api := client.API()
-
-		// sendCode + signIn → signUpRequired
-		hash, err := sendCodeUsername(ctx, api, username)
-		if err != nil {
-			return fmt.Errorf("sendCode: %w", err)
-		}
-
-		resp, err := signInUsername(ctx, api, username, hash, "")
+		// Step 3: auth.signUp → INPUT_REQUEST_INVALID.
+		_, err = signUpUsername(ctx, api, username, hash, firstName, "")
 		if err == nil {
-			if _, ok := resp.(*tg.AuthAuthorizationSignUpRequired); !ok {
-				return fmt.Errorf("signIn: unexpected response type %T", resp)
-			}
-		} else if !isSignUpRequired(err) {
-			return fmt.Errorf("signIn: expected SIGN_UP_REQUIRED, got %w", err)
+			return errors.New("signUp: expected INPUT_REQUEST_INVALID, got success")
 		}
-
-		// signUp → provisional session
-		resp, err = signUpUsername(ctx, api, username, hash, firstName, "")
-		if err != nil {
-			return fmt.Errorf("signUp: %w", err)
-		}
-		authResp, ok := resp.(*tg.AuthAuthorization)
-		if !ok {
-			return fmt.Errorf("signUp: unexpected response type %T", resp)
-		}
-		user, ok := authResp.User.(*tg.User)
-		if !ok || user == nil {
-			return fmt.Errorf("signUp: user is %T, want *tg.User", authResp.User)
-		}
-		userID = user.ID
-
-		// Phase 1b: try users.getUsers — should be blocked (provisional).
-		_, err = api.UsersGetUsers(ctx, []tg.InputUserClass{
-			&tg.InputUser{UserID: userID, AccessHash: 0},
-		})
-		if err == nil {
-			return errors.New("users.getUsers: expected AUTH_KEY_UNREGISTERED from provisional session, got success")
-		}
-		if !isAuthKeyUnregistered(err) {
-			return fmt.Errorf("users.getUsers: expected AUTH_KEY_UNREGISTERED, got %w", err)
+		if !isInputRequestInvalid(err) {
+			return fmt.Errorf("signUp: expected INPUT_REQUEST_INVALID, got %w", err)
 		}
 
 		return nil
 	}); err != nil {
-		t.Fatalf("provisional phase: %v", err)
-	}
-
-	// Phase 2: set password and verify users.getUsers now works.
-	client2 := newUsernameClient(port, key, dcID, sess1)
-	if err := client2.Run(ctx, func(ctx context.Context) error {
-		api := client2.API()
-
-		// Set password via updatePasswordSettings.
-		if err := setPasswordViaAPI(ctx, api, password); err != nil {
-			return fmt.Errorf("updatePasswordSettings: %w", err)
-		}
-
-		// users.getUsers should now succeed.
-		_, err = api.UsersGetUsers(ctx, []tg.InputUserClass{
-			&tg.InputUser{UserID: userID, AccessHash: 0},
-		})
-		if err != nil {
-			return fmt.Errorf("users.getUsers after password set: %w", err)
-		}
-
-		return nil
-	}); err != nil {
-		t.Fatalf("post-password phase: %v", err)
+		t.Fatalf("invite registration flow: %v", err)
 	}
 }
 
@@ -730,8 +522,8 @@ func TestRegistrationClosed(t *testing.T) {
 	}
 }
 
-// TestUsernameModeLock proves that after a full signup+login for a
-// username-mode account, account.updateUsername returns USERNAME_NOT_MODIFIED.
+// TestUsernameModeLock proves that an existing username-mode account keeps its
+// immutable login handle after sign-in.
 func TestUsernameModeLock(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -760,54 +552,20 @@ func TestUsernameModeLock(t *testing.T) {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
 	port := addr.Port
-	stop := bootServerWithRegMode(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationOpen)
+	stop := bootServerWithRegMode(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationInvite)
 	t.Cleanup(stop)
 
 	const username = "locktest_user"
 	const password = "lockpassword"
 	const firstName = "Lock"
 
-	// Phase 1: full sign-up + password set.
-	sess := &session.StorageMemory{}
-	client := newUsernameClient(port, key, dcID, sess)
+	// Seed the account directly. Registration is intentionally unavailable, so
+	// this test must not depend on auth.signUp to create its fixture.
+	seedUsernameUser(t, ctx, st, username, firstName, password)
+
+	client := newUsernameClient(port, key, dcID, nil)
 	if err := client.Run(ctx, func(ctx context.Context) error {
 		api := client.API()
-
-		// sendCode + signIn → signUpRequired
-		hash, err := sendCodeUsername(ctx, api, username)
-		if err != nil {
-			return fmt.Errorf("sendCode: %w", err)
-		}
-
-		resp, err := signInUsername(ctx, api, username, hash, "")
-		if err == nil {
-			if _, ok := resp.(*tg.AuthAuthorizationSignUpRequired); !ok {
-				return fmt.Errorf("signIn: unexpected response type %T", resp)
-			}
-		} else if !isSignUpRequired(err) {
-			return fmt.Errorf("signIn: expected SIGN_UP_REQUIRED, got %w", err)
-		}
-
-		// signUp
-		_, err = signUpUsername(ctx, api, username, hash, firstName, "")
-		if err != nil {
-			return fmt.Errorf("signUp: %w", err)
-		}
-
-		// Set password
-		if err := setPasswordViaAPI(ctx, api, password); err != nil {
-			return fmt.Errorf("updatePasswordSettings: %w", err)
-		}
-
-		return nil
-	}); err != nil {
-		t.Fatalf("sign-up phase: %v", err)
-	}
-
-	// Phase 2: re-sign in with fresh session, then try to change username.
-	client2 := newUsernameClient(port, key, dcID, nil)
-	if err := client2.Run(ctx, func(ctx context.Context) error {
-		api := client2.API()
 
 		// Full sign-in flow.
 		hash, err := sendCodeUsername(ctx, api, username)
@@ -884,7 +642,7 @@ func TestCheckPasswordBruteForceAccount(t *testing.T) {
 	rateLimits := config.RateLimitsConfig{
 		CheckPassword: store.RateLimitConfig{Limit: 3, Window: 10 * time.Minute},
 	}
-	stop := bootServerWithRegAndLimits(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationOpen, rateLimits)
+	stop := bootServerWithRegAndLimits(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationInvite, rateLimits)
 	t.Cleanup(stop)
 
 	const usernameA = "brute_force_user_a"
@@ -992,8 +750,8 @@ func TestCheckPasswordBruteForceAccount(t *testing.T) {
 	}
 }
 
-// TestSignUpUsernameOccupied proves that auth.signUp with a username that is
-// already registered returns USERNAME_OCCUPIED.
+// TestSignUpUsernameOccupied proves that registration is rejected before
+// username occupancy can be disclosed.
 func TestSignUpUsernameOccupied(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1022,7 +780,7 @@ func TestSignUpUsernameOccupied(t *testing.T) {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
 	port := addr.Port
-	stop := bootServerWithRegMode(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationOpen)
+	stop := bootServerWithRegMode(t, ctx, key, dcID, st, codes.Logger(), ln, config.RegistrationInvite)
 	t.Cleanup(stop)
 
 	const username = "occupied_user"
@@ -1048,13 +806,13 @@ func TestSignUpUsernameOccupied(t *testing.T) {
 			return fmt.Errorf("signIn: expected SESSION_PASSWORD_NEEDED, got %w", err)
 		}
 
-		// signUp → should be rejected with USERNAME_OCCUPIED.
+		// signUp → should be rejected at the registration boundary.
 		_, err = signUpUsername(ctx, api, username, hash, firstName, "")
 		if err == nil {
-			return errors.New("signUp: expected USERNAME_OCCUPIED, got success")
+			return errors.New("signUp: expected INPUT_REQUEST_INVALID, got success")
 		}
-		if !isUsernameOccupied(err) {
-			return fmt.Errorf("signUp: expected USERNAME_OCCUPIED, got %w", err)
+		if !isInputRequestInvalid(err) {
+			return fmt.Errorf("signUp: expected INPUT_REQUEST_INVALID, got %w", err)
 		}
 
 		return nil

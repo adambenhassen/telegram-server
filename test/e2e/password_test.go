@@ -115,6 +115,7 @@ func TestCloudPassword2FA(t *testing.T) {
 	})
 
 	const phone = "+15551260000"
+	seedPhoneUsers(t, ctx, st, phone)
 
 	// flowLogin runs a fresh-session login with the given password and returns
 	// whether the client ended up authorized. A fresh session forces a real

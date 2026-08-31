@@ -73,6 +73,7 @@ func TestContactsSearchChannelDiscovery(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551294001", "+15551294002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)

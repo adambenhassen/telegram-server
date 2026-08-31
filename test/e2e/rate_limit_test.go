@@ -96,6 +96,7 @@ func TestRateLimitE2E(t *testing.T) {
 	}
 
 	const phoneA, phoneB = "+15551295001", "+15551295002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	// Start A in interactive mode.
 	aClient := newClient()

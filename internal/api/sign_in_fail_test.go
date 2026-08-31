@@ -264,6 +264,9 @@ func TestSignInFailCorrectCodeDifferentAddress(t *testing.T) {
 	s := openStore(t)
 
 	phone := "+15551296601"
+	if _, err := s.CreateUser(ctx, phone); err != nil {
+		t.Fatal(err)
+	}
 	hash, code, err := s.IssueCode(ctx, phone)
 	if err != nil {
 		t.Fatal(err)
@@ -398,6 +401,9 @@ func TestSignInFailCorrectCodeRefunded(t *testing.T) {
 	s := openStore(t)
 
 	phone := "+15551296701"
+	if _, err := s.CreateUser(ctx, phone); err != nil {
+		t.Fatal(err)
+	}
 	hash, code, err := s.IssueCode(ctx, phone)
 	if err != nil {
 		t.Fatal(err)

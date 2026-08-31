@@ -18,23 +18,35 @@ import (
 const signInFailLockClass = 0x7369676e // "sign"
 
 // AttemptSignIn atomically checks the per-IP failure budget, verifies the code,
-// and charges the counter on failure — all within a single Postgres transaction
-// protected by an advisory lock keyed on the IP bucket.
+// checks that the phone belongs to an existing account, and charges the counter
+// on failure. All of this happens within a single Postgres transaction protected by an
+// advisory lock keyed on the IP bucket.
 //
 // Return contract:
 //   - (nil, nil)            — code correct, proceed to auth
 //   - (&RateLimitResult{}, nil) — budget exhausted (FLOOD_WAIT)
-//   - (nil, ErrCodeInvalid) — wrong code (handler calls verifyToRPC)
+//   - (nil, ErrCodeInvalid) — wrong code or unknown phone (handler calls verifyToRPC)
 //   - (nil, ErrCodeExpired) — expired code
 //   - (nil, ErrCodeExhausted) — code exhausted
 //   - (nil, error)          — internal error
 //
 // The advisory lock serializes same-IP requests across replicas. No refund
-// step is needed: correct codes never touch the counter.
+// step is needed because correct codes for existing accounts never touch the
+// counter.
 func (s *Store) AttemptSignIn(ctx context.Context, addr netip.Addr, phone, hash, code string, cfg RateLimitConfig) (*RateLimitResult, error) {
-	// If rate limit is disabled, just verify the code.
+	// If rate limit is disabled, verify the code and require an existing account.
 	if !cfg.enabled() {
-		return nil, s.verifyCodeWith(ctx, s.q, phone, hash, code)
+		if err := s.verifyCodeWith(ctx, s.q, phone, hash, code); err != nil {
+			return nil, err
+		}
+		registered, err := phoneUserExists(ctx, s.q, phone)
+		if err != nil {
+			return nil, fmt.Errorf("attempt sign in: lookup phone: %w", err)
+		}
+		if !registered {
+			return nil, ErrCodeInvalid
+		}
+		return nil, nil //nolint:nilnil // successful existing-account sign-in
 	}
 
 	key, ok := IPBucketKey(addr)
@@ -83,16 +95,8 @@ func (s *Store) AttemptSignIn(ctx context.Context, addr netip.Addr, phone, hash,
 			// the charge fails or affects no rows — the rollback undoes the
 			// verify writes (IncrementCodeAttempts / ConsumeCode) so the code
 			// is not consumed and the client can retry.
-			n, chargeErr := qtx.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{
-				IpKey:      key,
-				Column2:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
-				TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
-			})
-			if chargeErr != nil {
-				return nil, fmt.Errorf("sign in fail: charge: %w", chargeErr)
-			}
-			if n == 0 {
-				return nil, errors.New("sign in fail: charge affected no rows")
+			if err := chargeSignInFailure(ctx, qtx, key, cfg); err != nil {
+				return nil, err
 			}
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -101,11 +105,59 @@ func (s *Store) AttemptSignIn(ctx context.Context, addr netip.Addr, phone, hash,
 		return nil, verifyErr
 	}
 
-	// Correct code: commit with no charge.
+	// A valid code for an unknown phone must still look like a failed code
+	// attempt. The account lookup occurs only after the budget gate above, and
+	// the verification, refusal, and failure charge commit together.
+	registered, err := phoneUserExists(ctx, qtx, phone)
+	if err != nil {
+		return nil, fmt.Errorf("attempt sign in: lookup phone: %w", err)
+	}
+	if !registered {
+		if err := chargeSignInFailure(ctx, qtx, key, cfg); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("attempt sign in: %w", err)
+		}
+		return nil, ErrCodeInvalid
+	}
+
+	// Correct code for an existing account: commit with no charge.
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("attempt sign in: %w", err)
 	}
 	return nil, nil //nolint:nilnil // success returns nil result and nil error
+}
+
+func phoneUserExists(ctx context.Context, q *db.Queries, phone string) (bool, error) {
+	phone = NormalizePhone(phone)
+	_, err := q.UserByPhone(ctx, &phone)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	default:
+		return true, nil
+	}
+}
+
+func chargeSignInFailure(ctx context.Context, q *db.Queries, key netip.Prefix, cfg RateLimitConfig) error {
+	// Wrong code and unknown-account refusals use the same conditional charge.
+	// A zero-row result means another failure won the budget while this request
+	// was waiting and must fail closed rather than granting a free attempt.
+	n, err := q.ChargeSignInFailCall(ctx, db.ChargeSignInFailCallParams{
+		IpKey:      key,
+		Column2:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
+		TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
+	})
+	if err != nil {
+		return fmt.Errorf("sign in fail: charge: %w", err)
+	}
+	if n == 0 {
+		return errors.New("sign in fail: charge affected no rows")
+	}
+	return nil
 }
 
 // SweepExpiredSignInFailCalls deletes per-IP signIn-failure rows past their

@@ -69,6 +69,7 @@ func TestSearchGlobalAcrossDialogs(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551322001", "+15551322002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)
 	errA, errB := make(chan error, 1), make(chan error, 1)

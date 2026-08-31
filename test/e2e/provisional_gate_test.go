@@ -92,6 +92,7 @@ func TestProvisionalGateProbe(t *testing.T) {
 
 	// Login with a phone user to create an auth key.
 	phone := "+15551239911"
+	seedPhoneUsers(t, ctx, st, phone)
 	flow := auth.NewFlow(
 		auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
 			func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {

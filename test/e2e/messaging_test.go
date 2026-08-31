@@ -341,6 +341,7 @@ func TestMessagingRealtime(t *testing.T) {
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	clientA, clientB := newClient(collA), newClient(collB)
 	const phoneA, phoneB = "+15551280001", "+15551280002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	aCmds, bCmds := make(chan command), make(chan command)
 	aID, bID := make(chan int64, 1), make(chan int64, 1)
@@ -514,6 +515,7 @@ func TestMessagingOfflineBackfill(t *testing.T) {
 		)
 	}
 	const phoneA, phoneB = "+15551282001", "+15551282002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	// Log in B, capture its id, then disconnect (goes offline).
 	var bUserID int64
@@ -633,6 +635,7 @@ func TestMessagingCrossReplica(t *testing.T) {
 		)
 	}
 	const phoneA, phoneB = "+15551283001", "+15551283002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	// B stays connected to server 2, collecting pushes.
 	collB := newUpdateCollector()

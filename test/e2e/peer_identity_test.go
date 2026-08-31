@@ -54,6 +54,7 @@ func TestPeerIdentityStrangerStart(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551270001", "+15551270002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	collB := newUpdateCollector()
 	aCmds, bCmds := make(chan command), make(chan command)
@@ -159,6 +160,7 @@ func TestPeerIdentityPlaceholderRefused(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA = "+15551271001"
+	seedPhoneUsers(t, ctx, st, phoneA)
 
 	aCmds := make(chan command)
 	aID := make(chan int64, 1)
@@ -277,6 +279,7 @@ func TestPeerIdentityReplayRefused(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneC = "+15551272001", "+15551272003"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneC)
 
 	aCmds, cCmds := make(chan command), make(chan command)
 	aID, cID := make(chan int64, 1), make(chan int64, 1)
@@ -447,6 +450,7 @@ func TestPeerIdentityChannelLifecycle(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB, phoneC = "+15551273001", "+15551273002", "+15551273003"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneC)
 
 	collB := newUpdateCollector()
 	aCmds, bCmds, cCmds := make(chan command), make(chan command), make(chan command)
@@ -663,6 +667,7 @@ func TestPeerIdentityBackfillSpendable(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551274001", "+15551274002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	sessB := &session.StorageMemory{}
 
@@ -791,6 +796,7 @@ func TestPeerIdentityRoundTrip(t *testing.T) {
 	t.Cleanup(stop)
 
 	const phoneA, phoneB = "+15551275001", "+15551275002"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
 
 	collA, collB := newUpdateCollector(), newUpdateCollector()
 	aCmds, bCmds := make(chan command), make(chan command)

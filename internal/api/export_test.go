@@ -63,7 +63,7 @@ func SignInForTestWithLimits(s *store.Store, authKeyID [8]byte, addr netip.Addr,
 
 // SignUpForTest invokes handleSignUp for a request arriving from addr, against
 // the per-IP rate limit given. The authKeyID is required so the handler can
-// bind the key on success. registrationMode controls whether registration is open.
+// bind the key on success. registrationMode selects the configured mode.
 func SignUpForTest(s *store.Store, authKeyID [8]byte, addr netip.Addr, rateLimit store.RateLimitConfig, registrationMode config.RegistrationMode, req *tg.AuthSignUpRequest) (bin.Encoder, error) {
 	var buf bin.Buffer
 	if err := req.Encode(&buf); err != nil {
