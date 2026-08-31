@@ -17,6 +17,13 @@ WHERE ak.id = $1;
 -- name: BindAuthKeyUser :execrows
 UPDATE auth_keys SET user_id = $2 WHERE id = $1;
 
+-- name: LockUnboundAuthKey :one
+-- Locks the key admission will bind, rejecting keys already authorized or
+-- carrying a pending password challenge.
+SELECT id FROM auth_keys
+WHERE id = $1 AND user_id IS NULL AND pending_user_id IS NULL
+FOR UPDATE;
+
 -- name: TouchAuthKey :exec
 UPDATE auth_keys SET last_seen_at = now() WHERE id = $1;
 

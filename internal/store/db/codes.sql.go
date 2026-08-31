@@ -11,6 +11,27 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const clearCodeValue = `-- name: ClearCodeValue :execrows
+UPDATE phone_codes SET code = ''
+WHERE code_hash = $1
+  AND phone = $2
+`
+
+type ClearCodeValueParams struct {
+	CodeHash string
+	Phone    string
+}
+
+// Removes the handoff secret after successful invite consumption. The hash and
+// phone binding scope the update to the exact admission code row.
+func (q *Queries) ClearCodeValue(ctx context.Context, arg ClearCodeValueParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearCodeValue, arg.CodeHash, arg.Phone)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const consumeCode = `-- name: ConsumeCode :execrows
 UPDATE phone_codes SET consumed_at = now()
 WHERE phone = $1
@@ -81,7 +102,7 @@ func (q *Queries) GetCodeByHash(ctx context.Context, codeHash string) (PhoneCode
 }
 
 const getCodeByHashAndPhone = `-- name: GetCodeByHashAndPhone :one
-SELECT code_hash, phone, consumed_at, expires_at, attempts FROM phone_codes
+SELECT code_hash, phone, code, consumed_at, expires_at, attempts FROM phone_codes
 WHERE code_hash = $1 AND phone = $2
 `
 
@@ -93,6 +114,7 @@ type GetCodeByHashAndPhoneParams struct {
 type GetCodeByHashAndPhoneRow struct {
 	CodeHash   string
 	Phone      string
+	Code       string
 	ConsumedAt pgtype.Timestamptz
 	ExpiresAt  pgtype.Timestamptz
 	Attempts   int32
@@ -100,14 +122,15 @@ type GetCodeByHashAndPhoneRow struct {
 
 // Looks up a code row by hash AND phone binding. Used by username-mode signIn
 // to validate the hash alone (without the code value) while confirming the hash
-// was issued for the expected identifier. Returns only the columns needed for
-// the hash validity check.
+// was issued for the expected identifier. Returns the hash-check fields and
+// the code value that auth.signUp consumes as the invite secret.
 func (q *Queries) GetCodeByHashAndPhone(ctx context.Context, arg GetCodeByHashAndPhoneParams) (GetCodeByHashAndPhoneRow, error) {
 	row := q.db.QueryRow(ctx, getCodeByHashAndPhone, arg.CodeHash, arg.Phone)
 	var i GetCodeByHashAndPhoneRow
 	err := row.Scan(
 		&i.CodeHash,
 		&i.Phone,
+		&i.Code,
 		&i.ConsumedAt,
 		&i.ExpiresAt,
 		&i.Attempts,
@@ -175,4 +198,31 @@ func (q *Queries) InsertCode(ctx context.Context, arg InsertCodeParams) error {
 		arg.ExpiresAt,
 	)
 	return err
+}
+
+const setCodeByHashAndPhone = `-- name: SetCodeByHashAndPhone :execrows
+UPDATE phone_codes SET code = $3
+WHERE code_hash = $1
+  AND phone = $2
+  AND consumed_at IS NULL
+  AND expires_at >= now()
+  AND attempts < 3
+  AND code ~ '^[0-9]{5}$'
+  AND $3 !~ '^[0-9]{5}$'
+`
+
+type SetCodeByHashAndPhoneParams struct {
+	CodeHash string
+	Phone    string
+	Code     string
+}
+
+// Stores the caller-supplied username signIn code on the exact live code row.
+// The guards keep a concurrent consume or expiry from rewriting terminal state.
+func (q *Queries) SetCodeByHashAndPhone(ctx context.Context, arg SetCodeByHashAndPhoneParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setCodeByHashAndPhone, arg.CodeHash, arg.Phone, arg.Code)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

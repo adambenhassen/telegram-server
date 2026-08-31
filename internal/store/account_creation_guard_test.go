@@ -12,16 +12,49 @@ import (
 	"testing"
 )
 
-// TestAccountCreationPathsStayBehindAdmission keeps unauthenticated account
-// creation out of production code. Store.CreateUser remains available as a
-// fixture constructor, but no production caller may invoke it; the old
-// username signup method and its auth-key binding path must stay deleted.
+// TestAccountCreationPathsStayBehindAdmission keeps the username account
+// creation sequence in one production function. The other allowed primitive
+// calls are existing phone-account fixtures, bootstrap, authentication, and
+// username-management paths; adding a new call site requires naming it here.
 func TestAccountCreationPathsStayBehindAdmission(t *testing.T) {
 	t.Parallel()
 
 	root := filepath.Join("..", "..")
 	fset := token.NewFileSet()
 	var violations []string
+	seenAdmissionCalls := map[string]bool{}
+	allowed := map[string]map[string]map[string]bool{
+		"internal/api/auth.go": {
+			"handleSignInPhone": {"BindAuthKeyUser": true},
+		},
+		"internal/store/admission.go": {
+			"AdmitUsername": {
+				"CreateUsernameUser": true,
+				"ClaimUsername":      true,
+				"BindAuthKeyUser":    true,
+			},
+		},
+		// Bootstrap is the pre-port account path and must remain unaffected.
+		"internal/store/bootstrap.go": {
+			"BootstrapAccount": {"CreateUsernameUser": true, "ClaimUsername": true},
+		},
+		"internal/store/authkeys.go": {
+			"BindAuthKeyUser": {"BindAuthKeyUser": true},
+		},
+		// These Store methods are test fixtures or account/channel username
+		// management, not unauthenticated account issuance.
+		"internal/store/users.go": {
+			"CreateUser":           {"CreateUser": true},
+			"CreateUsernameUser":   {"CreateUsernameUser": true},
+			"UpdateUsername":       {"ClaimUsername": true},
+			"ClaimUsername":        {"ClaimUsername": true},
+			"ClaimChannelUsername": {"ClaimUsername": true},
+		},
+		"internal/store/channels.go": {
+			"EditChannelUsername": {"ClaimUsername": true},
+		},
+	}
+
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -46,35 +79,62 @@ func TestAccountCreationPathsStayBehindAdmission(t *testing.T) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		ast.Inspect(file, func(node ast.Node) bool {
-			switch n := node.(type) {
-			case *ast.CallExpr:
-				selector, ok := n.Fun.(*ast.SelectorExpr)
-				if !ok || selector.Sel.Name != "CreateUser" {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			function := fn.Name.Name
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
 					return true
 				}
-				// This is the Store.CreateUser implementation's call to the
-				// generated SQL query, not a production caller of Store.CreateUser.
-				if rel == "internal/store/users.go" {
-					if receiver, ok := selector.X.(*ast.Ident); ok && receiver.Name == "qtx" {
-						return true
-					}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
 				}
-				violations = append(violations, fmt.Sprintf("%s:%d calls CreateUser", rel, fset.Position(n.Pos()).Line))
-			case *ast.Ident:
-				if n.Name == "SignUpUsernameUser" || n.Name == "BindAuthKeyUserForSignUp" {
-					violations = append(violations, fmt.Sprintf("%s:%d references %s", rel, fset.Position(n.Pos()).Line, n.Name))
+				name := selector.Sel.Name
+				if !trackedPrimitive(name) {
+					return true
 				}
-			}
-			return true
-		})
+				if rel == "internal/store/admission.go" && function == "AdmitUsername" {
+					seenAdmissionCalls[name] = true
+				}
+				if !allowedCall(allowed, rel, function, name) {
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d %s in %s is outside the allowlist",
+						rel, fset.Position(call.Pos()).Line, name, function,
+					))
+				}
+				return true
+			})
+		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("walk source tree: %v", err)
 	}
-	sort.Strings(violations)
+	for _, name := range []string{"CreateUsernameUser", "ClaimUsername", "BindAuthKeyUser"} {
+		if !seenAdmissionCalls[name] {
+			violations = append(violations, "admission.go:AdmitUsername does not call "+name)
+		}
+	}
 	if len(violations) != 0 {
+		sort.Strings(violations)
 		t.Fatalf("account-creation path escaped the admission boundary:\n\t%s", strings.Join(violations, "\n\t"))
 	}
+}
+
+func trackedPrimitive(name string) bool {
+	switch name {
+	case "CreateUsernameUser", "ClaimUsername", "BindAuthKeyUser", "CreateUser":
+		return true
+	default:
+		return false
+	}
+}
+
+func allowedCall(allowed map[string]map[string]map[string]bool, file, function, primitive string) bool {
+	return allowed[file][function][primitive]
 }

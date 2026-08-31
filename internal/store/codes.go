@@ -206,6 +206,29 @@ func (s *Store) CheckCodeHash(ctx context.Context, phone, hash string) error {
 	case err != nil:
 		return fmt.Errorf("check code hash: %w", err)
 	}
+	return validateCodeHash(row)
+}
+
+// SetCodeForUsername stores the caller-supplied signIn code on its validated
+// username code row. The hash remains the only value CheckCodeHash validates;
+// the code is persisted so the following auth.signUp can use it as the invite
+// secret.
+func (s *Store) SetCodeForUsername(ctx context.Context, username, hash, code string) error {
+	rows, err := s.q.SetCodeByHashAndPhone(ctx, db.SetCodeByHashAndPhoneParams{
+		CodeHash: hash,
+		Phone:    NormalizePhone(username),
+		Code:     code,
+	})
+	if err != nil {
+		return fmt.Errorf("set username code: %w", err)
+	}
+	if rows != 1 {
+		return ErrCodeInvalid
+	}
+	return nil
+}
+
+func validateCodeHash(row db.GetCodeByHashAndPhoneRow) error {
 	if row.ConsumedAt.Valid {
 		return ErrCodeInvalid
 	}
