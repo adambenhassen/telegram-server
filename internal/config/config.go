@@ -272,8 +272,8 @@ type RateLimitsConfig struct {
 	// caller is not subject to this limit. The per-call 2048-bit modexp is
 	// the cost being bounded.
 	GetPasswordIP store.RateLimitConfig
-	// SignUpIP limits auth.signUp calls per client network. Applied only when
-	// TG_REGISTRATION=invite; no-op in closed mode.
+	// SignUpIP limits auth.signUp calls per client network before the
+	// registration gate, in both closed and invite modes.
 	SignUpIP store.RateLimitConfig
 	// PasswordProof limits account.getPasswordSettings and
 	// account.updatePasswordSettings (the proof-required path) per account, on

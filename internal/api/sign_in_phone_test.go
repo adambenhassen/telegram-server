@@ -54,6 +54,39 @@ func TestSignInUnknownPhoneRefusesWithoutCreatingOrBinding(t *testing.T) {
 		t.Fatalf("unknown phone signIn changed key binding: user_id=%d pending_user_id=%d", key.UserID, key.PendingUserID)
 	}
 
+	// The disabled-limit branch must enforce the same refusal and leave the
+	// users table unchanged rather than reintroducing the old auto-registration.
+	disabledPhone := "+15551298004"
+	disabledHash, disabledCode, err := s.IssueCode(ctx, disabledPhone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const disabledKeyID = int64(0x3)
+	if err := s.SaveAuthKey(ctx, disabledKeyID, make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.SignInForTestWithLimits(s, [8]byte{3}, netip.MustParseAddr("10.0.0.3"), store.RateLimitConfig{}, &tg.AuthSignInRequest{
+		PhoneNumber:   disabledPhone,
+		PhoneCodeHash: disabledHash,
+		PhoneCode:     disabledCode,
+	})
+	if !isPhoneCodeInvalid(err) {
+		t.Fatalf("unknown phone signIn with disabled limit: expected PHONE_CODE_INVALID, got %v", err)
+	}
+	if after := countUsers(t, dsn); after != before {
+		t.Fatalf("disabled-limit signIn changed users from %d to %d", before, after)
+	}
+	disabledKey, ok, err := s.AuthKeyByID(ctx, disabledKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("disabled-limit auth key disappeared")
+	}
+	if disabledKey.UserID != 0 || disabledKey.PendingUserID != 0 {
+		t.Fatalf("disabled-limit signIn changed key binding: user_id=%d pending_user_id=%d", disabledKey.UserID, disabledKey.PendingUserID)
+	}
+
 	// A second unknown-identity attempt from the same address must see the
 	// same failure budget as a bad code, rather than getting a free lookup.
 	secondPhone := "+15551298002"
