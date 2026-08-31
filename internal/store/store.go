@@ -144,10 +144,10 @@ var (
 	// ErrTooManyChannels is returned when a join would take an account past
 	// maxChannelsPerUser.
 	ErrTooManyChannels = errors.New("channel limit per account reached")
-	// ErrInviteInvalid is returned by JoinChannelByInvite for every rejection
-	// that depends on the hash: one that does not exist, and one whose channel is
-	// gone. They are one error on purpose — a distinguishable set makes the invite
-	// space probeable, and the hash is the whole admission boundary.
+	// ErrInviteInvalid is returned for every rejection that depends on an invite
+	// secret or hash. They are one error on purpose — a distinguishable set makes
+	// either invite space probeable, and the secret/hash is the whole admission
+	// boundary.
 	ErrInviteInvalid = errors.New("channel invite invalid")
 )
 
@@ -304,7 +304,7 @@ type queryRower interface {
 //
 // ponytail: presence-check of the newest migration's artifacts, not a version
 // table — pgtest applies raw SQL and has no Atlas revisions table to read. The
-// sentinels track the latest migration (blocked_users) plus the ones before it;
+// sentinels track the latest migration (registration_invites) plus the ones before it;
 // update them when a migration adds new schema.
 //
 // Indexes count as schema here. A database that stops short of one still opens
@@ -312,7 +312,7 @@ type queryRower interface {
 // reference predicate silently degrades to a per-row Seq Scan of messages —
 // so a missing index is exactly the un-migrated state this is here to refuse.
 func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
-	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload, hasMessageFileIdx, hasPartBlobKeyIdx, hasBlockedUsers bool
+	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload, hasMessageFileIdx, hasPartBlobKeyIdx, hasBlockedUsers, hasRegistrationInvites, hasRegistrationInviteLiveIdx bool
 	err := q.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
@@ -344,12 +344,14 @@ func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
 		                   WHERE table_name = 'upload_parts' AND column_name = 'payload'),
 		       to_regclass('public.messages_file_idx') IS NOT NULL,
 		       to_regclass('public.upload_parts_blob_key_idx') IS NOT NULL,
-		       to_regclass('public.blocked_users') IS NOT NULL`,
-	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload, &hasMessageFileIdx, &hasPartBlobKeyIdx, &hasBlockedUsers)
+		       to_regclass('public.blocked_users') IS NOT NULL,
+		       to_regclass('public.registration_invites') IS NOT NULL,
+		       to_regclass('public.registration_invites_live_handle_idx') IS NOT NULL`,
+	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload, &hasMessageFileIdx, &hasPartBlobKeyIdx, &hasBlockedUsers, &hasRegistrationInvites, &hasRegistrationInviteLiveIdx)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || hasPartPayload || !hasMessageFileIdx || !hasPartBlobKeyIdx || !hasBlockedUsers {
+	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || hasPartPayload || !hasMessageFileIdx || !hasPartBlobKeyIdx || !hasBlockedUsers || !hasRegistrationInvites || !hasRegistrationInviteLiveIdx {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil
