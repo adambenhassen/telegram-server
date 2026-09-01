@@ -48,9 +48,9 @@ type MetricsResponse struct {
 	// TotalChats is the number of group chats.
 	TotalChats int64 `json:"total_chats"`
 
-	// MaxPtsGap is the maximum pts gap observed across active sessions — how
-	// far behind the furthest authenticated client is from the head of the
-	// update stream. A gap of 0 means all clients are caught up.
+	// MaxPtsGap is the maximum pts spread across online accounts. Historical
+	// accounts that are no longer online are excluded; no online accounts report
+	// a spread of 0.
 	MaxPtsGap int64 `json:"max_pts_gap"`
 
 	// NotifyCount is the number of Postgres NOTIFY events dispatched in the
