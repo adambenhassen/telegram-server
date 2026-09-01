@@ -170,3 +170,59 @@ func TestMaxPtsGap_Empty(t *testing.T) {
 		t.Errorf("expected 0 gap, got %d", gap)
 	}
 }
+
+func TestMaxPtsGap_UsesLiveAccounts(t *testing.T) {
+	t.Parallel()
+
+	s := open(t)
+	ctx := context.Background()
+	historical := mustUser(t, s, "+15550000011")
+	liveA := mustUser(t, s, "+15550000012")
+	liveB := mustUser(t, s, "+15550000013")
+
+	for userID, pts := range map[int64]int64{
+		historical.ID: 1,
+		liveA.ID:      10,
+		liveB.ID:      12,
+	} {
+		if _, err := store.StorePool(s).Exec(ctx,
+			`UPDATE update_state SET pts = $2 WHERE user_id = $1`, userID, pts,
+		); err != nil {
+			t.Fatalf("set pts for user %d: %v", userID, err)
+		}
+	}
+	gap, err := s.MaxPtsGap(ctx, liveA.ID, liveB.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gap != 2 {
+		t.Errorf("expected live pts spread 2, got %d", gap)
+	}
+}
+
+func TestMaxPtsGap_NoLiveAccounts(t *testing.T) {
+	t.Parallel()
+
+	s := open(t)
+	ctx := context.Background()
+	first := mustUser(t, s, "+15550000021")
+	second := mustUser(t, s, "+15550000022")
+
+	for userID, pts := range map[int64]int64{
+		first.ID:  1,
+		second.ID: 100,
+	} {
+		if _, err := store.StorePool(s).Exec(ctx,
+			`UPDATE update_state SET pts = $2 WHERE user_id = $1`, userID, pts,
+		); err != nil {
+			t.Fatalf("set pts for user %d: %v", userID, err)
+		}
+	}
+	gap, err := s.MaxPtsGap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gap != 0 {
+		t.Errorf("expected no live accounts to report 0, got %d", gap)
+	}
+}

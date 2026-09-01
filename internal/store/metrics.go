@@ -136,20 +136,16 @@ func estimatedRows(ctx context.Context, pool *pgxpool.Pool, tableName string) in
 	return rows
 }
 
-// MaxPtsGap returns the maximum pts gap across all authenticated sessions.
-// It measures how far behind the furthest client is from the current head
-// of the update stream. A gap of 0 means all clients are caught up.
-func (s *Store) MaxPtsGap(ctx context.Context) (int64, error) {
+// MaxPtsGap returns the maximum pts spread across the supplied live accounts.
+// Callers must pass a snapshot of the live connection registry; an empty
+// snapshot reports a spread of 0 and excludes all historical account state.
+func (s *Store) MaxPtsGap(ctx context.Context, liveUserIDs ...int64) (int64, error) {
 	var gap int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(MAX(current_pts) - MIN(current_pts), 0)
-		FROM (
-			SELECT us.pts AS current_pts
-			FROM update_state us
-			JOIN auth_keys ak ON ak.user_id = us.user_id
-			WHERE ak.user_id IS NOT NULL
-		) sub
-	`).Scan(&gap)
+		SELECT COALESCE(MAX(us.pts) - MIN(us.pts), 0)
+		FROM update_state us
+		WHERE us.user_id = ANY($1::bigint[])
+	`, liveUserIDs).Scan(&gap)
 	if err != nil {
 		return 0, fmt.Errorf("max pts gap: %w", err)
 	}
