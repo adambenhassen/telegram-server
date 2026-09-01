@@ -161,7 +161,7 @@ func TestMetricsWithUserData(t *testing.T) {
 	}
 }
 
-func TestMetricsMaxPtsGapUsesLiveRegistry(t *testing.T) {
+func TestMetricsMaxPtsGapUsesRecentActivity(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -172,30 +172,26 @@ func TestMetricsMaxPtsGapUsesLiveRegistry(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }() //nolint:errcheck // best-effort close in test
 
-	stale := createMetricsUser(t, st, "+15550000101")
 	activeA := createMetricsUser(t, st, "+15550000102")
 	activeB := createMetricsUser(t, st, "+15550000103")
 	sinkA := createMetricsUser(t, st, "+15550000104")
 	sendMetricsMessages(t, ctx, st, activeA.ID, sinkA.ID, 2)
-	if err := st.SetUserStatus(ctx, stale.ID, true); err != nil {
-		t.Fatalf("mark stale user online: %v", err)
+	if err := st.SetUserStatus(ctx, activeA.ID, true); err != nil {
+		t.Fatalf("mark active user A online: %v", err)
+	}
+	if err := st.SetUserStatus(ctx, activeB.ID, true); err != nil {
+		t.Fatalf("mark active user B online: %v", err)
 	}
 
 	registry := mtproto.NewSessionRegistry()
-	if !registry.Add(activeA.ID, &mtproto.Conn{}) {
-		t.Fatal("register active user A")
-	}
-	if !registry.Add(activeB.ID, &mtproto.Conn{}) {
-		t.Fatal("register active user B")
-	}
 
 	resp := requestMetrics(t, ctx, admin.Handler(registry, st))
 	if resp.MaxPtsGap != 2 {
-		t.Errorf("expected live registry pts spread 2, got %d", resp.MaxPtsGap)
+		t.Errorf("expected recent activity pts spread 2, got %d", resp.MaxPtsGap)
 	}
 }
 
-func TestMetricsMaxPtsGapNoLiveConnections(t *testing.T) {
+func TestMetricsMaxPtsGapNoRecentActivity(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -215,16 +211,17 @@ func TestMetricsMaxPtsGapNoLiveConnections(t *testing.T) {
 	if _, _, _, _, err := st.SendMessage(ctx, first.ID, sink.ID, "second", 2, 0, 0); err != nil {
 		t.Fatalf("send second metrics message: %v", err)
 	}
-	if err := st.SetUserStatus(ctx, first.ID, true); err != nil {
-		t.Fatalf("mark first user online: %v", err)
+	registry := mtproto.NewSessionRegistry()
+	if !registry.Add(first.ID, &mtproto.Conn{}) {
+		t.Fatal("register first user")
 	}
-	if err := st.SetUserStatus(ctx, second.ID, true); err != nil {
-		t.Fatalf("mark second user online: %v", err)
+	if !registry.Add(sink.ID, &mtproto.Conn{}) {
+		t.Fatal("register sink user")
 	}
 
-	resp := requestMetrics(t, ctx, admin.Handler(mtproto.NewSessionRegistry(), st))
+	resp := requestMetrics(t, ctx, admin.Handler(registry, st))
 	if resp.MaxPtsGap != 0 {
-		t.Errorf("expected no live connections to report 0, got %d", resp.MaxPtsGap)
+		t.Errorf("expected no recent activity to report 0, got %d", resp.MaxPtsGap)
 	}
 }
 

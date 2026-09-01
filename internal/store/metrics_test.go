@@ -171,29 +171,19 @@ func TestMaxPtsGap_Empty(t *testing.T) {
 	}
 }
 
-func TestMaxPtsGap_ExcludesOfflineAccounts(t *testing.T) {
+func TestMaxPtsGap_ExcludesStaleAccounts(t *testing.T) {
 	t.Parallel()
 
 	s := open(t)
 	ctx := context.Background()
-	offline := mustUser(t, s, "+15550000011")
-	onlineA := mustUser(t, s, "+15550000012")
-	onlineB := mustUser(t, s, "+15550000013")
-
-	for i, userID := range []int64{offline.ID, onlineA.ID, onlineB.ID} {
-		keyID := int64(1001 + i)
-		if err := s.SaveAuthKey(ctx, keyID, []byte("test auth key")); err != nil {
-			t.Fatalf("save auth key %d: %v", keyID, err)
-		}
-		if err := s.BindAuthKeyUser(ctx, keyID, userID); err != nil {
-			t.Fatalf("bind auth key %d: %v", keyID, err)
-		}
-	}
+	stale := mustUser(t, s, "+15550000011")
+	recentA := mustUser(t, s, "+15550000012")
+	recentB := mustUser(t, s, "+15550000013")
 
 	for userID, pts := range map[int64]int64{
-		offline.ID: 1,
-		onlineA.ID: 10,
-		onlineB.ID: 12,
+		stale.ID:   1,
+		recentA.ID: 10,
+		recentB.ID: 12,
 	} {
 		if _, err := store.StorePool(s).Exec(ctx,
 			`UPDATE update_state SET pts = $2 WHERE user_id = $1`, userID, pts,
@@ -201,39 +191,37 @@ func TestMaxPtsGap_ExcludesOfflineAccounts(t *testing.T) {
 			t.Fatalf("set pts for user %d: %v", userID, err)
 		}
 	}
-	if err := s.SetUserStatus(ctx, onlineA.ID, true); err != nil {
-		t.Fatalf("set user %d online: %v", onlineA.ID, err)
+	if err := s.SetUserStatus(ctx, stale.ID, true); err != nil {
+		t.Fatalf("set stale user %d online: %v", stale.ID, err)
 	}
-	if err := s.SetUserStatus(ctx, onlineB.ID, true); err != nil {
-		t.Fatalf("set user %d online: %v", onlineB.ID, err)
+	if err := s.SetUserStatus(ctx, recentA.ID, true); err != nil {
+		t.Fatalf("set recent user %d online: %v", recentA.ID, err)
+	}
+	if err := s.SetUserStatus(ctx, recentB.ID, true); err != nil {
+		t.Fatalf("set recent user %d online: %v", recentB.ID, err)
+	}
+	if _, err := store.StorePool(s).Exec(ctx,
+		`UPDATE users SET last_seen_at = now() - INTERVAL '6 minutes' WHERE id = $1`, stale.ID,
+	); err != nil {
+		t.Fatalf("age stale user %d: %v", stale.ID, err)
 	}
 
-	gap, err := s.MaxPtsGap(ctx, onlineA.ID, onlineB.ID)
+	gap, err := s.MaxPtsGap(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gap != 2 {
-		t.Errorf("expected online pts spread 2, got %d", gap)
+		t.Errorf("expected recent pts spread 2, got %d", gap)
 	}
 }
 
-func TestMaxPtsGap_NoOnlineAccounts(t *testing.T) {
+func TestMaxPtsGap_NoRecentAccounts(t *testing.T) {
 	t.Parallel()
 
 	s := open(t)
 	ctx := context.Background()
 	first := mustUser(t, s, "+15550000021")
 	second := mustUser(t, s, "+15550000022")
-
-	for i, userID := range []int64{first.ID, second.ID} {
-		keyID := int64(2001 + i)
-		if err := s.SaveAuthKey(ctx, keyID, []byte("test auth key")); err != nil {
-			t.Fatalf("save auth key %d: %v", keyID, err)
-		}
-		if err := s.BindAuthKeyUser(ctx, keyID, userID); err != nil {
-			t.Fatalf("bind auth key %d: %v", keyID, err)
-		}
-	}
 
 	for userID, pts := range map[int64]int64{
 		first.ID:  1,
@@ -245,12 +233,17 @@ func TestMaxPtsGap_NoOnlineAccounts(t *testing.T) {
 			t.Fatalf("set pts for user %d: %v", userID, err)
 		}
 	}
+	if _, err := store.StorePool(s).Exec(ctx,
+		`UPDATE users SET last_seen_at = now() - INTERVAL '6 minutes' WHERE id IN ($1, $2)`, first.ID, second.ID,
+	); err != nil {
+		t.Fatalf("age users: %v", err)
+	}
 
 	gap, err := s.MaxPtsGap(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gap != 0 {
-		t.Errorf("expected no online accounts to report 0, got %d", gap)
+		t.Errorf("expected no recent accounts to report 0, got %d", gap)
 	}
 }
