@@ -171,19 +171,19 @@ func TestMaxPtsGap_Empty(t *testing.T) {
 	}
 }
 
-func TestMaxPtsGap_ExcludesStaleAccounts(t *testing.T) {
+func TestMaxPtsGap_UsesLiveAccounts(t *testing.T) {
 	t.Parallel()
 
 	s := open(t)
 	ctx := context.Background()
-	stale := mustUser(t, s, "+15550000011")
-	recentA := mustUser(t, s, "+15550000012")
-	recentB := mustUser(t, s, "+15550000013")
+	historical := mustUser(t, s, "+15550000011")
+	liveA := mustUser(t, s, "+15550000012")
+	liveB := mustUser(t, s, "+15550000013")
 
 	for userID, pts := range map[int64]int64{
-		stale.ID:   1,
-		recentA.ID: 10,
-		recentB.ID: 12,
+		historical.ID: 1,
+		liveA.ID:      10,
+		liveB.ID:      12,
 	} {
 		if _, err := store.StorePool(s).Exec(ctx,
 			`UPDATE update_state SET pts = $2 WHERE user_id = $1`, userID, pts,
@@ -191,31 +191,16 @@ func TestMaxPtsGap_ExcludesStaleAccounts(t *testing.T) {
 			t.Fatalf("set pts for user %d: %v", userID, err)
 		}
 	}
-	if err := s.SetUserStatus(ctx, stale.ID, true); err != nil {
-		t.Fatalf("set stale user %d online: %v", stale.ID, err)
-	}
-	if err := s.SetUserStatus(ctx, recentA.ID, true); err != nil {
-		t.Fatalf("set recent user %d online: %v", recentA.ID, err)
-	}
-	if err := s.SetUserStatus(ctx, recentB.ID, true); err != nil {
-		t.Fatalf("set recent user %d online: %v", recentB.ID, err)
-	}
-	if _, err := store.StorePool(s).Exec(ctx,
-		`UPDATE users SET last_seen_at = now() - INTERVAL '6 minutes' WHERE id = $1`, stale.ID,
-	); err != nil {
-		t.Fatalf("age stale user %d: %v", stale.ID, err)
-	}
-
-	gap, err := s.MaxPtsGap(ctx)
+	gap, err := s.MaxPtsGap(ctx, liveA.ID, liveB.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gap != 2 {
-		t.Errorf("expected recent pts spread 2, got %d", gap)
+		t.Errorf("expected live pts spread 2, got %d", gap)
 	}
 }
 
-func TestMaxPtsGap_NoRecentAccounts(t *testing.T) {
+func TestMaxPtsGap_NoLiveAccounts(t *testing.T) {
 	t.Parallel()
 
 	s := open(t)
@@ -233,17 +218,11 @@ func TestMaxPtsGap_NoRecentAccounts(t *testing.T) {
 			t.Fatalf("set pts for user %d: %v", userID, err)
 		}
 	}
-	if _, err := store.StorePool(s).Exec(ctx,
-		`UPDATE users SET last_seen_at = now() - INTERVAL '6 minutes' WHERE id IN ($1, $2)`, first.ID, second.ID,
-	); err != nil {
-		t.Fatalf("age users: %v", err)
-	}
-
 	gap, err := s.MaxPtsGap(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gap != 0 {
-		t.Errorf("expected no recent accounts to report 0, got %d", gap)
+		t.Errorf("expected no live accounts to report 0, got %d", gap)
 	}
 }

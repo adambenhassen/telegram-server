@@ -161,7 +161,7 @@ func TestMetricsWithUserData(t *testing.T) {
 	}
 }
 
-func TestMetricsMaxPtsGapUsesRecentActivity(t *testing.T) {
+func TestMetricsMaxPtsGapUsesLiveRegistry(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -184,14 +184,68 @@ func TestMetricsMaxPtsGapUsesRecentActivity(t *testing.T) {
 	}
 
 	registry := mtproto.NewSessionRegistry()
+	if !registry.Add(activeA.ID, &mtproto.Conn{}) {
+		t.Fatal("register active user A")
+	}
+	if !registry.Add(activeB.ID, &mtproto.Conn{}) {
+		t.Fatal("register active user B")
+	}
 
 	resp := requestMetrics(t, ctx, admin.Handler(registry, st))
 	if resp.MaxPtsGap != 2 {
-		t.Errorf("expected recent activity pts spread 2, got %d", resp.MaxPtsGap)
+		t.Errorf("expected live registry pts spread 2, got %d", resp.MaxPtsGap)
 	}
 }
 
-func TestMetricsMaxPtsGapNoRecentActivity(t *testing.T) {
+func TestMetricsMaxPtsGapDropsDisconnectedSession(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }() //nolint:errcheck // best-effort close in test
+
+	active := createMetricsUser(t, st, "+15550000105")
+	baseline := createMetricsUser(t, st, "+15550000106")
+	sink := createMetricsUser(t, st, "+15550000107")
+	sendMetricsMessages(t, ctx, st, active.ID, sink.ID, 2)
+	if err := st.SetUserStatus(ctx, active.ID, true); err != nil {
+		t.Fatalf("mark active user online: %v", err)
+	}
+	if err := st.SetUserStatus(ctx, baseline.ID, true); err != nil {
+		t.Fatalf("mark baseline user online: %v", err)
+	}
+
+	registry := mtproto.NewSessionRegistry()
+	activeConn := &mtproto.Conn{}
+	baselineConn := &mtproto.Conn{}
+	if !registry.Add(active.ID, activeConn) {
+		t.Fatal("register active user")
+	}
+	if !registry.Add(baseline.ID, baselineConn) {
+		t.Fatal("register baseline user")
+	}
+
+	resp := requestMetrics(t, ctx, admin.Handler(registry, st))
+	if resp.MaxPtsGap != 2 {
+		t.Errorf("expected connected pts spread 2, got %d", resp.MaxPtsGap)
+	}
+
+	registry.Remove(active.ID, activeConn)
+	if err := st.SetUserStatus(ctx, active.ID, false); err != nil {
+		t.Fatalf("mark disconnected user offline: %v", err)
+	}
+
+	resp = requestMetrics(t, ctx, admin.Handler(registry, st))
+	if resp.MaxPtsGap != 0 {
+		t.Errorf("expected disconnected user to be excluded immediately, got %d", resp.MaxPtsGap)
+	}
+}
+
+func TestMetricsMaxPtsGapNoLiveConnections(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -211,17 +265,18 @@ func TestMetricsMaxPtsGapNoRecentActivity(t *testing.T) {
 	if _, _, _, _, err := st.SendMessage(ctx, first.ID, sink.ID, "second", 2, 0, 0); err != nil {
 		t.Fatalf("send second metrics message: %v", err)
 	}
+	if err := st.SetUserStatus(ctx, first.ID, true); err != nil {
+		t.Fatalf("mark first user online: %v", err)
+	}
+	if err := st.SetUserStatus(ctx, second.ID, true); err != nil {
+		t.Fatalf("mark second user online: %v", err)
+	}
+
 	registry := mtproto.NewSessionRegistry()
-	if !registry.Add(first.ID, &mtproto.Conn{}) {
-		t.Fatal("register first user")
-	}
-	if !registry.Add(sink.ID, &mtproto.Conn{}) {
-		t.Fatal("register sink user")
-	}
 
 	resp := requestMetrics(t, ctx, admin.Handler(registry, st))
 	if resp.MaxPtsGap != 0 {
-		t.Errorf("expected no recent activity to report 0, got %d", resp.MaxPtsGap)
+		t.Errorf("expected no live connections to report 0, got %d", resp.MaxPtsGap)
 	}
 }
 

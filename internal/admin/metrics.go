@@ -48,9 +48,9 @@ type MetricsResponse struct {
 	// TotalChats is the number of group chats.
 	TotalChats int64 `json:"total_chats"`
 
-	// MaxPtsGap is the maximum pts spread across accounts seen in the last five
-	// minutes. Accounts with older or missing last_seen_at values are excluded;
-	// no recently seen accounts report a spread of 0.
+	// MaxPtsGap is the maximum pts spread across accounts with a live connection.
+	// Historical accounts that are no longer connected are excluded; no live
+	// connections report a spread of 0.
 	MaxPtsGap int64 `json:"max_pts_gap"`
 
 	// NotifyCount is the number of Postgres NOTIFY events dispatched in the
@@ -151,7 +151,7 @@ func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store
 		return MetricsResponse{}, fmt.Errorf("collect metrics: %w", err)
 	}
 
-	maxGap, err := st.MaxPtsGap(ctx)
+	maxGap, err := st.MaxPtsGap(ctx, reg.Users()...)
 	if err != nil {
 		if !tolerateGapErr {
 			return MetricsResponse{}, fmt.Errorf("collect max pts gap: %w", err)
