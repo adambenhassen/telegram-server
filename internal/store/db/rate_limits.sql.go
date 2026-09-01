@@ -200,3 +200,59 @@ func (q *Queries) TryConsumeRateLimit(ctx context.Context, arg TryConsumeRateLim
 	err := row.Scan(&i.TokenCount, &i.WindowStart, &i.ExpiresAt)
 	return i, err
 }
+
+const tryConsumeRateLimitCost = `-- name: TryConsumeRateLimitCost :one
+INSERT INTO rate_limits (subject_id, surface, token_count, window_start, expires_at)
+SELECT $1::bigint,
+       $2::text,
+       $3::int,
+       now(),
+       now() + $4::interval
+WHERE $3::int <= $5::int
+ON CONFLICT (subject_id, surface) DO UPDATE SET
+    token_count = CASE
+        WHEN rate_limits.expires_at <= now() THEN EXCLUDED.token_count
+        ELSE rate_limits.token_count + EXCLUDED.token_count
+    END,
+    window_start = CASE
+        WHEN rate_limits.expires_at <= now() THEN now()
+        ELSE rate_limits.window_start
+    END,
+    expires_at = CASE
+        WHEN rate_limits.expires_at <= now() THEN now() + $4::interval
+        ELSE rate_limits.expires_at
+    END
+WHERE rate_limits.expires_at <= now()
+   OR rate_limits.token_count + $3::int <= $5::int
+RETURNING token_count, window_start, expires_at
+`
+
+type TryConsumeRateLimitCostParams struct {
+	SubjectID      int64
+	Surface        string
+	Cost           int32
+	WindowDuration pgtype.Interval
+	LimitCount     int32
+}
+
+type TryConsumeRateLimitCostRow struct {
+	TokenCount  int32
+	WindowStart pgtype.Timestamptz
+	ExpiresAt   pgtype.Timestamptz
+}
+
+// Attempt to consume a bounded number of rate-limit tokens atomically.
+// A request whose cost exceeds the configured limit is deliberately not
+// inserted, so it cannot create an over-budget row on a fresh window.
+func (q *Queries) TryConsumeRateLimitCost(ctx context.Context, arg TryConsumeRateLimitCostParams) (TryConsumeRateLimitCostRow, error) {
+	row := q.db.QueryRow(ctx, tryConsumeRateLimitCost,
+		arg.SubjectID,
+		arg.Surface,
+		arg.Cost,
+		arg.WindowDuration,
+		arg.LimitCount,
+	)
+	var i TryConsumeRateLimitCostRow
+	err := row.Scan(&i.TokenCount, &i.WindowStart, &i.ExpiresAt)
+	return i, err
+}
