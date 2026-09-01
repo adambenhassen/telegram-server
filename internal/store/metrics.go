@@ -136,17 +136,16 @@ func estimatedRows(ctx context.Context, pool *pgxpool.Pool, tableName string) in
 	return rows
 }
 
-// MaxPtsGap returns the maximum pts spread across online accounts.
-// Historical accounts that are no longer online are excluded, and no online
-// accounts report a spread of 0.
-func (s *Store) MaxPtsGap(ctx context.Context) (int64, error) {
+// MaxPtsGap returns the maximum pts spread across the supplied live accounts.
+// Callers must pass a snapshot of the live connection registry; an empty
+// snapshot reports a spread of 0 and excludes all historical account state.
+func (s *Store) MaxPtsGap(ctx context.Context, liveUserIDs ...int64) (int64, error) {
 	var gap int64
 	err := s.pool.QueryRow(ctx, `
 		SELECT COALESCE(MAX(us.pts) - MIN(us.pts), 0)
 		FROM update_state us
-		JOIN users u ON u.id = us.user_id
-		WHERE u.is_online
-	`).Scan(&gap)
+		WHERE us.user_id = ANY($1::bigint[])
+	`, liveUserIDs).Scan(&gap)
 	if err != nil {
 		return 0, fmt.Errorf("max pts gap: %w", err)
 	}

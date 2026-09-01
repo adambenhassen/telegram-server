@@ -160,3 +160,103 @@ func TestMetricsWithUserData(t *testing.T) {
 		t.Errorf("expected 1 chat row, got %d", resp.StorageRows.Chats)
 	}
 }
+
+func TestMetricsMaxPtsGapUsesLiveRegistry(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }() //nolint:errcheck // best-effort close in test
+
+	stale := createMetricsUser(t, st, "+15550000101")
+	activeA := createMetricsUser(t, st, "+15550000102")
+	activeB := createMetricsUser(t, st, "+15550000103")
+	sinkA := createMetricsUser(t, st, "+15550000104")
+	sendMetricsMessages(t, ctx, st, activeA.ID, sinkA.ID, 2)
+	if err := st.SetUserStatus(ctx, stale.ID, true); err != nil {
+		t.Fatalf("mark stale user online: %v", err)
+	}
+
+	registry := mtproto.NewSessionRegistry()
+	if !registry.Add(activeA.ID, &mtproto.Conn{}) {
+		t.Fatal("register active user A")
+	}
+	if !registry.Add(activeB.ID, &mtproto.Conn{}) {
+		t.Fatal("register active user B")
+	}
+
+	resp := requestMetrics(t, ctx, admin.Handler(registry, st))
+	if resp.MaxPtsGap != 2 {
+		t.Errorf("expected live registry pts spread 2, got %d", resp.MaxPtsGap)
+	}
+}
+
+func TestMetricsMaxPtsGapNoLiveConnections(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }() //nolint:errcheck // best-effort close in test
+
+	first := createMetricsUser(t, st, "+15550000111")
+	second := createMetricsUser(t, st, "+15550000112")
+	sink := createMetricsUser(t, st, "+15550000113")
+	if _, _, _, _, err := st.SendMessage(ctx, first.ID, second.ID, "first", 1, 0, 0); err != nil {
+		t.Fatalf("send first metrics message: %v", err)
+	}
+	if _, _, _, _, err := st.SendMessage(ctx, first.ID, sink.ID, "second", 2, 0, 0); err != nil {
+		t.Fatalf("send second metrics message: %v", err)
+	}
+	if err := st.SetUserStatus(ctx, first.ID, true); err != nil {
+		t.Fatalf("mark first user online: %v", err)
+	}
+	if err := st.SetUserStatus(ctx, second.ID, true); err != nil {
+		t.Fatalf("mark second user online: %v", err)
+	}
+
+	resp := requestMetrics(t, ctx, admin.Handler(mtproto.NewSessionRegistry(), st))
+	if resp.MaxPtsGap != 0 {
+		t.Errorf("expected no live connections to report 0, got %d", resp.MaxPtsGap)
+	}
+}
+
+func createMetricsUser(t *testing.T, st *store.Store, phone string) store.User {
+	t.Helper()
+	u, err := st.CreateUser(context.Background(), phone)
+	if err != nil {
+		t.Fatalf("create metrics user: %v", err)
+	}
+	return u
+}
+
+func sendMetricsMessages(t *testing.T, ctx context.Context, st *store.Store, fromID, toID int64, count int) {
+	t.Helper()
+	for i := range count {
+		if _, _, _, _, err := st.SendMessage(ctx, fromID, toID, "metrics", int64(i+1), 0, 0); err != nil {
+			t.Fatalf("send metrics message %d: %v", i+1, err)
+		}
+	}
+}
+
+func requestMetrics(t *testing.T, ctx context.Context, h http.Handler) admin.MetricsResponse {
+	t.Helper()
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/admin/metrics", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200", rec.Code)
+	}
+	var resp admin.MetricsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode metrics response: %v", err)
+	}
+	return resp
+}

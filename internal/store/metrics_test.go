@@ -208,7 +208,7 @@ func TestMaxPtsGap_ExcludesOfflineAccounts(t *testing.T) {
 		t.Fatalf("set user %d online: %v", onlineB.ID, err)
 	}
 
-	gap, err := s.MaxPtsGap(ctx)
+	gap, err := s.MaxPtsGap(ctx, onlineA.ID, onlineB.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
