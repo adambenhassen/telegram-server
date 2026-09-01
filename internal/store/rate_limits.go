@@ -50,16 +50,28 @@ type RateLimitResult struct {
 // Exactness under concurrency comes from the row-level lock taken by the
 // INSERT ... ON CONFLICT query — different subjects never block each other.
 func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface string, cfg RateLimitConfig) (*RateLimitResult, error) {
+	return s.CheckRateLimitCost(ctx, subjectID, surface, cfg, 1)
+}
+
+// CheckRateLimitCost checks whether subjectID may spend cost tokens on the
+// given surface, consuming them atomically if allowed. It returns nil when the
+// request is allowed. When denied, it returns a RateLimitResult with the
+// remaining wait time. A wrapped error indicates a storage failure.
+func (s *Store) CheckRateLimitCost(ctx context.Context, subjectID int64, surface string, cfg RateLimitConfig, cost int) (*RateLimitResult, error) {
 	if !cfg.enabled() {
 		// Disabled: allow everything.
 		return nil, nil //nolint:nilnil // disabled config is not an error
 	}
+	if cost <= 0 {
+		return nil, fmt.Errorf("check rate limit: invalid cost %d", cost)
+	}
 
-	_, err := s.q.TryConsumeRateLimit(ctx, db.TryConsumeRateLimitParams{
-		SubjectID:  subjectID,
-		Surface:    surface,
-		Column3:    pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
-		TokenCount: int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
+	_, err := s.q.TryConsumeRateLimitCost(ctx, db.TryConsumeRateLimitCostParams{
+		SubjectID:      subjectID,
+		Surface:        surface,
+		Cost:           int32(cost), //nolint:gosec // request costs are bounded at the RPC boundary
+		WindowDuration: pgtype.Interval{Microseconds: cfg.Window.Microseconds(), Valid: true},
+		LimitCount:     int32(cfg.Limit), //nolint:gosec // rate limits are small positive ints
 	})
 	if err == nil {
 		// Allowed — token was consumed.
@@ -85,7 +97,13 @@ func (s *Store) CheckRateLimit(ctx context.Context, subjectID int64, surface str
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Row swept between INSERT and GET — window has expired, allow.
+			// A cost larger than the whole budget cannot fit even in a fresh
+			// window, so a missing row is still a denial in that case. Otherwise
+			// the row was swept between INSERT and GET and the window expired.
+			if cost > cfg.Limit {
+				now := s.now()
+				return &RateLimitResult{Wait: waitUntil(now, now.Add(cfg.Window))}, nil
+			}
 			return nil, nil //nolint:nilnil // swept row means expired window
 		}
 		return nil, fmt.Errorf("get rate limit: %w", err)

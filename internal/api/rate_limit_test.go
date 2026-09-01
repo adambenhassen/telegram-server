@@ -400,6 +400,102 @@ func TestForwardRateLimit(t *testing.T) {
 	}
 }
 
+// TestForwardMessagesRejectsOversizedBatch proves that the input cap is
+// checked before source or destination resolution and before the rate limit.
+func TestForwardMessagesRejectsOversizedBatch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293811")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551293812")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids := make([]int, 101)
+	randomIDs := make([]int64, 101)
+	for i := range ids {
+		ids[i] = i + 1
+		randomIDs[i] = int64(i + 1)
+	}
+	_, err = api.ForwardMessagesForTestWithLimits(s, alice.ID, store.RateLimitConfig{
+		Limit: 1, Window: time.Hour,
+	}, &tg.MessagesForwardMessagesRequest{
+		ToPeer:   api.InputPeerUser(alice.ID, bob.ID),
+		FromPeer: api.InputPeerUser(alice.ID, bob.ID),
+		ID:       ids,
+		RandomID: randomIDs,
+	})
+	if !tgerr.Is(err, "LIMIT_INVALID") {
+		t.Fatalf("oversized forward: expected LIMIT_INVALID, got %v", err)
+	}
+
+	rateLimit, err := s.CheckRateLimitBudget(ctx, alice.ID, "message_send", store.RateLimitConfig{
+		Limit: 1, Window: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rateLimit != nil {
+		t.Fatalf("oversized forward consumed a rate-limit token, want no charge")
+	}
+}
+
+// TestForwardMessagesRateLimitChargesPerSource proves that a batch spends one
+// shared message-send token per source message.
+func TestForwardMessagesRateLimitChargesPerSource(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	alice, err := s.CreateUser(ctx, "+15551293821")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551293822")
+	if err != nil {
+		t.Fatal(err)
+	}
+	charlie, err := s.CreateUser(ctx, "+15551293823")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 4 {
+		_, _, _, _, err := s.SendMessage(ctx, alice.ID, bob.ID, "source", int64(i+1), 0, 0)
+		if err != nil {
+			t.Fatalf("seed message %d: %v", i+1, err)
+		}
+	}
+
+	cfg := store.RateLimitConfig{Limit: 3, Window: time.Hour}
+	fromPeer := api.InputPeerUser(alice.ID, bob.ID)
+	toPeer := api.InputPeerUser(alice.ID, charlie.ID)
+	_, err = api.ForwardMessagesForTestWithLimits(s, alice.ID, cfg, &tg.MessagesForwardMessagesRequest{
+		ToPeer:   toPeer,
+		FromPeer: fromPeer,
+		ID:       []int{1, 2, 3},
+		RandomID: []int64{1001, 1002, 1003},
+	})
+	if err != nil {
+		t.Fatalf("batch forward: %v", err)
+	}
+
+	_, err = api.ForwardMessagesForTestWithLimits(s, alice.ID, cfg, &tg.MessagesForwardMessagesRequest{
+		ToPeer:   toPeer,
+		FromPeer: fromPeer,
+		ID:       []int{4},
+		RandomID: []int64{1004},
+	})
+	if !isFloodWait(err) {
+		t.Fatalf("single forward after full batch: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
 // TestSendMediaRateLimit proves that media send draws from the shared message send budget.
 func TestSendMediaRateLimit(t *testing.T) {
 	t.Parallel()

@@ -251,7 +251,13 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 // checkRateLimit checks the per-account rate limit for the given surface.
 // Returns nil when allowed, or a FLOOD_WAIT error when denied.
 func (h *handlers) checkRateLimit(r *mtproto.Request, surface string, cfg store.RateLimitConfig) error {
-	result, err := h.store.CheckRateLimit(r.Ctx, r.UserID, surface, cfg)
+	return h.checkRateLimitCost(r, surface, cfg, 1)
+}
+
+// checkRateLimitCost checks the per-account rate limit for a request with the
+// given token cost. Returns nil when allowed, or a FLOOD_WAIT error when denied.
+func (h *handlers) checkRateLimitCost(r *mtproto.Request, surface string, cfg store.RateLimitConfig, cost int) error {
+	result, err := h.store.CheckRateLimitCost(r.Ctx, r.UserID, surface, cfg, cost)
 	if err != nil {
 		h.log.Error("rate limit check", "user_id", r.UserID, "surface", surface, "err", err)
 		return errInternal
