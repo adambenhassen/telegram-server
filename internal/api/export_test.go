@@ -1007,6 +1007,13 @@ func SetPasswordProofLimit(h *handlers, cfg store.RateLimitConfig) {
 	h.rateLimitPasswordProof = cfg
 }
 
+// SetCheckPasswordLimits sets the per-account and per-IP checkPassword rate
+// limits on a shared test handler.
+func SetCheckPasswordLimits(h *handlers, perAccount, perIP store.RateLimitConfig) {
+	h.rateLimitCheckPassword = perAccount
+	h.rateLimitCheckPasswordIP = perIP
+}
+
 // HandleGetPassword invokes handleGetPassword on the given handler.
 func HandleGetPassword(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
 	return h.handleGetPassword(req)
@@ -1015,6 +1022,11 @@ func HandleGetPassword(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
 // HandleGetPasswordSettings invokes handleGetPasswordSettings on the given handler.
 func HandleGetPasswordSettings(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
 	return h.handleGetPasswordSettings(req)
+}
+
+// HandleCheckPassword invokes handleCheckPassword on the given handler.
+func HandleCheckPassword(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
+	return h.handleCheckPassword(req)
 }
 
 // ConfigTTL exposes the expiry window help.getConfig advertises.

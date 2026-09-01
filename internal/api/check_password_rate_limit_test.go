@@ -8,11 +8,14 @@ import (
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/srp"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -339,5 +342,120 @@ func TestCheckPasswordIPReserveErrorReturnsOriginalError(t *testing.T) {
 	var rpc *tgerr.Error
 	if !errors.As(err, &rpc) || rpc.Code != 420 {
 		t.Fatalf("expected FLOOD_WAIT (code 420), got %T: %v", err, err)
+	}
+}
+
+// TestCheckPasswordRefundErrorIsReturned proves a valid proof is not reported
+// as a successful login when refunding its reserved token fails. The database
+// constraint makes only the refund UPDATE fail, so promotion remains available
+// and the test distinguishes propagation from a later database failure.
+func TestCheckPasswordRefundErrorIsReturned(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+
+	alice, err := s.CreateUser(ctx, "+15551296403")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const password = "test-password"
+	salt1 := make([]byte, 32)
+	salt2 := make([]byte, 32)
+	for i := range salt1 {
+		salt1[i] = byte(i)
+		salt2[i] = byte(255 - i)
+	}
+	verifierAlgo := &tg.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow{
+		Salt1: salt1,
+		Salt2: salt2,
+		G:     srp.G,
+		P:     srp.PBytes(),
+	}
+	verifier, err := auth.NewPasswordHash([]byte(password), verifierAlgo)
+	if err != nil {
+		t.Fatalf("NewPasswordHash: %v", err)
+	}
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   alice.ID,
+		Salt1:    verifierAlgo.Salt1,
+		Salt2:    verifierAlgo.Salt2,
+		Verifier: verifier,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var authKeyID [8]byte
+	authKeyID[7] = 7
+	keyID := mtproto.AuthKeyIDInt64(authKeyID)
+	if err := s.SaveAuthKey(ctx, keyID, []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPendingUser(ctx, keyID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `
+		ALTER TABLE rate_limits
+		ADD CONSTRAINT check_password_refund_failure CHECK (token_count > 0)
+	`); err != nil {
+		t.Fatalf("install refund failure: %v", err)
+	}
+
+	h := api.SharedHandlersForTest(s)
+	api.SetCheckPasswordLimits(h,
+		store.RateLimitConfig{Limit: 1, Window: time.Minute},
+		store.RateLimitConfig{},
+	)
+
+	var getBuf bin.Buffer
+	if err := (&tg.AccountGetPasswordRequest{}).Encode(&getBuf); err != nil {
+		t.Fatal(err)
+	}
+	getResult, err := api.HandleGetPassword(h, &mtproto.Request{
+		Ctx:       ctx,
+		AuthKeyID: authKeyID,
+		Buf:       &getBuf,
+	})
+	if err != nil {
+		t.Fatalf("getPassword: %v", err)
+	}
+	passwordState, ok := getResult.(*tg.AccountPassword)
+	if !ok || !passwordState.HasPassword {
+		t.Fatalf("getPassword result = %T, want password state", getResult)
+	}
+
+	proof, err := auth.PasswordHash([]byte(password), passwordState.SRPID, passwordState.SRPB, passwordState.SecureRandom, passwordState.CurrentAlgo)
+	if err != nil {
+		t.Fatalf("PasswordHash: %v", err)
+	}
+	var checkBuf bin.Buffer
+	if err := (&tg.AuthCheckPasswordRequest{Password: proof}).Encode(&checkBuf); err != nil {
+		t.Fatal(err)
+	}
+	result, err := api.HandleCheckPassword(h, &mtproto.Request{
+		Ctx:       ctx,
+		AuthKeyID: authKeyID,
+		Buf:       &checkBuf,
+	})
+	if result != nil {
+		t.Fatalf("result = %T, want no authorization after refund failure", result)
+	}
+	var rpc *tgerr.Error
+	if err == nil || !errors.As(err, &rpc) || rpc.Message != "INTERNAL" {
+		t.Fatalf("error = %v, want INTERNAL", err)
+	}
+
+	key, found, err := s.AuthKeyByID(ctx, keyID)
+	if err != nil {
+		t.Fatalf("AuthKeyByID: %v", err)
+	}
+	if !found || key.UserID != 0 || key.PendingUserID != alice.ID {
+		t.Fatalf("auth key = %+v, want pending user %d and no bound user", key, alice.ID)
 	}
 }
