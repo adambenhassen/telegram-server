@@ -39,6 +39,7 @@ type pendingFrameConn struct {
 	deadlines []time.Time
 	readyOnce sync.Once
 	closed    atomic.Bool
+	sends     atomic.Int32
 }
 
 func (c *pendingFrameConn) Recv(ctx context.Context, b *bin.Buffer) error {
@@ -81,7 +82,10 @@ func (c *pendingFrameConn) Recv(ctx context.Context, b *bin.Buffer) error {
 	return nil
 }
 
-func (c *pendingFrameConn) Send(context.Context, *bin.Buffer) error { return nil }
+func (c *pendingFrameConn) Send(context.Context, *bin.Buffer) error {
+	c.sends.Add(1)
+	return nil
+}
 
 func (c *pendingFrameConn) Close() error {
 	c.closed.Store(true)
@@ -320,7 +324,7 @@ func TestPendingLoginCapClosesNewAttemptAndReleasesOnExit(t *testing.T) {
 	}
 }
 
-func TestPendingLoginFirstFrameReservesUnboundHold(t *testing.T) {
+func TestPendingLoginFirstFrameClaimsUnboundHoldBeforeDispatch(t *testing.T) {
 	t.Parallel()
 
 	key := rebindTestKey()
@@ -330,20 +334,15 @@ func TestPendingLoginFirstFrameReservesUnboundHold(t *testing.T) {
 	}
 
 	firstMarked := make(chan struct{})
-	secondStarted := make(chan struct{})
 	firstRelease := make(chan struct{})
 	var releaseOnce sync.Once
-	defer func() { releaseOnce.Do(func() { close(firstRelease) }) }()
+	defer releaseOnce.Do(func() { close(firstRelease) })
 	var calls atomic.Int32
 	h := mtproto.HandlerFunc(func(c *mtproto.Conn, _ *mtproto.Request) error {
-		switch calls.Add(1) {
-		case 1:
+		if calls.Add(1) == 1 {
 			c.MarkPendingLogin()
 			close(firstMarked)
 			<-firstRelease
-		case 2:
-			c.MarkPendingLogin()
-			close(secondStarted)
 		}
 		return nil
 	})
@@ -351,14 +350,11 @@ func TestPendingLoginFirstFrameReservesUnboundHold(t *testing.T) {
 	if err := srv.SetMaxConnsPerUnboundKey(1); err != nil {
 		t.Fatalf("set unbound-key cap: %v", err)
 	}
-	if err := srv.SetMaxPendingLoginConns(1); err != nil {
-		t.Fatalf("set pending-login cap: %v", err)
-	}
 
 	firstReady := make(chan struct{}, 1)
 	firstBlock := make(chan struct{})
 	first := &pendingFrameConn{
-		frames:  [][]byte{clientFrame(t, key, 42, 1<<32, &tg.AccountRegisterDeviceRequest{})},
+		frames:  [][]byte{clientFrame(t, key, 42, 1<<32, &tg.AuthSignInRequest{})},
 		blockAt: 1,
 		ready:   firstReady,
 		block:   firstBlock,
@@ -373,57 +369,38 @@ func TestPendingLoginFirstFrameReservesUnboundHold(t *testing.T) {
 		t.Fatal("first connection did not reach the pending transition")
 	}
 
-	secondReady := make(chan struct{}, 1)
-	secondBlock := make(chan struct{})
 	second := &pendingFrameConn{
-		frames:  [][]byte{clientFrame(t, key, 42, 2<<32, &tg.AccountRegisterDeviceRequest{})},
-		blockAt: 1,
-		ready:   secondReady,
-		block:   secondBlock,
+		frames:  [][]byte{clientFrame(t, key, 42, 2<<32, &tg.AuthSignInRequest{})},
+		blockAt: -1,
 	}
-	secondCtx, cancelSecond := context.WithCancel(context.Background())
-	defer cancelSecond()
 	secondDone := make(chan error, 1)
-	go func() { secondDone <- srv.ServeConn(secondCtx, second) }()
+	go func() { secondDone <- srv.ServeConn(context.Background(), second) }()
 	select {
-	case <-secondStarted:
-	case <-time.After(time.Second):
-		t.Fatal("second connection did not reach its handler")
-	}
-
-	// With the bug, the first frame has not charged the unbound hold yet, so
-	// the second connection takes both the unbound and pending slots and waits
-	// for another frame. With the fix, the first connection owns the unbound
-	// slot before its handler can mark it pending, so the second exits at the
-	// unbound-key cap instead.
-	select {
-	case <-secondReady:
 	case err := <-secondDone:
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
-			t.Fatalf("second connection ended during admission: %v", err)
+		if err != nil {
+			t.Fatalf("second connection = %v, want clean cap refusal", err)
 		}
-		secondDone = nil
 	case <-time.After(time.Second):
-		t.Fatal("second connection did not finish admission")
+		t.Fatal("second connection was not refused at the unbound-key cap")
 	}
-	releaseOnce.Do(func() { close(firstRelease) })
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler saw %d first-frame requests, want only the admitted connection", got)
+	}
+	if got := second.sends.Load(); got != 0 {
+		t.Fatalf("refused first frame sent %d responses, want none", got)
+	}
 
+	releaseOnce.Do(func() { close(firstRelease) })
 	select {
 	case <-firstReady:
 	case err := <-firstDone:
-		t.Fatalf("first pending connection ended before acquiring its slot: %v", err)
+		t.Fatalf("first pending connection ended before retaining its hold: %v", err)
 	case <-time.After(time.Second):
-		t.Fatal("first pending connection did not retain the unbound hold")
+		t.Fatal("first pending connection did not retain its unbound-key hold")
 	}
 
 	cancelFirst()
-	cancelSecond()
-	if err := <-firstDone; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
-		t.Errorf("first connection cleanup: %v", err)
-	}
-	if secondDone != nil {
-		if err := <-secondDone; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
-			t.Errorf("second connection cleanup: %v", err)
-		}
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first pending connection = %v, want cancellation during cleanup", err)
 	}
 }

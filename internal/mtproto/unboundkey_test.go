@@ -46,10 +46,9 @@ func TestUnboundKeyCapBoundsWhatOneKeyHolds(t *testing.T) {
 	for i := range raws {
 		raws[i], conns[i] = keyClient(t, ctx, addr, keys.key, int64(i+1))
 	}
-	// Every frame is dispatched before the cap decides anything, so waiting for
-	// all of them makes what follows a statement about the bound rather than
-	// about how far the server had got.
-	wantRequests(t, seen, opened)
+	// Only the admitted first frames reach the handler. A first frame that finds
+	// the cap full is refused before dispatch.
+	wantRequests(t, seen, maxHeld)
 
 	var live []int
 	for i, raw := range raws {
@@ -201,15 +200,13 @@ func TestUnboundKeyCapCountsTwoKeysIndependently(t *testing.T) {
 		t.Fatalf("key B: %d connections held, want %d", liveB, maxHeld)
 	}
 
-	// A third connection on key A is refused; one on key B is also refused.
-	// (They are each at cap.)
+	// A third connection on key A is refused before dispatch; one on key B is
+	// also refused. (They are each at cap.)
 	refusedA, _ := keyClient(t, ctx, addr, keys.keyA, 100)
-	wantRequests(t, seen, 1)
 	if !closedByServer(t, refusedA, 2*time.Second) {
 		t.Fatal("key A: cap did not refuse the N+1th connection")
 	}
 	refusedB, _ := keyClient(t, ctx, addr, keys.keyB, 110)
-	wantRequests(t, seen, 1)
 	if !closedByServer(t, refusedB, 2*time.Second) {
 		t.Fatal("key B: cap did not refuse the N+1th connection")
 	}
@@ -261,18 +258,17 @@ func TestUnboundKeyCapZeroDisablesIt(t *testing.T) {
 }
 
 // TestUnboundKeyCapBindDuringDispatchAtFullCap proves the post-dispatch re-read
-// closes the same-frame-bind gap: a connection whose key binds during its own
-// candidate frame stays open even when the cap is already full. Without the
-// re-read, charge sees the pre-dispatch userID of 0 and closes the connection
-// that just signed in — the invariant-2 breach.
+// closes the same-frame-bind gap on a connection that is already charged. The
+// binding changes during its second frame, while the unbound-key cap is full,
+// and the post-dispatch user is what releases its slot.
 //
 // Sequence at cap=1:
 //  1. Connection A fills the slot (unbound).
-//  2. Connection B's frame binds the key mid-dispatch. Cap is full at charge,
-//     but the re-read sees the bound user and B survives.
-//  3. Assert B stays open.
-//  4. Assert A still holds the slot: B never acquired one (it signed in,
-//     releasing its pre-dispatch reserve), so A's slot remains occupied.
+//  2. A's second frame binds the key mid-dispatch. The re-read sees the bound
+//     user and releases A's slot.
+//  3. Unbind the key and admit connection B in the released slot.
+//  4. Assert A remains open because a connection that has signed in is outside
+//     the unbound-key cap for good.
 func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
@@ -283,8 +279,8 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	keys := newSignInStore()
 	seen := make(chan struct{}, 64)
 
-	// Handler binds on the second request only — the first fills the cap
-	// (unbound), the second arrives at a full cap and binds mid-dispatch.
+	// Handler binds on the second request only. The first fills the cap while
+	// unbound; the second binds that already-charged connection mid-dispatch.
 	var reqCount int
 	mu := sync.Mutex{}
 	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, _ *mtproto.Request) error {
@@ -305,26 +301,26 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	addr := nl.Addr().String()
 
 	// 1. Connection A fills the slot while unbound.
-	rawA, _ := keyClient(t, ctx, addr, keys.key, 100)
+	rawA, connA := keyClient(t, ctx, addr, keys.key, 100)
 	wantRequests(t, seen, 1)
 
-	// 2. Connection B's frame binds the key mid-dispatch. Cap is full.
+	// 2. A's second frame binds the key mid-dispatch while the cap is full.
+	sendFrame(t, ctx, connA, keys.key, 100, int64(2)<<32)
+	wantRequests(t, seen, 1)
+
+	// 3. The binding is now removed, so a new connection can take the released
+	// slot. If charge used the pre-dispatch userID of 0, A would still occupy it.
+	keys.bind(0)
 	rawB, connB := keyClient(t, ctx, addr, keys.key, 200)
 	wantRequests(t, seen, 1)
-
-	// 3. B stays open — the re-read saw userID=7 (not 0).
-	// Mutation test: reverting the re-read to pre-dispatch userID=0 would
-	// make charge refuse B (cap full, unbound) and close it here.
 	if closedByServer(t, rawB, 2*time.Second) {
-		t.Fatal("connection whose key bound during dispatch was closed at the cap")
+		t.Fatal("connection did not take the slot released by the same-frame bind")
 	}
 
-	// A still holds the slot (B was signed-in, never charged).
+	// 4. A has signed in and remains outside the unbound-key cap.
 	if closedByServer(t, rawA, 2*time.Second) {
-		t.Fatal("fill connection was closed (should hold the slot)")
+		t.Fatal("connection that signed in was closed at the unbound-key cap")
 	}
-
-	// B serves further frames as a signed-in connection.
 	sendFrame(t, ctx, connB, keys.key, 200, int64(2)<<32)
 	wantRequests(t, seen, 1)
 }
@@ -486,9 +482,9 @@ func wantRequests(t *testing.T, seen <-chan struct{}, n int) {
 }
 
 // closedByServer reports whether the server dropped conn within grace,
-// discarding whatever it wrote first: a connection past this cap has its frame
-// answered before it is closed, so bytes arriving are not the connection
-// surviving.
+// discarding whatever it wrote first. A first frame refused at the cap writes
+// nothing, while a later frame may have been answered before the connection is
+// closed.
 func closedByServer(t *testing.T, conn net.Conn, grace time.Duration) bool {
 	t.Helper()
 	if err := conn.SetReadDeadline(time.Now().Add(grace)); err != nil {
