@@ -596,9 +596,27 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		// on a human reading a code — it has already paid for a key exchange, and
 		// closing it mid-login would be the bound taking legitimate sessions
 		// rather than anonymous holds.
-		if err := s.rpcHandle(ctx, conn, b, userID, provisional, clientAddr, slot, func() {
-			hold.charge(authKeyID, userID)
+		// An unbound first frame reserves its hold in rpcHandle, after MAC
+		// verification but before dispatch, because auth.signIn can mark the
+		// connection pending from inside the handler. A hold already charged to
+		// this key skips that reservation so the post-dispatch charge below still
+		// observes a same-frame rebind.
+		if err := s.rpcHandle(ctx, conn, b, userID, provisional, clientAddr, slot, func() error {
+			if hold.signedIn || userID != 0 || (hold.charged && hold.key == authKeyID) {
+				return nil
+			}
+			if hold.charge(authKeyID, userID) {
+				return nil
+			}
+			return errUnboundKeyCap
 		}); err != nil {
+			if errors.Is(err, errUnboundKeyCap) {
+				if dropped, ok := s.unboundKeyLog.allow(time.Now(), preAuthLogInterval); ok {
+					s.log.Info("connection closed at the cap on one unbound auth key",
+						"cap", s.unboundKeys.max, "suppressed", dropped)
+				}
+				return nil
+			}
 			return err
 		}
 
@@ -634,13 +652,10 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			})
 		}
 
-		// The frame decrypted, so this connection has proved the key rather than
-		// merely named it, and the population it now belongs to — connections
-		// under a key this server issued that nobody has signed in on — is
-		// bounded here. After the dispatch rather than before it, like the
-		// per-user cap below: the frame in hand is answered normally, and a
-		// socket past the bound closes on the way out, so a peer opening sockets
-		// in a loop is refused the new one instead of losing a working one.
+		// Every decrypted frame still gets this post-dispatch charge. A new
+		// unbound key was reserved by the callback above before dispatch; keeping
+		// this call after dispatch for an already-charged key lets a same-frame
+		// sign-in use the post-dispatch binding before the hold is released.
 		//
 		// Re-read the binding after dispatch only for the one path it helps:
 		// an unbound session (userID == 0) that has not already proven signed-in
