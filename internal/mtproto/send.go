@@ -63,6 +63,12 @@ type Conn struct {
 	// so reading it under writeMu would let one blackholed socket — a push
 	// parked in the write timeout — stall every user's delivery.
 	authKeyID atomic.Int64
+
+	// pendingLogin is set when auth.signIn stages a user for the password
+	// challenge. It belongs to this connection rather than the shared auth-key
+	// store, so the serve loop can apply connection-local limits to the socket
+	// that received SESSION_PASSWORD_NEEDED.
+	pendingLogin atomic.Bool
 }
 
 // LastPushedPts returns the highest pts already pushed to this connection.
@@ -75,6 +81,18 @@ func (c *Conn) LastPushedPts() int {
 // on purpose: it is read while matching an eviction against live conns.
 func (c *Conn) AuthKeyID() int64 {
 	return c.authKeyID.Load()
+}
+
+// PendingLogin reports whether auth.signIn has staged a password challenge on
+// this connection.
+func (c *Conn) PendingLogin() bool {
+	return c.pendingLogin.Load()
+}
+
+// MarkPendingLogin marks this connection as waiting for auth.checkPassword.
+// The marker is intentionally connection-local and idempotent.
+func (c *Conn) MarkPendingLogin() {
+	c.pendingLogin.Store(true)
 }
 
 // Close shuts the underlying transport down, unblocking the serve goroutine's

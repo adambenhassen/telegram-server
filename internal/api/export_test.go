@@ -59,7 +59,7 @@ func SignInForTestWithLimits(s *store.Store, authKeyID [8]byte, addr netip.Addr,
 	}
 	h := testHandlers(s)
 	h.rateLimitSignInFailIP = rateLimit
-	return h.handleSignIn(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+	return h.handleSignIn(nil, &mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
 }
 
 // SignUpForTest invokes handleSignUp for a request arriving from addr, against
