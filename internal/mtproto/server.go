@@ -107,6 +107,15 @@ type Server struct {
 	// are driven by a peer reusing one key, and a flood against this bound must
 	// not spend the window that says which other bound is firing.
 	unboundKeyLog logSampler
+	// pendingLogins bounds the process-wide connections that have received
+	// SESSION_PASSWORD_NEEDED. Written once before Serve and only read after,
+	// like the other connection bounds.
+	pendingLogins *pendingLoginLimiter
+	// pendingLoginLifetime is the absolute lease started by the first pending
+	// marker transition. It is fixed in production and shortened only by tests.
+	pendingLoginLifetime   time.Duration
+	pendingLoginCapLog     logSampler
+	pendingLoginCeilingLog logSampler
 
 	// onStatusChange fires when a user's connection count transitions between
 	// zero and non-zero. Called after the registry has been updated, so a
@@ -188,6 +197,19 @@ func (s *Server) SetMaxConnsPerUnboundKey(n int) error {
 	return nil
 }
 
+// SetMaxPendingLoginConns replaces the process-wide bound on connections that
+// are waiting for auth.checkPassword. Call it before Serve.
+//
+// Zero turns the bound off and negative is refused so a configuration typo
+// cannot silently remove this protection.
+func (s *Server) SetMaxPendingLoginConns(n int) error {
+	if n < 0 {
+		return fmt.Errorf("max pending login conns is %d: must not be negative, and 0 disables the cap", n)
+	}
+	s.pendingLogins = newPendingLoginLimiter(n)
+	return nil
+}
+
 // New creates a Server that answers on dcID using key for the handshake, keys to
 // persist auth keys, and handler for RPC requests.
 func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, log *slog.Logger) *Server {
@@ -196,21 +218,23 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 	}
 	c := clock.System
 	return &Server{
-		dcID:             dcID,
-		key:              key,
-		keys:             keys,
-		handler:          handler,
-		registry:         NewSessionRegistry(),
-		cipher:           crypto.NewServerCipher(crypto.DefaultRand()),
-		clock:            c,
-		msgID:            proto.NewMessageIDGen(c.Now),
-		readTimeout:      defaultReadTimeout,
-		writeTimeout:     defaultWriteTimeout,
-		handshakeTimeout: defaultHandshakeTimeout,
-		rpcDeadline:      DefaultRPCDeadline,
-		preAuth:          newPreAuthLimiter(DefaultPreAuthLimits()),
-		unboundKeys:      newUnboundKeyLimiter(DefaultMaxConnsPerUnboundKey),
-		log:              log,
+		dcID:                 dcID,
+		key:                  key,
+		keys:                 keys,
+		handler:              handler,
+		registry:             NewSessionRegistry(),
+		cipher:               crypto.NewServerCipher(crypto.DefaultRand()),
+		clock:                c,
+		msgID:                proto.NewMessageIDGen(c.Now),
+		readTimeout:          defaultReadTimeout,
+		writeTimeout:         defaultWriteTimeout,
+		handshakeTimeout:     defaultHandshakeTimeout,
+		rpcDeadline:          DefaultRPCDeadline,
+		preAuth:              newPreAuthLimiter(DefaultPreAuthLimits()),
+		unboundKeys:          newUnboundKeyLimiter(DefaultMaxConnsPerUnboundKey),
+		pendingLogins:        newPendingLoginLimiter(DefaultMaxPendingLoginConns),
+		pendingLoginLifetime: DefaultPendingLoginLifetime,
+		log:                  log,
 	}
 }
 
@@ -502,8 +526,18 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 	// connection.
 	hold := &unboundKeyHold{lim: s.unboundKeys}
 	defer hold.release()
+	pending := &pendingLoginHold{lim: s.pendingLogins}
+	defer pending.release()
+	var pendingLoginObserved bool
+	var pendingLoginDeadline time.Time
+	var pendingLoginTimer *time.Timer
+	defer func() {
+		if pendingLoginTimer != nil {
+			pendingLoginTimer.Stop()
+		}
+	}()
 	for {
-		if err := s.read(ctx, tconn, b); err != nil {
+		if err := s.read(ctx, tconn, b, pendingLoginDeadline); err != nil {
 			return err
 		}
 
@@ -564,6 +598,38 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		// rather than anonymous holds.
 		if err := s.rpcHandle(ctx, conn, b, userID, provisional, clientAddr, slot); err != nil {
 			return err
+		}
+
+		// auth.signIn marks the serving conn only after SetPendingUser commits.
+		// Claim the pending slot before any binding resync or another read, so a
+		// full process-wide cap closes this new attempt immediately. The hold is
+		// intentionally retained until the connection exits, even after a
+		// successful password check.
+		if !pendingLoginObserved && conn.PendingLogin() {
+			pendingLoginObserved = true
+			if !pending.acquire() {
+				if dropped, ok := s.pendingLoginCapLog.allow(time.Now(), preAuthLogInterval); ok {
+					s.log.Info("connection closed at the pending-login cap",
+						"cap", s.pendingLogins.max, "suppressed", dropped)
+				}
+				return nil
+			}
+
+			pendingLoginSince := conn.pendingLoginSince()
+			if pendingLoginSince.IsZero() {
+				pendingLoginSince = s.clock.Now()
+			}
+			pendingLoginDeadline = pendingLoginSince.Add(s.pendingLoginLifetime)
+			pendingLoginDelay := max(0, time.Until(pendingLoginDeadline))
+			pendingLoginTimer = time.AfterFunc(pendingLoginDelay, func() {
+				if err := conn.Close(); err != nil && !isDisconnect(err) {
+					s.log.Info("close connection at the pending-login ceiling", "err", err)
+				}
+				if dropped, ok := s.pendingLoginCeilingLog.allow(time.Now(), preAuthLogInterval); ok {
+					s.log.Info("connection closed at the pending-login lifetime ceiling",
+						"lifetime", s.pendingLoginLifetime, "suppressed", dropped)
+				}
+			})
 		}
 
 		// The frame decrypted, so this connection has proved the key rather than
@@ -675,10 +741,17 @@ func (s *Server) runExchange(ctx context.Context, tconn transport.Conn, first *b
 	return nil
 }
 
-// read resets b and reads one frame from conn under the read timeout.
-func (s *Server) read(ctx context.Context, conn transport.Conn, b *bin.Buffer) error {
+// read resets b and reads one frame from conn. An active pending-login deadline
+// is absolute and replaces the normal per-frame timeout; otherwise the normal
+// 30-second timeout remains unchanged.
+func (s *Server) read(ctx context.Context, conn transport.Conn, b *bin.Buffer, deadline time.Time) error {
 	b.Reset()
-	ctx, cancel := context.WithTimeout(ctx, s.readTimeout)
+	var cancel context.CancelFunc
+	if deadline.IsZero() {
+		ctx, cancel = context.WithTimeout(ctx, s.readTimeout)
+	} else {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+	}
 	defer cancel()
 	return conn.Recv(ctx, b)
 }

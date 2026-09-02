@@ -180,6 +180,9 @@ type Config struct {
 	// — at the first frame that decrypts under a server-issued key — and hands
 	// over to the per-user connection cap at sign-in. Zero disables it.
 	MaxConnsPerUnboundKey int
+	// MaxPendingLoginConns bounds connections waiting for auth.checkPassword
+	// after SESSION_PASSWORD_NEEDED. Zero disables the process-wide cap.
+	MaxPendingLoginConns int
 	// RPCDeadline is how long a single dispatched RPC may run before its
 	// context is cancelled and the client answered with a generic INTERNAL
 	// error. The connection survives; the next request starts with a full
@@ -389,6 +392,7 @@ func Load(log *slog.Logger) (Config, error) {
 		MediaErasureDestructive: false,
 
 		MaxConnsPerUnboundKey: mtproto.DefaultMaxConnsPerUnboundKey,
+		MaxPendingLoginConns:  mtproto.DefaultMaxPendingLoginConns,
 
 		RPCDeadline:      mtproto.DefaultRPCDeadline,
 		StatementTimeout: DefaultStatementTimeout,
@@ -801,6 +805,16 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_MAX_CONNS_PER_UNBOUND_KEY must not be negative; 0 disables the cap")
 		}
 		cfg.MaxConnsPerUnboundKey = n
+	}
+	if v := os.Getenv("TG_MAX_PENDING_LOGIN_CONNS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MAX_PENDING_LOGIN_CONNS must be an integer")
+		}
+		if n < 0 {
+			return Config{}, errors.New("TG_MAX_PENDING_LOGIN_CONNS must not be negative; 0 disables the cap")
+		}
+		cfg.MaxPendingLoginConns = n
 	}
 	trust, err := clientAddrTrust(os.Getenv("TG_CLIENT_ADDR_TRUST"))
 	if err != nil {
