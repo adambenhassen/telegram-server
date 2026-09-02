@@ -335,6 +335,9 @@ func run(log *slog.Logger) error {
 	if err := server.SetMaxConnsPerUnboundKey(cfg.MaxConnsPerUnboundKey); err != nil {
 		return err
 	}
+	if err := server.SetMaxPendingLoginConns(cfg.MaxPendingLoginConns); err != nil {
+		return err
+	}
 	if err := server.SetRPCDeadline(cfg.RPCDeadline); err != nil {
 		return err
 	}

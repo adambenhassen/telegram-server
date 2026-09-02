@@ -69,6 +69,11 @@ type Conn struct {
 	// store, so the serve loop can apply connection-local limits to the socket
 	// that received SESSION_PASSWORD_NEEDED.
 	pendingLogin atomic.Bool
+	// pendingLoginAt is written with the marker and read by the serving
+	// goroutine after rpcHandle returns. Unix nanoseconds keep the transition
+	// timestamp lock-free while the deadline remains tied to the first marker
+	// transition rather than to a later client frame.
+	pendingLoginAt atomic.Int64
 }
 
 // LastPushedPts returns the highest pts already pushed to this connection.
@@ -92,7 +97,17 @@ func (c *Conn) PendingLogin() bool {
 // MarkPendingLogin marks this connection as waiting for auth.checkPassword.
 // The marker is intentionally connection-local and idempotent.
 func (c *Conn) MarkPendingLogin() {
-	c.pendingLogin.Store(true)
+	if c.pendingLogin.CompareAndSwap(false, true) {
+		c.pendingLoginAt.Store(c.clock.Now().UnixNano())
+	}
+}
+
+func (c *Conn) pendingLoginSince() time.Time {
+	n := c.pendingLoginAt.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
 }
 
 // Close shuts the underlying transport down, unblocking the serve goroutine's

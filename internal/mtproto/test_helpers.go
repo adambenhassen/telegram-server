@@ -47,6 +47,13 @@ func (s *Server) SetHandshakeTimeout(d time.Duration) {
 	s.handshakeTimeout = d
 }
 
+// SetPendingLoginLifetime shortens the pending-login lease for tests. Production
+// uses DefaultPendingLoginLifetime, which is fixed to twice the SRP challenge
+// TTL.
+func (s *Server) SetPendingLoginLifetime(d time.Duration) {
+	s.pendingLoginLifetime = d
+}
+
 // ServeConn exposes the per-connection serve loop so tests can drive it with a
 // scripted transport instead of a real client handshake. The connection carries
 // no peer address: a scripted transport is not a socket, and the zero address is

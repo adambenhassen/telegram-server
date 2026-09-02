@@ -327,6 +327,46 @@ func TestLoadMaxConnsPerUnboundKey(t *testing.T) {
 	}
 }
 
+func TestLoadMaxPendingLoginConns(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+
+	tests := map[string]struct {
+		raw     string
+		want    int
+		wantErr bool
+	}{
+		"default":     {want: mtproto.DefaultMaxPendingLoginConns},
+		"override":    {raw: "3", want: 3},
+		"off":         {raw: "0", want: 0},
+		"not integer": {raw: "a few", wantErr: true},
+		"negative":    {raw: "-1", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if tc.raw != "" {
+				t.Setenv("TG_MAX_PENDING_LOGIN_CONNS", tc.raw)
+			}
+			cfg, err := config.Load(discardLog())
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got MaxPendingLoginConns = %d", tc.raw, cfg.MaxPendingLoginConns)
+				}
+				if !strings.Contains(err.Error(), "TG_MAX_PENDING_LOGIN_CONNS") {
+					t.Errorf("error %q does not name TG_MAX_PENDING_LOGIN_CONNS", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.MaxPendingLoginConns != tc.want {
+				t.Errorf("MaxPendingLoginConns = %d, want %d", cfg.MaxPendingLoginConns, tc.want)
+			}
+		})
+	}
+}
+
 func withMaxConns(l mtproto.PreAuthLimits, n int) mtproto.PreAuthLimits {
 	l.MaxConns = n
 	return l
