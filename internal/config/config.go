@@ -21,6 +21,7 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/gotd/td/exchange"
 )
 
 // RegistrationMode controls whether new accounts can be created via auth.signUp.
@@ -1151,7 +1152,7 @@ func (c Config) WarnClientAddrTrust(log *slog.Logger) {
 // exchange (its DefaultTimeout). It is not this server's number to set, and it
 // is the floor a pre-auth lifetime ceiling has to clear: a ceiling under it
 // expires while a handshake is still legitimately waiting on one read.
-const handshakeReadTimeout = 60 * time.Second
+const handshakeReadTimeout = exchange.DefaultTimeout
 
 // WarnPreAuthLifetime states, once at startup, that the configured pre-auth
 // ceiling is short enough to cut handshakes rather than holds.
