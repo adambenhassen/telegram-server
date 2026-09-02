@@ -596,7 +596,9 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		// on a human reading a code — it has already paid for a key exchange, and
 		// closing it mid-login would be the bound taking legitimate sessions
 		// rather than anonymous holds.
-		if err := s.rpcHandle(ctx, conn, b, userID, provisional, clientAddr, slot); err != nil {
+		if err := s.rpcHandle(ctx, conn, b, userID, provisional, clientAddr, slot, func() {
+			hold.charge(authKeyID, userID)
+		}); err != nil {
 			return err
 		}
 

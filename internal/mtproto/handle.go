@@ -31,7 +31,10 @@ var errInternalRPC = tgerr.New(500, "INTERNAL")
 // nowhere else. Clearing is idempotent, so every frame after the first passes a
 // slot already given back; it is nil for a connection that was never accepted
 // through a listener.
-func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID int64, provisional bool, clientAddr netip.Addr, slot *preAuthSlot) error {
+// beforeDispatch runs after the frame's MAC verifies but before any handler can
+// change the key binding. The serving loop uses it to reserve the unbound-key
+// hold before auth.signIn can mark the connection pending.
+func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID int64, provisional bool, clientAddr netip.Addr, slot *preAuthSlot, beforeDispatch func()) error {
 	m := &crypto.EncryptedMessage{}
 	if err := m.DecodeWithoutCopy(b); err != nil {
 		return fmt.Errorf("decode encrypted message: %w", err)
@@ -68,6 +71,9 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID i
 
 	// Buffer now holds the plaintext message body.
 	b.ResetTo(msg.Data())
+	if beforeDispatch != nil {
+		beforeDispatch()
+	}
 
 	return s.handle(c, &Request{
 		AuthKeyID:   c.authKey.ID,
