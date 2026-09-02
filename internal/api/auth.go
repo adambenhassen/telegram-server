@@ -253,7 +253,7 @@ func (h *handlers) logIssuedCode(phone, code string) {
 	h.log.Info("login code issued", "phone", phone, "code", code)
 }
 
-func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
+func (h *handlers) handleSignIn(c *mtproto.Conn, r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthSignInRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
@@ -273,11 +273,21 @@ func (h *handlers) handleSignIn(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errPhoneInvalid
 	}
 
+	var res bin.Encoder
+	var err error
 	if isUsername {
-		return h.handleSignInUsername(r, input, req.PhoneCodeHash, req.PhoneCode)
+		res, err = h.handleSignInUsername(r, input, req.PhoneCodeHash, req.PhoneCode)
+	} else {
+		res, err = h.handleSignInPhone(r, req)
 	}
 
-	return h.handleSignInPhone(r, req)
+	// The sign-in branches return SESSION_PASSWORD_NEEDED only after
+	// SetPendingUser commits. Mark the serving connection before the dispatcher
+	// writes that error back to the client.
+	if c != nil && errors.Is(err, errSessionPasswordNeeded) {
+		c.MarkPendingLogin()
+	}
+	return res, err
 }
 
 // handleSignInPhone is the phone-mode signIn path. It only authorizes an

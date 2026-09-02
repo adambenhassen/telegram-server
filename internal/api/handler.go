@@ -105,6 +105,10 @@ type handlers struct {
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
 
+type connMethodFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, error)
+
+type registeredFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error)
+
 // revokeFunc is a methodFunc that also returns work to run once the reply is on
 // the wire. Exactly one revocation needs it: the one whose eviction closes the
 // socket the reply goes out on. Nothing orders a Postgres round trip against a
@@ -184,7 +188,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
-	register(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
+	registerWithConn(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
 	register(d, tg.AuthSignUpRequestTypeID, h.handleSignUp)
 	registerRevoke(d, tg.AuthLogOutRequestTypeID, h.handleLogOut)
 	register(d, tg.UsersGetUsersRequestTypeID, h.handleGetUsers)
@@ -374,8 +378,15 @@ func fnv1a64(s string) uint64 {
 }
 
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
-	registerRevoke(d, id, func(req *mtproto.Request) (bin.Encoder, func(), error) {
+	registerReply(d, id, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
 		res, err := fn(req)
+		return res, nil, err
+	})
+}
+
+func registerWithConn(d *mtproto.Dispatcher, id uint32, fn connMethodFunc) {
+	registerReply(d, id, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
+		res, err := fn(c, req)
 		return res, nil, err
 	})
 }
@@ -383,9 +394,18 @@ func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
 // registerRevoke registers fn and runs its afterReply hook once the reply write
 // has been attempted, whether or not that write succeeded: the revocation it
 // announces has already committed, so it must propagate either way.
-// The provisional gate is applied here so it covers both register and
-// registerRevoke callers (including auth.logOut and account.resetAuthorization).
+// The shared registerReply path applies the provisional gate to both register
+// and registerRevoke callers (including auth.logOut and
+// account.resetAuthorization).
 func registerRevoke(d *mtproto.Dispatcher, id uint32, fn revokeFunc) {
+	registerReply(d, id, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
+		return fn(req)
+	})
+}
+
+// registerReply applies the common provisional gate, RPC error mapping, and
+// reply write around a method-specific function.
+func registerReply(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
 	d.HandleFunc(id, func(c *mtproto.Conn, req *mtproto.Request) error {
 		// Provisional gate: blocks all authorized RPCs except the allow-list.
 		// Does not apply when UserID == 0 (unauthenticated keys already
@@ -393,7 +413,7 @@ func registerRevoke(d *mtproto.Dispatcher, id uint32, fn revokeFunc) {
 		if provisionalBlocked(id, req) {
 			return c.SendErr(req, errAuthKeyUnreg)
 		}
-		res, afterReply, err := fn(req)
+		res, afterReply, err := fn(c, req)
 		if err != nil {
 			var rpc *tgerr.Error
 			if !errors.As(err, &rpc) {
