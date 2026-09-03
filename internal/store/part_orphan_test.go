@@ -17,12 +17,17 @@ import (
 // testTTL is the part TTL the orphan tests run against.
 const testTTL = 6 * time.Hour
 
-// partKey returns the nth key NewPartKey could have produced. The pass acts on
-// part keys and nothing else, so a fixture that is merely under the prefix
-// would test the wrong predicate. Zero padding also makes the numeric order
-// the key order, which is the order the walk yields them in.
+// partKey returns the nth legacy flat key under the parts prefix. Zero padding
+// makes the numeric order the key order, which is the order the walk yields
+// them in.
 func partKey(n uint64) string {
 	return blob.PartsPrefix + fmt.Sprintf("%032x", n)
+}
+
+// shardedPartKey returns the nth key in the sharded layout NewPartKey draws:
+// parts/xx/<30hex> with the low byte of n as the shard directory.
+func shardedPartKey(n uint64) string {
+	return fmt.Sprintf("%s%02x/%030x", blob.PartsPrefix, byte(n&0xff), n>>8)
 }
 
 // testCutoff returns a cutoff well past the floor for testTTL.
@@ -93,6 +98,32 @@ func TestPartOrphanPassReclaimsCrashWindowObject(t *testing.T) {
 	}
 }
 
+// TestPartOrphanPassReclaimsShardedCrashWindowObject is the sharded-layout
+// counterpart of TestPartOrphanPassReclaimsCrashWindowObject: WalkPrefix must
+// recurse into parts/xx/ and reclaim an orphan there.
+func TestPartOrphanPassReclaimsShardedCrashWindowObject(t *testing.T) {
+	t.Parallel()
+	s, l := openOrphanStore(t)
+	ctx := context.Background()
+
+	key := shardedPartKey(0xdeadbeef)
+	if _, err := l.Put(ctx, key, strings.NewReader("x")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	ageObject(t, l.RootDir(), key, time.Now().Add(-24*time.Hour))
+
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if res.Objects != 1 || res.Bytes != 1 {
+		t.Fatalf("reclaimed %+v, want 1 object / 1 byte", res)
+	}
+	if objectExists(t, l.RootDir(), key) {
+		t.Fatal("sharded object still present after pass")
+	}
+}
+
 // TestPartOrphanPassKeepsLiveRowObject asserts the live-key gate: an object
 // whose key a row still names is never removed, whatever its age.
 func TestPartOrphanPassKeepsLiveRowObject(t *testing.T) {
@@ -121,6 +152,37 @@ func TestPartOrphanPassKeepsLiveRowObject(t *testing.T) {
 	}
 	if !objectExists(t, l.RootDir(), key) {
 		t.Fatal("live object gone")
+	}
+}
+
+// TestPartOrphanPassKeepsShardedLiveRowObject is the sharded-layout counterpart
+// of TestPartOrphanPassKeepsLiveRowObject.
+func TestPartOrphanPassKeepsShardedLiveRowObject(t *testing.T) {
+	t.Parallel()
+	s, l := openOrphanStore(t)
+	ctx := context.Background()
+
+	key := shardedPartKey(0x11ffe0)
+	if _, err := l.Put(ctx, key, strings.NewReader("y")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := s.CreateUser(ctx, "+15551230011"); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := store.InsertUploadPartWithKey(ctx, s, 1, 7, 0, 1, key); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+	ageObject(t, l.RootDir(), key, time.Now().Add(-24*time.Hour))
+
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if res.Objects != 0 {
+		t.Fatalf("reclaimed %+v, want nothing (live row)", res)
+	}
+	if !objectExists(t, l.RootDir(), key) {
+		t.Fatal("sharded live object gone")
 	}
 }
 
@@ -421,6 +483,53 @@ func TestPartOrphanPassLeavesUnexplainedPaths(t *testing.T) {
 	for _, key := range unexplained {
 		if !objectExists(t, l.RootDir(), key) {
 			t.Fatalf("unexplained path %s deleted", key)
+		}
+	}
+}
+
+// TestPartOrphanPassLeavesShardedUnexplainedPaths is the sharded-layout
+// counterpart of TestPartOrphanPassLeavesUnexplainedPaths: invalid paths under
+// parts/xx/, including a temporary whose stripped key is not one NewPartKey
+// could have produced, must survive the pass.
+func TestPartOrphanPassLeavesShardedUnexplainedPaths(t *testing.T) {
+	t.Parallel()
+	s, l := openOrphanStore(t)
+	ctx := context.Background()
+
+	orphan := shardedPartKey(0xbeef)
+	if _, err := l.Put(ctx, orphan, strings.NewReader("o")); err != nil {
+		t.Fatalf("put orphan: %v", err)
+	}
+	ageObject(t, l.RootDir(), orphan, time.Now().Add(-24*time.Hour))
+
+	unexplained := []string{
+		blob.PartsPrefix + "9g/deadbeef000000000000000000000000",
+		blob.PartsPrefix + "aa/deadbeef",
+		blob.PartsPrefix + "bb/" + strings.ToUpper(strings.Repeat("cd", 15)),
+		blob.PartsPrefix + "cc/deadbeef000000000000000000000000/extra",
+		blob.PartsPrefix + "dd/README" + blob.TempSuffix,
+	}
+	for _, key := range unexplained {
+		p := filepath.Join(l.RootDir(), filepath.FromSlash(key))
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", key, err)
+		}
+		if err := os.WriteFile(p, []byte("not ours"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", key, err)
+		}
+		ageObject(t, l.RootDir(), key, time.Now().Add(-72*time.Hour))
+	}
+
+	res, err := s.ReclaimOrphanedPartBytes(ctx, testCutoff(), testTTL)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if res.Objects != 1 {
+		t.Fatalf("reclaimed %d objects, want 1 (the sharded orphan alone): %+v", res.Objects, res)
+	}
+	for _, key := range unexplained {
+		if !objectExists(t, l.RootDir(), key) {
+			t.Fatalf("unexplained sharded path %s deleted", key)
 		}
 	}
 }
