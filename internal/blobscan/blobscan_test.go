@@ -349,10 +349,9 @@ func TestScanNamesPathsUnderThePartsPrefixTheWriterDidNotProduce(t *testing.T) {
 		t.Fatalf("part key: %v", err)
 	}
 	f.plant(partKey, "part bytes")
-	// A real 32-character key that differs from a valid one only in case: if
-	// ParsePartKey stops checking case, this plant parses and the assertion
-	// below fails, so the test exercises the reason it claims to.
-	upper := "parts/" + strings.ToUpper(partKey[len(blob.PartsPrefix):])
+	// A real key that differs from a valid one only in case: if ParsePartKey
+	// stops checking case, this plant parses and the assertion below fails.
+	upper := blob.PartsPrefix + strings.ToUpper(partKey[len(blob.PartsPrefix):])
 	for _, rel := range []string{
 		"parts/README",     // not a part key
 		"parts/sub/nested", // an extra path element
@@ -642,6 +641,7 @@ func TestScanTotalsPartitionTheTree(t *testing.T) {
 	for _, id := range []int64{a.ID, b.ID, keep.ID, keep.ID + 2} {
 		shards[path.Dir(blob.Key(id))] = true
 	}
+	shards[path.Dir(partKey)] = true // part shard directory
 	got := rep.Orphans.Count + rep.Temps.Count + rep.Parts.Count + rep.Unexplained.Count +
 		rep.Accounted + rep.AboveSnapshot + rep.TempsInFlight
 	if rep.Walked != got+len(shards)+1 { // +1 for the parts directory

@@ -25,8 +25,8 @@ func TestPartKeyDisjointFromAssembledKeys(t *testing.T) {
 		if err != nil {
 			t.Fatalf("part key: %v", err)
 		}
-		if len(k) != len(blob.PartsPrefix)+32 {
-			t.Fatalf("part key %q has length %d, want %d", k, len(k), len(blob.PartsPrefix)+32)
+		if len(k) != len(blob.PartsPrefix)+33 {
+			t.Fatalf("part key %q has length %d, want %d", k, len(k), len(blob.PartsPrefix)+33)
 		}
 		if k[:len(blob.PartsPrefix)] != blob.PartsPrefix {
 			t.Fatalf("part key %q does not start with %q", k, blob.PartsPrefix)

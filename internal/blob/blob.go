@@ -147,34 +147,70 @@ func IsShard(name string) bool {
 // that owns its row.
 const PartsPrefix = "parts/"
 
+// partKeySuffixBytes is how many random bytes a part key carries after the
+// shard directory. Together with the low-byte shard, that is 128 bits of
+// entropy — the same draw NewPartKey used when the keyspace was flat.
+const partKeySuffixBytes = 15
+
 // NewPartKey draws a random key for one in-flight upload part under
-// PartsPrefix. It is not derivable from anything the client names, which is
-// what makes two accounts that chose the same file_id hold disjoint bytes.
+// PartsPrefix, sharded on the draw's low byte so no single directory
+// accumulates the whole keyspace. It is not derivable from anything the client
+// names, which is what makes two accounts that chose the same file_id hold
+// disjoint bytes.
 func NewPartKey() (string, error) {
-	var buf [16]byte
+	var buf [partKeySuffixBytes + 1]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		return "", fmt.Errorf("part key: %w", err)
 	}
-	return PartsPrefix + hex.EncodeToString(buf[:]), nil
+	shard := buf[len(buf)-1]
+	return fmt.Sprintf("%s%02x/%s", PartsPrefix, shard, hex.EncodeToString(buf[:partKeySuffixBytes])), nil
 }
 
-// ParsePartKey reports whether key is one NewPartKey could have produced:
-// PartsPrefix, then exactly 32 lower-case hex characters, and nothing after.
+// IsPartShardDir reports whether key names a shard directory the part layout
+// produces: PartsPrefix, then exactly two lower-case hex digits, and nothing
+// after. It is the directory half of NewPartKey and exists for the same reason
+// as [IsShard] — a directory under the parts prefix that no part key could
+// live in is something else's, not the store's.
+func IsPartShardDir(key string) bool {
+	rest, ok := strings.CutPrefix(key, strings.TrimSuffix(PartsPrefix, "/")+"/")
+	if !ok || strings.Contains(rest, "/") {
+		return false
+	}
+	return IsShard(rest)
+}
+
+// ParsePartKey reports whether key is one NewPartKey could have produced, or
+// a flat key from before the shard layout: PartsPrefix, then either a shard
+// directory and exactly 30 lower-case hex characters, or exactly 32 lower-case
+// hex characters with no shard directory, and nothing after.
 //
 // It is the part-key half of ParseKey and exists for the same reason: a class
 // is earned by round-tripping through what the writer produces, never by where
 // a path sits. A prefix match would count parts/README and parts/sub/nested
 // as in-flight upload bytes, and the report would contradict itself on the
 // same two files while the directory holding them was warn-logged as
-// unexplained. The round trip is through the same 16 bytes NewPartKey draws,
+// unexplained. The round trip is through the same random draw NewPartKey uses,
 // so the two cannot drift apart.
 func ParsePartKey(key string) bool {
 	suffix, ok := strings.CutPrefix(key, PartsPrefix)
-	if !ok || len(suffix) != 32 {
+	if !ok {
 		return false
 	}
-	for i := range suffix {
-		c := suffix[i]
+	if shard, rest, ok := strings.Cut(suffix, "/"); ok {
+		if len(shard) != 2 || len(rest) != partKeySuffixBytes*2 || !IsShard(shard) {
+			return false
+		}
+		return isLowerHex(rest)
+	}
+	if len(suffix) != (partKeySuffixBytes+1)*2 {
+		return false
+	}
+	return isLowerHex(suffix)
+}
+
+func isLowerHex(s string) bool {
+	for i := range s {
+		c := s[i]
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
