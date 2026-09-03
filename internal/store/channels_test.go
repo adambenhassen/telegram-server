@@ -950,6 +950,19 @@ func TestConcurrentJoinAndRevokeRevokeWins(t *testing.T) {
 		t.Fatalf("wait for join to queue behind revoke: %v", err)
 	}
 
+	// Neither goroutine may finish while the blocker still holds the lock —
+	// if either does, the queue order we asserted above was wrong.
+	select {
+	case <-revokeDone:
+		t.Fatal("revoke completed before blocker released — invite row lock not held?")
+	default:
+	}
+	select {
+	case <-joinDone:
+		t.Fatal("join completed before blocker released — invite row lock not held?")
+	default:
+	}
+
 	// Release blocker — revoke (first in queue) gets the lock, commits.
 	// Join (second) then gets the lock, sees revoked row, refuses.
 	release()
