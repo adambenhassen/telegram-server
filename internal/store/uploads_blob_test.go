@@ -41,8 +41,8 @@ func TestUploadPartBytesLeavePostgres(t *testing.T) {
 	if size != int64(len(payload)) {
 		t.Fatalf("recorded size = %d, want %d (measured server-side)", size, len(payload))
 	}
-	if key == "" || len(key) != len(blob.PartsPrefix)+32 {
-		t.Fatalf("blob key = %q, want a %d-byte key under the parts prefix", key, len(blob.PartsPrefix)+32)
+	if key == "" || len(key) != len(blob.PartsPrefix)+33 {
+		t.Fatalf("blob key = %q, want a sharded %d-byte key under the parts prefix", key, len(blob.PartsPrefix)+33)
 	}
 
 	// The bytes are in the blob store, byte-identical.
@@ -52,6 +52,40 @@ func TestUploadPartBytesLeavePostgres(t *testing.T) {
 	}
 	if !bytes.Equal(b, payload) {
 		t.Fatalf("stored bytes differ from the payload")
+	}
+}
+
+// TestReadLegacyFlatPartKey keeps in-flight parts from before the shard layout
+// readable for their whole TTL: the row still names a flat key and ReadPartBytes
+// must reach the object.
+func TestReadLegacyFlatPartKey(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "+15559000111")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	legacyKey := blob.PartsPrefix + "deadbeef000000000000000000000000"
+	payload := part('l', 100)
+	b, dir := localBlobsOf(t, s)
+	if _, err := b.Put(ctx, legacyKey, bytes.NewReader(payload)); err != nil {
+		t.Fatalf("put legacy part: %v", err)
+	}
+	if err := store.InsertUploadPartWithKey(ctx, s, u.ID, 31, 0, int64(len(payload)), legacyKey); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+
+	got, err := s.ReadPartBytes(ctx, legacyKey)
+	if err != nil {
+		t.Fatalf("read legacy part: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("legacy part bytes differ")
+	}
+	if n := countPartKeys(t, dir); n != 1 {
+		t.Fatalf("legacy part objects = %d, want 1", n)
 	}
 }
 
@@ -931,18 +965,32 @@ func localBlobsOfStore(t *testing.T, s *store.Store) blob.Store {
 	return b
 }
 
-// listPartKeys lists the keys under the parts prefix in dir.
+// listPartKeys lists object paths under the parts prefix in dir, relative to
+// parts/. Flat legacy keys and sharded keys are both included.
 func listPartKeys(t *testing.T, dir string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dir, "parts"))
+	partsRoot := filepath.Join(dir, "parts")
+	entries, err := os.ReadDir(partsRoot)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		t.Fatalf("read parts dir: %v", err)
 	}
-	keys := make([]string, 0, len(entries))
+	var keys []string
 	for _, e := range entries {
+		if e.IsDir() {
+			sub, err := os.ReadDir(filepath.Join(partsRoot, e.Name()))
+			if err != nil {
+				t.Fatalf("read parts shard %s: %v", e.Name(), err)
+			}
+			for _, f := range sub {
+				if !f.IsDir() {
+					keys = append(keys, e.Name()+"/"+f.Name())
+				}
+			}
+			continue
+		}
 		if !e.IsDir() {
 			keys = append(keys, e.Name())
 		}

@@ -306,9 +306,59 @@ func TestParsePartKeyRefusesAnythingTheWriterCannotProduce(t *testing.T) {
 		"temp file":      "parts/deadbeef000000000000000000000000.tmp",
 		"other prefix":   "partx/deadbeef000000000000000000000000",
 		"leading slash":  "/parts/deadbeef000000000000000000000000",
+		"sharded short":  "parts/aa/deadbeef",
+		"sharded long":   "parts/aa/deadbeef00000000000000000000000000",
+		"bad shard":      "parts/9g/deadbeef000000000000000000000000",
 	} {
 		if blob.ParsePartKey(key) {
 			t.Errorf("%s: ParsePartKey(%q) = true; want false", name, key)
+		}
+	}
+}
+
+// TestParsePartKeyAcceptsLegacyFlatKeys keeps in-flight parts from before the
+// shard layout readable for their whole TTL.
+func TestParsePartKeyAcceptsLegacyFlatKeys(t *testing.T) {
+	t.Parallel()
+
+	legacy := blob.PartsPrefix + "deadbeef000000000000000000000000"
+	if !blob.ParsePartKey(legacy) {
+		t.Fatalf("ParsePartKey(%q) = false for a flat key the writer used to draw", legacy)
+	}
+}
+
+// TestNewPartKeyShardsOnLowByte pins that no single directory under the parts
+// prefix accumulates every new key.
+func TestNewPartKeyShardsOnLowByte(t *testing.T) {
+	t.Parallel()
+
+	for range 64 {
+		k, err := blob.NewPartKey()
+		if err != nil {
+			t.Fatalf("part key: %v", err)
+		}
+		rest := strings.TrimPrefix(k, blob.PartsPrefix)
+		shard, suffix, ok := strings.Cut(rest, "/")
+		if !ok || len(shard) != 2 || len(suffix) != 30 {
+			t.Fatalf("part key %q is not sharded as parts/xx/<30hex>", k)
+		}
+		if !blob.IsShard(shard) {
+			t.Fatalf("part key %q has invalid shard %q", k, shard)
+		}
+	}
+}
+
+func TestIsPartShardDir(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"parts/00", "parts/ff", "parts/92"} {
+		if !blob.IsPartShardDir(key) {
+			t.Errorf("IsPartShardDir(%q) = false", key)
+		}
+	}
+	for _, key := range []string{"parts", "parts/", "parts/9", "parts/9g", "parts/00/extra", "92"} {
+		if blob.IsPartShardDir(key) {
+			t.Errorf("IsPartShardDir(%q) = true", key)
 		}
 	}
 }
