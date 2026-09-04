@@ -3,13 +3,17 @@ package api_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 // TestUpdateStatusRefusesUnauthenticated proves an unauthenticated caller
@@ -689,5 +693,304 @@ func TestUpdateUsernameLoginCredentialReject(t *testing.T) {
 	}
 	if !errors.As(err, &rpc) || rpc.Message != "USERNAME_NOT_MODIFIED" {
 		t.Fatalf("error = %v, want USERNAME_NOT_MODIFIED", err)
+	}
+}
+
+// --- account.updateProfile tests ---
+
+func TestUpdateProfileUnauthenticated(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+
+	req := &tg.AccountUpdateProfileRequest{}
+	req.SetFirstName("Alice")
+	_, err := api.UpdateProfileForTest(s, 0, req)
+	if err == nil {
+		t.Fatal("expected error for unauthenticated caller")
+	}
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) || rpc.Message != "AUTH_KEY_UNREGISTERED" {
+		t.Fatalf("error = %v, want AUTH_KEY_UNREGISTERED", err)
+	}
+}
+
+func TestUpdateProfileSuccess(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	user, err := s.CreateUser(ctx, "+15550004101")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := &tg.AccountUpdateProfileRequest{}
+	req.SetFirstName("Alice")
+	req.SetLastName("Smith")
+	res, err := api.UpdateProfileForTest(s, user.ID, req)
+	if err != nil {
+		t.Fatalf("update profile: %v", err)
+	}
+	uRes, ok := res.(*tg.User)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.User", res)
+	}
+	if uRes.FirstName != "Alice" || uRes.LastName != "Smith" {
+		t.Fatalf("returned name = %q %q, want Alice Smith", uRes.FirstName, uRes.LastName)
+	}
+	if !uRes.Self {
+		t.Fatal("returned user is not self")
+	}
+
+	got, ok, err := s.UserByID(ctx, user.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok=%v err=%v", ok, err)
+	}
+	if got.FirstName != "Alice" || got.LastName != "Smith" {
+		t.Fatalf("stored name = %q %q, want Alice Smith", got.FirstName, got.LastName)
+	}
+}
+
+func TestUpdateProfileLastNameOnly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	user, err := s.CreateUser(ctx, "+15550004102")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := &tg.AccountUpdateProfileRequest{}
+	seed.SetFirstName("Alice")
+	seed.SetLastName("Smith")
+	if _, err := api.UpdateProfileForTest(s, user.ID, seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	req := &tg.AccountUpdateProfileRequest{}
+	req.SetLastName("Jones")
+	res, err := api.UpdateProfileForTest(s, user.ID, req)
+	if err != nil {
+		t.Fatalf("update last: %v", err)
+	}
+	uRes, ok := res.(*tg.User)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.User", res)
+	}
+	if uRes.FirstName != "Alice" || uRes.LastName != "Jones" {
+		t.Fatalf("returned name = %q %q, want Alice Jones", uRes.FirstName, uRes.LastName)
+	}
+}
+
+func TestUpdateProfileRejectsOverlongOrNul(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	user, err := s.CreateUser(ctx, "+15550004103")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name  string
+		first string
+		last  string
+	}{
+		{name: "long first", first: strings.Repeat("a", 65), last: "Valid"},
+		{name: "long last", first: "Valid", last: strings.Repeat("界", 65)},
+		{name: "nul first", first: "Bad\x00Name", last: "Valid"},
+	}
+	for _, tc := range cases {
+		req := &tg.AccountUpdateProfileRequest{}
+		req.SetFirstName(tc.first)
+		req.SetLastName(tc.last)
+		_, err := api.UpdateProfileForTest(s, user.ID, req)
+		if err == nil {
+			t.Errorf("%s: expected INPUT_REQUEST_INVALID, got success", tc.name)
+			continue
+		}
+		var rpc *tgerr.Error
+		if !errors.As(err, &rpc) || rpc.Message != "INPUT_REQUEST_INVALID" {
+			t.Errorf("%s: error = %v, want INPUT_REQUEST_INVALID", tc.name, err)
+		}
+	}
+
+	got, ok, err := s.UserByID(ctx, user.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok=%v err=%v", ok, err)
+	}
+	if got.FirstName != "" || got.LastName != "" {
+		t.Fatalf("rejected updates wrote names %q %q", got.FirstName, got.LastName)
+	}
+}
+
+func TestUpdateProfileAcceptsSignupMaxLength(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	user, err := s.CreateUser(ctx, "+15550004104")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := strings.Repeat("a", 64)
+	last := strings.Repeat("界", 64)
+	if utf8.RuneCountInString(last) != 64 {
+		t.Fatalf("last rune count = %d, want 64", utf8.RuneCountInString(last))
+	}
+	req := &tg.AccountUpdateProfileRequest{}
+	req.SetFirstName(first)
+	req.SetLastName(last)
+	res, err := api.UpdateProfileForTest(s, user.ID, req)
+	if err != nil {
+		t.Fatalf("64-rune names must pass, as at signup: %v", err)
+	}
+	uRes, ok := res.(*tg.User)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.User", res)
+	}
+	if uRes.FirstName != first || uRes.LastName != last {
+		t.Fatal("returned names did not match the 64-rune inputs")
+	}
+}
+
+func TestUpdateProfileDoesNotChangeOtherUser(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	alice, err := s.CreateUser(ctx, "+15550004105")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15550004106")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := &tg.AccountUpdateProfileRequest{}
+	seed.SetFirstName("Bob")
+	seed.SetLastName("Original")
+	if _, err := api.UpdateProfileForTest(s, bob.ID, seed); err != nil {
+		t.Fatalf("seed bob: %v", err)
+	}
+
+	req := &tg.AccountUpdateProfileRequest{}
+	req.SetFirstName("Alice")
+	req.SetLastName("Smith")
+	if _, err := api.UpdateProfileForTest(s, alice.ID, req); err != nil {
+		t.Fatalf("update alice: %v", err)
+	}
+
+	got, ok, err := s.UserByID(ctx, bob.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup bob: ok=%v err=%v", ok, err)
+	}
+	if got.FirstName != "Bob" || got.LastName != "Original" {
+		t.Fatalf("bob name = %q %q, want Bob Original", got.FirstName, got.LastName)
+	}
+}
+
+func TestUpdateProfilePeerSeesNewName(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	alice, err := s.CreateUser(ctx, "+15550004107")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "+15550004108")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.SendMessageForTest(s, alice.ID, &tg.MessagesSendMessageRequest{
+		Peer:     api.InputPeerUser(alice.ID, bob.ID),
+		Message:  "hello",
+		RandomID: 4108,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	req := &tg.AccountUpdateProfileRequest{}
+	req.SetFirstName("Alicia")
+	req.SetLastName("Renamed")
+	if _, err := api.UpdateProfileForTest(s, alice.ID, req); err != nil {
+		t.Fatalf("update profile: %v", err)
+	}
+
+	users, err := api.LoadUsersForTest(s, []int64{alice.ID}, bob.ID)
+	if err != nil {
+		t.Fatalf("load users: %v", err)
+	}
+	var seen *tg.User
+	for _, u := range users {
+		if user, ok := u.(*tg.User); ok && user.ID == alice.ID {
+			seen = user
+			break
+		}
+	}
+	if seen == nil {
+		t.Fatal("bob did not receive alice as a full user")
+	}
+	if seen.FirstName != "Alicia" || seen.LastName != "Renamed" {
+		t.Fatalf("bob sees alice as %q %q, want Alicia Renamed", seen.FirstName, seen.LastName)
+	}
+}
+
+func TestUpdateProfileIgnoresAbout(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	user, err := s.CreateUser(ctx, "+15550004109")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := &tg.AccountUpdateProfileRequest{}
+	req.SetFirstName("Alice")
+	req.SetAbout("this bio is out of scope")
+	res, err := api.UpdateProfileForTest(s, user.ID, req)
+	if err != nil {
+		t.Fatalf("update with about: %v", err)
+	}
+	uRes, ok := res.(*tg.User)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.User", res)
+	}
+	if uRes.FirstName != "Alice" {
+		t.Fatalf("first name = %q, want Alice", uRes.FirstName)
+	}
+}
+
+func TestUpdateProfileRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	user, err := s.CreateUser(ctx, "+15550004110")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := store.RateLimitConfig{Limit: 2, Window: 10 * time.Second}
+	for i := range 2 {
+		req := &tg.AccountUpdateProfileRequest{}
+		req.SetFirstName("Name")
+		if _, err := api.UpdateProfileForTestWithLimits(s, user.ID, cfg, req); err != nil {
+			t.Fatalf("update %d: %v", i+1, err)
+		}
+	}
+	req := &tg.AccountUpdateProfileRequest{}
+	req.SetFirstName("Blocked")
+	_, err = api.UpdateProfileForTestWithLimits(s, user.ID, cfg, req)
+	if err == nil {
+		t.Fatal("expected FLOOD_WAIT on third update")
+	}
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) || rpc.Code != 420 {
+		t.Fatalf("error = %v, want FLOOD_WAIT", err)
+	}
+
+	got, ok, err := s.UserByID(ctx, user.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok=%v err=%v", ok, err)
+	}
+	if got.FirstName != "Name" {
+		t.Fatalf("denied update wrote first_name = %q", got.FirstName)
 	}
 }
