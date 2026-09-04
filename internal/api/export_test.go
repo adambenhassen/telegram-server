@@ -734,6 +734,27 @@ func UpdateUsernameForTest(s *store.Store, userID int64, username string) (bin.E
 	return testHandlers(s).handleUpdateUsername(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// UpdateProfileForTest invokes handleUpdateProfile for userID.
+func UpdateProfileForTest(s *store.Store, userID int64, req *tg.AccountUpdateProfileRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleUpdateProfile(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// UpdateProfileForTestWithLimits invokes handleUpdateProfile against a custom
+// per-account updateProfile rate limit.
+func UpdateProfileForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.AccountUpdateProfileRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitUpdateProfile = rateLimit
+	return h.handleUpdateProfile(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // ClaimChannelUsernameForTest claims a username for a channel atomically
 // (both usernames table and channels.username column), so api_test can exercise
 // the username resolution path without the RPC that claims channel usernames

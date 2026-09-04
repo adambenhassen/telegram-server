@@ -316,6 +316,30 @@ func (q *Queries) SetUsername(ctx context.Context, arg SetUsernameParams) (int64
 	return result.RowsAffected(), nil
 }
 
+const updateUserProfile = `-- name: UpdateUserProfile :execrows
+UPDATE users
+SET first_name = COALESCE($1, first_name),
+    last_name = COALESCE($2, last_name)
+WHERE id = $3
+`
+
+type UpdateUserProfileParams struct {
+	FirstName *string
+	LastName  *string
+	ID        int64
+}
+
+// A nil first_name or last_name leaves that column unchanged. An empty string
+// is a real write: signup accepts an empty display name, so the update path
+// must too.
+func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateUserProfile, arg.FirstName, arg.LastName, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const userByID = `-- name: UserByID :one
 SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
        un.handle AS username

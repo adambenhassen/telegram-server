@@ -99,6 +99,8 @@ type handlers struct {
 	// authorized callers (r.UserID != 0 && hasPw). Provisional accounts are
 	// not subject to this limit.
 	rateLimitGetPassword store.RateLimitConfig
+	// rateLimitUpdateProfile limits account.updateProfile per account.
+	rateLimitUpdateProfile store.RateLimitConfig
 	// registrationMode controls whether auth.signUp is available.
 	registrationMode config.RegistrationMode
 }
@@ -183,6 +185,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitSignUpIP:        rateLimits.SignUpIP,
 		rateLimitPasswordProof:   rateLimits.PasswordProof,
 		rateLimitGetPassword:     rateLimits.GetPassword,
+		rateLimitUpdateProfile:   rateLimits.UpdateProfile,
 		registrationMode:         registrationMode,
 	}
 	d := mtproto.NewDispatcher()
@@ -197,6 +200,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.AccountGetPasswordRequestTypeID, h.handleGetPassword)
 	register(d, tg.AccountUpdateStatusRequestTypeID, h.handleUpdateStatus)
 	register(d, tg.AccountUpdateUsernameRequestTypeID, h.handleUpdateUsername)
+	register(d, tg.AccountUpdateProfileRequestTypeID, h.handleUpdateProfile)
 	register(d, tg.AuthCheckPasswordRequestTypeID, h.handleCheckPassword)
 	register(d, tg.AccountUpdatePasswordSettingsRequestTypeID, h.handleUpdatePasswordSettings)
 	register(d, tg.AccountGetPasswordSettingsRequestTypeID, h.handleGetPasswordSettings)

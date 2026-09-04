@@ -186,3 +186,54 @@ func (h *handlers) handleUpdateUsername(r *mtproto.Request) (bin.Encoder, error)
 	}
 	return h.userToTL(updatedUser, r.UserID, true), nil
 }
+
+// handleUpdateProfile serves account.updateProfile. An authenticated caller
+// changes their own first and/or last name. About is accepted on the wire and
+// ignored: bio storage is out of scope. Name validation is the same predicate
+// auth.signUp uses, so a name that registration would accept cannot be rejected
+// here.
+func (h *handlers) handleUpdateProfile(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.AccountUpdateProfileRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+
+	first, hasFirst := req.GetFirstName()
+	last, hasLast := req.GetLastName()
+	if hasFirst && !validateSignUpName(first) {
+		return nil, errInputRequestInvalid
+	}
+	if hasLast && !validateSignUpName(last) {
+		return nil, errInputRequestInvalid
+	}
+
+	if hasFirst || hasLast {
+		if err := h.checkRateLimit(r, "update_profile", h.rateLimitUpdateProfile); err != nil {
+			return nil, err
+		}
+		var firstName, lastName *string
+		if hasFirst {
+			firstName = &first
+		}
+		if hasLast {
+			lastName = &last
+		}
+		if err := h.store.UpdateProfile(r.Ctx, r.UserID, firstName, lastName); err != nil {
+			h.log.Error("update profile", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+	}
+
+	updatedUser, ok, err := h.store.UserByID(r.Ctx, r.UserID)
+	if err != nil {
+		h.log.Error("update profile: load user", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !ok {
+		return nil, errInternal
+	}
+	return h.userToTL(updatedUser, r.UserID, true), nil
+}

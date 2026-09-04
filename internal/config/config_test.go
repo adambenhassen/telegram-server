@@ -99,6 +99,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.RateLimits.SaveFilePart.Window != 60*time.Second {
 		t.Errorf("SaveFilePart window = %v, want 60s", cfg.RateLimits.SaveFilePart.Window)
 	}
+	if cfg.RateLimits.UpdateProfile.Limit != 20 {
+		t.Errorf("UpdateProfile limit = %d, want 20", cfg.RateLimits.UpdateProfile.Limit)
+	}
+	if cfg.RateLimits.UpdateProfile.Window != 24*time.Hour {
+		t.Errorf("UpdateProfile window = %v, want 24h", cfg.RateLimits.UpdateProfile.Window)
+	}
 }
 
 func TestLoadBlobDir(t *testing.T) {
@@ -930,6 +936,19 @@ func TestLoadNewRateLimits(t *testing.T) {
 	}
 	if cfg.RateLimits.SignUpIP.Window != 12*time.Hour {
 		t.Errorf("SignUpIP window = %v, want 12h", cfg.RateLimits.SignUpIP.Window)
+	}
+
+	t.Setenv("TG_RATE_LIMIT_UPDATE_PROFILE", "7")
+	t.Setenv("TG_RATE_LIMIT_UPDATE_PROFILE_WINDOW", "2h")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.UpdateProfile.Limit != 7 {
+		t.Errorf("UpdateProfile limit = %d, want 7", cfg.RateLimits.UpdateProfile.Limit)
+	}
+	if cfg.RateLimits.UpdateProfile.Window != 2*time.Hour {
+		t.Errorf("UpdateProfile window = %v, want 2h", cfg.RateLimits.UpdateProfile.Window)
 	}
 
 	// Zero disables.

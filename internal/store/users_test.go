@@ -630,3 +630,87 @@ func TestUsersByIDBatchedLookup(t *testing.T) {
 		t.Fatalf("empty = %d, want 0", len(empty))
 	}
 }
+
+func TestUpdateProfileSetsBothNames(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15550004001")
+
+	if err := s.UpdateProfile(ctx, u.ID, new("Alice"), new("Smith")); err != nil {
+		t.Fatalf("update profile: %v", err)
+	}
+
+	got, ok, err := s.UserByID(ctx, u.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok=%v err=%v", ok, err)
+	}
+	if got.FirstName != "Alice" {
+		t.Errorf("first_name = %q, want Alice", got.FirstName)
+	}
+	if got.LastName != "Smith" {
+		t.Errorf("last_name = %q, want Smith", got.LastName)
+	}
+}
+
+func TestUpdateProfilePartialLeavesOtherField(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15550004002")
+	if err := s.UpdateProfile(ctx, u.ID, new("Alice"), new("Smith")); err != nil {
+		t.Fatalf("seed names: %v", err)
+	}
+
+	if err := s.UpdateProfile(ctx, u.ID, new("Alicia"), nil); err != nil {
+		t.Fatalf("update first: %v", err)
+	}
+	got, ok, err := s.UserByID(ctx, u.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup after first: ok=%v err=%v", ok, err)
+	}
+	if got.FirstName != "Alicia" || got.LastName != "Smith" {
+		t.Fatalf("after first = %q %q, want Alicia Smith", got.FirstName, got.LastName)
+	}
+
+	if err := s.UpdateProfile(ctx, u.ID, nil, new("Jones")); err != nil {
+		t.Fatalf("update last: %v", err)
+	}
+	got, ok, err = s.UserByID(ctx, u.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup after last: ok=%v err=%v", ok, err)
+	}
+	if got.FirstName != "Alicia" || got.LastName != "Jones" {
+		t.Fatalf("after last = %q %q, want Alicia Jones", got.FirstName, got.LastName)
+	}
+}
+
+func TestUpdateProfileEmptyStringClearsName(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	u := mustUser(t, s, "+15550004003")
+	if err := s.UpdateProfile(ctx, u.ID, new("Alice"), new("Smith")); err != nil {
+		t.Fatalf("seed names: %v", err)
+	}
+
+	if err := s.UpdateProfile(ctx, u.ID, new(""), new("")); err != nil {
+		t.Fatalf("clear names: %v", err)
+	}
+	got, ok, err := s.UserByID(ctx, u.ID)
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok=%v err=%v", ok, err)
+	}
+	if got.FirstName != "" || got.LastName != "" {
+		t.Fatalf("names = %q %q, want empty", got.FirstName, got.LastName)
+	}
+}
+
+func TestUpdateProfileMissingUser(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	err := s.UpdateProfile(context.Background(), 99999, new("Alice"), nil)
+	if err == nil {
+		t.Fatal("expected error for missing user")
+	}
+}
