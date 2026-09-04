@@ -385,8 +385,8 @@ func TestHandleCreateChannelAtPerAccountCap(t *testing.T) {
 	// reachable from this package.
 	channelExec(t, ctx, dsn, `
 		WITH created AS (
-			INSERT INTO channels (title, creator_id)
-			SELECT 'filler ' || g, $1 FROM generate_series(1, 500) g
+			INSERT INTO channels (id, title, creator_id)
+			SELECT g, 'filler ' || g, $1 FROM generate_series(1, 500) g
 			RETURNING id
 		)
 		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
@@ -2989,8 +2989,8 @@ func TestJoinChannelAtPerUserCap(t *testing.T) {
 	// so that the next join attempt is the 501st and fails.
 	channelExec(t, ctx, dsn, `
 		WITH filler_channels AS (
-			INSERT INTO channels (title, creator_id, megagroup)
-			SELECT 'filler ' || g, $1, false
+			INSERT INTO channels (id, title, creator_id, megagroup)
+			SELECT g, 'filler ' || g, $1, false
 			FROM generate_series(1, 500) g
 			RETURNING id
 		),
