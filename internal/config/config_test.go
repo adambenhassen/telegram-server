@@ -806,7 +806,7 @@ func TestLoadRegistrationMode(t *testing.T) {
 		"empty string": {raw: "", want: config.RegistrationClosed},
 		"closed":       {raw: "closed", want: config.RegistrationClosed},
 		"invite":       {raw: "invite", want: config.RegistrationInvite},
-		"open":         {raw: "open", wantErr: true},
+		"open":         {raw: "open", want: config.RegistrationOpen},
 		"invalid":      {raw: "unknown", wantErr: true},
 	}
 	for name, tc := range tests {
@@ -828,7 +828,7 @@ func TestLoadRegistrationMode(t *testing.T) {
 				if !strings.Contains(verr.Error(), "TG_REGISTRATION") {
 					t.Errorf("error %q does not name TG_REGISTRATION", verr)
 				}
-				for _, accepted := range []string{"closed", "invite"} {
+				for _, accepted := range []string{"closed", "invite", "open"} {
 					if !strings.Contains(verr.Error(), accepted) {
 						t.Errorf("error %q does not name accepted mode %q", verr, accepted)
 					}
