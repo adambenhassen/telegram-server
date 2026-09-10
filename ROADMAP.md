@@ -730,11 +730,11 @@ Tracked so shortcuts don't rot into "later means never".
   without inspecting plaintext, so full-text indexing of secret-chat content is not possible by
   design and will not be added. — M13
 
-- **Invite-gated account issuance.** `TG_REGISTRATION` accepts `closed` and
-  `invite`. In `invite` mode, `auth.signUp` admits one username only with an
-  operator-issued, single-use, expiring authorization and a possession proof
-  carried through username sign-in. The per-IP `sign_up_ip` limit (default
-  5/hour) remains defence in depth. — M20
+- **Invite-gated account issuance.** `TG_REGISTRATION` accepts `closed`, `invite`, and
+  `open`, with `closed` as the default. In `invite` mode, `auth.signUp` admits one username
+  only with an operator-issued, single-use, expiring authorization and a possession proof
+  carried through username sign-in; in `open` mode, it admits usernames without an invite.
+  The per-IP `sign_up_ip` limit (default 5/hour) remains defence in depth. — M20
 - **Residual account-issuance exposure.** The invite gate bounds issuance by
   operator access, not by a global account count. It does not constrain an
   invite obtained legitimately or contain a compromised operator credential.
@@ -764,9 +764,11 @@ Tracked so shortcuts don't rot into "later means never".
   clients put a phone number in the `phone_number` field of `auth.sendCode`, the server
   rejects that input as neither a valid E.164 phone nor a valid username, and no SMS code
   delivery exists.
-- **`TG_REGISTRATION`** (`closed` / `open`, default `closed`). Controls whether `auth.signUp`
-  creates new accounts. In `closed` mode the RPC is rejected at the boundary; sign-in for
-  accounts that already exist is unaffected. An unrecognized value fails startup.
+- **`TG_REGISTRATION`** (`closed` / `invite` / `open`, default `closed`). Controls whether
+  `auth.signUp` creates new accounts. In `closed` mode the RPC is rejected at the boundary;
+  `invite` mode requires an operator-issued invite; and `open` mode admits usernames without
+  one. Sign-in for accounts that already exist is unaffected. An unrecognized value fails
+  startup.
 - **`TG_BOOTSTRAP_USERNAME` / `TG_BOOTSTRAP_PASSWORD`** (or `TG_BOOTSTRAP_PASSWORD_FILE`).
   Creates a seed username-mode account with a verifier before the server binds its port.
   Idempotent when the username already exists, is a user-type owner with `login_mode='username'`,
@@ -802,9 +804,8 @@ Tracked so shortcuts don't rot into "later means never".
 - The `telegramd invite issue`, `invite list`, and `invite revoke` commands provide
   the operator issuance and lifecycle surface. `issue` prints the new secret once;
   `list` and `revoke` do not expose stored secrets.
-- `TG_REGISTRATION` accepts `closed` and `invite`; `open` was deliberately
-  removed in M20 and is rejected at startup. MAIN-585 brings it back once the
-  shared admission path it reuses is tested.
+- `TG_REGISTRATION` accepts `closed`, `invite`, and `open`; M20 added the invite-gated path,
+  while `open` uses the same admission flow without an invite.
 
 ## Engineering invariants
 
