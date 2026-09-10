@@ -141,7 +141,7 @@ The server refuses to start without a database and a master key:
 | `TG_DC_ID` | `2` | DC id the server advertises |
 | `TG_BOOTSTRAP_USERNAME` | *(unset)* | Seed a username/password operator account at startup; requires exactly one of `TG_BOOTSTRAP_PASSWORD` or `TG_BOOTSTRAP_PASSWORD_FILE` |
 | `TG_BOOTSTRAP_PASSWORD_FILE` | *(unset)* | File (mode 0600) the bootstrap password is read from. Prefer it over `TG_BOOTSTRAP_PASSWORD`: an env value stays visible in `/proc/<pid>/environ`, orchestrator inspect output and crash dumps for the life of the process |
-| `TG_REGISTRATION` | `closed` | Accepted values are `closed` and `invite`; both currently reject `auth.signUp` until invite admission is implemented |
+| `TG_REGISTRATION` | `closed` | Accepted values are `closed`, `invite`, and `open`; `closed` rejects `auth.signUp`, `invite` requires an operator-issued invite, and `open` admits usernames without one. An unrecognized value fails startup |
 | `TG_LOG_LOGIN_CODES` | `false` | Write phone-mode login codes to the log; with it off, phone-number sign-in cannot complete (username/password sign-in is unaffected) |
 | `TG_ADMIN_LISTEN_ADDR` | *(unset)* | Enables the admin HTTP server; requires `TG_ADMIN_TOKEN_HASH` (SHA-256 hex of the operator token) |
 

@@ -90,18 +90,20 @@ func verifyToRPC(err error) *tgerr.Error {
 	}
 }
 
-// handleSignUp serves auth.signUp. Account creation is admitted only when the
-// configured mode is invite and the store can commit the complete admission
-// transaction.
+// handleSignUp serves auth.signUp. Account creation is admitted when the
+// configured mode is invite or open and the store can commit the complete
+// admission transaction.
 func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthSignUpRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
 
-	// Keep the closed gate before validation and storage work. The only supported
-	// admission mode is invite-backed registration.
-	if h.registrationMode != config.RegistrationInvite {
+	// Keep the closed gate before validation and storage work. Unknown modes also
+	// fail closed if a handler is constructed without startup validation.
+	switch h.registrationMode {
+	case config.RegistrationInvite, config.RegistrationOpen:
+	default:
 		return nil, errInputRequestInvalid
 	}
 	if !validateUsername(req.PhoneNumber) {
@@ -126,6 +128,7 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 		mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		req.FirstName,
 		req.LastName,
+		h.registrationMode == config.RegistrationInvite,
 	)
 	if err != nil {
 		switch {

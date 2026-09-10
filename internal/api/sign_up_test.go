@@ -123,6 +123,104 @@ func TestSignUpInviteAdmissionCreatesProvisionalAccount(t *testing.T) {
 	}
 }
 
+func TestSignUpRegistrationModes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	addr := netip.MustParseAddr("10.0.0.11")
+	limits := store.RateLimitConfig{}
+
+	if err := s.SaveAuthKey(ctx, 1, make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	before := countUsers(t, dsn)
+	if _, err := api.SignUpForTest(s, [8]byte{1}, addr, limits, config.RegistrationClosed, &tg.AuthSignUpRequest{
+		PhoneNumber: "closeduser",
+		FirstName:   "Closed",
+	}); !isInputRequestInvalid(err) {
+		t.Fatalf("closed signUp: expected INPUT_REQUEST_INVALID, got %v", err)
+	}
+	if after := countUsers(t, dsn); after != before {
+		t.Fatalf("closed signUp changed users from %d to %d", before, after)
+	}
+
+	invite, _, err := s.IssueInvite(ctx, "inviteuser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inviteHash, _, err := s.IssueCodeForUsername(ctx, "inviteuser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveAuthKey(ctx, 2, make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.SignInForTestWithLimits(s, [8]byte{2}, addr, limits, &tg.AuthSignInRequest{
+		PhoneNumber:   "inviteuser",
+		PhoneCodeHash: inviteHash,
+		PhoneCode:     "wrong-secret",
+	}); err != nil {
+		t.Fatalf("invite signIn: %v", err)
+	}
+	if _, err := api.SignUpForTest(s, [8]byte{2}, addr, limits, config.RegistrationInvite, &tg.AuthSignUpRequest{
+		PhoneNumber:   "inviteuser",
+		PhoneCodeHash: inviteHash,
+		FirstName:     "Invite",
+	}); !isInputRequestInvalid(err) {
+		t.Fatalf("invite signUp without valid secret: expected INPUT_REQUEST_INVALID, got %v", err)
+	}
+
+	openHash, _, err := s.IssueCodeForUsername(ctx, "openuser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveAuthKey(ctx, 3, make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.SignInForTestWithLimits(s, [8]byte{3}, addr, limits, &tg.AuthSignInRequest{
+		PhoneNumber:   "openuser",
+		PhoneCodeHash: openHash,
+		PhoneCode:     "open-proof",
+	}); err != nil {
+		t.Fatalf("open signIn: %v", err)
+	}
+	res, err := api.SignUpForTest(s, [8]byte{3}, addr, limits, config.RegistrationOpen, &tg.AuthSignUpRequest{
+		PhoneNumber:   "openuser",
+		PhoneCodeHash: openHash,
+		FirstName:     "Open",
+	})
+	if err != nil {
+		t.Fatalf("open signUp: %v", err)
+	}
+	if _, ok := res.(*tg.AuthAuthorization); !ok {
+		t.Fatalf("open signUp result = %T, want *tg.AuthAuthorization", res)
+	}
+	if after := countUsers(t, dsn); after != before+1 {
+		t.Fatalf("open signUp changed users from %d to %d, want %d", before, after, before+1)
+	}
+	resolved, found, err := s.UserByUsernameWithLoginMode(ctx, "openuser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || resolved.LoginMode != "username" {
+		t.Fatalf("open user lookup = %#v found=%v, want username-mode user", resolved, found)
+	}
+	key, found, err := s.AuthKeyByID(ctx, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || key.UserID != resolved.ID || !key.Provisional {
+		t.Fatalf("open auth key = %#v found=%v, want provisional binding to user %d", key, found, resolved.ID)
+	}
+	invites, err := s.ListInvites(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invites) != 1 || invites[0].ID != invite.ID || invites[0].State != store.InviteIssued {
+		t.Fatalf("invites = %#v, want invite %d still issued", invites, invite.ID)
+	}
+}
+
 func TestSignUpRejectsOverlongOrNulDisplayNames(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -316,19 +414,39 @@ func TestSignUpFailureAfterInviteConsumptionRollsBack(t *testing.T) {
 func TestSignUpRateLimitChargesBeforeIdentifierLookup(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
-	addr := netip.MustParseAddr("10.0.0.4")
 	limits := store.RateLimitConfig{Limit: 1, Window: time.Hour}
-
-	request := &tg.AuthSignUpRequest{
-		PhoneNumber:   "unknownhandle",
-		PhoneCodeHash: "invalid-hash",
-		FirstName:     "Alice",
-	}
-	if _, err := api.SignUpForTest(s, [8]byte{1}, addr, limits, config.RegistrationInvite, request); !isInputRequestInvalid(err) {
-		t.Fatalf("first signUp: expected INPUT_REQUEST_INVALID, got %v", err)
-	}
-	if _, err := api.SignUpForTest(s, [8]byte{2}, addr, limits, config.RegistrationInvite, request); !isFloodWait(err) {
-		t.Fatalf("second signUp: expected FLOOD_WAIT, got %v", err)
+	for _, tc := range []struct {
+		mode      config.RegistrationMode
+		addr      netip.Addr
+		firstKey  [8]byte
+		secondKey [8]byte
+	}{
+		{
+			mode:      config.RegistrationInvite,
+			addr:      netip.MustParseAddr("10.0.0.4"),
+			firstKey:  [8]byte{1},
+			secondKey: [8]byte{2},
+		},
+		{
+			mode:      config.RegistrationOpen,
+			addr:      netip.MustParseAddr("10.0.0.5"),
+			firstKey:  [8]byte{3},
+			secondKey: [8]byte{4},
+		},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			request := &tg.AuthSignUpRequest{
+				PhoneNumber:   "unknownhandle",
+				PhoneCodeHash: "invalid-hash",
+				FirstName:     "Alice",
+			}
+			if _, err := api.SignUpForTest(s, tc.firstKey, tc.addr, limits, tc.mode, request); !isInputRequestInvalid(err) {
+				t.Fatalf("first signUp: expected INPUT_REQUEST_INVALID, got %v", err)
+			}
+			if _, err := api.SignUpForTest(s, tc.secondKey, tc.addr, limits, tc.mode, request); !isFloodWait(err) {
+				t.Fatalf("second signUp: expected FLOOD_WAIT, got %v", err)
+			}
+		})
 	}
 }
 
