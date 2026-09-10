@@ -218,9 +218,11 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 	// Valid proof: refund both reserved tokens.
 	if err := h.store.RefundRateLimit(r.Ctx, pendingUserID, "check_password", accountReserve); err != nil {
 		h.log.Error("check password: refund account reserve", "err", err)
+		return nil, errInternal
 	}
 	if err := h.refundRateLimitIP(r, "check_password_ip", ipReserve); err != nil {
 		h.log.Error("check password: refund IP reserve", "err", err)
+		return nil, errInternal
 	}
 
 	keyID := mtproto.AuthKeyIDInt64(r.AuthKeyID)

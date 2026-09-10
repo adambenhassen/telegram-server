@@ -99,6 +99,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.RateLimits.SaveFilePart.Window != 60*time.Second {
 		t.Errorf("SaveFilePart window = %v, want 60s", cfg.RateLimits.SaveFilePart.Window)
 	}
+	if cfg.RateLimits.UpdateProfile.Limit != 20 {
+		t.Errorf("UpdateProfile limit = %d, want 20", cfg.RateLimits.UpdateProfile.Limit)
+	}
+	if cfg.RateLimits.UpdateProfile.Window != 24*time.Hour {
+		t.Errorf("UpdateProfile window = %v, want 24h", cfg.RateLimits.UpdateProfile.Window)
+	}
 }
 
 func TestLoadBlobDir(t *testing.T) {
@@ -322,6 +328,46 @@ func TestLoadMaxConnsPerUnboundKey(t *testing.T) {
 			}
 			if cfg.MaxConnsPerUnboundKey != tc.want {
 				t.Errorf("MaxConnsPerUnboundKey = %d, want %d", cfg.MaxConnsPerUnboundKey, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadMaxPendingLoginConns(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+
+	tests := map[string]struct {
+		raw     string
+		want    int
+		wantErr bool
+	}{
+		"default":     {want: mtproto.DefaultMaxPendingLoginConns},
+		"override":    {raw: "3", want: 3},
+		"off":         {raw: "0", want: 0},
+		"not integer": {raw: "a few", wantErr: true},
+		"negative":    {raw: "-1", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if tc.raw != "" {
+				t.Setenv("TG_MAX_PENDING_LOGIN_CONNS", tc.raw)
+			}
+			cfg, err := config.Load(discardLog())
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got MaxPendingLoginConns = %d", tc.raw, cfg.MaxPendingLoginConns)
+				}
+				if !strings.Contains(err.Error(), "TG_MAX_PENDING_LOGIN_CONNS") {
+					t.Errorf("error %q does not name TG_MAX_PENDING_LOGIN_CONNS", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.MaxPendingLoginConns != tc.want {
+				t.Errorf("MaxPendingLoginConns = %d, want %d", cfg.MaxPendingLoginConns, tc.want)
 			}
 		})
 	}
@@ -890,6 +936,19 @@ func TestLoadNewRateLimits(t *testing.T) {
 	}
 	if cfg.RateLimits.SignUpIP.Window != 12*time.Hour {
 		t.Errorf("SignUpIP window = %v, want 12h", cfg.RateLimits.SignUpIP.Window)
+	}
+
+	t.Setenv("TG_RATE_LIMIT_UPDATE_PROFILE", "7")
+	t.Setenv("TG_RATE_LIMIT_UPDATE_PROFILE_WINDOW", "2h")
+	cfg, err = config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.UpdateProfile.Limit != 7 {
+		t.Errorf("UpdateProfile limit = %d, want 7", cfg.RateLimits.UpdateProfile.Limit)
+	}
+	if cfg.RateLimits.UpdateProfile.Window != 2*time.Hour {
+		t.Errorf("UpdateProfile window = %v, want 2h", cfg.RateLimits.UpdateProfile.Window)
 	}
 
 	// Zero disables.

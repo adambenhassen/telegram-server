@@ -79,6 +79,10 @@ func TestDeliverStatusPushesToPartnersOnly(t *testing.T) {
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
 
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
 	if err := s.Notify(ctx, store.ChannelStatus, store.StatusPayload(alice.ID, false)); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
@@ -140,6 +144,10 @@ func TestDeliverStatusOnline(t *testing.T) {
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
 
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
 	if err := s.Notify(ctx, store.ChannelStatus, store.StatusPayload(alice.ID, true)); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
@@ -181,6 +189,10 @@ func TestDeliverStatusNoPartners(t *testing.T) {
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
 
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
 	// Must not panic or error.
 	if err := s.Notify(ctx, store.ChannelStatus, store.StatusPayload(alice.ID, true)); err != nil {
 		t.Fatalf("notify: %v", err)
@@ -210,6 +222,10 @@ func TestDeliverStatusMalformedPayload(t *testing.T) {
 		t.Fatalf("start listener: %v", err)
 	}
 	defer func() { _ = stop() }() //nolint:errcheck // teardown
+
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
 
 	// Malformed payloads must be dropped.
 	for _, payload := range []string{"no-pipe", "abc|def", "|1", "1|"} {

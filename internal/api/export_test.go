@@ -59,7 +59,7 @@ func SignInForTestWithLimits(s *store.Store, authKeyID [8]byte, addr netip.Addr,
 	}
 	h := testHandlers(s)
 	h.rateLimitSignInFailIP = rateLimit
-	return h.handleSignIn(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+	return h.handleSignIn(nil, &mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
 }
 
 // SignUpForTest invokes handleSignUp for a request arriving from addr, against
@@ -734,6 +734,27 @@ func UpdateUsernameForTest(s *store.Store, userID int64, username string) (bin.E
 	return testHandlers(s).handleUpdateUsername(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// UpdateProfileForTest invokes handleUpdateProfile for userID.
+func UpdateProfileForTest(s *store.Store, userID int64, req *tg.AccountUpdateProfileRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleUpdateProfile(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// UpdateProfileForTestWithLimits invokes handleUpdateProfile against a custom
+// per-account updateProfile rate limit.
+func UpdateProfileForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.AccountUpdateProfileRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitUpdateProfile = rateLimit
+	return h.handleUpdateProfile(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // ClaimChannelUsernameForTest claims a username for a channel atomically
 // (both usernames table and channels.username column), so api_test can exercise
 // the username resolution path without the RPC that claims channel usernames
@@ -1007,6 +1028,13 @@ func SetPasswordProofLimit(h *handlers, cfg store.RateLimitConfig) {
 	h.rateLimitPasswordProof = cfg
 }
 
+// SetCheckPasswordLimits sets the per-account and per-IP checkPassword rate
+// limits on a shared test handler.
+func SetCheckPasswordLimits(h *handlers, perAccount, perIP store.RateLimitConfig) {
+	h.rateLimitCheckPassword = perAccount
+	h.rateLimitCheckPasswordIP = perIP
+}
+
 // HandleGetPassword invokes handleGetPassword on the given handler.
 func HandleGetPassword(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
 	return h.handleGetPassword(req)
@@ -1015,6 +1043,11 @@ func HandleGetPassword(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
 // HandleGetPasswordSettings invokes handleGetPasswordSettings on the given handler.
 func HandleGetPasswordSettings(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
 	return h.handleGetPasswordSettings(req)
+}
+
+// HandleCheckPassword invokes handleCheckPassword on the given handler.
+func HandleCheckPassword(h *handlers, req *mtproto.Request) (bin.Encoder, error) {
+	return h.handleCheckPassword(req)
 }
 
 // ConfigTTL exposes the expiry window help.getConfig advertises.

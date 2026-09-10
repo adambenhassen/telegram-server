@@ -319,10 +319,11 @@ type queryRower interface {
 // sentinels track the latest migration (registration_invites) plus the ones before it;
 // update them when a migration adds new schema.
 //
-// Indexes count as schema here. A database that stops short of one still opens
-// clean on every column check and then plans a different query — the media
-// reference predicate silently degrades to a per-row Seq Scan of messages —
-// so a missing index is exactly the un-migrated state this is here to refuse.
+// Indexes count as schema here. A database that stops short of one, or carries
+// one left invalid by a failed concurrent build, still opens clean on every
+// column check and then plans a different query — the media reference predicate
+// silently degrades to a per-row Seq Scan of messages — so either state is
+// exactly the un-migrated state this is here to refuse.
 func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
 	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload, hasMessageFileIdx, hasPartBlobKeyIdx, hasBlockedUsers, hasRegistrationInvites, hasRegistrationInviteLiveIdx bool
 	err := q.QueryRow(ctx, `
@@ -354,11 +355,17 @@ func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
 		              WHERE table_name = 'upload_parts' AND column_name = 'blob_key'),
 		       EXISTS(SELECT 1 FROM information_schema.columns
 		                   WHERE table_name = 'upload_parts' AND column_name = 'payload'),
-		       to_regclass('public.messages_file_idx') IS NOT NULL,
-		       to_regclass('public.upload_parts_blob_key_idx') IS NOT NULL,
+		       EXISTS(SELECT 1 FROM pg_catalog.pg_index
+		              WHERE indexrelid = to_regclass('public.messages_file_idx')
+		                AND indisvalid),
+		       EXISTS(SELECT 1 FROM pg_catalog.pg_index
+		              WHERE indexrelid = to_regclass('public.upload_parts_blob_key_idx')
+		                AND indisvalid),
 		       to_regclass('public.blocked_users') IS NOT NULL,
 		       to_regclass('public.registration_invites') IS NOT NULL,
-		       to_regclass('public.registration_invites_live_handle_idx') IS NOT NULL`,
+		       EXISTS(SELECT 1 FROM pg_catalog.pg_index
+		              WHERE indexrelid = to_regclass('public.registration_invites_live_handle_idx')
+		                AND indisvalid)`,
 	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload, &hasMessageFileIdx, &hasPartBlobKeyIdx, &hasBlockedUsers, &hasRegistrationInvites, &hasRegistrationInviteLiveIdx)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)

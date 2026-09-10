@@ -21,6 +21,7 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/gotd/td/exchange"
 )
 
 // RegistrationMode controls whether new accounts can be created via auth.signUp.
@@ -180,6 +181,9 @@ type Config struct {
 	// — at the first frame that decrypts under a server-issued key — and hands
 	// over to the per-user connection cap at sign-in. Zero disables it.
 	MaxConnsPerUnboundKey int
+	// MaxPendingLoginConns bounds connections waiting for auth.checkPassword
+	// after SESSION_PASSWORD_NEEDED. Zero disables the process-wide cap.
+	MaxPendingLoginConns int
 	// RPCDeadline is how long a single dispatched RPC may run before its
 	// context is cancelled and the client answered with a generic INTERNAL
 	// error. The connection survives; the next request starts with a full
@@ -286,6 +290,11 @@ type RateLimitsConfig struct {
 	// are not subject to this limit. The per-call 2048-bit modexp and SRP
 	// challenge issuance are the costs being bounded.
 	GetPassword store.RateLimitConfig
+	// UpdateProfile limits account.updateProfile per account. Display-name
+	// changes are a rare account mutation, not a chatty RPC: 20 per 24h covers
+	// a typo retry at signup and an occasional later rename without letting a
+	// client churn the generated name_tsv index that contacts.search uses.
+	UpdateProfile store.RateLimitConfig
 }
 
 // DefaultRateLimits returns the shipped per-surface defaults: 60 sends per 60s,
@@ -298,8 +307,8 @@ type RateLimitsConfig struct {
 // network, 20 getPassword calls per hour per client network (unauthenticated
 // callers only), 5 signUp calls per hour per client network, 5 password proof
 // attempts per 10 min per account (shared by getPasswordSettings and
-// updatePasswordSettings), and 20 getPassword calls per hour per account
-// (authorized callers only).
+// updatePasswordSettings), 20 getPassword calls per hour per account
+// (authorized callers only), and 20 updateProfile calls per 24h per account.
 // Zero disables enforcement for a surface.
 //
 // The upload number is the one derived rather than chosen: at the 512 KiB
@@ -330,6 +339,7 @@ func DefaultRateLimits() RateLimitsConfig {
 		SignUpIP:        store.RateLimitConfig{Limit: 5, Window: time.Hour},
 		PasswordProof:   store.RateLimitConfig{Limit: 5, Window: 10 * time.Minute},
 		GetPassword:     store.RateLimitConfig{Limit: 20, Window: time.Hour},
+		UpdateProfile:   store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
 	}
 }
 
@@ -389,6 +399,7 @@ func Load(log *slog.Logger) (Config, error) {
 		MediaErasureDestructive: false,
 
 		MaxConnsPerUnboundKey: mtproto.DefaultMaxConnsPerUnboundKey,
+		MaxPendingLoginConns:  mtproto.DefaultMaxPendingLoginConns,
 
 		RPCDeadline:      mtproto.DefaultRPCDeadline,
 		StatementTimeout: DefaultStatementTimeout,
@@ -787,6 +798,20 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.RateLimits.GetPassword.Window = d
 	}
+	if v := os.Getenv("TG_RATE_LIMIT_UPDATE_PROFILE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_UPDATE_PROFILE must be an integer")
+		}
+		cfg.RateLimits.UpdateProfile.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_UPDATE_PROFILE_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_UPDATE_PROFILE_WINDOW must be a duration")
+		}
+		cfg.RateLimits.UpdateProfile.Window = d
+	}
 	preAuth, err := preAuthLimits()
 	if err != nil {
 		return Config{}, err
@@ -801,6 +826,16 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_MAX_CONNS_PER_UNBOUND_KEY must not be negative; 0 disables the cap")
 		}
 		cfg.MaxConnsPerUnboundKey = n
+	}
+	if v := os.Getenv("TG_MAX_PENDING_LOGIN_CONNS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_MAX_PENDING_LOGIN_CONNS must be an integer")
+		}
+		if n < 0 {
+			return Config{}, errors.New("TG_MAX_PENDING_LOGIN_CONNS must not be negative; 0 disables the cap")
+		}
+		cfg.MaxPendingLoginConns = n
 	}
 	trust, err := clientAddrTrust(os.Getenv("TG_CLIENT_ADDR_TRUST"))
 	if err != nil {
@@ -1152,7 +1187,7 @@ func (c Config) WarnClientAddrTrust(log *slog.Logger) {
 // exchange (its DefaultTimeout). It is not this server's number to set, and it
 // is the floor a pre-auth lifetime ceiling has to clear: a ceiling under it
 // expires while a handshake is still legitimately waiting on one read.
-const handshakeReadTimeout = 60 * time.Second
+const handshakeReadTimeout = exchange.DefaultTimeout
 
 // WarnPreAuthLifetime states, once at startup, that the configured pre-auth
 // ceiling is short enough to cut handshakes rather than holds.

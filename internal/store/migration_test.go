@@ -98,6 +98,81 @@ func TestOpenRejectsMissingMessageFileIdx(t *testing.T) {
 	requireOpenMigrationError(t, ctx, dsn)
 }
 
+// TestOpenRejectsInvalidMessageFileIdx proves the sentinel rejects an index
+// that exists by name but is invalid and therefore invisible to the planner.
+func TestOpenRejectsInvalidMessageFileIdx(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `DROP INDEX messages_file_idx`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE INDEX messages_file_idx ON messages (file_id) WHERE file_id <> 0`); err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.messages_file_idx'::regclass`); err != nil {
+		t.Fatalf("mark index invalid: %v", err)
+	}
+
+	requireOpenMigrationError(t, ctx, dsn)
+}
+
+// TestOpenRejectsInvalidPartBlobKeyIdx covers the other index sentinel with
+// the same planner-invisible failure mode.
+func TestOpenRejectsInvalidPartBlobKeyIdx(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `DROP INDEX upload_parts_blob_key_idx`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE INDEX upload_parts_blob_key_idx ON upload_parts (blob_key)`); err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.upload_parts_blob_key_idx'::regclass`); err != nil {
+		t.Fatalf("mark index invalid: %v", err)
+	}
+
+	requireOpenMigrationError(t, ctx, dsn)
+}
+
+// TestOpenRejectsInvalidRegistrationInviteLiveIdx covers the live-invite
+// uniqueness index, which has the same invalid-index failure mode.
+func TestOpenRejectsInvalidRegistrationInviteLiveIdx(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `DROP INDEX registration_invites_live_handle_idx`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE UNIQUE INDEX registration_invites_live_handle_idx ON registration_invites (handle) WHERE state = 'issued'`); err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.registration_invites_live_handle_idx'::regclass`); err != nil {
+		t.Fatalf("mark index invalid: %v", err)
+	}
+
+	requireOpenMigrationError(t, ctx, dsn)
+}
+
 // TestOpenRejectsMissingPartBlobKeyIdx is the same clause for the index the
 // orphan pass's live-key gate reads. A database stopped one migration short
 // passes every column check, so without this the server starts and each batch

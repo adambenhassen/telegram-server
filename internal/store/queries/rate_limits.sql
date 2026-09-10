@@ -50,6 +50,34 @@ FROM rate_limits
 WHERE subject_id = $1
   AND surface = $2;
 
+-- name: TryConsumeRateLimitCost :one
+-- Attempt to consume a bounded number of rate-limit tokens atomically.
+-- A request whose cost exceeds the configured limit is deliberately not
+-- inserted, so it cannot create an over-budget row on a fresh window.
+INSERT INTO rate_limits (subject_id, surface, token_count, window_start, expires_at)
+SELECT sqlc.arg(subject_id)::bigint,
+       sqlc.arg(surface)::text,
+       sqlc.arg(cost)::int,
+       now(),
+       now() + sqlc.arg(window_duration)::interval
+WHERE sqlc.arg(cost)::int <= sqlc.arg(limit_count)::int
+ON CONFLICT (subject_id, surface) DO UPDATE SET
+    token_count = CASE
+        WHEN rate_limits.expires_at <= now() THEN EXCLUDED.token_count
+        ELSE rate_limits.token_count + EXCLUDED.token_count
+    END,
+    window_start = CASE
+        WHEN rate_limits.expires_at <= now() THEN now()
+        ELSE rate_limits.window_start
+    END,
+    expires_at = CASE
+        WHEN rate_limits.expires_at <= now() THEN now() + sqlc.arg(window_duration)::interval
+        ELSE rate_limits.expires_at
+    END
+WHERE rate_limits.expires_at <= now()
+   OR rate_limits.token_count + sqlc.arg(cost)::int <= sqlc.arg(limit_count)::int
+RETURNING token_count, window_start, expires_at;
+
 -- name: SweepExpiredRateLimits :execrows
 -- Delete rows whose per-row expiry deadline has passed. The deadline is stored
 -- on the row (expires_at = window_start + window), so the sweep does not need

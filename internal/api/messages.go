@@ -27,6 +27,10 @@ const (
 	// precedent as oversized message payloads (errMessageTooLong). 500 matches
 	// Telegram's own cap on fulltext search terms.
 	maxSearchQueryLen = 500
+
+	// maxForwardMessagesPerCall bounds the source messages one forward may name.
+	// It keeps the transaction's fan-out work proportional to a bounded request.
+	maxForwardMessagesPerCall = 100
 )
 
 // notify emits the cross-replica update nudge for userID (best-effort).
@@ -617,6 +621,12 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
+	// Check the cap before retry lookup, peer resolution, or any other store
+	// call. An oversized request must report the same client error regardless of
+	// whether its ids exist or the caller may see them.
+	if len(req.ID) > maxForwardMessagesPerCall {
+		return nil, errLimitInvalid
+	}
 	if len(req.ID) == 0 || len(req.RandomID) != len(req.ID) {
 		return nil, errPeerIDInvalid
 	}
@@ -665,8 +675,8 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, req.RandomID)
 	}
 
-	// Rate limit: at least one new forward, consume a token.
-	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+	// Rate limit: charge one token per source message requested.
+	if err := h.checkRateLimitCost(r, "message_send", h.rateLimitMessageSend, len(req.ID)); err != nil {
 		return nil, err
 	}
 

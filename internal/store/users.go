@@ -252,6 +252,24 @@ func (s *Store) SetUserStatus(ctx context.Context, userID int64, online bool) er
 	return nil
 }
 
+// UpdateProfile writes the caller's display name. A nil firstName or lastName
+// leaves that field unchanged; an empty string clears it. Returns an error
+// when the user does not exist.
+func (s *Store) UpdateProfile(ctx context.Context, userID int64, firstName, lastName *string) error {
+	n, err := s.q.UpdateUserProfile(ctx, db.UpdateUserProfileParams{
+		ID:        userID,
+		FirstName: firstName,
+		LastName:  lastName,
+	})
+	if err != nil {
+		return fmt.Errorf("update profile: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("update profile: user %d not found", userID)
+	}
+	return nil
+}
+
 // DialogPartners returns the distinct set of user IDs that share a 1:1 dialog
 // row with userID. Used as the fan-out target set for status changes.
 func (s *Store) DialogPartners(ctx context.Context, userID int64) ([]int64, error) {

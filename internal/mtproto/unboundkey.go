@@ -1,6 +1,11 @@
 package mtproto
 
-import "sync"
+import (
+	"errors"
+	"sync"
+)
+
+var errUnboundKeyCap = errors.New("unbound auth key connection cap exceeded")
 
 // DefaultMaxConnsPerUnboundKey is the shipped bound on what one auth key with
 // no signed-in user may hold: 8 concurrent connections.
