@@ -2,12 +2,14 @@ package api_test
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -94,6 +96,111 @@ type countingDownloadBlobStore struct {
 func (b *countingDownloadBlobStore) ReadAt(ctx context.Context, key string, offset, limit int64) ([]byte, error) {
 	b.reads.Add(1)
 	return b.Store.ReadAt(ctx, key, offset, limit)
+}
+
+func assertFixedRateLimitLog(t *testing.T, h *captureHandler, message, sentinel string) {
+	t.Helper()
+	if len(h.records) != 1 {
+		t.Fatalf("captured %d records, want one fixed rate-limit record", len(h.records))
+	}
+	record := h.records[0]
+	if record.Message != message {
+		t.Errorf("message = %q, want %q", record.Message, message)
+	}
+	if record.NumAttrs() != 0 {
+		t.Errorf("record has %d attrs, want no dynamic attrs", record.NumAttrs())
+	}
+	if strings.Contains(record.Message, sentinel) {
+		t.Errorf("record message contains sentinel %q", sentinel)
+	}
+}
+
+func TestGetFileRateLimitReserveErrorDoesNotLogDynamicDetails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn, blobs, a, _, doc := downloadFixtureWithDSN(t, "+15551297081", "+15551297082")
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	const sentinel = "get_file_reserve_error_sentinel"
+	if _, err := conn.Exec(ctx, `
+		ALTER TABLE rate_limits
+		ADD CONSTRAINT get_file_reserve_error_sentinel CHECK (token_count < 0)
+	`); err != nil {
+		t.Fatalf("install reserve failure: %v", err)
+	}
+
+	logs := &captureHandler{}
+	getFile := api.GetFileSeqForTestWithLimitsAndLogger(
+		s, blobs, slog.New(logs),
+		store.RateLimitConfig{Limit: 1, Window: time.Second},
+		store.RateLimitConfig{},
+	)
+	_, err = getFile(a.ID, &tg.UploadGetFileRequest{
+		Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+		Limit:    64,
+	})
+	if msg := rpcMessage(t, err); msg != "INTERNAL" {
+		t.Fatalf("reserve failure = %s, want INTERNAL", msg)
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("returned error contains sentinel %q: %v", sentinel, err)
+	}
+	assertFixedRateLimitLog(t, logs, "get file rate limit", sentinel)
+}
+
+func TestGetFileRateLimitRefundErrorDoesNotLogDynamicDetails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn, blobs, a, _, doc := downloadFixtureWithDSN(t, "+15551297091", "+15551297092")
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	logs := &captureHandler{}
+	getFile := api.GetFileSeqForTestWithLimitsAndLogger(
+		s, blobs, slog.New(logs),
+		store.RateLimitConfig{Limit: 2, Window: time.Second},
+		store.RateLimitConfig{Limit: 1, Window: time.Second},
+	)
+	request := func() error {
+		_, err := getFile(a.ID, &tg.UploadGetFileRequest{
+			Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+			Limit:    64,
+		})
+		return err
+	}
+	if err := request(); err != nil {
+		t.Fatalf("first getFile: %v", err)
+	}
+
+	if _, err := conn.Exec(ctx,
+		`DELETE FROM rate_limits WHERE subject_id = $1 AND surface = 'upload_get_file'`,
+		a.ID,
+	); err != nil {
+		t.Fatalf("clear account rate limit: %v", err)
+	}
+
+	const sentinel = "get_file_refund_error_sentinel"
+	if _, err := conn.Exec(ctx, `
+		ALTER TABLE rate_limits
+		ADD CONSTRAINT get_file_refund_error_sentinel CHECK (token_count > 0) NOT VALID
+	`); err != nil {
+		t.Fatalf("install refund failure: %v", err)
+	}
+	err = request()
+	if msg := rpcMessage(t, err); msg != "INTERNAL" {
+		t.Fatalf("refund failure = %s, want INTERNAL", msg)
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("returned error contains sentinel %q: %v", sentinel, err)
+	}
+	assertFixedRateLimitLog(t, logs, "get file rate limit refund", sentinel)
 }
 
 func TestGetFilePerAccountRateLimitAndReset(t *testing.T) {

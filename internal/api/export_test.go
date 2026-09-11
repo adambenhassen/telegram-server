@@ -177,8 +177,20 @@ func GetFileSeqForTestWithLimits(
 	s *store.Store, blobs blob.Store,
 	perAccount, perReplica store.RateLimitConfig,
 ) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimitsAndLogger(
+		s, blobs, slog.New(slog.DiscardHandler), perAccount, perReplica,
+	)
+}
+
+// GetFileSeqForTestWithLimitsAndLogger returns a getFile bound to one handlers
+// value with custom limits and logger. It is for error-path log assertions.
+func GetFileSeqForTestWithLimitsAndLogger(
+	s *store.Store, blobs blob.Store, log *slog.Logger,
+	perAccount, perReplica store.RateLimitConfig,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
 	h := testHandlers(s)
 	h.blobs = blobs
+	h.log = log
 	h.rateLimitGetFile = perAccount
 	h.getFileReplicaLimiter = newDownloadRateLimiter(perReplica)
 	return func(userID int64, req *tg.UploadGetFileRequest) (bin.Encoder, error) {

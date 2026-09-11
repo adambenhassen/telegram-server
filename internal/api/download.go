@@ -45,7 +45,7 @@ func (h *handlers) checkGetFileRateLimit(r *mtproto.Request) error {
 		r.Ctx, r.UserID, "upload_get_file", h.rateLimitGetFile,
 	)
 	if err != nil {
-		h.log.Error("get file rate limit", "err", err)
+		h.log.Error("get file rate limit")
 		return errInternal
 	}
 	if denied != nil {
@@ -58,7 +58,7 @@ func (h *handlers) checkGetFileRateLimit(r *mtproto.Request) error {
 	}
 	if reservation != nil {
 		if err := h.store.RefundRateLimit(r.Ctx, r.UserID, "upload_get_file", reservation); err != nil {
-			h.log.Error("get file rate limit refund", "err", err)
+			h.log.Error("get file rate limit refund")
 			return errInternal
 		}
 	}
