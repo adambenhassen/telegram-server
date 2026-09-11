@@ -177,8 +177,8 @@ func GetFileSeqForTestWithLimits(
 	s *store.Store, blobs blob.Store,
 	perAccount, perReplica store.RateLimitConfig,
 ) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
-	return GetFileSeqForTestWithLimitsAndLogger(
-		s, blobs, slog.New(slog.DiscardHandler), perAccount, perReplica,
+	return GetFileSeqForTestWithLimitsAndLoggerAt(
+		s, blobs, slog.New(slog.DiscardHandler), time.Now, perAccount, perReplica,
 	)
 }
 
@@ -188,9 +188,32 @@ func GetFileSeqForTestWithLimitsAndLogger(
 	s *store.Store, blobs blob.Store, log *slog.Logger,
 	perAccount, perReplica store.RateLimitConfig,
 ) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimitsAndLoggerAt(
+		s, blobs, log, time.Now, perAccount, perReplica,
+	)
+}
+
+// GetFileSeqForTestWithLimitsAndNow returns a getFile bound to one handlers
+// value with custom limits and clock. It is for fixed-window boundary tests.
+func GetFileSeqForTestWithLimitsAndNow(
+	s *store.Store, blobs blob.Store,
+	perAccount, perReplica store.RateLimitConfig, now func() time.Time,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimitsAndLoggerAt(
+		s, blobs, slog.New(slog.DiscardHandler), now, perAccount, perReplica,
+	)
+}
+
+// GetFileSeqForTestWithLimitsAndLoggerAt returns a getFile bound to one
+// handlers value with custom limits, logger, and clock.
+func GetFileSeqForTestWithLimitsAndLoggerAt(
+	s *store.Store, blobs blob.Store, log *slog.Logger, now func() time.Time,
+	perAccount, perReplica store.RateLimitConfig,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
 	h := testHandlers(s)
 	h.blobs = blobs
 	h.log = log
+	h.now = now
 	h.rateLimitGetFile = perAccount
 	h.getFileReplicaLimiter = newDownloadRateLimiter(perReplica)
 	return func(userID int64, req *tg.UploadGetFileRequest) (bin.Encoder, error) {

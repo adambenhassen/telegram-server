@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -711,6 +712,9 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		if n < 0 {
 			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE must not be negative; 0 disables the bound")
+		}
+		if n > math.MaxInt32 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE must not exceed math.MaxInt32")
 		}
 		cfg.RateLimits.GetFile.Limit = n
 	}

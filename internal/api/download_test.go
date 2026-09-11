@@ -303,6 +303,36 @@ func TestGetFileReplicaRateLimitIsSharedAcrossAccounts(t *testing.T) {
 	}
 }
 
+func TestGetFileReplicaDenialRefundsAccountBudget(t *testing.T) {
+	t.Parallel()
+	s, blobs, account, _, doc := downloadFixture(t, "+15551297081", "+15551297082")
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	getFile := api.GetFileSeqForTestWithLimitsAndNow(
+		s, blobs,
+		store.RateLimitConfig{Limit: 2, Window: time.Minute},
+		store.RateLimitConfig{Limit: 1, Window: time.Second},
+		func() time.Time { return now },
+	)
+	request := func() error {
+		_, err := getFile(account.ID, &tg.UploadGetFileRequest{
+			Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+			Limit:    64,
+		})
+		return err
+	}
+
+	if err := request(); err != nil {
+		t.Fatalf("first getFile: %v", err)
+	}
+	if msg := rpcMessage(t, request()); msg != "FLOOD_WAIT_1" {
+		t.Fatalf("aggregate denial = %s, want FLOOD_WAIT_1", msg)
+	}
+	now = now.Add(time.Second)
+	if err := request(); err != nil {
+		t.Fatalf("getFile after aggregate window reset: %v", err)
+	}
+}
+
 func TestGetFileRateLimitsCanBeDisabledIndependently(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {

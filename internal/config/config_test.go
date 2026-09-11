@@ -3,8 +3,10 @@ package config_test
 import (
 	"encoding/hex"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1010,6 +1012,17 @@ func TestLoadGetFileRateLimits(t *testing.T) {
 			replicaLimit: "19", replicaWindow: "3s",
 			wantAccountLimit: 7, wantAccountWindow: 2 * time.Second,
 			wantReplicaLimit: 19, wantReplicaWindow: 3 * time.Second,
+		},
+		"per-account int32 maximum": {
+			perAccountLimit:   strconv.FormatInt(math.MaxInt32, 10),
+			wantAccountLimit:  math.MaxInt32,
+			wantAccountWindow: time.Second,
+			wantReplicaLimit:  400,
+			wantReplicaWindow: time.Second,
+		},
+		"per-account above int32 maximum": {
+			perAccountLimit: strconv.FormatInt(math.MaxInt32+1, 10),
+			wantErr:         "TG_RATE_LIMIT_GET_FILE",
 		},
 		"per-account disabled": {
 			perAccountLimit:  "0",
