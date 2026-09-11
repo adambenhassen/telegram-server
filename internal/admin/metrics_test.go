@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,13 +76,36 @@ func TestMetricsHandler(t *testing.T) {
 
 	// Uninstrumented fields must be listed so the dashboard can distinguish
 	// a genuine zero from an absent instrument.
-	want := []string{"notify_count", "push_latency_p50_ms", "push_latency_p95_ms"}
+	want := []string{"push_latency_p50_ms", "push_latency_p95_ms"}
 	if len(resp.Uninstrumented) != len(want) {
 		t.Fatalf("expected %d uninstrumented fields, got %d: %v", len(want), len(resp.Uninstrumented), resp.Uninstrumented)
 	}
 	for i, name := range want {
 		if resp.Uninstrumented[i] != name {
 			t.Errorf("uninstrumented[%d] = %q, want %q", i, resp.Uninstrumented[i], name)
+		}
+	}
+
+	// Notification telemetry is present even when this replica has consumed
+	// nothing yet. The fixed channel names are part of the JSON contract.
+	body := rec.Body.String()
+	for _, field := range []string{
+		`"notify_window_seconds"`,
+		`"notify_rate_per_second"`,
+		`"notify_channels"`,
+		`"tg_updates"`,
+		`"tg_typing"`,
+		`"tg_evict"`,
+		`"tg_channel_post"`,
+		`"tg_encryption"`,
+		`"tg_status"`,
+		`"tg_encrypted_msg"`,
+		`"tg_reactions"`,
+		`"tg_pinned"`,
+		`"notify_invalid"`,
+	} {
+		if !strings.Contains(body, field) {
+			t.Errorf("metrics response missing notification field %s", field)
 		}
 	}
 }
@@ -105,6 +129,51 @@ func TestMetricsHandler_POST(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405, got %d", rec.Code)
+	}
+}
+
+func TestMetricsHandlerNotificationTelemetry(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }() //nolint:errcheck // best-effort close in test
+
+	now := time.Unix(1_700_000_000, 0)
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time { return now })
+	if err := metrics.RecordValidNotification(store.ChannelUpdates); err != nil {
+		t.Fatal(err)
+	}
+	if err := metrics.RecordValidNotification(store.ChannelTyping); err != nil {
+		t.Fatal(err)
+	}
+	if err := metrics.RecordInvalidNotification(); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(10 * time.Second)
+
+	resp := requestMetrics(t, ctx, admin.Handler(mtproto.NewSessionRegistry(), st, metrics))
+	if resp.NotifyCount != 2 {
+		t.Errorf("notify count = %d, want 2", resp.NotifyCount)
+	}
+	if resp.NotifyWindowSeconds != 10 {
+		t.Errorf("notify window = %v, want 10", resp.NotifyWindowSeconds)
+	}
+	if resp.NotifyRatePerSecond != 0.2 {
+		t.Errorf("notify rate = %v, want 0.2", resp.NotifyRatePerSecond)
+	}
+	if resp.NotifyChannels.Updates != 1 || resp.NotifyChannels.Typing != 1 {
+		t.Errorf("notify channels = %+v, want updates=1 and typing=1", resp.NotifyChannels)
+	}
+	if resp.NotifyInvalid != 1 {
+		t.Errorf("notify invalid = %d, want 1", resp.NotifyInvalid)
+	}
+	if len(resp.Uninstrumented) != 2 {
+		t.Errorf("uninstrumented = %v, want only push latency fields", resp.Uninstrumented)
 	}
 }
 

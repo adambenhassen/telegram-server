@@ -65,6 +65,7 @@ func TestStartListenerDispatches(t *testing.T) {
 	dsn := pgtest.DSN(t)
 	s := openDSN(t, dsn)
 
+	metrics := store.NewNotificationMetrics()
 	delivered := make(chan int64, 1)
 	typed := make(chan [2]int64, 1)
 	evicted := make(chan [2]int64, 1)
@@ -80,6 +81,7 @@ func TestStartListenerDispatches(t *testing.T) {
 		func(context.Context, int64, int64, int64) {},
 		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
+		metrics,
 	)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
@@ -146,6 +148,121 @@ func TestStartListenerDispatches(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("encryption callback not invoked")
+	}
+
+	snapshot := metrics.Snapshot()
+	if snapshot.NotifyCount != 4 {
+		t.Errorf("notify count = %d, want 4 valid notifications", snapshot.NotifyCount)
+	}
+	if snapshot.Invalid != 2 {
+		t.Errorf("invalid count = %d, want 2 malformed notifications", snapshot.Invalid)
+	}
+	if snapshot.Channels.Updates != 1 || snapshot.Channels.Typing != 1 ||
+		snapshot.Channels.Evict != 1 || snapshot.Channels.Encryption != 1 {
+		t.Errorf("channel counts = %+v, want one update, typing, evict, and encryption", snapshot.Channels)
+	}
+}
+
+func TestStartListenerContainsRecorderPanicAndPreservesCallback(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	delivered := make(chan int64, 1)
+	recorder := store.NotificationRecorderFunc{
+		Valid: func(string) error {
+			panic("telemetry failure")
+		},
+		Invalid: func() error {
+			panic("telemetry failure")
+		},
+	}
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(_ context.Context, userID int64) { delivered <- userID },
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+		recorder,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	defer func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	}()
+
+	if err := s.Notify(ctx, store.ChannelUpdates, "not-an-int"); err != nil {
+		t.Fatalf("notify malformed: %v", err)
+	}
+	if err := s.Notify(ctx, store.ChannelUpdates, "17"); err != nil {
+		t.Fatalf("notify valid: %v", err)
+	}
+	select {
+	case got := <-delivered:
+		if got != 17 {
+			t.Fatalf("delivered userID = %d, want 17", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliver callback not invoked after recorder panic")
+	}
+}
+
+func TestStartListenerRecordsBeforeCallback(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	ordered := make(chan string, 2)
+	recorder := store.NotificationRecorderFunc{
+		Valid: func(string) error {
+			ordered <- "recorded"
+			return nil
+		},
+	}
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(context.Context, int64) { ordered <- "callback" },
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+		recorder,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	defer func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	}()
+
+	if err := s.Notify(ctx, store.ChannelUpdates, "19"); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	for i, want := range []string{"recorded", "callback"} {
+		select {
+		case got := <-ordered:
+			if got != want {
+				t.Fatalf("event %d = %q, want %q", i, got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for event %d (%q)", i, want)
+		}
 	}
 }
 
