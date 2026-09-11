@@ -2,7 +2,10 @@ package api_test
 
 import (
 	"context"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/tg"
 
@@ -20,9 +23,26 @@ func downloadFixture(t *testing.T, phoneA, phoneB string) (
 	*store.Store, blob.Store, store.User, store.User, *tg.Document,
 ) {
 	t.Helper()
-	ctx := context.Background()
 	s := openStore(t)
 	blobs := newBlobs(t)
+	return downloadFixtureOn(t, s, blobs, phoneA, phoneB)
+}
+
+func downloadFixtureWithDSN(t *testing.T, phoneA, phoneB string) (
+	*store.Store, string, blob.Store, store.User, store.User, *tg.Document,
+) {
+	t.Helper()
+	s, dsn := openStoreDSN(t)
+	blobs := newBlobs(t)
+	_, _, a, b, doc := downloadFixtureOn(t, s, blobs, phoneA, phoneB)
+	return s, dsn, blobs, a, b, doc
+}
+
+func downloadFixtureOn(t *testing.T, s *store.Store, blobs blob.Store, phoneA, phoneB string) (
+	*store.Store, blob.Store, store.User, store.User, *tg.Document,
+) {
+	t.Helper()
+	ctx := context.Background()
 	a, err := s.CreateUser(ctx, phoneA)
 	if err != nil {
 		t.Fatalf("user a: %v", err)
@@ -63,6 +83,160 @@ func getBytes(t *testing.T, s *store.Store, blobs blob.Store, userID int64, doc 
 		t.Errorf("Type = %T, want *tg.StorageFileUnknown", f.Type)
 	}
 	return f.Bytes
+}
+
+type countingDownloadBlobStore struct {
+	blob.Store
+
+	reads atomic.Int64
+}
+
+func (b *countingDownloadBlobStore) ReadAt(ctx context.Context, key string, offset, limit int64) ([]byte, error) {
+	b.reads.Add(1)
+	return b.Store.ReadAt(ctx, key, offset, limit)
+}
+
+func TestGetFilePerAccountRateLimitAndReset(t *testing.T) {
+	t.Parallel()
+	s, dsn, blobs, a, _, doc := downloadFixtureWithDSN(t, "+15551297051", "+15551297052")
+	getFile := api.GetFileSeqForTestWithLimits(
+		s, blobs,
+		store.RateLimitConfig{Limit: 2, Window: time.Second},
+		store.RateLimitConfig{},
+	)
+	request := func() error {
+		_, err := getFile(a.ID, &tg.UploadGetFileRequest{
+			Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+			Limit:    64,
+		})
+		return err
+	}
+
+	for range 2 {
+		if err := request(); err != nil {
+			t.Fatalf("allowed getFile: %v", err)
+		}
+	}
+	if msg := rpcMessage(t, request()); msg != "FLOOD_WAIT_1" {
+		t.Fatalf("over-limit getFile = %s, want FLOOD_WAIT_1", msg)
+	}
+	if err := api.AgeRateLimitWindowForTest(dsn, a.ID, "upload_get_file", time.Second+time.Millisecond); err != nil {
+		t.Fatalf("age getFile window: %v", err)
+	}
+	if err := request(); err != nil {
+		t.Fatalf("getFile after reset: %v", err)
+	}
+}
+
+func TestGetFileReplicaRateLimitIsSharedAcrossAccounts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	blobs := &countingDownloadBlobStore{Store: newBlobs(t)}
+	users := make([]store.User, 4)
+	for i := range users {
+		u, err := s.CreateUser(ctx, "+1555129706"+string(rune('0'+i)))
+		if err != nil {
+			t.Fatalf("user %d: %v", i, err)
+		}
+		users[i] = u
+	}
+	file, err := s.AllocateFile(ctx, users[0].ID, 7, "text/plain", "shared.txt", api.TestMaxUserStorageBytes)
+	if err != nil {
+		t.Fatalf("allocate file: %v", err)
+	}
+	if err := s.MarkFileStored(ctx, file.ID); err != nil {
+		t.Fatalf("mark file stored: %v", err)
+	}
+	if _, err := blobs.Put(ctx, blob.Key(file.ID), strings.NewReader("payload")); err != nil {
+		t.Fatalf("put blob: %v", err)
+	}
+	for i := 1; i < len(users); i++ {
+		if _, _, _, _, err := s.SendMessage(ctx, users[0].ID, users[i].ID, "shared", int64(i), file.ID, 0); err != nil {
+			t.Fatalf("entitle user %d: %v", i, err)
+		}
+	}
+	getFile := api.GetFileSeqForTestWithLimits(
+		s, blobs,
+		store.RateLimitConfig{},
+		store.RateLimitConfig{Limit: 3, Window: time.Second},
+	)
+	request := func(userID int64) error {
+		_, err := getFile(userID, &tg.UploadGetFileRequest{
+			Location: &tg.InputDocumentFileLocation{ID: file.ID, AccessHash: file.AccessHash},
+			Limit:    64,
+		})
+		return err
+	}
+
+	for i := range 3 {
+		if err := request(users[i].ID); err != nil {
+			t.Fatalf("account %d getFile: %v", i, err)
+		}
+	}
+	if got := blobs.reads.Load(); got != 3 {
+		t.Fatalf("blob reads before denial = %d, want 3", got)
+	}
+	if msg := rpcMessage(t, request(users[3].ID)); msg != "FLOOD_WAIT_1" {
+		t.Fatalf("replica over-limit getFile = %s, want FLOOD_WAIT_1", msg)
+	}
+	if got := blobs.reads.Load(); got != 3 {
+		t.Fatalf("blob reads after denial = %d, want 3", got)
+	}
+
+	stranger, err := s.CreateUser(ctx, "+15551297069")
+	if err != nil {
+		t.Fatalf("stranger: %v", err)
+	}
+	if msg := rpcMessage(t, request(stranger.ID)); msg != "LOCATION_INVALID" {
+		t.Fatalf("unauthorized getFile while limited = %s, want LOCATION_INVALID", msg)
+	}
+	if got := blobs.reads.Load(); got != 3 {
+		t.Fatalf("blob reads after unauthorized request = %d, want 3", got)
+	}
+}
+
+func TestGetFileRateLimitsCanBeDisabledIndependently(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		perAccount store.RateLimitConfig
+		perReplica store.RateLimitConfig
+		phoneA     string
+		phoneB     string
+	}{
+		"per-account disabled": {
+			perAccount: store.RateLimitConfig{},
+			perReplica: store.RateLimitConfig{Limit: 2, Window: time.Second},
+			phoneA:     "+15551297061",
+			phoneB:     "+15551297062",
+		},
+		"replica disabled": {
+			perAccount: store.RateLimitConfig{Limit: 2, Window: time.Second},
+			perReplica: store.RateLimitConfig{},
+			phoneA:     "+15551297071",
+			phoneB:     "+15551297072",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, blobs, a, _, doc := downloadFixture(t, tc.phoneA, tc.phoneB)
+			getFile := api.GetFileSeqForTestWithLimits(s, blobs, tc.perAccount, tc.perReplica)
+			request := func() error {
+				_, err := getFile(a.ID, &tg.UploadGetFileRequest{
+					Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+					Limit:    64,
+				})
+				return err
+			}
+			for range 2 {
+				if err := request(); err != nil {
+					t.Fatalf("allowed getFile: %v", err)
+				}
+			}
+			if msg := rpcMessage(t, request()); msg != "FLOOD_WAIT_1" {
+				t.Fatalf("over-limit getFile = %s, want FLOOD_WAIT_1", msg)
+			}
+		})
+	}
 }
 
 func TestGetFileRanges(t *testing.T) {
