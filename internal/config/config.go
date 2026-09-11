@@ -37,6 +37,9 @@ const (
 // Config holds server configuration.
 type Config struct {
 	ListenAddr string
+	// WebSocketListenAddr is the address the WebSocket MTProto server binds to.
+	// Empty disables the endpoint entirely.
+	WebSocketListenAddr string
 	// AdminListenAddr is the address the admin HTTP server binds to.
 	// Empty disables the admin server entirely.
 	AdminListenAddr string
@@ -401,12 +404,13 @@ const DefaultStatementTimeout = 17 * time.Second
 // can create rather than read, and a generated one has to say so.
 func Load(log *slog.Logger) (Config, error) {
 	cfg := Config{
-		ListenAddr:      envOr("TG_LISTEN_ADDR", ":2443"),
-		AdminListenAddr: os.Getenv("TG_ADMIN_LISTEN_ADDR"),
-		PostgresDSN:     os.Getenv("TG_POSTGRES_DSN"),
-		RSAKeyPath:      envOr("TG_RSA_KEY_PATH", "server_key.pem"),
-		DCID:            2,
-		BlobDir:         envOr("TG_BLOB_DIR", "blobs"),
+		ListenAddr:          envOr("TG_LISTEN_ADDR", ":2443"),
+		WebSocketListenAddr: os.Getenv("TG_WEBSOCKET_LISTEN_ADDR"),
+		AdminListenAddr:     os.Getenv("TG_ADMIN_LISTEN_ADDR"),
+		PostgresDSN:         os.Getenv("TG_POSTGRES_DSN"),
+		RSAKeyPath:          envOr("TG_RSA_KEY_PATH", "server_key.pem"),
+		DCID:                2,
+		BlobDir:             envOr("TG_BLOB_DIR", "blobs"),
 
 		MaxFileBytes:        100 << 20,
 		MaxUserStorageBytes: 2 << 30,

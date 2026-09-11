@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/exchange"
+	"github.com/gotd/td/tdsync"
 
 	"github.com/adambenhassen/telegram-server/internal/admin"
 	"github.com/adambenhassen/telegram-server/internal/api"
@@ -441,8 +442,24 @@ func run(log *slog.Logger) error {
 	}
 	advertise := net.JoinHostPort(cfg.AdvertiseHost, strconv.Itoa(cfg.AdvertisePort))
 	log.Info("listening", "addr", cfg.ListenAddr, "advertise", advertise, "dc", cfg.DCID)
+	if cfg.WebSocketListenAddr == "" {
+		return server.Serve(ctx, ln)
+	}
 
-	return server.Serve(ctx, ln)
+	websocketLn, err := lc.Listen(ctx, "tcp", cfg.WebSocketListenAddr)
+	if err != nil {
+		return fmt.Errorf("websocket listen: %w", err)
+	}
+	log.Info("WebSocket MTProto listening", "addr", cfg.WebSocketListenAddr)
+
+	grp := tdsync.NewCancellableGroup(ctx)
+	grp.Go(func(ctx context.Context) error {
+		return server.Serve(ctx, ln)
+	})
+	grp.Go(func(ctx context.Context) error {
+		return server.ServeWebSocket(ctx, websocketLn)
+	})
+	return grp.Wait()
 }
 
 func newBlobStore(ctx context.Context, cfg config.Config, log *slog.Logger) (blob.Store, error) {

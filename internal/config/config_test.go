@@ -31,6 +31,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ListenAddr != ":2443" {
 		t.Errorf("ListenAddr = %q, want :2443", cfg.ListenAddr)
 	}
+	if cfg.WebSocketListenAddr != "" {
+		t.Errorf("WebSocketListenAddr = %q, want disabled by default", cfg.WebSocketListenAddr)
+	}
 	if cfg.DCID != 2 {
 		t.Errorf("DCID = %d, want 2", cfg.DCID)
 	}
@@ -118,6 +121,20 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.RateLimits.UpdateProfile.Window != 24*time.Hour {
 		t.Errorf("UpdateProfile window = %v, want 24h", cfg.RateLimits.UpdateProfile.Window)
+	}
+}
+
+func TestLoadWebSocketListenAddr(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_WEBSOCKET_LISTEN_ADDR", "127.0.0.1:2445")
+
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WebSocketListenAddr != "127.0.0.1:2445" {
+		t.Fatalf("WebSocketListenAddr = %q, want configured address", cfg.WebSocketListenAddr)
 	}
 }
 
