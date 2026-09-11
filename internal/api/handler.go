@@ -198,6 +198,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
+	register(d, tg.HelpGetAppConfigRequestTypeID, h.handleGetAppConfig)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	registerWithConn(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
 	register(d, tg.AuthSignUpRequestTypeID, h.handleSignUp)
@@ -205,6 +206,9 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.UsersGetUsersRequestTypeID, h.handleGetUsers)
 	register(d, tg.AccountGetAuthorizationsRequestTypeID, h.handleGetAuthorizations)
 	registerRevoke(d, tg.AccountResetAuthorizationRequestTypeID, h.handleResetAuthorization)
+	register(d, tg.AccountGetContentSettingsRequestTypeID, h.handleGetContentSettings)
+	register(d, tg.AccountGetGlobalPrivacySettingsRequestTypeID, h.handleGetGlobalPrivacySettings)
+	register(d, tg.AccountGetThemesRequestTypeID, h.handleGetThemes)
 	register(d, tg.AccountGetPasswordRequestTypeID, h.handleGetPassword)
 	register(d, tg.AccountUpdateStatusRequestTypeID, h.handleUpdateStatus)
 	register(d, tg.AccountUpdateUsernameRequestTypeID, h.handleUpdateUsername)
