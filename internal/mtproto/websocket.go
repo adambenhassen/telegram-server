@@ -3,10 +3,10 @@ package mtproto
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -27,7 +27,6 @@ type webSocketConnState struct {
 	socket *webSocketAcceptedConn
 	slot   *preAuthSlot
 	addr   netip.Addr
-	err    error
 }
 
 // webSocketAcceptedConn carries the pre-auth slot from the HTTP server's
@@ -36,29 +35,104 @@ type webSocketConnState struct {
 type webSocketAcceptedConn struct {
 	net.Conn
 
-	slot *preAuthSlot
+	slot   *preAuthSlot
+	state  sync.Mutex
+	closed bool
+	addr   netip.Addr
 }
 
 func (c *webSocketAcceptedConn) Close() error {
+	c.state.Lock()
+	if c.closed {
+		c.state.Unlock()
+		return nil
+	}
+	c.closed = true
+	c.state.Unlock()
 	c.slot.clear()
 	return c.Conn.Close()
 }
 
 // webSocketListener admits sockets before net/http reads their HTTP request.
-// The HTTP server still owns request parsing, while this wrapper keeps the
-// process-wide pre-auth cap on the same side of the accept boundary as TCP.
+// The raw accept loop only admits and dispatches sockets; every client-byte
+// read, including PROXY-v2 address establishment, happens in a worker before
+// that socket is made visible to net/http. This keeps a silent peer from
+// holding the goroutine that accepts the next HTTP connection.
 type webSocketListener struct {
 	net.Listener
 
-	server *Server
+	server    *Server
+	ready     chan *webSocketAcceptedConn
+	acceptErr chan error
+	done      chan struct{}
+	closeOnce sync.Once
+
+	// pendingMu is a leaf bookkeeping lock. It is never held while calling
+	// pre-auth, socket or server methods, so it cannot order against any other
+	// lock in the connection path.
+	pendingMu sync.Mutex
+	pending   map[*webSocketAcceptedConn]struct{}
+}
+
+func newWebSocketListener(listener net.Listener, server *Server) *webSocketListener {
+	return &webSocketListener{
+		Listener:  listener,
+		server:    server,
+		ready:     make(chan *webSocketAcceptedConn, 1),
+		acceptErr: make(chan error, 1),
+		done:      make(chan struct{}),
+		pending:   make(map[*webSocketAcceptedConn]struct{}),
+	}
+}
+
+func (l *webSocketListener) start() {
+	go l.acceptLoop()
 }
 
 func (l *webSocketListener) Accept() (net.Conn, error) {
+	select {
+	case err := <-l.acceptErr:
+		return nil, err
+	default:
+	}
+	select {
+	case accepted := <-l.ready:
+		l.untrack(accepted)
+		return accepted, nil
+	case err := <-l.acceptErr:
+		return nil, err
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *webSocketListener) acceptLoop() {
+	var backoff time.Duration
 	for {
 		sock, err := l.Listener.Accept()
 		if err != nil {
-			return nil, err
+			select {
+			case <-l.done:
+				return
+			default:
+			}
+			if isTransientAccept(err) {
+				backoff = nextAcceptBackoff(backoff)
+				select {
+				case <-l.done:
+					return
+				case <-time.After(backoff):
+				}
+				continue
+			}
+			select {
+			case l.acceptErr <- errors.Join(errors.New("accept WebSocket connection"), err):
+			default:
+			}
+			return
 		}
+		backoff = 0
+
 		slot, ok := l.server.preAuth.admit()
 		if !ok {
 			l.server.dropRefused(sock)
@@ -68,8 +142,108 @@ func (l *webSocketListener) Accept() (net.Conn, error) {
 			}
 			continue
 		}
-		return &webSocketAcceptedConn{Conn: sock, slot: slot}, nil
+		accepted := &webSocketAcceptedConn{Conn: sock, slot: slot}
+		l.armLifetime(accepted)
+		if !l.track(accepted) {
+			l.closeAccepted(accepted)
+			return
+		}
+		go l.prepare(accepted)
 	}
+}
+
+func (l *webSocketListener) armLifetime(accepted *webSocketAcceptedConn) {
+	accepted.slot.armLifetime(func() {
+		if err := accepted.Close(); err != nil && !isDisconnect(err) {
+			l.server.log.Info("close WebSocket connection at the pre-auth ceiling", "err", err)
+		}
+		if dropped, ok := l.server.ceilingLog.allow(time.Now(), preAuthLogInterval); ok {
+			l.server.log.Info("WebSocket connection closed at the pre-auth lifetime ceiling",
+				"lifetime", l.server.preAuth.limits.Lifetime, "suppressed", dropped)
+		}
+	})
+}
+
+func (l *webSocketListener) prepare(accepted *webSocketAcceptedConn) {
+	addr, err := l.server.clientAddr(accepted)
+	if err != nil {
+		l.server.logNegotiation(err)
+		l.closeAccepted(accepted)
+		l.untrack(accepted)
+		return
+	}
+	accepted.state.Lock()
+	if accepted.closed {
+		accepted.state.Unlock()
+		l.untrack(accepted)
+		return
+	}
+	if !accepted.slot.keyAddr(addr) {
+		accepted.state.Unlock()
+		l.server.dropRefused(accepted)
+		accepted.slot.clear()
+		l.untrack(accepted)
+		if dropped, ok := l.server.netCapLog.allow(time.Now(), preAuthLogInterval); ok {
+			l.server.log.Info("WebSocket connection refused at the per-network pre-auth cap",
+				"client_addr", addr, "cap", l.server.preAuth.limits.MaxConnsPerNet, "suppressed", dropped)
+		}
+		return
+	}
+	accepted.addr = addr
+	delivered := false
+	select {
+	case l.ready <- accepted:
+		delivered = true
+	case <-l.done:
+	}
+	accepted.state.Unlock()
+	if !delivered {
+		l.closeAccepted(accepted)
+		l.untrack(accepted)
+	}
+}
+
+func (l *webSocketListener) closeAccepted(accepted *webSocketAcceptedConn) {
+	if err := accepted.Close(); err != nil && !isDisconnect(err) {
+		l.server.log.Info("close WebSocket connection", "err", err)
+	}
+}
+
+func (l *webSocketListener) track(accepted *webSocketAcceptedConn) bool {
+	l.pendingMu.Lock()
+	defer l.pendingMu.Unlock()
+	select {
+	case <-l.done:
+		return false
+	default:
+	}
+	l.pending[accepted] = struct{}{}
+	return true
+}
+
+func (l *webSocketListener) untrack(accepted *webSocketAcceptedConn) {
+	l.pendingMu.Lock()
+	delete(l.pending, accepted)
+	l.pendingMu.Unlock()
+}
+
+func (l *webSocketListener) Close() error {
+	var closeErr error
+	l.closeOnce.Do(func() {
+		close(l.done)
+		closeErr = l.Listener.Close()
+		l.pendingMu.Lock()
+		pending := make([]*webSocketAcceptedConn, 0, len(l.pending))
+		for accepted := range l.pending {
+			pending = append(pending, accepted)
+		}
+		l.pending = make(map[*webSocketAcceptedConn]struct{})
+		l.pendingMu.Unlock()
+		for _, accepted := range pending {
+			l.closeAccepted(accepted)
+		}
+	})
+	return closeErr
 }
 
 // ServeWebSocket serves MTProto over WebSocket on l. It is deliberately a
@@ -92,49 +266,34 @@ func (s *Server) ServeWebSocket(ctx context.Context, l net.Listener) error {
 	})
 	defer stop()
 
-	err := server.Serve(&webSocketListener{Listener: l, server: s})
+	listener := newWebSocketListener(l, s)
+	listener.start()
+	defer func() {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.log.Info("close WebSocket listener", "err", err)
+		}
+	}()
+	err := server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
 }
 
-// webSocketConnContext establishes the client address before net/http reads
-// the request. In PROXY-v2 mode this consumes and validates that header here,
-// before any HTTP or MTProto bytes can be interpreted, and the resulting
-// address is the one used by every later per-IP bound.
+// webSocketConnContext copies the address established by the listener worker.
+// It must not read from conn: net/http invokes ConnContext on its accept path,
+// and a PROXY-v2 read there would let one silent peer stall every later accept.
 func (s *Server) webSocketConnContext(ctx context.Context, conn net.Conn) context.Context {
 	accepted, ok := conn.(*webSocketAcceptedConn)
 	if !ok {
 		return ctx
 	}
 
-	state := &webSocketConnState{socket: accepted, slot: accepted.slot}
-	accepted.slot.armLifetime(func() {
-		if err := accepted.Close(); err != nil && !isDisconnect(err) {
-			s.log.Info("close WebSocket connection at the pre-auth ceiling", "err", err)
-		}
-		if dropped, ok := s.ceilingLog.allow(time.Now(), preAuthLogInterval); ok {
-			s.log.Info("WebSocket connection closed at the pre-auth lifetime ceiling",
-				"lifetime", s.preAuth.limits.Lifetime, "suppressed", dropped)
-		}
-	})
-
-	addr, err := s.clientAddr(accepted)
-	if err != nil {
-		state.err = err
-		return context.WithValue(ctx, webSocketConnKey{}, state)
+	state := &webSocketConnState{
+		socket: accepted,
+		slot:   accepted.slot,
+		addr:   accepted.addr,
 	}
-	if !accepted.slot.keyAddr(addr) {
-		state.err = fmt.Errorf("WebSocket connection refused at the per-network pre-auth cap for %s", addr)
-		s.dropRefused(accepted)
-		if dropped, ok := s.netCapLog.allow(time.Now(), preAuthLogInterval); ok {
-			s.log.Info("WebSocket connection refused at the per-network pre-auth cap",
-				"client_addr", addr, "cap", s.preAuth.limits.MaxConnsPerNet, "suppressed", dropped)
-		}
-		return context.WithValue(ctx, webSocketConnKey{}, state)
-	}
-	state.addr = addr
 	return context.WithValue(ctx, webSocketConnKey{}, state)
 }
 
@@ -144,13 +303,9 @@ func (s *Server) handleWebSocket(ctx context.Context, w http.ResponseWriter, r *
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
-	// Keep the slot tied to the request even when address establishment or the
-	// HTTP upgrade fails. Neither path enters the hijacked-connection cleanup.
+	// Keep the slot tied to the request when the HTTP upgrade fails. The listener
+	// worker closes address-establishment failures before they reach net/http.
 	defer state.slot.clear()
-	if state.err != nil {
-		s.logNegotiation(state.err)
-		return
-	}
 	if r.URL.Path != websocketPath {
 		w.Header().Set("Connection", "close")
 		http.NotFound(w, r)

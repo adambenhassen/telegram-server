@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,6 +101,8 @@ func TestServeWebSocketHandlesMessageBoundaries(t *testing.T) {
 
 			if tt.packed {
 				boundary.bufferWrites = true
+			} else {
+				boundary.splitPacket = true
 			}
 			for i := range tt.want {
 				frame := clientFrame(t, result.AuthKey, 42, int64(i+1)<<32, &tg.HelpGetConfigRequest{})
@@ -111,6 +114,8 @@ func TestServeWebSocketHandlesMessageBoundaries(t *testing.T) {
 				if err := boundary.Flush(); err != nil {
 					t.Fatalf("flush packed frames: %v", err)
 				}
+			} else if boundary.splitPacket {
+				t.Fatal("abridged length prefix and body were not separate writes")
 			}
 
 			gotResults := 0
@@ -213,6 +218,165 @@ func TestServeWebSocketUsesProxyAddress(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("request did not reach handler")
+	}
+}
+
+func TestServeWebSocketProxyAddressDoesNotBlockNextAccept(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	base := mustListenTCP(t, ctx, "127.0.0.1:0")
+	accepted := make(chan struct{}, 1)
+	ln := &webSocketPreludeListener{
+		Listener:        base,
+		header:          proxyV2Header(proxyCmdProxy, netip.MustParseAddr("203.0.113.9")),
+		accepted:        accepted,
+		skipFirstHeader: true,
+	}
+	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
+	srv.TrustProxyV2Headers(loopback)
+	srv.SetHandshakeTimeout(time.Second)
+	served := make(chan error, 1)
+	go func() { served <- srv.ServeWebSocket(ctx, ln) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-served; err != nil {
+			t.Errorf("serve websocket: %v", err)
+		}
+	})
+
+	silent, err := (&net.Dialer{}).DialContext(ctx, "tcp", base.Addr().String())
+	if err != nil {
+		t.Fatalf("dial silent peer: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := silent.Close(); err != nil {
+			t.Logf("close silent peer: %v", err)
+		}
+	})
+	select {
+	case <-accepted:
+	case <-ctx.Done():
+		t.Fatal("server never accepted the silent peer")
+	}
+
+	healthyCtx, stopHealthy := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer stopHealthy()
+	healthy, err := dialWebSocket(healthyCtx, base.Addr().String())
+	if err != nil {
+		t.Fatalf("healthy peer handshake blocked behind silent peer: %v", err)
+	}
+	closeWebSocket(t, healthy)
+}
+
+func TestServeWebSocketWriteTimeoutDoesNotBlockOtherPeer(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	ln := mustListenTCP(t, ctx, "127.0.0.1:0")
+	key := rebindTestKey()
+	keys := &websocketAuthKeyStore{key: key}
+	var blackhole atomic.Pointer[mtproto.Conn]
+	blackholeSelected := make(chan struct{})
+	writeFailed := make(chan error, 1)
+	handler := mtproto.HandlerFunc(func(c *mtproto.Conn, req *mtproto.Request) error {
+		if blackhole.CompareAndSwap(nil, c) {
+			close(blackholeSelected)
+		}
+		if blackhole.Load() == c {
+			err := c.SendResult(req, websocketLargeResult{payload: make([]byte, 8<<20)})
+			if err != nil {
+				select {
+				case writeFailed <- err:
+				default:
+				}
+			}
+			return err
+		}
+		return c.SendResult(req, &tg.BoolTrue{})
+	})
+	srv := mtproto.New(exchange.PrivateKey{}, 2, keys, handler, nil)
+	srv.SetWriteTimeout(100 * time.Millisecond)
+	served := make(chan error, 1)
+	go func() { served <- srv.ServeWebSocket(ctx, ln) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-served; err != nil {
+			t.Errorf("serve websocket: %v", err)
+		}
+	})
+
+	blackCtx, cancelBlack := context.WithCancel(ctx)
+	defer cancelBlack()
+	blackWS, err := dialWebSocket(blackCtx, ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial blackhole peer: %v", err)
+	}
+	t.Cleanup(func() { closeWebSocket(t, blackWS) })
+	blackClient, err := transport.Intermediate.Handshake(websocket.NetConn(blackCtx, blackWS, websocket.MessageBinary))
+	if err != nil {
+		t.Fatalf("blackhole transport handshake: %v", err)
+	}
+	first := clientFrame(t, key, 42, int64(1)<<32, &tg.HelpGetConfigRequest{})
+	if err := blackClient.Send(ctx, &bin.Buffer{Buf: slices.Clone(first)}); err != nil {
+		t.Fatalf("send blackhole request: %v", err)
+	}
+	select {
+	case <-blackholeSelected:
+	case <-ctx.Done():
+		t.Fatal("blackhole request did not authenticate")
+	}
+
+	flood := make([][]byte, 15)
+	for i := range flood {
+		flood[i] = clientFrame(t, key, 42, int64(i+2)<<32, &tg.HelpGetConfigRequest{})
+	}
+	floodDone := make(chan struct{})
+	go func() {
+		defer close(floodDone)
+		for _, frame := range flood {
+			if err := blackClient.Send(blackCtx, &bin.Buffer{Buf: slices.Clone(frame)}); err != nil {
+				return
+			}
+		}
+	}()
+
+	healthy, err := dialWebSocket(ctx, ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial healthy peer: %v", err)
+	}
+	t.Cleanup(func() { closeWebSocket(t, healthy) })
+	healthyClient, err := transport.Intermediate.Handshake(websocket.NetConn(ctx, healthy, websocket.MessageBinary))
+	if err != nil {
+		t.Fatalf("healthy transport handshake: %v", err)
+	}
+	for i := range 4 {
+		frame := clientFrame(t, key, 84, int64(i+1)<<32, &tg.HelpGetConfigRequest{})
+		if err := healthyClient.Send(ctx, &bin.Buffer{Buf: slices.Clone(frame)}); err != nil {
+			t.Fatalf("send healthy request %d: %v", i, err)
+		}
+		receiveBoolResult(t, ctx, healthyClient, key)
+	}
+
+	writeStarted := time.Now()
+	select {
+	case err := <-writeFailed:
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("blackhole write failed without the write bound: %v", err)
+		}
+		if elapsed := time.Since(writeStarted); elapsed > time.Second {
+			t.Fatalf("blackhole write took %s to hit the bound", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blackhole peer did not hit the write bound")
+	}
+	cancelBlack()
+	select {
+	case <-floodDone:
+	case <-ctx.Done():
+		t.Fatal("blackhole flood did not stop")
 	}
 }
 
@@ -389,6 +553,38 @@ func closeWebSocket(t *testing.T, ws *websocket.Conn) {
 	}
 }
 
+func receiveBoolResult(t *testing.T, ctx context.Context, client transport.Conn, key crypto.AuthKey) {
+	t.Helper()
+	cipher := crypto.NewClientCipher(crypto.DefaultRand())
+	for {
+		var in bin.Buffer
+		if err := client.Recv(ctx, &in); err != nil {
+			t.Fatalf("recv response: %v", err)
+		}
+		message, err := cipher.DecryptFromBuffer(key, &in)
+		if err != nil {
+			t.Fatalf("decrypt response: %v", err)
+		}
+		body := &bin.Buffer{Buf: message.MessageDataWithPadding[:message.MessageDataLen]}
+		id, err := body.PeekID()
+		if err != nil {
+			t.Fatalf("peek response id: %v", err)
+		}
+		if id == mt.NewSessionCreatedTypeID {
+			continue
+		}
+		var result proto.Result
+		if err := result.Decode(body); err != nil {
+			t.Fatalf("decode rpc result: %v", err)
+		}
+		var value tg.BoolTrue
+		if err := value.Decode(&bin.Buffer{Buf: result.Result}); err != nil {
+			t.Fatalf("decode rpc value: %v", err)
+		}
+		return
+	}
+}
+
 func dialWebSocket(ctx context.Context, addr string) (*websocket.Conn, error) {
 	ws, resp, err := websocket.Dial(ctx, "ws://"+addr+"/apiws", &websocket.DialOptions{
 		HTTPHeader:   http.Header{"Origin": []string{"https://web.telegram.org"}},
@@ -405,7 +601,29 @@ func dialWebSocket(ctx context.Context, addr string) (*websocket.Conn, error) {
 type webSocketPreludeListener struct {
 	net.Listener
 
-	header []byte
+	header          []byte
+	accepted        chan struct{}
+	skipFirstHeader bool
+	acceptCount     int
+}
+
+type websocketAuthKeyStore struct {
+	key crypto.AuthKey
+}
+
+func (s *websocketAuthKeyStore) Save(context.Context, crypto.AuthKey) error { return nil }
+func (s *websocketAuthKeyStore) Touch(context.Context, [8]byte) error       { return nil }
+func (s *websocketAuthKeyStore) Get(context.Context, [8]byte) (crypto.AuthKey, int64, bool, bool, error) {
+	return s.key, 7, false, true, nil
+}
+
+type websocketLargeResult struct {
+	payload []byte
+}
+
+func (r websocketLargeResult) Encode(b *bin.Buffer) error {
+	b.Put(r.payload)
+	return nil
 }
 
 func (l *webSocketPreludeListener) Accept() (net.Conn, error) {
@@ -413,7 +631,18 @@ func (l *webSocketPreludeListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &webSocketPreludeConn{Conn: conn, header: slices.Clone(l.header)}, nil
+	if l.accepted != nil {
+		select {
+		case l.accepted <- struct{}{}:
+		default:
+		}
+	}
+	l.acceptCount++
+	header := l.header
+	if l.skipFirstHeader && l.acceptCount == 1 {
+		header = nil
+	}
+	return &webSocketPreludeConn{Conn: conn, header: slices.Clone(header)}, nil
 }
 
 type webSocketPreludeConn struct {
@@ -440,6 +669,8 @@ type webSocketBoundaryConn struct {
 	net.Conn
 
 	splitHeader  bool
+	splitPacket  bool
+	packetPrefix int
 	bufferWrites bool
 	pending      []byte
 }
@@ -457,6 +688,20 @@ func (c *webSocketBoundaryConn) Write(p []byte) (int, error) {
 			return 0, err
 		}
 		return len(p), nil
+	}
+	if c.splitPacket {
+		if c.packetPrefix == 0 {
+			if len(p) != 1 && len(p) != 4 {
+				return 0, errors.New("abridged length prefix was not one write")
+			}
+			c.packetPrefix = len(p)
+		} else {
+			if len(p) == 0 {
+				return 0, errors.New("abridged packet body was empty")
+			}
+			c.splitPacket = false
+			c.packetPrefix = 0
+		}
 	}
 	if c.bufferWrites {
 		c.pending = append(c.pending, p...)
