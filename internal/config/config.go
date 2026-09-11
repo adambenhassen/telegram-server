@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -258,6 +259,14 @@ type RateLimitsConfig struct {
 	// account, on one shared budget: both write the same rows, so a budget each
 	// would let an account double its part rate by alternating between them.
 	SaveFilePart store.RateLimitConfig
+	// GetFile limits upload.getFile per account. It is backed by the existing
+	// Postgres rate-limit counter, so concurrent requests for one account are
+	// admitted exactly across connections and replicas.
+	GetFile store.RateLimitConfig
+	// GetFileReplica limits upload.getFile across this process. It is deliberately
+	// process-local: its fixed-window state is reset when the replica restarts
+	// and is not presented as a cluster-wide quota.
+	GetFileReplica store.RateLimitConfig
 	// SendCodeIP limits auth.sendCode per client network. It is keyed on the
 	// connection's address rather than an account because the surface is
 	// unauthenticated: there is no account yet to hold a budget.
@@ -308,7 +317,9 @@ type RateLimitsConfig struct {
 // callers only), 5 signUp calls per hour per client network, 5 password proof
 // attempts per 10 min per account (shared by getPasswordSettings and
 // updatePasswordSettings), 20 getPassword calls per hour per account
-// (authorized callers only), and 20 updateProfile calls per 24h per account.
+// (authorized callers only), 20 updateProfile calls per 24h per account, 50
+// upload.getFile calls per second per account, and 400 upload.getFile calls per
+// second per process.
 // Zero disables enforcement for a surface.
 //
 // The upload number is the one derived rather than chosen: at the 512 KiB
@@ -328,6 +339,8 @@ func DefaultRateLimits() RateLimitsConfig {
 		SearchContacts: store.RateLimitConfig{Limit: 300, Window: time.Hour},
 		SearchGlobal:   store.RateLimitConfig{Limit: 300, Window: time.Hour},
 		SaveFilePart:   store.RateLimitConfig{Limit: 600, Window: 60 * time.Second},
+		GetFile:        store.RateLimitConfig{Limit: 50, Window: time.Second},
+		GetFileReplica: store.RateLimitConfig{Limit: 400, Window: time.Second},
 		SendCodeIP: store.SendCodeIPLimits{
 			Calls:  store.RateLimitConfig{Limit: 10, Window: time.Hour},
 			Phones: store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
@@ -341,6 +354,19 @@ func DefaultRateLimits() RateLimitsConfig {
 		GetPassword:     store.RateLimitConfig{Limit: 20, Window: time.Hour},
 		UpdateProfile:   store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
 	}
+}
+
+func validateGetFileRateLimit(limitName, windowName string, cfg store.RateLimitConfig) error {
+	if cfg.Limit < 0 {
+		return fmt.Errorf("%s must not be negative; 0 disables the bound", limitName)
+	}
+	if cfg.Window < 0 {
+		return fmt.Errorf("%s must not be negative", windowName)
+	}
+	if cfg.Limit > 0 && cfg.Window == 0 {
+		return fmt.Errorf("%s must be positive when %s is enabled", windowName, limitName)
+	}
+	return nil
 }
 
 // MaxFileBytesLimit is the ceiling on TG_MAX_FILE_BYTES. It is a bound on the
@@ -678,6 +704,55 @@ func Load(log *slog.Logger) (Config, error) {
 			return Config{}, errors.New("TG_RATE_LIMIT_SAVE_FILE_PART_WINDOW must be a duration")
 		}
 		cfg.RateLimits.SaveFilePart.Window = d
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_FILE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE must be an integer")
+		}
+		if n < 0 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE must not be negative; 0 disables the bound")
+		}
+		if n > math.MaxInt32 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE must not exceed math.MaxInt32")
+		}
+		cfg.RateLimits.GetFile.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_FILE_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_WINDOW must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_WINDOW must not be negative")
+		}
+		cfg.RateLimits.GetFile.Window = d
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_FILE_REPLICA"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_REPLICA must be an integer")
+		}
+		if n < 0 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_REPLICA must not be negative; 0 disables the bound")
+		}
+		cfg.RateLimits.GetFileReplica.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW must not be negative")
+		}
+		cfg.RateLimits.GetFileReplica.Window = d
+	}
+	if err := validateGetFileRateLimit("TG_RATE_LIMIT_GET_FILE", "TG_RATE_LIMIT_GET_FILE_WINDOW", cfg.RateLimits.GetFile); err != nil {
+		return Config{}, err
+	}
+	if err := validateGetFileRateLimit("TG_RATE_LIMIT_GET_FILE_REPLICA", "TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW", cfg.RateLimits.GetFileReplica); err != nil {
+		return Config{}, err
 	}
 	if v := os.Getenv("TG_RATE_LIMIT_SEND_CODE_IP"); v != "" {
 		n, err := strconv.Atoi(v)

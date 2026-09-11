@@ -73,6 +73,12 @@ type handlers struct {
 	// rateLimitSaveFilePart limits upload.saveFilePart and upload.saveBigFilePart
 	// to one shared budget per account: both write the same parts table.
 	rateLimitSaveFilePart store.RateLimitConfig
+	// rateLimitGetFile limits upload.getFile per account through the shared
+	// Postgres-backed rate limiter.
+	rateLimitGetFile store.RateLimitConfig
+	// getFileReplicaLimiter limits upload.getFile across this process. Its state
+	// is intentionally not shared with another replica.
+	getFileReplicaLimiter *downloadRateLimiter
 	// rateLimitSendCodeIP limits auth.sendCode per client network. It is the
 	// one limit here that is not keyed on an account: sendCode is
 	// unauthenticated, so the connection's address is the only subject there is.
@@ -177,6 +183,8 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitSearchContacts:  rateLimits.SearchContacts,
 		rateLimitSearchGlobal:    rateLimits.SearchGlobal,
 		rateLimitSaveFilePart:    rateLimits.SaveFilePart,
+		rateLimitGetFile:         rateLimits.GetFile,
+		getFileReplicaLimiter:    newDownloadRateLimiter(rateLimits.GetFileReplica),
 		rateLimitSendCodeIP:      rateLimits.SendCodeIP,
 		rateLimitSignInFailIP:    rateLimits.SignInFailIP,
 		rateLimitCheckPassword:   rateLimits.CheckPassword,

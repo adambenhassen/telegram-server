@@ -3,8 +3,10 @@ package config_test
 import (
 	"encoding/hex"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -98,6 +100,18 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.RateLimits.SaveFilePart.Window != 60*time.Second {
 		t.Errorf("SaveFilePart window = %v, want 60s", cfg.RateLimits.SaveFilePart.Window)
+	}
+	if cfg.RateLimits.GetFile.Limit != 50 {
+		t.Errorf("GetFile limit = %d, want 50", cfg.RateLimits.GetFile.Limit)
+	}
+	if cfg.RateLimits.GetFile.Window != time.Second {
+		t.Errorf("GetFile window = %v, want 1s", cfg.RateLimits.GetFile.Window)
+	}
+	if cfg.RateLimits.GetFileReplica.Limit != 400 {
+		t.Errorf("GetFileReplica limit = %d, want 400", cfg.RateLimits.GetFileReplica.Limit)
+	}
+	if cfg.RateLimits.GetFileReplica.Window != time.Second {
+		t.Errorf("GetFileReplica window = %v, want 1s", cfg.RateLimits.GetFileReplica.Window)
 	}
 	if cfg.RateLimits.UpdateProfile.Limit != 20 {
 		t.Errorf("UpdateProfile limit = %d, want 20", cfg.RateLimits.UpdateProfile.Limit)
@@ -969,6 +983,121 @@ func TestLoadNewRateLimits(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "TG_RATE_LIMIT_CHECK_PASSWORD") {
 		t.Errorf("error %q does not name TG_RATE_LIMIT_CHECK_PASSWORD", err)
+	}
+}
+
+func TestLoadGetFileRateLimits(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+
+	tests := map[string]struct {
+		perAccountLimit   string
+		perAccountWindow  string
+		replicaLimit      string
+		replicaWindow     string
+		wantAccountLimit  int
+		wantAccountWindow time.Duration
+		wantReplicaLimit  int
+		wantReplicaWindow time.Duration
+		wantErr           string
+	}{
+		"defaults": {
+			wantAccountLimit:  50,
+			wantAccountWindow: time.Second,
+			wantReplicaLimit:  400,
+			wantReplicaWindow: time.Second,
+		},
+		"overrides": {
+			perAccountLimit: "7", perAccountWindow: "2s",
+			replicaLimit: "19", replicaWindow: "3s",
+			wantAccountLimit: 7, wantAccountWindow: 2 * time.Second,
+			wantReplicaLimit: 19, wantReplicaWindow: 3 * time.Second,
+		},
+		"per-account int32 maximum": {
+			perAccountLimit:   strconv.FormatInt(math.MaxInt32, 10),
+			wantAccountLimit:  math.MaxInt32,
+			wantAccountWindow: time.Second,
+			wantReplicaLimit:  400,
+			wantReplicaWindow: time.Second,
+		},
+		"per-account above int32 maximum": {
+			perAccountLimit: strconv.FormatInt(math.MaxInt32+1, 10),
+			wantErr:         "TG_RATE_LIMIT_GET_FILE",
+		},
+		"per-account disabled": {
+			perAccountLimit:  "0",
+			wantAccountLimit: 0, wantAccountWindow: time.Second,
+			wantReplicaLimit: 400, wantReplicaWindow: time.Second,
+		},
+		"replica disabled": {
+			replicaLimit:     "0",
+			wantAccountLimit: 50, wantAccountWindow: time.Second,
+			wantReplicaLimit: 0, wantReplicaWindow: time.Second,
+		},
+		"negative per-account": {
+			perAccountLimit: "-1", wantErr: "TG_RATE_LIMIT_GET_FILE",
+		},
+		"invalid per-account": {
+			perAccountLimit: "many", wantErr: "TG_RATE_LIMIT_GET_FILE",
+		},
+		"negative replica": {
+			replicaLimit: "-1", wantErr: "TG_RATE_LIMIT_GET_FILE_REPLICA",
+		},
+		"invalid replica": {
+			replicaLimit: "many", wantErr: "TG_RATE_LIMIT_GET_FILE_REPLICA",
+		},
+		"negative per-account window": {
+			perAccountWindow: "-1s", wantErr: "TG_RATE_LIMIT_GET_FILE_WINDOW",
+		},
+		"invalid per-account window": {
+			perAccountWindow: "soon", wantErr: "TG_RATE_LIMIT_GET_FILE_WINDOW",
+		},
+		"negative replica window": {
+			replicaWindow: "-1s", wantErr: "TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW",
+		},
+		"invalid replica window": {
+			replicaWindow: "soon", wantErr: "TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW",
+		},
+		"zero per-account window with enabled limit": {
+			perAccountWindow: "0s", wantErr: "TG_RATE_LIMIT_GET_FILE_WINDOW",
+		},
+		"zero replica window with enabled limit": {
+			replicaWindow: "0s", wantErr: "TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TG_RATE_LIMIT_GET_FILE", tc.perAccountLimit)
+			t.Setenv("TG_RATE_LIMIT_GET_FILE_WINDOW", tc.perAccountWindow)
+			t.Setenv("TG_RATE_LIMIT_GET_FILE_REPLICA", tc.replicaLimit)
+			t.Setenv("TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW", tc.replicaWindow)
+
+			cfg, err := config.Load(discardLog())
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("Load succeeded, want an error naming %s", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error %q does not name %s", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.RateLimits.GetFile.Limit != tc.wantAccountLimit {
+				t.Errorf("GetFile limit = %d, want %d", cfg.RateLimits.GetFile.Limit, tc.wantAccountLimit)
+			}
+			if cfg.RateLimits.GetFile.Window != tc.wantAccountWindow {
+				t.Errorf("GetFile window = %v, want %v", cfg.RateLimits.GetFile.Window, tc.wantAccountWindow)
+			}
+			if cfg.RateLimits.GetFileReplica.Limit != tc.wantReplicaLimit {
+				t.Errorf("GetFileReplica limit = %d, want %d", cfg.RateLimits.GetFileReplica.Limit, tc.wantReplicaLimit)
+			}
+			if cfg.RateLimits.GetFileReplica.Window != tc.wantReplicaWindow {
+				t.Errorf("GetFileReplica window = %v, want %v", cfg.RateLimits.GetFileReplica.Window, tc.wantReplicaWindow)
+			}
+		})
 	}
 }
 

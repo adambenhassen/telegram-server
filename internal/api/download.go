@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -33,6 +34,43 @@ func (h *handlers) endDownload(userID int64) {
 	h.downloadsMu.Lock()
 	defer h.downloadsMu.Unlock()
 	delete(h.downloads, userID)
+}
+
+// checkGetFileRateLimit admits an authorized upload.getFile through both the
+// per-account and process-local budgets. The account reservation is refunded
+// when the replica budget rejects the call, so the two limits remain
+// independent and a replica denial does not spend the account's budget.
+func (h *handlers) checkGetFileRateLimit(r *mtproto.Request) error {
+	reservation, denied, err := h.store.ReserveRateLimit(
+		r.Ctx, r.UserID, "upload_get_file", h.rateLimitGetFile,
+	)
+	if err != nil {
+		h.log.Error("get file rate limit")
+		return errInternal
+	}
+	if denied != nil {
+		return floodWaitForDuration(denied.Wait)
+	}
+
+	wait, ok := h.getFileReplicaLimiter.allow(h.now())
+	if ok {
+		return nil
+	}
+	if reservation != nil {
+		if err := h.store.RefundRateLimit(r.Ctx, r.UserID, "upload_get_file", reservation); err != nil {
+			h.log.Error("get file rate limit refund")
+			return errInternal
+		}
+	}
+	return floodWaitForDuration(wait)
+}
+
+func floodWaitForDuration(wait time.Duration) error {
+	seconds := int(wait / time.Second)
+	if wait%time.Second != 0 {
+		seconds++
+	}
+	return FloodWaitError(seconds)
 }
 
 // handleGetFile serves upload.getFile: one byte range of one stored file, to a
@@ -90,6 +128,9 @@ func (h *handlers) handleGetFile(r *mtproto.Request) (bin.Encoder, error) {
 	n := int64(req.Limit)
 	if remaining := file.Size - req.Offset; n > remaining {
 		n = remaining
+	}
+	if err := h.checkGetFileRateLimit(r); err != nil {
+		return nil, err
 	}
 
 	b, err := h.blobs.ReadAt(r.Ctx, blob.Key(file.ID), req.Offset, n)

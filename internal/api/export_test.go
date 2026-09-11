@@ -138,6 +138,7 @@ func testHandlers(s *store.Store) *handlers {
 		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
 		maxFileBytes:             TestMaxFileBytes,
 		downloads:                map[int64]bool{},
+		getFileReplicaLimiter:    newDownloadRateLimiter(store.RateLimitConfig{}),
 		now:                      time.Now,
 		peers:                    pgtest.PeerDeriver(),
 		rateLimitMessageSend:     store.RateLimitConfig{},
@@ -154,14 +155,67 @@ func testHandlers(s *store.Store) *handlers {
 // MaxDownloadChunk exposes the per-reply download cap to the api_test package.
 const MaxDownloadChunk = maxDownloadChunk
 
+// NewDownloadRateLimiterForTest returns the process-local download admission
+// function for tests that need a controllable clock.
+func NewDownloadRateLimiterForTest(cfg store.RateLimitConfig) func(time.Time) (time.Duration, bool) {
+	return newDownloadRateLimiter(cfg).allow
+}
+
 // GetFileSeqForTest returns a getFile bound to ONE handlers value, so
 // successive calls share the in-flight download slot. GetFileForTest builds a
 // fresh handler per call and therefore cannot observe a leaked slot.
 func GetFileSeqForTest(
 	s *store.Store, blobs blob.Store,
 ) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimits(s, blobs, store.RateLimitConfig{}, store.RateLimitConfig{})
+}
+
+// GetFileSeqForTestWithLimits returns a getFile bound to one handlers value,
+// with custom per-account and process-local limits. Keeping one handler is
+// important for tests that exercise the replica-wide counter.
+func GetFileSeqForTestWithLimits(
+	s *store.Store, blobs blob.Store,
+	perAccount, perReplica store.RateLimitConfig,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimitsAndLoggerAt(
+		s, blobs, slog.New(slog.DiscardHandler), time.Now, perAccount, perReplica,
+	)
+}
+
+// GetFileSeqForTestWithLimitsAndLogger returns a getFile bound to one handlers
+// value with custom limits and logger. It is for error-path log assertions.
+func GetFileSeqForTestWithLimitsAndLogger(
+	s *store.Store, blobs blob.Store, log *slog.Logger,
+	perAccount, perReplica store.RateLimitConfig,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimitsAndLoggerAt(
+		s, blobs, log, time.Now, perAccount, perReplica,
+	)
+}
+
+// GetFileSeqForTestWithLimitsAndNow returns a getFile bound to one handlers
+// value with custom limits and clock. It is for fixed-window boundary tests.
+func GetFileSeqForTestWithLimitsAndNow(
+	s *store.Store, blobs blob.Store,
+	perAccount, perReplica store.RateLimitConfig, now func() time.Time,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimitsAndLoggerAt(
+		s, blobs, slog.New(slog.DiscardHandler), now, perAccount, perReplica,
+	)
+}
+
+// GetFileSeqForTestWithLimitsAndLoggerAt returns a getFile bound to one
+// handlers value with custom limits, logger, and clock.
+func GetFileSeqForTestWithLimitsAndLoggerAt(
+	s *store.Store, blobs blob.Store, log *slog.Logger, now func() time.Time,
+	perAccount, perReplica store.RateLimitConfig,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
 	h := testHandlers(s)
 	h.blobs = blobs
+	h.log = log
+	h.now = now
+	h.rateLimitGetFile = perAccount
+	h.getFileReplicaLimiter = newDownloadRateLimiter(perReplica)
 	return func(userID int64, req *tg.UploadGetFileRequest) (bin.Encoder, error) {
 		var buf bin.Buffer
 		if err := req.Encode(&buf); err != nil {
