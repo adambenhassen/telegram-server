@@ -128,6 +128,7 @@ The server refuses to start without a database and a master key:
 | `TG_AUTHKEY_ENC_KEY` | *(one of two required)* | 64 hex chars, the AES-256-GCM master key over stored auth keys. Alternatively set `TG_AUTHKEY_ENC_KEY_FILE` to read/generate the key from a file; one of the two must be set |
 | `TG_LISTEN_ADDR` | `:2443` | Address the MTProto listener binds |
 | `TG_WEBSOCKET_LISTEN_ADDR` | *(unset)* | Enables the WebSocket MTProto listener on this address; browser clients connect to `/apiws` |
+| `TG_WEBSOCKET_ALLOWED_ORIGINS` | *(unset)* | Comma-separated browser origins allowed to connect to `/apiws`; unset rejects every request carrying an `Origin` header |
 | `TG_RSA_KEY_PATH` | `server_key.pem` | Server RSA private key; generated on first start |
 | `TG_BLOB_DIR` | `blobs` | Where uploaded file bodies are written |
 | `TG_BLOB_S3_ENDPOINT` | *(unset)* | Enables the S3-compatible blob backend when non-empty; requires the other `TG_BLOB_S3_*` settings below |

@@ -1,6 +1,7 @@
 package mtproto_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -270,6 +271,128 @@ func TestServeWebSocketProxyAddressDoesNotBlockNextAccept(t *testing.T) {
 	closeWebSocket(t, healthy)
 }
 
+func TestServeWebSocketNegotiationUsesOneBudget(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	base := mustListenTCP(t, ctx, "127.0.0.1:0")
+	accepted := make(chan time.Time, 1)
+	ln := &timestampWebSocketListener{Listener: base, accepted: accepted}
+	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
+	srv.SetHandshakeTimeout(300 * time.Millisecond)
+	if err := srv.SetPreAuthLimits(mtproto.PreAuthLimits{MaxConns: 1}); err != nil {
+		t.Fatalf("set pre-auth limits: %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- srv.ServeWebSocket(ctx, ln) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-served; err != nil {
+			t.Errorf("serve websocket: %v", err)
+		}
+	})
+
+	first, err := (&net.Dialer{}).DialContext(ctx, "tcp", base.Addr().String())
+	if err != nil {
+		t.Fatalf("dial slow peer: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := first.Close(); err != nil {
+			t.Logf("close slow peer: %v", err)
+		}
+	})
+	var acceptedAt time.Time
+	select {
+	case acceptedAt = <-accepted:
+	case <-ctx.Done():
+		t.Fatal("server never accepted the slow peer")
+	}
+	request := rawWebSocketHandshake()
+	if _, err := first.Write(request[:len(request)-2]); err != nil {
+		t.Fatalf("write partial raw WebSocket handshake: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := first.Write(request[len(request)-2:]); err != nil {
+		t.Fatalf("finish raw WebSocket handshake: %v", err)
+	}
+	if err := readRawWebSocketHandshake(first); err != nil {
+		t.Fatalf("read slow peer handshake: %v", err)
+	}
+	if _, err := first.Write([]byte{0x82, 0x81, 0, 0, 0, 0, 0}); err != nil {
+		t.Fatalf("write partial transport frame: %v", err)
+	}
+
+	dialCtx, stopDial := context.WithDeadline(ctx, acceptedAt.Add(450*time.Millisecond))
+	defer stopDial()
+	var healthy *websocket.Conn
+	for {
+		healthy, err = dialWebSocket(dialCtx, base.Addr().String())
+		if err == nil {
+			break
+		}
+		select {
+		case <-dialCtx.Done():
+			t.Fatalf("slot was not released within one negotiation budget: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	defer closeWebSocket(t, healthy)
+	if elapsed := time.Since(acceptedAt); elapsed > 450*time.Millisecond {
+		t.Fatalf("slot was released after %s, want one negotiation budget", elapsed)
+	}
+}
+
+func TestServeWebSocketOriginPolicy(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name           string
+		origin         string
+		originPatterns []string
+		sameHost       bool
+		wantError      bool
+	}{
+		{name: "absent", wantError: false},
+		{name: "allowed", origin: "https://web.telegram.org", originPatterns: []string{"https://web.telegram.org"}, wantError: false},
+		{name: "unlisted", origin: "https://evil.example", wantError: true},
+		{name: "same-host-unset", sameHost: true, wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			ln := mustListenTCP(t, ctx, "127.0.0.1:0")
+			srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
+			srv.SetWebSocketOriginPatterns(tt.originPatterns)
+			served := make(chan error, 1)
+			go func() { served <- srv.ServeWebSocket(ctx, ln) }()
+			t.Cleanup(func() {
+				cancel()
+				if err := <-served; err != nil {
+					t.Errorf("serve websocket: %v", err)
+				}
+			})
+
+			origin := tt.origin
+			if tt.sameHost {
+				origin = "http://" + ln.Addr().String()
+			}
+			ws, err := dialWebSocketOrigin(ctx, ln.Addr().String(), origin)
+			if tt.wantError {
+				if err == nil {
+					closeWebSocket(t, ws)
+					t.Fatal("unlisted WebSocket origin was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("headerless WebSocket handshake: %v", err)
+			}
+			closeWebSocket(t, ws)
+		})
+	}
+}
+
 func TestServeWebSocketWriteTimeoutDoesNotBlockOtherPeer(t *testing.T) {
 	t.Parallel()
 
@@ -485,12 +608,10 @@ func TestServeWebSocketRejectsOversizedMessage(t *testing.T) {
 		t.Fatalf("write oversized message: %v", err)
 	}
 
-	closeCtx, stop := context.WithTimeout(context.Background(), 2*time.Second)
-	defer stop()
-	if _, _, err := ws.Read(closeCtx); err == nil {
+	if _, _, err := ws.Read(ctx); err == nil {
 		t.Fatal("oversized WebSocket message was accepted")
 	} else if errors.Is(err, context.DeadlineExceeded) {
-		t.Fatal("oversized WebSocket message did not close the connection")
+		t.Fatal("oversized WebSocket message did not close the connection before the test deadline")
 	} else if status := websocket.CloseStatus(err); status != websocket.StatusMessageTooBig {
 		t.Fatalf("close status = %v, want %v: %v", status, websocket.StatusMessageTooBig, err)
 	}
@@ -586,8 +707,16 @@ func receiveBoolResult(t *testing.T, ctx context.Context, client transport.Conn,
 }
 
 func dialWebSocket(ctx context.Context, addr string) (*websocket.Conn, error) {
+	return dialWebSocketOrigin(ctx, addr, "")
+}
+
+func dialWebSocketOrigin(ctx context.Context, addr, origin string) (*websocket.Conn, error) {
+	var headers http.Header
+	if origin != "" {
+		headers = http.Header{"Origin": []string{origin}}
+	}
 	ws, resp, err := websocket.Dial(ctx, "ws://"+addr+"/apiws", &websocket.DialOptions{
-		HTTPHeader:   http.Header{"Origin": []string{"https://web.telegram.org"}},
+		HTTPHeader:   headers,
 		Subprotocols: []string{"binary"},
 	})
 	if resp != nil && resp.Body != nil {
@@ -598,6 +727,28 @@ func dialWebSocket(ctx context.Context, addr string) (*websocket.Conn, error) {
 	return ws, err
 }
 
+func rawWebSocketHandshake() []byte {
+	return []byte("GET /apiws HTTP/1.1\r\n" +
+		"Host: localhost\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Sec-WebSocket-Version: 13\r\n\r\n")
+}
+
+func readRawWebSocketHandshake(conn net.Conn) error {
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if line == "\r\n" {
+			return nil
+		}
+	}
+}
+
 type webSocketPreludeListener struct {
 	net.Listener
 
@@ -605,6 +756,25 @@ type webSocketPreludeListener struct {
 	accepted        chan struct{}
 	skipFirstHeader bool
 	acceptCount     int
+}
+
+type timestampWebSocketListener struct {
+	net.Listener
+
+	accepted chan time.Time
+}
+
+func (l *timestampWebSocketListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	acceptedAt := time.Now()
+	select {
+	case l.accepted <- acceptedAt:
+	default:
+	}
+	return conn, nil
 }
 
 type websocketAuthKeyStore struct {

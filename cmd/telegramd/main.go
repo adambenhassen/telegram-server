@@ -327,6 +327,7 @@ func run(log *slog.Logger) error {
 	cfg.WarnClientAddrTrust(log)
 
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewPgAuthKeyStore(st), handler, log)
+	server.SetWebSocketOriginPatterns(cfg.WebSocketOriginPatterns)
 	if err := trustClientAddr(server, cfg, log); err != nil {
 		return err
 	}

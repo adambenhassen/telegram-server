@@ -29,6 +29,7 @@ Configuration is read from environment variables in `internal/config/config.go`:
 |---------------------|------------------|---------------------------------------------|
 | `TG_LISTEN_ADDR`    | `:2443`          | `host:port` (or `:port`) the server binds   |
 | `TG_WEBSOCKET_LISTEN_ADDR` | *(unset)* | Enables the WebSocket MTProto listener on this address; browser clients connect to `/apiws` |
+| `TG_WEBSOCKET_ALLOWED_ORIGINS` | *(unset)* | Comma-separated browser origins allowed to connect to `/apiws`; unset rejects every request carrying an `Origin` header |
 | `TG_ADVERTISE_ADDR` | *(derived from `TG_LISTEN_ADDR`)* | `host:port` clients are told to dial, used verbatim. Derived when unset: the listen address with an empty or wildcard host (`:2443`, `0.0.0.0`, `::`) replaced by `127.0.0.1`. A value that is not `host:port`, has no host, or has a port that is not an integer in 1–65535 fails startup |
 | `TG_POSTGRES_DSN`   | *(required)*     | Postgres connection string; no default, server fails to start without it |
 | `TG_AUTHKEY_ENC_KEY`| *(required)*     | 64 hex chars (32 bytes) — master key that encrypts auth keys at rest; must stay stable, or persisted sessions can no longer be decrypted |
@@ -59,9 +60,11 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_MAX_PENDING_LOGIN_CONNS`| `1024` | Process-wide concurrent connections waiting for `auth.checkPassword` after `SESSION_PASSWORD_NEEDED`. A pending connection remains counted in the unbound-key hold and this cap, and receives a single ten-minute absolute read lease (`2 × srp.DefaultTTL`); activity never refreshes it. The SRP challenge still expires after five minutes. Past the cap the connection is closed immediately. `0` disables it; a negative or non-integer value fails startup |
 | `TG_CLIENT_ADDR_PROXY_CIDRS`| *(unset)* | Comma-separated addresses or CIDRs (`10.0.0.0/8, 192.0.2.7`) of the balancers a PROXY protocol v2 header is accepted from. An IPv4-mapped entry takes its IPv4 meaning (`::ffff:192.0.2.0/120` is `192.0.2.0/24`), since peer addresses are matched unmapped; one too short to name an IPv4 network fails startup rather than starting and matching nothing. Required by, and only read in, `TG_CLIENT_ADDR_TRUST=proxy-v2`: an empty list there fails startup, and a list set in `socket` mode does too, since it means the balancer is in place but every client is being keyed on its address. Both directions then fail closed — a connection from a listed balancer without a valid v2 header is dropped rather than served on the balancer's address, and a header from anywhere else is dropped rather than believed. Only v2: the v1 text form is refused. An address is read only from `PROXY` over `AF_INET`/`AF_INET6` with the `STREAM` transport; the two headers that name no client — the `LOCAL` command a health check sends, and `AF_UNSPEC` — connect but carry no address and so cannot call `auth.sendCode`; every other family or transport is refused. Keep this list to the balancer addresses, not a VPC or subnet range: a connection whose header names no client is charged to no bucket, so anything inside an allowlisted CIDR can send a `LOCAL`/`AF_UNSPEC` header and sit outside `TG_MAX_PREAUTH_CONNS_PER_IP` entirely — with `10.0.0.0/8` that is every workload in the network, with the balancer's own addresses it is the balancer |
 
-When `TG_WEBSOCKET_LISTEN_ADDR` is set, `/apiws` accepts browser origins because
-MTProto authentication is carried by the encrypted protocol stream rather than
-HTTP cookies. Keep this listener within the intended network boundary.
+When `TG_WEBSOCKET_LISTEN_ADDR` is set, configure
+`TG_WEBSOCKET_ALLOWED_ORIGINS` with the browser origins that may connect to
+`/apiws`. Requests without an `Origin` header remain valid for native clients;
+requests carrying one are rejected unless it matches the configured list.
+Keep this listener within the intended network boundary.
 
 ### Object-store backend
 

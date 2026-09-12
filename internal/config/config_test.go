@@ -34,6 +34,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.WebSocketListenAddr != "" {
 		t.Errorf("WebSocketListenAddr = %q, want disabled by default", cfg.WebSocketListenAddr)
 	}
+	if len(cfg.WebSocketOriginPatterns) != 0 {
+		t.Errorf("WebSocketOriginPatterns = %v, want no browser origins by default", cfg.WebSocketOriginPatterns)
+	}
 	if cfg.DCID != 2 {
 		t.Errorf("DCID = %d, want 2", cfg.DCID)
 	}
@@ -135,6 +138,21 @@ func TestLoadWebSocketListenAddr(t *testing.T) {
 	}
 	if cfg.WebSocketListenAddr != "127.0.0.1:2445" {
 		t.Fatalf("WebSocketListenAddr = %q, want configured address", cfg.WebSocketListenAddr)
+	}
+}
+
+func TestLoadWebSocketOriginPatterns(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_WEBSOCKET_ALLOWED_ORIGINS", "https://web.telegram.org, https://webk.telegram.org,")
+
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"https://web.telegram.org", "https://webk.telegram.org"}
+	if strings.Join(cfg.WebSocketOriginPatterns, ",") != strings.Join(want, ",") {
+		t.Fatalf("WebSocketOriginPatterns = %v, want %v", cfg.WebSocketOriginPatterns, want)
 	}
 }
 

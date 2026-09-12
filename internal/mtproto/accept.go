@@ -42,12 +42,20 @@ const (
 // left set on the way out: gotd resets it from the context before every frame it
 // reads, so nothing here has to clear it.
 func (s *Server) clientAddr(sock net.Conn) (netip.Addr, error) {
+	return s.clientAddrUntil(sock, time.Now().Add(s.handshakeTimeout))
+}
+
+// clientAddrUntil establishes the address using an already-established
+// negotiation deadline. WebSocket accepts set that deadline before dispatching
+// the connection to the address worker, so the worker cannot buy another
+// handshake timeout before HTTP or codec negotiation begins.
+func (s *Server) clientAddrUntil(sock net.Conn, deadline time.Time) (netip.Addr, error) {
 	addr := peerAddr(sock.RemoteAddr())
 	if s.proxyV2 != nil && !s.proxyV2.allowed(addr) {
 		return netip.Addr{}, errors.Join(
 			fmt.Errorf("no PROXY header is accepted from %s: not an allowlisted balancer", addr), sock.Close())
 	}
-	if err := sock.SetReadDeadline(time.Now().Add(s.handshakeTimeout)); err != nil {
+	if err := sock.SetReadDeadline(deadline); err != nil {
 		return netip.Addr{}, errors.Join(errors.New("set handshake deadline"), err, sock.Close())
 	}
 	if s.proxyV2 == nil {

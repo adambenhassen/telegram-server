@@ -6,6 +6,9 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,9 +27,10 @@ const (
 type webSocketConnKey struct{}
 
 type webSocketConnState struct {
-	socket *webSocketAcceptedConn
-	slot   *preAuthSlot
-	addr   netip.Addr
+	socket   *webSocketAcceptedConn
+	slot     *preAuthSlot
+	addr     netip.Addr
+	deadline time.Time
 }
 
 // webSocketAcceptedConn carries the pre-auth slot from the HTTP server's
@@ -35,10 +39,11 @@ type webSocketConnState struct {
 type webSocketAcceptedConn struct {
 	net.Conn
 
-	slot   *preAuthSlot
-	state  sync.Mutex
-	closed bool
-	addr   netip.Addr
+	slot     *preAuthSlot
+	state    sync.Mutex
+	closed   bool
+	addr     netip.Addr
+	deadline time.Time
 }
 
 func (c *webSocketAcceptedConn) Close() error {
@@ -142,7 +147,15 @@ func (l *webSocketListener) acceptLoop() {
 			}
 			continue
 		}
-		accepted := &webSocketAcceptedConn{Conn: sock, slot: slot}
+		accepted := &webSocketAcceptedConn{
+			Conn:     sock,
+			slot:     slot,
+			deadline: time.Now().Add(l.server.handshakeTimeout),
+		}
+		if err := accepted.SetDeadline(accepted.deadline); err != nil {
+			l.closeAccepted(accepted)
+			continue
+		}
 		l.armLifetime(accepted)
 		if !l.track(accepted) {
 			l.closeAccepted(accepted)
@@ -165,7 +178,7 @@ func (l *webSocketListener) armLifetime(accepted *webSocketAcceptedConn) {
 }
 
 func (l *webSocketListener) prepare(accepted *webSocketAcceptedConn) {
-	addr, err := l.server.clientAddr(accepted)
+	addr, err := l.server.clientAddrUntil(accepted, accepted.deadline)
 	if err != nil {
 		l.server.logNegotiation(err)
 		l.closeAccepted(accepted)
@@ -252,8 +265,11 @@ func (l *webSocketListener) Close() error {
 // same per-connection MTProto path.
 func (s *Server) ServeWebSocket(ctx context.Context, l net.Listener) error {
 	server := &http.Server{
-		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.handleWebSocket(ctx, w, r) }),
-		ReadHeaderTimeout: s.handshakeTimeout,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.handleWebSocket(ctx, w, r) }),
+		// The accepted connection already carries an absolute deadline that
+		// covers address establishment, HTTP parsing, upgrade and codec
+		// detection. A duration here would replace it with a second budget.
+		ReadHeaderTimeout: 0,
 		MaxHeaderBytes:    8192,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ConnContext:       s.webSocketConnContext,
@@ -290,11 +306,20 @@ func (s *Server) webSocketConnContext(ctx context.Context, conn net.Conn) contex
 	}
 
 	state := &webSocketConnState{
-		socket: accepted,
-		slot:   accepted.slot,
-		addr:   accepted.addr,
+		socket:   accepted,
+		slot:     accepted.slot,
+		addr:     accepted.addr,
+		deadline: accepted.deadline,
 	}
 	return context.WithValue(ctx, webSocketConnKey{}, state)
+}
+
+// SetWebSocketOriginPatterns configures the browser origins accepted by the
+// WebSocket endpoint. Call it before ServeWebSocket. Requests without an
+// Origin header remain valid; an Origin header must match one of these
+// patterns, and an empty list therefore accepts no browser origin.
+func (s *Server) SetWebSocketOriginPatterns(patterns []string) {
+	s.webSocketOriginPatterns = append([]string(nil), patterns...)
 }
 
 func (s *Server) handleWebSocket(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -311,15 +336,15 @@ func (s *Server) handleWebSocket(ctx context.Context, w http.ResponseWriter, r *
 		http.NotFound(w, r)
 		return
 	}
+	if !webSocketOriginAllowed(r, s.webSocketOriginPatterns) {
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		return
+	}
 
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:    []string{"binary"},
 		CompressionMode: websocket.CompressionDisabled,
-		// MTProto authentication lives in the encrypted stream, not HTTP
-		// cookies. Web K is served from web.telegram.org while its WebSocket
-		// endpoint is on a different host, so origin verification here would
-		// reject the browser before MTProto can authenticate it.
-		InsecureSkipVerify: true,
+		OriginPatterns:  s.webSocketOriginPatterns,
 	})
 	if err != nil {
 		s.logNegotiation(err)
@@ -330,11 +355,13 @@ func (s *Server) handleWebSocket(ctx context.Context, w http.ResponseWriter, r *
 			s.log.Info("close WebSocket connection", "err", err)
 		}
 	}()
-	// Hijacking clears net/http's header deadline. Keep the same handshake
-	// timeout for transport detection; serveConn replaces it with the normal
-	// per-frame deadline after detection succeeds.
-	if err := state.socket.SetReadDeadline(time.Now().Add(s.handshakeTimeout)); err != nil {
-		s.logNegotiation(errors.Join(errors.New("set WebSocket handshake deadline"), err))
+	// net/http clears the connection deadline when it starts its background
+	// reader, and the upgrade itself hands the socket to the WebSocket layer.
+	// Restore the absolute deadline, never a fresh duration, before codec
+	// detection; serveConn replaces it with the normal per-frame deadlines after
+	// detection succeeds.
+	if err := state.socket.SetDeadline(state.deadline); err != nil {
+		s.logNegotiation(errors.Join(errors.New("set WebSocket negotiation deadline"), err))
 		return
 	}
 	stream := websocket.NetConn(ctx, ws, websocket.MessageBinary)
@@ -353,11 +380,38 @@ func (s *Server) handleWebSocket(ctx context.Context, w http.ResponseWriter, r *
 		s.logNegotiation(err)
 		return
 	}
-	if err := state.socket.SetReadDeadline(time.Time{}); err != nil {
-		s.logNegotiation(errors.Join(errors.New("clear WebSocket handshake deadline"), err))
+	if err := state.socket.SetDeadline(time.Time{}); err != nil {
+		s.logNegotiation(errors.Join(errors.New("clear WebSocket negotiation deadline"), err))
 		return
 	}
 	if err := s.serveConn(ctx, conn, state.addr, state.slot); err != nil && !isDisconnect(err) {
 		s.log.Info("WebSocket connection handler error", "err", err)
 	}
+}
+
+// webSocketOriginAllowed applies the explicit browser-origin policy before the
+// WebSocket library's check. The library always allows an Origin matching the
+// request Host, which is useful as a default but would make an unset policy
+// accept a browser request. The server's policy is fail-closed: an Origin must
+// match a configured pattern, while no Origin remains valid for native clients.
+func webSocketOriginAllowed(r *http.Request, patterns []string) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	for _, pattern := range patterns {
+		target := u.Host
+		if strings.Contains(pattern, "://") {
+			target = u.Scheme + "://" + u.Host
+		}
+		matched, err := path.Match(strings.ToLower(pattern), strings.ToLower(target))
+		if err == nil && matched {
+			return true
+		}
+	}
+	return false
 }
