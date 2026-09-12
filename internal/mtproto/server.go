@@ -85,6 +85,11 @@ type Server struct {
 	// Written once before Serve and only read after, so the accept path needs
 	// no synchronisation to see it.
 	proxyV2 *proxyV2Source
+	// webSocketOriginPatterns names the browser origins allowed to cross from
+	// their page into the WebSocket endpoint. An empty list still permits
+	// clients that carry no Origin header, but no cross-origin browser request.
+	// Written once before ServeWebSocket and only read by its handlers.
+	webSocketOriginPatterns []string
 	// negotiationLog thins the per-connection negotiation failure line, which
 	// anyone who can reach the port can provoke.
 	negotiationLog logSampler

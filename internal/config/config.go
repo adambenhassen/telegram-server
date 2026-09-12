@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -37,6 +38,13 @@ const (
 // Config holds server configuration.
 type Config struct {
 	ListenAddr string
+	// WebSocketListenAddr is the address the WebSocket MTProto server binds to.
+	// Empty disables the endpoint entirely.
+	WebSocketListenAddr string
+	// WebSocketOriginPatterns is the comma-separated allowlist of browser
+	// origins accepted by the WebSocket endpoint. Empty accepts no Origin
+	// header, while clients that send no Origin remain valid.
+	WebSocketOriginPatterns []string
 	// AdminListenAddr is the address the admin HTTP server binds to.
 	// Empty disables the admin server entirely.
 	AdminListenAddr string
@@ -400,13 +408,19 @@ const DefaultStatementTimeout = 17 * time.Second
 // logger is used only for the auth-key master key, which is the one value Load
 // can create rather than read, and a generated one has to say so.
 func Load(log *slog.Logger) (Config, error) {
+	originPatterns, err := parseWebSocketOriginPatterns(os.Getenv("TG_WEBSOCKET_ALLOWED_ORIGINS"))
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
-		ListenAddr:      envOr("TG_LISTEN_ADDR", ":2443"),
-		AdminListenAddr: os.Getenv("TG_ADMIN_LISTEN_ADDR"),
-		PostgresDSN:     os.Getenv("TG_POSTGRES_DSN"),
-		RSAKeyPath:      envOr("TG_RSA_KEY_PATH", "server_key.pem"),
-		DCID:            2,
-		BlobDir:         envOr("TG_BLOB_DIR", "blobs"),
+		ListenAddr:              envOr("TG_LISTEN_ADDR", ":2443"),
+		WebSocketListenAddr:     os.Getenv("TG_WEBSOCKET_LISTEN_ADDR"),
+		WebSocketOriginPatterns: originPatterns,
+		AdminListenAddr:         os.Getenv("TG_ADMIN_LISTEN_ADDR"),
+		PostgresDSN:             os.Getenv("TG_POSTGRES_DSN"),
+		RSAKeyPath:              envOr("TG_RSA_KEY_PATH", "server_key.pem"),
+		DCID:                    2,
+		BlobDir:                 envOr("TG_BLOB_DIR", "blobs"),
 
 		MaxFileBytes:        100 << 20,
 		MaxUserStorageBytes: 2 << 30,
@@ -1217,6 +1231,24 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
 	}
 	return prefixes, nil
+}
+
+// parseWebSocketOriginPatterns reads and validates the browser-origin
+// allowlist. Empty entries are ignored so an unset variable and a trailing
+// comma have the same fail-closed meaning: no cross-origin browser request is
+// accepted.
+func parseWebSocketOriginPatterns(raw string) ([]string, error) {
+	var patterns []string
+	for entry := range strings.SplitSeq(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry != "" {
+			if _, err := path.Match(entry, ""); err != nil {
+				return nil, fmt.Errorf("TG_WEBSOCKET_ALLOWED_ORIGINS entry %q is malformed: %w", entry, err)
+			}
+			patterns = append(patterns, entry)
+		}
+	}
+	return patterns, nil
 }
 
 // WarnClientAddrTrust states the operational assumption socket mode makes,
