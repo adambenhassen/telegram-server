@@ -7,11 +7,13 @@ import (
 	"crypto/rsa"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -431,6 +433,78 @@ func TestServeWebSocketReportsPersistentAcceptFailures(t *testing.T) {
 	}
 }
 
+func TestServeWebSocketReportsDeadlineFailureAndReleasesSlot(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	base := mustListenTCP(t, ctx, "127.0.0.1:0")
+	deadlineErr := errors.New("injected deadline failure")
+	ln := &deadlineErrorListener{Listener: base, err: deadlineErr}
+	sink := &webSocketNegotiationLogSink{messages: make(chan string, 1)}
+	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, slog.New(sink))
+	if err := srv.SetPreAuthLimits(mtproto.PreAuthLimits{MaxConns: 1}); err != nil {
+		t.Fatalf("set pre-auth limits: %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- srv.ServeWebSocket(ctx, ln) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-served; err != nil {
+			t.Errorf("serve websocket: %v", err)
+		}
+	})
+
+	bad, err := (&net.Dialer{}).DialContext(ctx, "tcp", base.Addr().String())
+	if err != nil {
+		t.Fatalf("dial deadline-failing peer: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := bad.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Logf("close deadline-failing peer: %v", err)
+		}
+	})
+
+	select {
+	case message := <-sink.messages:
+		for _, want := range []string{"set WebSocket negotiation deadline", deadlineErr.Error()} {
+			if !strings.Contains(message, want) {
+				t.Errorf("negotiation log = %q, want %q", message, want)
+			}
+		}
+	case <-ctx.Done():
+		t.Fatal("deadline failure was not reported")
+	}
+	if err := bad.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	var one [1]byte
+	if _, err := bad.Read(one[:]); err == nil {
+		t.Fatal("deadline-failing connection remained open")
+	} else {
+		var nerr net.Error
+		if errors.As(err, &nerr) && nerr.Timeout() {
+			t.Fatalf("deadline-failing connection was not closed: %v", err)
+		}
+	}
+
+	dialCtx, stopDial := context.WithTimeout(ctx, time.Second)
+	defer stopDial()
+	var healthy *websocket.Conn
+	for {
+		healthy, err = dialWebSocket(dialCtx, base.Addr().String())
+		if err == nil {
+			break
+		}
+		select {
+		case <-dialCtx.Done():
+			t.Fatalf("healthy connection was not accepted after deadline failure: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	closeWebSocket(t, healthy)
+}
+
 func TestServeWebSocketWriteTimeoutDoesNotBlockOtherPeer(t *testing.T) {
 	t.Parallel()
 
@@ -809,6 +883,10 @@ type webSocketAcceptLogSink struct {
 	warnOnce sync.Once
 }
 
+type webSocketNegotiationLogSink struct {
+	messages chan string
+}
+
 func (s *webSocketAcceptLogSink) Enabled(context.Context, slog.Level) bool { return true }
 func (s *webSocketAcceptLogSink) WithAttrs([]slog.Attr) slog.Handler       { return s }
 func (s *webSocketAcceptLogSink) WithGroup(string) slog.Handler            { return s }
@@ -818,6 +896,26 @@ func (s *webSocketAcceptLogSink) Handle(_ context.Context, r slog.Record) error 
 		s.warnOnce.Do(func() { close(s.warn) })
 	} else if r.Level >= slog.LevelInfo {
 		s.infoOnce.Do(func() { close(s.info) })
+	}
+	return nil
+}
+
+func (s *webSocketNegotiationLogSink) Enabled(context.Context, slog.Level) bool { return true }
+func (s *webSocketNegotiationLogSink) WithAttrs([]slog.Attr) slog.Handler       { return s }
+func (s *webSocketNegotiationLogSink) WithGroup(string) slog.Handler            { return s }
+
+func (s *webSocketNegotiationLogSink) Handle(_ context.Context, r slog.Record) error {
+	var detail any
+	r.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == "err" {
+			detail = attr.Value.Any()
+			return false
+		}
+		return true
+	})
+	select {
+	case s.messages <- fmt.Sprintf("%s: %v", r.Message, detail):
+	default:
 	}
 	return nil
 }
@@ -838,6 +936,34 @@ func (l *timestampWebSocketListener) Accept() (net.Conn, error) {
 type websocketAuthKeyStore struct {
 	key crypto.AuthKey
 }
+
+type deadlineErrorListener struct {
+	net.Listener
+
+	err  error
+	once sync.Once
+}
+
+func (l *deadlineErrorListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	failed := false
+	l.once.Do(func() { failed = true })
+	if failed {
+		return &deadlineErrorConn{Conn: conn, err: l.err}, nil
+	}
+	return conn, nil
+}
+
+type deadlineErrorConn struct {
+	net.Conn
+
+	err error
+}
+
+func (c *deadlineErrorConn) SetDeadline(time.Time) error { return c.err }
 
 func (s *websocketAuthKeyStore) Save(context.Context, crypto.AuthKey) error { return nil }
 func (s *websocketAuthKeyStore) Touch(context.Context, [8]byte) error       { return nil }

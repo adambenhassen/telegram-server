@@ -156,6 +156,22 @@ func TestLoadWebSocketOriginPatterns(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsMalformedWebSocketOriginPattern(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_WEBSOCKET_ALLOWED_ORIGINS", "https://web.telegram.org,[")
+
+	_, err := config.Load(discardLog())
+	if err == nil {
+		t.Fatal("Load accepted a malformed WebSocket origin pattern")
+	}
+	for _, want := range []string{"TG_WEBSOCKET_ALLOWED_ORIGINS", "["} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Load error = %q, want it to name %q", err, want)
+		}
+	}
+}
+
 func TestLoadBlobDir(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)

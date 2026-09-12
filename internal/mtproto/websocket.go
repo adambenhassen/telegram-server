@@ -161,6 +161,7 @@ func (l *webSocketListener) acceptLoop() {
 			deadline: time.Now().Add(l.server.handshakeTimeout),
 		}
 		if err := accepted.SetDeadline(accepted.deadline); err != nil {
+			l.server.logNegotiation(errors.Join(errors.New("set WebSocket negotiation deadline"), err))
 			l.closeAccepted(accepted)
 			continue
 		}

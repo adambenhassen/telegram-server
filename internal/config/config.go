@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -407,10 +408,14 @@ const DefaultStatementTimeout = 17 * time.Second
 // logger is used only for the auth-key master key, which is the one value Load
 // can create rather than read, and a generated one has to say so.
 func Load(log *slog.Logger) (Config, error) {
+	originPatterns, err := parseWebSocketOriginPatterns(os.Getenv("TG_WEBSOCKET_ALLOWED_ORIGINS"))
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		ListenAddr:              envOr("TG_LISTEN_ADDR", ":2443"),
 		WebSocketListenAddr:     os.Getenv("TG_WEBSOCKET_LISTEN_ADDR"),
-		WebSocketOriginPatterns: parseWebSocketOriginPatterns(os.Getenv("TG_WEBSOCKET_ALLOWED_ORIGINS")),
+		WebSocketOriginPatterns: originPatterns,
 		AdminListenAddr:         os.Getenv("TG_ADMIN_LISTEN_ADDR"),
 		PostgresDSN:             os.Getenv("TG_POSTGRES_DSN"),
 		RSAKeyPath:              envOr("TG_RSA_KEY_PATH", "server_key.pem"),
@@ -1228,18 +1233,22 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 	return prefixes, nil
 }
 
-// parseWebSocketOriginPatterns reads the browser-origin allowlist. Empty
-// entries are ignored so an unset variable and a trailing comma have the same
-// fail-closed meaning: no cross-origin browser request is accepted.
-func parseWebSocketOriginPatterns(raw string) []string {
+// parseWebSocketOriginPatterns reads and validates the browser-origin
+// allowlist. Empty entries are ignored so an unset variable and a trailing
+// comma have the same fail-closed meaning: no cross-origin browser request is
+// accepted.
+func parseWebSocketOriginPatterns(raw string) ([]string, error) {
 	var patterns []string
 	for entry := range strings.SplitSeq(raw, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry != "" {
+			if _, err := path.Match(entry, ""); err != nil {
+				return nil, fmt.Errorf("TG_WEBSOCKET_ALLOWED_ORIGINS entry %q is malformed: %w", entry, err)
+			}
 			patterns = append(patterns, entry)
 		}
 	}
-	return patterns
+	return patterns, nil
 }
 
 // WarnClientAddrTrust states the operational assumption socket mode makes,
