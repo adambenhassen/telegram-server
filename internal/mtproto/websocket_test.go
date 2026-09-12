@@ -7,11 +7,14 @@ import (
 	"crypto/rsa"
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"slices"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -393,6 +396,41 @@ func TestServeWebSocketOriginPolicy(t *testing.T) {
 	}
 }
 
+func TestServeWebSocketReportsPersistentAcceptFailures(t *testing.T) {
+	t.Parallel()
+
+	base := mustListenTCP(t, context.Background(), "127.0.0.1:0")
+	fl := &faultyListener{Listener: base, err: syscall.EMFILE, faults: 12}
+	sink := &webSocketAcceptLogSink{
+		info: make(chan struct{}, 1),
+		warn: make(chan struct{}, 1),
+	}
+	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, slog.New(sink))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.ServeWebSocket(ctx, fl) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := fl.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("listener close: %v", err)
+		}
+		if err := <-done; err != nil {
+			t.Errorf("serve websocket: %v", err)
+		}
+	})
+
+	select {
+	case <-sink.info:
+	case <-time.After(5 * time.Second):
+		t.Fatal("persistent WebSocket accept failure was not reported at Info")
+	}
+	select {
+	case <-sink.warn:
+	case <-time.After(30 * time.Second):
+		t.Fatal("persistent WebSocket accept failure was not escalated at Warn")
+	}
+}
+
 func TestServeWebSocketWriteTimeoutDoesNotBlockOtherPeer(t *testing.T) {
 	t.Parallel()
 
@@ -762,6 +800,26 @@ type timestampWebSocketListener struct {
 	net.Listener
 
 	accepted chan time.Time
+}
+
+type webSocketAcceptLogSink struct {
+	info     chan struct{}
+	warn     chan struct{}
+	infoOnce sync.Once
+	warnOnce sync.Once
+}
+
+func (s *webSocketAcceptLogSink) Enabled(context.Context, slog.Level) bool { return true }
+func (s *webSocketAcceptLogSink) WithAttrs([]slog.Attr) slog.Handler       { return s }
+func (s *webSocketAcceptLogSink) WithGroup(string) slog.Handler            { return s }
+
+func (s *webSocketAcceptLogSink) Handle(_ context.Context, r slog.Record) error {
+	if r.Level >= slog.LevelWarn {
+		s.warnOnce.Do(func() { close(s.warn) })
+	} else if r.Level >= slog.LevelInfo {
+		s.infoOnce.Do(func() { close(s.info) })
+	}
+	return nil
 }
 
 func (l *timestampWebSocketListener) Accept() (net.Conn, error) {

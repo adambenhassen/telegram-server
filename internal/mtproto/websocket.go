@@ -39,7 +39,10 @@ type webSocketConnState struct {
 type webSocketAcceptedConn struct {
 	net.Conn
 
-	slot     *preAuthSlot
+	slot *preAuthSlot
+	// Lock order: prepare may hold state while keyAddr acquires the pre-auth
+	// limiter mutex. Close releases state before slot.clear(), so no path takes
+	// those two locks in the reverse order.
 	state    sync.Mutex
 	closed   bool
 	addr     netip.Addr
@@ -123,6 +126,11 @@ func (l *webSocketListener) acceptLoop() {
 			}
 			if isTransientAccept(err) {
 				backoff = nextAcceptBackoff(backoff)
+				if backoff >= maxAcceptBackoff {
+					l.server.log.Warn("WebSocket accept still failing at maximum backoff", "err", err)
+				} else {
+					l.server.log.Info("WebSocket accept failed, retrying", "err", err)
+				}
 				select {
 				case <-l.done:
 					return
