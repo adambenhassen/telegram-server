@@ -72,3 +72,108 @@ func TestLoadDiscoveryLimits(t *testing.T) {
 		t.Fatalf("zero global window error = %v", err)
 	}
 }
+
+func TestLoadDiscoveryLimitsValidation(t *testing.T) {
+	defaults := mtproto.DefaultDiscoveryLimits()
+	disabledGlobal := defaults
+	disabledGlobal.MaxRequests = 0
+	disabledGlobal.Window = 0
+	disabledPerNet := defaults
+	disabledPerNet.MaxRequestsPerNet = 0
+	disabledPerNet.PerNetWindow = 0
+
+	const (
+		globalLimit       = "TG_RATE_LIMIT_DISCOVERY"
+		globalLimitAlias  = "TG_DISCOVERY_RATE_LIMIT"
+		globalWindow      = "TG_RATE_LIMIT_DISCOVERY_WINDOW"
+		globalWindowAlias = "TG_DISCOVERY_RATE_LIMIT_WINDOW"
+		perNetLimit       = "TG_RATE_LIMIT_DISCOVERY_IP"
+		perNetLimitAlias  = "TG_DISCOVERY_RATE_LIMIT_PER_IP"
+		perNetWindow      = "TG_RATE_LIMIT_DISCOVERY_IP_WINDOW"
+		perNetWindowAlias = "TG_DISCOVERY_RATE_LIMIT_PER_IP_WINDOW"
+	)
+
+	tests := []struct {
+		name       string
+		env        map[string]string
+		wantErr    []string
+		wantLimits mtproto.DiscoveryLimits
+	}{
+		{name: "global count malformed", env: map[string]string{globalLimit: "many"}, wantErr: []string{globalLimit}},
+		{name: "global count negative", env: map[string]string{globalLimit: "-1"}, wantErr: []string{globalLimit}},
+		{name: "global window malformed", env: map[string]string{globalWindow: "soon"}, wantErr: []string{globalWindow}},
+		{name: "global window negative", env: map[string]string{globalWindow: "-1s"}, wantErr: []string{globalWindow}},
+		{name: "per-network count malformed", env: map[string]string{perNetLimit: "many"}, wantErr: []string{perNetLimit}},
+		{name: "per-network count negative", env: map[string]string{perNetLimit: "-1"}, wantErr: []string{perNetLimit}},
+		{name: "per-network window malformed", env: map[string]string{perNetWindow: "soon"}, wantErr: []string{perNetWindow}},
+		{name: "per-network window negative", env: map[string]string{perNetWindow: "-1s"}, wantErr: []string{perNetWindow}},
+		{
+			name:    "global count aliases conflict",
+			env:     map[string]string{globalLimit: "3", globalLimitAlias: "4"},
+			wantErr: []string{globalLimit, globalLimitAlias},
+		},
+		{
+			name:    "global window aliases conflict",
+			env:     map[string]string{globalWindow: "1s", globalWindowAlias: "2s"},
+			wantErr: []string{globalWindow, globalWindowAlias},
+		},
+		{
+			name:    "per-network count aliases conflict",
+			env:     map[string]string{perNetLimit: "3", perNetLimitAlias: "4"},
+			wantErr: []string{perNetLimit, perNetLimitAlias},
+		},
+		{
+			name:    "per-network window aliases conflict",
+			env:     map[string]string{perNetWindow: "1s", perNetWindowAlias: "2s"},
+			wantErr: []string{perNetWindow, perNetWindowAlias},
+		},
+		{
+			name:       "global disabled with zero window",
+			env:        map[string]string{globalLimit: "0", globalWindow: "0s"},
+			wantLimits: disabledGlobal,
+		},
+		{
+			name:       "per-network disabled with zero window",
+			env:        map[string]string{perNetLimit: "0", perNetWindow: "0s"},
+			wantLimits: disabledPerNet,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+			t.Setenv("TG_AUTHKEY_ENC_KEY", strings.Repeat("00", 32))
+			t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", "")
+			for _, name := range []string{
+				globalLimit, globalLimitAlias,
+				globalWindow, globalWindowAlias,
+				perNetLimit, perNetLimitAlias,
+				perNetWindow, perNetWindowAlias,
+			} {
+				t.Setenv(name, "")
+			}
+			for name, value := range tt.env {
+				t.Setenv(name, value)
+			}
+
+			cfg, err := config.Load(slog.New(slog.DiscardHandler))
+			if len(tt.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("expected error, got discovery limits %+v", cfg.DiscoveryLimits)
+				}
+				for _, name := range tt.wantErr {
+					if !strings.Contains(err.Error(), name) {
+						t.Errorf("error %q does not name %s", err, name)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.DiscoveryLimits != tt.wantLimits {
+				t.Errorf("discovery limits = %+v, want %+v", cfg.DiscoveryLimits, tt.wantLimits)
+			}
+		})
+	}
+}
