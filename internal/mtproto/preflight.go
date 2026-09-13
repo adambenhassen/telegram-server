@@ -85,8 +85,6 @@ type discoveryWindow struct {
 
 const maxDiscoveryBuckets = 4096
 
-const preflightExtraByteWait = time.Millisecond
-
 func newDiscoveryLimiter(limits DiscoveryLimits) *discoveryLimiter {
 	return &discoveryLimiter{
 		limits:     limits,
@@ -158,8 +156,8 @@ type preflightProbe struct {
 	stream    net.Conn
 }
 
-// probePreflight reads only enough bytes to identify the local-direct request.
-// A non-match carries every byte back through replayConn so transport sniffing
+// probePreflight reads the local-direct request and its EOF delimiter. A
+// non-match carries every byte back through replayConn so transport sniffing
 // sees exactly the stream it would have seen without discovery enabled.
 func probePreflight(sock net.Conn, deadline time.Time) (preflightProbe, error) {
 	request := make([]byte, discovery.RequestMagicSize+discovery.NonceSize)
@@ -194,57 +192,32 @@ func probePreflight(sock net.Conn, deadline time.Time) (preflightProbe, error) {
 	}
 	var nonce [discovery.NonceSize]byte
 	copy(nonce[:], request[discovery.RequestMagicSize:])
-	// The request has no length field, so a byte already waiting after the
-	// nonce is the only overlong form the server can reject without delaying a
-	// valid client. A zero-time read observes bytes already buffered and returns
-	// immediately for a valid request; restore the whole-operation deadline
-	// before any response work.
-	if !deadline.IsZero() {
-		checkDeadline := time.Now().Add(preflightExtraByteWait)
-		if deadline.Before(checkDeadline) {
-			checkDeadline = deadline
-		}
-		if err := sock.SetReadDeadline(checkDeadline); err != nil {
-			return preflightProbe{}, fmt.Errorf("set overlong-request check deadline: %w", err)
-		}
-		var extra [1]byte
-		n, err := sock.Read(extra[:])
-		restoreErr := sock.SetReadDeadline(deadline)
-		if restoreErr != nil {
-			return preflightProbe{}, fmt.Errorf("restore preflight deadline: %w", restoreErr)
-		}
-		if n > 0 {
-			return preflightProbe{malformed: true, stream: sock}, nil
-		}
-		if !time.Now().Before(deadline) {
-			return preflightProbe{malformed: true, stream: sock}, errors.New("preflight handshake deadline expired")
-		}
-		if err == nil {
-			return preflightProbe{}, io.ErrNoProgress
-		}
-		if err != nil && !isTimeout(err) && !isDisconnect(err) {
-			return preflightProbe{}, fmt.Errorf("check for overlong request: %w", err)
-		}
+	// The request has no length field, so the only delimiter that can prove it
+	// is complete is EOF from the client's TCP write half. Read through the
+	// original handshake deadline: a delayed trailing byte is malformed, and a
+	// peer that never reaches EOF is malformed rather than receiving a response.
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return preflightProbe{malformed: true, stream: sock}, errors.New("preflight handshake deadline expired")
 	}
-	return preflightProbe{matched: true, nonce: nonce, stream: sock}, nil
-}
-
-func isTimeout(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
+	var trailing [1]byte
+	n, err := sock.Read(trailing[:])
+	if n > 0 {
+		return preflightProbe{malformed: true, stream: sock}, nil
+	}
+	if errors.Is(err, io.EOF) {
+		return preflightProbe{matched: true, nonce: nonce, stream: sock}, nil
+	}
+	if err == nil {
+		return preflightProbe{malformed: true, stream: sock}, io.ErrNoProgress
+	}
+	return preflightProbe{malformed: true, stream: sock}, fmt.Errorf("wait for discovery request EOF: %w", err)
 }
 
 // servePreflight writes one bounded response and closes the anonymous socket.
 // It deliberately runs before codec detection and never touches auth-key,
-// session, handler or store state.
-func (s *Server) servePreflight(ctx context.Context, sock net.Conn, nonce [discovery.NonceSize]byte) error {
-	if s.key.RSA == nil {
-		return errors.New("discovery server RSA key is nil")
-	}
-	response, err := discovery.BuildPreflightResponse(s.dcID, &s.key.RSA.PublicKey, nonce[:])
-	if err != nil {
-		return err
-	}
+// session, handler or store state. deadline is the original absolute
+// pre-auth deadline, which the response may not extend.
+func (s *Server) servePreflight(ctx context.Context, sock net.Conn, nonce [discovery.NonceSize]byte, deadline time.Time) error {
 	stop := context.AfterFunc(ctx, func() {
 		if closeErr := sock.Close(); closeErr != nil && !isDisconnect(closeErr) {
 			s.log.Info("close discovery connection at shutdown", "err", closeErr)
@@ -257,8 +230,19 @@ func (s *Server) servePreflight(ctx context.Context, sock net.Conn, nonce [disco
 		}
 	}() // the response socket has no next protocol
 
-	if err := sock.SetWriteDeadline(time.Now().Add(s.writeTimeout)); err != nil {
+	writeDeadline := time.Now().Add(s.writeTimeout)
+	if !deadline.IsZero() && deadline.Before(writeDeadline) {
+		writeDeadline = deadline
+	}
+	if err := sock.SetWriteDeadline(writeDeadline); err != nil {
 		return fmt.Errorf("set discovery write deadline: %w", err)
+	}
+	if s.key.RSA == nil {
+		return errors.New("discovery server RSA key is nil")
+	}
+	response, err := discovery.BuildPreflightResponse(s.dcID, &s.key.RSA.PublicKey, nonce[:])
+	if err != nil {
+		return err
 	}
 	for len(response) > 0 {
 		n, err := sock.Write(response)

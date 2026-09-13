@@ -104,7 +104,7 @@ The optional same-endpoint local-direct preflight is a separate TCP
 discriminator. It is checked only on the normal TCP listener, after a trusted
 PROXY-v2 header has been consumed when `TG_CLIENT_ADDR_TRUST=proxy-v2`, and
 before MTProto framing detection. WebSocket does not expose it. Its exact
-wire format is:
+wire format and delimiter are:
 
 ```text
 request  = 16 ASCII bytes "telegramd-key-v1" || 32 fresh opaque nonce bytes
@@ -115,14 +115,21 @@ response = 16 ASCII bytes "telegramd-key-r1" || 32 echoed nonce bytes
            || DER SubjectPublicKeyInfo
 ```
 
+The request is exactly 48 bytes followed by the client's TCP write-half-close.
+The server observes EOF before it responds. A 49th byte, or failure to reach
+EOF within the original absolute pre-auth deadline, is malformed and receives
+no discovery data. That same deadline covers detection, waiting for EOF, and
+the complete response; a configured write timeout may shorten it but never
+extend it.
+
 `spki_length` must be 1..4096 and `body_length` must be exactly
 `6 + spki_length`; the response contains the running server's configured DC
-and RSA public key. An exact 48-byte request consumes those bytes, emits at
-most one bounded response, and closes without codec negotiation, auth-key or
-session state, RPC dispatch, or database access. A partial, malformed,
-overlong, or wrong-version request receives no discovery response. Bytes
-consumed while identifying an ordinary MTProto stream are replayed in order,
-so plaintext and obfuscated MTProto retain their existing behavior.
+and RSA public key. A valid request emits at most one bounded response and
+closes without codec negotiation, auth-key or session state, RPC dispatch, or
+database access. A partial, unterminated, malformed, overlong, or wrong-version
+request receives no discovery response. Bytes consumed while identifying an
+ordinary MTProto stream are replayed in order, so plaintext and obfuscated
+MTProto retain their existing behavior.
 
 Discovery responses are bounded independently of the existing whole-operation
 pre-auth deadline and connection caps. By default a process may answer 60

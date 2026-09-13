@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,6 +135,101 @@ func TestDiscoveryLimiterBoundsGlobalAndNetworkRequests(t *testing.T) {
 	}
 }
 
+func TestDiscoveryLimiterEnforcesSimultaneousProcessAndNetworkLimits(t *testing.T) {
+	t.Parallel()
+
+	run := func(l *discoveryLimiter, addrs []netip.Addr, want int) {
+		t.Helper()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var accepted atomic.Int64
+		for _, addr := range addrs {
+			wg.Go(func() {
+				<-start
+				if l.allow(addr, time.Unix(100, 0)) {
+					accepted.Add(1)
+				}
+			})
+		}
+		close(start)
+		wg.Wait()
+		if got := int(accepted.Load()); got != want {
+			t.Fatalf("simultaneous accepted requests = %d, want %d", got, want)
+		}
+	}
+
+	addresses := make([]netip.Addr, 32)
+	for i := range addresses {
+		addresses[i] = mustAddr("192.0.2.1")
+	}
+	run(newDiscoveryLimiter(DiscoveryLimits{
+		MaxRequests:       32,
+		MaxRequestsPerNet: 4,
+		Window:            time.Minute,
+		PerNetWindow:      time.Minute,
+	}), addresses, 4)
+
+	for i := range addresses {
+		addresses[i] = netip.AddrFrom4([4]byte{198, 51, 100, byte(i + 1)})
+	}
+	run(newDiscoveryLimiter(DiscoveryLimits{
+		MaxRequests:       5,
+		MaxRequestsPerNet: 32,
+		Window:            time.Minute,
+		PerNetWindow:      time.Minute,
+	}), addresses, 5)
+}
+
+func TestDiscoveryLimiterFullyDisabled(t *testing.T) {
+	t.Parallel()
+
+	l := newDiscoveryLimiter(DiscoveryLimits{})
+	for i := range 100 {
+		if !l.allow(netip.AddrFrom4([4]byte{203, 0, 113, byte(i + 1)}), time.Unix(int64(i), 0)) {
+			t.Fatalf("disabled limiter refused request %d", i)
+		}
+	}
+	if l.global.calls != 0 {
+		t.Fatalf("disabled global calls = %d, want 0", l.global.calls)
+	}
+	if len(l.perNet) != 0 {
+		t.Fatalf("disabled network buckets = %d, want 0", len(l.perNet))
+	}
+}
+
+func TestSetDiscoveryLimitsRejectsInvalidConfiguration(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		limits DiscoveryLimits
+	}{
+		{name: "negative global cap", limits: DiscoveryLimits{MaxRequests: -1}},
+		{name: "negative network cap", limits: DiscoveryLimits{MaxRequestsPerNet: -1}},
+		{name: "negative global window", limits: DiscoveryLimits{Window: -time.Second}},
+		{name: "negative network window", limits: DiscoveryLimits{PerNetWindow: -time.Second}},
+		{name: "zero enabled global window", limits: DiscoveryLimits{MaxRequests: 1}},
+		{name: "zero enabled network window", limits: DiscoveryLimits{MaxRequestsPerNet: 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(exchange.PrivateKey{}, 2, NewMemoryAuthKeyStore(), nil, nil)
+			before := s.discovery
+			if err := s.SetDiscoveryLimits(tc.limits); err == nil {
+				t.Fatal("invalid discovery limits were accepted")
+			}
+			if s.discovery != before {
+				t.Fatal("invalid discovery limits replaced the active limiter")
+			}
+		})
+	}
+
+	s := New(exchange.PrivateKey{}, 2, NewMemoryAuthKeyStore(), nil, nil)
+	if err := s.SetDiscoveryLimits(DiscoveryLimits{}); err != nil {
+		t.Fatalf("fully disabled discovery limits rejected: %v", err)
+	}
+}
+
 func TestServePreflightReturnsWriteFailure(t *testing.T) {
 	t.Parallel()
 
@@ -143,7 +240,7 @@ func TestServePreflightReturnsWriteFailure(t *testing.T) {
 	server := New(exchange.PrivateKey{RSA: key}, 2, NewMemoryAuthKeyStore(), nil, nil)
 	conn := &failingPreflightConn{}
 	var nonce [32]byte
-	if err := server.servePreflight(context.Background(), conn, nonce); err == nil || !strings.Contains(err.Error(), "write discovery response") {
+	if err := server.servePreflight(context.Background(), conn, nonce, time.Time{}); err == nil || !strings.Contains(err.Error(), "write discovery response") {
 		t.Fatalf("servePreflight error = %v, want write failure", err)
 	}
 	if conn.writes != 1 {
@@ -164,7 +261,7 @@ func TestServePreflightCancellationClosesBlockedWrite(t *testing.T) {
 	var nonce [32]byte
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- server.servePreflight(ctx, left, nonce) }()
+	go func() { done <- server.servePreflight(ctx, left, nonce, time.Time{}) }()
 	time.Sleep(10 * time.Millisecond)
 	cancel()
 	select {

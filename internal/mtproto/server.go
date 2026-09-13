@@ -422,7 +422,7 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 			}
 			return
 		}
-		if err := s.servePreflight(ctx, sock, probe.nonce); err != nil && !isDisconnect(err) {
+		if err := s.servePreflight(ctx, sock, probe.nonce, handshakeDeadline); err != nil && !isDisconnect(err) {
 			s.logNegotiation(errors.Join(errors.New("serve discovery preflight"), err))
 		}
 		return
