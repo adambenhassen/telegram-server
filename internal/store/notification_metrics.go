@@ -13,6 +13,7 @@ const (
 	notificationCounterCount  = 10 // nine fixed channels plus invalid input
 	notificationInvalidIndex  = notificationCounterCount - 1
 	notificationUnsetEpoch    = int64(-1 << 63)
+	notificationSnapshotTries = 4
 )
 
 // NotificationChannelCounts is the fixed per-channel distribution of valid
@@ -73,12 +74,15 @@ func (f NotificationRecorderFunc) RecordInvalidNotification() error {
 
 // notificationMetricBucket is one second of fixed counters. readers is a
 // small reader gate: zero or more readers may increment counters, while -1
-// exclusively owns the bucket during an epoch reset. It avoids a mutex on the
-// notification hot path and makes resets exact under concurrent recording.
+// exclusively owns the bucket during an epoch reset. writerPending prevents
+// new snapshots from entering once a reset is waiting for active readers. It
+// avoids a mutex on the notification hot path and makes resets exact under
+// concurrent recording.
 type notificationMetricBucket struct {
-	epoch   atomic.Int64
-	readers atomic.Int32
-	counts  [notificationCounterCount]atomic.Int64
+	epoch         atomic.Int64
+	readers       atomic.Int32
+	writerPending atomic.Bool
+	counts        [notificationCounterCount]atomic.Int64
 }
 
 // NotificationMetrics counts valid notifications received by one process.
@@ -152,7 +156,10 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 
 	var counts [notificationCounterCount]int64
 	for i := range m.buckets {
-		epoch, bucketCounts := m.buckets[i].snapshot()
+		epoch, bucketCounts, ok := m.buckets[i].snapshot()
+		if !ok {
+			continue
+		}
 		if epoch <= cutoff || epoch > nowSecond {
 			continue
 		}
@@ -226,13 +233,17 @@ func (m *NotificationMetrics) record(index int) {
 			bucket.reset(second)
 			continue
 		}
+		if bucket.writerPending.Load() {
+			runtime.Gosched()
+			continue
+		}
 
 		readers := bucket.readers.Load()
 		if readers < 0 || !bucket.readers.CompareAndSwap(readers, readers+1) {
 			runtime.Gosched()
 			continue
 		}
-		if bucket.epoch.Load() != second {
+		if bucket.writerPending.Load() || bucket.epoch.Load() != second {
 			bucket.readers.Add(-1)
 			continue
 		}
@@ -251,30 +262,42 @@ func notificationBucketIndex(second int64) int {
 }
 
 func (b *notificationMetricBucket) reset(second int64) {
-	if !b.readers.CompareAndSwap(0, -1) {
+	if !b.writerPending.CompareAndSwap(false, true) {
 		runtime.Gosched()
 		return
+	}
+	for !b.readers.CompareAndSwap(0, -1) {
+		runtime.Gosched()
 	}
 	b.epoch.Store(second)
 	for i := range b.counts {
 		b.counts[i].Store(0)
 	}
 	b.readers.Store(0)
+	b.writerPending.Store(false)
 }
 
-func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]int64) {
-	for {
+func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]int64, bool) {
+	var counts [notificationCounterCount]int64
+	for range notificationSnapshotTries {
+		if b.writerPending.Load() {
+			return notificationUnsetEpoch, counts, false
+		}
 		readers := b.readers.Load()
 		if readers < 0 || !b.readers.CompareAndSwap(readers, readers+1) {
 			runtime.Gosched()
 			continue
 		}
+		if b.writerPending.Load() {
+			b.readers.Add(-1)
+			return notificationUnsetEpoch, counts, false
+		}
 		epoch := b.epoch.Load()
-		var counts [notificationCounterCount]int64
 		for i := range b.counts {
 			counts[i] = b.counts[i].Load()
 		}
 		b.readers.Add(-1)
-		return epoch, counts
+		return epoch, counts, true
 	}
+	return notificationUnsetEpoch, counts, false
 }
