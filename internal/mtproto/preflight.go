@@ -116,7 +116,7 @@ func (l *discoveryLimiter) allow(addr netip.Addr, now time.Time) bool {
 	hasNetwork := false
 	if l.limits.MaxRequestsPerNet > 0 {
 		if bucket, hasNetwork = store.IPBucketKey(addr); hasNetwork {
-			network, _ = l.perNet[bucket]
+			network = l.perNet[bucket]
 			if network.start.IsZero() || !now.Before(network.start.Add(l.limits.PerNetWindow)) {
 				network = discoveryWindow{start: now}
 			}
