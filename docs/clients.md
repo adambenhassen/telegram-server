@@ -46,6 +46,10 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_BLOB_S3_CA_PATH` | *(unset)*        | PEM bundle for a private endpoint CA; TLS verification remains enabled |
 | `TG_BLOB_S3_ALLOW_INSECURE_HTTP` | `false` | Explicit loopback/compose-only plaintext opt-in; startup warns when enabled |
 | `TG_DC_ID`          | `2`              | DC id this server advertises as `ThisDC`    |
+| `TG_RATE_LIMIT_DISCOVERY` | `60` | Process-wide valid local-direct preflight response attempts per fixed window; `0` disables this bound, and a negative or non-integer value fails startup |
+| `TG_RATE_LIMIT_DISCOVERY_WINDOW` | `1m` | Fixed window for the process-wide discovery bound; it must be positive while that bound is enabled |
+| `TG_RATE_LIMIT_DISCOVERY_IP` | `10` | Valid local-direct preflight response attempts per client network (`/32` for IPv4 or `/64` for IPv6) per fixed window; `0` disables this bound |
+| `TG_RATE_LIMIT_DISCOVERY_IP_WINDOW` | `1m` | Fixed window for the per-network discovery bound; it must be positive while that bound is enabled |
 | `TG_LOG_LOGIN_CODES`| `false`          | Write issued login codes to the log in cleartext. Off by default; with it off no code is delivered anywhere and sign-in cannot complete. A non-boolean value fails startup |
 | `TG_REGISTRATION`   | `closed`         | Accepted values are `closed`, `invite`, and `open`. `closed` rejects `auth.signUp`, `invite` requires an operator-issued invite, and `open` admits usernames without one. An unrecognized value fails startup. Sign-in for accounts that already exist is unaffected by this setting |
 | `TG_RATE_LIMIT_GET_FILE` | `50` | Per-account `upload.getFile` calls in one fixed window. `0` disables this bound; a negative or non-integer value fails startup |
@@ -65,6 +69,86 @@ When `TG_WEBSOCKET_LISTEN_ADDR` is set, configure
 `/apiws`. Requests without an `Origin` header remain valid for native clients;
 requests carrying one are rejected unless it matches the configured list.
 Keep this listener within the intended network boundary.
+
+### Static enrollment discovery and local preflight
+
+The server-side contract in this section is provided by telegram-server
+revision `b4b18c12` (`MAIN-736`). Deploy that server revision, or a later
+revision that retains the contract, as the document consumer. The command
+renders the public identity without opening Postgres or loading the auth-key
+master secret:
+
+```bash
+telegramd client-config > client.json
+```
+
+It loads or creates the same persistent 2048-bit RSA key at `TG_RSA_KEY_PATH`
+that `telegramd serve` uses. `TG_ADVERTISE_ADDR` and `TG_DC_ID` therefore need
+to resolve to the same values for both commands; both have defaults, and an
+unset advertise address is derived from `TG_LISTEN_ADDR`. The output is one
+deterministic UTF-8 JSON
+object with no private-key material and standard padded base64 of DER
+SubjectPublicKeyInfo:
+
+```json
+{"version":1,"mtproto":{"endpoint":"mtproto.example.com:443","dc_id":2,"rsa_spki":"<standard-padded-base64-DER-SPKI>"}}
+```
+
+The command does not publish or serve the file. Put `client.json` at
+`/.well-known/telegramd/client` on the selected public HTTPS origin, for
+example with a static web server or object store, and keep the file and its
+HTTPS certificate under the same deployment's control. HTTPS certificate
+serving, web-root publication, and TLS termination are outside telegramd.
+
+The optional same-endpoint local-direct preflight is a separate TCP
+discriminator. It is checked only on the normal TCP listener, after a trusted
+PROXY-v2 header has been consumed when `TG_CLIENT_ADDR_TRUST=proxy-v2`, and
+before MTProto framing detection. WebSocket does not expose it. Its exact
+wire format and delimiter are:
+
+```text
+request  = 16 ASCII bytes "telegramd-key-v1" || 32 fresh opaque nonce bytes
+response = 16 ASCII bytes "telegramd-key-r1" || 32 echoed nonce bytes
+           || uint32 body_length (big-endian)
+           || int32 dc_id (big-endian, positive)
+           || uint16 spki_length (big-endian)
+           || DER SubjectPublicKeyInfo
+```
+
+The request is exactly 48 bytes followed by the client's TCP write-half-close.
+The server observes EOF before it responds. A 49th byte, or failure to reach
+EOF within the original absolute pre-auth deadline, is malformed and receives
+no discovery data. That same deadline covers detection, waiting for EOF, and
+the complete response; a configured write timeout may shorten it but never
+extend it.
+
+`spki_length` must be 1..4096 and `body_length` must be exactly
+`6 + spki_length`; the response contains the running server's configured DC
+and RSA public key. A valid request emits at most one bounded response and
+closes without codec negotiation, auth-key or session state, RPC dispatch, or
+database access. A partial, unterminated, malformed, overlong, or wrong-version
+request receives no discovery response. Bytes consumed while identifying an
+ordinary MTProto stream are replayed in order, so plaintext and obfuscated
+MTProto retain their existing behavior.
+
+Discovery response attempts are bounded independently of the existing
+whole-operation pre-auth deadline and connection caps. By default a process may
+admit 60 valid requests to the response path per minute and one `/32` IPv4 or
+`/64` IPv6 client network may admit 10 per minute. `TG_RATE_LIMIT_DISCOVERY=0` and
+`TG_RATE_LIMIT_DISCOVERY_IP=0` disable the respective bounds; their window
+variables must remain positive while the bound is enabled. The
+`TG_DISCOVERY_RATE_LIMIT`, `TG_DISCOVERY_RATE_LIMIT_WINDOW`,
+`TG_DISCOVERY_RATE_LIMIT_PER_IP`, and `TG_DISCOVERY_RATE_LIMIT_PER_IP_WINDOW`
+spellings are accepted as aliases, but a canonical variable and its alias may
+not both be set. In PROXY-v2 mode, the per-network bucket uses the trusted
+reported client address, never the untrusted socket peer.
+
+The local TCP exchange is not an authenticity channel. A network attacker can
+race the first local connection and return a different public key; the nonce
+only prevents stale response replay. Compare the preflight SPKI with the
+HTTPS discovery document or an out-of-band fingerprint before trusting it,
+and treat HTTPS as the bootstrap trust anchor. Do not interpret a successful
+preflight as proof that the endpoint is the intended server.
 
 ### Object-store backend
 

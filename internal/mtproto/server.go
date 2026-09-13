@@ -96,6 +96,11 @@ type Server struct {
 	// preAuth bounds what connections that have not authenticated may hold.
 	// Written once before Serve and only read after, like proxyV2.
 	preAuth *preAuthLimiter
+	// discovery bounds valid local-direct preflight requests admitted to the
+	// response path. Written once before Serve and only read after, like the
+	// other admission controls.
+	discovery    *discoveryLimiter
+	discoveryLog logSampler
 	// One sampler per pre-auth event, never one shared between them: each is
 	// provoked by whoever can reach the port, and a flood against one bound
 	// would otherwise spend the shared window and silence the others — leaving
@@ -236,6 +241,7 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 		handshakeTimeout:     defaultHandshakeTimeout,
 		rpcDeadline:          DefaultRPCDeadline,
 		preAuth:              newPreAuthLimiter(DefaultPreAuthLimits()),
+		discovery:            newDiscoveryLimiter(DefaultDiscoveryLimits()),
 		unboundKeys:          newUnboundKeyLimiter(DefaultMaxConnsPerUnboundKey),
 		pendingLogins:        newPendingLoginLimiter(DefaultMaxPendingLoginConns),
 		pendingLoginLifetime: DefaultPendingLoginLifetime,
@@ -384,7 +390,8 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 		}
 	})
 
-	addr, err := s.clientAddr(sock)
+	handshakeDeadline := time.Now().Add(s.handshakeTimeout)
+	addr, err := s.clientAddrUntil(sock, handshakeDeadline)
 	if err != nil {
 		s.logNegotiation(err)
 		return
@@ -401,7 +408,31 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 		}
 		return
 	}
-	conn, err := s.detectCodec(sock)
+	probe, err := probePreflight(sock, handshakeDeadline)
+	if err != nil {
+		s.dropRefused(sock)
+		s.logNegotiation(errors.Join(errors.New("detect discovery preflight"), err))
+		return
+	}
+	if probe.matched {
+		if !s.discovery.allow(addr, time.Now()) {
+			s.dropRefused(sock)
+			if dropped, ok := s.discoveryLog.allow(time.Now(), preAuthLogInterval); ok {
+				s.log.Info("discovery request refused at rate limit",
+					"client_addr", addr, "suppressed", dropped)
+			}
+			return
+		}
+		if err := s.servePreflight(ctx, sock, probe.nonce, handshakeDeadline); err != nil && !isDisconnect(err) {
+			s.logNegotiation(errors.Join(errors.New("serve discovery preflight"), err))
+		}
+		return
+	}
+	if probe.malformed {
+		s.dropRefused(sock)
+		return
+	}
+	conn, err := s.detectCodec(probe.stream)
 	if err != nil {
 		s.logNegotiation(err)
 		return

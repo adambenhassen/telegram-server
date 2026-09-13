@@ -28,23 +28,6 @@ const (
 // Shutdown is neither one's business: the caller closes the socket on
 // cancellation, which ends whichever read it has got to.
 
-// clientAddr establishes the address of an accepted socket, from the socket
-// itself or from a PROXY v2 header, and sets the deadline that bounds the whole
-// negotiation.
-//
-// The address comes first and, in socket mode, before a single byte has been
-// read, so what every per-IP limit keys on cannot be a function of anything the
-// client wrote. In proxy-v2 mode the allowlist decides before any read too:
-// bytes from a sender that is not a configured balancer are never interpreted,
-// as a header or as anything else.
-//
-// One deadline covers the header read and the codec sniff that follows, and is
-// left set on the way out: gotd resets it from the context before every frame it
-// reads, so nothing here has to clear it.
-func (s *Server) clientAddr(sock net.Conn) (netip.Addr, error) {
-	return s.clientAddrUntil(sock, time.Now().Add(s.handshakeTimeout))
-}
-
 // clientAddrUntil establishes the address using an already-established
 // negotiation deadline. WebSocket accepts set that deadline before dispatching
 // the connection to the address worker, so the worker cannot buy another
