@@ -170,6 +170,9 @@ func (s *Store) BootstrapAccount(ctx context.Context, p BootstrapParams) (Bootst
 	if err != nil {
 		return BootstrapResult{}, fmt.Errorf("upsert password: %w", err)
 	}
+	if err := s.electServerAdministrator(ctx, qtx, u.ID); err != nil {
+		return BootstrapResult{}, fmt.Errorf("bootstrap election: %w", err)
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return BootstrapResult{}, fmt.Errorf("commit: %w", err)

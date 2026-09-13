@@ -108,6 +108,13 @@ func TestSignUpInviteAdmissionCreatesProvisionalAccount(t *testing.T) {
 	if !found || key.UserID != user.ID || !key.Provisional {
 		t.Fatalf("auth key = %#v found=%v, want provisional binding to user %d", key, found, user.ID)
 	}
+	administrator, err := s.IsServerAdministrator(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("check elected administrator: %v", err)
+	}
+	if !administrator {
+		t.Fatal("first invite admission did not elect the new user")
+	}
 	invites, err := s.ListInvites(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -120,6 +127,55 @@ func TestSignUpInviteAdmissionCreatesProvisionalAccount(t *testing.T) {
 	}
 	if storedCode != "" {
 		t.Fatalf("stored code after admission = %q, want empty", storedCode)
+	}
+}
+
+func TestOpenSignUpElectsOnlyTheFirstNewUser(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	addr := netip.MustParseAddr("10.0.0.12")
+	limits := store.RateLimitConfig{}
+
+	for i, handle := range []string{"owner1", "member1"} {
+		keyID := [8]byte{byte(i + 1)}
+		if err := s.SaveAuthKey(ctx, int64(i+1), make([]byte, 256)); err != nil {
+			t.Fatalf("save auth key %s: %v", handle, err)
+		}
+		hash, _, err := s.IssueCodeForUsername(ctx, handle)
+		if err != nil {
+			t.Fatalf("issue code %s: %v", handle, err)
+		}
+		if _, err := api.SignInForTestWithLimits(s, keyID, addr, limits, &tg.AuthSignInRequest{
+			PhoneNumber:   handle,
+			PhoneCodeHash: hash,
+			PhoneCode:     "open-proof",
+		}); err != nil {
+			t.Fatalf("signIn %s: %v", handle, err)
+		}
+		res, err := api.SignUpForTest(s, keyID, addr, limits, config.RegistrationOpen, &tg.AuthSignUpRequest{
+			PhoneNumber:   handle,
+			PhoneCodeHash: hash,
+			FirstName:     handle,
+		})
+		if err != nil {
+			t.Fatalf("signUp %s: %v", handle, err)
+		}
+		auth, ok := res.(*tg.AuthAuthorization)
+		if !ok {
+			t.Fatalf("signUp %s result = %T, want *tg.AuthAuthorization", handle, res)
+		}
+		user, ok := auth.User.(*tg.User)
+		if !ok {
+			t.Fatalf("signUp %s user = %T, want *tg.User", handle, auth.User)
+		}
+		administrator, err := s.IsServerAdministrator(ctx, user.ID)
+		if err != nil {
+			t.Fatalf("check %s administrator: %v", handle, err)
+		}
+		if administrator != (i == 0) {
+			t.Fatalf("%s administrator = %v, want %v", handle, administrator, i == 0)
+		}
 	}
 }
 
@@ -402,12 +458,26 @@ func TestSignUpFailureAfterInviteConsumptionRollsBack(t *testing.T) {
 	if err := s.SaveAuthKey(ctx, 2, make([]byte, 256)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := api.SignUpForTest(s, [8]byte{2}, netip.MustParseAddr("10.0.0.3"), store.RateLimitConfig{}, config.RegistrationInvite, &tg.AuthSignUpRequest{
+	res, err := api.SignUpForTest(s, [8]byte{2}, netip.MustParseAddr("10.0.0.3"), store.RateLimitConfig{}, config.RegistrationInvite, &tg.AuthSignUpRequest{
 		PhoneNumber:   "rollback",
 		PhoneCodeHash: hash,
 		FirstName:     "Rollback",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("signUp after rollback: invite was not still consumable: %v", err)
+	}
+	auth, ok := res.(*tg.AuthAuthorization)
+	if !ok {
+		t.Fatalf("signUp after rollback result = %T, want *tg.AuthAuthorization", res)
+	}
+	user, ok := auth.User.(*tg.User)
+	if !ok {
+		t.Fatalf("signUp after rollback user = %T, want *tg.User", auth.User)
+	}
+	if administrator, err := s.IsServerAdministrator(ctx, user.ID); err != nil {
+		t.Fatalf("check winner after rollback: %v", err)
+	} else if !administrator {
+		t.Fatal("waiting sign-up did not win after the first transaction rolled back")
 	}
 }
 

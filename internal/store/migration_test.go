@@ -33,6 +33,79 @@ func TestOpenRejectsUnmigratedSchema(t *testing.T) {
 	requireOpenMigrationError(t, ctx, dsn)
 }
 
+func TestServerAdministrationMigrationClosesNonEmptyDatabase(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const administrationMigration = "20260913000039_server_administration.sql"
+
+	migs, err := os.ReadDir(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatalf("read migrations dir: %v", err)
+	}
+	admin, err := pgx.Connect(ctx, pgtest.AdminDSN())
+	if err != nil {
+		t.Fatalf("admin connect: %v", err)
+	}
+	defer func() { _ = admin.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	name := "t_" + pgtest.RandomHex()
+	if _, err := admin.Exec(ctx, `CREATE DATABASE `+name); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	t.Cleanup(func() {
+		conn, err := pgx.Connect(context.Background(), pgtest.AdminDSN())
+		if err != nil {
+			t.Logf("cleanup connect: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close(context.Background()) }() //nolint:errcheck // best-effort close
+		if _, err := conn.Exec(context.Background(), `DROP DATABASE IF EXISTS `+name+` WITH (FORCE)`); err != nil {
+			t.Logf("cleanup drop %s: %v", name, err)
+		}
+	})
+
+	conn, err := pgx.Connect(ctx, pgtest.DSNFrom(name))
+	if err != nil {
+		t.Fatalf("connect to database: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	for _, entry := range migs {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= administrationMigration {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join("..", "..", "migrations", entry.Name()))
+		if err != nil {
+			t.Fatalf("read migration %s: %v", entry.Name(), err)
+		}
+		if _, err := conn.Exec(ctx, string(body)); err != nil {
+			t.Fatalf("apply migration %s: %v", entry.Name(), err)
+		}
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO users (phone) VALUES ('15550000999')`); err != nil {
+		t.Fatalf("seed existing user: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join("..", "..", "migrations", administrationMigration))
+	if err != nil {
+		t.Fatalf("read administration migration: %v", err)
+	}
+	if _, err := conn.Exec(ctx, string(body)); err != nil {
+		t.Fatalf("apply administration migration: %v", err)
+	}
+
+	var rows int
+	var closed bool
+	var administrator *int64
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*), bool_and(election_closed), max(administrator_user_id)
+		FROM server_administration
+	`).Scan(&rows, &closed, &administrator); err != nil {
+		t.Fatalf("read migrated administration: %v", err)
+	}
+	if rows != 1 || !closed || administrator != nil {
+		t.Fatalf("migrated administration = rows %d closed %v administrator %v, want 1/true/nil", rows, closed, administrator)
+	}
+}
+
 // TestOpenRejectsPrePartBlobSchema proves the sentinel also catches the state a
 // deployment can be in before the part-blob migration is applied: the template
 // carries the current schema, so undo that migration's artifacts by hand

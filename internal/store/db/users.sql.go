@@ -11,54 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createUser = `-- name: CreateUser :one
-
-WITH upserted AS (
-    INSERT INTO users (phone) VALUES ($1)
-    ON CONFLICT (phone) WHERE phone IS NOT NULL DO UPDATE SET phone = EXCLUDED.phone
-    RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at
-)
-SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
-       un.handle AS username
-FROM upserted u
-LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
-`
-
-type CreateUserRow struct {
-	ID         int64
-	Phone      *string
-	FirstName  string
-	LastName   string
-	CreatedAt  pgtype.Timestamptz
-	IsOnline   bool
-	LastSeenAt pgtype.Timestamptz
-	Username   *string
-}
-
-// Every query that loads a user reads the handle from the usernames row, never
-// from the denormalized users.username column. The two are written in one
-// transaction today, but only the usernames row is authoritative: it is what
-// admits an account to resolveUsername, and a writer that released a handle
-// without clearing the copy must not leave any RPC still reporting it. The join
-// is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
-// user lookup against 200k handles, so the hot per-peer read pays an index
-// probe rather than the copy's zero.
-func (q *Queries) CreateUser(ctx context.Context, phone *string) (CreateUserRow, error) {
-	row := q.db.QueryRow(ctx, createUser, phone)
-	var i CreateUserRow
-	err := row.Scan(
-		&i.ID,
-		&i.Phone,
-		&i.FirstName,
-		&i.LastName,
-		&i.CreatedAt,
-		&i.IsOnline,
-		&i.LastSeenAt,
-		&i.Username,
-	)
-	return i, err
-}
-
 const createUsernameUser = `-- name: CreateUsernameUser :one
 INSERT INTO users (phone, login_mode, first_name, last_name)
 VALUES (NULL, 'username', $1, $2)
@@ -167,6 +119,29 @@ func (q *Queries) GetUserLoginMode(ctx context.Context, id int64) (string, error
 	var login_mode string
 	err := row.Scan(&login_mode)
 	return login_mode, err
+}
+
+const insertUser = `-- name: InsertUser :one
+
+INSERT INTO users (phone)
+VALUES ($1)
+ON CONFLICT (phone) WHERE phone IS NOT NULL DO NOTHING
+RETURNING id
+`
+
+// Every query that loads a user reads the handle from the usernames row, never
+// from the denormalized users.username column. The two are written in one
+// transaction today, but only the usernames row is authoritative: it is what
+// admits an account to resolveUsername, and a writer that released a handle
+// without clearing the copy must not leave any RPC still reporting it. The join
+// is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
+// user lookup against 200k handles, so the hot per-peer read pays an index
+// probe rather than the copy's zero.
+func (q *Queries) InsertUser(ctx context.Context, phone *string) (int64, error) {
+	row := q.db.QueryRow(ctx, insertUser, phone)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
 }
 
 const searchContactsByName = `-- name: SearchContactsByName :many
