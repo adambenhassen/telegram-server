@@ -174,6 +174,10 @@ type Config struct {
 	// RateLimits holds the per-surface rate-limit configurations. Zero limit
 	// disables enforcement for that surface.
 	RateLimits RateLimitsConfig
+	// DiscoveryLimits bounds completed local-direct preflight responses. The
+	// connection bounds still cover partial requests; these limits cover valid
+	// requests that reach the response path.
+	DiscoveryLimits mtproto.DiscoveryLimits
 	// ClientAddrTrust names where the address a request is attributed to comes
 	// from: the connection's own peer address, or a PROXY protocol v2 header.
 	ClientAddrTrust ClientAddrTrust
@@ -217,6 +221,18 @@ type Config struct {
 	// BootstrapPasswordFile is the path to a file containing the bootstrap
 	// password. Mutually exclusive with BootstrapPassword.
 	BootstrapPasswordFile string
+}
+
+// ClientConfig contains only the identity settings needed to render the
+// public discovery document. Unlike Config, loading it does not require
+// Postgres, the auth-key encryption master key, blob storage, or any other
+// service resource.
+type ClientConfig struct {
+	ListenAddr    string
+	RSAKeyPath    string
+	AdvertiseHost string
+	AdvertisePort int
+	DCID          int
 }
 
 // ClientAddrTrust names the source a client address is taken from.
@@ -404,22 +420,63 @@ const MaxFileBytesLimit int64 = 1 << 40
 // cancellations in the sweep's log, not silent truncation.
 const DefaultStatementTimeout = 17 * time.Second
 
+// LoadClientConfig is the resource-free subset used by the client-config
+// command. Keep it separate from Load: a public document needs only the
+// advertised identity and the RSA key, and must remain usable during a
+// database outage or before the auth-key master secret is provisioned.
+func LoadClientConfig() (ClientConfig, error) {
+	listenAddr := envOr("TG_LISTEN_ADDR", ":2443")
+	cfg := ClientConfig{
+		ListenAddr: listenAddr,
+		RSAKeyPath: envOr("TG_RSA_KEY_PATH", "server_key.pem"),
+		DCID:       2,
+	}
+	if v := os.Getenv("TG_DC_ID"); v != "" {
+		id, err := strconv.Atoi(v)
+		if err != nil {
+			return ClientConfig{}, errors.New("TG_DC_ID must be an integer")
+		}
+		cfg.DCID = id
+	}
+	if cfg.DCID <= 0 || int64(cfg.DCID) > math.MaxInt32 {
+		return ClientConfig{}, errors.New("TG_DC_ID must be positive and fit int32")
+	}
+	if os.Getenv("TG_ADVERTISE_ADDR") == "" {
+		if _, _, err := net.SplitHostPort(listenAddr); err != nil {
+			return ClientConfig{}, errors.New("TG_LISTEN_ADDR must be host:port when TG_ADVERTISE_ADDR is unset")
+		}
+	}
+	advertiseHost, advertisePort, err := advertiseAddr(os.Getenv("TG_ADVERTISE_ADDR"), listenAddr)
+	if err != nil {
+		return ClientConfig{}, err
+	}
+	cfg.AdvertiseHost = advertiseHost
+	cfg.AdvertisePort = advertisePort
+	return cfg, nil
+}
+
 // Load reads configuration from environment variables, applying defaults. The
 // logger is used only for the auth-key master key, which is the one value Load
 // can create rather than read, and a generated one has to say so.
 func Load(log *slog.Logger) (Config, error) {
+	identity, err := LoadClientConfig()
+	if err != nil {
+		return Config{}, err
+	}
 	originPatterns, err := parseWebSocketOriginPatterns(os.Getenv("TG_WEBSOCKET_ALLOWED_ORIGINS"))
 	if err != nil {
 		return Config{}, err
 	}
 	cfg := Config{
-		ListenAddr:              envOr("TG_LISTEN_ADDR", ":2443"),
+		ListenAddr:              identity.ListenAddr,
 		WebSocketListenAddr:     os.Getenv("TG_WEBSOCKET_LISTEN_ADDR"),
 		WebSocketOriginPatterns: originPatterns,
 		AdminListenAddr:         os.Getenv("TG_ADMIN_LISTEN_ADDR"),
 		PostgresDSN:             os.Getenv("TG_POSTGRES_DSN"),
-		RSAKeyPath:              envOr("TG_RSA_KEY_PATH", "server_key.pem"),
-		DCID:                    2,
+		RSAKeyPath:              identity.RSAKeyPath,
+		AdvertiseHost:           identity.AdvertiseHost,
+		AdvertisePort:           identity.AdvertisePort,
+		DCID:                    identity.DCID,
 		BlobDir:                 envOr("TG_BLOB_DIR", "blobs"),
 
 		MaxFileBytes:        100 << 20,
@@ -445,13 +502,6 @@ func Load(log *slog.Logger) (Config, error) {
 		StatementTimeout: DefaultStatementTimeout,
 
 		RegistrationMode: RegistrationClosed,
-	}
-	if v := os.Getenv("TG_DC_ID"); v != "" {
-		id, err := strconv.Atoi(v)
-		if err != nil {
-			return Config{}, errors.New("TG_DC_ID must be an integer")
-		}
-		cfg.DCID = id
 	}
 	if v := os.Getenv("TG_MAX_FILE_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -906,6 +956,11 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.PreAuth = preAuth
+	discoveryLimits, err := discoveryLimits()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DiscoveryLimits = discoveryLimits
 	if v := os.Getenv("TG_MAX_CONNS_PER_UNBOUND_KEY"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -936,11 +991,6 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.ClientAddrProxies = proxies
-	advertiseHost, advertisePort, err := advertiseAddr(os.Getenv("TG_ADVERTISE_ADDR"), cfg.ListenAddr)
-	if err != nil {
-		return Config{}, err
-	}
-	cfg.AdvertiseHost, cfg.AdvertisePort = advertiseHost, advertisePort
 	// Admin server requires both env vars or neither: a listener without auth
 	// is a denial-of-service vector, and a hash with no listener is wasted work.
 	adminErr := validateAdmin(cfg)
@@ -1108,6 +1158,89 @@ func preAuthLimits() (mtproto.PreAuthLimits, error) {
 		limits.Lifetime = d
 	}
 	return limits, nil
+}
+
+// discoveryLimits resolves the fixed-window bounds for valid local-direct
+// preflight requests. The TG_RATE_LIMIT_* spelling follows the other RPC
+// surfaces; the TG_DISCOVERY_* aliases keep the setting discoverable for
+// deployments that group discovery controls together.
+func discoveryLimits() (mtproto.DiscoveryLimits, error) {
+	limits := mtproto.DefaultDiscoveryLimits()
+	global, globalName, err := discoveryEnvValue("TG_RATE_LIMIT_DISCOVERY", "TG_DISCOVERY_RATE_LIMIT")
+	if err != nil {
+		return mtproto.DiscoveryLimits{}, err
+	}
+	if global != "" {
+		n, err := strconv.Atoi(global)
+		if err != nil {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must be an integer", globalName)
+		}
+		if n < 0 {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must not be negative; 0 disables the cap", globalName)
+		}
+		limits.MaxRequests = n
+	}
+	globalWindow, globalWindowName, err := discoveryEnvValue("TG_RATE_LIMIT_DISCOVERY_WINDOW", "TG_DISCOVERY_RATE_LIMIT_WINDOW")
+	if err != nil {
+		return mtproto.DiscoveryLimits{}, err
+	}
+	if globalWindow != "" {
+		d, err := time.ParseDuration(globalWindow)
+		if err != nil {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must be a duration", globalWindowName)
+		}
+		if d < 0 {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must not be negative", globalWindowName)
+		}
+		limits.Window = d
+	}
+	perNet, perNetName, err := discoveryEnvValue("TG_RATE_LIMIT_DISCOVERY_IP", "TG_DISCOVERY_RATE_LIMIT_PER_IP")
+	if err != nil {
+		return mtproto.DiscoveryLimits{}, err
+	}
+	if perNet != "" {
+		n, err := strconv.Atoi(perNet)
+		if err != nil {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must be an integer", perNetName)
+		}
+		if n < 0 {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must not be negative; 0 disables the cap", perNetName)
+		}
+		limits.MaxRequestsPerNet = n
+	}
+	perNetWindow, perNetWindowName, err := discoveryEnvValue("TG_RATE_LIMIT_DISCOVERY_IP_WINDOW", "TG_DISCOVERY_RATE_LIMIT_PER_IP_WINDOW")
+	if err != nil {
+		return mtproto.DiscoveryLimits{}, err
+	}
+	if perNetWindow != "" {
+		d, err := time.ParseDuration(perNetWindow)
+		if err != nil {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must be a duration", perNetWindowName)
+		}
+		if d < 0 {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must not be negative", perNetWindowName)
+		}
+		limits.PerNetWindow = d
+	}
+	if limits.MaxRequests > 0 && limits.Window <= 0 {
+		return mtproto.DiscoveryLimits{}, errors.New("TG_RATE_LIMIT_DISCOVERY_WINDOW must be positive when TG_RATE_LIMIT_DISCOVERY is enabled")
+	}
+	if limits.MaxRequestsPerNet > 0 && limits.PerNetWindow <= 0 {
+		return mtproto.DiscoveryLimits{}, errors.New("TG_RATE_LIMIT_DISCOVERY_IP_WINDOW must be positive when TG_RATE_LIMIT_DISCOVERY_IP is enabled")
+	}
+	return limits, nil
+}
+
+func discoveryEnvValue(primary, alias string) (value, name string, err error) {
+	primaryValue := os.Getenv(primary)
+	aliasValue := os.Getenv(alias)
+	if primaryValue != "" && aliasValue != "" {
+		return "", "", fmt.Errorf("%s and %s must not both be set", primary, alias)
+	}
+	if primaryValue != "" {
+		return primaryValue, primary, nil
+	}
+	return aliasValue, alias, nil
 }
 
 // clientAddrTrust resolves the client-address source. An unset value is the
