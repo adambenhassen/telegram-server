@@ -73,8 +73,8 @@ Keep this listener within the intended network boundary.
 ### Static enrollment discovery and local preflight
 
 The server-side contract in this section is provided by telegram-server
-`MAIN-736`. Deploy the same server revision as the document consumer; the
-change is based on `7f02eeb38217693bc92557cda4f2eb0eb3bff8b7`. The command
+revision `efb302b8` (`MAIN-736`). Deploy that server revision, or a later
+revision that retains the contract, as the document consumer. The command
 renders the public identity without opening Postgres or loading the auth-key
 master secret:
 
