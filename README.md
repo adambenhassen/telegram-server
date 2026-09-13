@@ -142,9 +142,9 @@ The server refuses to start without a database and a master key:
 | `TG_BLOB_S3_CA_PATH` | *(unset)* | PEM bundle for a private endpoint CA; TLS verification remains enabled |
 | `TG_BLOB_S3_ALLOW_INSECURE_HTTP` | `false` | Explicit loopback/compose-only plaintext opt-in; startup warns when enabled |
 | `TG_DC_ID` | `2` | DC id the server advertises |
-| `TG_RATE_LIMIT_DISCOVERY` | `60` | Process-wide valid local-direct preflight responses per fixed window; `0` disables the bound |
+| `TG_RATE_LIMIT_DISCOVERY` | `60` | Process-wide valid local-direct preflight response attempts per fixed window; `0` disables the bound |
 | `TG_RATE_LIMIT_DISCOVERY_WINDOW` | `1m` | Window for the process-wide discovery response bound |
-| `TG_RATE_LIMIT_DISCOVERY_IP` | `10` | Valid local-direct preflight responses per IPv4 `/32` or IPv6 `/64` network per fixed window; `0` disables the bound |
+| `TG_RATE_LIMIT_DISCOVERY_IP` | `10` | Valid local-direct preflight response attempts per IPv4 `/32` or IPv6 `/64` network per fixed window; `0` disables the bound |
 | `TG_RATE_LIMIT_DISCOVERY_IP_WINDOW` | `1m` | Window for the per-network discovery response bound |
 | `TG_BOOTSTRAP_USERNAME` | *(unset)* | Seed a username/password operator account at startup; requires exactly one of `TG_BOOTSTRAP_PASSWORD` or `TG_BOOTSTRAP_PASSWORD_FILE` |
 | `TG_BOOTSTRAP_PASSWORD_FILE` | *(unset)* | File (mode 0600) the bootstrap password is read from. Prefer it over `TG_BOOTSTRAP_PASSWORD`: an env value stays visible in `/proc/<pid>/environ`, orchestrator inspect output and crash dumps for the life of the process |

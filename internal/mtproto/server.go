@@ -96,8 +96,9 @@ type Server struct {
 	// preAuth bounds what connections that have not authenticated may hold.
 	// Written once before Serve and only read after, like proxyV2.
 	preAuth *preAuthLimiter
-	// discovery bounds completed local-direct preflight responses. Written once
-	// before Serve and only read after, like the other admission controls.
+	// discovery bounds valid local-direct preflight requests admitted to the
+	// response path. Written once before Serve and only read after, like the
+	// other admission controls.
 	discovery    *discoveryLimiter
 	discoveryLog logSampler
 	// One sampler per pre-auth event, never one shared between them: each is

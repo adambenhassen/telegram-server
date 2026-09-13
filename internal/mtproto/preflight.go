@@ -15,16 +15,16 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
-// DiscoveryLimits bounds completed local-direct discovery requests. The
-// existing pre-auth connection bounds cover sockets while a request is slow or
-// partial; these fixed windows additionally bound the CPU and response work a
-// peer can trigger after sending a valid request.
+// DiscoveryLimits bounds valid local-direct requests admitted to the discovery
+// response path. The existing pre-auth connection bounds cover sockets while a
+// request is slow or partial; these fixed windows additionally bound the CPU
+// and response work a peer can trigger after sending a valid request.
 type DiscoveryLimits struct {
-	// MaxRequests is the process-wide number of responses in Window. Zero
-	// disables this bound.
+	// MaxRequests is the process-wide number of valid requests admitted to the
+	// response path in Window. Zero disables this bound.
 	MaxRequests int
-	// MaxRequestsPerNet is the number of responses from one client network in
-	// PerNetWindow. Zero disables this bound.
+	// MaxRequestsPerNet is the number of valid requests from one client network
+	// admitted to the response path in PerNetWindow. Zero disables this bound.
 	MaxRequestsPerNet int
 	// Window is the process-wide fixed window.
 	Window time.Duration

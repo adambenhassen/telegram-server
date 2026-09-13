@@ -46,9 +46,9 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_BLOB_S3_CA_PATH` | *(unset)*        | PEM bundle for a private endpoint CA; TLS verification remains enabled |
 | `TG_BLOB_S3_ALLOW_INSECURE_HTTP` | `false` | Explicit loopback/compose-only plaintext opt-in; startup warns when enabled |
 | `TG_DC_ID`          | `2`              | DC id this server advertises as `ThisDC`    |
-| `TG_RATE_LIMIT_DISCOVERY` | `60` | Process-wide completed local-direct preflight responses per fixed window; `0` disables this bound, and a negative or non-integer value fails startup |
+| `TG_RATE_LIMIT_DISCOVERY` | `60` | Process-wide valid local-direct preflight response attempts per fixed window; `0` disables this bound, and a negative or non-integer value fails startup |
 | `TG_RATE_LIMIT_DISCOVERY_WINDOW` | `1m` | Fixed window for the process-wide discovery bound; it must be positive while that bound is enabled |
-| `TG_RATE_LIMIT_DISCOVERY_IP` | `10` | Completed local-direct preflight responses per client network (`/32` for IPv4 or `/64` for IPv6) per fixed window; `0` disables this bound |
+| `TG_RATE_LIMIT_DISCOVERY_IP` | `10` | Valid local-direct preflight response attempts per client network (`/32` for IPv4 or `/64` for IPv6) per fixed window; `0` disables this bound |
 | `TG_RATE_LIMIT_DISCOVERY_IP_WINDOW` | `1m` | Fixed window for the per-network discovery bound; it must be positive while that bound is enabled |
 | `TG_LOG_LOGIN_CODES`| `false`          | Write issued login codes to the log in cleartext. Off by default; with it off no code is delivered anywhere and sign-in cannot complete. A non-boolean value fails startup |
 | `TG_REGISTRATION`   | `closed`         | Accepted values are `closed`, `invite`, and `open`. `closed` rejects `auth.signUp`, `invite` requires an operator-issued invite, and `open` admits usernames without one. An unrecognized value fails startup. Sign-in for accounts that already exist is unaffected by this setting |
@@ -73,7 +73,7 @@ Keep this listener within the intended network boundary.
 ### Static enrollment discovery and local preflight
 
 The server-side contract in this section is provided by telegram-server
-revision `efb302b8` (`MAIN-736`). Deploy that server revision, or a later
+revision `b4b18c12` (`MAIN-736`). Deploy that server revision, or a later
 revision that retains the contract, as the document consumer. The command
 renders the public identity without opening Postgres or loading the auth-key
 master secret:
@@ -131,10 +131,10 @@ request receives no discovery response. Bytes consumed while identifying an
 ordinary MTProto stream are replayed in order, so plaintext and obfuscated
 MTProto retain their existing behavior.
 
-Discovery responses are bounded independently of the existing whole-operation
-pre-auth deadline and connection caps. By default a process may answer 60
-valid requests per minute and one `/32` IPv4 or `/64` IPv6 client network may
-answer 10 per minute. `TG_RATE_LIMIT_DISCOVERY=0` and
+Discovery response attempts are bounded independently of the existing
+whole-operation pre-auth deadline and connection caps. By default a process may
+admit 60 valid requests to the response path per minute and one `/32` IPv4 or
+`/64` IPv6 client network may admit 10 per minute. `TG_RATE_LIMIT_DISCOVERY=0` and
 `TG_RATE_LIMIT_DISCOVERY_IP=0` disable the respective bounds; their window
 variables must remain positive while the bound is enabled. The
 `TG_DISCOVERY_RATE_LIMIT`, `TG_DISCOVERY_RATE_LIMIT_WINDOW`,

@@ -174,9 +174,9 @@ type Config struct {
 	// RateLimits holds the per-surface rate-limit configurations. Zero limit
 	// disables enforcement for that surface.
 	RateLimits RateLimitsConfig
-	// DiscoveryLimits bounds completed local-direct preflight responses. The
-	// connection bounds still cover partial requests; these limits cover valid
-	// requests that reach the response path.
+	// DiscoveryLimits bounds valid local-direct preflight requests admitted to
+	// the response path. The connection bounds still cover partial requests;
+	// these limits cover the response attempts that pass admission.
 	DiscoveryLimits mtproto.DiscoveryLimits
 	// ClientAddrTrust names where the address a request is attributed to comes
 	// from: the connection's own peer address, or a PROXY protocol v2 header.
