@@ -76,10 +76,13 @@ func nextBackoff(prev, uptime time.Duration) time.Duration {
 // breaks.
 type Listener struct {
 	log *slog.Logger
-	// recorder is optional so existing callers can keep the listener focused
-	// on delivery. It is invoked only after parsing and never while a callback
-	// is running.
-	recorder NotificationRecorder
+	// metrics is the built-in recorder. Its fixed in-process operation runs
+	// before the delivery callback.
+	metrics *NotificationMetrics
+	// recorder is an optional custom telemetry sink. It is fed through the
+	// bounded recorderQueue so a blocked sink cannot delay delivery or stop.
+	recorder      NotificationRecorder
+	recorderQueue chan notificationRecord
 
 	// closeErr is the loop's final connection close error. The loop goroutine
 	// writes it before returning and stop reads it after wg.Wait, so the
@@ -101,7 +104,8 @@ type Listener struct {
 // for a secret-chat message; reactions receives (ownerID, localID, userID) for
 // a reaction change on a specific message copy; pinned receives (peerType, peerID, pinnedMsgID) for a pin/unpin in a chat or channel; pinnedMsgID is nonzero on pin, zero on unpin.
 // An optional recorder receives fixed-channel valid counts and aggregate
-// malformed counts; recorder failures never affect delivery.
+// malformed counts; the built-in metrics recorder runs inline, while custom
+// recorder failures or blocking never affect delivery.
 //
 // A broken connection is reconnected with bounded backoff rather than ending
 // delivery for the life of the process. Notifications emitted while the
@@ -137,8 +141,17 @@ func StartListener(
 	if len(recorders) > 0 {
 		recorder = recorders[0]
 	}
-	l := &Listener{log: log, recorder: recorder}
+	l := &Listener{log: log}
 	loopCtx, cancel := context.WithCancel(ctx)
+	if metrics, ok := recorder.(*NotificationMetrics); ok {
+		l.metrics = metrics
+	} else if recorder != nil {
+		l.recorder = recorder
+		l.recorderQueue = make(chan notificationRecord, notificationRecorderQueueSize)
+		// This worker is deliberately outside wg: a custom telemetry sink may
+		// block forever, but listener shutdown must remain bounded.
+		go l.runRecorder(loopCtx)
+	}
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned)
@@ -372,6 +385,67 @@ func (l *Listener) dispatch(
 // recordValidNotification isolates the listener from recorder failures. A
 // recorder is telemetry only: an error or panic must not alter delivery.
 func (l *Listener) recordValidNotification(channel string) {
+	if l.metrics != nil {
+		if err := l.metrics.RecordValidNotification(channel); err != nil {
+			return
+		}
+		return
+	}
+	l.enqueueNotificationRecord(notificationRecord{channel: channel})
+}
+
+// recordInvalidNotification isolates malformed-input accounting from the
+// listener. Invalid notifications carry no channel or payload to telemetry.
+func (l *Listener) recordInvalidNotification() {
+	if l.metrics != nil {
+		if err := l.metrics.RecordInvalidNotification(); err != nil {
+			return
+		}
+		return
+	}
+	l.enqueueNotificationRecord(notificationRecord{invalid: true})
+}
+
+// notificationRecord is the only data that crosses the asynchronous custom
+// recorder boundary. Valid channels are compiled constants; invalid records
+// carry no channel or payload.
+type notificationRecord struct {
+	channel string
+	invalid bool
+}
+
+const notificationRecorderQueueSize = 64
+
+func (l *Listener) enqueueNotificationRecord(record notificationRecord) {
+	if l.recorderQueue == nil {
+		return
+	}
+	select {
+	case l.recorderQueue <- record:
+	default:
+		// A custom recorder is advisory telemetry. Dropping when its fixed
+		// queue is full preserves the listener's delivery contract.
+	}
+}
+
+func (l *Listener) runRecorder(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case record := <-l.recorderQueue:
+			if record.invalid {
+				l.invokeInvalidNotificationRecorder()
+				continue
+			}
+			l.invokeValidNotificationRecorder(record.channel)
+		}
+	}
+}
+
+// invokeValidNotificationRecorder isolates custom recorder failures. A
+// recorder is telemetry only: an error or panic must not alter delivery.
+func (l *Listener) invokeValidNotificationRecorder(channel string) {
 	if l.recorder == nil {
 		return
 	}
@@ -385,9 +459,9 @@ func (l *Listener) recordValidNotification(channel string) {
 	}
 }
 
-// recordInvalidNotification isolates malformed-input accounting from the
-// listener. Invalid notifications carry no channel or payload to telemetry.
-func (l *Listener) recordInvalidNotification() {
+// invokeInvalidNotificationRecorder isolates malformed-input accounting from
+// custom recorder failures. Invalid notifications carry no channel or payload.
+func (l *Listener) invokeInvalidNotificationRecorder() {
 	if l.recorder == nil {
 		return
 	}

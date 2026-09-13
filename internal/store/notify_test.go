@@ -172,11 +172,14 @@ func TestStartListenerContainsRecorderPanicAndPreservesCallback(t *testing.T) {
 	s := openDSN(t, dsn)
 
 	delivered := make(chan int64, 1)
+	called := make(chan struct{}, 2)
 	recorder := store.NotificationRecorderFunc{
 		Valid: func(string) error {
+			called <- struct{}{}
 			panic("telemetry failure")
 		},
 		Invalid: func() error {
+			called <- struct{}{}
 			panic("telemetry failure")
 		},
 	}
@@ -216,6 +219,13 @@ func TestStartListenerContainsRecorderPanicAndPreservesCallback(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("deliver callback not invoked after recorder panic")
 	}
+	for range 2 {
+		select {
+		case <-called:
+		case <-time.After(5 * time.Second):
+			t.Fatal("recorder panic path was not exercised")
+		}
+	}
 }
 
 func TestStartListenerRecordsBeforeCallback(t *testing.T) {
@@ -224,15 +234,64 @@ func TestStartListenerRecordsBeforeCallback(t *testing.T) {
 	dsn := pgtest.DSN(t)
 	s := openDSN(t, dsn)
 
-	ordered := make(chan string, 2)
+	metrics := store.NewNotificationMetrics()
+	callbackSawCount := make(chan int64, 1)
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(context.Context, int64) { callbackSawCount <- metrics.Snapshot().Channels.Updates },
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+		metrics,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	defer func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	}()
+
+	if err := s.Notify(ctx, store.ChannelUpdates, "19"); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	select {
+	case got := <-callbackSawCount:
+		if got != 1 {
+			t.Fatalf("callback observed notify count = %d, want 1", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for callback")
+	}
+}
+
+func TestStartListenerBlockingRecorderDoesNotBlockDeliveryOrStop(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
 	recorder := store.NotificationRecorderFunc{
 		Valid: func(string) error {
-			ordered <- "recorded"
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
 			return nil
 		},
 	}
+	delivered := make(chan int64, 2)
 	_, stop, err := store.StartListener(ctx, dsn,
-		func(context.Context, int64) { ordered <- "callback" },
+		func(_ context.Context, userID int64) { delivered <- userID },
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64) {},
@@ -247,24 +306,64 @@ func TestStartListenerRecordsBeforeCallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}
+	var stopStarted bool
+	var stopComplete bool
+	stopped := make(chan error, 1)
+	startStop := func() {
+		if stopStarted {
+			return
+		}
+		stopStarted = true
+		go func() { stopped <- stop() }()
+	}
 	defer func() {
-		if err := stop(); err != nil {
-			t.Errorf("stop: %v", err)
+		close(release)
+		startStop()
+		if !stopComplete {
+			select {
+			case err := <-stopped:
+				stopComplete = true
+				if err != nil {
+					t.Errorf("stop after blocking recorder test: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Error("listener did not stop after releasing recorder")
+			}
 		}
 	}()
 
-	if err := s.Notify(ctx, store.ChannelUpdates, "19"); err != nil {
-		t.Fatalf("notify: %v", err)
+	if err := s.Notify(ctx, store.ChannelUpdates, "31"); err != nil {
+		t.Fatalf("notify first update: %v", err)
 	}
-	for i, want := range []string{"recorded", "callback"} {
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking recorder was not called")
+	}
+	if err := s.Notify(ctx, store.ChannelUpdates, "32"); err != nil {
+		t.Fatalf("notify second update: %v", err)
+	}
+
+	for i, want := range []int64{31, 32} {
 		select {
-		case got := <-ordered:
+		case got := <-delivered:
 			if got != want {
-				t.Fatalf("event %d = %q, want %q", i, got, want)
+				t.Errorf("callback %d userID = %d, want %d", i, got, want)
 			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for event %d (%q)", i, want)
+		case <-time.After(1 * time.Second):
+			t.Errorf("callback %d did not complete while recorder was blocked", i)
 		}
+	}
+
+	startStop()
+	select {
+	case err := <-stopped:
+		stopComplete = true
+		if err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("stop did not complete while recorder was blocked")
 	}
 }
 

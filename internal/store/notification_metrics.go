@@ -41,9 +41,11 @@ type NotificationMetricsSnapshot struct {
 	Invalid       int64
 }
 
-// NotificationRecorder is the narrow seam used by the listener. Valid
-// notifications carry only a known compiled channel name; invalid input has
-// no channel argument, so malformed payloads cannot become a label.
+// NotificationRecorder is the narrow seam used by the listener. The built-in
+// NotificationMetrics implementation is recorded inline; custom implementations
+// are advisory and are invoked asynchronously through a bounded queue. Valid
+// notifications carry only a known compiled channel name; invalid input has no
+// channel argument, so malformed payloads cannot become a label.
 type NotificationRecorder interface {
 	RecordValidNotification(channel string) error
 	RecordInvalidNotification() error
