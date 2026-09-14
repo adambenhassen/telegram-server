@@ -116,15 +116,21 @@ func (s *Store) CheckAndChargeSendCodeIP(ctx context.Context, addr netip.Addr, p
 	if err != nil {
 		return nil, err
 	}
-	if denied == nil {
-		denied, err = chargeSendCodeIPPhone(ctx, qtx, key, phone, cfg.Phones)
-		if err != nil {
-			return nil, err
-		}
+	if denied != nil {
+		// Roll back by returning: the deferred Rollback undoes the token the
+		// call counter may already have consumed above.
+		denied.Surface = RateLimitResultSurfaceSendCodeIPCalls
+		return denied, nil
+	}
+
+	denied, err = chargeSendCodeIPPhone(ctx, qtx, key, phone, cfg.Phones)
+	if err != nil {
+		return nil, err
 	}
 	if denied != nil {
 		// Roll back by returning: the deferred Rollback undoes the token the
 		// call counter may already have consumed above.
+		denied.Surface = RateLimitResultSurfaceSendCodeIPDistinctNumbers
 		return denied, nil
 	}
 	if err := tx.Commit(ctx); err != nil {

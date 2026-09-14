@@ -509,7 +509,11 @@ func DefaultFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	if err != nil {
 		return nil, err
 	}
-	html := strings.TrimSuffix(buf.String(), `</div>`) + telemetry + `</div>`
+	rateLimitDenialTelemetry, err := rateLimitDenialTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	html := strings.TrimSuffix(buf.String(), `</div>`) + telemetry + rateLimitDenialTelemetry + `</div>`
 	return []Fragment{{Event: sseDefaultEvent, HTML: html}}, nil
 }
 
@@ -547,6 +551,29 @@ func pushTelemetryHTML(m MetricsResponse) (string, error) {
 		return "", fmt.Errorf("marshal push telemetry: %w", err)
 	}
 	return `<script id="push-telemetry" type="application/json">` + string(data) + `</script>`, nil
+}
+
+type rateLimitDenialTelemetryPayload struct {
+	RateLimitDenialsCount         int64                     `json:"rate_limit_denials_count"`
+	RateLimitDenialsWindowSeconds float64                   `json:"rate_limit_denials_window_seconds"`
+	RateLimitDenialsRatePerSecond float64                   `json:"rate_limit_denials_rate_per_second"`
+	RateLimitDenialsBySurface     RateLimitDenialsBySurface `json:"rate_limit_denials_by_surface"`
+	RateLimitDenialsDropped       int64                     `json:"rate_limit_denials_dropped"`
+}
+
+func rateLimitDenialTelemetryHTML(m MetricsResponse) (string, error) {
+	payload := rateLimitDenialTelemetryPayload{
+		RateLimitDenialsCount:         m.RateLimitDenialsCount,
+		RateLimitDenialsWindowSeconds: m.RateLimitDenialsWindowSeconds,
+		RateLimitDenialsRatePerSecond: m.RateLimitDenialsRatePerSecond,
+		RateLimitDenialsBySurface:     m.RateLimitDenialsBySurface,
+		RateLimitDenialsDropped:       m.RateLimitDenialsDropped,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal rate-limit denial telemetry: %w", err)
+	}
+	return `<script id="rate-limit-denials-telemetry" type="application/json">` + string(data) + `</script>`, nil
 }
 
 // metricsFragmentHTML mirrors the data-metric attributes the dashboard uses, so

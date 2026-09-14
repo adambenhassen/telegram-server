@@ -83,6 +83,13 @@ func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code stri
 	h.logIssuedCode(phone, code)
 }
 
+// RecordRateLimitDenialForTest drives the request telemetry wrapper for the
+// external api_test package, including its panic isolation boundary.
+func RecordRateLimitDenialForTest(metrics *store.NotificationMetrics, surface string) {
+	h := &handlers{rateLimitMetrics: metrics}
+	h.recordRateLimitDenial(surface)
+}
+
 // UnhandledForTest drives the dispatcher's fallback for the external api_test
 // package, over a body positioned at its constructor id. It returns the error
 // the caller would receive and writes the record the RPC-gap capture reads.
