@@ -16,7 +16,8 @@ func TestChannelUpdatesProductionDeliverRecordsOnePushSample(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, dsn := openStoreDSN(t)
-	metrics := store.NewNotificationMetrics()
+	start := time.Unix(1_700_000_000, 0)
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time { return start })
 	reg := mtproto.NewSessionRegistry()
 	updater := api.NewUpdater(s, reg, nil, pgtest.PeerDeriver(), metrics)
 
@@ -39,14 +40,22 @@ func TestChannelUpdatesProductionDeliverRecordsOnePushSample(t *testing.T) {
 		t.Fatal("registry rejected bob connection")
 	}
 	t.Cleanup(func() { reg.Remove(bob.ID, conn) })
+	typingDone := make(chan struct{}, 1)
+	statusDone := make(chan struct{}, 1)
 
 	_, stop, err := store.StartListener(ctx, dsn,
 		updater.Deliver,
-		func(context.Context, int64, int64) {},
+		func(ctx context.Context, peerID, fromID int64) {
+			updater.DeliverTyping(ctx, peerID, fromID)
+			typingDone <- struct{}{}
+		},
 		func(context.Context, int64, int64) {},
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) {},
-		func(context.Context, int64, bool) {},
+		func(ctx context.Context, userID int64, online bool) {
+			updater.DeliverStatus(ctx, userID, online)
+			statusDone <- struct{}{}
+		},
 		func(context.Context, int64, int) {},
 		func(context.Context, int64, int64, int64) {},
 		func(context.Context, store.PeerType, int64, int32) {},
@@ -80,17 +89,41 @@ func TestChannelUpdatesProductionDeliverRecordsOnePushSample(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if snapshot.Channels.Updates != 1 {
-		t.Fatalf("valid tg_updates count = %d, want one", snapshot.Channels.Updates)
+	beforeTransient := snapshot.Push
+	if err := s.Notify(ctx, store.ChannelTyping, store.TypingPayload(bob.ID, alice.ID)); err != nil {
+		t.Fatalf("notify typing: %v", err)
 	}
-	if snapshot.Push.Outcomes != (store.PushOutcomeCounts{Success: 1}) {
-		t.Fatalf("push outcomes = %+v, want exactly one success", snapshot.Push.Outcomes)
+	select {
+	case <-typingDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("typing callback did not run")
+	}
+	if err := s.Notify(ctx, store.ChannelStatus, store.StatusPayload(alice.ID, true)); err != nil {
+		t.Fatalf("notify status: %v", err)
+	}
+	select {
+	case <-statusDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("status callback did not run")
+	}
+	afterTransient := metrics.Snapshot()
+	if afterTransient.Push != beforeTransient {
+		t.Fatalf("transient push telemetry changed from %+v to %+v", beforeTransient, afterTransient.Push)
+	}
+	if afterTransient.Channels.Updates != 1 {
+		t.Fatalf("valid tg_updates count = %d, want one", afterTransient.Channels.Updates)
+	}
+	if afterTransient.Channels.Typing != 1 || afterTransient.Channels.Status != 1 {
+		t.Fatalf("transient channel counts = %+v, want one typing and one status", afterTransient.Channels)
+	}
+	if afterTransient.Push.Outcomes != (store.PushOutcomeCounts{Success: 1}) {
+		t.Fatalf("push outcomes = %+v, want exactly one success", afterTransient.Push.Outcomes)
 	}
 	var bucketSamples int64
-	for _, count := range snapshot.Push.LatencyBucketCounts {
+	for _, count := range afterTransient.Push.LatencyBucketCounts {
 		bucketSamples += count
 	}
 	if bucketSamples != 1 {
-		t.Fatalf("push latency buckets = %v, want exactly one sample", snapshot.Push.LatencyBucketCounts)
+		t.Fatalf("push latency buckets = %v, want exactly one sample", afterTransient.Push.LatencyBucketCounts)
 	}
 }
