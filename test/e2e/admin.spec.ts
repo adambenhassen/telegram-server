@@ -450,6 +450,90 @@ test.describe('admin SSE stream', () => {
     });
   });
 
+  test('source identity notices distinguish restarts from source changes', async ({ page }) => {
+    await page.addInitScript(() => {
+      let sampleClock = 0;
+      Object.defineProperty(window, '__setSampleClock', {
+        value: (value: number) => {
+          sampleClock = value;
+        },
+      });
+      Object.defineProperty(performance, 'now', {
+        configurable: true,
+        value: () => sampleClock,
+      });
+    });
+    await page.route('**/admin/events', (route) => route.abort());
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    const notices = await page.evaluate(() => {
+      const clock = window.__setSampleClock;
+      const stream = document.getElementById('metrics-stream');
+      const sseRoot = document.getElementById('sse-root');
+      const dataEvent = sseRoot?.getAttribute('data-sse-event');
+      if (!clock || !stream || !dataEvent) {
+        throw new Error('dashboard freshness test hooks are missing');
+      }
+
+      const emit = (type: string) => {
+        document.dispatchEvent(new CustomEvent('datastar-sse', {
+          detail: { type, elId: 'sse-root' },
+        }));
+      };
+      const sample = (
+        clockValue: number,
+        timestamp: string,
+        age: string,
+        generation: string,
+        replica: string,
+      ) => {
+        clock(clockValue);
+        stream.setAttribute('data-sample-timestamp', timestamp);
+        stream.setAttribute('data-sample-age-seconds', age);
+        stream.setAttribute('data-sample-state', 'available');
+        stream.setAttribute('data-process-generation', generation);
+        stream.setAttribute('data-replica-id', replica);
+        emit(dataEvent);
+        return document.getElementById('chip-text')?.textContent ?? '';
+      };
+
+      emit('started');
+      sample(0, '2099-09-14T12:00:00Z', '10', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'edge-a');
+      const restart = sample(
+        1000,
+        '2099-09-14T12:00:01Z',
+        '11',
+        'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        'edge-a',
+      );
+      const swappedReplica = sample(
+        2000,
+        '2099-09-14T12:00:02Z',
+        '12',
+        'cccccccccccccccccccccccccccccccc',
+        'edge-b',
+      );
+      const nullReplica = sample(
+        3000,
+        '2099-09-14T12:00:03Z',
+        '13',
+        'dddddddddddddddddddddddddddddddd',
+        '',
+      );
+
+      return { restart, swappedReplica, nullReplica };
+    });
+
+    expect(notices).toEqual({
+      restart: '● Live · updated 11s ago · Restart detected',
+      swappedReplica: '● Live · updated 12s ago · Metrics source changed',
+      nullReplica: '● Live · updated 13s ago · Metrics source changed',
+    });
+  });
+
   // Criterion: the chip flips to its critical state when the stream ends and
   // recovers when it comes back. The server only closes on the 25-minute cap
   // or shutdown, so the transition is driven through the lifecycle events the

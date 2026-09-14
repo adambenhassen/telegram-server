@@ -244,9 +244,10 @@ func (b *Broadcaster) Clients() int {
 	return len(b.subs)
 }
 
-// tick collects one snapshot and pushes it. A sampling or rendering failure
-// leaves the last good payload in place: clients keep their current values and
-// the dashboard's freshness threshold is what surfaces the staleness.
+// tick collects one snapshot and pushes it. Snapshot retains and returns the
+// last complete sample as stale after a required collection failure, so tick
+// renders and emits that stale fragment. Only a failure before any complete
+// sample leaves the stream unavailable.
 func (b *Broadcaster) tick(ctx context.Context) {
 	if b.Clients() == 0 {
 		return
