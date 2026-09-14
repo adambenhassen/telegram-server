@@ -191,11 +191,10 @@ func TestAuthenticatedJSONAndSSEShareDeliveryLag(t *testing.T) {
 	sampledAt := time.Unix(1_700_000_000, 0).UTC()
 	sampler := admin.NewDeliveryLagSamplerWithClock(func() time.Time { return sampledAt })
 	b := sseTestBroadcaster(t, admin.BroadcasterConfig{
-		Sample:            admin.NewMetricsSamplerWithDeliveryLag(registry, st, sampler),
-		Render:            admin.DefaultFragmentRenderer,
-		Interval:          time.Hour,
-		Heartbeat:         time.Hour,
-		MaxStreamDuration: 100 * time.Millisecond,
+		Sample:    admin.NewMetricsSamplerWithDeliveryLag(registry, st, sampler),
+		Render:    admin.DefaultFragmentRenderer,
+		Interval:  time.Hour,
+		Heartbeat: time.Hour,
 	})
 	rawToken := "delivery-lag-cross-surface-token" //nolint:gosec // G101: test credential
 	h := admin.AdminRouter(admin.LoginHandlerConfig{

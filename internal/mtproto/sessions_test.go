@@ -384,6 +384,67 @@ func TestSessionRegistryDeliveryLagSnapshotCountUnderChurn(t *testing.T) {
 	}
 }
 
+func TestSessionRegistrySamplingDoesNotBlockPush(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	transport := &fakeConn{}
+	conn := mtproto.NewTestConn(transport, testKey(t))
+	conn.SetOwner(7)
+	r := mtproto.NewSessionRegistry()
+	if !r.Add(7, conn) {
+		t.Fatal("register connection")
+	}
+
+	headStarted := make(chan struct{})
+	releaseHead := make(chan struct{})
+	sampleDone := make(chan mtproto.DeliveryLagSample, 1)
+	go func() {
+		sampleDone <- r.SampleDeliveryLag(ctx, func(context.Context, int64) (int64, error) {
+			close(headStarted)
+			<-releaseHead
+			return 11, nil
+		})
+	}()
+	<-headStarted
+
+	released := false
+	release := func() {
+		if !released {
+			close(releaseHead)
+			released = true
+		}
+	}
+	defer release()
+
+	pushDone := make(chan struct{})
+	var pushed bool
+	var pushErr error
+	go func() {
+		pushed, pushErr = conn.PushTo(ctx, 7, &mt.Pong{PingID: 1}, 5)
+		close(pushDone)
+	}()
+	select {
+	case <-pushDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("PushTo blocked while the sampler waited on account head")
+	}
+	if pushErr != nil {
+		t.Fatalf("PushTo: %v", pushErr)
+	}
+	if !pushed {
+		t.Fatal("PushTo refused a push for the current owner")
+	}
+	if got := conn.LastPushedPts(); got != 5 {
+		t.Fatalf("watermark = %d, want 5 before releasing the sampler", got)
+	}
+
+	release()
+	if sample := <-sampleDone; sample.SampledConnections != 1 || sample.WorstPts != 6 {
+		t.Fatalf("sample after independent push = %+v, want one sample with lag 6", sample)
+	}
+}
+
 func TestSessionRegistryConcurrentDeliveryLagSampling(t *testing.T) {
 	t.Parallel()
 
