@@ -39,6 +39,28 @@ const (
 	ChannelPinned = "tg_pinned"
 )
 
+type notificationAcceptedAtKey struct{}
+
+// WithNotificationAcceptedAt carries a valid tg_updates acceptance timestamp
+// to the in-process delivery callback. It never leaves the process or enters a
+// database, update payload, log, or protocol response.
+func WithNotificationAcceptedAt(ctx context.Context, acceptedAt time.Time) context.Context {
+	return context.WithValue(ctx, notificationAcceptedAtKey{}, acceptedAt)
+}
+
+// NotificationAcceptedAt returns the acceptance timestamp carried by a valid
+// tg_updates callback context.
+func NotificationAcceptedAt(ctx context.Context) (time.Time, bool) {
+	if ctx == nil {
+		return time.Time{}, false
+	}
+	acceptedAt, ok := ctx.Value(notificationAcceptedAtKey{}).(time.Time)
+	if !ok || acceptedAt.IsZero() {
+		return time.Time{}, false
+	}
+	return acceptedAt, true
+}
+
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
 // nudge that wakes each process's Listener after an event transaction commits.
 func (s *Store) Notify(ctx context.Context, channel, payload string) error {
@@ -250,8 +272,9 @@ func (l *Listener) dispatch(
 				l.log.Warn("bad tg_updates payload", "payload", n.Payload)
 				continue
 			}
+			acceptedAt := time.Now()
 			l.recordValidNotification(ChannelUpdates)
-			deliver(ctx, userID)
+			deliver(WithNotificationAcceptedAt(ctx, acceptedAt), userID)
 		case ChannelTyping:
 			peerID, fromID, perr := parsePairPayload(n.Payload)
 			if perr != nil {

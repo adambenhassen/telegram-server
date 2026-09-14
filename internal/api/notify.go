@@ -18,20 +18,26 @@ import (
 // pending updates once (shared with getDifference) and writes them to each of
 // the user's live connections in this process.
 type Updater struct {
-	h        *handlers
-	registry *mtproto.SessionRegistry
-	log      *slog.Logger
+	h           *handlers
+	registry    *mtproto.SessionRegistry
+	log         *slog.Logger
+	pushMetrics *store.NotificationMetrics
 }
 
 // NewUpdater builds an Updater over the store and the server's session registry.
-func NewUpdater(s *store.Store, registry *mtproto.SessionRegistry, log *slog.Logger, peers *peerhash.Deriver) *Updater {
+func NewUpdater(s *store.Store, registry *mtproto.SessionRegistry, log *slog.Logger, peers *peerhash.Deriver, pushMetrics ...*store.NotificationMetrics) *Updater {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	var metrics *store.NotificationMetrics
+	if len(pushMetrics) > 0 {
+		metrics = pushMetrics[0]
+	}
 	return &Updater{
-		h:        &handlers{store: s, log: log, peers: peers},
-		registry: registry,
-		log:      log,
+		h:           &handlers{store: s, log: log, peers: peers},
+		registry:    registry,
+		log:         log,
+		pushMetrics: metrics,
 	}
 }
 
@@ -54,9 +60,10 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	for i, c := range conns {
 		targets[i] = c
 	}
-	u.deliver(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
+	acceptedAt, _ := store.NotificationAcceptedAt(ctx)
+	u.deliverAt(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
 		return u.h.buildUpdates(ctx, userID, fromPts)
-	})
+	}, acceptedAt)
 }
 
 // maxDeliveryRounds caps the store round trips one notification may cost. Two
@@ -88,6 +95,10 @@ const maxDeliveryRounds = 2
 // by a later notification, whose window has advanced, or by its own
 // getDifference — push is the optimisation, not the guarantee.
 func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error)) {
+	u.deliverAt(ctx, userID, conns, build, time.Time{})
+}
+
+func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error), acceptedAt time.Time) {
 	var head int
 	for round := 0; round < maxDeliveryRounds && len(conns) > 0; round++ {
 		lo, hi := conns[0].LastPushedPts(), conns[0].LastPushedPts()
@@ -145,12 +156,39 @@ func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, b
 			//
 			// users covers the whole batch, so a conn taking a suffix gets a
 			// superset of the users it needs, which a client ignores.
-			if _, err := c.PushTo(ctx, userID, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts); err != nil {
+			pushed, err := c.PushTo(ctx, userID, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts)
+			u.recordPushOutcome(acceptedAt, pushed, err)
+			if err != nil {
 				u.log.Info("deliver push", "user_id", userID, "err", err)
 			}
 		}
 		conns = ahead
 	}
+}
+
+func (u *Updater) recordPushOutcome(acceptedAt time.Time, pushed bool, err error) {
+	if u.pushMetrics == nil || acceptedAt.IsZero() {
+		return
+	}
+	var outcome store.PushOutcome
+	switch {
+	case err != nil && mtproto.IsPushEncodeError(err):
+		outcome = store.PushOutcomeEncodeFailure
+	case err != nil:
+		outcome = store.PushOutcomeWriteFailure
+	case !pushed:
+		outcome = store.PushOutcomeOwnerMismatch
+	default:
+		outcome = store.PushOutcomeSuccess
+	}
+	defer func() {
+		// Telemetry must never change delivery behavior, including if a future
+		// recorder implementation panics while recording.
+		if recovered := recover(); recovered != nil {
+			return
+		}
+	}()
+	u.pushMetrics.RecordPushOutcome(outcome, acceptedAt)
 }
 
 // DeliverTyping pushes a transient updateUserTyping to the peer's live conns. It

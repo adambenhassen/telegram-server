@@ -3,6 +3,7 @@ package admin_test
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -633,6 +634,83 @@ func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 	if !strings.Contains(wire, "data: selector #metrics-stream\n") {
 		t.Errorf("unnamed fragment did not pin the dashboard selector:\n%s", wire)
 	}
+}
+
+func TestSSE_pushTelemetryMatchesJSONSnapshot(t *testing.T) {
+	t.Parallel()
+
+	m := admin.MetricsResponse{
+		PushLatencyP50:         50,
+		PushLatencyP50Overflow: false,
+		PushLatencyP95:         60000,
+		PushLatencyP95Overflow: true,
+		PushLatencySampleCount: 2,
+		PushWindowSeconds:      42,
+		PushOutcomes: admin.PushOutcomes{
+			Success:       2,
+			OwnerMismatch: 1,
+		},
+		PushLatencyBucketUpperBoundsMS: [15]float64{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000, 60000},
+		PushLatencyBucketCounts:        [16]int64{0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+	}
+	type expectedPayload struct {
+		PushLatencyP50                 float64            `json:"push_latency_p50_ms"`
+		PushLatencyP50Overflow         bool               `json:"push_latency_p50_overflow"`
+		PushLatencyP95                 float64            `json:"push_latency_p95_ms"`
+		PushLatencyP95Overflow         bool               `json:"push_latency_p95_overflow"`
+		PushLatencySampleCount         int64              `json:"push_latency_sample_count"`
+		PushWindowSeconds              float64            `json:"push_window_seconds"`
+		PushOutcomes                   admin.PushOutcomes `json:"push_outcomes"`
+		PushLatencyBucketUpperBoundsMS [15]float64        `json:"push_latency_bucket_upper_bounds_ms"`
+		PushLatencyBucketCounts        [16]int64          `json:"push_latency_bucket_counts"`
+	}
+	want, err := json.Marshal(expectedPayload{
+		PushLatencyP50:                 m.PushLatencyP50,
+		PushLatencyP50Overflow:         m.PushLatencyP50Overflow,
+		PushLatencyP95:                 m.PushLatencyP95,
+		PushLatencyP95Overflow:         m.PushLatencyP95Overflow,
+		PushLatencySampleCount:         m.PushLatencySampleCount,
+		PushWindowSeconds:              m.PushWindowSeconds,
+		PushOutcomes:                   m.PushOutcomes,
+		PushLatencyBucketUpperBoundsMS: m.PushLatencyBucketUpperBoundsMS,
+		PushLatencyBucketCounts:        m.PushLatencyBucketCounts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	renderers := []func(admin.MetricsResponse) ([]admin.Fragment, error){
+		admin.DefaultFragmentRenderer,
+		admin.DashboardFragmentRenderer,
+	}
+	for _, render := range renderers {
+		fragments, err := render(m)
+		if err != nil {
+			t.Fatalf("render push telemetry: %v", err)
+		}
+		if len(fragments) != 1 {
+			t.Fatalf("render returned %d fragments, want 1", len(fragments))
+		}
+		got := extractPushTelemetryJSON(t, fragments[0].HTML)
+		if string(got) != string(want) {
+			t.Errorf("push telemetry JSON = %s, want %s", got, want)
+		}
+	}
+}
+
+func extractPushTelemetryJSON(t *testing.T, html string) []byte {
+	t.Helper()
+	const open = `<script id="push-telemetry" type="application/json">`
+	start := strings.Index(html, open)
+	if start < 0 {
+		t.Fatalf("push telemetry script missing from fragment")
+	}
+	start += len(open)
+	end := strings.Index(html[start:], `</script>`)
+	if end < 0 {
+		t.Fatalf("push telemetry script is not closed")
+	}
+	return []byte(html[start : start+end])
 }
 
 // assertSingleRootWithTargetID fails unless html is exactly one element and

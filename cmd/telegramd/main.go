@@ -401,8 +401,8 @@ func run(log *slog.Logger) error {
 	// Cross-replica real-time delivery: the listener wakes on NOTIFY and pushes
 	// each user's pending updates to their live conns in this process. Drained
 	// before the store pool closes (defer registered after st.Close, runs first).
-	updater := api.NewUpdater(st, server.Registry(), log, peers)
 	notifyMetrics := store.NewNotificationMetrics()
+	updater := api.NewUpdater(st, server.Registry(), log, peers, notifyMetrics)
 	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, log, notifyMetrics)
 	if err != nil {
 		return err
