@@ -61,11 +61,12 @@ const (
 // Server is an MTProto server: it accepts transport connections, performs key
 // exchange for new clients, and dispatches decrypted RPC requests to a Handler.
 type Server struct {
-	dcID     int
-	key      exchange.PrivateKey
-	keys     AuthKeyStore
-	handler  Handler
-	registry *SessionRegistry
+	dcID      int
+	key       exchange.PrivateKey
+	keys      AuthKeyStore
+	handler   Handler
+	rpcTracer *RPCTracer
+	registry  *SessionRegistry
 
 	cipher crypto.Cipher
 	clock  clock.Clock
@@ -141,6 +142,17 @@ type Server struct {
 // transitions between zero and non-zero.
 func (s *Server) OnStatusChange(fn func(ctx context.Context, userID int64, online bool)) {
 	s.onStatusChange = fn
+}
+
+// SetRPCTracer installs the optional bounded RPC tracing boundary. Call it
+// before Serve or ServeConn; a nil or disabled tracer leaves the request path
+// unchanged and starts no tracing worker. The boundary includes fallback error
+// replies written by Server.handle.
+func (s *Server) SetRPCTracer(tracer *RPCTracer) {
+	if existing, ok := s.handler.(*rpcTraceHandler); ok {
+		s.handler = existing.next
+	}
+	s.rpcTracer = tracer
 }
 
 // TrustProxyV2Headers makes the server take each client address from a PROXY
