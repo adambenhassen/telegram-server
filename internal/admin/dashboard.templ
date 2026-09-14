@@ -90,13 +90,66 @@ templ dashboardPage(d DashboardData) {
 						 opens the SSE stream on load; openWhenHidden keeps it open
 						 for operators who park the tab in the background. -->
 					<div id="sse-root" data-sse-event={ sseDefaultEvent } data-on-load="@get('/admin/events', {openWhenHidden: true})">
-						<div id="metrics-stream">
+						<div
+							id="metrics-stream"
+							data-sample-timestamp={ d.SampleTimestamp }
+							data-sample-age-seconds={ d.SampleAgeSeconds }
+							data-sample-state={ d.SampleState }
+							data-process-started-at={ d.ProcessStartedAt }
+							data-process-generation={ d.ProcessGeneration }
+							data-replica-id={ d.ReplicaID }
+						>
 							@metricsFragment(d)
 						</div>
 					</div>
 				</main>
 			</div>
 			@chipScript()
+		</body>
+	</html>
+}
+
+// dashboardUnavailablePage is deliberately independent of metric data. It
+// gives an authenticated operator a safe recovery path without exposing a
+// database error or filling the dashboard with fabricated values.
+templ dashboardUnavailablePage(d DashboardData) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>Operations — telegram-server</title>
+			<link rel="stylesheet" href="/admin/assets/dashboard.css"/>
+		</head>
+		<body class="style-nova min-h-screen bg-background text-foreground">
+			<div class="mx-auto max-w-[1440px] px-6 py-8 sm:px-4">
+				<header class="mb-6 flex flex-wrap items-start justify-between gap-4">
+					<div class="flex flex-col">
+						<h1 class="text-xl font-semibold leading-tight">Operations</h1>
+						<span class="text-xs text-muted-foreground">telegram-server</span>
+					</div>
+					<div class="flex flex-wrap items-center gap-3">
+						@button.Button(button.Props{ID: "refresh-btn", Variant: button.VariantGhost, Type: button.TypeButton, Attributes: templ.Attributes{"aria-label": "Reload page"}}) {
+							&#8635; Reload
+						}
+						<form method="post" action="/admin/logout" class="logout-form inline">
+							<input type="hidden" name="csrf_token" value={ d.CSRFToken }/>
+							@button.Button(button.Props{Variant: button.VariantGhost, Type: button.TypeSubmit}) {
+								Log out
+							}
+						</form>
+					</div>
+				</header>
+				<main id="main">
+					@alert.Alert(alert.Props{Variant: alert.VariantDestructive}) {
+						@alert.Title() { Metrics unavailable }
+						@alert.Description() { No complete metrics sample is available right now. Reload to try again. }
+					}
+				</main>
+			</div>
+			<script>
+				document.getElementById('refresh-btn').addEventListener('click', function() { location.reload(); });
+			</script>
 		</body>
 	</html>
 }
@@ -381,17 +434,66 @@ templ chipScript() {
 			var bannerDc = document.getElementById('banner-disconnected');
 			var refreshBtn = document.getElementById('refresh-btn');
 
-			var lastOk    = Date.now();
 			var connected = false;
+			var metricsStream = document.getElementById('metrics-stream');
+			var sampleTimestamp = metricsStream ? metricsStream.getAttribute('data-sample-timestamp') || '' : '';
+			var sampleAgeSeconds = metricsStream ? parseAge(metricsStream.getAttribute('data-sample-age-seconds')) : 0;
+			var sampleState = metricsStream ? metricsStream.getAttribute('data-sample-state') || '' : '';
+			var sampleObservedAt = performance.now();
+			var sourceGeneration = metricsStream ? metricsStream.getAttribute('data-process-generation') || '' : '';
+			var sourceReplica = metricsStream ? metricsStream.getAttribute('data-replica-id') || '' : '';
+			var sourceNotice = '';
 
 			var baseChipClass = 'chip inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium';
 
-			function ago(ms) {
-				var s = Math.round(ms / 1000);
+			function parseAge(value) {
+				var age = Number(value);
+				return isFinite(age) && age >= 0 ? age : 0;
+			}
+
+			function ago(seconds) {
+				var s = Math.round(seconds);
 				if (s < 60) return s + 's ago';
 				var m = Math.round(s / 60);
 				if (m < 60) return m + 'm ago';
 				return Math.round(m / 60) + 'h ago';
+			}
+
+			function currentSampleAge() {
+				return Math.max(0, sampleAgeSeconds + (performance.now() - sampleObservedAt) / 1000);
+			}
+
+			function updateSampleMetadata() {
+				var stream = document.getElementById('metrics-stream');
+				if (!stream) return;
+
+				var nextTimestamp = stream.getAttribute('data-sample-timestamp') || '';
+				var nextAge = parseAge(stream.getAttribute('data-sample-age-seconds'));
+				if (nextTimestamp && nextTimestamp !== sampleTimestamp) {
+					sampleTimestamp = nextTimestamp;
+					sampleAgeSeconds = nextAge;
+					sampleObservedAt = performance.now();
+				} else if (nextTimestamp === sampleTimestamp) {
+					// A cached replay or stale fragment is not a new sample. Keep
+					// monotonic elapsed time and only accept a server age that is
+					// further ahead than the local clock.
+					sampleAgeSeconds = Math.max(sampleAgeSeconds, nextAge);
+				}
+				sampleState = stream.getAttribute('data-sample-state') || sampleState;
+
+				var nextGeneration = stream.getAttribute('data-process-generation') || '';
+				var nextReplica = stream.getAttribute('data-replica-id') || '';
+				var generationChanged = nextGeneration !== sourceGeneration && (sourceGeneration !== '' || nextGeneration !== '');
+				var replicaChanged = sourceReplica !== nextReplica;
+				if (generationChanged || replicaChanged) {
+					if (generationChanged && sourceReplica !== '' && nextReplica !== '' && sourceReplica === nextReplica) {
+						sourceNotice = 'Restart detected';
+					} else {
+						sourceNotice = 'Metrics source changed';
+					}
+				}
+				sourceGeneration = nextGeneration;
+				sourceReplica = nextReplica;
 			}
 
 			function setChip(cls, text) {
@@ -400,15 +502,16 @@ templ chipScript() {
 			}
 
 			function updateChip() {
+				var age = currentSampleAge();
+				var notice = sourceNotice ? ' · ' + sourceNotice : '';
 				if (!connected) {
-					setChip('chip-critical', '● Disconnected · last updated ' + ago(Date.now() - lastOk));
+					setChip('chip-critical', '● Disconnected · last updated ' + ago(age) + notice);
 					return;
 				}
-				var age = Date.now() - lastOk;
-				if (age <= 40000) {
-					setChip('chip-good', '● Live · updated ' + ago(age));
+				if (sampleState === 'stale' || age > 40) {
+					setChip('chip-warning', '● Stale · updated ' + ago(age) + notice);
 				} else {
-					setChip('chip-warning', '● Stale · updated ' + ago(age));
+					setChip('chip-good', '● Live · updated ' + ago(age) + notice);
 				}
 			}
 
@@ -435,7 +538,7 @@ templ chipScript() {
 			document.addEventListener('datastar-sse', function(e) {
 				if (e.detail.elId !== 'sse-root') return;
 				if (e.detail.type === dataEvent) {
-					lastOk = Date.now();
+					updateSampleMetadata();
 					connected = true;
 					bannerDc.classList.add('hidden');
 					updateChip();

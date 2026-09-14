@@ -2,10 +2,14 @@ package admin
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 
@@ -13,13 +17,73 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
+// SampleState describes whether a response contains a current or retained
+// complete database sample.
+type SampleState string
+
+const (
+	SampleStateAvailable SampleState = "available"
+	SampleStateStale     SampleState = "stale"
+)
+
+// ProcessIdentity is fixed for one process lifetime. Generation is random
+// process identity, not an identifier derived from a request or resource.
+type ProcessIdentity struct {
+	StartedAt  time.Time
+	Generation string
+	ReplicaID  *string
+}
+
+var replicaIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// NewProcessIdentity creates the identity exposed on successful admin samples.
+// An empty replica id means that the deployment has not supplied one.
+func NewProcessIdentity(replicaID string) (ProcessIdentity, error) {
+	if replicaID != "" && !replicaIDPattern.MatchString(replicaID) {
+		return ProcessIdentity{}, errors.New("replica id must be 1-64 characters from [A-Za-z0-9._-]")
+	}
+
+	var generationBytes [16]byte
+	if _, err := rand.Read(generationBytes[:]); err != nil {
+		return ProcessIdentity{}, fmt.Errorf("generate process generation: %w", err)
+	}
+	identity := ProcessIdentity{
+		StartedAt:  time.Now().UTC(),
+		Generation: hex.EncodeToString(generationBytes[:]),
+	}
+	if replicaID != "" {
+		identity.ReplicaID = &replicaID
+	}
+	return identity, nil
+}
+
+var defaultProcessIdentity = func() ProcessIdentity {
+	identity, err := NewProcessIdentity("")
+	if err != nil {
+		panic(err)
+	}
+	return identity
+}()
+
 // MetricsResponse is the JSON payload returned by GET /admin/metrics.
 //
 // All values are point-in-time snapshots or rolling-window counters. No per-user
 // data, no PII, no message content.
 type MetricsResponse struct {
-	// Timestamp is the server time at which this snapshot was assembled.
+	// Timestamp is the server time at which this complete snapshot was sampled.
 	Timestamp time.Time `json:"timestamp"`
+	// SampleAgeSeconds is computed at response or fragment rendering time from
+	// Timestamp. It is never retained as part of the sampled values.
+	SampleAgeSeconds float64 `json:"sample_age_seconds"`
+	// SampleState is available for a successful sample and stale when the last
+	// complete sample is retained after a later collection failure.
+	SampleState SampleState `json:"sample_state"`
+	// ProcessStartedAt and ProcessGeneration identify the process that sampled
+	// the response. They are fixed for that process lifetime.
+	ProcessStartedAt  time.Time `json:"process_started_at"`
+	ProcessGeneration string    `json:"process_generation"`
+	// ReplicaID is the optional operator-supplied instance identity.
+	ReplicaID *string `json:"replica_id"`
 
 	// Connections is the number of currently open MTProto connections.
 	Connections int `json:"connections"`
@@ -187,65 +251,126 @@ type StorageRows struct {
 // N dashboard tabs from costing N full query sets against the DB.
 const cacheRefresh = 10 * time.Second
 
-// metricsCache holds a stale snapshot and its collection time.
-type metricsCache struct {
-	mu      sync.Mutex
-	last    time.Time
-	resp    MetricsResponse
-	lastErr bool // true if the most recent refresh attempt failed
+// MetricsSnapshotCache owns the shared ten-second sampler used by JSON, HTML,
+// and SSE. It retains only complete samples, so all process-local values in a
+// response belong to the same sample as the database values.
+type MetricsSnapshotCache struct {
+	mu sync.Mutex
+
+	registry    *mtproto.SessionRegistry
+	store       *store.Store
+	deliveryLag *DeliveryLagSampler
+	notify      *store.NotificationMetrics
+	identity    ProcessIdentity
+
+	lastAttempt time.Time
+	resp        MetricsResponse
+	hasSample   bool
 }
 
-// refresh re-reads metrics from the store and registry if enough time has
-// elapsed since the last refresh.
-func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) {
+// NewMetricsSnapshotCache creates a shared admin metrics sampler.
+func NewMetricsSnapshotCache(
+	registry *mtproto.SessionRegistry,
+	st *store.Store,
+	identity ProcessIdentity,
+	deliveryLag *DeliveryLagSampler,
+	notifyMetrics ...*store.NotificationMetrics,
+) *MetricsSnapshotCache {
+	if identity.StartedAt.IsZero() || identity.Generation == "" {
+		identity = defaultProcessIdentity
+	}
+	if deliveryLag == nil {
+		deliveryLag = NewDeliveryLagSampler()
+	}
+	var notify *store.NotificationMetrics
+	if len(notifyMetrics) > 0 {
+		notify = notifyMetrics[0]
+	}
+	return &MetricsSnapshotCache{
+		registry:    registry,
+		store:       st,
+		deliveryLag: deliveryLag,
+		notify:      notify,
+		identity:    identity,
+	}
+}
+
+// Snapshot returns a complete sample, refreshing it no more than once per
+// cacheRefresh. A failed refresh retains the prior complete sample as stale.
+// Before the first complete sample it returns the collection error.
+func (c *MetricsSnapshotCache) Snapshot(ctx context.Context) (MetricsResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if time.Since(c.last) < cacheRefresh {
-		return
+	now := time.Now().UTC()
+	if !c.lastAttempt.IsZero() && now.Before(c.lastAttempt.Add(cacheRefresh)) {
+		if !c.hasSample {
+			return MetricsResponse{}, errMetricsUnavailable
+		}
+		return c.responseAt(now), nil
 	}
+	c.lastAttempt = now
 
-	resp, err := collectMetricsWithDeliveryLag(ctx, reg, st, tolerateGapFailure, deliveryLag, notifyMetrics...)
+	resp, err := collectMetricsWithDeliveryLag(ctx, c.registry, c.store, requireAllMetrics, c.deliveryLag, c.notify)
 	if err != nil {
 		slog.Error("admin metrics refresh", "err", err)
-		c.lastErr = true
-		return
+		if !c.hasSample {
+			return MetricsResponse{}, err
+		}
+		c.resp.SampleState = SampleStateStale
+		return c.responseAt(time.Now().UTC()), nil
 	}
 
+	resp.ProcessStartedAt = c.identity.StartedAt.UTC()
+	resp.ProcessGeneration = c.identity.Generation
+	resp.ReplicaID = c.identity.ReplicaID
+	resp.SampleState = SampleStateAvailable
 	c.resp = resp
-	c.last = time.Now()
-	c.lastErr = false
+	c.hasSample = true
+	return c.responseAt(time.Now().UTC()), nil
+}
+
+var errMetricsUnavailable = errors.New("metrics unavailable")
+
+func (c *MetricsSnapshotCache) responseAt(now time.Time) MetricsResponse {
+	resp := c.resp
+	resp.Timestamp = resp.Timestamp.UTC()
+	resp.ProcessStartedAt = resp.ProcessStartedAt.UTC()
+	age := now.UTC().Sub(resp.Timestamp).Seconds()
+	if age < 0 {
+		age = 0
+	}
+	resp.SampleAgeSeconds = age
+	return resp
 }
 
 // Gap-failure tolerance for collectMetrics, named at the call sites because a
 // bare boolean there says nothing.
 const (
-	// tolerateGapFailure degrades a failed pts-gap query to zero and serves the
-	// rest of the snapshot. It is the JSON endpoint's long-standing behaviour:
-	// a polling client sees the same field every 10 s and a transient zero
-	// corrects itself on the next poll.
-	tolerateGapFailure = true
+	// tolerateGapFailure keeps the legacy test seam's partial-snapshot behavior.
+	// Production surfaces use requireAllMetrics so a failed required query
+	// retains the previous complete sample instead of serving a fabricated zero.
+	tolerateGapFailure = false
 
-	// requireAllMetrics fails the whole snapshot instead. The SSE stream needs
-	// this: it only emits on a successful sample, and a zeroed MaxPtsGap
-	// carrying a fresh timestamp would push a false "all clients caught up"
-	// that nothing later contradicts.
-	requireAllMetrics = false
+	// requireAllMetrics fails the whole snapshot instead. A required query
+	// failure must retain the prior complete sample or leave the surface
+	// unavailable; it must never advance the timestamp with a fabricated zero.
+	requireAllMetrics = true
 )
 
 // collectMetrics assembles one metrics snapshot from the store and the session
 // registry for callers that do not need to share lag state. Production JSON,
 // dashboard, and SSE handlers use collectMetricsWithDeliveryLag with the one
 // process-local sampler instead.
-func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
-	return collectMetricsWithDeliveryLag(ctx, reg, st, tolerateGapErr, NewDeliveryLagSampler(), notifyMetrics...)
+func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, requireAll bool, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
+	return collectMetricsWithDeliveryLag(ctx, reg, st, requireAll, NewDeliveryLagSampler(), notifyMetrics...)
 }
 
 // collectMetricsWithDeliveryLag assembles one snapshot using the supplied
 // process-local lag sampler. A shared sampler lets JSON and SSE retain and
 // expose the same complete sample while their database snapshots remain
 // independently cached.
-func collectMetricsWithDeliveryLag(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
+func collectMetricsWithDeliveryLag(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, requireAll bool, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
 	snap, err := st.Metrics(ctx)
 	if err != nil {
 		return MetricsResponse{}, fmt.Errorf("collect metrics: %w", err)
@@ -253,7 +378,7 @@ func collectMetricsWithDeliveryLag(ctx context.Context, reg *mtproto.SessionRegi
 
 	maxGap, err := st.MaxPtsGap(ctx, reg.Users()...)
 	if err != nil {
-		if !tolerateGapErr {
+		if requireAll {
 			return MetricsResponse{}, fmt.Errorf("collect max pts gap: %w", err)
 		}
 		maxGap = 0
@@ -266,7 +391,8 @@ func collectMetricsWithDeliveryLag(ctx context.Context, reg *mtproto.SessionRegi
 	notify := notificationSnapshot(notifyMetrics...)
 	pushUninstrumented := pushMetricsUninstrumented(notifyMetrics...)
 	return MetricsResponse{
-		Timestamp:                      time.Now(),
+		Timestamp:                      time.Now().UTC(),
+		SampleState:                    SampleStateAvailable,
 		Connections:                    reg.TotalConns(),
 		Sessions:                       reg.TotalSessions(),
 		TotalUsers:                     snap.TotalUsers,
@@ -317,33 +443,6 @@ func notificationSnapshot(notifyMetrics ...*store.NotificationMetrics) store.Not
 		return store.NotificationMetricsSnapshot{}
 	}
 	return notifyMetrics[0].Snapshot()
-}
-
-func applyNotificationSnapshot(resp *MetricsResponse, notifyMetrics *store.NotificationMetrics) {
-	if notifyMetrics == nil {
-		return
-	}
-	notify := notifyMetrics.Snapshot()
-	resp.NotifyCount = notify.NotifyCount
-	resp.NotifyWindowSeconds = notify.WindowSeconds
-	resp.NotifyRatePerSecond = notify.RatePerSecond
-	resp.NotifyChannels = notificationChannels(notify.Channels)
-	resp.NotifyInvalid = notify.Invalid
-	resp.PushLatencyP50 = notify.Push.P50Milliseconds
-	resp.PushLatencyP50Overflow = notify.Push.P50Overflow
-	resp.PushLatencyP95 = notify.Push.P95Milliseconds
-	resp.PushLatencyP95Overflow = notify.Push.P95Overflow
-	resp.PushLatencySampleCount = notify.Push.SampleCount
-	resp.PushWindowSeconds = notify.Push.WindowSeconds
-	resp.PushOutcomes = pushOutcomes(notify.Push.Outcomes)
-	resp.PushLatencyBucketUpperBoundsMS = pushBucketUpperBounds(notify.Push)
-	resp.PushLatencyBucketCounts = notify.Push.LatencyBucketCounts
-	resp.Uninstrumented = removePushPercentileUninstrumented(resp.Uninstrumented)
-	resp.RateLimitDenialsCount = notify.RateLimitDenials.Count
-	resp.RateLimitDenialsWindowSeconds = notify.RateLimitDenials.WindowSeconds
-	resp.RateLimitDenialsRatePerSecond = notify.RateLimitDenials.RatePerSecond
-	resp.RateLimitDenialsBySurface = rateLimitDenialsBySurface(notify.RateLimitDenials.BySurface)
-	resp.RateLimitDenialsDropped = notify.RateLimitDenials.Dropped
 }
 
 func pushMetricsUninstrumented(notifyMetrics ...*store.NotificationMetrics) []string {
@@ -422,21 +521,6 @@ func pushBucketUpperBounds(push store.PushMetricsSnapshot) [15]float64 {
 	return push.LatencyBucketUpperBoundsMilliseconds
 }
 
-// get returns the cached metrics response.
-func (c *metricsCache) get() MetricsResponse {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.resp
-}
-
-// failed reports whether the most recent refresh attempt produced an error.
-// When true, the cached snapshot is stale due to a DB failure.
-func (c *metricsCache) failed() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastErr
-}
-
 // Handler returns an http.HandlerFunc that serves operational metrics as JSON.
 // The handler reads from the provided registry and store on each request, but
 // caches results for at least cacheRefresh (10 s) to prevent N dashboard tabs
@@ -449,10 +533,13 @@ func Handler(registry *mtproto.SessionRegistry, st *store.Store, notifyMetrics .
 // lag sampler. The sampler can be shared with the SSE broadcaster so both
 // authenticated surfaces expose the same retained complete sample.
 func HandlerWithDeliveryLag(registry *mtproto.SessionRegistry, st *store.Store, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
-	if deliveryLag == nil {
-		deliveryLag = NewDeliveryLagSampler()
-	}
-	var cache metricsCache
+	cache := NewMetricsSnapshotCache(registry, st, defaultProcessIdentity, deliveryLag, notifyMetrics...)
+	return HandlerWithSnapshotCache(cache)
+}
+
+// HandlerWithSnapshotCache returns an admin metrics handler backed by the
+// supplied shared sampler.
+func HandlerWithSnapshotCache(cache *MetricsSnapshotCache) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -460,20 +547,23 @@ func HandlerWithDeliveryLag(registry *mtproto.SessionRegistry, st *store.Store, 
 			return
 		}
 
-		cache.refresh(r.Context(), registry, st, deliveryLag, notifyMetrics...)
-		if cache.failed() {
-			http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
+		resp, err := cache.Snapshot(r.Context())
+		if err != nil {
+			writeMetricsUnavailable(w)
 			return
-		}
-		resp := cache.get()
-		resp.DeliveryLag = deliveryLag.Snapshot()
-		if len(notifyMetrics) > 0 {
-			applyNotificationSnapshot(&resp, notifyMetrics[0])
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
+	}
+}
+
+func writeMetricsUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	if _, err := w.Write([]byte(`{"error":"metrics_unavailable"}`)); err != nil {
+		slog.Error("write metrics unavailable response", "err", err)
 	}
 }

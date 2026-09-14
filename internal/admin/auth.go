@@ -206,6 +206,9 @@ type LoginHandlerConfig struct {
 	// DeliveryLag is the process-local live-connection lag sampler shared by
 	// JSON, dashboard, and SSE metrics surfaces.
 	DeliveryLag *DeliveryLagSampler
+	// Metrics is the shared complete-snapshot cache used by JSON and dashboard
+	// handlers and, in production, by the SSE sampler as well.
+	Metrics *MetricsSnapshotCache
 }
 
 // handleLoginGET serves the login form with a CSRF token.
@@ -446,9 +449,13 @@ func SecurityHeaders(next http.Handler) http.Handler {
 // hard-coding them.
 func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http.Handler {
 	rl := newRateLimiter()
-	deliveryLag := cfg.DeliveryLag
-	if deliveryLag == nil {
-		deliveryLag = NewDeliveryLagSampler()
+	metricsCache := cfg.Metrics
+	if metricsCache == nil {
+		deliveryLag := cfg.DeliveryLag
+		if deliveryLag == nil {
+			deliveryLag = NewDeliveryLagSampler()
+		}
+		metricsCache = NewMetricsSnapshotCache(registry, cfg.Store, defaultProcessIdentity, deliveryLag, cfg.NotifyMetrics)
 	}
 
 	// Protected routes (behind RequireAdmin). Track registered patterns so
@@ -459,8 +466,8 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 		protectedPatterns = append(protectedPatterns, pattern)
 		protectedMux.HandleFunc(pattern, handler)
 	}
-	registerProtected("GET /admin/metrics", HandlerWithDeliveryLag(registry, cfg.Store, deliveryLag, cfg.NotifyMetrics))
-	registerProtected("GET /admin/dashboard", DashboardHandlerWithDeliveryLag(registry, cfg.Store, cfg.TokenHash, deliveryLag, cfg.NotifyMetrics))
+	registerProtected("GET /admin/metrics", HandlerWithSnapshotCache(metricsCache))
+	registerProtected("GET /admin/dashboard", DashboardHandlerWithSnapshotCache(metricsCache, cfg.TokenHash))
 	registerProtected("GET /admin/events", EventsHandler(cfg.Events))
 
 	// Top-level mux: specific public routes registered first (they take priority
