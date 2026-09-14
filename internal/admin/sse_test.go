@@ -3,11 +3,13 @@ package admin_test
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -633,6 +635,184 @@ func TestSSE_default_contract_is_the_dashboard_contract(t *testing.T) {
 	if !strings.Contains(wire, "data: selector #metrics-stream\n") {
 		t.Errorf("unnamed fragment did not pin the dashboard selector:\n%s", wire)
 	}
+}
+
+func TestSSE_pushTelemetryMatchesJSONSnapshot(t *testing.T) {
+	t.Parallel()
+
+	m := admin.MetricsResponse{
+		PushLatencyP50:         50,
+		PushLatencyP50Overflow: false,
+		PushLatencyP95:         60000,
+		PushLatencyP95Overflow: true,
+		PushLatencySampleCount: 2,
+		PushWindowSeconds:      42,
+		PushOutcomes: admin.PushOutcomes{
+			Success:       2,
+			OwnerMismatch: 1,
+		},
+		PushLatencyBucketUpperBoundsMS: [15]float64{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000, 60000},
+		PushLatencyBucketCounts:        [16]int64{0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+	}
+	type expectedPayload struct {
+		PushLatencyP50                 float64            `json:"push_latency_p50_ms"`
+		PushLatencyP50Overflow         bool               `json:"push_latency_p50_overflow"`
+		PushLatencyP95                 float64            `json:"push_latency_p95_ms"`
+		PushLatencyP95Overflow         bool               `json:"push_latency_p95_overflow"`
+		PushLatencySampleCount         int64              `json:"push_latency_sample_count"`
+		PushWindowSeconds              float64            `json:"push_window_seconds"`
+		PushOutcomes                   admin.PushOutcomes `json:"push_outcomes"`
+		PushLatencyBucketUpperBoundsMS [15]float64        `json:"push_latency_bucket_upper_bounds_ms"`
+		PushLatencyBucketCounts        [16]int64          `json:"push_latency_bucket_counts"`
+	}
+	want, err := json.Marshal(expectedPayload{
+		PushLatencyP50:                 m.PushLatencyP50,
+		PushLatencyP50Overflow:         m.PushLatencyP50Overflow,
+		PushLatencyP95:                 m.PushLatencyP95,
+		PushLatencyP95Overflow:         m.PushLatencyP95Overflow,
+		PushLatencySampleCount:         m.PushLatencySampleCount,
+		PushWindowSeconds:              m.PushWindowSeconds,
+		PushOutcomes:                   m.PushOutcomes,
+		PushLatencyBucketUpperBoundsMS: m.PushLatencyBucketUpperBoundsMS,
+		PushLatencyBucketCounts:        m.PushLatencyBucketCounts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	renderers := []func(admin.MetricsResponse) ([]admin.Fragment, error){
+		admin.DefaultFragmentRenderer,
+		admin.DashboardFragmentRenderer,
+	}
+	for _, render := range renderers {
+		fragments, err := render(m)
+		if err != nil {
+			t.Fatalf("render push telemetry: %v", err)
+		}
+		if len(fragments) != 1 {
+			t.Fatalf("render returned %d fragments, want 1", len(fragments))
+		}
+		got := extractPushTelemetryJSON(t, fragments[0].HTML)
+		if string(got) != string(want) {
+			t.Errorf("push telemetry JSON = %s, want %s", got, want)
+		}
+	}
+}
+
+func TestSSE_rateLimitDenialTelemetryHasFixedJSONSchema(t *testing.T) {
+	t.Parallel()
+
+	m := admin.MetricsResponse{
+		RateLimitDenialsCount:         5,
+		RateLimitDenialsWindowSeconds: 10,
+		RateLimitDenialsRatePerSecond: 0.5,
+		RateLimitDenialsBySurface: admin.RateLimitDenialsBySurface{
+			MessageSend:   2,
+			UpdateProfile: 3,
+		},
+		RateLimitDenialsDropped: 4,
+	}
+	type expectedPayload struct {
+		Count         int64                           `json:"rate_limit_denials_count"`
+		WindowSeconds float64                         `json:"rate_limit_denials_window_seconds"`
+		RatePerSecond float64                         `json:"rate_limit_denials_rate_per_second"`
+		BySurface     admin.RateLimitDenialsBySurface `json:"rate_limit_denials_by_surface"`
+		Dropped       int64                           `json:"rate_limit_denials_dropped"`
+	}
+	want, err := json.Marshal(expectedPayload{
+		Count:         m.RateLimitDenialsCount,
+		WindowSeconds: m.RateLimitDenialsWindowSeconds,
+		RatePerSecond: m.RateLimitDenialsRatePerSecond,
+		BySurface:     m.RateLimitDenialsBySurface,
+		Dropped:       m.RateLimitDenialsDropped,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantTopLevel := []string{
+		"rate_limit_denials_by_surface",
+		"rate_limit_denials_count",
+		"rate_limit_denials_dropped",
+		"rate_limit_denials_rate_per_second",
+		"rate_limit_denials_window_seconds",
+	}
+	wantSurface := []string{
+		"add_chat_user", "check_password", "check_password_ip", "contacts_search",
+		"create_channel", "create_chat", "get_password", "get_password_ip",
+		"message_send", "messages_search", "messages_search_global", "password_proof",
+		"save_file_part", "send_code_ip_calls", "send_code_ip_distinct_numbers",
+		"sign_in_fail_ip", "sign_up_ip", "update_profile", "upload_get_file",
+	}
+	for _, render := range []func(admin.MetricsResponse) ([]admin.Fragment, error){
+		admin.DefaultFragmentRenderer,
+		admin.DashboardFragmentRenderer,
+	} {
+		fragments, err := render(m)
+		if err != nil {
+			t.Fatalf("render rate-limit denial telemetry: %v", err)
+		}
+		got := extractRateLimitDenialTelemetryJSON(t, fragments[0].HTML)
+		var topLevel map[string]json.RawMessage
+		if err := json.Unmarshal(got, &topLevel); err != nil {
+			t.Fatalf("decode rate-limit denial telemetry: %v", err)
+		}
+		if !slices.Equal(sortedKeys(topLevel), wantTopLevel) {
+			t.Fatalf("rate-limit denial top-level keys = %v, want %v", sortedKeys(topLevel), wantTopLevel)
+		}
+		var payload expectedPayload
+		decoder := json.NewDecoder(strings.NewReader(string(got)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil {
+			t.Fatalf("decode rate-limit denial telemetry with exact types: %v", err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("rate-limit denial telemetry = %s, want %s", got, want)
+		}
+		var surface map[string]json.RawMessage
+		if err := json.Unmarshal(topLevel["rate_limit_denials_by_surface"], &surface); err != nil {
+			t.Fatalf("decode rate-limit denial surfaces: %v", err)
+		}
+		if !slices.Equal(sortedKeys(surface), wantSurface) {
+			t.Errorf("rate-limit denial surface keys = %v, want %v", sortedKeys(surface), wantSurface)
+		}
+		for key, raw := range surface {
+			var count int64
+			if err := json.Unmarshal(raw, &count); err != nil {
+				t.Errorf("decode rate-limit denial surface %s as integer: %v", key, err)
+			}
+		}
+	}
+}
+
+func extractPushTelemetryJSON(t *testing.T, html string) []byte {
+	t.Helper()
+	const open = `<script id="push-telemetry" type="application/json">`
+	start := strings.Index(html, open)
+	if start < 0 {
+		t.Fatalf("push telemetry script missing from fragment")
+	}
+	start += len(open)
+	end := strings.Index(html[start:], `</script>`)
+	if end < 0 {
+		t.Fatalf("push telemetry script is not closed")
+	}
+	return []byte(html[start : start+end])
+}
+
+func extractRateLimitDenialTelemetryJSON(t *testing.T, html string) []byte {
+	t.Helper()
+	const open = `<script id="rate-limit-denials-telemetry" type="application/json">`
+	start := strings.Index(html, open)
+	if start < 0 {
+		t.Fatalf("rate-limit denial telemetry script missing from fragment")
+	}
+	start += len(open)
+	end := strings.Index(html[start:], `</script>`)
+	if end < 0 {
+		t.Fatalf("rate-limit denial telemetry script is not closed")
+	}
+	return []byte(html[start : start+end])
 }
 
 // assertSingleRootWithTargetID fails unless html is exactly one element and

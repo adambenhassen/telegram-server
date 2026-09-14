@@ -17,10 +17,6 @@ import (
 //
 // All values are point-in-time snapshots or rolling-window counters. No per-user
 // data, no PII, no message content.
-//
-// PushLatencyP50 and PushLatencyP95 are placeholder zeroes: push delivery
-// latency is not yet instrumented. They are included so the response schema is
-// stable when instrumentation lands.
 type MetricsResponse struct {
 	// Timestamp is the server time at which this snapshot was assembled.
 	Timestamp time.Time `json:"timestamp"`
@@ -53,6 +49,10 @@ type MetricsResponse struct {
 	// connections report a spread of 0.
 	MaxPtsGap int64 `json:"max_pts_gap"`
 
+	// DeliveryLag is the aggregate lag from each live connection's push
+	// watermark to its account's authoritative current head.
+	DeliveryLag DeliveryLag `json:"delivery_lag"`
+
 	// NotifyCount is the number of Postgres NOTIFY events dispatched in the
 	// rolling observation window on this replica. It is delivery work: summing
 	// this value across replicas does not count unique committed events.
@@ -68,16 +68,49 @@ type MetricsResponse struct {
 	// notifications. It has no channel label.
 	NotifyInvalid int64 `json:"notify_invalid"`
 
-	// PushLatencyP50 is the p50 push delivery latency in milliseconds.
-	// Placeholder zero — push delivery latency is not yet instrumented.
+	// PushLatencyP50 is the p50 persisted-update push latency in milliseconds.
 	PushLatencyP50 float64 `json:"push_latency_p50_ms"`
-	// PushLatencyP95 is the p95 push delivery latency in milliseconds.
-	// Placeholder zero — push delivery latency is not yet instrumented.
+	// PushLatencyP50Overflow reports whether the p50 rank landed in the final
+	// bucket above the 60,000 ms finite bound.
+	PushLatencyP50Overflow bool `json:"push_latency_p50_overflow"`
+	// PushLatencyP95 is the p95 persisted-update push latency in milliseconds.
 	PushLatencyP95 float64 `json:"push_latency_p95_ms"`
+	// PushLatencyP95Overflow reports whether the p95 rank landed in the final
+	// bucket above the 60,000 ms finite bound.
+	PushLatencyP95Overflow bool `json:"push_latency_p95_overflow"`
+	// PushLatencySampleCount is the number of successful latency samples in the
+	// rolling observation window.
+	PushLatencySampleCount int64 `json:"push_latency_sample_count"`
+	// PushWindowSeconds is the rolling observation window used by push telemetry,
+	// capped at one hour and reset at process start.
+	PushWindowSeconds float64 `json:"push_window_seconds"`
+	// PushOutcomes holds one fixed count for every attempted persisted-update
+	// push result.
+	PushOutcomes PushOutcomes `json:"push_outcomes"`
+	// PushLatencyBucketUpperBoundsMS contains the 15 finite histogram bounds.
+	// The matching counts array has one additional final overflow bucket.
+	PushLatencyBucketUpperBoundsMS [15]float64 `json:"push_latency_bucket_upper_bounds_ms"`
+	// PushLatencyBucketCounts contains one disjoint count per finite bound and a
+	// final count for observations above 60,000 ms.
+	PushLatencyBucketCounts [16]int64 `json:"push_latency_bucket_counts"`
 
 	// RateLimitActive is the number of currently active rate-limit rows
 	// (rows that have not yet expired), approximating recent throttling activity.
 	RateLimitActive int64 `json:"rate_limit_active"`
+	// RateLimitDenialsCount is the rolling count of requests that actually
+	// returned FLOOD_WAIT from one of the fixed rate-limit surfaces.
+	RateLimitDenialsCount int64 `json:"rate_limit_denials_count"`
+	// RateLimitDenialsWindowSeconds is the process-local rolling observation
+	// window, capped at one hour and reset when the process starts.
+	RateLimitDenialsWindowSeconds float64 `json:"rate_limit_denials_window_seconds"`
+	// RateLimitDenialsRatePerSecond is the fixed-surface denial count divided by
+	// RateLimitDenialsWindowSeconds.
+	RateLimitDenialsRatePerSecond float64 `json:"rate_limit_denials_rate_per_second"`
+	// RateLimitDenialsBySurface holds exactly the fixed client-visible surfaces.
+	RateLimitDenialsBySurface RateLimitDenialsBySurface `json:"rate_limit_denials_by_surface"`
+	// RateLimitDenialsDropped counts denials whose internal surface was not in
+	// the fixed contract. It is not included in the aggregate or breakdown.
+	RateLimitDenialsDropped int64 `json:"rate_limit_denials_dropped"`
 
 	// Uninstrumented lists the field names in this payload that are hardcoded
 	// zeroes because the underlying metric is not yet instrumented. A field is
@@ -102,6 +135,39 @@ type NotifyChannels struct {
 	EncryptedMsg int64 `json:"tg_encrypted_msg"`
 	Reactions    int64 `json:"tg_reactions"`
 	Pinned       int64 `json:"tg_pinned"`
+}
+
+// PushOutcomes holds one count for every fixed persisted-update push result.
+// No account, connection, peer, payload, or error label is retained.
+type PushOutcomes struct {
+	Success       int64 `json:"success"`
+	OwnerMismatch int64 `json:"owner_mismatch"`
+	EncodeFailure int64 `json:"encode_failure"`
+	WriteFailure  int64 `json:"write_failure"`
+}
+
+// RateLimitDenialsBySurface holds one count for every fixed rate-limit
+// surface. No caller-supplied label becomes a JSON key.
+type RateLimitDenialsBySurface struct {
+	MessageSend               int64 `json:"message_send"`
+	CreateChat                int64 `json:"create_chat"`
+	AddChatUser               int64 `json:"add_chat_user"`
+	CreateChannel             int64 `json:"create_channel"`
+	MessagesSearch            int64 `json:"messages_search"`
+	ContactsSearch            int64 `json:"contacts_search"`
+	MessagesSearchGlobal      int64 `json:"messages_search_global"`
+	SaveFilePart              int64 `json:"save_file_part"`
+	UploadGetFile             int64 `json:"upload_get_file"`
+	SendCodeIPCalls           int64 `json:"send_code_ip_calls"`
+	SendCodeIPDistinctNumbers int64 `json:"send_code_ip_distinct_numbers"`
+	SignInFailIP              int64 `json:"sign_in_fail_ip"`
+	CheckPassword             int64 `json:"check_password"`
+	CheckPasswordIP           int64 `json:"check_password_ip"`
+	GetPasswordIP             int64 `json:"get_password_ip"`
+	SignUpIP                  int64 `json:"sign_up_ip"`
+	PasswordProof             int64 `json:"password_proof"`
+	GetPassword               int64 `json:"get_password"`
+	UpdateProfile             int64 `json:"update_profile"`
 }
 
 // StorageRows is approximate row counts across key database tables,
@@ -131,7 +197,7 @@ type metricsCache struct {
 
 // refresh re-reads metrics from the store and registry if enough time has
 // elapsed since the last refresh.
-func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, notifyMetrics ...*store.NotificationMetrics) {
+func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -139,7 +205,7 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 		return
 	}
 
-	resp, err := collectMetrics(ctx, reg, st, tolerateGapFailure, notifyMetrics...)
+	resp, err := collectMetricsWithDeliveryLag(ctx, reg, st, tolerateGapFailure, deliveryLag, notifyMetrics...)
 	if err != nil {
 		slog.Error("admin metrics refresh", "err", err)
 		c.lastErr = true
@@ -168,9 +234,18 @@ const (
 )
 
 // collectMetrics assembles one metrics snapshot from the store and the session
-// registry. Both the cached JSON endpoint and the SSE broadcaster's shared
-// sampler read through it, so the two surfaces cannot drift apart.
+// registry for callers that do not need to share lag state. Production JSON,
+// dashboard, and SSE handlers use collectMetricsWithDeliveryLag with the one
+// process-local sampler instead.
 func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
+	return collectMetricsWithDeliveryLag(ctx, reg, st, tolerateGapErr, NewDeliveryLagSampler(), notifyMetrics...)
+}
+
+// collectMetricsWithDeliveryLag assembles one snapshot using the supplied
+// process-local lag sampler. A shared sampler lets JSON and SSE retain and
+// expose the same complete sample while their database snapshots remain
+// independently cached.
+func collectMetricsWithDeliveryLag(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
 	snap, err := st.Metrics(ctx)
 	if err != nil {
 		return MetricsResponse{}, fmt.Errorf("collect metrics: %w", err)
@@ -183,29 +258,47 @@ func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store
 		}
 		maxGap = 0
 	}
+	if deliveryLag == nil {
+		deliveryLag = NewDeliveryLagSampler()
+	}
+	lag := deliveryLag.sample(ctx, reg, st)
 
 	notify := notificationSnapshot(notifyMetrics...)
+	pushUninstrumented := pushMetricsUninstrumented(notifyMetrics...)
 	return MetricsResponse{
-		Timestamp:           time.Now(),
-		Connections:         reg.TotalConns(),
-		Sessions:            reg.TotalSessions(),
-		TotalUsers:          snap.TotalUsers,
-		ActiveUsers1H:       snap.ActiveUsers1H,
-		ActiveUsers24H:      snap.ActiveUsers24H,
-		Messages1H:          snap.Messages1H,
-		Messages24H:         snap.Messages24H,
-		TotalChannels:       snap.TotalChannels,
-		TotalChats:          snap.TotalChats,
-		MaxPtsGap:           maxGap,
-		NotifyCount:         notify.NotifyCount,
-		NotifyWindowSeconds: notify.WindowSeconds,
-		NotifyRatePerSecond: notify.RatePerSecond,
-		NotifyChannels:      notificationChannels(notify.Channels),
-		NotifyInvalid:       notify.Invalid,
-		PushLatencyP50:      0, // not yet instrumented
-		PushLatencyP95:      0, // not yet instrumented
-		Uninstrumented:      []string{"push_latency_p50_ms", "push_latency_p95_ms"},
-		RateLimitActive:     snap.RateLimitHits1H,
+		Timestamp:                      time.Now(),
+		Connections:                    reg.TotalConns(),
+		Sessions:                       reg.TotalSessions(),
+		TotalUsers:                     snap.TotalUsers,
+		ActiveUsers1H:                  snap.ActiveUsers1H,
+		ActiveUsers24H:                 snap.ActiveUsers24H,
+		Messages1H:                     snap.Messages1H,
+		Messages24H:                    snap.Messages24H,
+		TotalChannels:                  snap.TotalChannels,
+		TotalChats:                     snap.TotalChats,
+		MaxPtsGap:                      maxGap,
+		DeliveryLag:                    lag,
+		NotifyCount:                    notify.NotifyCount,
+		NotifyWindowSeconds:            notify.WindowSeconds,
+		NotifyRatePerSecond:            notify.RatePerSecond,
+		NotifyChannels:                 notificationChannels(notify.Channels),
+		NotifyInvalid:                  notify.Invalid,
+		PushLatencyP50:                 notify.Push.P50Milliseconds,
+		PushLatencyP50Overflow:         notify.Push.P50Overflow,
+		PushLatencyP95:                 notify.Push.P95Milliseconds,
+		PushLatencyP95Overflow:         notify.Push.P95Overflow,
+		PushLatencySampleCount:         notify.Push.SampleCount,
+		PushWindowSeconds:              notify.Push.WindowSeconds,
+		PushOutcomes:                   pushOutcomes(notify.Push.Outcomes),
+		PushLatencyBucketUpperBoundsMS: pushBucketUpperBounds(notify.Push),
+		PushLatencyBucketCounts:        notify.Push.LatencyBucketCounts,
+		Uninstrumented:                 pushUninstrumented,
+		RateLimitActive:                snap.RateLimitHits1H,
+		RateLimitDenialsCount:          notify.RateLimitDenials.Count,
+		RateLimitDenialsWindowSeconds:  notify.RateLimitDenials.WindowSeconds,
+		RateLimitDenialsRatePerSecond:  notify.RateLimitDenials.RatePerSecond,
+		RateLimitDenialsBySurface:      rateLimitDenialsBySurface(notify.RateLimitDenials.BySurface),
+		RateLimitDenialsDropped:        notify.RateLimitDenials.Dropped,
 		StorageRows: StorageRows{
 			Users:           snap.StorageRows.Users,
 			Messages:        snap.StorageRows.Messages,
@@ -236,6 +329,43 @@ func applyNotificationSnapshot(resp *MetricsResponse, notifyMetrics *store.Notif
 	resp.NotifyRatePerSecond = notify.RatePerSecond
 	resp.NotifyChannels = notificationChannels(notify.Channels)
 	resp.NotifyInvalid = notify.Invalid
+	resp.PushLatencyP50 = notify.Push.P50Milliseconds
+	resp.PushLatencyP50Overflow = notify.Push.P50Overflow
+	resp.PushLatencyP95 = notify.Push.P95Milliseconds
+	resp.PushLatencyP95Overflow = notify.Push.P95Overflow
+	resp.PushLatencySampleCount = notify.Push.SampleCount
+	resp.PushWindowSeconds = notify.Push.WindowSeconds
+	resp.PushOutcomes = pushOutcomes(notify.Push.Outcomes)
+	resp.PushLatencyBucketUpperBoundsMS = pushBucketUpperBounds(notify.Push)
+	resp.PushLatencyBucketCounts = notify.Push.LatencyBucketCounts
+	resp.Uninstrumented = removePushPercentileUninstrumented(resp.Uninstrumented)
+	resp.RateLimitDenialsCount = notify.RateLimitDenials.Count
+	resp.RateLimitDenialsWindowSeconds = notify.RateLimitDenials.WindowSeconds
+	resp.RateLimitDenialsRatePerSecond = notify.RateLimitDenials.RatePerSecond
+	resp.RateLimitDenialsBySurface = rateLimitDenialsBySurface(notify.RateLimitDenials.BySurface)
+	resp.RateLimitDenialsDropped = notify.RateLimitDenials.Dropped
+}
+
+func pushMetricsUninstrumented(notifyMetrics ...*store.NotificationMetrics) []string {
+	fields := []string{"push_latency_p50_ms", "push_latency_p95_ms"}
+	if len(notifyMetrics) > 0 && notifyMetrics[0] != nil {
+		return removePushPercentileUninstrumented(fields)
+	}
+	return fields
+}
+
+func removePushPercentileUninstrumented(fields []string) []string {
+	if len(fields) == 0 {
+		return fields
+	}
+	filtered := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if field == "push_latency_p50_ms" || field == "push_latency_p95_ms" {
+			continue
+		}
+		filtered = append(filtered, field)
+	}
+	return filtered
 }
 
 func notificationChannels(channels store.NotificationChannelCounts) NotifyChannels {
@@ -250,6 +380,46 @@ func notificationChannels(channels store.NotificationChannelCounts) NotifyChanne
 		Reactions:    channels.Reactions,
 		Pinned:       channels.Pinned,
 	}
+}
+
+func pushOutcomes(outcomes store.PushOutcomeCounts) PushOutcomes {
+	return PushOutcomes{
+		Success:       outcomes.Success,
+		OwnerMismatch: outcomes.OwnerMismatch,
+		EncodeFailure: outcomes.EncodeFailure,
+		WriteFailure:  outcomes.WriteFailure,
+	}
+}
+
+func rateLimitDenialsBySurface(counts store.RateLimitDenialSurfaceCounts) RateLimitDenialsBySurface {
+	return RateLimitDenialsBySurface{
+		MessageSend:               counts.MessageSend,
+		CreateChat:                counts.CreateChat,
+		AddChatUser:               counts.AddChatUser,
+		CreateChannel:             counts.CreateChannel,
+		MessagesSearch:            counts.MessagesSearch,
+		ContactsSearch:            counts.ContactsSearch,
+		MessagesSearchGlobal:      counts.MessagesSearchGlobal,
+		SaveFilePart:              counts.SaveFilePart,
+		UploadGetFile:             counts.UploadGetFile,
+		SendCodeIPCalls:           counts.SendCodeIPCalls,
+		SendCodeIPDistinctNumbers: counts.SendCodeIPDistinctNumbers,
+		SignInFailIP:              counts.SignInFailIP,
+		CheckPassword:             counts.CheckPassword,
+		CheckPasswordIP:           counts.CheckPasswordIP,
+		GetPasswordIP:             counts.GetPasswordIP,
+		SignUpIP:                  counts.SignUpIP,
+		PasswordProof:             counts.PasswordProof,
+		GetPassword:               counts.GetPassword,
+		UpdateProfile:             counts.UpdateProfile,
+	}
+}
+
+func pushBucketUpperBounds(push store.PushMetricsSnapshot) [15]float64 {
+	if push.LatencyBucketUpperBoundsMilliseconds == ([15]float64{}) {
+		return store.PushLatencyBucketUpperBoundsMilliseconds()
+	}
+	return push.LatencyBucketUpperBoundsMilliseconds
 }
 
 // get returns the cached metrics response.
@@ -272,6 +442,16 @@ func (c *metricsCache) failed() bool {
 // caches results for at least cacheRefresh (10 s) to prevent N dashboard tabs
 // from costing N full query sets. No background goroutines are started.
 func Handler(registry *mtproto.SessionRegistry, st *store.Store, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
+	return HandlerWithDeliveryLag(registry, st, NewDeliveryLagSampler(), notifyMetrics...)
+}
+
+// HandlerWithDeliveryLag returns an admin metrics handler using a supplied
+// lag sampler. The sampler can be shared with the SSE broadcaster so both
+// authenticated surfaces expose the same retained complete sample.
+func HandlerWithDeliveryLag(registry *mtproto.SessionRegistry, st *store.Store, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
+	if deliveryLag == nil {
+		deliveryLag = NewDeliveryLagSampler()
+	}
 	var cache metricsCache
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -280,12 +460,13 @@ func Handler(registry *mtproto.SessionRegistry, st *store.Store, notifyMetrics .
 			return
 		}
 
-		cache.refresh(r.Context(), registry, st, notifyMetrics...)
+		cache.refresh(r.Context(), registry, st, deliveryLag, notifyMetrics...)
 		if cache.failed() {
 			http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		resp := cache.get()
+		resp.DeliveryLag = deliveryLag.Snapshot()
 		if len(notifyMetrics) > 0 {
 			applyNotificationSnapshot(&resp, notifyMetrics[0])
 		}

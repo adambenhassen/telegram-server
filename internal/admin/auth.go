@@ -203,6 +203,9 @@ type LoginHandlerConfig struct {
 	// NotifyMetrics is the process-local Postgres notification recorder shared
 	// by the listener and every admin metrics surface.
 	NotifyMetrics *store.NotificationMetrics
+	// DeliveryLag is the process-local live-connection lag sampler shared by
+	// JSON, dashboard, and SSE metrics surfaces.
+	DeliveryLag *DeliveryLagSampler
 }
 
 // handleLoginGET serves the login form with a CSRF token.
@@ -443,6 +446,10 @@ func SecurityHeaders(next http.Handler) http.Handler {
 // hard-coding them.
 func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http.Handler {
 	rl := newRateLimiter()
+	deliveryLag := cfg.DeliveryLag
+	if deliveryLag == nil {
+		deliveryLag = NewDeliveryLagSampler()
+	}
 
 	// Protected routes (behind RequireAdmin). Track registered patterns so
 	// the gate test can enumerate them without hard-coding.
@@ -452,8 +459,8 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 		protectedPatterns = append(protectedPatterns, pattern)
 		protectedMux.HandleFunc(pattern, handler)
 	}
-	registerProtected("GET /admin/metrics", Handler(registry, cfg.Store, cfg.NotifyMetrics))
-	registerProtected("GET /admin/dashboard", DashboardHandler(registry, cfg.Store, cfg.TokenHash, cfg.NotifyMetrics))
+	registerProtected("GET /admin/metrics", HandlerWithDeliveryLag(registry, cfg.Store, deliveryLag, cfg.NotifyMetrics))
+	registerProtected("GET /admin/dashboard", DashboardHandlerWithDeliveryLag(registry, cfg.Store, cfg.TokenHash, deliveryLag, cfg.NotifyMetrics))
 	registerProtected("GET /admin/events", EventsHandler(cfg.Events))
 
 	// Top-level mux: specific public routes registered first (they take priority

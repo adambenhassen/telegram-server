@@ -2,7 +2,10 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -168,6 +171,24 @@ func TestMaxPtsGap_Empty(t *testing.T) {
 	}
 	if gap != 0 {
 		t.Errorf("expected 0 gap, got %d", gap)
+	}
+}
+
+func TestAccountHeadMissingStateIsError(t *testing.T) {
+	t.Parallel()
+
+	s := open(t)
+	ctx := context.Background()
+	user := mustUser(t, s, "+15550000743")
+	if _, err := store.StorePool(s).Exec(ctx,
+		`DELETE FROM update_state WHERE user_id = $1`, user.ID,
+	); err != nil {
+		t.Fatalf("delete update state: %v", err)
+	}
+
+	_, err := s.AccountHead(ctx, user.ID)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("AccountHead error = %v, want pgx.ErrNoRows", err)
 	}
 }
 

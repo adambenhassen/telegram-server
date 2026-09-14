@@ -66,12 +66,22 @@ func TestMetricsHandler(t *testing.T) {
 		t.Errorf("expected 0 max pts gap, got %d", resp.MaxPtsGap)
 	}
 
-	// Push latency fields should be zero (placeholder).
+	// Push latency fields are zero until a valid persisted-update push is
+	// observed, but the fixed histogram schema is still present.
 	if resp.PushLatencyP50 != 0 {
 		t.Errorf("expected push_latency_p50_ms = 0, got %f", resp.PushLatencyP50)
 	}
 	if resp.PushLatencyP95 != 0 {
 		t.Errorf("expected push_latency_p95_ms = 0, got %f", resp.PushLatencyP95)
+	}
+	if resp.PushLatencyP50Overflow || resp.PushLatencyP95Overflow {
+		t.Errorf("empty push percentiles report overflow: p50=%v p95=%v", resp.PushLatencyP50Overflow, resp.PushLatencyP95Overflow)
+	}
+	if resp.PushLatencyBucketUpperBoundsMS != [15]float64{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000, 60000} {
+		t.Errorf("unexpected push bucket bounds: %v", resp.PushLatencyBucketUpperBoundsMS)
+	}
+	if resp.PushLatencyBucketCounts != ([16]int64{}) {
+		t.Errorf("expected empty push bucket counts, got %v", resp.PushLatencyBucketCounts)
 	}
 
 	// Uninstrumented fields must be listed so the dashboard can distinguish
@@ -103,6 +113,16 @@ func TestMetricsHandler(t *testing.T) {
 		`"tg_reactions"`,
 		`"tg_pinned"`,
 		`"notify_invalid"`,
+		`"push_latency_sample_count"`,
+		`"push_latency_p50_overflow"`,
+		`"push_latency_p95_overflow"`,
+		`"push_window_seconds"`,
+		`"push_outcomes"`,
+		`"owner_mismatch"`,
+		`"encode_failure"`,
+		`"write_failure"`,
+		`"push_latency_bucket_upper_bounds_ms"`,
+		`"push_latency_bucket_counts"`,
 	} {
 		if !strings.Contains(body, field) {
 			t.Errorf("metrics response missing notification field %s", field)
@@ -154,7 +174,10 @@ func TestMetricsHandlerNotificationTelemetry(t *testing.T) {
 	if err := metrics.RecordInvalidNotification(); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(10 * time.Second)
+	acceptedAt := now
+	now = now.Add(24 * time.Millisecond)
+	metrics.RecordPushOutcome(store.PushOutcomeSuccess, acceptedAt)
+	now = time.Unix(1_700_000_010, 0)
 
 	resp := requestMetrics(t, ctx, admin.Handler(mtproto.NewSessionRegistry(), st, metrics))
 	if resp.NotifyCount != 2 {
@@ -172,8 +195,26 @@ func TestMetricsHandlerNotificationTelemetry(t *testing.T) {
 	if resp.NotifyInvalid != 1 {
 		t.Errorf("notify invalid = %d, want 1", resp.NotifyInvalid)
 	}
-	if len(resp.Uninstrumented) != 2 {
-		t.Errorf("uninstrumented = %v, want only push latency fields", resp.Uninstrumented)
+	if resp.PushLatencySampleCount != 1 {
+		t.Errorf("push latency samples = %d, want 1", resp.PushLatencySampleCount)
+	}
+	if resp.PushWindowSeconds != 10 {
+		t.Errorf("push window = %v, want 10", resp.PushWindowSeconds)
+	}
+	if resp.PushLatencyP50 == 0 || resp.PushLatencyP95 == 0 {
+		t.Errorf("push latency percentiles = p50=%v p95=%v, want non-zero", resp.PushLatencyP50, resp.PushLatencyP95)
+	}
+	if resp.PushLatencyP50Overflow || resp.PushLatencyP95Overflow {
+		t.Errorf("push percentiles report overflow: p50=%v p95=%v", resp.PushLatencyP50Overflow, resp.PushLatencyP95Overflow)
+	}
+	if resp.PushOutcomes.Success != 1 {
+		t.Errorf("push outcomes = %+v, want one success", resp.PushOutcomes)
+	}
+	if resp.PushLatencyBucketCounts[5] != 1 {
+		t.Errorf("push bucket counts = %v, want one sample in the >20ms and <=50ms bucket", resp.PushLatencyBucketCounts)
+	}
+	if len(resp.Uninstrumented) != 0 {
+		t.Errorf("uninstrumented = %v, want no push fields when observer is enabled", resp.Uninstrumented)
 	}
 }
 

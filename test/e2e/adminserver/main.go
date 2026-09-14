@@ -96,9 +96,10 @@ func run(log *slog.Logger) error {
 	defer sweepWG.Wait()
 
 	registry := mtproto.NewSessionRegistry()
+	deliveryLag := admin.NewDeliveryLagSampler()
 
 	events := admin.NewBroadcaster(admin.BroadcasterConfig{
-		Sample: admin.NewMetricsSampler(registry, st),
+		Sample: admin.NewMetricsSamplerWithDeliveryLag(registry, st, deliveryLag),
 		Logger: log,
 		Render: admin.DashboardFragmentRenderer,
 	})
@@ -116,6 +117,7 @@ func run(log *slog.Logger) error {
 		Logger:      log,
 		AdminOrigin: "http://" + adminListenAddr,
 		Events:      events,
+		DeliveryLag: deliveryLag,
 	}, registry)
 
 	srv := &http.Server{

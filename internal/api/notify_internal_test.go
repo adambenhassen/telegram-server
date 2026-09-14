@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
@@ -35,6 +37,31 @@ func (f *fakePushConn) PushTo(_ context.Context, _ int64, enc bin.Encoder, pts i
 		return false, errors.New("unexpected encoder")
 	}
 	f.got = append(f.got, ups)
+	f.pts = pts
+	return true, nil
+}
+
+type outcomePushConn struct {
+	pushed   bool
+	err      error
+	pts      int
+	attempts int
+	onPush   func()
+}
+
+func (f *outcomePushConn) LastPushedPts() int { return f.pts }
+
+func (f *outcomePushConn) PushTo(_ context.Context, _ int64, _ bin.Encoder, pts int) (bool, error) {
+	f.attempts++
+	if f.onPush != nil {
+		f.onPush()
+	}
+	if f.err != nil {
+		return false, f.err
+	}
+	if !f.pushed {
+		return false, nil
+	}
 	f.pts = pts
 	return true, nil
 }
@@ -272,6 +299,98 @@ func TestDeliverPushFailureDoesNotBlockOthers(t *testing.T) {
 	}
 	if broken.pts != 0 {
 		t.Fatalf("failed push advanced the watermark to %d", broken.pts)
+	}
+}
+
+func TestDeliverRecordsPushOutcomesPerConnection(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(1_700_000_000, 0)
+	now := start
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time { return now })
+	acceptedAt := start
+
+	successA := &outcomePushConn{
+		pushed: true,
+		onPush: func() { now = start.Add(24 * time.Millisecond) },
+	}
+	successB := &outcomePushConn{
+		pushed: true,
+		onPush: func() { now = start.Add(48 * time.Millisecond) },
+	}
+	ownerMismatch := &outcomePushConn{}
+	encodeFailure := &outcomePushConn{err: mtproto.MarkPushEncodeError(errors.New("encode"))}
+	writeFailure := &outcomePushConn{err: errors.New("write")}
+
+	u := &Updater{log: slog.New(slog.DiscardHandler), pushMetrics: metrics}
+	u.deliverAt(context.Background(), 7, []pushConn{
+		successA,
+		successB,
+		ownerMismatch,
+		encodeFailure,
+		writeFailure,
+	}, func(int) (updateBatch, error) {
+		return batch(0, 1, 1), nil
+	}, acceptedAt)
+
+	got := metrics.Snapshot()
+	if got.Push.SampleCount != 2 {
+		t.Errorf("push samples = %d, want one per successful connection", got.Push.SampleCount)
+	}
+	if got.Push.P50Milliseconds == 0 || got.Push.P95Milliseconds == 0 {
+		t.Errorf("push percentiles = p50=%v p95=%v, want non-zero", got.Push.P50Milliseconds, got.Push.P95Milliseconds)
+	}
+	if got.Push.Outcomes != (store.PushOutcomeCounts{
+		Success:       2,
+		OwnerMismatch: 1,
+		EncodeFailure: 1,
+		WriteFailure:  1,
+	}) {
+		t.Errorf("push outcomes = %+v, want one fixed outcome per attempted connection", got.Push.Outcomes)
+	}
+	if successA.attempts != 1 || successB.attempts != 1 {
+		t.Fatalf("successful connection attempts = %d/%d, want one each", successA.attempts, successB.attempts)
+	}
+}
+
+func TestDeliverRecorderPanicDoesNotStopFanout(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(1_700_000_000, 0)
+	var clockCalls atomic.Int32
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time {
+		if clockCalls.Add(1) == 2 {
+			panic("telemetry failure")
+		}
+		return start.Add(24 * time.Millisecond)
+	})
+	first := &outcomePushConn{pushed: true}
+	later := &outcomePushConn{pushed: true}
+
+	u := &Updater{log: slog.New(slog.DiscardHandler), pushMetrics: metrics}
+	u.deliverAt(context.Background(), 7, []pushConn{first, later}, func(int) (updateBatch, error) {
+		return batch(0, 1, 1), nil
+	}, start)
+
+	if first.attempts != 1 || later.attempts != 1 {
+		t.Fatalf("push attempts after recorder panic = %d/%d, want one per connection", first.attempts, later.attempts)
+	}
+	if got := metrics.Snapshot().Push.SampleCount; got != 1 {
+		t.Fatalf("recorded samples after recorder panic = %d, want the later successful attempt", got)
+	}
+}
+
+func TestDeliverWithoutPushObserverPreservesDelivery(t *testing.T) {
+	t.Parallel()
+
+	conn := &outcomePushConn{pushed: true}
+	u := &Updater{log: slog.New(slog.DiscardHandler)}
+	u.deliverAt(context.Background(), 7, []pushConn{conn}, func(int) (updateBatch, error) {
+		return batch(0, 1, 1), nil
+	}, time.Unix(1_700_000_000, 0))
+
+	if conn.attempts != 1 || conn.pts != 1 {
+		t.Fatalf("delivery without observer = attempts %d pts %d, want one successful write at pts 1", conn.attempts, conn.pts)
 	}
 }
 

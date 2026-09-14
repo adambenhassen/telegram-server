@@ -38,7 +38,20 @@ type RateLimitResult struct {
 	// Wait is how long the subject must wait before the next request is allowed.
 	// Always >= 1 second, rounded up from the actual remainder.
 	Wait time.Duration
+	// Surface identifies a fixed compound limiter counter when the result came
+	// from one. It is telemetry metadata only and is not persisted.
+	Surface RateLimitResultSurface
 }
+
+// RateLimitResultSurface identifies the two independently bounded counters in
+// auth.sendCode. Other rate-limit results leave this at Unknown.
+type RateLimitResultSurface uint8
+
+const (
+	RateLimitResultSurfaceUnknown RateLimitResultSurface = iota
+	RateLimitResultSurfaceSendCodeIPCalls
+	RateLimitResultSurfaceSendCodeIPDistinctNumbers
+)
 
 // CheckRateLimit checks whether subjectID is allowed to make a request on the
 // given surface, consuming a token if allowed.

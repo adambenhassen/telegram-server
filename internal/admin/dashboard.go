@@ -29,6 +29,21 @@ func DashboardFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	if err := metricsFragment(d).Render(context.Background(), &buf); err != nil {
 		return nil, fmt.Errorf("render metrics fragment: %w", err)
 	}
+	telemetry, err := pushTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	rateLimitDenialTelemetry, err := rateLimitDenialTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	deliveryLagTelemetry, err := deliveryLagTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	buf.WriteString(telemetry)
+	buf.WriteString(rateLimitDenialTelemetry)
+	buf.WriteString(deliveryLagTelemetry)
 	buf.WriteString(`</div>`)
 	return []Fragment{{Event: sseDefaultEvent, HTML: buf.String()}}, nil
 }
@@ -223,6 +238,16 @@ func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 // tokenHash is the hex-encoded SHA-256 digest of TG_ADMIN_TOKEN_HASH, used to
 // derive the session-bound CSRF token for the logout form.
 func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenHash string, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
+	return DashboardHandlerWithDeliveryLag(registry, st, tokenHash, NewDeliveryLagSampler(), notifyMetrics...)
+}
+
+// DashboardHandlerWithDeliveryLag returns a dashboard handler using a supplied
+// lag sampler. Sharing it with the JSON and SSE handlers keeps the retained
+// complete sample and its source timestamp consistent across surfaces.
+func DashboardHandlerWithDeliveryLag(registry *mtproto.SessionRegistry, st *store.Store, tokenHash string, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
+	if deliveryLag == nil {
+		deliveryLag = NewDeliveryLagSampler()
+	}
 	var cache metricsCache
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -231,12 +256,13 @@ func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenH
 			return
 		}
 
-		cache.refresh(r.Context(), registry, st, notifyMetrics...)
+		cache.refresh(r.Context(), registry, st, deliveryLag, notifyMetrics...)
 		if cache.failed() {
 			http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		m := cache.get()
+		m.DeliveryLag = deliveryLag.Snapshot()
 		if len(notifyMetrics) > 0 {
 			applyNotificationSnapshot(&m, notifyMetrics[0])
 		}

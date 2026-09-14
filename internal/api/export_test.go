@@ -83,6 +83,13 @@ func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code stri
 	h.logIssuedCode(phone, code)
 }
 
+// RecordRateLimitDenialForTest drives the request telemetry wrapper for the
+// external api_test package, including its panic isolation boundary.
+func RecordRateLimitDenialForTest(metrics *store.NotificationMetrics, surface string) {
+	h := &handlers{rateLimitMetrics: metrics}
+	h.recordRateLimitDenial(surface)
+}
+
 // UnhandledForTest drives the dispatcher's fallback for the external api_test
 // package, over a body positioned at its constructor id. It returns the error
 // the caller would receive and writes the record the RPC-gap capture reads.
@@ -567,6 +574,20 @@ func SendMessageForTestWithLimits(s *store.Store, userID int64, rateLimit store.
 	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SendMessageForTestWithLimitsAndMetrics invokes handleSendMessage with a
+// shared rate-limit recorder, so external tests can assert the telemetry after
+// admitted and denied RPCs.
+func SendMessageForTestWithLimitsAndMetrics(s *store.Store, metrics *store.NotificationMetrics, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMetrics = metrics
+	h.rateLimitMessageSend = rateLimit
+	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SendMediaForTestWithLimits encodes req and invokes handleSendMedia with a
 // custom message send rate limit config.
 func SendMediaForTestWithLimits(
@@ -998,6 +1019,35 @@ func CheckPasswordForTestWithLimits(s *store.Store, authKeyID [8]byte, addr neti
 	h.rateLimitCheckPassword = perAccount
 	h.rateLimitCheckPasswordIP = perIP
 	return h.handleCheckPassword(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+}
+
+// CheckPasswordForTestWithLimitsAndMetrics invokes handleCheckPassword with a
+// shared rate-limit recorder, so external tests can assert the telemetry at
+// the RPC outcome boundary.
+func CheckPasswordForTestWithLimitsAndMetrics(s *store.Store, metrics *store.NotificationMetrics, authKeyID [8]byte, addr netip.Addr, perAccount, perIP store.RateLimitConfig, req *tg.AuthCheckPasswordRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMetrics = metrics
+	h.rateLimitCheckPassword = perAccount
+	h.rateLimitCheckPasswordIP = perIP
+	return h.handleCheckPassword(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+}
+
+// UpdateProfileForTestWithLimitsAndMetricsContext invokes handleUpdateProfile
+// with a shared rate-limit recorder and caller-supplied context, so external
+// tests can exercise the storage-failure path at the real handler boundary.
+func UpdateProfileForTestWithLimitsAndMetricsContext(ctx context.Context, s *store.Store, metrics *store.NotificationMetrics, userID int64, rateLimit store.RateLimitConfig, req *tg.AccountUpdateProfileRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMetrics = metrics
+	h.rateLimitUpdateProfile = rateLimit
+	return h.handleUpdateProfile(&mtproto.Request{Ctx: ctx, UserID: userID, Buf: &buf})
 }
 
 // UpdatePasswordSettingsForTest invokes handleUpdatePasswordSettings with a
