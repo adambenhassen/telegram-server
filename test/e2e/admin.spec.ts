@@ -209,6 +209,11 @@ interface DisconnectRecord {
 declare global {
   interface Window {
     __disconnectRecord?: DisconnectRecord;
+    __heartbeatState?: {
+      heartbeats: number;
+      dataEvents: number;
+      disconnects: number;
+    };
     __setSampleClock?: (value: number) => void;
   }
 }
@@ -532,6 +537,69 @@ test.describe('admin SSE stream', () => {
       swappedReplica: '● Live · updated 12s ago · Metrics source changed',
       nullReplica: '● Live · updated 13s ago · Metrics source changed',
     });
+  });
+
+  test('heartbeat-only aging marks the connected stream stale', async ({ page }) => {
+    await page.clock.install({ time: new Date('2099-09-14T12:00:00Z') });
+    await page.addInitScript(() => {
+      const state = { heartbeats: 0, dataEvents: 0, disconnects: 0 };
+      window.__heartbeatState = state;
+      document.addEventListener('datastar-sse', (event) => {
+        const type = (event as CustomEvent<{ type?: string }>).detail?.type;
+        if (type === 'datastar-merge-fragments') state.dataEvents++;
+        if (type === 'finished' || type === 'error') state.disconnects++;
+      });
+
+      const realFetch = window.fetch.bind(window);
+      window.fetch = async (input, init) => {
+        const inputURL = input instanceof Request ? input.url : input.toString();
+        const url = new URL(inputURL, window.location.href);
+        if (url.pathname !== '/admin/events') return realFetch(input, init);
+
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const encoder = new TextEncoder();
+            const sendHeartbeat = () => {
+              state.heartbeats++;
+              controller.enqueue(encoder.encode(': keepalive\n\n'));
+            };
+            sendHeartbeat();
+            const interval = window.setInterval(sendHeartbeat, 15_000);
+            init?.signal?.addEventListener(
+              'abort',
+              () => {
+                window.clearInterval(interval);
+                controller.close();
+              },
+              { once: true },
+            );
+          },
+        });
+        return new window.Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      };
+    });
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    // Advance only the browser clock. The response contains keepalive comments
+    // but never a data event, so the connected chip must age on its own timer.
+    await page.clock.fastForward(41_000);
+
+    await expect(page.locator('#chip-text')).toHaveText(/^● Stale · updated \d+s ago$/);
+    await expect(page.locator('#banner-disconnected')).toBeHidden();
+
+    const state = await page.evaluate(() => {
+      if (!window.__heartbeatState) throw new Error('heartbeat test state is missing');
+      return window.__heartbeatState;
+    });
+    expect(state.heartbeats).toBeGreaterThan(1);
+    expect(state.dataEvents).toBe(0);
+    expect(state.disconnects).toBe(0);
   });
 
   // Criterion: the chip flips to its critical state when the stream ends and
