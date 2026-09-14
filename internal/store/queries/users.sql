@@ -1,12 +1,3 @@
--- Every query that loads a user reads the handle from the usernames row, never
--- from the denormalized users.username column. The two are written in one
--- transaction today, but only the usernames row is authoritative: it is what
--- admits an account to resolveUsername, and a writer that released a handle
--- without clearing the copy must not leave any RPC still reporting it. The join
--- is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
--- user lookup against 200k handles, so the hot per-peer read pays an index
--- probe rather than the copy's zero.
-
 -- name: InsertUser :one
 INSERT INTO users (phone)
 VALUES ($1)
@@ -17,6 +8,15 @@ RETURNING id;
 INSERT INTO users (phone, login_mode, first_name, last_name)
 VALUES (NULL, 'username', $1, $2)
 RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at;
+
+-- Every query that loads a user reads the handle from the usernames row, never
+-- from the denormalized users.username column. The two are written in one
+-- transaction today, but only the usernames row is authoritative: it is what
+-- admits an account to resolveUsername, and a writer that released a handle
+-- without clearing the copy must not leave any RPC still reporting it. The join
+-- is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
+-- user lookup against 200k handles, so the hot per-peer read pays an index
+-- probe rather than the copy's zero.
 
 -- name: UserByPhone :one
 SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
@@ -158,4 +158,3 @@ LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 WHERE u.id IN (SELECT id FROM matched)
 ORDER BY u.id
 LIMIT sqlc.arg(lim)::int;
-

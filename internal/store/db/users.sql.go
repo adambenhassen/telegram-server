@@ -122,21 +122,12 @@ func (q *Queries) GetUserLoginMode(ctx context.Context, id int64) (string, error
 }
 
 const insertUser = `-- name: InsertUser :one
-
 INSERT INTO users (phone)
 VALUES ($1)
 ON CONFLICT (phone) WHERE phone IS NOT NULL DO NOTHING
 RETURNING id
 `
 
-// Every query that loads a user reads the handle from the usernames row, never
-// from the denormalized users.username column. The two are written in one
-// transaction today, but only the usernames row is authoritative: it is what
-// admits an account to resolveUsername, and a writer that released a handle
-// without clearing the copy must not leave any RPC still reporting it. The join
-// is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
-// user lookup against 200k handles, so the hot per-peer read pays an index
-// probe rather than the copy's zero.
 func (q *Queries) InsertUser(ctx context.Context, phone *string) (int64, error) {
 	row := q.db.QueryRow(ctx, insertUser, phone)
 	var id int64
@@ -351,6 +342,7 @@ func (q *Queries) UserByID(ctx context.Context, id int64) (UserByIDRow, error) {
 }
 
 const userByPhone = `-- name: UserByPhone :one
+
 SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
        un.handle AS username
 FROM users u
@@ -369,6 +361,14 @@ type UserByPhoneRow struct {
 	Username   *string
 }
 
+// Every query that loads a user reads the handle from the usernames row, never
+// from the denormalized users.username column. The two are written in one
+// transaction today, but only the usernames row is authoritative: it is what
+// admits an account to resolveUsername, and a writer that released a handle
+// without clearing the copy must not leave any RPC still reporting it. The join
+// is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
+// user lookup against 200k handles, so the hot per-peer read pays an index
+// probe rather than the copy's zero.
 func (q *Queries) UserByPhone(ctx context.Context, phone *string) (UserByPhoneRow, error) {
 	row := q.db.QueryRow(ctx, userByPhone, phone)
 	var i UserByPhoneRow
