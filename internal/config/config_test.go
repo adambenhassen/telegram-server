@@ -127,6 +127,43 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadReplicaID(t *testing.T) {
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_REPLICA_ID", "edge-2")
+
+	cfg, err := config.Load(discardLog())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ReplicaID != "edge-2" {
+		t.Fatalf("ReplicaID = %q, want edge-2", cfg.ReplicaID)
+	}
+}
+
+func TestLoadRejectsInvalidReplicaID(t *testing.T) {
+	cases := []string{
+		"bad id",
+		"edge/2",
+		strings.Repeat("a", 65),
+	}
+	for _, replicaID := range cases {
+		t.Run(replicaID, func(t *testing.T) {
+			t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+			t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+			t.Setenv("TG_REPLICA_ID", replicaID)
+
+			_, err := config.Load(discardLog())
+			if err == nil {
+				t.Fatal("Load accepted invalid TG_REPLICA_ID")
+			}
+			if !strings.Contains(err.Error(), "TG_REPLICA_ID") {
+				t.Fatalf("Load error = %q, want TG_REPLICA_ID", err)
+			}
+		})
+	}
+}
+
 func TestLoadWebSocketListenAddr(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)

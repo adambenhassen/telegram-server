@@ -131,7 +131,7 @@ func estimatedRows(ctx context.Context, pool *pgxpool.Pool, tableName string) in
 	if err := pool.QueryRow(ctx,
 		`SELECT reltuples::int8 FROM pg_class WHERE relname = $1`, tableName,
 	).Scan(&rows); err != nil {
-		return 0
+		return -1
 	}
 	return rows
 }

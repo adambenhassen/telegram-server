@@ -252,6 +252,10 @@ func run(log *slog.Logger) error {
 	if err := cfg.ValidateRegistrationMode(); err != nil {
 		return err
 	}
+	processIdentity, err := admin.NewProcessIdentity(cfg.ReplicaID)
+	if err != nil {
+		return fmt.Errorf("process identity: %w", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -433,8 +437,9 @@ func run(log *slog.Logger) error {
 		// dashboard so all authenticated surfaces retain the same complete
 		// sample after a partial attempt.
 		deliveryLag := admin.NewDeliveryLagSampler()
+		metricsCache := admin.NewMetricsSnapshotCache(server.Registry(), st, processIdentity, deliveryLag, notifyMetrics)
 		events := admin.NewBroadcaster(admin.BroadcasterConfig{
-			Sample: admin.NewMetricsSamplerWithDeliveryLag(server.Registry(), st, deliveryLag, notifyMetrics),
+			Sample: metricsCache.Snapshot,
 			Logger: log,
 			Render: admin.DashboardFragmentRenderer,
 		})
@@ -451,6 +456,7 @@ func run(log *slog.Logger) error {
 			Events:        events,
 			NotifyMetrics: notifyMetrics,
 			DeliveryLag:   deliveryLag,
+			Metrics:       metricsCache,
 		}, server.Registry())
 		adminSrv := &http.Server{
 			Addr:              cfg.AdminListenAddr,

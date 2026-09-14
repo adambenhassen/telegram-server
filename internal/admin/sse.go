@@ -118,19 +118,12 @@ func NewMetricsSampler(registry *mtproto.SessionRegistry, st *store.Store, notif
 	return NewMetricsSamplerWithDeliveryLag(registry, st, NewDeliveryLagSampler(), notifyMetrics...)
 }
 
-// NewMetricsSamplerWithDeliveryLag returns a Sampler using the supplied
-// process-local lag state. Production shares it with the JSON and dashboard
-// handlers so a partial attempt cannot make one surface look newer than the
-// other.
+// NewMetricsSamplerWithDeliveryLag returns a Sampler backed by the shared
+// complete-snapshot cache and using the supplied process-local lag state. The
+// production server injects one cache into all authenticated surfaces.
 func NewMetricsSamplerWithDeliveryLag(registry *mtproto.SessionRegistry, st *store.Store, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) Sampler {
-	if deliveryLag == nil {
-		deliveryLag = NewDeliveryLagSampler()
-	}
-	return func(ctx context.Context) (MetricsResponse, error) {
-		// requireAllMetrics: the stream stays silent on a partial snapshot
-		// rather than pushing a metric that reads as good news.
-		return collectMetricsWithDeliveryLag(ctx, registry, st, requireAllMetrics, deliveryLag, notifyMetrics...)
-	}
+	cache := NewMetricsSnapshotCache(registry, st, defaultProcessIdentity, deliveryLag, notifyMetrics...)
+	return cache.Snapshot
 }
 
 // BroadcasterConfig configures a Broadcaster. Every duration and bound has a
@@ -251,9 +244,10 @@ func (b *Broadcaster) Clients() int {
 	return len(b.subs)
 }
 
-// tick collects one snapshot and pushes it. A sampling or rendering failure
-// leaves the last good payload in place: clients keep their current values and
-// the dashboard's freshness threshold is what surfaces the staleness.
+// tick collects one snapshot and pushes it. Snapshot retains and returns the
+// last complete sample as stale after a required collection failure, so tick
+// renders and emits that stale fragment. Only a failure before any complete
+// sample leaves the stream unavailable.
 func (b *Broadcaster) tick(ctx context.Context) {
 	if b.Clients() == 0 {
 		return
@@ -603,7 +597,13 @@ func deliveryLagTelemetryHTML(m MetricsResponse) (string, error) {
 // a patch target can address the same values it server-rendered on first paint.
 // The wrapper id is the patch target agreed on MAIN-302 and is asserted by
 // TestSSE_default_contract_is_the_dashboard_contract.
-const metricsFragmentHTML = `<div id="` + sseTargetID + `" data-timestamp="{{.ServerTimestamp}}">` +
+const metricsFragmentHTML = `<div id="` + sseTargetID + `" data-timestamp="{{.ServerTimestamp}}"` +
+	` data-sample-timestamp="{{.SampleTimestamp}}"` +
+	` data-sample-age-seconds="{{.SampleAgeSeconds}}"` +
+	` data-sample-state="{{.SampleState}}"` +
+	` data-process-started-at="{{.ProcessStartedAt}}"` +
+	` data-process-generation="{{.ProcessGeneration}}"` +
+	` data-replica-id="{{.ReplicaID}}">` +
 	`<span data-metric="connections">{{.Connections}}</span>` +
 	`<span data-metric="sessions">{{.Sessions}}</span>` +
 	`<span data-metric="messages_1h">{{.Messages1H}}</span>` +
