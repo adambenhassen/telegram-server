@@ -165,24 +165,21 @@ func TestStartListenerDispatches(t *testing.T) {
 	}
 }
 
-func TestStartListenerContainsRecorderPanicAndPreservesCallback(t *testing.T) {
+func TestStartListenerContainsMetricsPanicAndPreservesCallback(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dsn := pgtest.DSN(t)
 	s := openDSN(t, dsn)
 
+	start := time.Unix(1_700_000_000, 0)
+	var clockCalls atomic.Int32
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time {
+		if clockCalls.Add(1) == 1 {
+			return start
+		}
+		panic("telemetry failure")
+	})
 	delivered := make(chan int64, 1)
-	called := make(chan struct{}, 2)
-	recorder := store.NotificationRecorderFunc{
-		Valid: func(string) error {
-			called <- struct{}{}
-			panic("telemetry failure")
-		},
-		Invalid: func() error {
-			called <- struct{}{}
-			panic("telemetry failure")
-		},
-	}
 	_, stop, err := store.StartListener(ctx, dsn,
 		func(_ context.Context, userID int64) { delivered <- userID },
 		func(context.Context, int64, int64) {},
@@ -194,7 +191,7 @@ func TestStartListenerContainsRecorderPanicAndPreservesCallback(t *testing.T) {
 		func(context.Context, int64, int64, int64) {},
 		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
-		recorder,
+		metrics,
 	)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
@@ -218,13 +215,6 @@ func TestStartListenerContainsRecorderPanicAndPreservesCallback(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("deliver callback not invoked after recorder panic")
-	}
-	for range 2 {
-		select {
-		case <-called:
-		case <-time.After(5 * time.Second):
-			t.Fatal("recorder panic path was not exercised")
-		}
 	}
 }
 
@@ -271,99 +261,32 @@ func TestStartListenerRecordsBeforeCallback(t *testing.T) {
 	}
 }
 
-func TestStartListenerBlockingRecorderDoesNotBlockDeliveryOrStop(t *testing.T) {
+func TestStartListenerRepeatedStartStopDoesNotRetainRecorderWorker(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dsn := pgtest.DSN(t)
-	s := openDSN(t, dsn)
 
-	entered := make(chan struct{}, 1)
-	release := make(chan struct{})
-	recorder := store.NotificationRecorderFunc{
-		Valid: func(string) error {
-			select {
-			case entered <- struct{}{}:
-			default:
-			}
-			<-release
-			return nil
-		},
-	}
-	delivered := make(chan int64, 2)
-	_, stop, err := store.StartListener(ctx, dsn,
-		func(_ context.Context, userID int64) { delivered <- userID },
-		func(context.Context, int64, int64) {},
-		func(context.Context, int64, int64) {},
-		func(context.Context, int64) {},
-		func(context.Context, int64, int64) {},
-		func(context.Context, int64, bool) {},
-		func(context.Context, int64, int) {},
-		func(context.Context, int64, int64, int64) {},
-		func(context.Context, store.PeerType, int64, int32) {},
-		nil,
-		recorder,
-	)
-	if err != nil {
-		t.Fatalf("start listener: %v", err)
-	}
-	var stopStarted bool
-	var stopComplete bool
-	stopped := make(chan error, 1)
-	startStop := func() {
-		if stopStarted {
-			return
-		}
-		stopStarted = true
-		go func() { stopped <- stop() }()
-	}
-	defer func() {
-		close(release)
-		startStop()
-		if !stopComplete {
-			select {
-			case err := <-stopped:
-				stopComplete = true
-				if err != nil {
-					t.Errorf("stop after blocking recorder test: %v", err)
-				}
-			case <-time.After(5 * time.Second):
-				t.Error("listener did not stop after releasing recorder")
-			}
-		}
-	}()
-
-	if err := s.Notify(ctx, store.ChannelUpdates, "31"); err != nil {
-		t.Fatalf("notify first update: %v", err)
-	}
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("blocking recorder was not called")
-	}
-	if err := s.Notify(ctx, store.ChannelUpdates, "32"); err != nil {
-		t.Fatalf("notify second update: %v", err)
-	}
-
-	for i, want := range []int64{31, 32} {
-		select {
-		case got := <-delivered:
-			if got != want {
-				t.Errorf("callback %d userID = %d, want %d", i, got, want)
-			}
-		case <-time.After(1 * time.Second):
-			t.Errorf("callback %d did not complete while recorder was blocked", i)
-		}
-	}
-
-	startStop()
-	select {
-	case err := <-stopped:
-		stopComplete = true
+	for i := range 8 {
+		metrics := store.NewNotificationMetrics()
+		_, stop, err := store.StartListener(ctx, dsn,
+			func(context.Context, int64) {},
+			func(context.Context, int64, int64) {},
+			func(context.Context, int64, int64) {},
+			func(context.Context, int64) {},
+			func(context.Context, int64, int64) {},
+			func(context.Context, int64, bool) {},
+			func(context.Context, int64, int) {},
+			func(context.Context, int64, int64, int64) {},
+			func(context.Context, store.PeerType, int64, int32) {},
+			nil,
+			metrics,
+		)
 		if err != nil {
-			t.Errorf("stop: %v", err)
+			t.Fatalf("start listener %d: %v", i, err)
 		}
-	case <-time.After(1 * time.Second):
-		t.Error("stop did not complete while recorder was blocked")
+		if err := stop(); err != nil {
+			t.Fatalf("stop listener %d: %v", i, err)
+		}
 	}
 }
 

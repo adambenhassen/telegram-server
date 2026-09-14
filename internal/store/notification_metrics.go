@@ -41,39 +41,6 @@ type NotificationMetricsSnapshot struct {
 	Invalid       int64
 }
 
-// NotificationRecorder is the narrow seam used by the listener. The built-in
-// NotificationMetrics implementation is recorded inline; custom implementations
-// are advisory and are invoked asynchronously through a bounded queue. Valid
-// notifications carry only a known compiled channel name; invalid input has no
-// channel argument, so malformed payloads cannot become a label.
-type NotificationRecorder interface {
-	RecordValidNotification(channel string) error
-	RecordInvalidNotification() error
-}
-
-// NotificationRecorderFunc adapts a pair of recording callbacks for tests and
-// other in-process callers that need to observe listener ordering.
-type NotificationRecorderFunc struct {
-	Valid   func(channel string) error
-	Invalid func() error
-}
-
-// RecordValidNotification implements NotificationRecorder.
-func (f NotificationRecorderFunc) RecordValidNotification(channel string) error {
-	if f.Valid == nil {
-		return nil
-	}
-	return f.Valid(channel)
-}
-
-// RecordInvalidNotification implements NotificationRecorder.
-func (f NotificationRecorderFunc) RecordInvalidNotification() error {
-	if f.Invalid == nil {
-		return nil
-	}
-	return f.Invalid()
-}
-
 // notificationMetricBucket is one second of fixed counters. readers is a
 // small reader gate: zero or more readers may increment counters, while -1
 // exclusively owns the bucket during an epoch reset. writerPending prevents
