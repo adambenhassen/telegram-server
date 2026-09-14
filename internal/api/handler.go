@@ -252,7 +252,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesExportChatInviteRequestTypeID, h.handleExportChatInvite)
 	register(d, tg.MessagesCheckChatInviteRequestTypeID, h.handleCheckChatInvite)
 	register(d, tg.MessagesImportChatInviteRequestTypeID, h.handleImportChatInvite)
-	register(d, revokeExportedChatInviteTypeID, h.handleRevokeExportedChatInvite)
+	registerNamed(d, revokeExportedChatInviteTypeID, "messages.revokeExportedChatInvite", h.handleRevokeExportedChatInvite)
 	register(d, tg.MessagesSendMediaRequestTypeID, h.handleSendMedia)
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
 	register(d, tg.ChannelsGetChannelsRequestTypeID, h.handleGetChannels)
@@ -427,7 +427,11 @@ func fnv1a64(s string) uint64 {
 }
 
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
-	registerReply(d, id, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
+	registerNamed(d, id, "", fn)
+}
+
+func registerNamed(d *mtproto.Dispatcher, id uint32, name string, fn methodFunc) {
+	registerReplyNamed(d, id, name, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
 		res, err := fn(req)
 		return res, nil, err
 	})
@@ -455,7 +459,11 @@ func registerRevoke(d *mtproto.Dispatcher, id uint32, fn revokeFunc) {
 // registerReply applies the common provisional gate, RPC error mapping, and
 // reply write around a method-specific function.
 func registerReply(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
-	d.HandleFunc(id, func(c *mtproto.Conn, req *mtproto.Request) error {
+	registerReplyNamed(d, id, "", fn)
+}
+
+func registerReplyNamed(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc) {
+	handler := func(c *mtproto.Conn, req *mtproto.Request) error {
 		// Provisional gate: blocks all authorized RPCs except the allow-list.
 		// Does not apply when UserID == 0 (unauthenticated keys already
 		// handled per-method).
@@ -475,5 +483,10 @@ func registerReply(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
 			afterReply()
 		}
 		return sendErr
-	})
+	}
+	if name == "" {
+		d.HandleFunc(id, handler)
+		return
+	}
+	d.HandleFuncNamed(id, name, handler)
 }

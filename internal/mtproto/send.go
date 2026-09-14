@@ -286,19 +286,25 @@ func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int
 func (c *Conn) SendResult(req *Request, msg bin.Encoder) error {
 	var buf bin.Buffer
 	if err := msg.Encode(&buf); err != nil {
+		req.rpcResult = RPCResultInternal
 		return fmt.Errorf("encode result: %w", err)
 	}
 	if err := c.send(context.WithoutCancel(req.Ctx), proto.MessageServerResponse, &proto.Result{
 		RequestMessageID: req.MsgID,
 		Result:           buf.Raw(),
 	}); err != nil {
+		req.rpcResult = RPCResultTransportFailure
 		return fmt.Errorf("send result [%T]: %w", msg, err)
+	}
+	if req.rpcResult == "" {
+		req.rpcResult = RPCResultSuccess
 	}
 	return nil
 }
 
 // SendErr sends e as the RPC error result for req.
 func (c *Conn) SendErr(req *Request, e *tgerr.Error) error {
+	req.rpcResult = ClassifyRPCError(e)
 	return c.SendResult(req, &mt.RPCError{
 		ErrorCode:    e.Code,
 		ErrorMessage: e.Message,

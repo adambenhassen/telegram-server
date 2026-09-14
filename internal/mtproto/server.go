@@ -143,6 +143,13 @@ func (s *Server) OnStatusChange(fn func(ctx context.Context, userID int64, onlin
 	s.onStatusChange = fn
 }
 
+// SetRPCTracer installs the optional bounded RPC tracing boundary. Call it
+// before Serve or ServeConn; a nil or disabled tracer leaves the handler
+// unchanged and starts no tracing worker.
+func (s *Server) SetRPCTracer(tracer *RPCTracer) {
+	s.handler = TraceRPCs(s.handler, tracer)
+}
+
 // TrustProxyV2Headers makes the server take each client address from a PROXY
 // protocol v2 header instead of the socket it arrived on, honoured only from a
 // source in allow. Call it before Serve.
