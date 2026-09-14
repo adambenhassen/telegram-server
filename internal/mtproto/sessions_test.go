@@ -239,6 +239,26 @@ func TestSessionRegistrySampleDeliveryLagDeduplicatesHeads(t *testing.T) {
 	}
 }
 
+func TestSessionRegistrySampleDeliveryLagZeroWatermark(t *testing.T) {
+	t.Parallel()
+
+	r := mtproto.NewSessionRegistry()
+	conn := mtproto.NewTestConn(&fakeConn{}, testKey(t))
+	if got := conn.LastPushedPts(); got != 0 {
+		t.Fatalf("new connection watermark = %d, want 0", got)
+	}
+	if !r.Add(12, conn) {
+		t.Fatal("register connection")
+	}
+
+	sample := r.SampleDeliveryLag(context.Background(), func(context.Context, int64) (int64, error) {
+		return 17, nil
+	})
+	if sample.EligibleConnections != 1 || sample.SampledConnections != 1 || sample.WorstPts != 17 {
+		t.Fatalf("sample = %+v, want eligible=1 sampled=1 worst=17", sample)
+	}
+}
+
 func TestSessionRegistryConcurrentDeliveryLagSampling(t *testing.T) {
 	t.Parallel()
 
