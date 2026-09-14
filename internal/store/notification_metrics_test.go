@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -284,10 +285,18 @@ func TestNotificationMetricsConcurrentPushRecordAndSnapshot(t *testing.T) {
 
 	const workers = 8
 	const attempts = 1_000
+	var inconsistentSnapshots atomic.Int64
 	var snapshots sync.WaitGroup
 	snapshots.Go(func() {
 		for range attempts {
-			metrics.Snapshot()
+			got := metrics.Snapshot()
+			var bucketSamples int64
+			for _, count := range got.Push.LatencyBucketCounts {
+				bucketSamples += count
+			}
+			if got.Push.SampleCount != bucketSamples || got.Push.SampleCount != got.Push.Outcomes.Success {
+				inconsistentSnapshots.Add(1)
+			}
 		}
 	})
 
@@ -305,6 +314,9 @@ func TestNotificationMetricsConcurrentPushRecordAndSnapshot(t *testing.T) {
 	}
 	records.Wait()
 	snapshots.Wait()
+	if got := inconsistentSnapshots.Load(); got != 0 {
+		t.Errorf("concurrent snapshots observed %d inconsistent push samples", got)
+	}
 
 	got := metrics.Snapshot()
 	if got.Push.SampleCount+got.Push.Outcomes.WriteFailure != workers*attempts {

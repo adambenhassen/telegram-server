@@ -95,6 +95,7 @@ type notificationMetricBucket struct {
 	counts        [notificationCounterCount]atomic.Int64
 	pushOutcomes  [pushOutcomeCount]atomic.Int64
 	latencies     [pushLatencyBucketCount]atomic.Int64
+	pushVersion   atomic.Uint64
 }
 
 // NotificationMetrics counts valid notifications received by one process.
@@ -192,10 +193,14 @@ func (m *NotificationMetrics) RecordPushOutcome(outcome PushOutcome, acceptedAt 
 			bucket.readers.Add(-1)
 			continue
 		}
+		// Publish the outcome and its matching latency bucket as one logical
+		// update. Snapshots use this sequence to reject a torn pair of loads.
+		bucket.pushVersion.Add(1)
 		bucket.pushOutcomes[outcome].Add(1)
 		if outcome == PushOutcomeSuccess {
 			bucket.latencies[pushLatencyBucketIndex(latency)].Add(1)
 		}
+		bucket.pushVersion.Add(1)
 		bucket.readers.Add(-1)
 		return
 	}
@@ -457,6 +462,7 @@ func (b *notificationMetricBucket) reset(second int64) {
 	for i := range b.latencies {
 		b.latencies[i].Store(0)
 	}
+	b.pushVersion.Store(0)
 	b.readers.Store(0)
 	b.writerPending.Store(false)
 }
@@ -479,6 +485,12 @@ func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]
 			return notificationUnsetEpoch, counts, outcomes, latencies, false
 		}
 		epoch := b.epoch.Load()
+		pushVersion := b.pushVersion.Load()
+		if pushVersion&1 != 0 {
+			b.readers.Add(-1)
+			runtime.Gosched()
+			continue
+		}
 		for i := range b.counts {
 			counts[i] = b.counts[i].Load()
 		}
@@ -487,6 +499,11 @@ func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]
 		}
 		for i := range b.latencies {
 			latencies[i] = b.latencies[i].Load()
+		}
+		if pushVersion != b.pushVersion.Load() {
+			b.readers.Add(-1)
+			runtime.Gosched()
+			continue
 		}
 		b.readers.Add(-1)
 		return epoch, counts, outcomes, latencies, true
