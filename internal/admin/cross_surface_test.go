@@ -111,14 +111,23 @@ func TestAuthenticatedJSONAndSSESharePushSnapshot(t *testing.T) {
 		t.Fatalf("JSON push payload = %+v, want %+v", gotJSON, want)
 	}
 
-	sseReq := httptest.NewRequestWithContext(ctx, http.MethodGet, "/admin/events", nil)
-	sseReq.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionID}) //nolint:gosec // G124: test cookie
-	sseRec := httptest.NewRecorder()
-	h.ServeHTTP(sseRec, sseReq)
-	if sseRec.Code != http.StatusOK {
-		t.Fatalf("authenticated SSE status = %d, want 200", sseRec.Code)
+	sseServer := httptest.NewServer(h)
+	t.Cleanup(sseServer.Close)
+	sseReq, err := http.NewRequestWithContext(ctx, http.MethodGet, sseServer.URL+"/admin/events", nil)
+	if err != nil {
+		t.Fatalf("new authenticated SSE request: %v", err)
 	}
-	sseJSON := extractPushTelemetryJSON(t, sseRec.Body.String())
+	sseReq.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionID}) //nolint:gosec // G124: test cookie
+	sseResponse, err := http.DefaultClient.Do(sseReq)
+	if err != nil {
+		t.Fatalf("authenticated SSE request: %v", err)
+	}
+	defer func() { _ = sseResponse.Body.Close() }() //nolint:errcheck // best-effort close
+	if sseResponse.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated SSE status = %d, want 200", sseResponse.StatusCode)
+	}
+	sseBody := readSSEUntil(t, sseResponse.Body, `<script id="push-telemetry" type="application/json">`, 5*time.Second)
+	sseJSON := extractPushTelemetryJSON(t, sseBody)
 	gotSSE := decodePushSurface(t, "SSE", pushFields(t, "SSE", sseJSON, false))
 	if gotSSE != gotJSON {
 		t.Fatalf("SSE push payload = %+v, JSON = %+v", gotSSE, gotJSON)

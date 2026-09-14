@@ -95,16 +95,22 @@ type notificationMetricBucket struct {
 	counts        [notificationCounterCount]atomic.Int64
 	pushOutcomes  [pushOutcomeCount]atomic.Int64
 	latencies     [pushLatencyBucketCount]atomic.Int64
-	pushVersion   atomic.Uint64
+	// pushVersion is a publication sequence. A writer claims an even version
+	// by changing it to odd, publishes the outcome and matching latency bucket,
+	// then stores the next even version. Snapshots accept only an unchanged,
+	// even sequence.
+	pushVersion atomic.Uint64
 }
 
 // NotificationMetrics counts valid notifications received by one process.
 // The state is intentionally independent of Postgres and is reset by creating
 // a new value at process startup.
 type NotificationMetrics struct {
-	now       func() time.Time
-	startedAt time.Time
-	buckets   [notificationBucketCount]notificationMetricBucket
+	now                   func() time.Time
+	startedAt             time.Time
+	buckets               [notificationBucketCount]notificationMetricBucket
+	beforePushPublication func()
+	beforePushLatency     func()
 }
 
 // NewNotificationMetrics creates an empty process-local notification
@@ -174,6 +180,11 @@ func (m *NotificationMetrics) RecordPushOutcome(outcome PushOutcome, acceptedAt 
 	}
 	second := now.Unix()
 	bucket := &m.buckets[notificationBucketIndex(second)]
+	beforePushPublication := m.beforePushPublication
+	beforePushLatency := m.beforePushLatency
+	if beforePushPublication != nil {
+		beforePushPublication()
+	}
 	for {
 		if bucket.epoch.Load() != second {
 			bucket.reset(second)
@@ -193,14 +204,22 @@ func (m *NotificationMetrics) RecordPushOutcome(outcome PushOutcome, acceptedAt 
 			bucket.readers.Add(-1)
 			continue
 		}
+		pushVersion := bucket.pushVersion.Load()
+		if pushVersion&1 != 0 || !bucket.pushVersion.CompareAndSwap(pushVersion, pushVersion+1) {
+			bucket.readers.Add(-1)
+			runtime.Gosched()
+			continue
+		}
 		// Publish the outcome and its matching latency bucket as one logical
 		// update. Snapshots use this sequence to reject a torn pair of loads.
-		bucket.pushVersion.Add(1)
 		bucket.pushOutcomes[outcome].Add(1)
 		if outcome == PushOutcomeSuccess {
+			if beforePushLatency != nil {
+				beforePushLatency()
+			}
 			bucket.latencies[pushLatencyBucketIndex(latency)].Add(1)
 		}
-		bucket.pushVersion.Add(1)
+		bucket.pushVersion.Store(pushVersion + 2)
 		bucket.readers.Add(-1)
 		return
 	}
