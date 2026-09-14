@@ -469,15 +469,21 @@ templ chipScript() {
 
 				var nextTimestamp = stream.getAttribute('data-sample-timestamp') || '';
 				var nextAge = parseAge(stream.getAttribute('data-sample-age-seconds'));
+				var observedAt = performance.now();
 				if (nextTimestamp && nextTimestamp !== sampleTimestamp) {
 					sampleTimestamp = nextTimestamp;
 					sampleAgeSeconds = nextAge;
-					sampleObservedAt = performance.now();
+					sampleObservedAt = observedAt;
 				} else if (nextTimestamp === sampleTimestamp) {
 					// A cached replay or stale fragment is not a new sample. Keep
 					// monotonic elapsed time and only accept a server age that is
-					// further ahead than the local clock.
-					sampleAgeSeconds = Math.max(sampleAgeSeconds, nextAge);
+					// further ahead than the local clock. Rebase when it is accepted
+					// so the elapsed interval is not counted a second time.
+					var localAge = Math.max(0, sampleAgeSeconds + (observedAt - sampleObservedAt) / 1000);
+					if (nextAge > localAge) {
+						sampleAgeSeconds = nextAge;
+						sampleObservedAt = observedAt;
+					}
 				}
 				sampleState = stream.getAttribute('data-sample-state') || sampleState;
 
