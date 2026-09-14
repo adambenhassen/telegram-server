@@ -28,6 +28,48 @@ func TestRateLimitDenialRecorderFailureIsContained(t *testing.T) {
 	api.RecordRateLimitDenialForTest(metrics, "message_send")
 }
 
+func TestRateLimitDenialTelemetryRecordsMessageSendFloodWait(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := openStore(t)
+	alice, err := s.CreateUser(ctx, "+15551297002")
+	if err != nil {
+		t.Fatalf("create sender: %v", err)
+	}
+	bob, err := s.CreateUser(ctx, "+15551297003")
+	if err != nil {
+		t.Fatalf("create recipient: %v", err)
+	}
+
+	metrics := store.NewNotificationMetrics()
+	limit := store.RateLimitConfig{Limit: 3, Window: time.Minute}
+	peerBob := api.InputPeerUser(alice.ID, bob.ID)
+	for i := range 3 {
+		if _, err := api.SendMessageForTestWithLimitsAndMetrics(s, metrics, alice.ID, limit, &tg.MessagesSendMessageRequest{
+			Peer: peerBob, Message: "message", RandomID: int64(i + 1),
+		}); err != nil {
+			t.Fatalf("admitted message %d: %v", i+1, err)
+		}
+	}
+
+	if got := metrics.Snapshot().RateLimitDenials; got.Count != 0 || got.BySurface != (store.RateLimitDenialSurfaceCounts{}) || got.Dropped != 0 {
+		t.Fatalf("after three admitted messages: denial snapshot = %+v, want empty", got)
+	}
+
+	if _, err := api.SendMessageForTestWithLimitsAndMetrics(s, metrics, alice.ID, limit, &tg.MessagesSendMessageRequest{
+		Peer: peerBob, Message: "blocked", RandomID: 4,
+	}); !isFloodWait(err) {
+		t.Fatalf("token-exhaustion message: expected FLOOD_WAIT, got %v", err)
+	}
+
+	want := store.RateLimitDenialSurfaceCounts{MessageSend: 1}
+	got := metrics.Snapshot().RateLimitDenials
+	if got.Count != 1 || got.BySurface != want || got.Dropped != 0 {
+		t.Fatalf("after returned FLOOD_WAIT: denial snapshot = %+v, want count 1, surfaces %+v, dropped 0", got, want)
+	}
+}
+
 func TestRateLimitDenialTelemetryFollowsRealHandlerOutcomes(t *testing.T) {
 	t.Parallel()
 

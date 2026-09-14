@@ -574,6 +574,20 @@ func SendMessageForTestWithLimits(s *store.Store, userID int64, rateLimit store.
 	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SendMessageForTestWithLimitsAndMetrics invokes handleSendMessage with a
+// shared rate-limit recorder, so external tests can assert the telemetry after
+// admitted and denied RPCs.
+func SendMessageForTestWithLimitsAndMetrics(s *store.Store, metrics *store.NotificationMetrics, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMetrics = metrics
+	h.rateLimitMessageSend = rateLimit
+	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SendMediaForTestWithLimits encodes req and invokes handleSendMedia with a
 // custom message send rate limit config.
 func SendMediaForTestWithLimits(
