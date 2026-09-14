@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -504,10 +505,49 @@ func DefaultFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	if err := metricsFragmentTmpl.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("render metrics fragment: %w", err)
 	}
-	return []Fragment{{Event: sseDefaultEvent, HTML: buf.String()}}, nil
+	telemetry, err := pushTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	html := strings.TrimSuffix(buf.String(), `</div>`) + telemetry + `</div>`
+	return []Fragment{{Event: sseDefaultEvent, HTML: html}}, nil
 }
 
 var metricsFragmentTmpl = template.Must(template.New("metrics-fragment").Parse(metricsFragmentHTML))
+
+type pushTelemetryPayload struct {
+	PushLatencyP50                 float64      `json:"push_latency_p50_ms"`
+	PushLatencyP50Overflow         bool         `json:"push_latency_p50_overflow"`
+	PushLatencyP95                 float64      `json:"push_latency_p95_ms"`
+	PushLatencyP95Overflow         bool         `json:"push_latency_p95_overflow"`
+	PushLatencySampleCount         int64        `json:"push_latency_sample_count"`
+	PushWindowSeconds              float64      `json:"push_window_seconds"`
+	PushOutcomes                   PushOutcomes `json:"push_outcomes"`
+	PushLatencyBucketUpperBoundsMS [15]float64  `json:"push_latency_bucket_upper_bounds_ms"`
+	PushLatencyBucketCounts        [16]int64    `json:"push_latency_bucket_counts"`
+}
+
+func pushTelemetryHTML(m MetricsResponse) (string, error) {
+	payload := pushTelemetryPayload{
+		PushLatencyP50:                 m.PushLatencyP50,
+		PushLatencyP50Overflow:         m.PushLatencyP50Overflow,
+		PushLatencyP95:                 m.PushLatencyP95,
+		PushLatencyP95Overflow:         m.PushLatencyP95Overflow,
+		PushLatencySampleCount:         m.PushLatencySampleCount,
+		PushWindowSeconds:              m.PushWindowSeconds,
+		PushOutcomes:                   m.PushOutcomes,
+		PushLatencyBucketUpperBoundsMS: m.PushLatencyBucketUpperBoundsMS,
+		PushLatencyBucketCounts:        m.PushLatencyBucketCounts,
+	}
+	if payload.PushLatencyBucketUpperBoundsMS == ([15]float64{}) {
+		payload.PushLatencyBucketUpperBoundsMS = store.PushLatencyBucketUpperBoundsMilliseconds()
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal push telemetry: %w", err)
+	}
+	return `<script id="push-telemetry" type="application/json">` + string(data) + `</script>`, nil
+}
 
 // metricsFragmentHTML mirrors the data-metric attributes the dashboard uses, so
 // a patch target can address the same values it server-rendered on first paint.

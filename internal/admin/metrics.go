@@ -17,10 +17,6 @@ import (
 //
 // All values are point-in-time snapshots or rolling-window counters. No per-user
 // data, no PII, no message content.
-//
-// PushLatencyP50 and PushLatencyP95 are placeholder zeroes: push delivery
-// latency is not yet instrumented. They are included so the response schema is
-// stable when instrumentation lands.
 type MetricsResponse struct {
 	// Timestamp is the server time at which this snapshot was assembled.
 	Timestamp time.Time `json:"timestamp"`
@@ -68,12 +64,31 @@ type MetricsResponse struct {
 	// notifications. It has no channel label.
 	NotifyInvalid int64 `json:"notify_invalid"`
 
-	// PushLatencyP50 is the p50 push delivery latency in milliseconds.
-	// Placeholder zero — push delivery latency is not yet instrumented.
+	// PushLatencyP50 is the p50 persisted-update push latency in milliseconds.
 	PushLatencyP50 float64 `json:"push_latency_p50_ms"`
-	// PushLatencyP95 is the p95 push delivery latency in milliseconds.
-	// Placeholder zero — push delivery latency is not yet instrumented.
+	// PushLatencyP50Overflow reports whether the p50 rank landed in the final
+	// bucket above the 60,000 ms finite bound.
+	PushLatencyP50Overflow bool `json:"push_latency_p50_overflow"`
+	// PushLatencyP95 is the p95 persisted-update push latency in milliseconds.
 	PushLatencyP95 float64 `json:"push_latency_p95_ms"`
+	// PushLatencyP95Overflow reports whether the p95 rank landed in the final
+	// bucket above the 60,000 ms finite bound.
+	PushLatencyP95Overflow bool `json:"push_latency_p95_overflow"`
+	// PushLatencySampleCount is the number of successful latency samples in the
+	// rolling observation window.
+	PushLatencySampleCount int64 `json:"push_latency_sample_count"`
+	// PushWindowSeconds is the rolling observation window used by push telemetry,
+	// capped at one hour and reset at process start.
+	PushWindowSeconds float64 `json:"push_window_seconds"`
+	// PushOutcomes holds one fixed count for every attempted persisted-update
+	// push result.
+	PushOutcomes PushOutcomes `json:"push_outcomes"`
+	// PushLatencyBucketUpperBoundsMS contains the 15 finite histogram bounds.
+	// The matching counts array has one additional final overflow bucket.
+	PushLatencyBucketUpperBoundsMS [15]float64 `json:"push_latency_bucket_upper_bounds_ms"`
+	// PushLatencyBucketCounts contains one disjoint count per finite bound and a
+	// final count for observations above 60,000 ms.
+	PushLatencyBucketCounts [16]int64 `json:"push_latency_bucket_counts"`
 
 	// RateLimitActive is the number of currently active rate-limit rows
 	// (rows that have not yet expired), approximating recent throttling activity.
@@ -102,6 +117,15 @@ type NotifyChannels struct {
 	EncryptedMsg int64 `json:"tg_encrypted_msg"`
 	Reactions    int64 `json:"tg_reactions"`
 	Pinned       int64 `json:"tg_pinned"`
+}
+
+// PushOutcomes holds one count for every fixed persisted-update push result.
+// No account, connection, peer, payload, or error label is retained.
+type PushOutcomes struct {
+	Success       int64 `json:"success"`
+	OwnerMismatch int64 `json:"owner_mismatch"`
+	EncodeFailure int64 `json:"encode_failure"`
+	WriteFailure  int64 `json:"write_failure"`
 }
 
 // StorageRows is approximate row counts across key database tables,
@@ -185,27 +209,35 @@ func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store
 	}
 
 	notify := notificationSnapshot(notifyMetrics...)
+	pushUninstrumented := pushMetricsUninstrumented(notifyMetrics...)
 	return MetricsResponse{
-		Timestamp:           time.Now(),
-		Connections:         reg.TotalConns(),
-		Sessions:            reg.TotalSessions(),
-		TotalUsers:          snap.TotalUsers,
-		ActiveUsers1H:       snap.ActiveUsers1H,
-		ActiveUsers24H:      snap.ActiveUsers24H,
-		Messages1H:          snap.Messages1H,
-		Messages24H:         snap.Messages24H,
-		TotalChannels:       snap.TotalChannels,
-		TotalChats:          snap.TotalChats,
-		MaxPtsGap:           maxGap,
-		NotifyCount:         notify.NotifyCount,
-		NotifyWindowSeconds: notify.WindowSeconds,
-		NotifyRatePerSecond: notify.RatePerSecond,
-		NotifyChannels:      notificationChannels(notify.Channels),
-		NotifyInvalid:       notify.Invalid,
-		PushLatencyP50:      0, // not yet instrumented
-		PushLatencyP95:      0, // not yet instrumented
-		Uninstrumented:      []string{"push_latency_p50_ms", "push_latency_p95_ms"},
-		RateLimitActive:     snap.RateLimitHits1H,
+		Timestamp:                      time.Now(),
+		Connections:                    reg.TotalConns(),
+		Sessions:                       reg.TotalSessions(),
+		TotalUsers:                     snap.TotalUsers,
+		ActiveUsers1H:                  snap.ActiveUsers1H,
+		ActiveUsers24H:                 snap.ActiveUsers24H,
+		Messages1H:                     snap.Messages1H,
+		Messages24H:                    snap.Messages24H,
+		TotalChannels:                  snap.TotalChannels,
+		TotalChats:                     snap.TotalChats,
+		MaxPtsGap:                      maxGap,
+		NotifyCount:                    notify.NotifyCount,
+		NotifyWindowSeconds:            notify.WindowSeconds,
+		NotifyRatePerSecond:            notify.RatePerSecond,
+		NotifyChannels:                 notificationChannels(notify.Channels),
+		NotifyInvalid:                  notify.Invalid,
+		PushLatencyP50:                 notify.Push.P50Milliseconds,
+		PushLatencyP50Overflow:         notify.Push.P50Overflow,
+		PushLatencyP95:                 notify.Push.P95Milliseconds,
+		PushLatencyP95Overflow:         notify.Push.P95Overflow,
+		PushLatencySampleCount:         notify.Push.SampleCount,
+		PushWindowSeconds:              notify.Push.WindowSeconds,
+		PushOutcomes:                   pushOutcomes(notify.Push.Outcomes),
+		PushLatencyBucketUpperBoundsMS: pushBucketUpperBounds(notify.Push),
+		PushLatencyBucketCounts:        notify.Push.LatencyBucketCounts,
+		Uninstrumented:                 pushUninstrumented,
+		RateLimitActive:                snap.RateLimitHits1H,
 		StorageRows: StorageRows{
 			Users:           snap.StorageRows.Users,
 			Messages:        snap.StorageRows.Messages,
@@ -236,6 +268,38 @@ func applyNotificationSnapshot(resp *MetricsResponse, notifyMetrics *store.Notif
 	resp.NotifyRatePerSecond = notify.RatePerSecond
 	resp.NotifyChannels = notificationChannels(notify.Channels)
 	resp.NotifyInvalid = notify.Invalid
+	resp.PushLatencyP50 = notify.Push.P50Milliseconds
+	resp.PushLatencyP50Overflow = notify.Push.P50Overflow
+	resp.PushLatencyP95 = notify.Push.P95Milliseconds
+	resp.PushLatencyP95Overflow = notify.Push.P95Overflow
+	resp.PushLatencySampleCount = notify.Push.SampleCount
+	resp.PushWindowSeconds = notify.Push.WindowSeconds
+	resp.PushOutcomes = pushOutcomes(notify.Push.Outcomes)
+	resp.PushLatencyBucketUpperBoundsMS = pushBucketUpperBounds(notify.Push)
+	resp.PushLatencyBucketCounts = notify.Push.LatencyBucketCounts
+	resp.Uninstrumented = removePushPercentileUninstrumented(resp.Uninstrumented)
+}
+
+func pushMetricsUninstrumented(notifyMetrics ...*store.NotificationMetrics) []string {
+	fields := []string{"push_latency_p50_ms", "push_latency_p95_ms"}
+	if len(notifyMetrics) > 0 && notifyMetrics[0] != nil {
+		return removePushPercentileUninstrumented(fields)
+	}
+	return fields
+}
+
+func removePushPercentileUninstrumented(fields []string) []string {
+	if len(fields) == 0 {
+		return fields
+	}
+	filtered := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if field == "push_latency_p50_ms" || field == "push_latency_p95_ms" {
+			continue
+		}
+		filtered = append(filtered, field)
+	}
+	return filtered
 }
 
 func notificationChannels(channels store.NotificationChannelCounts) NotifyChannels {
@@ -250,6 +314,22 @@ func notificationChannels(channels store.NotificationChannelCounts) NotifyChanne
 		Reactions:    channels.Reactions,
 		Pinned:       channels.Pinned,
 	}
+}
+
+func pushOutcomes(outcomes store.PushOutcomeCounts) PushOutcomes {
+	return PushOutcomes{
+		Success:       outcomes.Success,
+		OwnerMismatch: outcomes.OwnerMismatch,
+		EncodeFailure: outcomes.EncodeFailure,
+		WriteFailure:  outcomes.WriteFailure,
+	}
+}
+
+func pushBucketUpperBounds(push store.PushMetricsSnapshot) [15]float64 {
+	if push.LatencyBucketUpperBoundsMilliseconds == ([15]float64{}) {
+		return store.PushLatencyBucketUpperBoundsMilliseconds()
+	}
+	return push.LatencyBucketUpperBoundsMilliseconds
 }
 
 // get returns the cached metrics response.

@@ -29,6 +29,11 @@ func DashboardFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	if err := metricsFragment(d).Render(context.Background(), &buf); err != nil {
 		return nil, fmt.Errorf("render metrics fragment: %w", err)
 	}
+	telemetry, err := pushTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	buf.WriteString(telemetry)
 	buf.WriteString(`</div>`)
 	return []Fragment{{Event: sseDefaultEvent, HTML: buf.String()}}, nil
 }
