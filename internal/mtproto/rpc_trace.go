@@ -397,6 +397,13 @@ func requestRPCResult(req *Request, err error) RPCResultClass {
 	return ClassifyRPCError(err)
 }
 
+func requestRPCMethod(req *Request) string {
+	if req != nil && req.rpcMethod != "" {
+		return req.rpcMethod
+	}
+	return UnknownRPCMethod
+}
+
 // TraceRPCs records one span around each request handed to next. The request's
 // dispatcher-selected method is used after wrappers have been peeled, so
 // invokeWithLayer and similar wrappers cannot create extra spans or labels.
@@ -418,11 +425,7 @@ type rpcTraceHandler struct {
 func (h *rpcTraceHandler) OnMessage(c *Conn, req *Request) (err error) {
 	handle := h.tracer.Start()
 	defer func() {
-		method := UnknownRPCMethod
-		if req != nil && req.rpcMethod != "" {
-			method = req.rpcMethod
-		}
-		h.tracer.Finish(handle, method, requestRPCResult(req, err))
+		h.tracer.Finish(handle, requestRPCMethod(req), requestRPCResult(req, err))
 	}()
 	return h.next.OnMessage(c, req)
 }

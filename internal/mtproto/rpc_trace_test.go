@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/netip"
 	"strconv"
 	"sync"
@@ -13,10 +14,17 @@ import (
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
+	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/peerhash"
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 func TestRPCTraceRecordsAllResultClasses(t *testing.T) {
@@ -166,6 +174,199 @@ func TestRPCTraceDoesNotRetainRequestData(t *testing.T) {
 		if contains(got, forbidden) {
 			t.Fatalf("span snapshot retained forbidden request data: %q", got)
 		}
+	}
+}
+
+func TestRPCTraceIncludesFallbackReplyFailure(t *testing.T) {
+	t.Parallel()
+
+	key := rebindTestKey()
+	start := time.Unix(1_700_000_000, 0)
+	now := start
+	exporter := mtproto.NewMemoryRPCSpanExporter(1)
+	tracer := mtproto.NewRPCTracer(mtproto.RPCTracerConfig{
+		Exporter: exporter,
+		Now:      func() time.Time { return now },
+	})
+	d := mtproto.NewDispatcher()
+	d.Fallback(mtproto.HandlerFunc(func(_ *mtproto.Conn, _ *mtproto.Request) error {
+		now = now.Add(5 * time.Millisecond)
+		return tgerr.New(420, "FLOOD_WAIT_7")
+	}))
+	srv := mtproto.New(exchange.PrivateKey{}, 2, &statusKeyStore{key: key, users: []int64{0}}, d, nil)
+	srv.SetRPCTracer(tracer)
+
+	var sends int
+	conn := &scriptedConn{
+		frames: [][]byte{statusClientFrame(t, key, 42, 1<<32, &tg.UsersGetUsersRequest{})},
+		sendFn: func() error {
+			sends++
+			if sends == 1 {
+				return nil
+			}
+			now = now.Add(7 * time.Millisecond)
+			return io.ErrClosedPipe
+		},
+	}
+	if err := srv.ServeConn(context.Background(), conn); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("ServeConn = %v, want closed-pipe reply failure", err)
+	}
+	if sends != 2 {
+		t.Fatalf("transport writes = %d, want session-created and fallback replies", sends)
+	}
+	if err := tracer.Close(); err != nil {
+		t.Fatalf("close tracer: %v", err)
+	}
+
+	spans := exporter.Spans()
+	if len(spans) != 1 {
+		t.Fatalf("spans = %d, want 1", len(spans))
+	}
+	if spans[0].Method != mtproto.UnknownRPCMethod {
+		t.Fatalf("method = %q, want %q", spans[0].Method, mtproto.UnknownRPCMethod)
+	}
+	if spans[0].Result != mtproto.RPCResultTransportFailure {
+		t.Fatalf("result = %q, want %q", spans[0].Result, mtproto.RPCResultTransportFailure)
+	}
+	if spans[0].Duration != 12*time.Millisecond {
+		t.Fatalf("duration = %s, want 12ms", spans[0].Duration)
+	}
+}
+
+func TestRPCTraceRealRateLimitReplyPath(t *testing.T) {
+	t.Parallel()
+
+	const (
+		sentinelBody   = "sentinel-rpc-body-user-991337"
+		sentinelDevice = "sentinel-rpc-device-991337"
+		sentinelAddr   = "198.51.100.88"
+		sentinelUserID = int64(991337)
+		sentinelPeerID = int64(991338)
+	)
+	for _, test := range []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "enabled", enabled: true},
+		{name: "disabled", enabled: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			blobs, err := blob.NewLocal(t.TempDir())
+			if err != nil {
+				t.Fatalf("blob store: %v", err)
+			}
+			s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(blobs))
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := s.Close(); err != nil {
+					t.Errorf("close store: %v", err)
+				}
+			})
+
+			limit := store.RateLimitConfig{Limit: 1, Window: time.Minute}
+			if _, err := s.CheckRateLimit(ctx, sentinelUserID, "message_send", limit); err != nil {
+				t.Fatalf("seed rate limit: %v", err)
+			}
+			handler := api.New(
+				s,
+				2,
+				api.DefaultConfig(2, "127.0.0.1", 0),
+				slog.New(slog.DiscardHandler),
+				false,
+				100<<20,
+				blobs,
+				2<<30,
+				pgtest.PeerDeriver(),
+				config.RateLimitsConfig{MessageSend: limit},
+				config.RegistrationClosed,
+			)
+
+			var exporter *mtproto.MemoryRPCSpanExporter
+			var tracer *mtproto.RPCTracer
+			if test.enabled {
+				exporter = mtproto.NewMemoryRPCSpanExporter(1)
+				tracer = mtproto.NewRPCTracer(mtproto.RPCTracerConfig{Exporter: exporter})
+			} else {
+				tracer = mtproto.NewRPCTracer(mtproto.RPCTracerConfig{})
+			}
+			t.Cleanup(func() {
+				if err := tracer.Close(); err != nil {
+					t.Errorf("close tracer: %v", err)
+				}
+			})
+
+			var body bin.Buffer
+			wrapped := &tg.InvokeWithLayerRequest{
+				Layer: 100,
+				Query: &tg.InitConnectionRequest{
+					APIID:          1,
+					DeviceModel:    sentinelDevice,
+					SystemVersion:  "test-system",
+					AppVersion:     "test-app",
+					SystemLangCode: "en",
+					LangPack:       "",
+					LangCode:       "en",
+					Query: &tg.MessagesSendMessageRequest{
+						Peer: &tg.InputPeerUser{
+							UserID:     sentinelPeerID,
+							AccessHash: pgtest.PeerDeriver().Derive(sentinelUserID, peerhash.KindUser, sentinelPeerID),
+						},
+						Message:  sentinelBody,
+						RandomID: 0,
+					},
+				},
+			}
+			if err := wrapped.Encode(&body); err != nil {
+				t.Fatalf("encode request: %v", err)
+			}
+			req := &mtproto.Request{
+				UserID:     sentinelUserID,
+				ClientAddr: netip.MustParseAddr(sentinelAddr),
+				MsgID:      1 << 32,
+				Buf:        &body,
+				Ctx:        ctx,
+			}
+			transport := &fakeConn{sendErr: io.ErrClosedPipe}
+			conn := mtproto.NewTestConn(transport, rebindTestKey())
+			if err := tracer.Wrap(handler).OnMessage(conn, req); !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("OnMessage = %v, want closed-pipe reply failure", err)
+			}
+			if got := transport.writes(); got != 1 {
+				t.Fatalf("transport writes = %d, want one SendErr reply", got)
+			}
+
+			if err := tracer.Close(); err != nil {
+				t.Fatalf("flush tracer: %v", err)
+			}
+			if test.enabled {
+				spans := exporter.Spans()
+				if len(spans) != 1 {
+					t.Fatalf("spans = %d, want 1", len(spans))
+				}
+				span := spans[0]
+				if span.Method != "messages.sendMessage" {
+					t.Fatalf("method = %q, want messages.sendMessage", span.Method)
+				}
+				if span.Result != mtproto.RPCResultTransportFailure {
+					t.Fatalf("result = %q, want %q", span.Result, mtproto.RPCResultTransportFailure)
+				}
+				if span.Duration < 0 {
+					t.Fatalf("duration = %s, want non-negative", span.Duration)
+				}
+				got := fmt.Sprint(spans)
+				for _, forbidden := range []string{sentinelBody, sentinelDevice, sentinelAddr, strconv.FormatInt(sentinelUserID, 10)} {
+					if contains(got, forbidden) {
+						t.Fatalf("span snapshot retained forbidden request data: %q", got)
+					}
+				}
+			} else if got := tracer.Snapshot(); got != (mtproto.RPCTracerSnapshot{}) {
+				t.Fatalf("disabled tracer snapshot = %+v, want zero", got)
+			}
+		})
 	}
 }
 
