@@ -10,5 +10,10 @@ CREATE TABLE server_administration (
     CHECK (election_closed OR administrator_user_id IS NULL)
 );
 
+-- Serialize the emptiness decision against legacy user inserts. SHARE conflicts
+-- with the ROW EXCLUSIVE lock acquired by INSERT and remains held through the
+-- initialization insert in the migration transaction.
+LOCK TABLE users IN SHARE MODE;
+
 INSERT INTO server_administration (singleton_id, election_closed)
 SELECT 1, EXISTS (SELECT 1 FROM users);

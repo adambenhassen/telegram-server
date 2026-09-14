@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -103,6 +104,150 @@ func TestServerAdministrationMigrationClosesNonEmptyDatabase(t *testing.T) {
 	}
 	if rows != 1 || !closed || administrator != nil {
 		t.Fatalf("migrated administration = rows %d closed %v administrator %v, want 1/true/nil", rows, closed, administrator)
+	}
+}
+
+// TestServerAdministrationMigrationSerializesLegacyInsert proves migration 39
+// cannot decide that the database is empty while an old server's user insert is
+// still in flight. The migration must wait for the writer, then observe the
+// committed user and close the election without assigning an administrator.
+func TestServerAdministrationMigrationSerializesLegacyInsert(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const administrationMigration = "20260913000039_server_administration.sql"
+
+	migs, err := os.ReadDir(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatalf("read migrations dir: %v", err)
+	}
+	admin, err := pgx.Connect(ctx, pgtest.AdminDSN())
+	if err != nil {
+		t.Fatalf("admin connect: %v", err)
+	}
+	defer func() { _ = admin.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	name := "t_" + pgtest.RandomHex()
+	if _, err := admin.Exec(ctx, `CREATE DATABASE `+name); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	t.Cleanup(func() {
+		conn, err := pgx.Connect(context.Background(), pgtest.AdminDSN())
+		if err != nil {
+			t.Logf("cleanup connect: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close(context.Background()) }() //nolint:errcheck // best-effort close
+		if _, err := conn.Exec(context.Background(), `DROP DATABASE IF EXISTS `+name+` WITH (FORCE)`); err != nil {
+			t.Logf("cleanup drop %s: %v", name, err)
+		}
+	})
+
+	dsn := pgtest.DSNFrom(name)
+	legacyConn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("legacy connect: %v", err)
+	}
+	defer func() { _ = legacyConn.Close(ctx) }() //nolint:errcheck // best-effort close
+	migrationConn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("migration connect: %v", err)
+	}
+	defer func() { _ = migrationConn.Close(ctx) }() //nolint:errcheck // best-effort close
+	observerConn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("observer connect: %v", err)
+	}
+	defer func() { _ = observerConn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	for _, entry := range migs {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= administrationMigration {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join("..", "..", "migrations", entry.Name()))
+		if err != nil {
+			t.Fatalf("read migration %s: %v", entry.Name(), err)
+		}
+		if _, err := legacyConn.Exec(ctx, string(body)); err != nil {
+			t.Fatalf("apply migration %s: %v", entry.Name(), err)
+		}
+	}
+	body, err := os.ReadFile(filepath.Join("..", "..", "migrations", administrationMigration))
+	if err != nil {
+		t.Fatalf("read administration migration: %v", err)
+	}
+	const lockStatement = "LOCK TABLE users IN SHARE MODE;"
+	lockOffset := strings.Index(string(body), lockStatement)
+	if lockOffset < 0 {
+		t.Fatalf("administration migration must serialize users before initialization")
+	}
+	if _, err := migrationConn.Exec(ctx, string(body[:lockOffset])); err != nil {
+		t.Fatalf("apply administration table creation: %v", err)
+	}
+
+	legacyTx, err := legacyConn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin legacy insert: %v", err)
+	}
+	defer func() { _ = legacyTx.Rollback(ctx) }() //nolint:errcheck // rollback after commit is a no-op
+	if _, err := legacyTx.Exec(ctx, `INSERT INTO users (phone) VALUES ($1)`, "1555000"+pgtest.RandomHex()); err != nil {
+		t.Fatalf("legacy insert: %v", err)
+	}
+
+	var migrationPID int32
+	if err := migrationConn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&migrationPID); err != nil {
+		t.Fatalf("read migration backend pid: %v", err)
+	}
+	migrationDone := make(chan error, 1)
+	go func() {
+		_, err := migrationConn.Exec(ctx, string(body[lockOffset:]))
+		migrationDone <- err
+	}()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for {
+		var waiting bool
+		if err := observerConn.QueryRow(waitCtx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_locks
+				WHERE pid = $1
+				  AND relation = 'public.users'::regclass
+				  AND NOT granted
+			)
+		`, migrationPID).Scan(&waiting); err != nil {
+			t.Fatalf("observe migration lock: %v", err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-migrationDone:
+			t.Fatalf("migration completed before waiting for legacy insert: %v", err)
+		case <-waitCtx.Done():
+			t.Fatalf("migration did not wait for legacy insert: %v", waitCtx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	if err := legacyTx.Commit(ctx); err != nil {
+		t.Fatalf("commit legacy insert: %v", err)
+	}
+	if err := <-migrationDone; err != nil {
+		t.Fatalf("apply administration migration: %v", err)
+	}
+
+	var closed bool
+	var administrator *int64
+	if err := observerConn.QueryRow(ctx, `
+		SELECT election_closed, administrator_user_id
+		FROM server_administration
+		WHERE singleton_id = 1
+	`).Scan(&closed, &administrator); err != nil {
+		t.Fatalf("read migrated administration: %v", err)
+	}
+	if !closed || administrator != nil {
+		t.Fatalf("migrated administration = closed %v administrator %v, want true/nil", closed, administrator)
 	}
 }
 
