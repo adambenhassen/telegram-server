@@ -1,6 +1,9 @@
 package mtproto
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // SessionRegistry tracks the live connections for each authenticated user so the
 // update-delivery path can push server-initiated messages to a user's sockets. A
@@ -8,6 +11,25 @@ import "sync"
 type SessionRegistry struct {
 	mu sync.Mutex
 	m  map[int64][]*Conn
+}
+
+// DeliveryLagSample is the aggregate result of sampling the live authenticated
+// connections in one registry snapshot. It carries no account or connection
+// identity; the registry keeps those details private to the sampling pass.
+type DeliveryLagSample struct {
+	EligibleConnections int
+	SampledConnections  int
+	WorstPts            int64
+}
+
+type deliveryLagConnection struct {
+	ownerID int64
+	conn    *Conn
+}
+
+type deliveryLagHead struct {
+	head int64
+	ok   bool
 }
 
 // NewSessionRegistry creates an empty registry.
@@ -80,4 +102,55 @@ func (r *SessionRegistry) TotalSessions() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.m)
+}
+
+// SampleDeliveryLag snapshots the registry, then reads each distinct account
+// head once and compares it with every connection for that account. The
+// accountHead callback runs after the registry lock is released, so database
+// work never blocks connection registration, removal, or delivery.
+//
+// An account-head error leaves all of that account's connections unsampled.
+// The caller can therefore distinguish a partial or empty sample from a
+// complete zero without publishing a fabricated caught-up result.
+func (r *SessionRegistry) SampleDeliveryLag(
+	ctx context.Context,
+	accountHead func(context.Context, int64) (int64, error),
+) DeliveryLagSample {
+	r.mu.Lock()
+	connections := make([]deliveryLagConnection, 0)
+	for ownerID, conns := range r.m {
+		for _, conn := range conns {
+			connections = append(connections, deliveryLagConnection{ownerID: ownerID, conn: conn})
+		}
+	}
+	r.mu.Unlock()
+
+	sample := DeliveryLagSample{EligibleConnections: len(connections)}
+	if len(connections) == 0 || accountHead == nil {
+		return sample
+	}
+
+	heads := make(map[int64]deliveryLagHead, len(connections))
+	for _, connection := range connections {
+		result, ok := heads[connection.ownerID]
+		if !ok {
+			head, err := accountHead(ctx, connection.ownerID)
+			result = deliveryLagHead{head: head, ok: err == nil}
+			heads[connection.ownerID] = result
+		}
+		if !result.ok || connection.conn == nil {
+			continue
+		}
+
+		sample.SampledConnections++
+		watermark := int64(connection.conn.LastPushedPts())
+		if result.head <= watermark {
+			continue
+		}
+		lag := result.head - watermark
+		if lag > sample.WorstPts {
+			sample.WorstPts = lag
+		}
+	}
+	return sample
 }

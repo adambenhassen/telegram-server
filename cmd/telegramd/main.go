@@ -429,9 +429,12 @@ func run(log *slog.Logger) error {
 		adminOrigin := "http://" + net.JoinHostPort(adminHost, adminPort)
 
 		// One shared sampler feeds every dashboard stream; it idles while
-		// nobody is connected.
+		// nobody is connected. Delivery lag state is shared with JSON and the
+		// dashboard so all authenticated surfaces retain the same complete
+		// sample after a partial attempt.
+		deliveryLag := admin.NewDeliveryLagSampler()
 		events := admin.NewBroadcaster(admin.BroadcasterConfig{
-			Sample: admin.NewMetricsSampler(server.Registry(), st, notifyMetrics),
+			Sample: admin.NewMetricsSamplerWithDeliveryLag(server.Registry(), st, deliveryLag, notifyMetrics),
 			Logger: log,
 			Render: admin.DashboardFragmentRenderer,
 		})
@@ -447,6 +450,7 @@ func run(log *slog.Logger) error {
 			AdminOrigin:   adminOrigin,
 			Events:        events,
 			NotifyMetrics: notifyMetrics,
+			DeliveryLag:   deliveryLag,
 		}, server.Registry())
 		adminSrv := &http.Server{
 			Addr:              cfg.AdminListenAddr,

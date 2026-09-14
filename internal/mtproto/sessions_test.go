@@ -1,8 +1,12 @@
 package mtproto_test
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
+
+	"github.com/gotd/td/mt"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
@@ -176,4 +180,81 @@ func TestSessionRegistry_TotalSessions(t *testing.T) {
 	if got := r.TotalSessions(); got != 0 {
 		t.Errorf("empty: expected 0, got %d", got)
 	}
+}
+
+func TestSessionRegistrySampleDeliveryLagDeduplicatesHeads(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	r := mtproto.NewSessionRegistry()
+	a := mtproto.NewTestConn(&fakeConn{}, testKey(t))
+	b := mtproto.NewTestConn(&fakeConn{}, testKey(t))
+	c := mtproto.NewTestConn(&fakeConn{}, testKey(t))
+	a.SetOwner(7)
+	b.SetOwner(7)
+	c.SetOwner(9)
+	for _, item := range []struct {
+		conn *mtproto.Conn
+		pts  int
+	}{
+		{a, 8}, {b, 10}, {c, 10},
+	} {
+		if _, err := item.conn.PushTo(ctx, map[*mtproto.Conn]int64{a: 7, b: 7, c: 9}[item.conn], &mt.Pong{PingID: 1}, item.pts); err != nil {
+			t.Fatalf("set watermark %d: %v", item.pts, err)
+		}
+	}
+	if !r.Add(7, a) || !r.Add(7, b) || !r.Add(9, c) {
+		t.Fatal("register connections")
+	}
+
+	var calls = map[int64]int{}
+	sample := r.SampleDeliveryLag(ctx, func(_ context.Context, userID int64) (int64, error) {
+		calls[userID]++
+		if userID == 7 {
+			return 11, nil
+		}
+		return 4, nil
+	})
+	if sample.EligibleConnections != 3 {
+		t.Errorf("eligible connections = %d, want 3", sample.EligibleConnections)
+	}
+	if sample.SampledConnections != 3 {
+		t.Errorf("sampled connections = %d, want 3", sample.SampledConnections)
+	}
+	if sample.WorstPts != 3 {
+		t.Errorf("worst pts = %d, want 3", sample.WorstPts)
+	}
+	if calls[7] != 1 || calls[9] != 1 {
+		t.Errorf("account-head calls = %v, want one call per account", calls)
+	}
+
+	partial := r.SampleDeliveryLag(ctx, func(_ context.Context, userID int64) (int64, error) {
+		if userID == 7 {
+			return 0, errors.New("head unavailable")
+		}
+		return 4, nil
+	})
+	if partial.EligibleConnections != 3 || partial.SampledConnections != 1 || partial.WorstPts != 0 {
+		t.Errorf("partial sample = %+v, want eligible=3 sampled=1 worst=0", partial)
+	}
+}
+
+func TestSessionRegistryConcurrentDeliveryLagSampling(t *testing.T) {
+	t.Parallel()
+
+	r := mtproto.NewSessionRegistry()
+	var wg sync.WaitGroup
+	for range 50 {
+		conn := &mtproto.Conn{}
+		wg.Go(func() {
+			for range 10 {
+				r.Add(1, conn)
+				_ = r.SampleDeliveryLag(context.Background(), func(context.Context, int64) (int64, error) {
+					return 1, nil
+				})
+				r.Remove(1, conn)
+			}
+		})
+	}
+	wg.Wait()
 }
