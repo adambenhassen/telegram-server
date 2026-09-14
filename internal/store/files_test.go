@@ -41,22 +41,23 @@ func allocate(t *testing.T, s *store.Store, uploaderID, size int64) store.File {
 func TestFilesRejectsNonPositiveID(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openStore(t, dsn)
+	uploader, err := s.CreateUser(ctx, "+15550000001")
+	if err != nil {
+		t.Fatalf("create uploader: %v", err)
+	}
 
-	conn, err := pgx.Connect(ctx, pgtest.DSN(t))
+	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
 
-	var uploaderID int64
-	if err := conn.QueryRow(ctx, `INSERT INTO users DEFAULT VALUES RETURNING id`).Scan(&uploaderID); err != nil {
-		t.Fatalf("create uploader: %v", err)
-	}
-
 	for _, id := range []int64{0, -1} {
 		_, err := conn.Exec(ctx,
 			`INSERT INTO files (id, uploader_id, access_hash, size, mime_type, file_name)
-			 VALUES ($1, $2, 1, 0, 'text/plain', 'x.txt')`, id, uploaderID)
+			 VALUES ($1, $2, 1, 0, 'text/plain', 'x.txt')`, id, uploader.ID)
 		if err == nil {
 			t.Fatalf("insert at files.id = %d must be refused", id)
 		}

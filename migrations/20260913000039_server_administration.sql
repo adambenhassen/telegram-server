@@ -10,6 +10,32 @@ CREATE TABLE server_administration (
     CHECK (election_closed OR administrator_user_id IS NULL)
 );
 
+-- The deferred constraint lets the current first-user transaction close the
+-- election after inserting its user, while rejecting legacy inserts that
+-- commit after migration initialized an open election.
+CREATE FUNCTION ensure_server_administration_closed()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM server_administration
+        WHERE singleton_id = 1
+          AND election_closed
+    ) THEN
+        RAISE EXCEPTION 'server administrator election is open';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER users_require_closed_server_administration
+AFTER INSERT ON users
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION ensure_server_administration_closed();
+
 -- Serialize the emptiness decision against legacy user inserts. SHARE conflicts
 -- with the ROW EXCLUSIVE lock acquired by INSERT and remains held through the
 -- initialization insert in the migration transaction.
