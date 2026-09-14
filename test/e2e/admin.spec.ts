@@ -590,6 +590,8 @@ test.describe('admin SSE stream', () => {
     // but never a data event, so the connected chip must age on its own timer.
     await page.clock.fastForward(41_000);
 
+    const performanceNow = await page.evaluate(() => performance.now());
+    expect(performanceNow).toBeGreaterThan(40_000);
     await expect(page.locator('#chip-text')).toHaveText(/^● Stale · updated \d+s ago$/);
     await expect(page.locator('#banner-disconnected')).toBeHidden();
 
