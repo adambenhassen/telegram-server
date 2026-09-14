@@ -358,7 +358,7 @@ test.describe('admin SSE stream', () => {
 
       emit('started');
       clock(0);
-      stream.setAttribute('data-sample-timestamp', '2026-09-14T12:00:00Z');
+      stream.setAttribute('data-sample-timestamp', '2099-09-14T12:00:00Z');
       stream.setAttribute('data-sample-age-seconds', '10');
       stream.setAttribute('data-sample-state', 'available');
       emit(dataEvent);
@@ -376,6 +376,78 @@ test.describe('admin SSE stream', () => {
     // The accepted server age is 20s at monotonic time 5s. Rebased timing
     // therefore reports 25s at time 10s; the old baseline reports 30s.
     expect(freshness).toBe('● Stale · updated 25s ago');
+  });
+
+  test('replays after failure preserve stale freshness state and age', async ({ page }) => {
+    await page.addInitScript(() => {
+      let sampleClock = 0;
+      Object.defineProperty(window, '__setSampleClock', {
+        value: (value: number) => {
+          sampleClock = value;
+        },
+      });
+      Object.defineProperty(performance, 'now', {
+        configurable: true,
+        value: () => sampleClock,
+      });
+    });
+    await page.route('**/admin/events', (route) => route.abort());
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    const freshness = await page.evaluate(() => {
+      const clock = window.__setSampleClock;
+      const stream = document.getElementById('metrics-stream');
+      const sseRoot = document.getElementById('sse-root');
+      const dataEvent = sseRoot?.getAttribute('data-sse-event');
+      if (!clock || !stream || !dataEvent) {
+        throw new Error('dashboard freshness test hooks are missing');
+      }
+
+      const emit = (type: string) => {
+        document.dispatchEvent(new CustomEvent('datastar-sse', {
+          detail: { type, elId: 'sse-root' },
+        }));
+      };
+
+      emit('started');
+      clock(0);
+      stream.setAttribute('data-sample-timestamp', '2099-09-14T12:00:00Z');
+      stream.setAttribute('data-sample-age-seconds', '10');
+      stream.setAttribute('data-sample-state', 'available');
+      emit(dataEvent);
+
+      // A failed refresh retains the complete sample as stale.
+      clock(5000);
+      stream.setAttribute('data-sample-age-seconds', '20');
+      stream.setAttribute('data-sample-state', 'stale');
+      emit(dataEvent);
+
+      // An equal-timestamp replay may advance server age, but cannot recover
+      // freshness from the retained stale sample.
+      clock(10000);
+      stream.setAttribute('data-sample-age-seconds', '26');
+      stream.setAttribute('data-sample-state', 'available');
+      emit(dataEvent);
+      const equalReplay = document.getElementById('chip-text')?.textContent ?? '';
+
+      // An older replay cannot reset the timestamp or monotonic age baseline.
+      clock(15000);
+      stream.setAttribute('data-sample-timestamp', '2099-09-14T11:59:00Z');
+      stream.setAttribute('data-sample-age-seconds', '0');
+      stream.setAttribute('data-sample-state', 'available');
+      emit(dataEvent);
+      const oldReplay = document.getElementById('chip-text')?.textContent ?? '';
+
+      return { equalReplay, oldReplay };
+    });
+
+    expect(freshness).toEqual({
+      equalReplay: '● Stale · updated 26s ago',
+      oldReplay: '● Stale · updated 31s ago',
+    });
   });
 
   // Criterion: the chip flips to its critical state when the stream ends and

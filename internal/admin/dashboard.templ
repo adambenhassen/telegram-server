@@ -451,6 +451,11 @@ templ chipScript() {
 				return isFinite(age) && age >= 0 ? age : 0;
 			}
 
+			function parseTimestamp(value) {
+				var timestamp = Date.parse(value);
+				return isFinite(timestamp) ? timestamp : NaN;
+			}
+
 			function ago(seconds) {
 				var s = Math.round(seconds);
 				if (s < 60) return s + 's ago';
@@ -470,11 +475,23 @@ templ chipScript() {
 				var nextTimestamp = stream.getAttribute('data-sample-timestamp') || '';
 				var nextAge = parseAge(stream.getAttribute('data-sample-age-seconds'));
 				var observedAt = performance.now();
-				if (nextTimestamp && nextTimestamp !== sampleTimestamp) {
+				var nextTimestampMs = parseTimestamp(nextTimestamp);
+				var sampleTimestampMs = parseTimestamp(sampleTimestamp);
+				var newerSample = isFinite(nextTimestampMs) &&
+					(!isFinite(sampleTimestampMs) || nextTimestampMs > sampleTimestampMs);
+				var sameSample = isFinite(nextTimestampMs) && isFinite(sampleTimestampMs) &&
+					nextTimestampMs === sampleTimestampMs;
+				if (!newerSample && !sameSample) return;
+
+				var nextState = stream.getAttribute('data-sample-state') || '';
+				if (newerSample) {
 					sampleTimestamp = nextTimestamp;
 					sampleAgeSeconds = nextAge;
 					sampleObservedAt = observedAt;
-				} else if (nextTimestamp === sampleTimestamp) {
+					if (nextState === 'available' || nextState === 'stale') {
+						sampleState = nextState;
+					}
+				} else {
 					// A cached replay or stale fragment is not a new sample. Keep
 					// monotonic elapsed time and only accept a server age that is
 					// further ahead than the local clock. Rebase when it is accepted
@@ -484,8 +501,10 @@ templ chipScript() {
 						sampleAgeSeconds = nextAge;
 						sampleObservedAt = observedAt;
 					}
+					if (nextState === 'stale' || (nextState === 'available' && sampleState !== 'stale')) {
+						sampleState = nextState;
+					}
 				}
-				sampleState = stream.getAttribute('data-sample-state') || sampleState;
 
 				var nextGeneration = stream.getAttribute('data-process-generation') || '';
 				var nextReplica = stream.getAttribute('data-replica-id') || '';
