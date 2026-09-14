@@ -54,8 +54,19 @@ type MetricsResponse struct {
 	MaxPtsGap int64 `json:"max_pts_gap"`
 
 	// NotifyCount is the number of Postgres NOTIFY events dispatched in the
-	// last hour. Zero if not yet instrumented.
+	// rolling observation window on this replica. It is delivery work: summing
+	// this value across replicas does not count unique committed events.
 	NotifyCount int64 `json:"notify_count"`
+	// NotifyWindowSeconds is the elapsed observation window, capped at one hour
+	// and reset when the process starts.
+	NotifyWindowSeconds float64 `json:"notify_window_seconds"`
+	// NotifyRatePerSecond is NotifyCount divided by NotifyWindowSeconds.
+	NotifyRatePerSecond float64 `json:"notify_rate_per_second"`
+	// NotifyChannels is the fixed per-channel distribution of valid notifications.
+	NotifyChannels NotifyChannels `json:"notify_channels"`
+	// NotifyInvalid is the aggregate count of malformed or unknown
+	// notifications. It has no channel label.
+	NotifyInvalid int64 `json:"notify_invalid"`
 
 	// PushLatencyP50 is the p50 push delivery latency in milliseconds.
 	// Placeholder zero — push delivery latency is not yet instrumented.
@@ -77,6 +88,20 @@ type MetricsResponse struct {
 
 	// StorageRows holds approximate row counts for key database tables.
 	StorageRows StorageRows `json:"storage_rows"`
+}
+
+// NotifyChannels holds one count for each compiled Postgres notification
+// channel. The fixed field set prevents input from creating metric series.
+type NotifyChannels struct {
+	Updates      int64 `json:"tg_updates"`
+	Typing       int64 `json:"tg_typing"`
+	Evict        int64 `json:"tg_evict"`
+	ChannelPost  int64 `json:"tg_channel_post"`
+	Encryption   int64 `json:"tg_encryption"`
+	Status       int64 `json:"tg_status"`
+	EncryptedMsg int64 `json:"tg_encrypted_msg"`
+	Reactions    int64 `json:"tg_reactions"`
+	Pinned       int64 `json:"tg_pinned"`
 }
 
 // StorageRows is approximate row counts across key database tables,
@@ -106,7 +131,7 @@ type metricsCache struct {
 
 // refresh re-reads metrics from the store and registry if enough time has
 // elapsed since the last refresh.
-func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store) {
+func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, notifyMetrics ...*store.NotificationMetrics) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -114,7 +139,7 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 		return
 	}
 
-	resp, err := collectMetrics(ctx, reg, st, tolerateGapFailure)
+	resp, err := collectMetrics(ctx, reg, st, tolerateGapFailure, notifyMetrics...)
 	if err != nil {
 		slog.Error("admin metrics refresh", "err", err)
 		c.lastErr = true
@@ -145,7 +170,7 @@ const (
 // collectMetrics assembles one metrics snapshot from the store and the session
 // registry. Both the cached JSON endpoint and the SSE broadcaster's shared
 // sampler read through it, so the two surfaces cannot drift apart.
-func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool) (MetricsResponse, error) {
+func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
 	snap, err := st.Metrics(ctx)
 	if err != nil {
 		return MetricsResponse{}, fmt.Errorf("collect metrics: %w", err)
@@ -159,23 +184,28 @@ func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store
 		maxGap = 0
 	}
 
+	notify := notificationSnapshot(notifyMetrics...)
 	return MetricsResponse{
-		Timestamp:       time.Now(),
-		Connections:     reg.TotalConns(),
-		Sessions:        reg.TotalSessions(),
-		TotalUsers:      snap.TotalUsers,
-		ActiveUsers1H:   snap.ActiveUsers1H,
-		ActiveUsers24H:  snap.ActiveUsers24H,
-		Messages1H:      snap.Messages1H,
-		Messages24H:     snap.Messages24H,
-		TotalChannels:   snap.TotalChannels,
-		TotalChats:      snap.TotalChats,
-		MaxPtsGap:       maxGap,
-		NotifyCount:     0, // not yet instrumented
-		PushLatencyP50:  0, // not yet instrumented
-		PushLatencyP95:  0, // not yet instrumented
-		Uninstrumented:  []string{"notify_count", "push_latency_p50_ms", "push_latency_p95_ms"},
-		RateLimitActive: snap.RateLimitHits1H,
+		Timestamp:           time.Now(),
+		Connections:         reg.TotalConns(),
+		Sessions:            reg.TotalSessions(),
+		TotalUsers:          snap.TotalUsers,
+		ActiveUsers1H:       snap.ActiveUsers1H,
+		ActiveUsers24H:      snap.ActiveUsers24H,
+		Messages1H:          snap.Messages1H,
+		Messages24H:         snap.Messages24H,
+		TotalChannels:       snap.TotalChannels,
+		TotalChats:          snap.TotalChats,
+		MaxPtsGap:           maxGap,
+		NotifyCount:         notify.NotifyCount,
+		NotifyWindowSeconds: notify.WindowSeconds,
+		NotifyRatePerSecond: notify.RatePerSecond,
+		NotifyChannels:      notificationChannels(notify.Channels),
+		NotifyInvalid:       notify.Invalid,
+		PushLatencyP50:      0, // not yet instrumented
+		PushLatencyP95:      0, // not yet instrumented
+		Uninstrumented:      []string{"push_latency_p50_ms", "push_latency_p95_ms"},
+		RateLimitActive:     snap.RateLimitHits1H,
 		StorageRows: StorageRows{
 			Users:           snap.StorageRows.Users,
 			Messages:        snap.StorageRows.Messages,
@@ -187,6 +217,39 @@ func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store
 			AuthKeys:        snap.StorageRows.AuthKeys,
 		},
 	}, nil
+}
+
+func notificationSnapshot(notifyMetrics ...*store.NotificationMetrics) store.NotificationMetricsSnapshot {
+	if len(notifyMetrics) == 0 || notifyMetrics[0] == nil {
+		return store.NotificationMetricsSnapshot{}
+	}
+	return notifyMetrics[0].Snapshot()
+}
+
+func applyNotificationSnapshot(resp *MetricsResponse, notifyMetrics *store.NotificationMetrics) {
+	if notifyMetrics == nil {
+		return
+	}
+	notify := notifyMetrics.Snapshot()
+	resp.NotifyCount = notify.NotifyCount
+	resp.NotifyWindowSeconds = notify.WindowSeconds
+	resp.NotifyRatePerSecond = notify.RatePerSecond
+	resp.NotifyChannels = notificationChannels(notify.Channels)
+	resp.NotifyInvalid = notify.Invalid
+}
+
+func notificationChannels(channels store.NotificationChannelCounts) NotifyChannels {
+	return NotifyChannels{
+		Updates:      channels.Updates,
+		Typing:       channels.Typing,
+		Evict:        channels.Evict,
+		ChannelPost:  channels.ChannelPost,
+		Encryption:   channels.Encryption,
+		Status:       channels.Status,
+		EncryptedMsg: channels.EncryptedMsg,
+		Reactions:    channels.Reactions,
+		Pinned:       channels.Pinned,
+	}
 }
 
 // get returns the cached metrics response.
@@ -208,7 +271,7 @@ func (c *metricsCache) failed() bool {
 // The handler reads from the provided registry and store on each request, but
 // caches results for at least cacheRefresh (10 s) to prevent N dashboard tabs
 // from costing N full query sets. No background goroutines are started.
-func Handler(registry *mtproto.SessionRegistry, st *store.Store) http.HandlerFunc {
+func Handler(registry *mtproto.SessionRegistry, st *store.Store, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
 	var cache metricsCache
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -217,12 +280,15 @@ func Handler(registry *mtproto.SessionRegistry, st *store.Store) http.HandlerFun
 			return
 		}
 
-		cache.refresh(r.Context(), registry, st)
+		cache.refresh(r.Context(), registry, st, notifyMetrics...)
 		if cache.failed() {
 			http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		resp := cache.get()
+		if len(notifyMetrics) > 0 {
+			applyNotificationSnapshot(&resp, notifyMetrics[0])
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
