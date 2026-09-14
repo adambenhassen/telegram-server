@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/mt"
 
@@ -256,6 +258,129 @@ func TestSessionRegistrySampleDeliveryLagZeroWatermark(t *testing.T) {
 	})
 	if sample.EligibleConnections != 1 || sample.SampledConnections != 1 || sample.WorstPts != 17 {
 		t.Fatalf("sample = %+v, want eligible=1 sampled=1 worst=17", sample)
+	}
+}
+
+func TestSessionRegistrySampleDeliveryLagCapsWork(t *testing.T) {
+	t.Parallel()
+
+	const eligible = 1025
+	r := mtproto.NewSessionRegistry()
+	for userID := int64(1); userID <= eligible; userID++ {
+		if !r.Add(userID, &mtproto.Conn{}) {
+			t.Fatalf("register connection for user %d", userID)
+		}
+	}
+
+	var calls atomic.Int64
+	sample := r.SampleDeliveryLag(context.Background(), func(context.Context, int64) (int64, error) {
+		calls.Add(1)
+		return 1, nil
+	})
+	if sample.EligibleConnections != eligible {
+		t.Fatalf("eligible connections = %d, want %d", sample.EligibleConnections, eligible)
+	}
+	if sample.SampledConnections != 1024 {
+		t.Fatalf("sampled connections = %d, want 1024", sample.SampledConnections)
+	}
+	if calls.Load() != 1024 {
+		t.Fatalf("account-head calls = %d, want 1024", calls.Load())
+	}
+	if !sample.Complete {
+		t.Fatal("bounded sample did not finish its selected work")
+	}
+}
+
+func TestSessionRegistrySampleDeliveryLagStopsOnCancellation(t *testing.T) {
+	t.Parallel()
+
+	r := mtproto.NewSessionRegistry()
+	for userID := int64(1); userID <= 3; userID++ {
+		if !r.Add(userID, &mtproto.Conn{}) {
+			t.Fatalf("register connection for user %d", userID)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int64
+	sample := r.SampleDeliveryLag(ctx, func(context.Context, int64) (int64, error) {
+		calls.Add(1)
+		cancel()
+		return 1, nil
+	})
+	if calls.Load() != 1 {
+		t.Fatalf("account-head calls = %d, want 1 after cancellation", calls.Load())
+	}
+	if sample.SampledConnections != 0 {
+		t.Fatalf("sampled connections = %d, want 0 after cancellation", sample.SampledConnections)
+	}
+	if sample.Complete {
+		t.Fatal("cancelled sample reported complete")
+	}
+}
+
+func TestSessionRegistrySampleDeliveryLagStopsAtDeadline(t *testing.T) {
+	t.Parallel()
+
+	r := mtproto.NewSessionRegistry()
+	for userID := int64(1); userID <= 3; userID++ {
+		if !r.Add(userID, &mtproto.Conn{}) {
+			t.Fatalf("register connection for user %d", userID)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	var calls atomic.Int64
+	sample := r.SampleDeliveryLag(ctx, func(ctx context.Context, _ int64) (int64, error) {
+		calls.Add(1)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	})
+	if calls.Load() != 1 {
+		t.Fatalf("account-head calls = %d, want 1 at deadline", calls.Load())
+	}
+	if sample.Complete || sample.SampledConnections != 0 {
+		t.Fatalf("deadline sample = %+v, want incomplete with no sampled connections", sample)
+	}
+}
+
+func TestSessionRegistryDeliveryLagSnapshotCountUnderChurn(t *testing.T) {
+	t.Parallel()
+
+	r := mtproto.NewSessionRegistry()
+	if !r.Add(1, &mtproto.Conn{}) {
+		t.Fatal("register initial connection")
+	}
+
+	headStarted := make(chan struct{})
+	releaseHead := make(chan struct{})
+	result := make(chan mtproto.DeliveryLagSample, 1)
+	go func() {
+		result <- r.SampleDeliveryLag(context.Background(), func(context.Context, int64) (int64, error) {
+			close(headStarted)
+			<-releaseHead
+			return 1, nil
+		})
+	}()
+	<-headStarted
+
+	for userID := int64(2); userID <= 4; userID++ {
+		if !r.Add(userID, &mtproto.Conn{}) {
+			t.Fatalf("register churn connection for user %d", userID)
+		}
+	}
+	close(releaseHead)
+	sample := <-result
+	if sample.EligibleConnections != 1 {
+		t.Fatalf("snapshot eligible connections = %d, want 1", sample.EligibleConnections)
+	}
+	if sample.SampledConnections != 1 {
+		t.Fatalf("snapshot sampled connections = %d, want 1", sample.SampledConnections)
+	}
+	if got := r.TotalConns(); got != 4 {
+		t.Fatalf("live connection count after concurrent adds = %d, want 4", got)
 	}
 }
 

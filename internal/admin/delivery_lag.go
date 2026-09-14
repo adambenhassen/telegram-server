@@ -87,23 +87,34 @@ func NewDeliveryLagSamplerWithClock(now func() time.Time) *DeliveryLagSampler {
 }
 
 func (s *DeliveryLagSampler) sample(ctx context.Context, registry *mtproto.SessionRegistry, st *store.Store) DeliveryLag {
+	return s.sampleWithAccountHead(ctx, registry, st.AccountHead)
+}
+
+func (s *DeliveryLagSampler) sampleWithAccountHead(
+	ctx context.Context,
+	registry *mtproto.SessionRegistry,
+	accountHead func(context.Context, int64) (int64, error),
+) DeliveryLag {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	sampleCtx, cancel := context.WithTimeout(ctx, deliveryLagSampleTimeout)
+	// The sampler owns its hard budget. A request that disconnects while the
+	// sample is in flight must not publish a partial result into the process
+	// shared state consumed by the other authenticated surfaces.
+	sampleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryLagSampleTimeout)
 	defer cancel()
 
 	attempt := s.attempt.Add(1)
-	raw := registry.SampleDeliveryLag(sampleCtx, st.AccountHead)
+	raw := registry.SampleDeliveryLag(sampleCtx, accountHead)
 	var sampledAt time.Time
-	if raw.SampledConnections == raw.EligibleConnections {
+	if raw.Complete && raw.SampledConnections == raw.EligibleConnections {
 		sampledAt = s.now().UTC()
 	}
 	return s.publish(attempt, raw, sampledAt)
 }
 
 func (s *DeliveryLagSampler) publish(attempt uint64, raw mtproto.DeliveryLagSample, sampledAt time.Time) DeliveryLag {
-	coverage := deliveryLagCoverage(raw.EligibleConnections, raw.SampledConnections)
+	coverage := deliveryLagCoverage(raw)
 	full := coverage == DeliveryLagCoverageFull
 
 	for {
@@ -146,9 +157,15 @@ func (s *DeliveryLagSampler) Snapshot() DeliveryLag {
 	return deliveryLagResponse(s.state.Load())
 }
 
-func deliveryLagCoverage(eligible, sampled int) DeliveryLagCoverage {
-	switch sampled {
-	case eligible:
+func deliveryLagCoverage(sample mtproto.DeliveryLagSample) DeliveryLagCoverage {
+	if !sample.Complete {
+		if sample.SampledConnections == 0 {
+			return DeliveryLagCoverageNone
+		}
+		return DeliveryLagCoveragePartial
+	}
+	switch sample.SampledConnections {
+	case sample.EligibleConnections:
 		return DeliveryLagCoverageFull
 	case 0:
 		return DeliveryLagCoverageNone

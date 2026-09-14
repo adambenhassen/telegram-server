@@ -234,8 +234,9 @@ const (
 )
 
 // collectMetrics assembles one metrics snapshot from the store and the session
-// registry. Both the cached JSON endpoint and the SSE broadcaster's shared
-// sampler read through it, so the two surfaces cannot drift apart.
+// registry for callers that do not need to share lag state. Production JSON,
+// dashboard, and SSE handlers use collectMetricsWithDeliveryLag with the one
+// process-local sampler instead.
 func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
 	return collectMetricsWithDeliveryLag(ctx, reg, st, tolerateGapErr, NewDeliveryLagSampler(), notifyMetrics...)
 }

@@ -44,6 +44,18 @@ func PublishDeliveryLagForTest(s *DeliveryLagSampler, attempt uint64, raw mtprot
 	return s.publish(attempt, raw, sampledAt)
 }
 
+// SampleDeliveryLagForTest runs the bounded sampler with a supplied head
+// reader, so tests can control database timing without adding a production
+// dependency seam.
+func SampleDeliveryLagForTest(
+	s *DeliveryLagSampler,
+	ctx context.Context,
+	registry *mtproto.SessionRegistry,
+	accountHead func(context.Context, int64) (int64, error),
+) DeliveryLag {
+	return s.sampleWithAccountHead(ctx, registry, accountHead)
+}
+
 // EncodeFragment exposes the SSE wire encoding so the framing rules can be
 // asserted without standing up a stream.
 func EncodeFragment(f Fragment) []byte {
