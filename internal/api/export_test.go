@@ -1007,6 +1007,35 @@ func CheckPasswordForTestWithLimits(s *store.Store, authKeyID [8]byte, addr neti
 	return h.handleCheckPassword(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
 }
 
+// CheckPasswordForTestWithLimitsAndMetrics invokes handleCheckPassword with a
+// shared rate-limit recorder, so external tests can assert the telemetry at
+// the RPC outcome boundary.
+func CheckPasswordForTestWithLimitsAndMetrics(s *store.Store, metrics *store.NotificationMetrics, authKeyID [8]byte, addr netip.Addr, perAccount, perIP store.RateLimitConfig, req *tg.AuthCheckPasswordRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMetrics = metrics
+	h.rateLimitCheckPassword = perAccount
+	h.rateLimitCheckPasswordIP = perIP
+	return h.handleCheckPassword(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+}
+
+// UpdateProfileForTestWithLimitsAndMetricsContext invokes handleUpdateProfile
+// with a shared rate-limit recorder and caller-supplied context, so external
+// tests can exercise the storage-failure path at the real handler boundary.
+func UpdateProfileForTestWithLimitsAndMetricsContext(ctx context.Context, s *store.Store, metrics *store.NotificationMetrics, userID int64, rateLimit store.RateLimitConfig, req *tg.AccountUpdateProfileRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMetrics = metrics
+	h.rateLimitUpdateProfile = rateLimit
+	return h.handleUpdateProfile(&mtproto.Request{Ctx: ctx, UserID: userID, Buf: &buf})
+}
+
 // UpdatePasswordSettingsForTest invokes handleUpdatePasswordSettings with a
 // pre-encoded request buffer for the caller.
 func UpdatePasswordSettingsForTest(s *store.Store, userID int64, buf *bin.Buffer) (bin.Encoder, error) {
