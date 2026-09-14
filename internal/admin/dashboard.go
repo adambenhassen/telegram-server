@@ -222,7 +222,7 @@ func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 // It server-renders the full operations dashboard using shadcn-templ components.
 // tokenHash is the hex-encoded SHA-256 digest of TG_ADMIN_TOKEN_HASH, used to
 // derive the session-bound CSRF token for the logout form.
-func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenHash string) http.HandlerFunc {
+func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenHash string, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
 	var cache metricsCache
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -231,12 +231,15 @@ func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenH
 			return
 		}
 
-		cache.refresh(r.Context(), registry, st)
+		cache.refresh(r.Context(), registry, st, notifyMetrics...)
 		if cache.failed() {
 			http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		m := cache.get()
+		if len(notifyMetrics) > 0 {
+			applyNotificationSnapshot(&m, notifyMetrics[0])
+		}
 
 		// Derive the logout CSRF token from the session cookie. It is
 		// deterministic, so no Set-Cookie is needed: every tab with the same

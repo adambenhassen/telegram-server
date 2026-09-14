@@ -5,7 +5,9 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,6 +67,7 @@ func TestStartListenerDispatches(t *testing.T) {
 	dsn := pgtest.DSN(t)
 	s := openDSN(t, dsn)
 
+	metrics := store.NewNotificationMetrics()
 	delivered := make(chan int64, 1)
 	typed := make(chan [2]int64, 1)
 	evicted := make(chan [2]int64, 1)
@@ -80,6 +83,7 @@ func TestStartListenerDispatches(t *testing.T) {
 		func(context.Context, int64, int64, int64) {},
 		func(context.Context, store.PeerType, int64, int32) {},
 		nil,
+		metrics,
 	)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
@@ -146,6 +150,241 @@ func TestStartListenerDispatches(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("encryption callback not invoked")
+	}
+
+	snapshot := metrics.Snapshot()
+	if snapshot.NotifyCount != 4 {
+		t.Errorf("notify count = %d, want 4 valid notifications", snapshot.NotifyCount)
+	}
+	if snapshot.Invalid != 2 {
+		t.Errorf("invalid count = %d, want 2 malformed notifications", snapshot.Invalid)
+	}
+	if snapshot.Channels.Updates != 1 || snapshot.Channels.Typing != 1 ||
+		snapshot.Channels.Evict != 1 || snapshot.Channels.Encryption != 1 {
+		t.Errorf("channel counts = %+v, want one update, typing, evict, and encryption", snapshot.Channels)
+	}
+}
+
+func TestStartListenerContainsMetricsPanicAndPreservesCallback(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	start := time.Unix(1_700_000_000, 0)
+	var clockCalls atomic.Int32
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time {
+		if clockCalls.Add(1) == 1 {
+			return start
+		}
+		panic("telemetry failure")
+	})
+	delivered := make(chan int64, 1)
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(_ context.Context, userID int64) { delivered <- userID },
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+		metrics,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	defer func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	}()
+
+	if err := s.Notify(ctx, store.ChannelUpdates, "not-an-int"); err != nil {
+		t.Fatalf("notify malformed: %v", err)
+	}
+	if err := s.Notify(ctx, store.ChannelUpdates, "17"); err != nil {
+		t.Fatalf("notify valid: %v", err)
+	}
+	select {
+	case got := <-delivered:
+		if got != 17 {
+			t.Fatalf("delivered userID = %d, want 17", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliver callback not invoked after recorder panic")
+	}
+}
+
+func TestStartListenerRecordsBeforeCallback(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	metrics := store.NewNotificationMetrics()
+	callbackSawCount := make(chan int64, 1)
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(context.Context, int64) { callbackSawCount <- metrics.Snapshot().Channels.Updates },
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+		metrics,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	defer func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	}()
+
+	if err := s.Notify(ctx, store.ChannelUpdates, "19"); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	select {
+	case got := <-callbackSawCount:
+		if got != 1 {
+			t.Fatalf("callback observed notify count = %d, want 1", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for callback")
+	}
+}
+
+func TestStartListenerRepeatedStartStopDoesNotRetainRecorderWorker(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	for i := range 8 {
+		metrics := store.NewNotificationMetrics()
+		_, stop, err := store.StartListener(ctx, dsn,
+			func(context.Context, int64) {},
+			func(context.Context, int64, int64) {},
+			func(context.Context, int64, int64) {},
+			func(context.Context, int64) {},
+			func(context.Context, int64, int64) {},
+			func(context.Context, int64, bool) {},
+			func(context.Context, int64, int) {},
+			func(context.Context, int64, int64, int64) {},
+			func(context.Context, store.PeerType, int64, int32) {},
+			nil,
+			metrics,
+		)
+		if err != nil {
+			t.Fatalf("start listener %d: %v", i, err)
+		}
+		if err := stop(); err != nil {
+			t.Fatalf("stop listener %d: %v", i, err)
+		}
+	}
+}
+
+func TestStartListenerSnapshotSaturationPreservesDeliveryAndShutdown(t *testing.T) {
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	start := time.Unix(1_700_000_000, 0)
+	var currentSecond atomic.Int64
+	currentSecond.Store(start.Unix())
+	var snapshotCalls atomic.Int64
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time {
+		snapshotCalls.Add(1)
+		return time.Unix(currentSecond.Load(), 0)
+	})
+
+	delivered := make(chan int64, 1)
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(_ context.Context, userID int64) { delivered <- userID },
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+		metrics,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+
+	const snapshotWorkers = 32
+	begin := make(chan struct{})
+	stopSnapshots := make(chan struct{})
+	var ready sync.WaitGroup
+	var snapshots sync.WaitGroup
+	defer func() {
+		close(stopSnapshots)
+		snapshots.Wait()
+		if err := stop(); err != nil {
+			t.Errorf("stop after saturation test: %v", err)
+		}
+	}()
+	ready.Add(snapshotWorkers)
+	snapshots.Add(snapshotWorkers)
+	for range snapshotWorkers {
+		go func() {
+			defer snapshots.Done()
+			ready.Done()
+			<-begin
+			for {
+				select {
+				case <-stopSnapshots:
+					return
+				default:
+					metrics.Snapshot()
+				}
+			}
+		}()
+	}
+	ready.Wait()
+	close(begin)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for snapshotCalls.Load() < snapshotWorkers*2 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if snapshotCalls.Load() < snapshotWorkers*2 {
+		t.Fatalf("snapshot storm did not start: calls = %d", snapshotCalls.Load())
+	}
+
+	currentSecond.Store(start.Unix() + 1)
+	if err := s.Notify(ctx, store.ChannelUpdates, "23"); err != nil {
+		t.Fatalf("notify updates: %v", err)
+	}
+
+	select {
+	case got := <-delivered:
+		if got != 23 {
+			t.Errorf("delivered userID = %d, want 23", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("notification callback did not complete under snapshot saturation")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- stop() }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("listener shutdown did not complete under snapshot saturation")
 	}
 }
 

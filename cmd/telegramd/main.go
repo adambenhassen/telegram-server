@@ -402,7 +402,8 @@ func run(log *slog.Logger) error {
 	// each user's pending updates to their live conns in this process. Drained
 	// before the store pool closes (defer registered after st.Close, runs first).
 	updater := api.NewUpdater(st, server.Registry(), log, peers)
-	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, log)
+	notifyMetrics := store.NewNotificationMetrics()
+	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, log, notifyMetrics)
 	if err != nil {
 		return err
 	}
@@ -430,7 +431,7 @@ func run(log *slog.Logger) error {
 		// One shared sampler feeds every dashboard stream; it idles while
 		// nobody is connected.
 		events := admin.NewBroadcaster(admin.BroadcasterConfig{
-			Sample: admin.NewMetricsSampler(server.Registry(), st),
+			Sample: admin.NewMetricsSampler(server.Registry(), st, notifyMetrics),
 			Logger: log,
 			Render: admin.DashboardFragmentRenderer,
 		})
@@ -440,11 +441,12 @@ func run(log *slog.Logger) error {
 		eventsWG.Go(func() { events.Run(eventsCtx) })
 
 		adminRouter := admin.AdminRouter(admin.LoginHandlerConfig{
-			Store:       st,
-			TokenHash:   cfg.AdminTokenHash,
-			Logger:      log,
-			AdminOrigin: adminOrigin,
-			Events:      events,
+			Store:         st,
+			TokenHash:     cfg.AdminTokenHash,
+			Logger:        log,
+			AdminOrigin:   adminOrigin,
+			Events:        events,
+			NotifyMetrics: notifyMetrics,
 		}, server.Registry())
 		adminSrv := &http.Server{
 			Addr:              cfg.AdminListenAddr,

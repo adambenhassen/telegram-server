@@ -200,6 +200,9 @@ type LoginHandlerConfig struct {
 	// A nil value registers the route but reports it unavailable, so the
 	// dashboard falls back to its server-rendered first paint.
 	Events *Broadcaster
+	// NotifyMetrics is the process-local Postgres notification recorder shared
+	// by the listener and every admin metrics surface.
+	NotifyMetrics *store.NotificationMetrics
 }
 
 // handleLoginGET serves the login form with a CSRF token.
@@ -449,8 +452,8 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 		protectedPatterns = append(protectedPatterns, pattern)
 		protectedMux.HandleFunc(pattern, handler)
 	}
-	registerProtected("GET /admin/metrics", Handler(registry, cfg.Store))
-	registerProtected("GET /admin/dashboard", DashboardHandler(registry, cfg.Store, cfg.TokenHash))
+	registerProtected("GET /admin/metrics", Handler(registry, cfg.Store, cfg.NotifyMetrics))
+	registerProtected("GET /admin/dashboard", DashboardHandler(registry, cfg.Store, cfg.TokenHash, cfg.NotifyMetrics))
 	registerProtected("GET /admin/events", EventsHandler(cfg.Events))
 
 	// Top-level mux: specific public routes registered first (they take priority

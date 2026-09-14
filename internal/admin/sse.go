@@ -113,11 +113,11 @@ type Sampler func(context.Context) (MetricsResponse, error)
 
 // NewMetricsSampler returns a Sampler reading the same snapshot that
 // GET /admin/metrics serves.
-func NewMetricsSampler(registry *mtproto.SessionRegistry, st *store.Store) Sampler {
+func NewMetricsSampler(registry *mtproto.SessionRegistry, st *store.Store, notifyMetrics ...*store.NotificationMetrics) Sampler {
 	return func(ctx context.Context) (MetricsResponse, error) {
 		// requireAllMetrics: the stream stays silent on a partial snapshot
 		// rather than pushing a metric that reads as good news.
-		return collectMetrics(ctx, registry, st, requireAllMetrics)
+		return collectMetrics(ctx, registry, st, requireAllMetrics, notifyMetrics...)
 	}
 }
 
