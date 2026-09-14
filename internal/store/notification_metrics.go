@@ -95,22 +95,16 @@ type notificationMetricBucket struct {
 	counts        [notificationCounterCount]atomic.Int64
 	pushOutcomes  [pushOutcomeCount]atomic.Int64
 	latencies     [pushLatencyBucketCount]atomic.Int64
-	// pushVersion is a publication sequence. A writer claims an even version
-	// by changing it to odd, publishes the outcome and matching latency bucket,
-	// then stores the next even version. Snapshots accept only an unchanged,
-	// even sequence.
-	pushVersion atomic.Uint64
 }
 
 // NotificationMetrics counts valid notifications received by one process.
 // The state is intentionally independent of Postgres and is reset by creating
 // a new value at process startup.
 type NotificationMetrics struct {
-	now                   func() time.Time
-	startedAt             time.Time
-	buckets               [notificationBucketCount]notificationMetricBucket
-	beforePushPublication func()
-	beforePushLatency     func()
+	now               func() time.Time
+	startedAt         time.Time
+	buckets           [notificationBucketCount]notificationMetricBucket
+	beforePushLatency func()
 }
 
 // NewNotificationMetrics creates an empty process-local notification
@@ -180,11 +174,7 @@ func (m *NotificationMetrics) RecordPushOutcome(outcome PushOutcome, acceptedAt 
 	}
 	second := now.Unix()
 	bucket := &m.buckets[notificationBucketIndex(second)]
-	beforePushPublication := m.beforePushPublication
 	beforePushLatency := m.beforePushLatency
-	if beforePushPublication != nil {
-		beforePushPublication()
-	}
 	for {
 		if bucket.epoch.Load() != second {
 			bucket.reset(second)
@@ -204,22 +194,16 @@ func (m *NotificationMetrics) RecordPushOutcome(outcome PushOutcome, acceptedAt 
 			bucket.readers.Add(-1)
 			continue
 		}
-		pushVersion := bucket.pushVersion.Load()
-		if pushVersion&1 != 0 || !bucket.pushVersion.CompareAndSwap(pushVersion, pushVersion+1) {
-			bucket.readers.Add(-1)
-			runtime.Gosched()
-			continue
-		}
-		// Publish the outcome and its matching latency bucket as one logical
-		// update. Snapshots use this sequence to reject a torn pair of loads.
-		bucket.pushOutcomes[outcome].Add(1)
 		if outcome == PushOutcomeSuccess {
+			// The latency bucket is the single atomic source for successful
+			// samples; snapshots derive both success and sample count from it.
 			if beforePushLatency != nil {
 				beforePushLatency()
 			}
 			bucket.latencies[pushLatencyBucketIndex(latency)].Add(1)
+		} else {
+			bucket.pushOutcomes[outcome].Add(1)
 		}
-		bucket.pushVersion.Store(pushVersion + 2)
 		bucket.readers.Add(-1)
 		return
 	}
@@ -481,7 +465,6 @@ func (b *notificationMetricBucket) reset(second int64) {
 	for i := range b.latencies {
 		b.latencies[i].Store(0)
 	}
-	b.pushVersion.Store(0)
 	b.readers.Store(0)
 	b.writerPending.Store(false)
 }
@@ -504,12 +487,6 @@ func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]
 			return notificationUnsetEpoch, counts, outcomes, latencies, false
 		}
 		epoch := b.epoch.Load()
-		pushVersion := b.pushVersion.Load()
-		if pushVersion&1 != 0 {
-			b.readers.Add(-1)
-			runtime.Gosched()
-			continue
-		}
 		for i := range b.counts {
 			counts[i] = b.counts[i].Load()
 		}
@@ -519,11 +496,11 @@ func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]
 		for i := range b.latencies {
 			latencies[i] = b.latencies[i].Load()
 		}
-		if pushVersion != b.pushVersion.Load() {
-			b.readers.Add(-1)
-			runtime.Gosched()
-			continue
+		var successCount int64
+		for _, count := range latencies {
+			successCount += count
 		}
+		outcomes[PushOutcomeSuccess] = successCount
 		b.readers.Add(-1)
 		return epoch, counts, outcomes, latencies, true
 	}

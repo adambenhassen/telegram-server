@@ -34,10 +34,9 @@ func SetDeniedHook(s *Store, fn func()) { s.deniedHook = fn }
 // without racing.
 func SetNowFunc(s *Store, fn func() time.Time) { s.now = fn }
 
-// SetNotificationMetricsPushHooks installs the deterministic publication
-// pauses used by the concurrent push snapshot tests.
-func SetNotificationMetricsPushHooks(m *NotificationMetrics, beforePublication, beforeLatency func()) {
-	m.beforePushPublication = beforePublication
+// SetNotificationMetricsPushHooks installs the deterministic pause used by the
+// concurrent push snapshot tests.
+func SetNotificationMetricsPushHooks(m *NotificationMetrics, beforeLatency func()) {
 	m.beforePushLatency = beforeLatency
 }
 
