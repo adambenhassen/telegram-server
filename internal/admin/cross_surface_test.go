@@ -29,6 +29,30 @@ type pushSurfacePayload struct {
 	PushLatencyBucketCounts        [16]int64          `json:"push_latency_bucket_counts"`
 }
 
+type rateLimitDenialSurfacePayload struct {
+	Count         int64                           `json:"rate_limit_denials_count"`
+	WindowSeconds float64                         `json:"rate_limit_denials_window_seconds"`
+	RatePerSecond float64                         `json:"rate_limit_denials_rate_per_second"`
+	BySurface     admin.RateLimitDenialsBySurface `json:"rate_limit_denials_by_surface"`
+	Dropped       int64                           `json:"rate_limit_denials_dropped"`
+}
+
+var rateLimitDenialPayloadKeys = []string{
+	"rate_limit_denials_by_surface",
+	"rate_limit_denials_count",
+	"rate_limit_denials_dropped",
+	"rate_limit_denials_rate_per_second",
+	"rate_limit_denials_window_seconds",
+}
+
+var rateLimitDenialSurfacePayloadKeys = []string{
+	"add_chat_user", "check_password", "check_password_ip", "contacts_search",
+	"create_channel", "create_chat", "get_password", "get_password_ip",
+	"message_send", "messages_search", "messages_search_global", "password_proof",
+	"save_file_part", "send_code_ip_calls", "send_code_ip_distinct_numbers",
+	"sign_in_fail_ip", "sign_up_ip", "update_profile", "upload_get_file",
+}
+
 var pushSurfaceKeys = []string{
 	"push_latency_p50_ms",
 	"push_latency_p50_overflow",
@@ -137,6 +161,120 @@ func TestAuthenticatedJSONAndSSESharePushSnapshot(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedJSONAndSSEShareRateLimitDenialSnapshot(t *testing.T) {
+	t.Parallel()
+
+	st := newAuthTestStore(t)
+	registry := mtproto.NewSessionRegistry()
+	start := time.Unix(1_700_000_000, 0)
+	now := start
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time { return now })
+	now = start.Add(42 * time.Second)
+	surfaces := []string{
+		"message_send",
+		"create_chat",
+		"add_chat_user",
+		"create_channel",
+		"messages_search",
+		"contacts_search",
+		"messages_search_global",
+		"save_file_part",
+		"upload_get_file",
+		"send_code_ip_calls",
+		"send_code_ip_distinct_numbers",
+		"sign_in_fail_ip",
+		"check_password",
+		"check_password_ip",
+		"get_password_ip",
+		"sign_up_ip",
+		"password_proof",
+		"get_password",
+		"update_profile",
+	}
+	for i, surface := range surfaces {
+		for range i + 1 {
+			metrics.RecordRateLimitDenial(surface)
+		}
+	}
+	metrics.RecordRateLimitDenial("unknown_surface")
+	metrics.RecordRateLimitDenial("unknown_surface")
+
+	want := rateLimitDenialSurfacePayload{
+		Count:         190,
+		WindowSeconds: 42,
+		RatePerSecond: 190.0 / 42.0,
+		BySurface: admin.RateLimitDenialsBySurface{
+			MessageSend:               1,
+			CreateChat:                2,
+			AddChatUser:               3,
+			CreateChannel:             4,
+			MessagesSearch:            5,
+			ContactsSearch:            6,
+			MessagesSearchGlobal:      7,
+			SaveFilePart:              8,
+			UploadGetFile:             9,
+			SendCodeIPCalls:           10,
+			SendCodeIPDistinctNumbers: 11,
+			SignInFailIP:              12,
+			CheckPassword:             13,
+			CheckPasswordIP:           14,
+			GetPasswordIP:             15,
+			SignUpIP:                  16,
+			PasswordProof:             17,
+			GetPassword:               18,
+			UpdateProfile:             19,
+		},
+		Dropped: 2,
+	}
+
+	b := sseTestBroadcaster(t, admin.BroadcasterConfig{
+		Sample:            admin.NewMetricsSampler(registry, st, metrics),
+		Render:            admin.DashboardFragmentRenderer,
+		Interval:          time.Hour,
+		Heartbeat:         time.Hour,
+		MaxStreamDuration: 100 * time.Millisecond,
+	})
+	rawToken := "rate-limit-cross-surface-token"
+	h := admin.AdminRouter(admin.LoginHandlerConfig{
+		Store:         st,
+		TokenHash:     sha256hex([]byte(rawToken)),
+		Logger:        slog.New(slog.DiscardHandler),
+		Events:        b,
+		NotifyMetrics: metrics,
+	}, registry)
+
+	sessionID := loginAndGetSession(t, h, rawToken)
+	jsonBody, _ := authenticatedMetrics(t, h, sessionID)
+	gotJSON := decodeRateLimitDenialSurface(t, "JSON", []byte(jsonBody), true)
+	if gotJSON != want {
+		t.Fatalf("JSON rate-limit denial payload = %+v, want %+v", gotJSON, want)
+	}
+
+	sseServer := httptest.NewServer(h)
+	t.Cleanup(sseServer.Close)
+	sseReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, sseServer.URL+"/admin/events", nil)
+	if err != nil {
+		t.Fatalf("new authenticated SSE request: %v", err)
+	}
+	sseReq.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionID}) //nolint:gosec // G124: test cookie
+	sseResponse, err := http.DefaultClient.Do(sseReq)
+	if err != nil {
+		t.Fatalf("authenticated SSE request: %v", err)
+	}
+	defer func() { _ = sseResponse.Body.Close() }() //nolint:errcheck // best-effort close
+	if sseResponse.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated SSE status = %d, want 200", sseResponse.StatusCode)
+	}
+	sseBody := readSSEUntil(t, sseResponse.Body, `<script id="rate-limit-denials-telemetry" type="application/json">`, 5*time.Second)
+	gotSSE := decodeRateLimitDenialSurface(t, "SSE", extractRateLimitDenialTelemetryJSON(t, sseBody), false)
+	if gotSSE != gotJSON {
+		t.Fatalf("SSE rate-limit denial payload = %+v, JSON = %+v", gotSSE, gotJSON)
+	}
+	if gotSSE != want {
+		t.Fatalf("SSE rate-limit denial payload = %+v, want %+v", gotSSE, want)
+	}
+}
+
 func authenticatedMetrics(t *testing.T, h http.Handler, sessionID string) (string, admin.MetricsResponse) {
 	t.Helper()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/admin/metrics", nil)
@@ -184,6 +322,55 @@ func pushFields(t *testing.T, label string, body []byte, endpoint bool) map[stri
 		t.Fatalf("%s push payload keys = %v, want exactly %v", label, sortedKeys(root), pushSurfaceKeys)
 	}
 	return fields
+}
+
+func decodeRateLimitDenialSurface(t *testing.T, label string, body []byte, endpoint bool) rateLimitDenialSurfacePayload {
+	t.Helper()
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("decode %s rate-limit denial JSON: %v", label, err)
+	}
+	fields := make(map[string]json.RawMessage, len(rateLimitDenialPayloadKeys))
+	for _, key := range rateLimitDenialPayloadKeys {
+		raw, ok := root[key]
+		if !ok {
+			t.Fatalf("%s rate-limit denial payload missing %q", label, key)
+		}
+		fields[key] = raw
+	}
+	if !endpoint && !slices.Equal(sortedKeys(root), rateLimitDenialPayloadKeys) {
+		t.Fatalf("%s rate-limit denial top-level keys = %v, want %v", label, sortedKeys(root), rateLimitDenialPayloadKeys)
+	}
+
+	var surface map[string]json.RawMessage
+	if err := json.Unmarshal(fields["rate_limit_denials_by_surface"], &surface); err != nil {
+		t.Fatalf("decode %s rate-limit denial surfaces: %v", label, err)
+	}
+	if !slices.Equal(sortedKeys(surface), rateLimitDenialSurfacePayloadKeys) {
+		t.Fatalf("%s rate-limit denial surface keys = %v, want %v", label, sortedKeys(surface), rateLimitDenialSurfacePayloadKeys)
+	}
+	for key, raw := range surface {
+		if string(bytes.TrimSpace(raw)) == "null" {
+			t.Errorf("%s rate-limit denial surface %s is null, want integer", label, key)
+			continue
+		}
+		var count int64
+		if err := json.Unmarshal(raw, &count); err != nil {
+			t.Errorf("decode %s rate-limit denial surface %s as integer: %v", label, key, err)
+		}
+	}
+
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("encode %s rate-limit denial fields: %v", label, err)
+	}
+	var payload rateLimitDenialSurfacePayload
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		t.Fatalf("decode %s rate-limit denial fields with exact types: %v", label, err)
+	}
+	return payload
 }
 
 func decodePushSurface(t *testing.T, label string, fields map[string]json.RawMessage) pushSurfacePayload {

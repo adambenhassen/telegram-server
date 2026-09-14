@@ -9,15 +9,17 @@ import (
 )
 
 const (
-	notificationWindowSeconds = int64((time.Hour / time.Second))
-	notificationBucketCount   = int(notificationWindowSeconds + 1)
-	notificationCounterCount  = 10 // nine fixed channels plus invalid input
-	notificationInvalidIndex  = notificationCounterCount - 1
-	notificationUnsetEpoch    = int64(-1 << 63)
-	notificationSnapshotTries = 4
-	pushOutcomeCount          = 4
-	pushLatencyFiniteBuckets  = 15
-	pushLatencyBucketCount    = pushLatencyFiniteBuckets + 1
+	notificationWindowSeconds   = int64((time.Hour / time.Second))
+	notificationBucketCount     = int(notificationWindowSeconds + 1)
+	notificationCounterCount    = 10 // nine fixed channels plus invalid input
+	notificationInvalidIndex    = notificationCounterCount - 1
+	notificationUnsetEpoch      = int64(-1 << 63)
+	notificationSnapshotTries   = 4
+	pushOutcomeCount            = 4
+	pushLatencyFiniteBuckets    = 15
+	pushLatencyBucketCount      = pushLatencyFiniteBuckets + 1
+	rateLimitDenialSurfaceCount = 20 // nineteen fixed surfaces plus dropped
+	rateLimitDenialDroppedIndex = rateLimitDenialSurfaceCount - 1
 )
 
 // PushOutcome is the fixed result set for one attempted persisted-update push.
@@ -47,6 +49,31 @@ type NotificationChannelCounts struct {
 	Pinned       int64
 }
 
+// RateLimitDenialSurfaceCounts holds one count for every fixed client-visible
+// rate-limit surface. Its field set is deliberately closed so an internal
+// surface name or error cannot create metric cardinality.
+type RateLimitDenialSurfaceCounts struct {
+	MessageSend               int64
+	CreateChat                int64
+	AddChatUser               int64
+	CreateChannel             int64
+	MessagesSearch            int64
+	ContactsSearch            int64
+	MessagesSearchGlobal      int64
+	SaveFilePart              int64
+	UploadGetFile             int64
+	SendCodeIPCalls           int64
+	SendCodeIPDistinctNumbers int64
+	SignInFailIP              int64
+	CheckPassword             int64
+	CheckPasswordIP           int64
+	GetPasswordIP             int64
+	SignUpIP                  int64
+	PasswordProof             int64
+	GetPassword               int64
+	UpdateProfile             int64
+}
+
 // PushOutcomeCounts holds one count for every possible result of an attempted
 // persisted-update push.
 type PushOutcomeCounts struct {
@@ -71,15 +98,28 @@ type PushMetricsSnapshot struct {
 	LatencyBucketCounts                  [pushLatencyBucketCount]int64
 }
 
+// RateLimitDenialMetricsSnapshot is the process-local rolling telemetry for
+// requests that actually returned FLOOD_WAIT from a fixed rate-limit surface.
+// Dropped contains only denials whose internal surface was not in the fixed
+// contract; it is intentionally excluded from Count and BySurface.
+type RateLimitDenialMetricsSnapshot struct {
+	WindowSeconds float64
+	Count         int64
+	RatePerSecond float64
+	BySurface     RateLimitDenialSurfaceCounts
+	Dropped       int64
+}
+
 // NotificationMetricsSnapshot is the process-local rolling notification
 // telemetry exposed to the admin metrics surface.
 type NotificationMetricsSnapshot struct {
-	WindowSeconds float64
-	NotifyCount   int64
-	RatePerSecond float64
-	Channels      NotificationChannelCounts
-	Invalid       int64
-	Push          PushMetricsSnapshot
+	WindowSeconds    float64
+	NotifyCount      int64
+	RatePerSecond    float64
+	Channels         NotificationChannelCounts
+	Invalid          int64
+	Push             PushMetricsSnapshot
+	RateLimitDenials RateLimitDenialMetricsSnapshot
 }
 
 // notificationMetricBucket is one second of fixed counters. readers is a
@@ -89,12 +129,13 @@ type NotificationMetricsSnapshot struct {
 // avoids a mutex on the notification hot path and makes resets exact under
 // concurrent recording.
 type notificationMetricBucket struct {
-	epoch         atomic.Int64
-	readers       atomic.Int32
-	writerPending atomic.Bool
-	counts        [notificationCounterCount]atomic.Int64
-	pushOutcomes  [pushOutcomeCount]atomic.Int64
-	latencies     [pushLatencyBucketCount]atomic.Int64
+	epoch            atomic.Int64
+	readers          atomic.Int32
+	writerPending    atomic.Bool
+	counts           [notificationCounterCount]atomic.Int64
+	rateLimitDenials [rateLimitDenialSurfaceCount]atomic.Int64
+	pushOutcomes     [pushOutcomeCount]atomic.Int64
+	latencies        [pushLatencyBucketCount]atomic.Int64
 }
 
 // NotificationMetrics counts valid notifications received by one process.
@@ -154,6 +195,20 @@ func (m *NotificationMetrics) RecordInvalidNotification() error {
 	}
 	m.record(notificationInvalidIndex)
 	return nil
+}
+
+// RecordRateLimitDenial records one client-visible FLOOD_WAIT from a fixed
+// rate-limit surface. Unknown surfaces are counted only in the bounded dropped
+// counter and never retain the supplied name.
+func (m *NotificationMetrics) RecordRateLimitDenial(surface string) {
+	if m == nil {
+		return
+	}
+	index := rateLimitDenialSurfaceIndex(surface)
+	if index < 0 {
+		index = rateLimitDenialDroppedIndex
+	}
+	m.recordRateLimitDenial(index)
 }
 
 // RecordPushOutcome records one result for an attempted persisted-update push.
@@ -221,10 +276,11 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 	cutoff := nowSecond - notificationWindowSeconds
 
 	var counts [notificationCounterCount]int64
+	var rateLimitDenials [rateLimitDenialSurfaceCount]int64
 	var pushOutcomes [pushOutcomeCount]int64
 	var latencyBuckets [pushLatencyBucketCount]int64
 	for i := range m.buckets {
-		epoch, bucketCounts, bucketOutcomes, bucketLatencies, ok := m.buckets[i].snapshot()
+		epoch, bucketCounts, bucketDenials, bucketOutcomes, bucketLatencies, ok := m.buckets[i].snapshot()
 		if !ok {
 			continue
 		}
@@ -233,6 +289,9 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 		}
 		for j, count := range bucketCounts {
 			counts[j] += count
+		}
+		for j, count := range bucketDenials {
+			rateLimitDenials[j] += count
 		}
 		for j, count := range bucketOutcomes {
 			pushOutcomes[j] += count
@@ -254,6 +313,14 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 	if windowSeconds > 0 {
 		rate = float64(notifyCount) / windowSeconds
 	}
+	denialCount := int64(0)
+	for i := range rateLimitDenialDroppedIndex {
+		denialCount += rateLimitDenials[i]
+	}
+	denialRate := float64(0)
+	if windowSeconds > 0 {
+		denialRate = float64(denialCount) / windowSeconds
+	}
 
 	return NotificationMetricsSnapshot{
 		WindowSeconds: windowSeconds,
@@ -271,6 +338,33 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 			Pinned:       counts[8],
 		},
 		Invalid: counts[notificationInvalidIndex],
+		RateLimitDenials: RateLimitDenialMetricsSnapshot{
+			WindowSeconds: windowSeconds,
+			Count:         denialCount,
+			RatePerSecond: denialRate,
+			BySurface: RateLimitDenialSurfaceCounts{
+				MessageSend:               rateLimitDenials[0],
+				CreateChat:                rateLimitDenials[1],
+				AddChatUser:               rateLimitDenials[2],
+				CreateChannel:             rateLimitDenials[3],
+				MessagesSearch:            rateLimitDenials[4],
+				ContactsSearch:            rateLimitDenials[5],
+				MessagesSearchGlobal:      rateLimitDenials[6],
+				SaveFilePart:              rateLimitDenials[7],
+				UploadGetFile:             rateLimitDenials[8],
+				SendCodeIPCalls:           rateLimitDenials[9],
+				SendCodeIPDistinctNumbers: rateLimitDenials[10],
+				SignInFailIP:              rateLimitDenials[11],
+				CheckPassword:             rateLimitDenials[12],
+				CheckPasswordIP:           rateLimitDenials[13],
+				GetPasswordIP:             rateLimitDenials[14],
+				SignUpIP:                  rateLimitDenials[15],
+				PasswordProof:             rateLimitDenials[16],
+				GetPassword:               rateLimitDenials[17],
+				UpdateProfile:             rateLimitDenials[18],
+			},
+			Dropped: rateLimitDenials[rateLimitDenialDroppedIndex],
+		},
 		Push: PushMetricsSnapshot{
 			WindowSeconds:   windowSeconds,
 			SampleCount:     pushOutcomes[PushOutcomeSuccess],
@@ -404,6 +498,51 @@ func notificationChannelIndex(channel string) int {
 	}
 }
 
+func rateLimitDenialSurfaceIndex(surface string) int {
+	switch surface {
+	case "message_send":
+		return 0
+	case "create_chat":
+		return 1
+	case "add_chat_user":
+		return 2
+	case "create_channel":
+		return 3
+	case "messages_search":
+		return 4
+	case "contacts_search":
+		return 5
+	case "messages_search_global":
+		return 6
+	case "save_file_part":
+		return 7
+	case "upload_get_file":
+		return 8
+	case "send_code_ip_calls":
+		return 9
+	case "send_code_ip_distinct_numbers":
+		return 10
+	case "sign_in_fail_ip":
+		return 11
+	case "check_password":
+		return 12
+	case "check_password_ip":
+		return 13
+	case "get_password_ip":
+		return 14
+	case "sign_up_ip":
+		return 15
+	case "password_proof":
+		return 16
+	case "get_password":
+		return 17
+	case "update_profile":
+		return 18
+	default:
+		return -1
+	}
+}
+
 func (m *NotificationMetrics) record(index int) {
 	second := m.now().Unix()
 	bucket := &m.buckets[notificationBucketIndex(second)]
@@ -427,6 +566,34 @@ func (m *NotificationMetrics) record(index int) {
 			continue
 		}
 		bucket.counts[index].Add(1)
+		bucket.readers.Add(-1)
+		return
+	}
+}
+
+func (m *NotificationMetrics) recordRateLimitDenial(index int) {
+	second := m.now().Unix()
+	bucket := &m.buckets[notificationBucketIndex(second)]
+	for {
+		if bucket.epoch.Load() != second {
+			bucket.reset(second)
+			continue
+		}
+		if bucket.writerPending.Load() {
+			runtime.Gosched()
+			continue
+		}
+
+		readers := bucket.readers.Load()
+		if readers < 0 || !bucket.readers.CompareAndSwap(readers, readers+1) {
+			runtime.Gosched()
+			continue
+		}
+		if bucket.writerPending.Load() || bucket.epoch.Load() != second {
+			bucket.readers.Add(-1)
+			continue
+		}
+		bucket.rateLimitDenials[index].Add(1)
 		bucket.readers.Add(-1)
 		return
 	}
@@ -459,6 +626,9 @@ func (b *notificationMetricBucket) reset(second int64) {
 	for i := range b.counts {
 		b.counts[i].Store(0)
 	}
+	for i := range b.rateLimitDenials {
+		b.rateLimitDenials[i].Store(0)
+	}
 	for i := range b.pushOutcomes {
 		b.pushOutcomes[i].Store(0)
 	}
@@ -469,13 +639,14 @@ func (b *notificationMetricBucket) reset(second int64) {
 	b.writerPending.Store(false)
 }
 
-func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]int64, [pushOutcomeCount]int64, [pushLatencyBucketCount]int64, bool) {
+func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]int64, [rateLimitDenialSurfaceCount]int64, [pushOutcomeCount]int64, [pushLatencyBucketCount]int64, bool) {
 	var counts [notificationCounterCount]int64
+	var denials [rateLimitDenialSurfaceCount]int64
 	var outcomes [pushOutcomeCount]int64
 	var latencies [pushLatencyBucketCount]int64
 	for range notificationSnapshotTries {
 		if b.writerPending.Load() {
-			return notificationUnsetEpoch, counts, outcomes, latencies, false
+			return notificationUnsetEpoch, counts, denials, outcomes, latencies, false
 		}
 		readers := b.readers.Load()
 		if readers < 0 || !b.readers.CompareAndSwap(readers, readers+1) {
@@ -484,11 +655,14 @@ func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]
 		}
 		if b.writerPending.Load() {
 			b.readers.Add(-1)
-			return notificationUnsetEpoch, counts, outcomes, latencies, false
+			return notificationUnsetEpoch, counts, denials, outcomes, latencies, false
 		}
 		epoch := b.epoch.Load()
 		for i := range b.counts {
 			counts[i] = b.counts[i].Load()
+		}
+		for i := range b.rateLimitDenials {
+			denials[i] = b.rateLimitDenials[i].Load()
 		}
 		for i := range b.pushOutcomes {
 			outcomes[i] = b.pushOutcomes[i].Load()
@@ -502,7 +676,7 @@ func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]
 		}
 		outcomes[PushOutcomeSuccess] = successCount
 		b.readers.Add(-1)
-		return epoch, counts, outcomes, latencies, true
+		return epoch, counts, denials, outcomes, latencies, true
 	}
-	return notificationUnsetEpoch, counts, outcomes, latencies, false
+	return notificationUnsetEpoch, counts, denials, outcomes, latencies, false
 }

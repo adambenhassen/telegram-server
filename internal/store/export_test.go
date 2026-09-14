@@ -43,7 +43,8 @@ func SetNotificationMetricsPushHooks(m *NotificationMetrics, beforeLatency func(
 // NotificationMetricsPushBucketSnapshot reads one bucket's push publication
 // state for the concurrent push snapshot tests.
 func NotificationMetricsPushBucketSnapshot(m *NotificationMetrics, second int64) (PushOutcomeCounts, [pushLatencyBucketCount]int64, bool) {
-	_, _, outcomes, latencies, ok := m.buckets[notificationBucketIndex(second)].snapshot()
+	_, _, denials, outcomes, latencies, ok := m.buckets[notificationBucketIndex(second)].snapshot()
+	_ = denials
 	return PushOutcomeCounts{
 		Success:       outcomes[PushOutcomeSuccess],
 		OwnerMismatch: outcomes[PushOutcomeOwnerMismatch],

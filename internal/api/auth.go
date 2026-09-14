@@ -222,12 +222,21 @@ func (h *handlers) checkSendCodeIP(r *mtproto.Request, phone string) error {
 			// does exactly that — so this is a request arriving on a connection
 			// that was never meant to carry one, not a fault in the server.
 			h.log.Info("send code: connection carries no client address")
+			h.recordRateLimitDenial("")
 			return FloodWaitError(int(h.sendCodeIPRetry() / time.Second))
 		}
 		h.log.Error("send code: ip rate limit", "err", err)
 		return errInternal
 	}
 	if res != nil {
+		switch res.Surface {
+		case store.RateLimitResultSurfaceSendCodeIPCalls:
+			h.recordRateLimitDenial("send_code_ip_calls")
+		case store.RateLimitResultSurfaceSendCodeIPDistinctNumbers:
+			h.recordRateLimitDenial("send_code_ip_distinct_numbers")
+		default:
+			h.recordRateLimitDenial("")
+		}
 		return FloodWaitError(int(res.Wait / time.Second))
 	}
 	return nil
@@ -305,6 +314,7 @@ func (h *handlers) handleSignInPhone(r *mtproto.Request, req tg.AuthSignInReques
 	// for existing accounts never touch the counter.
 	rateLimited, err := h.store.AttemptSignIn(r.Ctx, r.ClientAddr, req.PhoneNumber, req.PhoneCodeHash, code, h.rateLimitSignInFailIP)
 	if rateLimited != nil {
+		h.recordRateLimitDenial("sign_in_fail_ip")
 		return nil, FloodWaitError(int(rateLimited.Wait / time.Second))
 	}
 	if err != nil {

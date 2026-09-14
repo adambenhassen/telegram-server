@@ -93,6 +93,20 @@ type MetricsResponse struct {
 	// RateLimitActive is the number of currently active rate-limit rows
 	// (rows that have not yet expired), approximating recent throttling activity.
 	RateLimitActive int64 `json:"rate_limit_active"`
+	// RateLimitDenialsCount is the rolling count of requests that actually
+	// returned FLOOD_WAIT from one of the fixed rate-limit surfaces.
+	RateLimitDenialsCount int64 `json:"rate_limit_denials_count"`
+	// RateLimitDenialsWindowSeconds is the process-local rolling observation
+	// window, capped at one hour and reset when the process starts.
+	RateLimitDenialsWindowSeconds float64 `json:"rate_limit_denials_window_seconds"`
+	// RateLimitDenialsRatePerSecond is the fixed-surface denial count divided by
+	// RateLimitDenialsWindowSeconds.
+	RateLimitDenialsRatePerSecond float64 `json:"rate_limit_denials_rate_per_second"`
+	// RateLimitDenialsBySurface holds exactly the fixed client-visible surfaces.
+	RateLimitDenialsBySurface RateLimitDenialsBySurface `json:"rate_limit_denials_by_surface"`
+	// RateLimitDenialsDropped counts denials whose internal surface was not in
+	// the fixed contract. It is not included in the aggregate or breakdown.
+	RateLimitDenialsDropped int64 `json:"rate_limit_denials_dropped"`
 
 	// Uninstrumented lists the field names in this payload that are hardcoded
 	// zeroes because the underlying metric is not yet instrumented. A field is
@@ -126,6 +140,30 @@ type PushOutcomes struct {
 	OwnerMismatch int64 `json:"owner_mismatch"`
 	EncodeFailure int64 `json:"encode_failure"`
 	WriteFailure  int64 `json:"write_failure"`
+}
+
+// RateLimitDenialsBySurface holds one count for every fixed rate-limit
+// surface. No caller-supplied label becomes a JSON key.
+type RateLimitDenialsBySurface struct {
+	MessageSend               int64 `json:"message_send"`
+	CreateChat                int64 `json:"create_chat"`
+	AddChatUser               int64 `json:"add_chat_user"`
+	CreateChannel             int64 `json:"create_channel"`
+	MessagesSearch            int64 `json:"messages_search"`
+	ContactsSearch            int64 `json:"contacts_search"`
+	MessagesSearchGlobal      int64 `json:"messages_search_global"`
+	SaveFilePart              int64 `json:"save_file_part"`
+	UploadGetFile             int64 `json:"upload_get_file"`
+	SendCodeIPCalls           int64 `json:"send_code_ip_calls"`
+	SendCodeIPDistinctNumbers int64 `json:"send_code_ip_distinct_numbers"`
+	SignInFailIP              int64 `json:"sign_in_fail_ip"`
+	CheckPassword             int64 `json:"check_password"`
+	CheckPasswordIP           int64 `json:"check_password_ip"`
+	GetPasswordIP             int64 `json:"get_password_ip"`
+	SignUpIP                  int64 `json:"sign_up_ip"`
+	PasswordProof             int64 `json:"password_proof"`
+	GetPassword               int64 `json:"get_password"`
+	UpdateProfile             int64 `json:"update_profile"`
 }
 
 // StorageRows is approximate row counts across key database tables,
@@ -238,6 +276,11 @@ func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store
 		PushLatencyBucketCounts:        notify.Push.LatencyBucketCounts,
 		Uninstrumented:                 pushUninstrumented,
 		RateLimitActive:                snap.RateLimitHits1H,
+		RateLimitDenialsCount:          notify.RateLimitDenials.Count,
+		RateLimitDenialsWindowSeconds:  notify.RateLimitDenials.WindowSeconds,
+		RateLimitDenialsRatePerSecond:  notify.RateLimitDenials.RatePerSecond,
+		RateLimitDenialsBySurface:      rateLimitDenialsBySurface(notify.RateLimitDenials.BySurface),
+		RateLimitDenialsDropped:        notify.RateLimitDenials.Dropped,
 		StorageRows: StorageRows{
 			Users:           snap.StorageRows.Users,
 			Messages:        snap.StorageRows.Messages,
@@ -278,6 +321,11 @@ func applyNotificationSnapshot(resp *MetricsResponse, notifyMetrics *store.Notif
 	resp.PushLatencyBucketUpperBoundsMS = pushBucketUpperBounds(notify.Push)
 	resp.PushLatencyBucketCounts = notify.Push.LatencyBucketCounts
 	resp.Uninstrumented = removePushPercentileUninstrumented(resp.Uninstrumented)
+	resp.RateLimitDenialsCount = notify.RateLimitDenials.Count
+	resp.RateLimitDenialsWindowSeconds = notify.RateLimitDenials.WindowSeconds
+	resp.RateLimitDenialsRatePerSecond = notify.RateLimitDenials.RatePerSecond
+	resp.RateLimitDenialsBySurface = rateLimitDenialsBySurface(notify.RateLimitDenials.BySurface)
+	resp.RateLimitDenialsDropped = notify.RateLimitDenials.Dropped
 }
 
 func pushMetricsUninstrumented(notifyMetrics ...*store.NotificationMetrics) []string {
@@ -322,6 +370,30 @@ func pushOutcomes(outcomes store.PushOutcomeCounts) PushOutcomes {
 		OwnerMismatch: outcomes.OwnerMismatch,
 		EncodeFailure: outcomes.EncodeFailure,
 		WriteFailure:  outcomes.WriteFailure,
+	}
+}
+
+func rateLimitDenialsBySurface(counts store.RateLimitDenialSurfaceCounts) RateLimitDenialsBySurface {
+	return RateLimitDenialsBySurface{
+		MessageSend:               counts.MessageSend,
+		CreateChat:                counts.CreateChat,
+		AddChatUser:               counts.AddChatUser,
+		CreateChannel:             counts.CreateChannel,
+		MessagesSearch:            counts.MessagesSearch,
+		ContactsSearch:            counts.ContactsSearch,
+		MessagesSearchGlobal:      counts.MessagesSearchGlobal,
+		SaveFilePart:              counts.SaveFilePart,
+		UploadGetFile:             counts.UploadGetFile,
+		SendCodeIPCalls:           counts.SendCodeIPCalls,
+		SendCodeIPDistinctNumbers: counts.SendCodeIPDistinctNumbers,
+		SignInFailIP:              counts.SignInFailIP,
+		CheckPassword:             counts.CheckPassword,
+		CheckPasswordIP:           counts.CheckPasswordIP,
+		GetPasswordIP:             counts.GetPasswordIP,
+		SignUpIP:                  counts.SignUpIP,
+		PasswordProof:             counts.PasswordProof,
+		GetPassword:               counts.GetPassword,
+		UpdateProfile:             counts.UpdateProfile,
 	}
 }
 

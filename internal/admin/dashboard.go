@@ -33,7 +33,12 @@ func DashboardFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	if err != nil {
 		return nil, err
 	}
+	rateLimitDenialTelemetry, err := rateLimitDenialTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
 	buf.WriteString(telemetry)
+	buf.WriteString(rateLimitDenialTelemetry)
 	buf.WriteString(`</div>`)
 	return []Fragment{{Event: sseDefaultEvent, HTML: buf.String()}}, nil
 }

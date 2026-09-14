@@ -109,6 +109,10 @@ type handlers struct {
 	rateLimitUpdateProfile store.RateLimitConfig
 	// registrationMode controls whether auth.signUp is available.
 	registrationMode config.RegistrationMode
+	// rateLimitMetrics records only client-visible fixed-surface FLOOD_WAITs.
+	// It is process-local and optional so tests and embedders without admin
+	// telemetry retain the same enforcement behaviour.
+	rateLimitMetrics *store.NotificationMetrics
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -158,9 +162,13 @@ func selfRevocation(r *mtproto.Request, keyID int64) bool {
 // peers derives the per-viewer peer access hashes. It is required, and a nil one
 // is a programming error rather than a runtime condition, so it stops the server
 // at startup instead of surfacing as a nil dereference on the first peer emitted.
-func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver, rateLimits config.RateLimitsConfig, registrationMode config.RegistrationMode) mtproto.Handler {
+func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver, rateLimits config.RateLimitsConfig, registrationMode config.RegistrationMode, rateLimitMetrics ...*store.NotificationMetrics) mtproto.Handler {
 	if peers == nil {
 		panic("api: nil peer hash deriver")
+	}
+	var denialMetrics *store.NotificationMetrics
+	if len(rateLimitMetrics) > 0 {
+		denialMetrics = rateLimitMetrics[0]
 	}
 	h := &handlers{
 		peers:                    peers,
@@ -195,6 +203,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitGetPassword:     rateLimits.GetPassword,
 		rateLimitUpdateProfile:   rateLimits.UpdateProfile,
 		registrationMode:         registrationMode,
+		rateLimitMetrics:         denialMetrics,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
@@ -289,6 +298,7 @@ func (h *handlers) checkRateLimitCost(r *mtproto.Request, surface string, cfg st
 		return errInternal
 	}
 	if result != nil {
+		h.recordRateLimitDenial(surface)
 		return FloodWaitError(int(result.Wait / time.Second))
 	}
 	return nil
@@ -304,6 +314,7 @@ func (h *handlers) checkAndChargeRateLimitIP(r *mtproto.Request, surface string,
 	}
 	key, ok := store.IPBucketKey(r.ClientAddr)
 	if !ok {
+		h.recordRateLimitDenial(surface)
 		return FloodWaitError(int(cfg.Window / time.Second))
 	}
 	subjectID, err := keyToSubjectID(key)
@@ -317,6 +328,7 @@ func (h *handlers) checkAndChargeRateLimitIP(r *mtproto.Request, surface string,
 		return errInternal
 	}
 	if result != nil {
+		h.recordRateLimitDenial(surface)
 		return FloodWaitError(int(result.Wait / time.Second))
 	}
 	return nil
@@ -331,6 +343,7 @@ func (h *handlers) reserveRateLimitIP(r *mtproto.Request, surface string, cfg st
 	}
 	key, ok := store.IPBucketKey(r.ClientAddr)
 	if !ok {
+		h.recordRateLimitDenial(surface)
 		return nil, nil, FloodWaitError(int(cfg.Window / time.Second))
 	}
 	subjectID, err := keyToSubjectID(key)
@@ -357,6 +370,20 @@ func (h *handlers) refundRateLimitIP(r *mtproto.Request, surface string, res *st
 		return err
 	}
 	return h.store.RefundRateLimit(r.Ctx, subjectID, surface, res)
+}
+
+// recordRateLimitDenial keeps telemetry observational: a broken recorder must
+// never change the rate-limit decision or the RPC response.
+func (h *handlers) recordRateLimitDenial(surface string) {
+	if h.rateLimitMetrics == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			return
+		}
+	}()
+	h.rateLimitMetrics.RecordRateLimitDenial(surface)
 }
 
 // provisionalAllowList holds the method IDs that a provisional session may call.

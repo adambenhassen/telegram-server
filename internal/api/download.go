@@ -49,6 +49,7 @@ func (h *handlers) checkGetFileRateLimit(r *mtproto.Request) error {
 		return errInternal
 	}
 	if denied != nil {
+		h.recordRateLimitDenial("upload_get_file")
 		return floodWaitForDuration(denied.Wait)
 	}
 
@@ -62,6 +63,7 @@ func (h *handlers) checkGetFileRateLimit(r *mtproto.Request) error {
 			return errInternal
 		}
 	}
+	h.recordRateLimitDenial("upload_get_file")
 	return floodWaitForDuration(wait)
 }
 

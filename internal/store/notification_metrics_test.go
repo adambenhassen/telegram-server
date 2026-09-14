@@ -154,6 +154,119 @@ func TestNotificationMetricsUnknownChannelIsOnlyInvalid(t *testing.T) {
 	}
 }
 
+func TestNotificationMetricsRateLimitDenialsUseFixedSurfaces(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(1_700_000_000, 0)
+	now := start
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time { return now })
+	surfaces := []string{
+		"message_send",
+		"create_chat",
+		"add_chat_user",
+		"create_channel",
+		"messages_search",
+		"contacts_search",
+		"messages_search_global",
+		"save_file_part",
+		"upload_get_file",
+		"send_code_ip_calls",
+		"send_code_ip_distinct_numbers",
+		"sign_in_fail_ip",
+		"check_password",
+		"check_password_ip",
+		"get_password_ip",
+		"sign_up_ip",
+		"password_proof",
+		"get_password",
+		"update_profile",
+	}
+
+	initial := metrics.Snapshot().RateLimitDenials
+	if initial.Count != 0 || initial.RatePerSecond != 0 || initial.Dropped != 0 {
+		t.Fatalf("initial rate-limit denial snapshot = %+v, want empty zero-rate state", initial)
+	}
+	for _, surface := range surfaces {
+		metrics.RecordRateLimitDenial(surface)
+	}
+	metrics.RecordRateLimitDenial("attacker-controlled-surface")
+
+	got := metrics.Snapshot().RateLimitDenials
+	if got.Count != int64(len(surfaces)) {
+		t.Errorf("denial count = %d, want %d fixed-surface denials", got.Count, len(surfaces))
+	}
+	if got.Dropped != 1 {
+		t.Errorf("dropped denials = %d, want 1", got.Dropped)
+	}
+	if got.RatePerSecond != 0 {
+		t.Errorf("zero-second denial rate = %v, want 0", got.RatePerSecond)
+	}
+	want := store.RateLimitDenialSurfaceCounts{
+		MessageSend:               1,
+		CreateChat:                1,
+		AddChatUser:               1,
+		CreateChannel:             1,
+		MessagesSearch:            1,
+		ContactsSearch:            1,
+		MessagesSearchGlobal:      1,
+		SaveFilePart:              1,
+		UploadGetFile:             1,
+		SendCodeIPCalls:           1,
+		SendCodeIPDistinctNumbers: 1,
+		SignInFailIP:              1,
+		CheckPassword:             1,
+		CheckPasswordIP:           1,
+		GetPasswordIP:             1,
+		SignUpIP:                  1,
+		PasswordProof:             1,
+		GetPassword:               1,
+		UpdateProfile:             1,
+	}
+	if got.BySurface != want {
+		t.Errorf("fixed denial surfaces = %+v, want %+v", got.BySurface, want)
+	}
+
+	now = start.Add(3_600 * time.Second)
+	got = metrics.Snapshot().RateLimitDenials
+	if got.Count != 0 || got.Dropped != 0 || got.BySurface != (store.RateLimitDenialSurfaceCounts{}) {
+		t.Errorf("expired rate-limit denials = %+v, want zero", got)
+	}
+	if got.WindowSeconds != 3_600 || got.RatePerSecond != 0 {
+		t.Errorf("expired denial window/rate = %v/%v, want 3600/0", got.WindowSeconds, got.RatePerSecond)
+	}
+}
+
+func TestNotificationMetricsConcurrentRateLimitDenials(t *testing.T) {
+	t.Parallel()
+
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time {
+		return time.Unix(1_700_000_000, 0)
+	})
+	const workers = 8
+	const attempts = 1_000
+	var wg sync.WaitGroup
+	for worker := range workers {
+		wg.Go(func() {
+			for attempt := range attempts {
+				surface := "message_send"
+				if (worker+attempt)%2 == 0 {
+					surface = "password_proof"
+				}
+				metrics.RecordRateLimitDenial(surface)
+			}
+		})
+	}
+	wg.Wait()
+
+	got := metrics.Snapshot().RateLimitDenials
+	if got.Count != workers*attempts {
+		t.Fatalf("concurrent denial count = %d, want %d", got.Count, workers*attempts)
+	}
+	if got.BySurface.MessageSend+got.BySurface.PasswordProof != got.Count {
+		t.Errorf("concurrent denial breakdown = %+v, want aggregate %d", got.BySurface, got.Count)
+	}
+}
+
 func TestNotificationMetricsPushOutcomesAndPercentiles(t *testing.T) {
 	t.Parallel()
 
