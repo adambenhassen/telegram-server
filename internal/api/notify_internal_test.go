@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -349,6 +350,33 @@ func TestDeliverRecordsPushOutcomesPerConnection(t *testing.T) {
 	}
 	if successA.attempts != 1 || successB.attempts != 1 {
 		t.Fatalf("successful connection attempts = %d/%d, want one each", successA.attempts, successB.attempts)
+	}
+}
+
+func TestDeliverRecorderPanicDoesNotStopFanout(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(1_700_000_000, 0)
+	var clockCalls atomic.Int32
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time {
+		if clockCalls.Add(1) == 2 {
+			panic("telemetry failure")
+		}
+		return start.Add(24 * time.Millisecond)
+	})
+	first := &outcomePushConn{pushed: true}
+	later := &outcomePushConn{pushed: true}
+
+	u := &Updater{log: slog.New(slog.DiscardHandler), pushMetrics: metrics}
+	u.deliverAt(context.Background(), 7, []pushConn{first, later}, func(int) (updateBatch, error) {
+		return batch(0, 1, 1), nil
+	}, start)
+
+	if first.attempts != 1 || later.attempts != 1 {
+		t.Fatalf("push attempts after recorder panic = %d/%d, want one per connection", first.attempts, later.attempts)
+	}
+	if got := metrics.Snapshot().Push.SampleCount; got != 1 {
+		t.Fatalf("recorded samples after recorder panic = %d, want the later successful attempt", got)
 	}
 }
 
