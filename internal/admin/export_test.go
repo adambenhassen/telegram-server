@@ -37,6 +37,25 @@ func CollectMetricsTolerant(ctx context.Context, reg *mtproto.SessionRegistry, s
 	return collectMetrics(ctx, reg, st, tolerateGapFailure)
 }
 
+// PublishDeliveryLagForTest applies an aggregate sample to a sampler so
+// external package tests can cover retained-state transitions without exposing
+// that test seam in the production API.
+func PublishDeliveryLagForTest(s *DeliveryLagSampler, attempt uint64, raw mtproto.DeliveryLagSample, sampledAt time.Time) DeliveryLag {
+	return s.publish(attempt, raw, sampledAt)
+}
+
+// SampleDeliveryLagForTest runs the bounded sampler with a supplied head
+// reader, so tests can control database timing without adding a production
+// dependency seam.
+func SampleDeliveryLagForTest(
+	s *DeliveryLagSampler,
+	ctx context.Context,
+	registry *mtproto.SessionRegistry,
+	accountHead func(context.Context, int64) (int64, error),
+) DeliveryLag {
+	return s.sampleWithAccountHead(ctx, registry, accountHead)
+}
+
 // EncodeFragment exposes the SSE wire encoding so the framing rules can be
 // asserted without standing up a stream.
 func EncodeFragment(f Fragment) []byte {

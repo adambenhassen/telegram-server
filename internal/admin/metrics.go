@@ -49,6 +49,10 @@ type MetricsResponse struct {
 	// connections report a spread of 0.
 	MaxPtsGap int64 `json:"max_pts_gap"`
 
+	// DeliveryLag is the aggregate lag from each live connection's push
+	// watermark to its account's authoritative current head.
+	DeliveryLag DeliveryLag `json:"delivery_lag"`
+
 	// NotifyCount is the number of Postgres NOTIFY events dispatched in the
 	// rolling observation window on this replica. It is delivery work: summing
 	// this value across replicas does not count unique committed events.
@@ -193,7 +197,7 @@ type metricsCache struct {
 
 // refresh re-reads metrics from the store and registry if enough time has
 // elapsed since the last refresh.
-func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, notifyMetrics ...*store.NotificationMetrics) {
+func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -201,7 +205,7 @@ func (c *metricsCache) refresh(ctx context.Context, reg *mtproto.SessionRegistry
 		return
 	}
 
-	resp, err := collectMetrics(ctx, reg, st, tolerateGapFailure, notifyMetrics...)
+	resp, err := collectMetricsWithDeliveryLag(ctx, reg, st, tolerateGapFailure, deliveryLag, notifyMetrics...)
 	if err != nil {
 		slog.Error("admin metrics refresh", "err", err)
 		c.lastErr = true
@@ -230,9 +234,18 @@ const (
 )
 
 // collectMetrics assembles one metrics snapshot from the store and the session
-// registry. Both the cached JSON endpoint and the SSE broadcaster's shared
-// sampler read through it, so the two surfaces cannot drift apart.
+// registry for callers that do not need to share lag state. Production JSON,
+// dashboard, and SSE handlers use collectMetricsWithDeliveryLag with the one
+// process-local sampler instead.
 func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
+	return collectMetricsWithDeliveryLag(ctx, reg, st, tolerateGapErr, NewDeliveryLagSampler(), notifyMetrics...)
+}
+
+// collectMetricsWithDeliveryLag assembles one snapshot using the supplied
+// process-local lag sampler. A shared sampler lets JSON and SSE retain and
+// expose the same complete sample while their database snapshots remain
+// independently cached.
+func collectMetricsWithDeliveryLag(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store, tolerateGapErr bool, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) (MetricsResponse, error) {
 	snap, err := st.Metrics(ctx)
 	if err != nil {
 		return MetricsResponse{}, fmt.Errorf("collect metrics: %w", err)
@@ -245,6 +258,10 @@ func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store
 		}
 		maxGap = 0
 	}
+	if deliveryLag == nil {
+		deliveryLag = NewDeliveryLagSampler()
+	}
+	lag := deliveryLag.sample(ctx, reg, st)
 
 	notify := notificationSnapshot(notifyMetrics...)
 	pushUninstrumented := pushMetricsUninstrumented(notifyMetrics...)
@@ -260,6 +277,7 @@ func collectMetrics(ctx context.Context, reg *mtproto.SessionRegistry, st *store
 		TotalChannels:                  snap.TotalChannels,
 		TotalChats:                     snap.TotalChats,
 		MaxPtsGap:                      maxGap,
+		DeliveryLag:                    lag,
 		NotifyCount:                    notify.NotifyCount,
 		NotifyWindowSeconds:            notify.WindowSeconds,
 		NotifyRatePerSecond:            notify.RatePerSecond,
@@ -424,6 +442,16 @@ func (c *metricsCache) failed() bool {
 // caches results for at least cacheRefresh (10 s) to prevent N dashboard tabs
 // from costing N full query sets. No background goroutines are started.
 func Handler(registry *mtproto.SessionRegistry, st *store.Store, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
+	return HandlerWithDeliveryLag(registry, st, NewDeliveryLagSampler(), notifyMetrics...)
+}
+
+// HandlerWithDeliveryLag returns an admin metrics handler using a supplied
+// lag sampler. The sampler can be shared with the SSE broadcaster so both
+// authenticated surfaces expose the same retained complete sample.
+func HandlerWithDeliveryLag(registry *mtproto.SessionRegistry, st *store.Store, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
+	if deliveryLag == nil {
+		deliveryLag = NewDeliveryLagSampler()
+	}
 	var cache metricsCache
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -432,12 +460,13 @@ func Handler(registry *mtproto.SessionRegistry, st *store.Store, notifyMetrics .
 			return
 		}
 
-		cache.refresh(r.Context(), registry, st, notifyMetrics...)
+		cache.refresh(r.Context(), registry, st, deliveryLag, notifyMetrics...)
 		if cache.failed() {
 			http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		resp := cache.get()
+		resp.DeliveryLag = deliveryLag.Snapshot()
 		if len(notifyMetrics) > 0 {
 			applyNotificationSnapshot(&resp, notifyMetrics[0])
 		}

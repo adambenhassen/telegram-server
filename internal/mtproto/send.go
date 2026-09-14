@@ -83,8 +83,8 @@ type Conn struct {
 	unimplemented unimplementedBudget
 
 	// lastPushedPts is the highest pts already pushed to this conn, so a
-	// notification never re-delivers events. Read/written only by the delivery
-	// goroutine, but atomic for safety across the registry hand-off.
+	// notification never re-delivers events. Delivery writes it and the bounded
+	// admin sampler reads it; atomic access keeps the registry hand-off safe.
 	lastPushedPts atomic.Int64
 
 	// authKeyID mirrors authKey.IntID() for readers that must not take writeMu.

@@ -115,10 +115,21 @@ type Sampler func(context.Context) (MetricsResponse, error)
 // NewMetricsSampler returns a Sampler reading the same snapshot that
 // GET /admin/metrics serves.
 func NewMetricsSampler(registry *mtproto.SessionRegistry, st *store.Store, notifyMetrics ...*store.NotificationMetrics) Sampler {
+	return NewMetricsSamplerWithDeliveryLag(registry, st, NewDeliveryLagSampler(), notifyMetrics...)
+}
+
+// NewMetricsSamplerWithDeliveryLag returns a Sampler using the supplied
+// process-local lag state. Production shares it with the JSON and dashboard
+// handlers so a partial attempt cannot make one surface look newer than the
+// other.
+func NewMetricsSamplerWithDeliveryLag(registry *mtproto.SessionRegistry, st *store.Store, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) Sampler {
+	if deliveryLag == nil {
+		deliveryLag = NewDeliveryLagSampler()
+	}
 	return func(ctx context.Context) (MetricsResponse, error) {
 		// requireAllMetrics: the stream stays silent on a partial snapshot
 		// rather than pushing a metric that reads as good news.
-		return collectMetrics(ctx, registry, st, requireAllMetrics, notifyMetrics...)
+		return collectMetricsWithDeliveryLag(ctx, registry, st, requireAllMetrics, deliveryLag, notifyMetrics...)
 	}
 }
 
@@ -513,7 +524,11 @@ func DefaultFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	if err != nil {
 		return nil, err
 	}
-	html := strings.TrimSuffix(buf.String(), `</div>`) + telemetry + rateLimitDenialTelemetry + `</div>`
+	deliveryLagTelemetry, err := deliveryLagTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	html := strings.TrimSuffix(buf.String(), `</div>`) + telemetry + rateLimitDenialTelemetry + deliveryLagTelemetry + `</div>`
 	return []Fragment{{Event: sseDefaultEvent, HTML: html}}, nil
 }
 
@@ -574,6 +589,14 @@ func rateLimitDenialTelemetryHTML(m MetricsResponse) (string, error) {
 		return "", fmt.Errorf("marshal rate-limit denial telemetry: %w", err)
 	}
 	return `<script id="rate-limit-denials-telemetry" type="application/json">` + string(data) + `</script>`, nil
+}
+
+func deliveryLagTelemetryHTML(m MetricsResponse) (string, error) {
+	data, err := json.Marshal(m.DeliveryLag)
+	if err != nil {
+		return "", fmt.Errorf("marshal delivery lag telemetry: %w", err)
+	}
+	return `<script id="delivery-lag-telemetry" type="application/json">` + string(data) + `</script>`, nil
 }
 
 // metricsFragmentHTML mirrors the data-metric attributes the dashboard uses, so

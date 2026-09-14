@@ -151,3 +151,17 @@ func (s *Store) MaxPtsGap(ctx context.Context, liveUserIDs ...int64) (int64, err
 	}
 	return gap, nil
 }
+
+// AccountHead returns the authoritative current pts head for one account.
+// A missing update_state row is an error: normal account creation provisions
+// the row, and treating an unexpected absence as zero would make an incomplete
+// lag sample look fully caught up.
+func (s *Store) AccountHead(ctx context.Context, userID int64) (int64, error) {
+	var head int64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT pts FROM update_state WHERE user_id = $1`, userID,
+	).Scan(&head); err != nil {
+		return 0, fmt.Errorf("account head: %w", err)
+	}
+	return head, nil
+}
