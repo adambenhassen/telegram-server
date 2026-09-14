@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,8 +18,6 @@ import (
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
-
-const traceTestMethodID = 0xdecafbad
 
 func TestRPCTraceRecordsAllResultClasses(t *testing.T) {
 	t.Parallel()
@@ -53,11 +53,11 @@ func TestRPCTraceRecordsAllResultClasses(t *testing.T) {
 			}()
 
 			d := mtproto.NewDispatcher()
-			d.HandleFuncNamed(traceTestMethodID, "messages.sendMessage", func(_ *mtproto.Conn, _ *mtproto.Request) error {
+			d.HandleFunc(tg.MessagesSendMessageRequestTypeID, func(_ *mtproto.Conn, _ *mtproto.Request) error {
 				now = now.Add(5 * time.Millisecond)
 				return test.err
 			})
-			req := traceRequest(traceTestMethodID)
+			req := traceRequest(tg.MessagesSendMessageRequestTypeID)
 			if err := tracer.Wrap(d).OnMessage(nil, req); !errors.Is(err, test.err) {
 				t.Fatalf("OnMessage error = %v, want %v", err, test.err)
 			}
@@ -113,29 +113,59 @@ func TestRPCTraceUnknownMethodsCollapse(t *testing.T) {
 func TestRPCTraceDoesNotRetainRequestData(t *testing.T) {
 	t.Parallel()
 
-	const sentinel = "sentinel-message-body-user-991337"
+	const (
+		sentinelBody   = "sentinel-message-body"
+		sentinelDevice = "sentinel-device-model"
+		sentinelUserID = int64(991337)
+		sentinelAddr   = "198.51.100.77"
+	)
 	exporter := mtproto.NewMemoryRPCSpanExporter(2)
 	tracer := mtproto.NewRPCTracer(mtproto.RPCTracerConfig{Exporter: exporter})
 	d := mtproto.NewDispatcher()
 	d.HandleFunc(tg.HelpGetConfigRequestTypeID, func(_ *mtproto.Conn, req *mtproto.Request) error {
 		if req.Buf == nil {
-			return errors.New(sentinel)
+			return errors.New(sentinelBody)
 		}
 		return nil
 	})
+	wrapped := &tg.InvokeWithLayerRequest{
+		Layer: 100,
+		Query: &tg.InitConnectionRequest{
+			APIID:          1,
+			DeviceModel:    sentinelDevice,
+			SystemVersion:  "test-system",
+			AppVersion:     "test-app",
+			SystemLangCode: "en",
+			LangPack:       "",
+			LangCode:       "en",
+			Query:          &tg.HelpGetConfigRequest{},
+		},
+	}
 	var b bin.Buffer
-	if err := (&tg.HelpGetConfigRequest{}).Encode(&b); err != nil {
+	if err := wrapped.Encode(&b); err != nil {
 		t.Fatal(err)
 	}
-	b.Buf = append(b.Buf, []byte(sentinel)...)
-	if err := tracer.Wrap(d).OnMessage(nil, &mtproto.Request{Buf: &b}); err != nil {
+	b.Buf = append(b.Buf, []byte(sentinelBody)...)
+	req := &mtproto.Request{
+		UserID:     sentinelUserID,
+		ClientAddr: netip.MustParseAddr(sentinelAddr),
+		Buf:        &b,
+		Ctx:        context.Background(),
+	}
+	if err := tracer.Wrap(mtproto.UnpackInvoke(d)).OnMessage(nil, req); err != nil {
 		t.Fatal(err)
 	}
 	if err := tracer.Close(); err != nil {
 		t.Fatalf("close tracer: %v", err)
 	}
-	if got := fmt.Sprint(exporter.Spans()); got == "" || contains(got, sentinel) {
-		t.Fatalf("span snapshot retained forbidden request data: %q", got)
+	got := fmt.Sprint(exporter.Spans())
+	if got == "" {
+		t.Fatal("span snapshot is empty")
+	}
+	for _, forbidden := range []string{sentinelBody, sentinelDevice, sentinelAddr, strconv.FormatInt(sentinelUserID, 10)} {
+		if contains(got, forbidden) {
+			t.Fatalf("span snapshot retained forbidden request data: %q", got)
+		}
 	}
 }
 
@@ -144,11 +174,11 @@ func TestRPCTraceDisabledDoesNoWork(t *testing.T) {
 
 	tracer := mtproto.NewRPCTracer(mtproto.RPCTracerConfig{})
 	d := mtproto.NewDispatcher()
-	d.HandleFuncNamed(traceTestMethodID, "messages.sendMessage", func(_ *mtproto.Conn, _ *mtproto.Request) error { return nil })
+	d.HandleFunc(tg.MessagesSendMessageRequestTypeID, func(_ *mtproto.Conn, _ *mtproto.Request) error { return nil })
 	if got := tracer.Wrap(d); got != d {
 		t.Fatal("disabled tracer wrapped the handler")
 	}
-	if err := tracer.Wrap(d).OnMessage(nil, traceRequest(traceTestMethodID)); err != nil {
+	if err := tracer.Wrap(d).OnMessage(nil, traceRequest(tg.MessagesSendMessageRequestTypeID)); err != nil {
 		t.Fatal(err)
 	}
 	tracer.Record(mtproto.RPCSpan{Method: "messages.sendMessage", Result: mtproto.RPCResultSuccess})
