@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Response } from '@playwright/test';
+import { expect, test, type Page, type Response, type Route } from '@playwright/test';
 
 // The admin token the Go e2e server (test/e2e/adminserver) was started with.
 const ADMIN_TOKEN = 'e2e-secret-token';
@@ -73,6 +73,106 @@ async function postLogout(
     headers: cookieHeader ? { Cookie: cookieHeader } : {},
     // No Origin header: the handler only rejects a present-but-wrong Origin.
   });
+}
+
+function encodeDashboardFragment(html: string): string {
+  const lines = html.replace(/\r\n?/g, '\n').split('\n');
+  return [
+    'event: datastar-merge-fragments',
+    'data: selector #metrics-stream',
+    'data: mergeMode morph',
+    ...lines.map((line) => `data: fragments ${line}`),
+    '',
+    '',
+  ].join('\n');
+}
+
+async function dashboardFixture(page: Page, kind: 'partial-delivery' | 'zero-window'): Promise<string> {
+  return page.locator('#metrics-stream').evaluate((stream, fixtureKind) => {
+    const fixture = stream.cloneNode(true) as HTMLElement;
+    const setText = (selector: string, value: string) => {
+      const element = fixture.querySelector(selector);
+      if (!element) throw new Error(`fixture selector is missing: ${selector}`);
+      element.textContent = value;
+    };
+    const setMetric = (selector: string, value: string, state: string, helper: string) => {
+      const element = fixture.querySelector(selector);
+      if (!element) throw new Error(`fixture metric is missing: ${selector}`);
+      element.replaceChildren(document.createTextNode(value));
+      const reading = element.closest('dl');
+      if (reading) reading.dataset.readingState = state;
+      if (state && state !== value) {
+        const stateElement = document.createElement('p');
+        stateElement.className = 'metric-state';
+        stateElement.textContent = state;
+        element.append(stateElement);
+      }
+      if (helper) {
+        const helperElement = document.createElement('p');
+        helperElement.className = 'dashboard-helper';
+        helperElement.textContent = helper;
+        element.append(helperElement);
+      }
+    };
+
+    if (fixtureKind === 'partial-delivery') {
+      setMetric(
+        '#v-delivery-lag',
+        'Unavailable',
+        'Partial coverage',
+        'Maximum of sampled connection lag; the sample is incomplete.',
+      );
+      const details = fixture.querySelectorAll<HTMLElement>('[aria-label="Delivery lag sample details"] dd');
+      if (details.length !== 3) throw new Error('delivery fixture details are incomplete');
+      details[0].textContent = 'Sample 2026-09-15 02:00:00 UTC';
+      details[1].textContent = 'Partial coverage';
+      details[2].textContent = '1 of 2';
+    } else {
+      setMetric(
+        '#v-push-p50',
+        'No samples',
+        '',
+        'Percentile unavailable until the observation window has elapsed.',
+      );
+      setMetric(
+        '#v-push-p95',
+        'No samples',
+        '',
+        'Percentile unavailable until the observation window has elapsed.',
+      );
+      setText('#push-writes-card .dashboard-sample-count strong', '2');
+      setText('#push-writes-card .dashboard-window-label', 'Observation window · last <0.1 s · this replica');
+      setText('#push-writes-card .dashboard-window-status', 'Window just started');
+      setText('#push-outcome-success td[data-label="Count"]', '0');
+      setText('#push-outcome-owner-mismatch td[data-label="Count"]', '2');
+      setText('#push-outcome-encode-failure td[data-label="Count"]', '1');
+      setText('#push-outcome-write-failure td[data-label="Count"]', '3');
+      setMetric('#v-notify-rate', '0.00/s', '', 'Average over the elapsed rolling window.');
+      setMetric('#v-denials-rate', '0.00/s', '', 'Average over the elapsed rolling window.');
+      setText('#notifications-card .dashboard-window-status', 'Window just started');
+      setText('#denials-card .dashboard-window-status', 'Window just started');
+    }
+
+    return fixture.outerHTML;
+  }, kind);
+}
+
+async function reloadWithDashboardFixture(page: Page, fixture: string): Promise<number> {
+  let requests = 0;
+  await page.route('**/admin/events**', async (route) => {
+    requests++;
+    await route.fulfill({
+      status: 200,
+      headers: {
+        'Cache-Control': 'no-store',
+        'Content-Type': 'text/event-stream; charset=utf-8',
+      },
+      body: encodeDashboardFragment(fixture),
+    });
+  });
+  await page.reload();
+  await expect.poll(() => requests, { message: 'fixture SSE request' }).toBeGreaterThan(0);
+  return requests;
 }
 
 test.describe('admin login/logout CSRF flow', () => {
@@ -340,7 +440,7 @@ test.describe('admin SSE stream', () => {
         value: () => sampleClock,
       });
     });
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
 
     await login(page);
     await page.goto('/admin/dashboard');
@@ -396,7 +496,7 @@ test.describe('admin SSE stream', () => {
         value: () => sampleClock,
       });
     });
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
 
     await login(page);
     await page.goto('/admin/dashboard');
@@ -468,7 +568,7 @@ test.describe('admin SSE stream', () => {
         value: () => sampleClock,
       });
     });
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
 
     await login(page);
     await page.goto('/admin/dashboard');
@@ -710,7 +810,7 @@ test.describe('admin SSE stream', () => {
   });
 
   test('initial loading keeps the connecting copy until SSE starts', async ({ page }) => {
-    await page.route('**/admin/events', async (route) => {
+    await page.route('**/admin/events**', async (route) => {
       await new Promise((resolve) => setTimeout(resolve, 5000));
       await route.continue();
     });
@@ -762,40 +862,30 @@ test.describe('admin SSE stream', () => {
 
 test.describe('admin dashboard acceptance states', () => {
   test('confirmed SSE 401 expiry hides metrics and offers login', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    let eventsRequests = 0;
+    await page.route('**/admin/events**', async (route) => {
+      eventsRequests++;
+      await route.fulfill({
+        status: 401,
+        headers: { 'Content-Type': 'text/event-stream; charset=utf-8' },
+        body: 'session expired',
+      });
+    });
     await login(page);
     await page.goto('/admin/dashboard');
-    await expect(page.locator('#v-connections')).toBeVisible();
+    await expect(page.locator('#metrics-stream')).toBeAttached();
+    await expect.poll(() => eventsRequests, { message: 'authenticated SSE expiry request' }).toBeGreaterThan(0);
 
-    const state = await page.evaluate(() => {
-      document.dispatchEvent(new CustomEvent('datastar-sse', {
-        detail: { type: 'error', elId: 'sse-root', argsRaw: { status: 401 } },
-      }));
-      const metrics = document.getElementById('metrics-stream');
-      const auth = document.getElementById('banner-auth');
-      const disconnect = document.getElementById('banner-disconnected');
-      const root = document.getElementById('sse-root');
-      return {
-        chip: document.getElementById('chip-text')?.textContent ?? '',
-        metricsHidden: metrics?.classList.contains('hidden') ?? false,
-        authVisible: !(auth?.classList.contains('hidden') ?? true),
-        disconnectHidden: disconnect?.classList.contains('hidden') ?? false,
-        streamDisabled: !root?.hasAttribute('data-on-load'),
-      };
-    });
-
-    expect(state).toEqual({
-      chip: '● Session ended. Log in again.',
-      metricsHidden: true,
-      authVisible: true,
-      disconnectHidden: true,
-      streamDisabled: true,
-    });
+    await expect(page.locator('#chip-text')).toHaveText('● Session ended. Log in again.');
+    await expect(page.locator('#metrics-stream')).toBeHidden();
+    await expect(page.locator('#banner-auth')).toBeVisible();
+    await expect(page.locator('#banner-disconnected')).toBeHidden();
+    await expect(page.locator('#sse-root')).not.toHaveAttribute('data-on-load');
     await expect(page.locator('#banner-auth')).toContainText('Session ended. Log in again.');
   });
 
   test('initial paint keeps absent capabilities and empty windows safe', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await login(page);
     const response = await page.goto('/admin/dashboard');
     expect(response!.status()).toBe(200);
@@ -818,32 +908,46 @@ test.describe('admin dashboard acceptance states', () => {
   });
 
   test('delivery copy distinguishes no sampled connections and partial coverage', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
     await login(page);
     await page.goto('/admin/dashboard');
 
     await expect(page.locator('#delivery-lag-card')).toContainText('No sampled connections');
 
-    await page.evaluate(() => {
-      const stream = document.getElementById('metrics-stream');
-      const metric = document.getElementById('v-delivery-lag');
-      const details = stream?.querySelectorAll('.dashboard-meta-grid dd');
-      if (!stream || !metric || !details || details.length < 3) {
-        throw new Error('delivery lag fixture hooks are missing');
-      }
-      metric.childNodes[0].textContent = 'Unavailable';
-      const state = metric.querySelector('.metric-state');
-      if (state) state.textContent = 'Partial coverage';
-      details[1].textContent = 'Partial coverage';
-      details[2].textContent = '1 of 2';
-    });
+    const fixture = await dashboardFixture(page, 'partial-delivery');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
 
     await expect(page.locator('#delivery-lag-card')).toContainText('Partial coverage');
     await expect(page.locator('#delivery-lag-card')).toContainText('1 of 2');
   });
 
+  test('SSE fixture renders failed outcomes with zero-duration rates safely', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'zero-window');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#v-push-p50')).toContainText('No samples');
+    await expect(page.locator('#v-push-p95')).toContainText('No samples');
+    await expect(page.locator('#v-push-p50')).toContainText('Percentile unavailable until the observation window has elapsed.');
+    await expect(page.locator('#v-push-p95')).toContainText('Percentile unavailable until the observation window has elapsed.');
+    await expect(page.locator('#push-writes-card .dashboard-sample-count strong')).toHaveText('2');
+    await expect(page.locator('#push-writes-card .dashboard-window-status')).toHaveText('Window just started');
+    await expect(page.locator('#push-outcome-owner-mismatch td[data-label="Count"]')).toHaveText('2');
+    await expect(page.locator('#push-outcome-encode-failure td[data-label="Count"]')).toHaveText('1');
+    await expect(page.locator('#push-outcome-write-failure td[data-label="Count"]')).toHaveText('3');
+    await expect(page.locator('#v-notify-rate')).toContainText('0.00/s');
+    await expect(page.locator('#v-denials-rate')).toContainText('0.00/s');
+  });
+
   test('fixed operational families retain their browser labels', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await login(page);
     await page.goto('/admin/dashboard');
 
@@ -870,7 +974,7 @@ test.describe('admin dashboard acceptance states', () => {
   });
 
   test('renders exact push copy', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await login(page);
     await page.goto('/admin/dashboard');
 
@@ -880,7 +984,7 @@ test.describe('admin dashboard acceptance states', () => {
   });
 
   test('keeps dashboard reading semantics valid', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await login(page);
     await page.goto('/admin/dashboard');
 
@@ -895,7 +999,7 @@ test.describe('admin dashboard acceptance states', () => {
   });
 
   test('320px viewport has no horizontal overflow', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await page.setViewportSize({ width: 320, height: 720 });
     await login(page);
     await page.goto('/admin/dashboard');
@@ -910,7 +1014,7 @@ test.describe('admin dashboard acceptance states', () => {
   });
 
   test('dashboard follows light and dark theme preference', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await page.emulateMedia({ colorScheme: 'dark' });
     await login(page);
     await page.goto('/admin/dashboard');
@@ -922,7 +1026,7 @@ test.describe('admin dashboard acceptance states', () => {
   });
 
   test('sentinel values never reach the rendered dashboard', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await login(page);
     await page.goto('/admin/dashboard');
 
@@ -934,7 +1038,7 @@ test.describe('admin dashboard acceptance states', () => {
   });
 
   test('keyboard focus order reaches skip link and controls', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await login(page);
     await page.goto('/admin/dashboard');
 
@@ -949,7 +1053,7 @@ test.describe('admin dashboard acceptance states', () => {
   });
 
   test('200 percent zoom keeps the dashboard inside the viewport', async ({ page }) => {
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await page.setViewportSize({ width: 1280, height: 720 });
     await login(page);
     await page.goto('/admin/dashboard');
@@ -969,7 +1073,7 @@ test.describe('admin dashboard acceptance states', () => {
 
   test('reduced motion disables dashboard animation', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' });
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
     await login(page);
     await page.goto('/admin/dashboard');
 
