@@ -113,6 +113,9 @@ type handlers struct {
 	// It is process-local and optional so tests and embedders without admin
 	// telemetry retain the same enforcement behaviour.
 	rateLimitMetrics *store.NotificationMetrics
+	// rateLimitRecorder is a test-only failure injection seam. Production uses
+	// the fixed recorder method through rateLimitMetrics.
+	rateLimitRecorder func(surface string) error
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -378,12 +381,17 @@ func (h *handlers) recordRateLimitDenial(surface string) {
 	if h.rateLimitMetrics == nil {
 		return
 	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			return
-		}
-	}()
-	h.rateLimitMetrics.RecordRateLimitDenial(surface)
+	var failed bool
+	if h.rateLimitRecorder != nil {
+		failed = store.InvokeRecorder(func() error { return h.rateLimitRecorder(surface) })
+	} else {
+		failed = store.InvokeRecorder(func() error {
+			return h.rateLimitMetrics.RecordRateLimitDenialResult(surface)
+		})
+	}
+	if failed {
+		store.ReportRecorderFailure(h.log, h.rateLimitMetrics, store.RecorderFailureRateLimitDenial)
+	}
 }
 
 // provisionalAllowList holds the method IDs that a provisional session may call.
