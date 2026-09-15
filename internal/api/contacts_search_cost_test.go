@@ -67,13 +67,14 @@ func seedBackground(t *testing.T, ctx context.Context, s *store.Store, creatorID
 // hold no username, so none of them is publicly discoverable and none has a
 // member. They are inserted in one statement rather than through CreateChannel:
 // this seeds a corpus, not channels anyone acts on, and 100k round trips would
-// dominate the measurement the test exists to take.
-func seedPrivateChannels(t *testing.T, ctx context.Context, dsn string, creatorID int64, token string, n int) {
+// dominate the measurement the test exists to take. Ids sit below 2^31 so they
+// cannot collide with the random ids CreateChannel draws for the background.
+func seedPrivateChannels(t *testing.T, ctx context.Context, dsn string, creatorID int64, token string, n, idOffset int) {
 	t.Helper()
 	channelExec(t, ctx, dsn, `
-		INSERT INTO channels (title, about, creator_id)
-		SELECT $1 || ' Circle ' || g, '', $2
-		FROM generate_series(1, $3) g`, token, creatorID, n)
+		INSERT INTO channels (id, title, about, creator_id)
+		SELECT $4 + g, $1 || ' Circle ' || g, '', $2
+		FROM generate_series(1, $3) g`, token, creatorID, n, idOffset)
 	// Without fresh statistics the planner works from the table it was last
 	// analysed on and picks the same plan at every size, which would hide
 	// exactly the flip this test is looking for.
@@ -140,7 +141,7 @@ func TestContactsSearchCostIndependentOfPrivateChannelCount(t *testing.T) {
 	latencies := make([]time.Duration, 0, len(privateChannelCounts))
 	seeded := 0
 	for _, n := range privateChannelCounts {
-		seedPrivateChannels(t, ctx, dsn, creator.ID, token, n-seeded)
+		seedPrivateChannels(t, ctx, dsn, creator.ID, token, n-seeded, seeded)
 		seeded = n
 		latencies = append(latencies, searchMinLatency(t, s, caller.ID, token))
 	}
