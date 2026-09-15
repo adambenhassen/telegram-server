@@ -216,7 +216,7 @@ templ metricsFragment(d DashboardData) {
 			@card.Card(card.Props{ID: "push-writes-card"}) {
 				@card.Header() {
 					<h3 class="dashboard-card-title">Push writes · distribution</h3>
-					<p class="dashboard-card-description">Persisted account updates (`<code>tg_updates</code>`) only · successful connection writes.</p>
+					<p class="dashboard-card-description">Persisted account updates (<code>tg_updates</code>) only · successful connection writes.</p>
 				}
 				@card.Content() {
 					<div class="dashboard-two-up">
@@ -321,18 +321,20 @@ templ metricsFragment(d DashboardData) {
 					<dl class="dashboard-reading">
 						<dt>Active accounts · last 24 hours</dt>
 						<dd id="v-active_users_24h" data-metric="active_users_24h" class="metric-value tabular-nums">{ d.SharedDatabase.ActiveUsers24H }</dd>
-						if d.SharedDatabase.ActiveUsersMeta != "" {
-							<div id="meter-wrap" class="mt-2">
-								@progress.Progress(progress.Props{Value: int(d.SharedDatabase.ActiveUsersPct), Attributes: templ.Attributes{"aria-label": "Active accounts ratio"}}) {}
-								<p id="meter-text" class="mt-1 text-xs text-muted-foreground">{ d.SharedDatabase.ActiveUsersMeta }</p>
-							</div>
-						} else {
-							<div id="meter-wrap" class="hidden mt-2">
-								@progress.Progress(progress.Props{Value: 0, Attributes: templ.Attributes{"aria-label": "Active accounts ratio"}}) {}
-								<p id="meter-text" class="mt-1 text-xs text-muted-foreground"></p>
-							</div>
-						}
-						<p class="dashboard-helper">Accounts with account activity in the last 24 hours.</p>
+						<dd>
+							if d.SharedDatabase.ActiveUsersMeta != "" {
+								<div id="meter-wrap" class="mt-2">
+									@progress.Progress(progress.Props{Value: int(d.SharedDatabase.ActiveUsersPct), Attributes: templ.Attributes{"aria-label": "Active accounts ratio"}}) {}
+									<p id="meter-text" class="mt-1 text-xs text-muted-foreground">{ d.SharedDatabase.ActiveUsersMeta }</p>
+								</div>
+							} else {
+								<div id="meter-wrap" class="hidden mt-2">
+									@progress.Progress(progress.Props{Value: 0, Attributes: templ.Attributes{"aria-label": "Active accounts ratio"}}) {}
+									<p id="meter-text" class="mt-1 text-xs text-muted-foreground"></p>
+								</div>
+							}
+							<p class="dashboard-helper">Accounts with account activity in the last 24 hours.</p>
+						</dd>
 					</dl>
 				}
 			}
@@ -409,26 +411,30 @@ templ metricsFragment(d DashboardData) {
 templ simpleReading(id, metric, label, value, helper, state string) {
 	<dl class="dashboard-reading">
 		<dt>{ label }</dt>
-		<dd id={ id } data-metric={ metric } class="metric-value tabular-nums">{ value }</dd>
-		if state != "" {
-			<p class="metric-state">{ state }</p>
-		}
-		if helper != "" {
-			<p class="dashboard-helper">{ helper }</p>
-		}
+		<dd id={ id } data-metric={ metric } class="metric-value tabular-nums">
+			{ value }
+			if state != "" {
+				<p class="metric-state">{ state }</p>
+			}
+			if helper != "" {
+				<p class="dashboard-helper">{ helper }</p>
+			}
+		</dd>
 	</dl>
 }
 
 templ metricReading(reading DashMetric, extraClass string) {
 	<dl class={ "dashboard-reading " + extraClass } data-reading-state={ reading.State }>
 		<dt>{ reading.Label }</dt>
-		<dd id={ reading.ID } data-metric={ reading.Metric } class="metric-value tabular-nums">{ reading.Value }</dd>
-		if reading.State != "" && reading.State != reading.Value {
-			<p class="metric-state">{ reading.State }</p>
-		}
-		if reading.Helper != "" {
-			<p class="dashboard-helper">{ reading.Helper }</p>
-		}
+		<dd id={ reading.ID } data-metric={ reading.Metric } class="metric-value tabular-nums">
+			{ reading.Value }
+			if reading.State != "" && reading.State != reading.Value {
+				<p class="metric-state">{ reading.State }</p>
+			}
+			if reading.Helper != "" {
+				<p class="dashboard-helper">{ reading.Helper }</p>
+			}
+		</dd>
 	</dl>
 }
 

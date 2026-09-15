@@ -752,12 +752,19 @@ test.describe('admin dashboard acceptance states', () => {
 
     await expect(page.locator('#metrics-stream')).toBeVisible();
     await expect(page.locator('#uninstr-card')).toBeHidden();
-    await expect(page.locator('#v-push-p50')).toHaveText('No samples');
-    await expect(page.locator('#v-push-p95')).toHaveText('No samples');
+    const metricValue = (selector: string) => page.locator(selector).evaluate((element) =>
+      Array.from(element.childNodes)
+        .filter((node) => node.nodeType === Node.TEXT_NODE)
+        .map((node) => node.textContent ?? '')
+        .join('')
+        .trim(),
+    );
+    expect(await metricValue('#v-push-p50')).toBe('No samples');
+    expect(await metricValue('#v-push-p95')).toBe('No samples');
     await expect(page.locator('#push-writes-card .dashboard-sample-count strong')).toHaveText('0');
-    await expect(page.locator('#v-notify-rate')).toHaveText('0.00/s');
-    await expect(page.locator('#v-denials-rate')).toHaveText('0.00/s');
-    await expect(page.locator('#v-delivery-lag')).toHaveText('0 PTS');
+    expect(await metricValue('#v-notify-rate')).toBe('0.00/s');
+    expect(await metricValue('#v-denials-rate')).toBe('0.00/s');
+    expect(await metricValue('#v-delivery-lag')).toBe('0 PTS');
   });
 
   test('fixed operational families retain their browser labels', async ({ page }) => {
@@ -785,6 +792,58 @@ test.describe('admin dashboard acceptance states', () => {
       'check_password', 'check_password_ip', 'get_password_ip', 'sign_up_ip',
       'password_proof', 'get_password', 'update_profile',
     ]);
+  });
+
+  test('renders exact push copy', async ({ page }) => {
+    await page.route('**/admin/events', (route) => route.abort());
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    await expect(page.locator('#push-writes-card .dashboard-card-description')).toHaveText(
+      'Persisted account updates (tg_updates) only · successful connection writes.',
+    );
+  });
+
+  test('keeps dashboard reading semantics valid', async ({ page }) => {
+    await page.route('**/admin/events', (route) => route.abort());
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const invalidChildren = await page.locator('dl.dashboard-reading').evaluateAll((readings) =>
+      readings.flatMap((reading) =>
+        Array.from(reading.children)
+          .filter((child) => child.tagName !== 'DT' && child.tagName !== 'DD')
+          .map((child) => child.tagName),
+      ),
+    );
+    expect(invalidChildren).toEqual([]);
+  });
+
+  test('320px viewport has no horizontal overflow', async ({ page }) => {
+    await page.route('**/admin/events', (route) => route.abort());
+    await page.setViewportSize({ width: 320, height: 720 });
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const layout = await page.evaluate(() => ({
+      viewport: document.documentElement.clientWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      bodyWidth: document.body.scrollWidth,
+    }));
+    expect(layout.documentWidth).toBeLessThanOrEqual(layout.viewport + 1);
+    expect(layout.bodyWidth).toBeLessThanOrEqual(layout.viewport + 1);
+  });
+
+  test('dashboard follows light and dark theme preference', async ({ page }) => {
+    await page.route('**/admin/events', (route) => route.abort());
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('html')).toHaveClass(/dark/);
+
+    await page.emulateMedia({ colorScheme: 'light' });
+    await page.reload();
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
   });
 
   test('sentinel values never reach the rendered dashboard', async ({ page }) => {

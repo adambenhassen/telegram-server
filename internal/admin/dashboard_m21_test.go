@@ -88,7 +88,7 @@ func TestDashboardM21RendersFixedOperationalFamilies(t *testing.T) {
 		t.Fatal("delivery sample metadata must use a description list")
 	}
 	spread := strings.Index(markup, `data-metric="max_pts_gap"`)
-	if spread < 0 || !strings.Contains(markup[spread:], ">0 PTS<") {
+	if spread < 0 || !strings.Contains(markup[spread:], ">0 PTS") {
 		t.Fatalf("account-head spread should carry PTS units: %q", markup[max(0, spread-80):min(len(markup), spread+180)])
 	}
 }
