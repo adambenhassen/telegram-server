@@ -80,6 +80,9 @@ func (s *Store) AdmitUsername(ctx context.Context, handle, phoneCodeHash string,
 	if _, err := qtx.SetUsername(ctx, db.SetUsernameParams{ID: u.ID, Username: &handle}); err != nil {
 		return User{}, fmt.Errorf("admit username: set username: %w", err)
 	}
+	if err := s.electServerAdministrator(ctx, qtx, u.ID); err != nil {
+		return User{}, fmt.Errorf("admit username: election: %w", err)
+	}
 
 	if _, err := qtx.LockUnboundAuthKey(ctx, authKeyID); errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrAuthKeyNotFound

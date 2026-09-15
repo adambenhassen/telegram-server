@@ -66,17 +66,40 @@ func (s *Store) CreateUser(ctx context.Context, phone string) (User, error) {
 	qtx := s.q.WithTx(tx)
 
 	normalized := NormalizePhone(phone)
-	u, err := qtx.CreateUser(ctx, &normalized)
-	if err != nil {
+	inserted, err := qtx.InsertUser(ctx, &normalized)
+	created := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return User{}, fmt.Errorf("create user: %w", err)
 	}
-	if err := qtx.EnsureUpdateState(ctx, u.ID); err != nil {
+	var user User
+	if created {
+		row, loadErr := qtx.UserByID(ctx, inserted)
+		err = loadErr
+		if err == nil {
+			user = UserFromDB(row)
+		}
+	} else {
+		row, loadErr := qtx.UserByPhone(ctx, &normalized)
+		err = loadErr
+		if err == nil {
+			user = UserFromDB(db.UserByIDRow(row))
+		}
+	}
+	if err != nil {
+		return User{}, fmt.Errorf("load created user: %w", err)
+	}
+	if err := qtx.EnsureUpdateState(ctx, user.ID); err != nil {
 		return User{}, fmt.Errorf("ensure update state: %w", err)
+	}
+	if created {
+		if err := s.electServerAdministrator(ctx, qtx, user.ID); err != nil {
+			return User{}, fmt.Errorf("create user election: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return User{}, fmt.Errorf("commit: %w", err)
 	}
-	return UserFromDB(db.UserByIDRow(u)), nil
+	return user, nil
 }
 
 // CreateUsernameUser inserts a username-mode user with no phone. It provisions
@@ -107,6 +130,9 @@ func (s *Store) CreateUsernameUser(ctx context.Context, handle, firstName, lastN
 	}
 	if err := qtx.EnsureUpdateState(ctx, u.ID); err != nil {
 		return User{}, fmt.Errorf("ensure update state: %w", err)
+	}
+	if err := s.electServerAdministrator(ctx, qtx, u.ID); err != nil {
+		return User{}, fmt.Errorf("create username user election: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return User{}, fmt.Errorf("commit: %w", err)
