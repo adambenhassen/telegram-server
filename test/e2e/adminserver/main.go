@@ -97,11 +97,12 @@ func run(log *slog.Logger) error {
 
 	registry := mtproto.NewSessionRegistry()
 	deliveryLag := admin.NewDeliveryLagSampler()
+	notifyMetrics := store.NewNotificationMetrics()
 	processIdentity, err := admin.NewProcessIdentity(os.Getenv("TG_REPLICA_ID"))
 	if err != nil {
 		return err
 	}
-	metricsCache := admin.NewMetricsSnapshotCache(registry, st, processIdentity, deliveryLag)
+	metricsCache := admin.NewMetricsSnapshotCache(registry, st, processIdentity, deliveryLag, notifyMetrics)
 
 	events := admin.NewBroadcaster(admin.BroadcasterConfig{
 		Sample: metricsCache.Snapshot,
@@ -117,13 +118,14 @@ func run(log *slog.Logger) error {
 	}()
 
 	router := admin.AdminRouter(admin.LoginHandlerConfig{
-		Store:       st,
-		TokenHash:   tokenHash,
-		Logger:      log,
-		AdminOrigin: "http://" + adminListenAddr,
-		Events:      events,
-		DeliveryLag: deliveryLag,
-		Metrics:     metricsCache,
+		Store:         st,
+		TokenHash:     tokenHash,
+		Logger:        log,
+		AdminOrigin:   "http://" + adminListenAddr,
+		Events:        events,
+		DeliveryLag:   deliveryLag,
+		Metrics:       metricsCache,
+		NotifyMetrics: notifyMetrics,
 	}, registry)
 
 	srv := &http.Server{
