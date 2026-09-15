@@ -574,6 +574,79 @@ func TestSSE_route_behind_admin_gate(t *testing.T) {
 	}
 }
 
+// TestSSE_revoked_session_closes_and_reconnect_is_rejected verifies that a
+// stream does not outlive the session which authenticated it. Deleting the
+// session while the response is open must end the stream before its normal
+// lifetime cap, and the next request with the same cookie must be rejected.
+func TestSSE_revoked_session_closes_and_reconnect_is_rejected(t *testing.T) {
+	t.Parallel()
+
+	st := newAuthTestStore(t)
+	rawToken := "sse-revocation-" + t.Name()
+	tokenHash := sha256hex([]byte(rawToken))
+	b := sseTestBroadcaster(t, admin.BroadcasterConfig{
+		Interval:          20 * time.Millisecond,
+		Heartbeat:         20 * time.Millisecond,
+		MaxStreamDuration: 5 * time.Second,
+	})
+	h := admin.AdminRouter(admin.LoginHandlerConfig{
+		Store:     st,
+		TokenHash: tokenHash,
+		Logger:    slog.Default(),
+		Events:    b,
+	}, mtproto.NewSessionRegistry())
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	sessionID := loginAndGetSession(t, h, rawToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/admin/events", nil)
+	if err != nil {
+		t.Fatalf("new stream request: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: admin.SessionCookieName(), Value: sessionID}) //nolint:gosec // G124: test cookie
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200", resp.StatusCode)
+	}
+	readSSEUntil(t, resp.Body, "v-connections", 5*time.Second)
+
+	if _, err := st.DeleteAdminSession(ctx, admin.HashSessionID(sessionID)); err != nil {
+		t.Fatalf("revoke session: %v", err)
+	}
+
+	streamDone := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadAll(resp.Body)
+		streamDone <- readErr
+	}()
+	select {
+	case readErr := <-streamDone:
+		if readErr != nil {
+			t.Fatalf("read revoked stream: %v", readErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("revoked stream remained open")
+	}
+
+	reconnect, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/admin/events", nil)
+	if err != nil {
+		t.Fatalf("new reconnect request: %v", err)
+	}
+	reconnect.AddCookie(&http.Cookie{Name: admin.SessionCookieName(), Value: sessionID}) //nolint:gosec // G124: test cookie
+	reconnectResp, err := http.DefaultClient.Do(reconnect)
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer func() { _ = reconnectResp.Body.Close() }() //nolint:errcheck // best-effort close
+	if reconnectResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revoked reconnect status = %d, want 401", reconnectResp.StatusCode)
+	}
+}
+
 // TestSSE_default_contract_is_the_dashboard_contract pins the event name and
 // patch target agreed with MAIN-302. Datastar answers an unknown event name or
 // a selector that hits nothing with a 200 and no patch — a page that never

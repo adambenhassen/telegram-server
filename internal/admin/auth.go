@@ -468,7 +468,10 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 	}
 	registerProtected("GET /admin/metrics", HandlerWithSnapshotCache(metricsCache))
 	registerProtected("GET /admin/dashboard", DashboardHandlerWithSnapshotCache(metricsCache, cfg.TokenHash))
-	registerProtected("GET /admin/events", EventsHandler(cfg.Events))
+	registerProtected("GET /admin/events", EventsHandlerWithAuth(cfg.Events, AdminMiddlewareConfig{
+		Store:     cfg.Store,
+		TokenHash: cfg.TokenHash,
+	}))
 
 	// Top-level mux: specific public routes registered first (they take priority
 	// over the prefix match), then the catch-all protected prefix.
