@@ -87,9 +87,73 @@ func TestDashboardM21RendersFixedOperationalFamilies(t *testing.T) {
 	if strings.Contains(markup, `<div class="dashboard-meta-grid"`) {
 		t.Fatal("delivery sample metadata must use a description list")
 	}
+	if strings.Contains(markup, "No successful writes in this window.") {
+		t.Fatal("a positive push sample count must not render the empty-window helper")
+	}
 	spread := strings.Index(markup, `data-metric="max_pts_gap"`)
 	if spread < 0 || !strings.Contains(markup[spread:], ">0 PTS") {
 		t.Fatalf("account-head spread should carry PTS units: %q", markup[max(0, spread-80):min(len(markup), spread+180)])
+	}
+}
+
+func TestDashboardM21KeepsOutcomesWhenLatencyHasNoSamples(t *testing.T) {
+	m := admin.MetricsResponse{
+		PushLatencySampleCount: 0,
+		PushWindowSeconds:      3600,
+		PushOutcomes: admin.PushOutcomes{
+			OwnerMismatch: 2,
+			EncodeFailure: 1,
+			WriteFailure:  3,
+		},
+	}
+
+	data := admin.BuildDashboardData(m, "csrf")
+	if data.Push.P50.Value != "No samples" || data.Push.P95.Value != "No samples" {
+		t.Fatalf("empty latency readings = %q, %q, want no samples", data.Push.P50.Value, data.Push.P95.Value)
+	}
+	want := []string{"0", "2", "1", "3"}
+	for i, row := range data.Push.Outcomes {
+		if row.Value != want[i] {
+			t.Errorf("outcome %q = %q, want %q", row.Label, row.Value, want[i])
+		}
+	}
+}
+
+func TestDashboardM21NoSampledConnectionsCopy(t *testing.T) {
+	worstPts := int64(0)
+	m := admin.MetricsResponse{
+		DeliveryLag: admin.DeliveryLag{
+			WorstPts:            &worstPts,
+			State:               admin.DeliveryLagAvailable,
+			Coverage:            admin.DeliveryLagCoverageFull,
+			EligibleConnections: 0,
+			SampledConnections:  0,
+		},
+	}
+
+	data := admin.BuildDashboardData(m, "csrf")
+	if data.Delivery.Coverage != "No sampled connections" {
+		t.Fatalf("delivery coverage = %q, want no-sampled copy", data.Delivery.Coverage)
+	}
+	if data.Delivery.Worst.Helper != "No live authenticated connections." {
+		t.Fatalf("delivery helper = %q, want no-live copy", data.Delivery.Worst.Helper)
+	}
+}
+
+func TestDashboardM21RendersPushP95Overflow(t *testing.T) {
+	m := admin.MetricsResponse{
+		PushLatencyP95:         60_000,
+		PushLatencyP95Overflow: true,
+		PushLatencySampleCount: 1,
+		PushWindowSeconds:      3600,
+	}
+
+	data := admin.BuildDashboardData(m, "csrf")
+	if data.Push.P95.Value != "> 60,000 ms" {
+		t.Fatalf("p95 overflow = %q, want > 60,000 ms", data.Push.P95.Value)
+	}
+	if data.Push.P95.Helper != "" {
+		t.Fatalf("p95 overflow helper = %q, want empty", data.Push.P95.Helper)
 	}
 }
 

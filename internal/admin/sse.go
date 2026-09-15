@@ -64,6 +64,12 @@ const (
 	// commonly cut a connection that has been silent for 30-60 s.
 	sseHeartbeat = 15 * time.Second
 
+	// sseAuthCheckInterval bounds how long an already-open stream can continue
+	// after its session is deleted, expires, or changes fingerprint. The check
+	// deliberately does not refresh last_activity; only a new authenticated
+	// request may keep an idle session alive.
+	sseAuthCheckInterval = time.Second
+
 	// sseRetryHint is the reconnect delay advertised to the browser.
 	sseRetryHint = 5 * time.Second
 
@@ -420,6 +426,18 @@ func encodeFragment(f Fragment) []byte {
 // itself unavailable rather than 404ing, so the dashboard degrades to its
 // server-rendered first paint.
 func EventsHandler(b *Broadcaster) http.HandlerFunc {
+	return eventsHandler(b, nil)
+}
+
+// EventsHandlerWithAuth returns the authenticated stream handler used by the
+// admin router. RequireAdmin admits the initial request; this handler repeats
+// the session lifetime check while the response is open so revocation cannot
+// leave telemetry flowing on a dead session.
+func EventsHandlerWithAuth(b *Broadcaster, cfg AdminMiddlewareConfig) http.HandlerFunc {
+	return eventsHandler(b, &cfg)
+}
+
+func eventsHandler(b *Broadcaster, auth *AdminMiddlewareConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -428,6 +446,32 @@ func EventsHandler(b *Broadcaster) http.HandlerFunc {
 		if b == nil {
 			http.Error(w, "events unavailable", http.StatusServiceUnavailable)
 			return
+		}
+
+		var sessionHash []byte
+		var tokenFingerprint []byte
+		var authCheck <-chan time.Time
+		var authTicker *time.Ticker
+		if auth != nil {
+			cookie, err := r.Cookie(sessionCookieName)
+			if err != nil || auth.Store == nil {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			sessionHash = HashSessionID(cookie.Value)
+			tokenFingerprint, err = TokenFingerprint(auth.TokenHash)
+			if err != nil {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			row, err := auth.Store.GetAdminSession(r.Context(), sessionHash)
+			if err != nil || !adminSessionRowValid(row, tokenFingerprint, time.Now()) {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			authTicker = time.NewTicker(sseAuthCheckInterval)
+			authCheck = authTicker.C
+			defer authTicker.Stop()
 		}
 
 		// Without a Flusher every event would sit in the response buffer until
@@ -479,6 +523,14 @@ func EventsHandler(b *Broadcaster) http.HandlerFunc {
 			case <-lifetime.C:
 				// Stream recycled; the client reconnects after sseRetryHint.
 				return
+			case <-authCheck:
+				row, err := auth.Store.GetAdminSession(r.Context(), sessionHash)
+				if err != nil || !adminSessionRowValid(row, tokenFingerprint, time.Now()) {
+					// The response is already a 200 SSE stream. Closing it is
+					// what makes Datastar reconnect, where RequireAdmin returns
+					// the authoritative 401.
+					return
+				}
 			case payload, open := <-sub.ch:
 				if !open {
 					// Broadcaster shut down.

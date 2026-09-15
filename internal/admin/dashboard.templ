@@ -206,9 +206,9 @@ templ metricsFragment(d DashboardData) {
 				@card.Content() {
 					@metricReading(d.Delivery.Worst, "metric-primary")
 					<dl class="dashboard-meta-grid" aria-label="Delivery lag sample details">
-						<div><dt>Sample</dt><dd>{ d.Delivery.Sample }</dd></div>
-						<div><dt>Coverage</dt><dd>{ d.Delivery.Coverage }</dd></div>
-						<div><dt>Sampled connections</dt><dd>{ d.Delivery.SampledConnections } of { d.Delivery.EligibleConnections }</dd></div>
+						<dt>Sample</dt><dd>{ d.Delivery.Sample }</dd>
+						<dt>Coverage</dt><dd>{ d.Delivery.Coverage }</dd>
+						<dt>Sampled connections</dt><dd>{ d.Delivery.SampledConnections } of { d.Delivery.EligibleConnections }</dd>
 					</dl>
 					@metricReading(d.Delivery.AccountHeadSpread, "metric-secondary")
 				}
@@ -608,8 +608,13 @@ templ chipScript() {
 					return;
 				}
 				if (!connected) {
-					setChip('chip-critical', '● Reconnecting · last sample ' + ago(age));
-					setStatus('Live updates disconnected. Showing the last successful sample.');
+					if (hasLiveSignal) {
+						setChip('chip-critical', '● Reconnecting · last sample ' + ago(age));
+						setStatus('Live updates disconnected. Showing the last successful sample.');
+					} else {
+						setChip('chip-good', '● Live · connecting…');
+						setStatus('Connecting to live updates…');
+					}
 					updateBanners(age);
 					return;
 				}

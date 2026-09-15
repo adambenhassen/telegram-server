@@ -708,6 +708,56 @@ test.describe('admin SSE stream', () => {
     expect(before, 'finished reveals the banner').toBe(false);
     expect(after, 'reconnect re-hides the banner').toBe(true);
   });
+
+  test('initial loading keeps the connecting copy until SSE starts', async ({ page }) => {
+    await page.route('**/admin/events', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await route.continue();
+    });
+
+    await login(page);
+    const navigation = page.goto('/admin/dashboard');
+    await expect(page.locator('#metrics-stream')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#chip-text')).toHaveText('● Live · connecting…', {
+      timeout: 2500,
+    });
+    await navigation;
+    await expect(page.locator('#chip-text')).toHaveText(/Live · updated/, {
+      timeout: 15000,
+    });
+  });
+
+  test('revoked session closes the stream and rejects its reconnect', async ({ browser, page }) => {
+    const sessionValue = await login(page);
+    const contextA = await browser.newContext();
+    const contextB = await browser.newContext();
+    for (const context of [contextA, contextB]) {
+      await context.addCookies([{ name: SESSION_COOKIE, value: sessionValue, ...cookieAttrs }]);
+    }
+
+    const pageA = await contextA.newPage();
+    const pageB = await contextB.newPage();
+    await pageA.goto('/admin/dashboard');
+    await expect(pageA.locator('#chip-text')).toHaveText(/Live · updated/, { timeout: 15000 });
+
+    const csrfToken = await extractCsrfToken(pageB, '/admin/dashboard');
+    const logoutResponse = await postLogout(
+      pageB,
+      [{ name: SESSION_COOKIE, value: sessionValue }],
+      csrfToken,
+    );
+    expect(logoutResponse.status(), 'revocation logout status').toBe(200);
+
+    await expect(pageA.locator('#banner-disconnected')).toBeVisible({ timeout: 5000 });
+    const reconnect = await pageA.request.get('/admin/events', {
+      headers: { Cookie: `${SESSION_COOKIE}=${sessionValue}` },
+      failOnStatusCode: false,
+    });
+    expect(reconnect.status(), 'revoked SSE reconnect status').toBe(401);
+
+    await contextA.close();
+    await contextB.close();
+  });
 });
 
 test.describe('admin dashboard acceptance states', () => {
@@ -765,6 +815,31 @@ test.describe('admin dashboard acceptance states', () => {
     expect(await metricValue('#v-notify-rate')).toBe('0.00/s');
     expect(await metricValue('#v-denials-rate')).toBe('0.00/s');
     expect(await metricValue('#v-delivery-lag')).toBe('0 PTS');
+  });
+
+  test('delivery copy distinguishes no sampled connections and partial coverage', async ({ page }) => {
+    await page.route('**/admin/events', (route) => route.abort());
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    await expect(page.locator('#delivery-lag-card')).toContainText('No sampled connections');
+
+    await page.evaluate(() => {
+      const stream = document.getElementById('metrics-stream');
+      const metric = document.getElementById('v-delivery-lag');
+      const details = stream?.querySelectorAll('.dashboard-meta-grid dd');
+      if (!stream || !metric || !details || details.length < 3) {
+        throw new Error('delivery lag fixture hooks are missing');
+      }
+      metric.childNodes[0].textContent = 'Unavailable';
+      const state = metric.querySelector('.metric-state');
+      if (state) state.textContent = 'Partial coverage';
+      details[1].textContent = 'Partial coverage';
+      details[2].textContent = '1 of 2';
+    });
+
+    await expect(page.locator('#delivery-lag-card')).toContainText('Partial coverage');
+    await expect(page.locator('#delivery-lag-card')).toContainText('1 of 2');
   });
 
   test('fixed operational families retain their browser labels', async ({ page }) => {

@@ -338,10 +338,11 @@ func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 	}
 	d.UninstrumentedJSON = string(jsonBytes)
 
-	d.Delivery = dashboardDelivery(m)
-	d.Push = dashboardPush(m)
-	d.Notifications = dashboardNotifications(m)
-	d.Denials = dashboardDenials(m)
+	capabilities := dashboardCapabilities(m.Uninstrumented)
+	d.Delivery = dashboardDelivery(m, capabilities)
+	d.Push = dashboardPush(m, capabilities)
+	d.Notifications = dashboardNotifications(m, capabilities)
+	d.Denials = dashboardDenials(m, capabilities)
 	d.SharedDatabase = dashboardSharedDatabase(d)
 
 	// Storage table.
@@ -475,8 +476,10 @@ func formatPTS(value int64) string {
 	return display + " PTS"
 }
 
-func isUninstrumented(fields []string, field string) bool {
-	return slices.Contains(fields, field)
+type dashboardCapabilities []string
+
+func (c dashboardCapabilities) unavailable(field string) bool {
+	return slices.Contains(c, field)
 }
 
 func dashboardMetric(id, metric, label, value, helper, state string) DashMetric {
@@ -495,7 +498,7 @@ func markUninstrumentedRows(rows []DashCountRow) {
 	}
 }
 
-func dashboardDelivery(m MetricsResponse) DashDeliveryData {
+func dashboardDelivery(m MetricsResponse, capabilities dashboardCapabilities) DashDeliveryData {
 	state := snapshotStatus(m)
 	d := DashDeliveryData{
 		Worst: dashboardMetric(
@@ -511,10 +514,10 @@ func dashboardDelivery(m MetricsResponse) DashDeliveryData {
 		SampledConnections:  "Unavailable",
 		EligibleConnections: "Unavailable",
 	}
-	if isUninstrumented(m.Uninstrumented, "max_pts_gap") {
+	if capabilities.unavailable("max_pts_gap") {
 		markUninstrumentedMetric(&d.AccountHeadSpread)
 	}
-	if isUninstrumented(m.Uninstrumented, "delivery_lag") {
+	if capabilities.unavailable("delivery_lag") {
 		markUninstrumentedMetric(&d.Worst)
 		d.Sample = "Sample unavailable"
 		d.Coverage = "Coverage unavailable"
@@ -529,7 +532,11 @@ func dashboardDelivery(m MetricsResponse) DashDeliveryData {
 	}
 	switch m.DeliveryLag.Coverage {
 	case DeliveryLagCoverageFull:
-		d.Coverage = "Full coverage"
+		if m.DeliveryLag.SampledConnections == 0 {
+			d.Coverage = "No sampled connections"
+		} else {
+			d.Coverage = "Full coverage"
+		}
 	case DeliveryLagCoveragePartial:
 		d.Coverage = "Partial coverage"
 	case DeliveryLagCoverageNone:
@@ -561,11 +568,11 @@ func dashboardDelivery(m MetricsResponse) DashDeliveryData {
 	return d
 }
 
-func dashboardPush(m MetricsResponse) DashPushData {
+func dashboardPush(m MetricsResponse, capabilities dashboardCapabilities) DashPushData {
 	baseState := snapshotStatus(m)
-	sampleCountUnavailable := isUninstrumented(m.Uninstrumented, "push_latency_sample_count")
-	p50Unavailable := isUninstrumented(m.Uninstrumented, "push_latency_p50_ms")
-	p95Unavailable := isUninstrumented(m.Uninstrumented, "push_latency_p95_ms")
+	sampleCountUnavailable := capabilities.unavailable("push_latency_sample_count")
+	p50Unavailable := capabilities.unavailable("push_latency_p50_ms")
+	p95Unavailable := capabilities.unavailable("push_latency_p95_ms")
 	data := DashPushData{
 		P50:          dashboardMetric("v-push-p50", "push_latency_p50_ms", "p50", "No samples", "No successful writes in this window.", baseState),
 		P95:          dashboardMetric("v-push-p95", "push_latency_p95_ms", "p95", "No samples", "No successful writes in this window.", baseState),
@@ -587,6 +594,7 @@ func dashboardPush(m MetricsResponse) DashPushData {
 		markUninstrumentedMetric(&data.P50)
 	case m.PushLatencySampleCount > 0 && m.PushWindowSeconds > 0:
 		data.P50.Value = formatLatency(m.PushLatencyP50, m.PushLatencyP50Overflow)
+		data.P50.Helper = ""
 	case m.PushLatencySampleCount > 0:
 		data.P50.Helper = "Percentile unavailable until the observation window has elapsed."
 	}
@@ -595,10 +603,11 @@ func dashboardPush(m MetricsResponse) DashPushData {
 		markUninstrumentedMetric(&data.P95)
 	case m.PushLatencySampleCount > 0 && m.PushWindowSeconds > 0:
 		data.P95.Value = formatLatency(m.PushLatencyP95, m.PushLatencyP95Overflow)
+		data.P95.Helper = ""
 	case m.PushLatencySampleCount > 0:
 		data.P95.Helper = "Percentile unavailable until the observation window has elapsed."
 	}
-	if isUninstrumented(m.Uninstrumented, "push_outcomes") {
+	if capabilities.unavailable("push_outcomes") {
 		markUninstrumentedRows(data.Outcomes)
 	}
 	if m.PushLatencySampleCount < 0 && !sampleCountUnavailable {
@@ -615,9 +624,9 @@ func dashboardPush(m MetricsResponse) DashPushData {
 	return data
 }
 
-func dashboardNotifications(m MetricsResponse) DashNotificationsData {
-	countUnavailable := isUninstrumented(m.Uninstrumented, "notify_count")
-	channelsUnavailable := isUninstrumented(m.Uninstrumented, "notify_channels")
+func dashboardNotifications(m MetricsResponse, capabilities dashboardCapabilities) DashNotificationsData {
+	countUnavailable := capabilities.unavailable("notify_count")
+	channelsUnavailable := capabilities.unavailable("notify_channels")
 	data := DashNotificationsData{
 		Count:  dashboardMetric("v-notify-count", "notify_count", "Valid notifications", safeCount(m.NotifyCount), "Known-channel notifications accepted after successful parsing. Counts replica delivery work; one notification may fan out to multiple connection writes.", ""),
 		Rate:   dashboardMetric("v-notify-rate", "notify_rate_per_second", "Average per second", formatRate(m.NotifyRatePerSecond), "Average over the elapsed rolling window.", ""),
@@ -627,10 +636,10 @@ func dashboardNotifications(m MetricsResponse) DashNotificationsData {
 	if countUnavailable {
 		markUninstrumentedMetric(&data.Count)
 	}
-	if isUninstrumented(m.Uninstrumented, "notify_rate_per_second") {
+	if capabilities.unavailable("notify_rate_per_second") {
 		markUninstrumentedMetric(&data.Rate)
 	}
-	if isUninstrumented(m.Uninstrumented, "notify_invalid") {
+	if capabilities.unavailable("notify_invalid") {
 		data.Invalid.Value = "Not yet instrumented"
 	}
 	if m.NotifyCount == 0 && !countUnavailable {
@@ -653,8 +662,8 @@ func dashboardNotifications(m MetricsResponse) DashNotificationsData {
 	return data
 }
 
-func dashboardDenials(m MetricsResponse) DashDenialsData {
-	countUnavailable := isUninstrumented(m.Uninstrumented, "rate_limit_denials_count")
+func dashboardDenials(m MetricsResponse, capabilities dashboardCapabilities) DashDenialsData {
+	countUnavailable := capabilities.unavailable("rate_limit_denials_count")
 	data := DashDenialsData{
 		Count:  dashboardMetric("v-denials-count", "rate_limit_denials_count", "Rate-limit denials", safeCount(m.RateLimitDenialsCount), "Requests returned as FLOOD_WAIT. Allowed requests, refunded reservations and storage failures do not count.", ""),
 		Rate:   dashboardMetric("v-denials-rate", "rate_limit_denials_rate_per_second", "Average per second", formatRate(m.RateLimitDenialsRatePerSecond), "Average over the elapsed rolling window.", ""),
@@ -664,10 +673,10 @@ func dashboardDenials(m MetricsResponse) DashDenialsData {
 	if countUnavailable {
 		markUninstrumentedMetric(&data.Count)
 	}
-	if isUninstrumented(m.Uninstrumented, "rate_limit_denials_rate_per_second") {
+	if capabilities.unavailable("rate_limit_denials_rate_per_second") {
 		markUninstrumentedMetric(&data.Rate)
 	}
-	if isUninstrumented(m.Uninstrumented, "rate_limit_denials_dropped") {
+	if capabilities.unavailable("rate_limit_denials_dropped") {
 		data.Dropped.Value = "Not yet instrumented"
 	}
 	if m.RateLimitDenialsCount == 0 && !countUnavailable {
@@ -694,7 +703,7 @@ func dashboardDenials(m MetricsResponse) DashDenialsData {
 		{ID: "denial-get_password", Label: "get_password", Value: safeCount(m.RateLimitDenialsBySurface.GetPassword)},
 		{ID: "denial-update_profile", Label: "update_profile", Value: safeCount(m.RateLimitDenialsBySurface.UpdateProfile)},
 	}
-	if isUninstrumented(m.Uninstrumented, "rate_limit_denials_by_surface") {
+	if capabilities.unavailable("rate_limit_denials_by_surface") {
 		markUninstrumentedRows(data.Rows)
 	}
 	return data
