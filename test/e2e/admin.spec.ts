@@ -773,6 +773,24 @@ test.describe('admin SSE stream', () => {
     });
   });
 
+  test('initial loading stays connecting while the SSE request is pending', async ({ page }) => {
+    await page.clock.install();
+    await page.addInitScript(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url.includes('/admin/events')) return new Promise<Response>(() => {});
+        return originalFetch(input, init);
+      };
+    });
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#chip-text')).toHaveText('● Live · connecting…');
+    await page.clock.fastForward(1500);
+    await expect(page.locator('#chip-text')).toHaveText('● Live · connecting…');
+  });
+
   test('revoked session closes the stream and rejects its reconnect', async ({ browser, page }) => {
     const sessionValue = await login(page);
     const contextA = await browser.newContext();

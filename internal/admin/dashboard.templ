@@ -502,6 +502,7 @@ templ chipScript() {
 			var connected = false;
 			var authExpired = false;
 			var hasLiveSignal = false;
+			var hasLiveSample = false;
 			var initialServerStale = !!(bannerStale && bannerStale.getAttribute('data-server-stale'));
 			var sampleTimestamp = metricsStream ? metricsStream.getAttribute('data-sample-timestamp') || '' : '';
 			var sampleAgeSeconds = metricsStream ? parseAge(metricsStream.getAttribute('data-sample-age-seconds')) : 0;
@@ -622,6 +623,9 @@ templ chipScript() {
 				if (stale) {
 					setChip('chip-warning', '● Stale · last sample ' + ago(age));
 					setStatus('Stale · last sample ' + ago(age));
+				} else if (!hasLiveSample) {
+					setChip('chip-good', '● Live · connecting…');
+					setStatus('Connecting to live updates…');
 				} else {
 					setChip('chip-good', '● Live · updated ' + ago(age) + notice);
 					setStatus('Live · updated ' + ago(age));
@@ -638,6 +642,7 @@ templ chipScript() {
 				if (detail.elId !== 'sse-root' || authExpired) return;
 				if (detail.type === dataEvent) {
 					hasLiveSignal = true;
+					hasLiveSample = true;
 					updateSampleMetadata();
 					connected = true;
 					if (bannerDc) bannerDc.classList.add('hidden');
@@ -646,6 +651,7 @@ templ chipScript() {
 				}
 				if (detail.type === 'started') {
 					hasLiveSignal = true;
+					hasLiveSample = false;
 					connected = true;
 					if (bannerDc) bannerDc.classList.add('hidden');
 					setChip('chip-good', '● Live · connecting…');
