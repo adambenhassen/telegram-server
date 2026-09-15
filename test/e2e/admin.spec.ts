@@ -89,7 +89,7 @@ function encodeDashboardFragment(html: string): string {
 
 async function dashboardFixture(
   page: Page,
-  kind: 'partial-delivery' | 'stale-delivery' | 'zero-window' | 'absent-capability',
+  kind: 'partial-delivery' | 'stale-delivery' | 'zero-window' | 'no-connections' | 'missing-field' | 'absent-capability',
 ): Promise<string> {
   const cookies = await page.context().cookies();
   const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
@@ -256,6 +256,9 @@ declare global {
       heartbeats: number;
       dataEvents: number;
       disconnects: number;
+    };
+    __datastarAuthError?: {
+      status?: number | string;
     };
     __setSampleClock?: (value: number) => void;
   }
@@ -806,18 +809,36 @@ test.describe('admin SSE stream', () => {
 test.describe('admin dashboard acceptance states', () => {
   test('confirmed SSE 401 expiry hides metrics and offers login', async ({ page }) => {
     let eventsRequests = 0;
+    await page.addInitScript(() => {
+      window.__datastarAuthError = undefined;
+      document.addEventListener('datastar-sse', (event) => {
+        const detail = (event as CustomEvent<{
+          type?: string;
+          elId?: string;
+          argsRaw?: { status?: number | string };
+        }>).detail;
+        if (detail?.type === 'error' && detail.elId === 'sse-root') {
+          window.__datastarAuthError = detail.argsRaw;
+        }
+      });
+    });
     await page.route('**/admin/events**', async (route) => {
       eventsRequests++;
       await route.fulfill({
         status: 401,
         headers: { 'Content-Type': 'text/event-stream; charset=utf-8' },
-        body: 'session expired',
+        body: '',
       });
     });
     await login(page);
     await page.goto('/admin/dashboard');
     await expect(page.locator('#metrics-stream')).toBeAttached();
     await expect.poll(() => eventsRequests, { message: 'authenticated SSE expiry request' }).toBeGreaterThan(0);
+    await expect
+      .poll(() => page.evaluate(() => window.__datastarAuthError?.status), {
+        message: 'Datastar receives the 401 error payload',
+      })
+      .toBe('401');
 
     await expect(page.locator('#chip-text')).toHaveText('● Session ended. Log in again.');
     await expect(page.locator('#metrics-stream')).toBeHidden();
@@ -864,6 +885,22 @@ test.describe('admin dashboard acceptance states', () => {
 
     await expect(page.locator('#delivery-lag-card')).toContainText('Partial coverage');
     await expect(page.locator('#delivery-lag-card')).toContainText('1 of 2');
+  });
+
+  test('server-rendered no-connection delivery keeps zero lag and safe counts', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'no-connections');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#delivery-lag-card')).toContainText('0 PTS');
+    await expect(page.locator('#delivery-lag-card')).toContainText('No live authenticated connections.');
+    await expect(page.locator('#delivery-lag-card')).toContainText('No sampled connections');
+    await expect(page.locator('#delivery-lag-card')).toContainText('0 of 0');
   });
 
   test('server-rendered stale delivery names the last successful sample', async ({ page }) => {
@@ -920,6 +957,23 @@ test.describe('admin dashboard acceptance states', () => {
     await expect(page.locator('#uninstr-card')).not.toContainText('unknown_metric');
     await expect(page.locator('#v-push-p50')).toContainText('Not yet instrumented');
     await expect(page.locator('#v-push-p50')).not.toContainText('0');
+  });
+
+  test('server-rendered missing fields stay unavailable without leaking unknown keys', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'missing-field');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#v-delivery-lag')).toContainText('Unavailable');
+    await expect(page.locator('#delivery-lag-card')).toContainText('Coverage unavailable');
+    const bodyText = await page.locator('body').innerText();
+    expect(bodyText).not.toContain('unknown_metric');
+    expect(bodyText).not.toMatch(/(?:^|\s)-1(?:$|\s)/);
   });
 
   test('fixed operational families retain their browser labels', async ({ page }) => {

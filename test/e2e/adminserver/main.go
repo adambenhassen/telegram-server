@@ -217,6 +217,16 @@ func dashboardFixture(kind string) (admin.MetricsResponse, bool) {
 			SampledConnections:  1,
 			SampledAt:           &sampledAt,
 		}
+	case "no-connections":
+		worstPts := int64(0)
+		m.DeliveryLag = admin.DeliveryLag{
+			WorstPts:            &worstPts,
+			State:               admin.DeliveryLagAvailable,
+			Coverage:            admin.DeliveryLagCoverageFull,
+			EligibleConnections: 0,
+			SampledConnections:  0,
+			SampledAt:           &sampledAt,
+		}
 	case "zero-window":
 		m.PushLatencyP50 = 50
 		m.PushLatencyP95 = 95
@@ -229,6 +239,11 @@ func dashboardFixture(kind string) (admin.MetricsResponse, bool) {
 		}
 		m.NotifyWindowSeconds = 0
 		m.RateLimitDenialsWindowSeconds = 0
+	case "missing-field":
+		// Leave DeliveryLag at its zero value to model a response where the
+		// optional delivery object is absent. The renderer must retain its
+		// fixed unavailable copy and discard unknown capability names.
+		m.Uninstrumented = []string{"unknown_metric"}
 	case "absent-capability":
 		m.Uninstrumented = []string{"push_latency_p50_ms", "unknown_metric"}
 	default:
