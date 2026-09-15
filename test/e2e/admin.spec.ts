@@ -87,74 +87,17 @@ function encodeDashboardFragment(html: string): string {
   ].join('\n');
 }
 
-async function dashboardFixture(page: Page, kind: 'partial-delivery' | 'zero-window'): Promise<string> {
-  return page.locator('#metrics-stream').evaluate((stream, fixtureKind) => {
-    const fixture = stream.cloneNode(true) as HTMLElement;
-    const setText = (selector: string, value: string) => {
-      const element = fixture.querySelector(selector);
-      if (!element) throw new Error(`fixture selector is missing: ${selector}`);
-      element.textContent = value;
-    };
-    const setMetric = (selector: string, value: string, state: string, helper: string) => {
-      const element = fixture.querySelector(selector);
-      if (!element) throw new Error(`fixture metric is missing: ${selector}`);
-      element.replaceChildren(document.createTextNode(value));
-      const reading = element.closest('dl');
-      if (reading) reading.dataset.readingState = state;
-      if (state && state !== value) {
-        const stateElement = document.createElement('p');
-        stateElement.className = 'metric-state';
-        stateElement.textContent = state;
-        element.append(stateElement);
-      }
-      if (helper) {
-        const helperElement = document.createElement('p');
-        helperElement.className = 'dashboard-helper';
-        helperElement.textContent = helper;
-        element.append(helperElement);
-      }
-    };
-
-    if (fixtureKind === 'partial-delivery') {
-      setMetric(
-        '#v-delivery-lag',
-        'Unavailable',
-        'Partial coverage',
-        'Maximum of sampled connection lag; the sample is incomplete.',
-      );
-      const details = fixture.querySelectorAll<HTMLElement>('[aria-label="Delivery lag sample details"] dd');
-      if (details.length !== 3) throw new Error('delivery fixture details are incomplete');
-      details[0].textContent = 'Sample 2026-09-15 02:00:00 UTC';
-      details[1].textContent = 'Partial coverage';
-      details[2].textContent = '1 of 2';
-    } else {
-      setMetric(
-        '#v-push-p50',
-        'No samples',
-        '',
-        'Percentile unavailable until the observation window has elapsed.',
-      );
-      setMetric(
-        '#v-push-p95',
-        'No samples',
-        '',
-        'Percentile unavailable until the observation window has elapsed.',
-      );
-      setText('#push-writes-card .dashboard-sample-count strong', '2');
-      setText('#push-writes-card .dashboard-window-label', 'Observation window · last <0.1 s · this replica');
-      setText('#push-writes-card .dashboard-window-status', 'Window just started');
-      setText('#push-outcome-success td[data-label="Count"]', '0');
-      setText('#push-outcome-owner-mismatch td[data-label="Count"]', '2');
-      setText('#push-outcome-encode-failure td[data-label="Count"]', '1');
-      setText('#push-outcome-write-failure td[data-label="Count"]', '3');
-      setMetric('#v-notify-rate', '0.00/s', '', 'Average over the elapsed rolling window.');
-      setMetric('#v-denials-rate', '0.00/s', '', 'Average over the elapsed rolling window.');
-      setText('#notifications-card .dashboard-window-status', 'Window just started');
-      setText('#denials-card .dashboard-window-status', 'Window just started');
-    }
-
-    return fixture.outerHTML;
-  }, kind);
+async function dashboardFixture(
+  page: Page,
+  kind: 'partial-delivery' | 'stale-delivery' | 'zero-window' | 'absent-capability',
+): Promise<string> {
+  const cookies = await page.context().cookies();
+  const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
+  const response = await page.request.get(`/admin/e2e/dashboard-fixture?kind=${kind}`, {
+    headers: { Cookie: cookieHeader },
+  });
+  expect(response.status(), `dashboard ${kind} fixture status`).toBe(200);
+  return response.text();
 }
 
 async function reloadWithDashboardFixture(page: Page, fixture: string): Promise<number> {
@@ -923,6 +866,22 @@ test.describe('admin dashboard acceptance states', () => {
     await expect(page.locator('#delivery-lag-card')).toContainText('1 of 2');
   });
 
+  test('server-rendered stale delivery names the last successful sample', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'stale-delivery');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#delivery-lag-card')).toContainText(
+      'Stale · last successful sample 2026-09-15 02:00:00 UTC',
+    );
+    await expect(page.locator('#delivery-lag-card')).not.toContainText('last complete sample');
+  });
+
   test('SSE fixture renders failed outcomes with zero-duration rates safely', async ({ page }) => {
     const abortEvents = (route: Route) => route.abort();
     await page.route('**/admin/events**', abortEvents);
@@ -944,6 +903,23 @@ test.describe('admin dashboard acceptance states', () => {
     await expect(page.locator('#push-outcome-write-failure td[data-label="Count"]')).toHaveText('3');
     await expect(page.locator('#v-notify-rate')).toContainText('0.00/s');
     await expect(page.locator('#v-denials-rate')).toContainText('0.00/s');
+  });
+
+  test('server-rendered absent capabilities stay unavailable and hide unknown fields', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'absent-capability');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#uninstr-card')).toBeVisible();
+    await expect(page.locator('#uninstr-card')).toContainText('Push latency p50');
+    await expect(page.locator('#uninstr-card')).not.toContainText('unknown_metric');
+    await expect(page.locator('#v-push-p50')).toContainText('Not yet instrumented');
+    await expect(page.locator('#v-push-p50')).not.toContainText('0');
   });
 
   test('fixed operational families retain their browser labels', async ({ page }) => {

@@ -140,6 +140,39 @@ func TestDashboardM21NoSampledConnectionsCopy(t *testing.T) {
 	}
 }
 
+func TestDashboardM21RendersStaleDeliveryWithSuccessfulSampleTime(t *testing.T) {
+	worstPts := int64(4)
+	sampledAt := time.Date(2026, 9, 15, 2, 0, 0, 0, time.UTC)
+	m := admin.MetricsResponse{
+		DeliveryLag: admin.DeliveryLag{
+			WorstPts:            &worstPts,
+			State:               admin.DeliveryLagStale,
+			Coverage:            admin.DeliveryLagCoveragePartial,
+			EligibleConnections: 2,
+			SampledConnections:  1,
+			SampledAt:           &sampledAt,
+		},
+	}
+
+	data := admin.BuildDashboardData(m, "csrf")
+	wantState := "Stale · last successful sample 2026-09-15 02:00:00 UTC"
+	if data.Delivery.Worst.State != wantState {
+		t.Fatalf("stale delivery state = %q, want %q", data.Delivery.Worst.State, wantState)
+	}
+	if data.Delivery.Worst.Helper != "Showing the last successful sample. Maximum of database account head minus connection push watermark, floored at zero." {
+		t.Fatalf("stale delivery helper = %q, want successful-sample copy", data.Delivery.Worst.Helper)
+	}
+
+	var body strings.Builder
+	if err := admin.RenderDashboard(&body, data); err != nil {
+		t.Fatal(err)
+	}
+	markup := body.String()
+	if strings.Contains(markup, "last complete sample") {
+		t.Fatal("stale delivery markup must not use the old complete-sample copy")
+	}
+}
+
 func TestDashboardM21RendersPushP95Overflow(t *testing.T) {
 	m := admin.MetricsResponse{
 		PushLatencyP95:         60_000,

@@ -556,8 +556,12 @@ func dashboardDelivery(m MetricsResponse, capabilities dashboardCapabilities) Da
 	}
 	if m.DeliveryLag.WorstPts != nil && *m.DeliveryLag.WorstPts >= 0 && m.DeliveryLag.State == DeliveryLagStale {
 		d.Worst.Value = safeCount(*m.DeliveryLag.WorstPts) + " PTS"
-		d.Worst.State = "Stale · last complete sample"
-		d.Worst.Helper = "Showing the last complete sample. " + d.Worst.Helper
+		lastSuccessfulSample := "Stale · last successful sample"
+		if m.DeliveryLag.SampledAt != nil {
+			lastSuccessfulSample += " " + m.DeliveryLag.SampledAt.UTC().Format("2006-01-02 15:04:05 UTC")
+		}
+		d.Worst.State = lastSuccessfulSample
+		d.Worst.Helper = "Showing the last successful sample. " + d.Worst.Helper
 		return d
 	}
 	if m.DeliveryLag.Coverage == DeliveryLagCoveragePartial {

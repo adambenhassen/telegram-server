@@ -128,9 +128,33 @@ func run(log *slog.Logger) error {
 		NotifyMetrics: notifyMetrics,
 	}, registry)
 
+	// The browser suite uses these authenticated, server-rendered snapshots to
+	// exercise the real dashboard renderer for states that the empty e2e
+	// database cannot produce on demand. This route exists only in the
+	// e2e_admin_server binary; it is never registered by the production router.
+	fixtureMux := http.NewServeMux()
+	fixtureMux.Handle("/admin/e2e/dashboard-fixture", admin.RequireAdmin(admin.AdminMiddlewareConfig{
+		Store:     st,
+		TokenHash: tokenHash,
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m, ok := dashboardFixture(r.URL.Query().Get("kind"))
+		if !ok {
+			http.Error(w, "unknown dashboard fixture", http.StatusNotFound)
+			return
+		}
+		fragments, err := admin.DashboardFragmentRenderer(m)
+		if err != nil || len(fragments) != 1 {
+			http.Error(w, "dashboard fixture unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(fragments[0].HTML))
+	})))
+	fixtureMux.Handle("/", router)
+
 	srv := &http.Server{
 		Addr:              adminListenAddr,
-		Handler:           router,
+		Handler:           admin.SecurityHeaders(fixtureMux),
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    8192,
 	}
@@ -160,4 +184,55 @@ func run(log *slog.Logger) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func dashboardFixture(kind string) (admin.MetricsResponse, bool) {
+	sampledAt := time.Date(2026, 9, 15, 2, 0, 0, 0, time.UTC)
+	m := admin.MetricsResponse{
+		Timestamp:         sampledAt,
+		SampleState:       admin.SampleStateAvailable,
+		SampleAgeSeconds:  2,
+		ProcessStartedAt:  sampledAt.Add(-time.Hour),
+		ProcessGeneration: "e2e-fixture-generation",
+	}
+
+	switch kind {
+	case "partial-delivery":
+		m.DeliveryLag = admin.DeliveryLag{
+			State:               admin.DeliveryLagAvailable,
+			Coverage:            admin.DeliveryLagCoveragePartial,
+			EligibleConnections: 2,
+			SampledConnections:  1,
+			SampledAt:           &sampledAt,
+		}
+	case "stale-delivery":
+		worstPts := int64(4)
+		m.SampleState = admin.SampleStateStale
+		m.SampleAgeSeconds = 45
+		m.DeliveryLag = admin.DeliveryLag{
+			WorstPts:            &worstPts,
+			State:               admin.DeliveryLagStale,
+			Coverage:            admin.DeliveryLagCoveragePartial,
+			EligibleConnections: 2,
+			SampledConnections:  1,
+			SampledAt:           &sampledAt,
+		}
+	case "zero-window":
+		m.PushLatencyP50 = 50
+		m.PushLatencyP95 = 95
+		m.PushLatencySampleCount = 2
+		m.PushWindowSeconds = 0
+		m.PushOutcomes = admin.PushOutcomes{
+			OwnerMismatch: 2,
+			EncodeFailure: 1,
+			WriteFailure:  3,
+		}
+		m.NotifyWindowSeconds = 0
+		m.RateLimitDenialsWindowSeconds = 0
+	case "absent-capability":
+		m.Uninstrumented = []string{"push_latency_p50_ms", "unknown_metric"}
+	default:
+		return admin.MetricsResponse{}, false
+	}
+	return m, true
 }
