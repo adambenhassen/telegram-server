@@ -22,6 +22,9 @@ type Updater struct {
 	registry    *mtproto.SessionRegistry
 	log         *slog.Logger
 	pushMetrics *store.NotificationMetrics
+	// pushRecorder is a test-only failure injection seam. Production uses the
+	// fixed recorder method through pushMetrics.
+	pushRecorder func(store.PushOutcome, time.Time) error
 }
 
 // NewUpdater builds an Updater over the store and the server's session registry.
@@ -181,14 +184,17 @@ func (u *Updater) recordPushOutcome(acceptedAt time.Time, pushed bool, err error
 	default:
 		outcome = store.PushOutcomeSuccess
 	}
-	defer func() {
-		// Telemetry must never change delivery behavior, including if a future
-		// recorder implementation panics while recording.
-		if recovered := recover(); recovered != nil {
-			return
-		}
-	}()
-	u.pushMetrics.RecordPushOutcome(outcome, acceptedAt)
+	var failed bool
+	if u.pushRecorder != nil {
+		failed = store.InvokeRecorder(func() error { return u.pushRecorder(outcome, acceptedAt) })
+	} else {
+		failed = store.InvokeRecorder(func() error {
+			return u.pushMetrics.RecordPushOutcomeResult(outcome, acceptedAt)
+		})
+	}
+	if failed {
+		store.ReportRecorderFailure(u.log, u.pushMetrics, store.RecorderFailurePushOutcome)
+	}
 }
 
 // DeliverTyping pushes a transient updateUserTyping to the peer's live conns. It

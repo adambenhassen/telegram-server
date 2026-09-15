@@ -34,6 +34,31 @@ const (
 	PushOutcomeWriteFailure
 )
 
+// RecorderFailureCategory is the closed set of telemetry recorder failures.
+// It identifies the recorder family only; no original error or request value
+// can become a metric dimension.
+type RecorderFailureCategory uint8
+
+const (
+	RecorderFailureRateLimitDenial RecorderFailureCategory = iota
+	RecorderFailurePushOutcome
+	RecorderFailureNotification
+	recorderFailureCategoryCount
+)
+
+func (c RecorderFailureCategory) String() string {
+	switch c {
+	case RecorderFailureRateLimitDenial:
+		return "rate_limit_denial"
+	case RecorderFailurePushOutcome:
+		return "push_outcome"
+	case RecorderFailureNotification:
+		return "notification"
+	default:
+		return "unknown"
+	}
+}
+
 // NotificationChannelCounts is the fixed per-channel distribution of valid
 // notifications. Its fields deliberately mirror the compiled Postgres
 // channel constants; no caller-supplied channel becomes a field or key.
@@ -83,6 +108,15 @@ type PushOutcomeCounts struct {
 	WriteFailure  int64
 }
 
+// RecorderFailureCounts holds one count for every fixed telemetry recorder
+// family. It is deliberately aggregate-only: errors, payloads, and identities
+// never enter the snapshot.
+type RecorderFailureCounts struct {
+	RateLimitDenial int64
+	PushOutcome     int64
+	Notification    int64
+}
+
 // PushMetricsSnapshot is the rolling process-local telemetry for persisted
 // account-update pushes. Latency percentiles are upper bounds of fixed
 // histogram buckets, not raw observations.
@@ -120,6 +154,7 @@ type NotificationMetricsSnapshot struct {
 	Invalid          int64
 	Push             PushMetricsSnapshot
 	RateLimitDenials RateLimitDenialMetricsSnapshot
+	RecorderFailures RecorderFailureCounts
 }
 
 // notificationMetricBucket is one second of fixed counters. readers is a
@@ -136,6 +171,7 @@ type notificationMetricBucket struct {
 	rateLimitDenials [rateLimitDenialSurfaceCount]atomic.Int64
 	pushOutcomes     [pushOutcomeCount]atomic.Int64
 	latencies        [pushLatencyBucketCount]atomic.Int64
+	recorderFailures [recorderFailureCategoryCount]atomic.Int64
 }
 
 // NotificationMetrics counts valid notifications received by one process.
@@ -176,6 +212,9 @@ var errUnknownNotificationChannel = errors.New("unknown notification channel")
 // unknown channel is treated as invalid and is never assigned a dynamic
 // series.
 func (m *NotificationMetrics) RecordValidNotification(channel string) error {
+	if m == nil {
+		return nil
+	}
 	index := notificationChannelIndex(channel)
 	if index < 0 {
 		if err := m.RecordInvalidNotification(); err != nil {
@@ -201,27 +240,45 @@ func (m *NotificationMetrics) RecordInvalidNotification() error {
 // rate-limit surface. Unknown surfaces are counted only in the bounded dropped
 // counter and never retain the supplied name.
 func (m *NotificationMetrics) RecordRateLimitDenial(surface string) {
-	if m == nil {
+	if err := m.RecordRateLimitDenialResult(surface); err != nil {
 		return
+	}
+}
+
+// RecordRateLimitDenialResult is the error-reporting form used by the request
+// boundary so recorder failures can be surfaced without changing the legacy
+// no-result convenience method.
+func (m *NotificationMetrics) RecordRateLimitDenialResult(surface string) error {
+	if m == nil {
+		return nil
 	}
 	index := rateLimitDenialSurfaceIndex(surface)
 	if index < 0 {
 		index = rateLimitDenialDroppedIndex
 	}
 	m.recordRateLimitDenial(index)
+	return nil
 }
 
 // RecordPushOutcome records one result for an attempted persisted-update push.
 // Successful attempts also record the elapsed time from acceptedAt through the
 // completion of PushTo. The timestamp and latency stay in process memory.
 func (m *NotificationMetrics) RecordPushOutcome(outcome PushOutcome, acceptedAt time.Time) {
-	if m == nil {
+	if err := m.RecordPushOutcomeResult(outcome, acceptedAt); err != nil {
 		return
+	}
+}
+
+// RecordPushOutcomeResult is the error-reporting form used by the delivery
+// boundary so recorder failures can be surfaced without changing the legacy
+// no-result convenience method.
+func (m *NotificationMetrics) RecordPushOutcomeResult(outcome PushOutcome, acceptedAt time.Time) error {
+	if m == nil {
+		return nil
 	}
 	if outcome >= pushOutcomeCount {
 		outcome = PushOutcomeWriteFailure
 	}
-
 	now := m.now()
 	latency := time.Duration(0)
 	if !acceptedAt.IsZero() {
@@ -260,8 +317,34 @@ func (m *NotificationMetrics) RecordPushOutcome(outcome PushOutcome, acceptedAt 
 			bucket.pushOutcomes[outcome].Add(1)
 		}
 		bucket.readers.Add(-1)
+		return nil
+	}
+}
+
+// RecordRecorderFailure records one fixed-category failure of a telemetry
+// recorder. Failure accounting is itself best effort and never invokes a test
+// hook or retains the failure value.
+func (m *NotificationMetrics) RecordRecorderFailure(category RecorderFailureCategory) {
+	if m == nil || category >= recorderFailureCategoryCount {
 		return
 	}
+	m.recordRecorderFailure(int(category), m.recorderFailureSecond())
+}
+
+// recorderFailureSecond uses the current clock when possible, but falls back to
+// process start if the recorder's own clock is the failing operation. That lets
+// a recorder panic still produce its bounded failure signal.
+func (m *NotificationMetrics) recorderFailureSecond() (second int64) {
+	second = m.startedAt.Unix()
+	if m.now == nil {
+		return second
+	}
+	defer func() {
+		if recover() != nil {
+			second = m.startedAt.Unix()
+		}
+	}()
+	return m.now().Unix()
 }
 
 // Snapshot returns the current rolling-hour notification counters. The window
@@ -279,8 +362,9 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 	var rateLimitDenials [rateLimitDenialSurfaceCount]int64
 	var pushOutcomes [pushOutcomeCount]int64
 	var latencyBuckets [pushLatencyBucketCount]int64
+	var recorderFailures [recorderFailureCategoryCount]int64
 	for i := range m.buckets {
-		epoch, bucketCounts, bucketDenials, bucketOutcomes, bucketLatencies, ok := m.buckets[i].snapshot()
+		epoch, bucketCounts, bucketDenials, bucketOutcomes, bucketLatencies, bucketFailures, ok := m.buckets[i].snapshot()
 		if !ok {
 			continue
 		}
@@ -298,6 +382,9 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 		}
 		for j, count := range bucketLatencies {
 			latencyBuckets[j] += count
+		}
+		for j, count := range bucketFailures {
+			recorderFailures[j] += count
 		}
 	}
 
@@ -380,6 +467,11 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 			},
 			LatencyBucketUpperBoundsMilliseconds: pushLatencyBucketUpperBoundsMilliseconds,
 			LatencyBucketCounts:                  latencyBuckets,
+		},
+		RecorderFailures: RecorderFailureCounts{
+			RateLimitDenial: recorderFailures[RecorderFailureRateLimitDenial],
+			PushOutcome:     recorderFailures[RecorderFailurePushOutcome],
+			Notification:    recorderFailures[RecorderFailureNotification],
 		},
 	}
 }
@@ -599,6 +691,33 @@ func (m *NotificationMetrics) recordRateLimitDenial(index int) {
 	}
 }
 
+func (m *NotificationMetrics) recordRecorderFailure(index int, second int64) {
+	bucket := &m.buckets[notificationBucketIndex(second)]
+	for {
+		if bucket.epoch.Load() != second {
+			bucket.reset(second)
+			continue
+		}
+		if bucket.writerPending.Load() {
+			runtime.Gosched()
+			continue
+		}
+
+		readers := bucket.readers.Load()
+		if readers < 0 || !bucket.readers.CompareAndSwap(readers, readers+1) {
+			runtime.Gosched()
+			continue
+		}
+		if bucket.writerPending.Load() || bucket.epoch.Load() != second {
+			bucket.readers.Add(-1)
+			continue
+		}
+		bucket.recorderFailures[index].Add(1)
+		bucket.readers.Add(-1)
+		return
+	}
+}
+
 func notificationBucketIndex(second int64) int {
 	index := second % int64(notificationBucketCount)
 	if index < 0 {
@@ -635,18 +754,22 @@ func (b *notificationMetricBucket) reset(second int64) {
 	for i := range b.latencies {
 		b.latencies[i].Store(0)
 	}
+	for i := range b.recorderFailures {
+		b.recorderFailures[i].Store(0)
+	}
 	b.readers.Store(0)
 	b.writerPending.Store(false)
 }
 
-func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]int64, [rateLimitDenialSurfaceCount]int64, [pushOutcomeCount]int64, [pushLatencyBucketCount]int64, bool) {
+func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]int64, [rateLimitDenialSurfaceCount]int64, [pushOutcomeCount]int64, [pushLatencyBucketCount]int64, [recorderFailureCategoryCount]int64, bool) {
 	var counts [notificationCounterCount]int64
 	var denials [rateLimitDenialSurfaceCount]int64
 	var outcomes [pushOutcomeCount]int64
 	var latencies [pushLatencyBucketCount]int64
+	var failures [recorderFailureCategoryCount]int64
 	for range notificationSnapshotTries {
 		if b.writerPending.Load() {
-			return notificationUnsetEpoch, counts, denials, outcomes, latencies, false
+			return notificationUnsetEpoch, counts, denials, outcomes, latencies, failures, false
 		}
 		readers := b.readers.Load()
 		if readers < 0 || !b.readers.CompareAndSwap(readers, readers+1) {
@@ -655,7 +778,7 @@ func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]
 		}
 		if b.writerPending.Load() {
 			b.readers.Add(-1)
-			return notificationUnsetEpoch, counts, denials, outcomes, latencies, false
+			return notificationUnsetEpoch, counts, denials, outcomes, latencies, failures, false
 		}
 		epoch := b.epoch.Load()
 		for i := range b.counts {
@@ -670,13 +793,16 @@ func (b *notificationMetricBucket) snapshot() (int64, [notificationCounterCount]
 		for i := range b.latencies {
 			latencies[i] = b.latencies[i].Load()
 		}
+		for i := range b.recorderFailures {
+			failures[i] = b.recorderFailures[i].Load()
+		}
 		var successCount int64
 		for _, count := range latencies {
 			successCount += count
 		}
 		outcomes[PushOutcomeSuccess] = successCount
 		b.readers.Add(-1)
-		return epoch, counts, denials, outcomes, latencies, true
+		return epoch, counts, denials, outcomes, latencies, failures, true
 	}
-	return notificationUnsetEpoch, counts, denials, outcomes, latencies, false
+	return notificationUnsetEpoch, counts, denials, outcomes, latencies, failures, false
 }
