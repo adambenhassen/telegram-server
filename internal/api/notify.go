@@ -170,7 +170,7 @@ func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn,
 }
 
 func (u *Updater) recordPushOutcome(acceptedAt time.Time, pushed bool, err error) {
-	if u.pushMetrics == nil || acceptedAt.IsZero() {
+	if (u.pushMetrics == nil && u.pushRecorder == nil) || acceptedAt.IsZero() {
 		return
 	}
 	var outcome store.PushOutcome

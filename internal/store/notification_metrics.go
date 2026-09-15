@@ -178,10 +178,11 @@ type notificationMetricBucket struct {
 // The state is intentionally independent of Postgres and is reset by creating
 // a new value at process startup.
 type NotificationMetrics struct {
-	now               func() time.Time
-	startedAt         time.Time
-	buckets           [notificationBucketCount]notificationMetricBucket
-	beforePushLatency func()
+	now                        func() time.Time
+	startedAt                  time.Time
+	buckets                    [notificationBucketCount]notificationMetricBucket
+	beforePushLatency          func()
+	recorderFailureLogSamplers [recorderFailureCategoryCount]recorderFailureLogSampler
 }
 
 // NewNotificationMetrics creates an empty process-local notification
