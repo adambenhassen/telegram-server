@@ -37,6 +37,8 @@ import (
 
 const observabilitySentinel = "MAIN744_SENTINEL_PAYLOAD_998877665544332211"
 
+const observabilityWaitTimeout = 5 * time.Second
+
 type observabilityLogState struct {
 	mu    sync.Mutex
 	lines []string
@@ -262,6 +264,34 @@ func waitObservabilityConn(
 		case <-deadline.C:
 			t.Fatalf("user %d connection not registered within %s", userID, within)
 			return nil
+		}
+	}
+}
+
+func waitObservabilityWatermark(
+	t *testing.T,
+	ctx context.Context,
+	conn *mtproto.Conn,
+	want int,
+	within time.Duration,
+) int {
+	t.Helper()
+	deadline := time.NewTimer(within)
+	defer deadline.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		if got := conn.LastPushedPts(); got >= want {
+			return got
+		}
+		select {
+		case <-poll.C:
+		case <-ctx.Done():
+			t.Fatalf("waiting for watermark %d: %v", want, ctx.Err())
+			return 0
+		case <-deadline.C:
+			t.Fatalf("watermark did not reach %d within %s; got %d", want, within, conn.LastPushedPts())
+			return 0
 		}
 	}
 }
@@ -497,7 +527,7 @@ func TestCrossReplicaObservabilityMetrics(t *testing.T) {
 	if got := recvOrCtx(t, ctx, bID, "client B login"); got != userB.ID {
 		t.Fatalf("client B id = %d, want %d", got, userB.ID)
 	}
-	bConn := waitObservabilityConn(t, ctx, replicaB.registry, userB.ID, 5*time.Second)
+	bConn := waitObservabilityConn(t, ctx, replicaB.registry, userB.ID, observabilityWaitTimeout)
 	if got := len(replicaB.registry.Conns(userB.ID)); got != 1 {
 		t.Fatalf("replica B live connections = %d, want 1", got)
 	}
@@ -516,7 +546,7 @@ func TestCrossReplicaObservabilityMetrics(t *testing.T) {
 			t.Fatalf("warm-up point %d = %d", i, got)
 		}
 	}
-	if got := bConn.LastPushedPts(); got != 41 {
+	if got := waitObservabilityWatermark(t, ctx, bConn, 41, observabilityWaitTimeout); got != 41 {
 		t.Fatalf("warm-up watermark = %d, want 41", got)
 	}
 
@@ -613,7 +643,7 @@ func TestCrossReplicaObservabilityMetrics(t *testing.T) {
 	if got := recvOrCtx(t, ctx, collector.points, "sentinel pts"); got != 42 {
 		t.Fatalf("delivered pts = %d, want 42", got)
 	}
-	if got := bConn.LastPushedPts(); got != 42 {
+	if got := waitObservabilityWatermark(t, ctx, bConn, 42, observabilityWaitTimeout); got != 42 {
 		t.Fatalf("final watermark = %d, want 42", got)
 	}
 
