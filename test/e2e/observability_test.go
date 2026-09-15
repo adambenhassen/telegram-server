@@ -238,6 +238,34 @@ func (r *observabilityReplica) stop(t *testing.T) {
 	}
 }
 
+func waitObservabilityConn(
+	t *testing.T,
+	ctx context.Context,
+	registry *mtproto.SessionRegistry,
+	userID int64,
+	within time.Duration,
+) *mtproto.Conn {
+	t.Helper()
+	deadline := time.NewTimer(within)
+	defer deadline.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		if conns := registry.Conns(userID); len(conns) > 0 {
+			return conns[0]
+		}
+		select {
+		case <-poll.C:
+		case <-ctx.Done():
+			t.Fatalf("waiting for user %d connection: %v", userID, ctx.Err())
+			return nil
+		case <-deadline.C:
+			t.Fatalf("user %d connection not registered within %s", userID, within)
+			return nil
+		}
+	}
+}
+
 type observabilityPushTelemetry struct {
 	PushLatencySampleCount int64              `json:"push_latency_sample_count"`
 	PushOutcomes           admin.PushOutcomes `json:"push_outcomes"`
@@ -469,6 +497,7 @@ func TestCrossReplicaObservabilityMetrics(t *testing.T) {
 	if got := recvOrCtx(t, ctx, bID, "client B login"); got != userB.ID {
 		t.Fatalf("client B id = %d, want %d", got, userB.ID)
 	}
+	bConn := waitObservabilityConn(t, ctx, replicaB.registry, userB.ID, 5*time.Second)
 	if got := len(replicaB.registry.Conns(userB.ID)); got != 1 {
 		t.Fatalf("replica B live connections = %d, want 1", got)
 	}
@@ -487,7 +516,7 @@ func TestCrossReplicaObservabilityMetrics(t *testing.T) {
 			t.Fatalf("warm-up point %d = %d", i, got)
 		}
 	}
-	if got := replicaB.registry.Conns(userB.ID)[0].LastPushedPts(); got != 41 {
+	if got := bConn.LastPushedPts(); got != 41 {
 		t.Fatalf("warm-up watermark = %d, want 41", got)
 	}
 
@@ -584,7 +613,7 @@ func TestCrossReplicaObservabilityMetrics(t *testing.T) {
 	if got := recvOrCtx(t, ctx, collector.points, "sentinel pts"); got != 42 {
 		t.Fatalf("delivered pts = %d, want 42", got)
 	}
-	if got := replicaB.registry.Conns(userB.ID)[0].LastPushedPts(); got != 42 {
+	if got := bConn.LastPushedPts(); got != 42 {
 		t.Fatalf("final watermark = %d, want 42", got)
 	}
 
