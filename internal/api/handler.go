@@ -378,7 +378,7 @@ func (h *handlers) refundRateLimitIP(r *mtproto.Request, surface string, res *st
 // recordRateLimitDenial keeps telemetry observational: a broken recorder must
 // never change the rate-limit decision or the RPC response.
 func (h *handlers) recordRateLimitDenial(surface string) {
-	if h.rateLimitMetrics == nil {
+	if h.rateLimitMetrics == nil && h.rateLimitRecorder == nil {
 		return
 	}
 	var failed bool

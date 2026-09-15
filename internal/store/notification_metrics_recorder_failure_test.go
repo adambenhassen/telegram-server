@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 
@@ -37,5 +38,31 @@ func TestNotificationMetricsRecorderFailuresAreFixedAndRolling(t *testing.T) {
 	restarted := store.NewNotificationMetricsWithClock(func() time.Time { return now })
 	if got := restarted.Snapshot().RecorderFailures; got != (store.RecorderFailureCounts{}) {
 		t.Fatalf("restarted recorder failures = %+v, want zero", got)
+	}
+}
+
+func TestRecorderFailureLogsAreSampledPerCategory(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(1_700_000_000, 0)
+	now := start
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time { return now })
+	logs := &listenerRecorderFailureLogHandler{}
+	log := slog.New(logs)
+
+	for range 100 {
+		store.ReportRecorderFailure(log, metrics, store.RecorderFailureNotification)
+	}
+	if len(logs.records) != 1 {
+		t.Fatalf("captured %d recorder failure logs, want one sampled log", len(logs.records))
+	}
+	if got := metrics.Snapshot().RecorderFailures.Notification; got != 100 {
+		t.Fatalf("recorder failure signal = %d, want 100", got)
+	}
+
+	now = start.Add(10 * time.Second)
+	store.ReportRecorderFailure(log, metrics, store.RecorderFailureNotification)
+	if len(logs.records) != 2 {
+		t.Fatalf("captured %d recorder failure logs after sample interval, want two", len(logs.records))
 	}
 }
