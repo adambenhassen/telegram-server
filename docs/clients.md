@@ -71,6 +71,13 @@ When `TG_WEBSOCKET_LISTEN_ADDR` is set, configure
 requests carrying one are rejected unless it matches the configured list.
 Keep this listener within the intended network boundary.
 
+Before asking for registration details, an unauthenticated client may call
+`help.getAppConfig`. The `help.appConfig` response keeps its standard TL shape;
+its JSON object contains a `registration_mode` string with one of `closed`,
+`invite`, or `open`. The value is the running server configuration, and the
+field is an extension to the JSON object, so clients that do not read it can
+continue to ignore it. This call is also available to provisional sessions.
+
 ### Static enrollment discovery and local preflight
 
 The server-side contract in this section is provided by telegram-server
@@ -388,12 +395,13 @@ Both admission modes use the same account-creation flow:
 ```
 
 After step 3 the session is in provisional state: only `help.getConfig`,
-`account.getPassword`, `account.updatePasswordSettings`, and `auth.logOut` may
-be called. Every other RPC returns `AUTH_KEY_UNREGISTERED` until step 4
-completes. If the client disconnects before step 4, the account remains
-provisional and the next sign-in attempt (section 5a step 2) will fail with an
-internal error — the only exits are `account.updatePasswordSettings` to set the
-password, or `auth.logOut` to remove the key.
+`help.getAppConfig`, `account.getPassword`, `account.updatePasswordSettings`,
+and `auth.logOut` may be called. Every other RPC returns
+`AUTH_KEY_UNREGISTERED` until step 4 completes. If the client disconnects
+before step 4, the account remains provisional and the next sign-in attempt
+(section 5a step 2) will fail with an internal error — the only exits are
+`account.updatePasswordSettings` to set the password, or `auth.logOut` to
+remove the key.
 
 A username that already exists continues to return `USERNAME_OCCUPIED` from
 `auth.signUp`. There is no re-registration path: once a username is claimed it

@@ -396,10 +396,12 @@ func (h *handlers) recordRateLimitDenial(surface string) {
 }
 
 // provisionalAllowList holds the method IDs that a provisional session may call.
-// A provisional session is a username-mode account with no verifier: it can set
-// its password, check password state, or log out — but nothing else.
+// A provisional session is a username-mode account with no verifier: it can
+// read server configuration, set its password, check password state, or log
+// out — but nothing else.
 var provisionalAllowList = map[uint32]bool{
 	tg.HelpGetConfigRequestTypeID:                 true,
+	tg.HelpGetAppConfigRequestTypeID:              true,
 	tg.AccountGetPasswordRequestTypeID:            true,
 	tg.AccountUpdatePasswordSettingsRequestTypeID: true,
 	tg.AuthLogOutRequestTypeID:                    true,

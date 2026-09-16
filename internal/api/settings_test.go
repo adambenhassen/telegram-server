@@ -23,20 +23,22 @@ import (
 )
 
 type settingsHandler struct {
-	name     string
-	handle   func(int64) (bin.Encoder, error)
-	request  func() bin.Encoder
-	response func() bin.Decoder
-	assert   func(*testing.T, bin.Decoder)
+	name                  string
+	handle                func(int64) (bin.Encoder, error)
+	request               func() bin.Encoder
+	response              func() bin.Decoder
+	assert                func(*testing.T, bin.Decoder)
+	requiresAuthorization bool
 }
 
 func settingsHandlers() []settingsHandler {
 	return []settingsHandler{
 		{
-			name:     "content settings",
-			handle:   api.GetContentSettingsForTest,
-			request:  func() bin.Encoder { return &tg.AccountGetContentSettingsRequest{} },
-			response: func() bin.Decoder { return &tg.AccountContentSettings{} },
+			name:                  "content settings",
+			handle:                api.GetContentSettingsForTest,
+			request:               func() bin.Encoder { return &tg.AccountGetContentSettingsRequest{} },
+			response:              func() bin.Decoder { return &tg.AccountContentSettings{} },
+			requiresAuthorization: true,
 			assert: func(t *testing.T, response bin.Decoder) {
 				t.Helper()
 				got, ok := response.(*tg.AccountContentSettings)
@@ -49,10 +51,11 @@ func settingsHandlers() []settingsHandler {
 			},
 		},
 		{
-			name:     "global privacy settings",
-			handle:   api.GetGlobalPrivacySettingsForTest,
-			request:  func() bin.Encoder { return &tg.AccountGetGlobalPrivacySettingsRequest{} },
-			response: func() bin.Decoder { return &tg.GlobalPrivacySettings{} },
+			name:                  "global privacy settings",
+			handle:                api.GetGlobalPrivacySettingsForTest,
+			request:               func() bin.Encoder { return &tg.AccountGetGlobalPrivacySettingsRequest{} },
+			response:              func() bin.Decoder { return &tg.GlobalPrivacySettings{} },
+			requiresAuthorization: true,
 			assert: func(t *testing.T, response bin.Decoder) {
 				t.Helper()
 				got, ok := response.(*tg.GlobalPrivacySettings)
@@ -65,10 +68,11 @@ func settingsHandlers() []settingsHandler {
 			},
 		},
 		{
-			name:     "themes",
-			handle:   api.GetThemesForTest,
-			request:  func() bin.Encoder { return &tg.AccountGetThemesRequest{} },
-			response: func() bin.Decoder { return &tg.AccountThemes{} },
+			name:                  "themes",
+			handle:                api.GetThemesForTest,
+			request:               func() bin.Encoder { return &tg.AccountGetThemesRequest{} },
+			response:              func() bin.Decoder { return &tg.AccountThemes{} },
+			requiresAuthorization: true,
 			assert: func(t *testing.T, response bin.Decoder) {
 				t.Helper()
 				got, ok := response.(*tg.AccountThemes)
@@ -81,8 +85,10 @@ func settingsHandlers() []settingsHandler {
 			},
 		},
 		{
-			name:     "app config",
-			handle:   api.GetAppConfigForTest,
+			name: "app config",
+			handle: func(userID int64) (bin.Encoder, error) {
+				return api.GetAppConfigForTestWithMode(userID, config.RegistrationInvite)
+			},
 			request:  func() bin.Encoder { return &tg.HelpGetAppConfigRequest{} },
 			response: func() bin.Decoder { return &tg.HelpAppConfig{} },
 			assert: func(t *testing.T, response bin.Decoder) {
@@ -91,9 +97,16 @@ func settingsHandlers() []settingsHandler {
 				if !ok {
 					t.Fatalf("response = %T, want *tg.HelpAppConfig", response)
 				}
-				config, ok := got.Config.(*tg.JSONObject)
-				if !ok || len(config.Value) != 0 {
-					t.Fatalf("app config = %T with %v, want empty JSON object", got.Config, got.Config)
+				jsonConfig, ok := got.Config.(*tg.JSONObject)
+				if !ok || len(jsonConfig.Value) != 1 {
+					t.Fatalf("app config = %T with %v, want registration mode", got.Config, got.Config)
+				}
+				if jsonConfig.Value[0].Key != "registration_mode" {
+					t.Fatalf("app config key = %q, want registration_mode", jsonConfig.Value[0].Key)
+				}
+				mode, ok := jsonConfig.Value[0].Value.(*tg.JSONString)
+				if !ok || mode.Value != string(config.RegistrationInvite) {
+					t.Fatalf("registration mode = %T %v, want %q", jsonConfig.Value[0].Value, jsonConfig.Value[0].Value, config.RegistrationInvite)
 				}
 			},
 		},
@@ -103,6 +116,9 @@ func settingsHandlers() []settingsHandler {
 func TestSettingsHandlersRequireAuthorization(t *testing.T) {
 	for _, method := range settingsHandlers() {
 		t.Run(method.name, func(t *testing.T) {
+			if !method.requiresAuthorization {
+				return
+			}
 			res, err := method.handle(0)
 			if res != nil {
 				t.Fatalf("response = %T, want nil", res)
@@ -141,9 +157,13 @@ func TestSettingsHandlersReturnHonestDefaults(t *testing.T) {
 					t.Fatalf("themes = hash %d, %d themes; want empty", got.Hash, len(got.Themes))
 				}
 			case *tg.HelpAppConfig:
-				config, ok := got.Config.(*tg.JSONObject)
-				if !ok || len(config.Value) != 0 {
-					t.Fatalf("app config = %T with %v, want empty JSON object", got.Config, got.Config)
+				jsonConfig, ok := got.Config.(*tg.JSONObject)
+				if !ok || len(jsonConfig.Value) != 1 {
+					t.Fatalf("app config = %T with %v, want registration mode", got.Config, got.Config)
+				}
+				mode, ok := jsonConfig.Value[0].Value.(*tg.JSONString)
+				if jsonConfig.Value[0].Key != "registration_mode" || !ok || mode.Value != string(config.RegistrationInvite) {
+					t.Fatalf("registration mode = %v, want %q", jsonConfig.Value[0], config.RegistrationInvite)
 				}
 			default:
 				t.Fatalf("response = %T, want one of the settings success types", res)
@@ -253,6 +273,15 @@ func TestSettingsHandlersThroughDispatcher(t *testing.T) {
 				{name: "provisional", userID: 1, provisional: true},
 			} {
 				t.Run(session.name, func(t *testing.T) {
+					if !method.requiresAuthorization {
+						body := dispatchSettings(t, h, method, session.userID, session.provisional)
+						response := method.response()
+						if err := response.Decode(&bin.Buffer{Buf: body}); err != nil {
+							t.Fatalf("decode allowed response: %v", err)
+						}
+						method.assert(t, response)
+						return
+					}
 					body := dispatchSettings(t, h, method, session.userID, session.provisional)
 					rpc := &mt.RPCError{}
 					if err := rpc.Decode(&bin.Buffer{Buf: body}); err != nil {
@@ -262,6 +291,37 @@ func TestSettingsHandlersThroughDispatcher(t *testing.T) {
 						t.Fatalf("rejection = %d %q, want 401 AUTH_KEY_UNREGISTERED", rpc.ErrorCode, rpc.ErrorMessage)
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestAppConfigAdvertisesRegistrationModeWithoutAuthorization(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []config.RegistrationMode{
+		config.RegistrationClosed,
+		config.RegistrationOpen,
+	} {
+		t.Run(string(mode), func(t *testing.T) {
+			res, err := api.GetAppConfigForTestWithMode(0, mode)
+			if err != nil {
+				t.Fatalf("help.getAppConfig: %v", err)
+			}
+			appConfig, ok := res.(*tg.HelpAppConfig)
+			if !ok {
+				t.Fatalf("response = %T, want *tg.HelpAppConfig", res)
+			}
+			object, ok := appConfig.Config.(*tg.JSONObject)
+			if !ok || len(object.Value) != 1 {
+				t.Fatalf("config = %T with %v, want one registration_mode field", appConfig.Config, appConfig.Config)
+			}
+			if object.Value[0].Key != "registration_mode" {
+				t.Fatalf("config key = %q, want registration_mode", object.Value[0].Key)
+			}
+			value, ok := object.Value[0].Value.(*tg.JSONString)
+			if !ok || value.Value != string(mode) {
+				t.Fatalf("registration mode = %T %v, want %q", object.Value[0].Value, object.Value[0].Value, mode)
 			}
 		})
 	}
