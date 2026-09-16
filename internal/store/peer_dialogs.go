@@ -45,6 +45,11 @@ type PeerDialogsSnapshot struct {
 	Files          map[int64]File
 }
 
+// SetPeerDialogsSnapshotHook installs the test-only synchronization seam used
+// by API concurrency tests. Production callers leave it nil, so it has no
+// effect on the read path outside tests.
+func SetPeerDialogsSnapshotHook(s *Store, fn func()) { s.peerDialogsSnapshotHook = fn }
+
 // PeerDialogsSnapshot selects and hydrates the requested peers for ownerID.
 // The caller has already validated the input constructors and access hashes;
 // this method only reads the exact owner-scoped rows that those keys name.
@@ -68,6 +73,9 @@ func (s *Store) PeerDialogsSnapshot(ctx context.Context, ownerID int64, peers []
 		return PeerDialogsSnapshot{}, fmt.Errorf("begin peer dialogs snapshot: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	if s.peerDialogsSnapshotHook != nil {
+		s.peerDialogsSnapshotHook()
+	}
 	qtx := s.q.WithTx(tx)
 
 	userIDs, chatIDs, channelIDs := peerIDLists(peers)

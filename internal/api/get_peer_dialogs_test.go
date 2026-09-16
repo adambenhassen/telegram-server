@@ -6,9 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 func TestGetPeerDialogsReturnsRequestedUserDialog(t *testing.T) {
@@ -350,4 +352,86 @@ func TestGetPeerDialogsOmitsRemovedAndBannedChannels(t *testing.T) {
 		t.Fatalf("unauthorized channels leaked dialogs=%d messages=%d chats=%d", len(res.Dialogs), len(res.Messages), len(res.Chats))
 	}
 	assertEncodes(t, enc)
+}
+
+func TestGetPeerDialogsDoesNotLeakChannelAfterMidReadEntitlementChange(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, context.Context, *store.Store, string, int64, int64)
+	}{
+		{
+			name: "leave",
+			mutate: func(t *testing.T, ctx context.Context, s *store.Store, _ string, channelID, memberID int64) {
+				t.Helper()
+				left, err := s.LeaveChannel(ctx, channelID, memberID)
+				if err != nil || !left {
+					t.Fatalf("leave channel: left=%v err=%v", left, err)
+				}
+			},
+		},
+		{
+			name: "ban",
+			mutate: func(t *testing.T, ctx context.Context, _ *store.Store, dsn string, channelID, memberID int64) {
+				t.Helper()
+				banChannelMember(t, ctx, dsn, channelID, memberID, time.Now().Add(time.Hour))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			s, dsn := openStoreDSN(t)
+			creator, member, channel := channelWith(t, s, "+15551298013", "+15551298014")
+			joinChannelByInvite(t, s, channel, member.ID)
+			if _, err := sendToChannel(t, s, creator.ID, channel.ID, "mid-read", 98008); err != nil {
+				t.Fatalf("channel send: %v", err)
+			}
+
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			store.SetPeerDialogsSnapshotHook(s, func() {
+				close(entered)
+				<-release
+			})
+			defer store.SetPeerDialogsSnapshotHook(s, nil)
+
+			type result struct {
+				enc bin.Encoder
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				enc, err := api.GetPeerDialogsForTest(s, member.ID, &tg.MessagesGetPeerDialogsRequest{
+					Peers: []tg.InputDialogPeerClass{
+						&tg.InputDialogPeer{Peer: api.InputPeerChannel(member.ID, channel.ID)},
+					},
+				})
+				done <- result{enc: enc, err: err}
+			}()
+
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("peer dialog snapshot did not reach its read barrier")
+			}
+			tt.mutate(t, ctx, s, dsn, channel.ID, member.ID)
+			close(release)
+
+			out := <-done
+			if out.err != nil {
+				t.Fatalf("get peer dialogs: %v", out.err)
+			}
+			res, ok := out.enc.(*tg.MessagesPeerDialogs)
+			if !ok {
+				t.Fatalf("result = %T, want *tg.MessagesPeerDialogs", out.enc)
+			}
+			if len(res.Dialogs) != 0 || len(res.Messages) != 0 || len(res.Chats) != 0 {
+				t.Fatalf("mid-read entitlement change leaked dialogs=%d messages=%d chats=%d", len(res.Dialogs), len(res.Messages), len(res.Chats))
+			}
+			assertEncodes(t, out.enc)
+		})
+	}
 }
