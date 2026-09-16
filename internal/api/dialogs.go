@@ -54,6 +54,10 @@ func (h *handlers) createUsersForDialog(ctx context.Context, chatID, viewerID in
 // is MAIN-109.
 const maxChannelDialogs = 100
 
+// maxPeerDialogs bounds one messages.getPeerDialogs request and all of the
+// selected-row and hydration work it can trigger.
+const maxPeerDialogs = 100
+
 // channelDialogs builds the dialog entries for the channels userID belongs to,
 // returning the channel ids referenced, the entries, and the top post of each so
 // the caller can hydrate media for the whole reply in one query. A channel with
@@ -265,4 +269,142 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	// page purely to count them.
 	total += len(channelDialogs)
 	return &tg.MessagesDialogsSlice{Count: total, Dialogs: tlDialogs, Messages: tlMsgs, Users: users, Chats: chats}, nil
+}
+
+// handleGetPeerDialogs serves messages.getPeerDialogs. Unlike getDialogs, the
+// request names an exact peer set; missing or unauthorized peers are omitted
+// from the same read snapshot rather than answered with a distinguishable
+// existence error.
+func (h *handlers) handleGetPeerDialogs(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesGetPeerDialogsRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if len(req.Peers) == 0 {
+		return nil, errInputPeersEmpty
+	}
+	if len(req.Peers) > maxPeerDialogs {
+		return nil, errLimitInvalid
+	}
+
+	peers := make([]store.PeerDialogKey, 0, len(req.Peers))
+	seen := make(map[store.PeerDialogKey]bool, len(req.Peers))
+	for _, input := range req.Peers {
+		peer, ok := input.(*tg.InputDialogPeer)
+		if !ok || peer.Peer == nil {
+			return nil, errPeerIDInvalid
+		}
+		peerType, peerID, err := h.inputPeer(peer.Peer, r.UserID)
+		if err != nil {
+			return nil, err
+		}
+		key := store.PeerDialogKey{PeerType: peerType, PeerID: peerID}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		peers = append(peers, key)
+	}
+
+	snapshot, err := h.store.PeerDialogsSnapshot(r.Ctx, r.UserID, peers)
+	if err != nil {
+		h.log.Error("get peer dialogs", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return h.peerDialogsToTL(snapshot, r.UserID), nil
+}
+
+// peerDialogsToTL is the response-only half of the snapshot path. Every map
+// here was populated by the store's repeatable-read selection and the same
+// viewer-aware entitlement gates used by getDialogs; this function performs no
+// further database reads.
+func (h *handlers) peerDialogsToTL(snapshot store.PeerDialogsSnapshot, viewerID int64) *tg.MessagesPeerDialogs {
+	tlDialogs := make([]tg.DialogClass, 0, len(snapshot.Dialogs))
+	tlMsgs := make([]tg.MessageClass, 0, len(snapshot.Dialogs))
+	files := make(map[int64]*tg.Document, len(snapshot.Files))
+	for id, file := range snapshot.Files {
+		files[id] = h.documentToTL(file)
+	}
+	chatIDs := make([]int64, 0, len(snapshot.Dialogs))
+	channelIDs := make([]int64, 0, len(snapshot.Dialogs))
+	seenChats := map[int64]bool{}
+	seenChannels := map[int64]bool{}
+
+	for _, selected := range snapshot.Dialogs {
+		d := selected.Dialog
+		tlDialog := &tg.Dialog{
+			Peer:            peerToTL(d.PeerType, d.PeerID),
+			TopMessage:      int(d.TopMessage),
+			ReadInboxMaxID:  int(d.ReadInboxMaxID),
+			ReadOutboxMaxID: int(d.ReadOutboxMaxID),
+			UnreadCount:     d.UnreadCount,
+		}
+		switch d.PeerType {
+		case store.PeerTypeChannel:
+			tlDialog.SetPts(selected.Pts)
+			if !seenChannels[d.PeerID] {
+				seenChannels[d.PeerID] = true
+				channelIDs = append(channelIDs, d.PeerID)
+			}
+		case store.PeerTypeChat:
+			if !seenChats[d.PeerID] {
+				seenChats[d.PeerID] = true
+				chatIDs = append(chatIDs, d.PeerID)
+			}
+		}
+		tlDialogs = append(tlDialogs, tlDialog)
+
+		switch {
+		case selected.Message != nil:
+			var createUsers []int64
+			if selected.Message.Action == store.ChatActionCreate && snapshot.ChatMembership[d.PeerID] {
+				for _, participant := range snapshot.ChatMembers[d.PeerID] {
+					createUsers = append(createUsers, participant.UserID)
+				}
+			}
+			tlMsgs = append(tlMsgs, messageToTL(*selected.Message, createUsers, files, nil, nil))
+		case selected.ChannelMessage != nil:
+			tlMsgs = append(tlMsgs, channelMessageToTL(*selected.ChannelMessage, viewerID, files))
+		}
+	}
+
+	users := make([]tg.UserClass, 0, len(snapshot.Users))
+	for id, user := range snapshot.Users {
+		if id != viewerID && !snapshot.EntitledUsers[id] {
+			users = append(users, &tg.UserEmpty{ID: id})
+			continue
+		}
+		users = append(users, h.userToTL(user, viewerID, id == viewerID))
+	}
+
+	chats := make([]tg.ChatClass, 0, len(chatIDs)+len(channelIDs))
+	for _, chatID := range chatIDs {
+		chat, ok := snapshot.Chats[chatID]
+		if !ok {
+			continue
+		}
+		if !snapshot.ChatMembership[chatID] {
+			chats = append(chats, &tg.ChatForbidden{ID: chat.ID, Title: ""})
+			continue
+		}
+		chats = append(chats, chatToTL(chat, len(snapshot.ChatMembers[chatID]), viewerID))
+	}
+	for _, channelID := range channelIDs {
+		channel, ok := snapshot.Channels[channelID]
+		if !ok {
+			continue
+		}
+		chats = append(chats, h.channelToTL(channel, snapshot.ChannelMembers[channelID], true, viewerID))
+	}
+
+	return &tg.MessagesPeerDialogs{
+		Dialogs:  tlDialogs,
+		Messages: tlMsgs,
+		Chats:    chats,
+		Users:    users,
+		State:    *stateToTL(snapshot.State),
+	}
 }
