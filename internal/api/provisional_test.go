@@ -17,8 +17,9 @@ import (
 func TestProvisionalAllowListContainsExpectedMethods(t *testing.T) {
 	t.Parallel()
 	// The allow-list must contain exactly the five methods that a provisional
-	// session is permitted to call. The help methods are needed because gotd's
-	// connection setup calls them before the user finishes registration.
+	// session is permitted to call. The help methods cover gotd's connection
+	// setup and this ticket's registration-mode discovery before the user
+	// finishes registration.
 	want := map[uint32]bool{
 		tg.HelpGetConfigRequestTypeID:                 true,
 		tg.HelpGetAppConfigRequestTypeID:              true,
