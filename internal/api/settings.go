@@ -45,8 +45,12 @@ func (h *handlers) handleGetAppConfig(r *mtproto.Request) (bin.Encoder, error) {
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
-	if r.UserID == 0 {
-		return nil, errAuthKeyUnreg
-	}
-	return &tg.HelpAppConfig{Config: &tg.JSONObject{}}, nil
+	// help.appConfig carries an extensible JSON object, so the registration mode
+	// does not change the fixed TL response shape that stock clients decode.
+	return &tg.HelpAppConfig{
+		Config: &tg.JSONObject{Value: []tg.JSONObjectValue{{
+			Key:   "registration_mode",
+			Value: &tg.JSONString{Value: string(h.registrationMode)},
+		}}},
+	}, nil
 }

@@ -6,6 +6,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
 
@@ -34,5 +35,19 @@ func GetThemesForTest(userID int64) (bin.Encoder, error) {
 }
 
 func GetAppConfigForTest(userID int64) (bin.Encoder, error) {
-	return handleSettingsForTest(userID, &tg.HelpGetAppConfigRequest{}, (*handlers).handleGetAppConfig)
+	return GetAppConfigForTestWithMode(userID, config.RegistrationClosed)
+}
+
+func GetAppConfigForTestWithMode(userID int64, mode config.RegistrationMode) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := (&tg.HelpGetAppConfigRequest{}).Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(nil)
+	h.registrationMode = mode
+	return h.handleGetAppConfig(&mtproto.Request{
+		Ctx:    context.Background(),
+		UserID: userID,
+		Buf:    &buf,
+	})
 }

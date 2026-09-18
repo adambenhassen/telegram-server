@@ -113,6 +113,9 @@ type handlers struct {
 	// It is process-local and optional so tests and embedders without admin
 	// telemetry retain the same enforcement behaviour.
 	rateLimitMetrics *store.NotificationMetrics
+	// rateLimitRecorder is a test-only failure injection seam. Production uses
+	// the fixed recorder method through rateLimitMetrics.
+	rateLimitRecorder func(surface string) error
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -230,6 +233,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.UpdatesGetChannelDifferenceRequestTypeID, h.handleGetChannelDifference)
 	register(d, tg.MessagesSendMessageRequestTypeID, h.handleSendMessage)
 	register(d, tg.MessagesGetDialogsRequestTypeID, h.handleGetDialogs)
+	register(d, tg.MessagesGetPeerDialogsRequestTypeID, h.handleGetPeerDialogs)
 	register(d, tg.MessagesGetHistoryRequestTypeID, h.handleGetHistory)
 	register(d, tg.MessagesReadHistoryRequestTypeID, h.handleReadHistory)
 	register(d, tg.MessagesEditMessageRequestTypeID, h.handleEditMessage)
@@ -375,22 +379,29 @@ func (h *handlers) refundRateLimitIP(r *mtproto.Request, surface string, res *st
 // recordRateLimitDenial keeps telemetry observational: a broken recorder must
 // never change the rate-limit decision or the RPC response.
 func (h *handlers) recordRateLimitDenial(surface string) {
-	if h.rateLimitMetrics == nil {
+	if h.rateLimitMetrics == nil && h.rateLimitRecorder == nil {
 		return
 	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			return
-		}
-	}()
-	h.rateLimitMetrics.RecordRateLimitDenial(surface)
+	var failed bool
+	if h.rateLimitRecorder != nil {
+		failed = store.InvokeRecorder(func() error { return h.rateLimitRecorder(surface) })
+	} else {
+		failed = store.InvokeRecorder(func() error {
+			return h.rateLimitMetrics.RecordRateLimitDenialResult(surface)
+		})
+	}
+	if failed {
+		store.ReportRecorderFailure(h.log, h.rateLimitMetrics, store.RecorderFailureRateLimitDenial)
+	}
 }
 
 // provisionalAllowList holds the method IDs that a provisional session may call.
-// A provisional session is a username-mode account with no verifier: it can set
-// its password, check password state, or log out — but nothing else.
+// A provisional session is a username-mode account with no verifier: it can
+// read server configuration, set its password, check password state, or log
+// out — but nothing else.
 var provisionalAllowList = map[uint32]bool{
 	tg.HelpGetConfigRequestTypeID:                 true,
+	tg.HelpGetAppConfigRequestTypeID:              true,
 	tg.AccountGetPasswordRequestTypeID:            true,
 	tg.AccountUpdatePasswordSettingsRequestTypeID: true,
 	tg.AuthLogOutRequestTypeID:                    true,
