@@ -107,7 +107,7 @@ func TestAuthenticatedJSONAndSSESharePushSnapshot(t *testing.T) {
 		Render:            admin.DefaultFragmentRenderer,
 		Interval:          time.Hour,
 		Heartbeat:         time.Hour,
-		MaxStreamDuration: 100 * time.Millisecond,
+		MaxStreamDuration: 5 * time.Second,
 	})
 	rawToken := "cross-surface-token"
 	h := admin.AdminRouter(admin.LoginHandlerConfig{
@@ -232,7 +232,7 @@ func TestAuthenticatedJSONAndSSEShareRateLimitDenialSnapshot(t *testing.T) {
 		Render:            admin.DashboardFragmentRenderer,
 		Interval:          time.Hour,
 		Heartbeat:         time.Hour,
-		MaxStreamDuration: 100 * time.Millisecond,
+		MaxStreamDuration: 5 * time.Second,
 	})
 	rawToken := "rate-limit-cross-surface-token"
 	h := admin.AdminRouter(admin.LoginHandlerConfig{

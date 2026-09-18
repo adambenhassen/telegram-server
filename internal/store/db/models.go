@@ -245,6 +245,12 @@ type SendCodeIpPhone struct {
 	ExpiresAt pgtype.Timestamptz
 }
 
+type ServerAdministration struct {
+	SingletonID         int16
+	ElectionClosed      bool
+	AdministratorUserID *int64
+}
+
 type SignInFailCall struct {
 	IpKey       netip.Prefix
 	TokenCount  int32

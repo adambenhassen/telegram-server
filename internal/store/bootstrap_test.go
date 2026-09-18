@@ -60,6 +60,11 @@ func TestBootstrapAccount_CreatesNewAccount(t *testing.T) {
 	if len(pw.Verifier) == 0 {
 		t.Error("expected non-empty verifier")
 	}
+	if administrator, err := s.IsServerAdministrator(ctx, result.UserID); err != nil {
+		t.Fatalf("check elected administrator: %v", err)
+	} else if !administrator {
+		t.Fatal("fresh bootstrap account did not receive the administrator grant")
+	}
 }
 
 func TestBootstrapAccount_Idempotent(t *testing.T) {
@@ -94,6 +99,39 @@ func TestBootstrapAccount_Idempotent(t *testing.T) {
 	}
 	if result2.UserID != result1.UserID {
 		t.Errorf("UserID mismatch: first=%d second=%d", result1.UserID, result2.UserID)
+	}
+	if administrator, err := s.IsServerAdministrator(ctx, result2.UserID); err != nil {
+		t.Fatalf("check idempotent administrator: %v", err)
+	} else if !administrator {
+		t.Fatal("idempotent bootstrap changed the administrator grant")
+	}
+}
+
+func TestBootstrapAccountDoesNotTransferClosedElection(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t, pgtest.DSN(t))
+
+	owner, err := s.CreateUser(ctx, "+15551234568")
+	if err != nil {
+		t.Fatalf("create existing owner: %v", err)
+	}
+	result, err := s.BootstrapAccount(ctx, bootstrapParams(t))
+	if err != nil {
+		t.Fatalf("bootstrap after existing user: %v", err)
+	}
+	if !result.Created {
+		t.Fatal("bootstrap account was not created")
+	}
+	if administrator, err := s.IsServerAdministrator(ctx, owner.ID); err != nil {
+		t.Fatalf("check existing owner administrator: %v", err)
+	} else if !administrator {
+		t.Fatal("existing first user lost the administrator grant")
+	}
+	if administrator, err := s.IsServerAdministrator(ctx, result.UserID); err != nil {
+		t.Fatalf("check bootstrap administrator: %v", err)
+	} else if administrator {
+		t.Fatal("bootstrap transferred a closed election")
 	}
 }
 
