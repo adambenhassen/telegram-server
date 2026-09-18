@@ -2,7 +2,6 @@
 package config
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -214,16 +213,6 @@ type Config struct {
 	// bound RPCDeadline puts on the handler side. See
 	// store.WithStatementTimeout. Zero disables it.
 	StatementTimeout time.Duration
-	// BootstrapUsername is the handle to create at startup. Empty disables
-	// bootstrap. When set, exactly one of BootstrapPassword or
-	// BootstrapPasswordFile must be configured.
-	BootstrapUsername string
-	// BootstrapPassword is the cleartext password for the bootstrap account.
-	// Mutually exclusive with BootstrapPasswordFile.
-	BootstrapPassword string
-	// BootstrapPasswordFile is the path to a file containing the bootstrap
-	// password. Mutually exclusive with BootstrapPassword.
-	BootstrapPasswordFile string
 }
 
 // ClientConfig contains only the identity settings needed to render the
@@ -462,6 +451,15 @@ func LoadClientConfig() (ClientConfig, error) {
 // logger is used only for the auth-key master key, which is the one value Load
 // can create rather than read, and a generated one has to say so.
 func Load(log *slog.Logger) (Config, error) {
+	for _, name := range [...]string{
+		"TG_BOOTSTRAP_USERNAME",
+		"TG_BOOTSTRAP_PASSWORD",
+		"TG_BOOTSTRAP_PASSWORD_FILE",
+	} {
+		if _, ok := os.LookupEnv(name); ok {
+			return Config{}, fmt.Errorf("%s is no longer supported", name)
+		}
+	}
 	identity, err := LoadClientConfig()
 	if err != nil {
 		return Config{}, err
@@ -1021,13 +1019,6 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.AuthKeyEncKey = encKey
-	// Bootstrap: resolve username and password source before returning.
-	cfg.BootstrapUsername = os.Getenv("TG_BOOTSTRAP_USERNAME")
-	cfg.BootstrapPassword = os.Getenv("TG_BOOTSTRAP_PASSWORD")
-	cfg.BootstrapPasswordFile = os.Getenv("TG_BOOTSTRAP_PASSWORD_FILE")
-	if err := validateBootstrap(cfg); err != nil {
-		return Config{}, err
-	}
 	return cfg, nil
 }
 
@@ -1711,56 +1702,4 @@ func (c Config) ValidateRegistrationMode() error {
 		return nil
 	}
 	return fmt.Errorf("TG_REGISTRATION must be unset, %q, %q, or %q; got %q", RegistrationClosed, RegistrationInvite, RegistrationOpen, c.RegistrationMode)
-}
-
-// validateBootstrap checks that bootstrap env vars are consistent.
-//
-// When TG_BOOTSTRAP_USERNAME is set, exactly one of TG_BOOTSTRAP_PASSWORD or
-// TG_BOOTSTRAP_PASSWORD_FILE must be set. Both set simultaneously is an error;
-// neither set with a username is also an error.
-func validateBootstrap(cfg Config) error {
-	if cfg.BootstrapUsername == "" {
-		return nil // bootstrap disabled
-	}
-
-	bothSet := cfg.BootstrapPassword != "" && cfg.BootstrapPasswordFile != ""
-	noneSet := cfg.BootstrapPassword == "" && cfg.BootstrapPasswordFile == ""
-
-	if bothSet {
-		return errors.New("TG_BOOTSTRAP_PASSWORD and TG_BOOTSTRAP_PASSWORD_FILE are both set: use only one")
-	}
-	if noneSet {
-		return errors.New("TG_BOOTSTRAP_USERNAME is set but no password source is configured: set TG_BOOTSTRAP_PASSWORD or TG_BOOTSTRAP_PASSWORD_FILE")
-	}
-	return nil
-}
-
-// BootstrapPasswordBytes returns the password for the bootstrap account.
-// It reads from the file path when BootstrapPasswordFile is set, otherwise
-// returns the in-memory password. Both paths trim whitespace. Rejects
-// passwords shorter than 12 bytes.
-func (c Config) BootstrapPasswordBytes() ([]byte, error) {
-	var password []byte
-	if c.BootstrapPasswordFile != "" {
-		data, err := os.ReadFile(c.BootstrapPasswordFile) // #nosec G304,G703 -- operator-configured path.
-		if err != nil {
-			return nil, fmt.Errorf("read bootstrap password file %s: %w", c.BootstrapPasswordFile, err)
-		}
-		password = bytes.TrimSpace(data)
-		// Copy the trimmed password into its own allocation so we can clear
-		// the original ReadFile buffer without corrupting the return value.
-		passwordCopy := make([]byte, len(password))
-		copy(passwordCopy, password)
-		clear(data)
-		password = passwordCopy
-	} else {
-		password = []byte(strings.TrimSpace(c.BootstrapPassword))
-	}
-	if len(password) < 12 {
-		if c.BootstrapPasswordFile != "" {
-			return nil, fmt.Errorf("TG_BOOTSTRAP_PASSWORD_FILE: password must be at least 12 bytes (got %d)", len(password))
-		}
-		return nil, fmt.Errorf("TG_BOOTSTRAP_PASSWORD: password must be at least 12 bytes (got %d)", len(password))
-	}
-	return password, nil
 }

@@ -14,7 +14,7 @@ import (
 
 // TestAccountCreationPathsStayBehindAdmission keeps the username account
 // creation sequence in one production function. The other allowed primitive
-// calls are existing phone-account fixtures, bootstrap, authentication, and
+// calls are existing phone-account fixtures, authentication, and
 // username-management paths; adding a new call site requires naming it here.
 func TestAccountCreationPathsStayBehindAdmission(t *testing.T) {
 	t.Parallel()
@@ -33,10 +33,6 @@ func TestAccountCreationPathsStayBehindAdmission(t *testing.T) {
 				"ClaimUsername":      true,
 				"BindAuthKeyUser":    true,
 			},
-		},
-		// Bootstrap is the pre-port account path and must remain unaffected.
-		"internal/store/bootstrap.go": {
-			"BootstrapAccount": {"CreateUsernameUser": true, "ClaimUsername": true},
 		},
 		"internal/store/authkeys.go": {
 			"BindAuthKeyUser": {"BindAuthKeyUser": true},

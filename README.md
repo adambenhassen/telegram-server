@@ -13,9 +13,9 @@ Two ways to sign in:
 
 - **Username + password**: SRP-6a cloud-password accounts that authenticate
   with a username and password, no code delivery involved. Sign-up is gated by
-  `TG_REGISTRATION` (default `closed`), and `TG_BOOTSTRAP_USERNAME` /
-  `TG_BOOTSTRAP_PASSWORD` seed a fully provisioned operator account at startup,
-  the recommended way to create the first account on a closed server.
+  `TG_REGISTRATION` (default `closed`). The first account admitted on a fresh
+  database becomes the durable server administrator; startup never creates or
+  changes accounts.
 - **Phone number + login code**: there is no SMS or push transport, so codes
   are written to the server log, and only when `TG_LOG_LOGIN_CODES=true`.
   Development against fake numbers only.
@@ -93,8 +93,10 @@ The server listens on `127.0.0.1:2443`. The stack enables
 `TG_LOG_LOGIN_CODES`, so phone-mode login codes appear in
 `docker compose logs telegramd`; phone-mode accounts must already exist because
 sign-in no longer creates unknown accounts. Username/password accounts are also
-supported here: set the `TG_BOOTSTRAP_*` variables in `.env` if you want a
-username/password operator account. `docker compose down` keeps
+supported here: for a fresh database, temporarily set `TG_REGISTRATION=open` in
+`.env`, complete the registration flow in [the client guide](docs/clients.md),
+and then set it back to `closed`. The first committed account becomes the
+durable server administrator. `docker compose down` keeps
 the local volumes (rows, RSA identity, auth-key master key, and filesystem
 blobs); `down -v` destroys them and every client has to re-handshake.
 `.env.example` documents each variable.
@@ -146,8 +148,6 @@ The server refuses to start without a database and a master key:
 | `TG_RATE_LIMIT_DISCOVERY_WINDOW` | `1m` | Window for the process-wide discovery response bound |
 | `TG_RATE_LIMIT_DISCOVERY_IP` | `10` | Valid local-direct preflight response attempts per IPv4 `/32` or IPv6 `/64` network per fixed window; `0` disables the bound |
 | `TG_RATE_LIMIT_DISCOVERY_IP_WINDOW` | `1m` | Window for the per-network discovery response bound |
-| `TG_BOOTSTRAP_USERNAME` | *(unset)* | Seed a username/password operator account at startup; requires exactly one of `TG_BOOTSTRAP_PASSWORD` or `TG_BOOTSTRAP_PASSWORD_FILE` |
-| `TG_BOOTSTRAP_PASSWORD_FILE` | *(unset)* | File (mode 0600) the bootstrap password is read from. Prefer it over `TG_BOOTSTRAP_PASSWORD`: an env value stays visible in `/proc/<pid>/environ`, orchestrator inspect output and crash dumps for the life of the process |
 | `TG_REGISTRATION` | `closed` | Accepted values are `closed`, `invite`, and `open`; `closed` rejects `auth.signUp`, `invite` requires an operator-issued invite, and `open` admits usernames without one. An unrecognized value fails startup |
 | `TG_LOG_LOGIN_CODES` | `false` | Write phone-mode login codes to the log; with it off, phone-number sign-in cannot complete (username/password sign-in is unaffected) |
 | `TG_ADMIN_LISTEN_ADDR` | *(unset)* | Enables the admin HTTP server; requires `TG_ADMIN_TOKEN_HASH` (SHA-256 hex of the operator token) |
@@ -206,22 +206,20 @@ HTTP is rejected unless `TG_BLOB_S3_ALLOW_INSECURE_HTTP=true` is explicitly
 set for a loopback or compose-only endpoint; startup logs a warning when this
 escape hatch is used. There is no TLS verification bypass setting.
 
-A minimal run against a local Postgres, seeding an operator account you can
-sign in to with username + password:
+A minimal run against a local Postgres, creating the first account through the
+normal registration flow:
 
 ```bash
 export TG_POSTGRES_DSN="postgres://user:pass@localhost:5432/telegram?sslmode=disable"
 make migrate
-printf '%s' 'change-me-at-least-12-chars' > bootstrap_password && chmod 600 bootstrap_password
 TG_AUTHKEY_ENC_KEY="$(openssl rand -hex 32)" \
-TG_BOOTSTRAP_USERNAME=operator \
-TG_BOOTSTRAP_PASSWORD_FILE=./bootstrap_password \
+TG_REGISTRATION=open \
   make run
 ```
 
-The password goes through a file rather than `TG_BOOTSTRAP_PASSWORD` on
-purpose: an environment value is readable in `/proc/<pid>/environ` and
-orchestrator inspect output for as long as the server runs.
+Complete the username registration flow in `docs/clients.md`, then restart with
+`TG_REGISTRATION=closed`. Later accounts can use `invite` mode and the local
+`telegramd invite` commands.
 
 The full variable reference (rate limits, pre-auth connection bounds, PROXY
 protocol support, upload limits) is in `docs/clients.md` and

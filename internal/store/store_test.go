@@ -34,6 +34,16 @@ func open(t *testing.T) *store.Store {
 	return s
 }
 
+func openStore(tb testing.TB, dsn string) *store.Store {
+	tb.Helper()
+	s, err := store.Open(context.Background(), dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(tb)))
+	if err != nil {
+		tb.Fatalf("store.Open: %v", err)
+	}
+	tb.Cleanup(func() { _ = s.Close() }) //nolint:errcheck // best-effort close
+	return s
+}
+
 // TestOpenRequiresBlobStore: the part bytes live in the blob backend, so a
 // Store without one has no way to serve an upload. Left to default it would
 // nil-panic on the first saveFilePart of a running server rather than refusing
