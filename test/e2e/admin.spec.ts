@@ -545,6 +545,7 @@ test.describe('admin SSE stream', () => {
         stream.setAttribute('data-sample-timestamp', timestamp);
         stream.setAttribute('data-sample-age-seconds', age);
         stream.setAttribute('data-sample-state', 'available');
+        stream.setAttribute('data-process-started-at', '2099-09-14T11:59:50Z');
         stream.setAttribute('data-process-generation', generation);
         stream.setAttribute('data-replica-id', replica);
         emit(dataEvent);
@@ -583,6 +584,125 @@ test.describe('admin SSE stream', () => {
       swappedReplica: '● Live · updated 12s ago · Metrics source changed',
       nullReplica: '● Live · updated 13s ago · Metrics source changed',
     });
+  });
+
+  test('older source samples still announce a source change', async ({ page }) => {
+    await page.addInitScript(() => {
+      let sampleClock = 0;
+      Object.defineProperty(window, '__setSampleClock', {
+        value: (value: number) => {
+          sampleClock = value;
+        },
+      });
+      Object.defineProperty(performance, 'now', {
+        configurable: true,
+        value: () => sampleClock,
+      });
+    });
+    await page.route('**/admin/events**', (route) => route.abort());
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    const notice = await page.evaluate(() => {
+      const clock = window.__setSampleClock;
+      const stream = document.getElementById('metrics-stream');
+      const sseRoot = document.getElementById('sse-root');
+      const dataEvent = sseRoot?.getAttribute('data-sse-event');
+      if (!clock || !stream || !dataEvent) {
+        throw new Error('dashboard source-change test hooks are missing');
+      }
+
+      const initialGeneration = stream.getAttribute('data-process-generation') || '';
+      const initialReplica = stream.getAttribute('data-replica-id') || '';
+      const emit = (type: string) => {
+        document.dispatchEvent(new CustomEvent('datastar-sse', {
+          detail: { type, elId: 'sse-root' },
+        }));
+      };
+      const sample = (timestamp: string, generation: string, replica: string) => {
+        stream.setAttribute('data-sample-timestamp', timestamp);
+        stream.setAttribute('data-sample-age-seconds', '10');
+        stream.setAttribute('data-sample-state', 'available');
+        stream.setAttribute('data-process-started-at', '2099-09-14T11:59:50Z');
+        stream.setAttribute('data-process-generation', generation);
+        stream.setAttribute('data-replica-id', replica);
+        emit(dataEvent);
+        return document.getElementById('chip-text')?.textContent ?? '';
+      };
+
+      emit('started');
+      clock(0);
+      sample('2099-09-14T12:00:00Z', initialGeneration, initialReplica);
+      clock(1000);
+      return sample('2099-09-14T11:59:59Z', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', initialReplica);
+    });
+
+    expect(notice).toBe('● Live · updated 11s ago · Metrics source changed');
+  });
+
+  test('source identity notices expire after the startup window', async ({ page }) => {
+    await page.clock.install({ time: new Date('2099-09-14T12:00:00Z') });
+    await page.addInitScript(() => {
+      let sampleClock = 0;
+      Object.defineProperty(window, '__setSampleClock', {
+        value: (value: number) => {
+          sampleClock = value;
+        },
+      });
+      Object.defineProperty(performance, 'now', {
+        configurable: true,
+        value: () => sampleClock,
+      });
+    });
+    await page.route('**/admin/events**', (route) => route.abort());
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    const initialNotice = await page.evaluate(() => {
+      const clock = window.__setSampleClock;
+      const stream = document.getElementById('metrics-stream');
+      const sseRoot = document.getElementById('sse-root');
+      const dataEvent = sseRoot?.getAttribute('data-sse-event');
+      if (!clock || !stream || !dataEvent) {
+        throw new Error('dashboard source-window test hooks are missing');
+      }
+
+      const emit = () => {
+        document.dispatchEvent(new CustomEvent('datastar-sse', {
+          detail: { type: dataEvent, elId: 'sse-root' },
+        }));
+      };
+      const sample = (generation: string) => {
+        stream.setAttribute('data-sample-timestamp', '2099-09-14T12:00:00Z');
+        stream.setAttribute('data-sample-age-seconds', '10');
+        stream.setAttribute('data-sample-state', 'available');
+        stream.setAttribute('data-process-started-at', '2099-09-14T11:59:50Z');
+        stream.setAttribute('data-process-generation', generation);
+        stream.setAttribute('data-replica-id', 'edge-a');
+        emit();
+        return document.getElementById('chip-text')?.textContent ?? '';
+      };
+
+      clock(0);
+      sample('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+      clock(1000);
+      return sample('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+    });
+
+    expect(initialNotice).toBe('● Live · updated 11s ago · Restart detected');
+    await expect(page.locator('#banner-source')).toBeVisible();
+    await expect(page.locator('#banner-source-text')).toHaveText(
+      'Replica restarted. Rolling metrics reset; collecting a new window.',
+    );
+    await page.evaluate(() => window.__setSampleClock?.(3_601_000));
+    await page.clock.fastForward(1000);
+    await expect(page.locator('#chip-text')).toHaveText('● Stale · last sample 1h ago');
+    await expect(page.locator('#banner-source')).toBeHidden();
+    await expect(page.locator('#banner-source-text')).toHaveText('');
   });
 
   test('heartbeat-only aging marks the connected stream stale', async ({ page }) => {
