@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -25,12 +27,37 @@ func DashboardFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	// first paint put around the same component: a fragment must be a single
 	// element whose id is the selector, or the merge keeps only its last
 	// top-level node.
-	buf.WriteString(`<div id="` + sseTargetID + `">`)
+	buf.WriteString(metricsStreamOpenHTML(d))
 	if err := metricsFragment(d).Render(context.Background(), &buf); err != nil {
 		return nil, fmt.Errorf("render metrics fragment: %w", err)
 	}
+	telemetry, err := pushTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	rateLimitDenialTelemetry, err := rateLimitDenialTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	deliveryLagTelemetry, err := deliveryLagTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	buf.WriteString(telemetry)
+	buf.WriteString(rateLimitDenialTelemetry)
+	buf.WriteString(deliveryLagTelemetry)
 	buf.WriteString(`</div>`)
 	return []Fragment{{Event: sseDefaultEvent, HTML: buf.String()}}, nil
+}
+
+func metricsStreamOpenHTML(d DashboardData) string {
+	return `<div id="` + sseTargetID +
+		`" data-sample-timestamp="` + html.EscapeString(d.SampleTimestamp) +
+		`" data-sample-age-seconds="` + html.EscapeString(d.SampleAgeSeconds) +
+		`" data-sample-state="` + html.EscapeString(d.SampleState) +
+		`" data-process-started-at="` + html.EscapeString(d.ProcessStartedAt) +
+		`" data-process-generation="` + html.EscapeString(d.ProcessGeneration) +
+		`" data-replica-id="` + html.EscapeString(d.ReplicaID) + `">`
 }
 
 // DashboardData is the template data for GET /admin/dashboard. Exported for
@@ -74,6 +101,16 @@ type DashboardData struct {
 
 	// Logout form
 	CSRFToken string
+
+	// Snapshot metadata is copied to both the initial HTML and every SSE
+	// fragment. The browser uses the sample timestamp and age as its freshness
+	// clock; these strings are intentionally server-formatted.
+	SampleTimestamp   string
+	SampleAgeSeconds  string
+	SampleState       string
+	ProcessStartedAt  string
+	ProcessGeneration string
+	ReplicaID         string
 
 	// Server timestamp string (for chip tooltip)
 	ServerTimestamp string
@@ -150,20 +187,28 @@ func storageDisplay(n int64, exact bool) (display, source string) {
 // fresh CSRF token.
 func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 	d := DashboardData{
-		Connections:     FmtInt(int64(m.Connections)),
-		Sessions:        FmtInt(int64(m.Sessions)),
-		Messages1H:      FmtInt(m.Messages1H),
-		MaxPtsGap:       FmtInt(m.MaxPtsGap),
-		TotalUsers:      FmtInt(m.TotalUsers),
-		ActiveUsers1H:   FmtInt(m.ActiveUsers1H),
-		ActiveUsers24H:  FmtInt(m.ActiveUsers24H),
-		TotalChannels:   FmtInt(m.TotalChannels),
-		TotalChats:      FmtInt(m.TotalChats),
-		Messages24H:     FmtInt(m.Messages24H),
-		RateLimitActive: FmtInt(m.RateLimitActive),
-		CSRFToken:       csrfToken,
-		ServerTimestamp: m.Timestamp.Format("2006-01-02 15:04:05 UTC"),
-		ShowEmptyAlert:  m.TotalUsers == 0 && m.Connections == 0 && m.Messages24H == 0,
+		Connections:       FmtInt(int64(m.Connections)),
+		Sessions:          FmtInt(int64(m.Sessions)),
+		Messages1H:        FmtInt(m.Messages1H),
+		MaxPtsGap:         FmtInt(m.MaxPtsGap),
+		TotalUsers:        FmtInt(m.TotalUsers),
+		ActiveUsers1H:     FmtInt(m.ActiveUsers1H),
+		ActiveUsers24H:    FmtInt(m.ActiveUsers24H),
+		TotalChannels:     FmtInt(m.TotalChannels),
+		TotalChats:        FmtInt(m.TotalChats),
+		Messages24H:       FmtInt(m.Messages24H),
+		RateLimitActive:   FmtInt(m.RateLimitActive),
+		CSRFToken:         csrfToken,
+		SampleTimestamp:   m.Timestamp.UTC().Format(time.RFC3339Nano),
+		SampleAgeSeconds:  strconv.FormatFloat(maxFloat(m.SampleAgeSeconds), 'f', -1, 64),
+		SampleState:       string(m.SampleState),
+		ProcessStartedAt:  m.ProcessStartedAt.UTC().Format(time.RFC3339Nano),
+		ProcessGeneration: m.ProcessGeneration,
+		ServerTimestamp:   m.Timestamp.UTC().Format("2006-01-02 15:04:05 UTC"),
+		ShowEmptyAlert:    m.TotalUsers == 0 && m.Connections == 0 && m.Messages24H == 0,
+	}
+	if m.ReplicaID != nil {
+		d.ReplicaID = *m.ReplicaID
 	}
 
 	// Active users meter: only when total > 0.
@@ -175,12 +220,12 @@ func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 	}
 
 	// Uninstrumented card.
-	d.UninstrumentedFields = m.Uninstrumented
 	for _, name := range m.Uninstrumented {
 		label, ok := uninstrumentedLabels[name]
 		if !ok {
-			label = name
+			continue
 		}
+		d.UninstrumentedFields = append(d.UninstrumentedFields, name)
 		d.UninstrumentedNames = append(d.UninstrumentedNames, UninstrLabel{
 			Field: name,
 			Label: label,
@@ -188,7 +233,7 @@ func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 	}
 	// JSON-encode the field list so the script block can consume it safely.
 	// json.Marshal on []string cannot fail; the fallback guards a nil slice.
-	jsonBytes, err := json.Marshal(m.Uninstrumented)
+	jsonBytes, err := json.Marshal(d.UninstrumentedFields)
 	if err != nil || jsonBytes == nil {
 		jsonBytes = []byte("[]")
 	}
@@ -218,12 +263,32 @@ func BuildDashboardData(m MetricsResponse, csrfToken string) DashboardData {
 	return d
 }
 
+func maxFloat(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
 // DashboardHandler returns an http.HandlerFunc for GET /admin/dashboard.
 // It server-renders the full operations dashboard using shadcn-templ components.
 // tokenHash is the hex-encoded SHA-256 digest of TG_ADMIN_TOKEN_HASH, used to
 // derive the session-bound CSRF token for the logout form.
-func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenHash string) http.HandlerFunc {
-	var cache metricsCache
+func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenHash string, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
+	return DashboardHandlerWithDeliveryLag(registry, st, tokenHash, NewDeliveryLagSampler(), notifyMetrics...)
+}
+
+// DashboardHandlerWithDeliveryLag returns a dashboard handler using a supplied
+// lag sampler. Sharing it with the JSON and SSE handlers keeps the retained
+// complete sample and its source timestamp consistent across surfaces.
+func DashboardHandlerWithDeliveryLag(registry *mtproto.SessionRegistry, st *store.Store, tokenHash string, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) http.HandlerFunc {
+	cache := NewMetricsSnapshotCache(registry, st, defaultProcessIdentity, deliveryLag, notifyMetrics...)
+	return DashboardHandlerWithSnapshotCache(cache, tokenHash)
+}
+
+// DashboardHandlerWithSnapshotCache returns a dashboard handler backed by the
+// supplied shared sampler.
+func DashboardHandlerWithSnapshotCache(cache *MetricsSnapshotCache, tokenHash string) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -231,12 +296,11 @@ func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenH
 			return
 		}
 
-		cache.refresh(r.Context(), registry, st)
-		if cache.failed() {
-			http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
+		m, err := cache.Snapshot(r.Context())
+		if err != nil {
+			writeDashboardUnavailable(w, r, tokenHash)
 			return
 		}
-		m := cache.get()
 
 		// Derive the logout CSRF token from the session cookie. It is
 		// deterministic, so no Set-Cookie is needed: every tab with the same
@@ -261,5 +325,19 @@ func DashboardHandler(registry *mtproto.SessionRegistry, st *store.Store, tokenH
 			slog.Error("render dashboard", "err", err)
 			return
 		}
+	}
+}
+
+func writeDashboardUnavailable(w http.ResponseWriter, r *http.Request, tokenHash string) {
+	var csrfToken string
+	if sessionCookie, err := r.Cookie(sessionCookieName); err == nil {
+		if token, err := SessionCSRFToken(tokenHash, sessionCookie.Value); err == nil {
+			csrfToken = token
+		}
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	if err := dashboardUnavailablePage(DashboardData{CSRFToken: csrfToken}).Render(r.Context(), w); err != nil {
+		slog.Error("render unavailable dashboard", "err", err)
 	}
 }

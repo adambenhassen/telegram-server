@@ -47,6 +47,12 @@ func (s *Server) SetHandshakeTimeout(d time.Duration) {
 	s.handshakeTimeout = d
 }
 
+// SetWriteTimeout shortens the bound on a socket write for tests that need to
+// observe a peer that stops reading. Production conns keep the server default.
+func (s *Server) SetWriteTimeout(d time.Duration) {
+	s.writeTimeout = d
+}
+
 // SetPendingLoginLifetime shortens the pending-login lease for tests. Production
 // uses DefaultPendingLoginLifetime, which is fixed to twice the SRP challenge
 // TTL.

@@ -39,6 +39,28 @@ const (
 	ChannelPinned = "tg_pinned"
 )
 
+type notificationAcceptedAtKey struct{}
+
+// WithNotificationAcceptedAt carries a valid tg_updates acceptance timestamp
+// to the in-process delivery callback. It never leaves the process or enters a
+// database, update payload, log, or protocol response.
+func WithNotificationAcceptedAt(ctx context.Context, acceptedAt time.Time) context.Context {
+	return context.WithValue(ctx, notificationAcceptedAtKey{}, acceptedAt)
+}
+
+// NotificationAcceptedAt returns the acceptance timestamp carried by a valid
+// tg_updates callback context.
+func NotificationAcceptedAt(ctx context.Context) (time.Time, bool) {
+	if ctx == nil {
+		return time.Time{}, false
+	}
+	acceptedAt, ok := ctx.Value(notificationAcceptedAtKey{}).(time.Time)
+	if !ok || acceptedAt.IsZero() {
+		return time.Time{}, false
+	}
+	return acceptedAt, true
+}
+
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
 // nudge that wakes each process's Listener after an event transaction commits.
 func (s *Store) Notify(ctx context.Context, channel, payload string) error {
@@ -76,6 +98,13 @@ func nextBackoff(prev, uptime time.Duration) time.Duration {
 // breaks.
 type Listener struct {
 	log *slog.Logger
+	// metrics is the only recorder accepted by StartListener. Its fixed
+	// in-process operation runs before the delivery callback.
+	metrics *NotificationMetrics
+	// These overrides exist only in package tests to inject recorder outcomes;
+	// production leaves them nil and uses the fixed metrics recorder above.
+	validNotificationRecorder   func(channel string) error
+	invalidNotificationRecorder func() error
 
 	// closeErr is the loop's final connection close error. The loop goroutine
 	// writes it before returning and stop reads it after wg.Wait, so the
@@ -96,6 +125,11 @@ type Listener struct {
 // (userID, online) for a status change; encryptedMsg receives (recipientID, qts)
 // for a secret-chat message; reactions receives (ownerID, localID, userID) for
 // a reaction change on a specific message copy; pinned receives (peerType, peerID, pinnedMsgID) for a pin/unpin in a chat or channel; pinnedMsgID is nonzero on pin, zero on unpin.
+// An optional built-in metrics recorder receives fixed-channel valid counts and
+// aggregate malformed counts inline before delivery callbacks. StartListener
+// does not accept arbitrary telemetry sinks: the recorder's operation is fixed
+// and process-local, so delivery and shutdown cannot depend on an external
+// execution bound.
 //
 // A broken connection is reconnected with bounded backoff rather than ending
 // delivery for the life of the process. Notifications emitted while the
@@ -117,6 +151,7 @@ func StartListener(
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
 	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
 	log *slog.Logger,
+	notifyMetrics ...*NotificationMetrics,
 ) (*Listener, func() error, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -126,7 +161,11 @@ func StartListener(
 		return nil, nil, err
 	}
 
-	l := &Listener{log: log}
+	var metrics *NotificationMetrics
+	if len(notifyMetrics) > 0 {
+		metrics = notifyMetrics[0]
+	}
+	l := &Listener{log: log, metrics: metrics}
 	loopCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -233,64 +272,82 @@ func (l *Listener) dispatch(
 		case ChannelUpdates:
 			userID, perr := strconv.ParseInt(n.Payload, 10, 64)
 			if perr != nil {
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_updates payload", "payload", n.Payload)
 				continue
 			}
-			deliver(ctx, userID)
+			acceptedAt := time.Now()
+			l.recordValidNotification(ChannelUpdates)
+			deliver(WithNotificationAcceptedAt(ctx, acceptedAt), userID)
 		case ChannelTyping:
 			peerID, fromID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_typing payload", "payload", n.Payload)
 				continue
 			}
+			l.recordValidNotification(ChannelTyping)
 			typing(ctx, peerID, fromID)
 		case ChannelEvict:
 			userID, authKeyID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
+				l.recordInvalidNotification()
 				// Dropped, never widened: an evict that cannot be read must not
 				// escalate into closing every connection of some user.
 				l.log.Warn("bad tg_evict payload", "payload", n.Payload)
 				continue
 			}
+			l.recordValidNotification(ChannelEvict)
 			evict(ctx, userID, authKeyID)
 		case ChannelPost:
 			channelID, perr := strconv.ParseInt(n.Payload, 10, 64)
 			if perr != nil {
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_channel_post payload", "payload", n.Payload)
 				continue
 			}
+			l.recordValidNotification(ChannelPost)
 			channelPost(ctx, channelID)
 		case ChannelEncryption:
 			userID, chatID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_encryption payload", "payload", n.Payload)
 				continue
 			}
+			l.recordValidNotification(ChannelEncryption)
 			encryption(ctx, userID, chatID)
 		case ChannelStatus:
 			userID, onlineID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_status payload", "payload", n.Payload)
 				continue
 			}
+			l.recordValidNotification(ChannelStatus)
 			status(ctx, userID, onlineID == 1)
 		case ChannelEncryptedMsg:
 			recipientID, qts64, perr := parsePairPayload(n.Payload)
 			if perr != nil {
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_encrypted_msg payload", "payload", n.Payload)
 				continue
 			}
+			l.recordValidNotification(ChannelEncryptedMsg)
 			encryptedMsg(ctx, recipientID, int(qts64))
 		case ChannelReactions:
 			opts, perr := parseReactionPayload(n.Payload)
 			if perr != nil {
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_reactions payload", "payload", n.Payload)
 				continue
 			}
+			l.recordValidNotification(ChannelReactions)
 			reactions(ctx, opts.ownerID, opts.localID, opts.userID)
 		case ChannelPinned:
 			payload := n.Payload
 			if len(payload) < 2 {
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_pinned payload", "payload", n.Payload)
 				continue
 			}
@@ -301,6 +358,7 @@ func (l *Listener) dispatch(
 			case 'h':
 				peerType = PeerTypeChannel
 			default:
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_pinned peer type", "payload", n.Payload)
 				continue
 			}
@@ -313,11 +371,13 @@ func (l *Listener) dispatch(
 				// Pin: "<peerID>|<msgID>"
 				parts := strings.SplitN(payload, "|", 2)
 				if len(parts) != 2 {
+					l.recordInvalidNotification()
 					l.log.Warn("bad tg_pinned payload", "payload", n.Payload)
 					continue
 				}
 				msgID, perr := strconv.ParseInt(parts[1], 10, 32)
 				if perr != nil {
+					l.recordInvalidNotification()
 					l.log.Warn("bad tg_pinned msgID", "payload", n.Payload)
 					continue
 				}
@@ -326,11 +386,53 @@ func (l *Listener) dispatch(
 			}
 			peerID, perr := strconv.ParseInt(payload, 10, 64)
 			if perr != nil {
+				l.recordInvalidNotification()
 				l.log.Warn("bad tg_pinned payload", "payload", n.Payload)
 				continue
 			}
+			l.recordValidNotification(ChannelPinned)
 			pinned(ctx, peerType, peerID, pinnedMsgID)
+		default:
+			l.recordInvalidNotification()
 		}
+	}
+}
+
+// recordValidNotification isolates the listener from recorder failures. A
+// recorder is telemetry only: an error or panic must not alter delivery.
+func (l *Listener) recordValidNotification(channel string) {
+	if l.metrics == nil && l.validNotificationRecorder == nil {
+		return
+	}
+	var failed bool
+	if l.validNotificationRecorder != nil {
+		failed = InvokeRecorder(func() error { return l.validNotificationRecorder(channel) })
+	} else {
+		failed = InvokeRecorder(func() error {
+			return l.metrics.RecordValidNotification(channel)
+		})
+	}
+	if failed {
+		ReportRecorderFailure(l.log, l.metrics, RecorderFailureNotification)
+	}
+}
+
+// recordInvalidNotification isolates malformed-input accounting from the
+// listener. Invalid notifications carry no channel or payload to telemetry.
+func (l *Listener) recordInvalidNotification() {
+	if l.metrics == nil && l.invalidNotificationRecorder == nil {
+		return
+	}
+	var failed bool
+	if l.invalidNotificationRecorder != nil {
+		failed = InvokeRecorder(func() error { return l.invalidNotificationRecorder() })
+	} else {
+		failed = InvokeRecorder(func() error {
+			return l.metrics.RecordInvalidNotification()
+		})
+	}
+	if failed {
+		ReportRecorderFailure(l.log, l.metrics, RecorderFailureNotification)
 	}
 }
 

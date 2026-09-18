@@ -61,11 +61,12 @@ const (
 // Server is an MTProto server: it accepts transport connections, performs key
 // exchange for new clients, and dispatches decrypted RPC requests to a Handler.
 type Server struct {
-	dcID     int
-	key      exchange.PrivateKey
-	keys     AuthKeyStore
-	handler  Handler
-	registry *SessionRegistry
+	dcID      int
+	key       exchange.PrivateKey
+	keys      AuthKeyStore
+	handler   Handler
+	rpcTracer *RPCTracer
+	registry  *SessionRegistry
 
 	cipher crypto.Cipher
 	clock  clock.Clock
@@ -85,12 +86,22 @@ type Server struct {
 	// Written once before Serve and only read after, so the accept path needs
 	// no synchronisation to see it.
 	proxyV2 *proxyV2Source
+	// webSocketOriginPatterns names the browser origins allowed to cross from
+	// their page into the WebSocket endpoint. An empty list still permits
+	// clients that carry no Origin header, but no cross-origin browser request.
+	// Written once before ServeWebSocket and only read by its handlers.
+	webSocketOriginPatterns []string
 	// negotiationLog thins the per-connection negotiation failure line, which
 	// anyone who can reach the port can provoke.
 	negotiationLog logSampler
 	// preAuth bounds what connections that have not authenticated may hold.
 	// Written once before Serve and only read after, like proxyV2.
 	preAuth *preAuthLimiter
+	// discovery bounds valid local-direct preflight requests admitted to the
+	// response path. Written once before Serve and only read after, like the
+	// other admission controls.
+	discovery    *discoveryLimiter
+	discoveryLog logSampler
 	// One sampler per pre-auth event, never one shared between them: each is
 	// provoked by whoever can reach the port, and a flood against one bound
 	// would otherwise spend the shared window and silence the others — leaving
@@ -131,6 +142,17 @@ type Server struct {
 // transitions between zero and non-zero.
 func (s *Server) OnStatusChange(fn func(ctx context.Context, userID int64, online bool)) {
 	s.onStatusChange = fn
+}
+
+// SetRPCTracer installs the optional bounded RPC tracing boundary. Call it
+// before Serve or ServeConn; a nil or disabled tracer leaves the request path
+// unchanged and starts no tracing worker. The boundary includes fallback error
+// replies written by Server.handle.
+func (s *Server) SetRPCTracer(tracer *RPCTracer) {
+	if existing, ok := s.handler.(*rpcTraceHandler); ok {
+		s.handler = existing.next
+	}
+	s.rpcTracer = tracer
 }
 
 // TrustProxyV2Headers makes the server take each client address from a PROXY
@@ -231,6 +253,7 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 		handshakeTimeout:     defaultHandshakeTimeout,
 		rpcDeadline:          DefaultRPCDeadline,
 		preAuth:              newPreAuthLimiter(DefaultPreAuthLimits()),
+		discovery:            newDiscoveryLimiter(DefaultDiscoveryLimits()),
 		unboundKeys:          newUnboundKeyLimiter(DefaultMaxConnsPerUnboundKey),
 		pendingLogins:        newPendingLoginLimiter(DefaultMaxPendingLoginConns),
 		pendingLoginLifetime: DefaultPendingLoginLifetime,
@@ -379,7 +402,8 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 		}
 	})
 
-	addr, err := s.clientAddr(sock)
+	handshakeDeadline := time.Now().Add(s.handshakeTimeout)
+	addr, err := s.clientAddrUntil(sock, handshakeDeadline)
 	if err != nil {
 		s.logNegotiation(err)
 		return
@@ -396,7 +420,31 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 		}
 		return
 	}
-	conn, err := s.detectCodec(sock)
+	probe, err := probePreflight(sock, handshakeDeadline)
+	if err != nil {
+		s.dropRefused(sock)
+		s.logNegotiation(errors.Join(errors.New("detect discovery preflight"), err))
+		return
+	}
+	if probe.matched {
+		if !s.discovery.allow(addr, time.Now()) {
+			s.dropRefused(sock)
+			if dropped, ok := s.discoveryLog.allow(time.Now(), preAuthLogInterval); ok {
+				s.log.Info("discovery request refused at rate limit",
+					"client_addr", addr, "suppressed", dropped)
+			}
+			return
+		}
+		if err := s.servePreflight(ctx, sock, probe.nonce, handshakeDeadline); err != nil && !isDisconnect(err) {
+			s.logNegotiation(errors.Join(errors.New("serve discovery preflight"), err))
+		}
+		return
+	}
+	if probe.malformed {
+		s.dropRefused(sock)
+		return
+	}
+	conn, err := s.detectCodec(probe.stream)
 	if err != nil {
 		s.logNegotiation(err)
 		return

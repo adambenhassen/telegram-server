@@ -2,9 +2,14 @@ package api_test
 
 import (
 	"context"
+	"log/slog"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -20,9 +25,26 @@ func downloadFixture(t *testing.T, phoneA, phoneB string) (
 	*store.Store, blob.Store, store.User, store.User, *tg.Document,
 ) {
 	t.Helper()
-	ctx := context.Background()
 	s := openStore(t)
 	blobs := newBlobs(t)
+	return downloadFixtureOn(t, s, blobs, phoneA, phoneB)
+}
+
+func downloadFixtureWithDSN(t *testing.T, phoneA, phoneB string) (
+	*store.Store, string, blob.Store, store.User, store.User, *tg.Document,
+) {
+	t.Helper()
+	s, dsn := openStoreDSN(t)
+	blobs := newBlobs(t)
+	_, _, a, b, doc := downloadFixtureOn(t, s, blobs, phoneA, phoneB)
+	return s, dsn, blobs, a, b, doc
+}
+
+func downloadFixtureOn(t *testing.T, s *store.Store, blobs blob.Store, phoneA, phoneB string) (
+	*store.Store, blob.Store, store.User, store.User, *tg.Document,
+) {
+	t.Helper()
+	ctx := context.Background()
 	a, err := s.CreateUser(ctx, phoneA)
 	if err != nil {
 		t.Fatalf("user a: %v", err)
@@ -63,6 +85,295 @@ func getBytes(t *testing.T, s *store.Store, blobs blob.Store, userID int64, doc 
 		t.Errorf("Type = %T, want *tg.StorageFileUnknown", f.Type)
 	}
 	return f.Bytes
+}
+
+type countingDownloadBlobStore struct {
+	blob.Store
+
+	reads atomic.Int64
+}
+
+func (b *countingDownloadBlobStore) ReadAt(ctx context.Context, key string, offset, limit int64) ([]byte, error) {
+	b.reads.Add(1)
+	return b.Store.ReadAt(ctx, key, offset, limit)
+}
+
+func assertFixedRateLimitLog(t *testing.T, h *captureHandler, message, sentinel string) {
+	t.Helper()
+	if len(h.records) != 1 {
+		t.Fatalf("captured %d records, want one fixed rate-limit record", len(h.records))
+	}
+	record := h.records[0]
+	if record.Message != message {
+		t.Errorf("message = %q, want %q", record.Message, message)
+	}
+	if record.NumAttrs() != 0 {
+		t.Errorf("record has %d attrs, want no dynamic attrs", record.NumAttrs())
+	}
+	if strings.Contains(record.Message, sentinel) {
+		t.Errorf("record message contains sentinel %q", sentinel)
+	}
+}
+
+func TestGetFileRateLimitReserveErrorDoesNotLogDynamicDetails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn, blobs, a, _, doc := downloadFixtureWithDSN(t, "+15551297081", "+15551297082")
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	const sentinel = "get_file_reserve_error_sentinel"
+	if _, err := conn.Exec(ctx, `
+		ALTER TABLE rate_limits
+		ADD CONSTRAINT get_file_reserve_error_sentinel CHECK (token_count < 0)
+	`); err != nil {
+		t.Fatalf("install reserve failure: %v", err)
+	}
+
+	logs := &captureHandler{}
+	getFile := api.GetFileSeqForTestWithLimitsAndLogger(
+		s, blobs, slog.New(logs),
+		store.RateLimitConfig{Limit: 1, Window: time.Second},
+		store.RateLimitConfig{},
+	)
+	_, err = getFile(a.ID, &tg.UploadGetFileRequest{
+		Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+		Limit:    64,
+	})
+	if msg := rpcMessage(t, err); msg != "INTERNAL" {
+		t.Fatalf("reserve failure = %s, want INTERNAL", msg)
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("returned error contains sentinel %q: %v", sentinel, err)
+	}
+	assertFixedRateLimitLog(t, logs, "get file rate limit", sentinel)
+}
+
+func TestGetFileRateLimitRefundErrorDoesNotLogDynamicDetails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn, blobs, a, _, doc := downloadFixtureWithDSN(t, "+15551297091", "+15551297092")
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	logs := &captureHandler{}
+	getFile := api.GetFileSeqForTestWithLimitsAndLogger(
+		s, blobs, slog.New(logs),
+		store.RateLimitConfig{Limit: 2, Window: time.Second},
+		store.RateLimitConfig{Limit: 1, Window: time.Second},
+	)
+	request := func() error {
+		_, err := getFile(a.ID, &tg.UploadGetFileRequest{
+			Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+			Limit:    64,
+		})
+		return err
+	}
+	if err := request(); err != nil {
+		t.Fatalf("first getFile: %v", err)
+	}
+
+	if _, err := conn.Exec(ctx,
+		`DELETE FROM rate_limits WHERE subject_id = $1 AND surface = 'upload_get_file'`,
+		a.ID,
+	); err != nil {
+		t.Fatalf("clear account rate limit: %v", err)
+	}
+
+	const sentinel = "get_file_refund_error_sentinel"
+	if _, err := conn.Exec(ctx, `
+		ALTER TABLE rate_limits
+		ADD CONSTRAINT get_file_refund_error_sentinel CHECK (token_count > 0) NOT VALID
+	`); err != nil {
+		t.Fatalf("install refund failure: %v", err)
+	}
+	err = request()
+	if msg := rpcMessage(t, err); msg != "INTERNAL" {
+		t.Fatalf("refund failure = %s, want INTERNAL", msg)
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("returned error contains sentinel %q: %v", sentinel, err)
+	}
+	assertFixedRateLimitLog(t, logs, "get file rate limit refund", sentinel)
+}
+
+func TestGetFilePerAccountRateLimitAndReset(t *testing.T) {
+	t.Parallel()
+	s, dsn, blobs, a, _, doc := downloadFixtureWithDSN(t, "+15551297051", "+15551297052")
+	getFile := api.GetFileSeqForTestWithLimits(
+		s, blobs,
+		store.RateLimitConfig{Limit: 2, Window: time.Second},
+		store.RateLimitConfig{},
+	)
+	request := func() error {
+		_, err := getFile(a.ID, &tg.UploadGetFileRequest{
+			Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+			Limit:    64,
+		})
+		return err
+	}
+
+	for range 2 {
+		if err := request(); err != nil {
+			t.Fatalf("allowed getFile: %v", err)
+		}
+	}
+	if msg := rpcMessage(t, request()); msg != "FLOOD_WAIT_1" {
+		t.Fatalf("over-limit getFile = %s, want FLOOD_WAIT_1", msg)
+	}
+	if err := api.AgeRateLimitWindowForTest(dsn, a.ID, "upload_get_file", time.Second+time.Millisecond); err != nil {
+		t.Fatalf("age getFile window: %v", err)
+	}
+	if err := request(); err != nil {
+		t.Fatalf("getFile after reset: %v", err)
+	}
+}
+
+func TestGetFileReplicaRateLimitIsSharedAcrossAccounts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	blobs := &countingDownloadBlobStore{Store: newBlobs(t)}
+	users := make([]store.User, 4)
+	for i := range users {
+		u, err := s.CreateUser(ctx, "+1555129706"+string(rune('0'+i)))
+		if err != nil {
+			t.Fatalf("user %d: %v", i, err)
+		}
+		users[i] = u
+	}
+	file, err := s.AllocateFile(ctx, users[0].ID, 7, "text/plain", "shared.txt", api.TestMaxUserStorageBytes)
+	if err != nil {
+		t.Fatalf("allocate file: %v", err)
+	}
+	if err := s.MarkFileStored(ctx, file.ID); err != nil {
+		t.Fatalf("mark file stored: %v", err)
+	}
+	if _, err := blobs.Put(ctx, blob.Key(file.ID), strings.NewReader("payload")); err != nil {
+		t.Fatalf("put blob: %v", err)
+	}
+	for i := 1; i < len(users); i++ {
+		if _, _, _, _, err := s.SendMessage(ctx, users[0].ID, users[i].ID, "shared", int64(i), file.ID, 0); err != nil {
+			t.Fatalf("entitle user %d: %v", i, err)
+		}
+	}
+	getFile := api.GetFileSeqForTestWithLimits(
+		s, blobs,
+		store.RateLimitConfig{},
+		store.RateLimitConfig{Limit: 3, Window: time.Second},
+	)
+	request := func(userID int64) error {
+		_, err := getFile(userID, &tg.UploadGetFileRequest{
+			Location: &tg.InputDocumentFileLocation{ID: file.ID, AccessHash: file.AccessHash},
+			Limit:    64,
+		})
+		return err
+	}
+
+	for i := range 3 {
+		if err := request(users[i].ID); err != nil {
+			t.Fatalf("account %d getFile: %v", i, err)
+		}
+	}
+	if got := blobs.reads.Load(); got != 3 {
+		t.Fatalf("blob reads before denial = %d, want 3", got)
+	}
+	if msg := rpcMessage(t, request(users[3].ID)); msg != "FLOOD_WAIT_1" {
+		t.Fatalf("replica over-limit getFile = %s, want FLOOD_WAIT_1", msg)
+	}
+	if got := blobs.reads.Load(); got != 3 {
+		t.Fatalf("blob reads after denial = %d, want 3", got)
+	}
+
+	stranger, err := s.CreateUser(ctx, "+15551297069")
+	if err != nil {
+		t.Fatalf("stranger: %v", err)
+	}
+	if msg := rpcMessage(t, request(stranger.ID)); msg != "LOCATION_INVALID" {
+		t.Fatalf("unauthorized getFile while limited = %s, want LOCATION_INVALID", msg)
+	}
+	if got := blobs.reads.Load(); got != 3 {
+		t.Fatalf("blob reads after unauthorized request = %d, want 3", got)
+	}
+}
+
+func TestGetFileReplicaDenialRefundsAccountBudget(t *testing.T) {
+	t.Parallel()
+	s, blobs, account, _, doc := downloadFixture(t, "+15551297081", "+15551297082")
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	getFile := api.GetFileSeqForTestWithLimitsAndNow(
+		s, blobs,
+		store.RateLimitConfig{Limit: 2, Window: time.Minute},
+		store.RateLimitConfig{Limit: 1, Window: time.Second},
+		func() time.Time { return now },
+	)
+	request := func() error {
+		_, err := getFile(account.ID, &tg.UploadGetFileRequest{
+			Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+			Limit:    64,
+		})
+		return err
+	}
+
+	if err := request(); err != nil {
+		t.Fatalf("first getFile: %v", err)
+	}
+	if msg := rpcMessage(t, request()); msg != "FLOOD_WAIT_1" {
+		t.Fatalf("aggregate denial = %s, want FLOOD_WAIT_1", msg)
+	}
+	now = now.Add(time.Second)
+	if err := request(); err != nil {
+		t.Fatalf("getFile after aggregate window reset: %v", err)
+	}
+}
+
+func TestGetFileRateLimitsCanBeDisabledIndependently(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		perAccount store.RateLimitConfig
+		perReplica store.RateLimitConfig
+		phoneA     string
+		phoneB     string
+	}{
+		"per-account disabled": {
+			perAccount: store.RateLimitConfig{},
+			perReplica: store.RateLimitConfig{Limit: 2, Window: time.Second},
+			phoneA:     "+15551297061",
+			phoneB:     "+15551297062",
+		},
+		"replica disabled": {
+			perAccount: store.RateLimitConfig{Limit: 2, Window: time.Second},
+			perReplica: store.RateLimitConfig{},
+			phoneA:     "+15551297071",
+			phoneB:     "+15551297072",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, blobs, a, _, doc := downloadFixture(t, tc.phoneA, tc.phoneB)
+			getFile := api.GetFileSeqForTestWithLimits(s, blobs, tc.perAccount, tc.perReplica)
+			request := func() error {
+				_, err := getFile(a.ID, &tg.UploadGetFileRequest{
+					Location: &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash},
+					Limit:    64,
+				})
+				return err
+			}
+			for range 2 {
+				if err := request(); err != nil {
+					t.Fatalf("allowed getFile: %v", err)
+				}
+			}
+			if msg := rpcMessage(t, request()); msg != "FLOOD_WAIT_1" {
+				t.Fatalf("over-limit getFile = %s, want FLOOD_WAIT_1", msg)
+			}
+		})
+	}
 }
 
 func TestGetFileRanges(t *testing.T) {

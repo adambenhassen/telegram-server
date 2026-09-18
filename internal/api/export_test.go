@@ -83,6 +83,13 @@ func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code stri
 	h.logIssuedCode(phone, code)
 }
 
+// RecordRateLimitDenialForTest drives the request telemetry wrapper for the
+// external api_test package, including its panic isolation boundary.
+func RecordRateLimitDenialForTest(metrics *store.NotificationMetrics, surface string) {
+	h := &handlers{rateLimitMetrics: metrics}
+	h.recordRateLimitDenial(surface)
+}
+
 // UnhandledForTest drives the dispatcher's fallback for the external api_test
 // package, over a body positioned at its constructor id. It returns the error
 // the caller would receive and writes the record the RPC-gap capture reads.
@@ -138,6 +145,7 @@ func testHandlers(s *store.Store) *handlers {
 		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
 		maxFileBytes:             TestMaxFileBytes,
 		downloads:                map[int64]bool{},
+		getFileReplicaLimiter:    newDownloadRateLimiter(store.RateLimitConfig{}),
 		now:                      time.Now,
 		peers:                    pgtest.PeerDeriver(),
 		rateLimitMessageSend:     store.RateLimitConfig{},
@@ -154,14 +162,67 @@ func testHandlers(s *store.Store) *handlers {
 // MaxDownloadChunk exposes the per-reply download cap to the api_test package.
 const MaxDownloadChunk = maxDownloadChunk
 
+// NewDownloadRateLimiterForTest returns the process-local download admission
+// function for tests that need a controllable clock.
+func NewDownloadRateLimiterForTest(cfg store.RateLimitConfig) func(time.Time) (time.Duration, bool) {
+	return newDownloadRateLimiter(cfg).allow
+}
+
 // GetFileSeqForTest returns a getFile bound to ONE handlers value, so
 // successive calls share the in-flight download slot. GetFileForTest builds a
 // fresh handler per call and therefore cannot observe a leaked slot.
 func GetFileSeqForTest(
 	s *store.Store, blobs blob.Store,
 ) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimits(s, blobs, store.RateLimitConfig{}, store.RateLimitConfig{})
+}
+
+// GetFileSeqForTestWithLimits returns a getFile bound to one handlers value,
+// with custom per-account and process-local limits. Keeping one handler is
+// important for tests that exercise the replica-wide counter.
+func GetFileSeqForTestWithLimits(
+	s *store.Store, blobs blob.Store,
+	perAccount, perReplica store.RateLimitConfig,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimitsAndLoggerAt(
+		s, blobs, slog.New(slog.DiscardHandler), time.Now, perAccount, perReplica,
+	)
+}
+
+// GetFileSeqForTestWithLimitsAndLogger returns a getFile bound to one handlers
+// value with custom limits and logger. It is for error-path log assertions.
+func GetFileSeqForTestWithLimitsAndLogger(
+	s *store.Store, blobs blob.Store, log *slog.Logger,
+	perAccount, perReplica store.RateLimitConfig,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimitsAndLoggerAt(
+		s, blobs, log, time.Now, perAccount, perReplica,
+	)
+}
+
+// GetFileSeqForTestWithLimitsAndNow returns a getFile bound to one handlers
+// value with custom limits and clock. It is for fixed-window boundary tests.
+func GetFileSeqForTestWithLimitsAndNow(
+	s *store.Store, blobs blob.Store,
+	perAccount, perReplica store.RateLimitConfig, now func() time.Time,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
+	return GetFileSeqForTestWithLimitsAndLoggerAt(
+		s, blobs, slog.New(slog.DiscardHandler), now, perAccount, perReplica,
+	)
+}
+
+// GetFileSeqForTestWithLimitsAndLoggerAt returns a getFile bound to one
+// handlers value with custom limits, logger, and clock.
+func GetFileSeqForTestWithLimitsAndLoggerAt(
+	s *store.Store, blobs blob.Store, log *slog.Logger, now func() time.Time,
+	perAccount, perReplica store.RateLimitConfig,
+) func(int64, *tg.UploadGetFileRequest) (bin.Encoder, error) {
 	h := testHandlers(s)
 	h.blobs = blobs
+	h.log = log
+	h.now = now
+	h.rateLimitGetFile = perAccount
+	h.getFileReplicaLimiter = newDownloadRateLimiter(perReplica)
 	return func(userID int64, req *tg.UploadGetFileRequest) (bin.Encoder, error) {
 		var buf bin.Buffer
 		if err := req.Encode(&buf); err != nil {
@@ -449,6 +510,16 @@ func GetDialogsPageForTest(s *store.Store, userID int64, req *tg.MessagesGetDial
 	return testHandlers(s).handleGetDialogs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// GetPeerDialogsForTest encodes req and invokes handleGetPeerDialogs for the
+// caller.
+func GetPeerDialogsForTest(s *store.Store, userID int64, req *tg.MessagesGetPeerDialogsRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetPeerDialogs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // ReadHistoryForTest encodes req and invokes handleReadHistory for the caller.
 func ReadHistoryForTest(s *store.Store, userID int64, req *tg.MessagesReadHistoryRequest) (bin.Encoder, error) {
 	var buf bin.Buffer
@@ -509,6 +580,20 @@ func SendMessageForTestWithLimits(s *store.Store, userID int64, rateLimit store.
 		return nil, err
 	}
 	h := testHandlers(s)
+	h.rateLimitMessageSend = rateLimit
+	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// SendMessageForTestWithLimitsAndMetrics invokes handleSendMessage with a
+// shared rate-limit recorder, so external tests can assert the telemetry after
+// admitted and denied RPCs.
+func SendMessageForTestWithLimitsAndMetrics(s *store.Store, metrics *store.NotificationMetrics, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMetrics = metrics
 	h.rateLimitMessageSend = rateLimit
 	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
@@ -734,6 +819,27 @@ func UpdateUsernameForTest(s *store.Store, userID int64, username string) (bin.E
 	return testHandlers(s).handleUpdateUsername(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// UpdateProfileForTest invokes handleUpdateProfile for userID.
+func UpdateProfileForTest(s *store.Store, userID int64, req *tg.AccountUpdateProfileRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleUpdateProfile(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// UpdateProfileForTestWithLimits invokes handleUpdateProfile against a custom
+// per-account updateProfile rate limit.
+func UpdateProfileForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.AccountUpdateProfileRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitUpdateProfile = rateLimit
+	return h.handleUpdateProfile(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // ClaimChannelUsernameForTest claims a username for a channel atomically
 // (both usernames table and channels.username column), so api_test can exercise
 // the username resolution path without the RPC that claims channel usernames
@@ -923,6 +1029,35 @@ func CheckPasswordForTestWithLimits(s *store.Store, authKeyID [8]byte, addr neti
 	h.rateLimitCheckPassword = perAccount
 	h.rateLimitCheckPasswordIP = perIP
 	return h.handleCheckPassword(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+}
+
+// CheckPasswordForTestWithLimitsAndMetrics invokes handleCheckPassword with a
+// shared rate-limit recorder, so external tests can assert the telemetry at
+// the RPC outcome boundary.
+func CheckPasswordForTestWithLimitsAndMetrics(s *store.Store, metrics *store.NotificationMetrics, authKeyID [8]byte, addr netip.Addr, perAccount, perIP store.RateLimitConfig, req *tg.AuthCheckPasswordRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMetrics = metrics
+	h.rateLimitCheckPassword = perAccount
+	h.rateLimitCheckPasswordIP = perIP
+	return h.handleCheckPassword(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
+}
+
+// UpdateProfileForTestWithLimitsAndMetricsContext invokes handleUpdateProfile
+// with a shared rate-limit recorder and caller-supplied context, so external
+// tests can exercise the storage-failure path at the real handler boundary.
+func UpdateProfileForTestWithLimitsAndMetricsContext(ctx context.Context, s *store.Store, metrics *store.NotificationMetrics, userID int64, rateLimit store.RateLimitConfig, req *tg.AccountUpdateProfileRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitMetrics = metrics
+	h.rateLimitUpdateProfile = rateLimit
+	return h.handleUpdateProfile(&mtproto.Request{Ctx: ctx, UserID: userID, Buf: &buf})
 }
 
 // UpdatePasswordSettingsForTest invokes handleUpdatePasswordSettings with a

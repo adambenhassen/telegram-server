@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
 	"sync"
 
 	"github.com/gotd/td/bin"
@@ -38,6 +39,12 @@ type Request struct {
 	Buf *bin.Buffer
 	// Ctx is the request context.
 	Ctx context.Context
+
+	// rpcMethod and rpcResult are set by the dispatcher and reply path for the
+	// optional RPC tracing boundary. They stay inside this package so request
+	// data can never become trace data by accident.
+	rpcMethod string
+	rpcResult RPCResultClass
 }
 
 // Handler processes decrypted MTProto requests.
@@ -59,6 +66,7 @@ func (h HandlerFunc) OnMessage(c *Conn, req *Request) error {
 type Dispatcher struct {
 	mux      sync.Mutex
 	reqs     map[uint32]Handler
+	methods  map[uint32]string
 	fallback Handler
 }
 
@@ -66,13 +74,27 @@ var _ Handler = (*Dispatcher)(nil)
 
 // NewDispatcher creates an empty Dispatcher.
 func NewDispatcher() *Dispatcher {
-	return &Dispatcher{reqs: map[uint32]Handler{}}
+	return &Dispatcher{
+		reqs:    map[uint32]Handler{},
+		methods: map[uint32]string{},
+	}
 }
 
 // Handle registers a handler for the given TL constructor ID.
 func (d *Dispatcher) Handle(id uint32, h Handler) *Dispatcher {
+	return d.HandleNamed(id, compiledMethodName(id), h)
+}
+
+// HandleNamed registers h with the fixed method name used by RPC tracing.
+// The name is supplied by compiled server code, never by a request.
+func (d *Dispatcher) HandleNamed(id uint32, name string, h Handler) *Dispatcher {
 	d.mux.Lock()
 	d.reqs[id] = h
+	if canonical := sanitizeRPCMethod(name); canonical != UnknownRPCMethod {
+		d.methods[id] = canonical
+	} else {
+		delete(d.methods, id)
+	}
 	d.mux.Unlock()
 	return d
 }
@@ -80,6 +102,13 @@ func (d *Dispatcher) Handle(id uint32, h Handler) *Dispatcher {
 // HandleFunc registers a handler function for the given TL constructor ID.
 func (d *Dispatcher) HandleFunc(id uint32, fn func(c *Conn, req *Request) error) *Dispatcher {
 	return d.Handle(id, HandlerFunc(fn))
+}
+
+// HandleFuncNamed registers fn with the fixed method name used by RPC
+// tracing. It is for handlers whose constructor is not present in the gotd
+// generated registry.
+func (d *Dispatcher) HandleFuncNamed(id uint32, name string, fn func(c *Conn, req *Request) error) *Dispatcher {
+	return d.HandleNamed(id, name, HandlerFunc(fn))
 }
 
 // Fallback sets the handler invoked for unregistered constructor IDs.
@@ -100,8 +129,13 @@ func (d *Dispatcher) OnMessage(c *Conn, req *Request) error {
 
 	d.mux.Lock()
 	h, ok := d.reqs[id]
+	method := d.methods[id]
 	fallback := d.fallback
 	d.mux.Unlock()
+	if method == "" {
+		method = unknownRPCMethod
+	}
+	req.rpcMethod = method
 
 	if ok {
 		return h.OnMessage(c, req)
@@ -111,6 +145,40 @@ func (d *Dispatcher) OnMessage(c *Conn, req *Request) error {
 	}
 	return fmt.Errorf("unexpected type %#x", id)
 }
+
+// compiledMethodName resolves an id through gotd's generated type registry.
+// The dispatcher records only ids explicitly registered by this process, so a
+// valid method in the schema that this server does not handle still collapses
+// to unknown at the tracing boundary.
+func compiledMethodName(id uint32) string {
+	name, ok := compiledMethodNames[id]
+	if !ok {
+		return ""
+	}
+	return name
+}
+
+var compiledMethodNames = func() map[uint32]string {
+	methods := make(map[uint32]string)
+	for id, name := range tg.TypesMap() {
+		method, _, ok := strings.Cut(name, "#")
+		if ok && strings.Contains(method, ".") {
+			methods[id] = method
+		}
+	}
+	return methods
+}()
+
+var compiledMethodVocabulary = func() map[string]struct{} {
+	methods := make(map[string]struct{}, len(compiledMethodNames)+1)
+	for _, name := range compiledMethodNames {
+		methods[name] = struct{}{}
+	}
+	// gotd v0.161.0 does not generate this request, but the application
+	// handler is compiled for it and supplies its fixed name at registration.
+	methods["messages.revokeExportedChatInvite"] = struct{}{}
+	return methods
+}()
 
 // UnpackInvoke peels invokeWithLayer, initConnection and invokeWithoutUpdates
 // wrappers off the request buffer before delegating to next, leaving the buffer

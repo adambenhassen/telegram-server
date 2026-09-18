@@ -83,6 +83,15 @@ WHERE id = sqlc.arg(viewer_id)::bigint
 -- name: SetUserStatus :execrows
 UPDATE users SET is_online = $2, last_seen_at = now() WHERE id = $1;
 
+-- name: UpdateUserProfile :execrows
+-- A nil first_name or last_name leaves that column unchanged. An empty string
+-- is a real write: signup accepts an empty display name, so the update path
+-- must too.
+UPDATE users
+SET first_name = COALESCE(sqlc.narg('first_name'), first_name),
+    last_name = COALESCE(sqlc.narg('last_name'), last_name)
+WHERE id = sqlc.arg('id');
+
 -- name: SetUsername :execrows
 UPDATE users SET username = $2 WHERE id = $1;
 

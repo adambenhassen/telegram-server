@@ -73,6 +73,12 @@ type handlers struct {
 	// rateLimitSaveFilePart limits upload.saveFilePart and upload.saveBigFilePart
 	// to one shared budget per account: both write the same parts table.
 	rateLimitSaveFilePart store.RateLimitConfig
+	// rateLimitGetFile limits upload.getFile per account through the shared
+	// Postgres-backed rate limiter.
+	rateLimitGetFile store.RateLimitConfig
+	// getFileReplicaLimiter limits upload.getFile across this process. Its state
+	// is intentionally not shared with another replica.
+	getFileReplicaLimiter *downloadRateLimiter
 	// rateLimitSendCodeIP limits auth.sendCode per client network. It is the
 	// one limit here that is not keyed on an account: sendCode is
 	// unauthenticated, so the connection's address is the only subject there is.
@@ -99,8 +105,17 @@ type handlers struct {
 	// authorized callers (r.UserID != 0 && hasPw). Provisional accounts are
 	// not subject to this limit.
 	rateLimitGetPassword store.RateLimitConfig
+	// rateLimitUpdateProfile limits account.updateProfile per account.
+	rateLimitUpdateProfile store.RateLimitConfig
 	// registrationMode controls whether auth.signUp is available.
 	registrationMode config.RegistrationMode
+	// rateLimitMetrics records only client-visible fixed-surface FLOOD_WAITs.
+	// It is process-local and optional so tests and embedders without admin
+	// telemetry retain the same enforcement behaviour.
+	rateLimitMetrics *store.NotificationMetrics
+	// rateLimitRecorder is a test-only failure injection seam. Production uses
+	// the fixed recorder method through rateLimitMetrics.
+	rateLimitRecorder func(surface string) error
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -150,9 +165,13 @@ func selfRevocation(r *mtproto.Request, keyID int64) bool {
 // peers derives the per-viewer peer access hashes. It is required, and a nil one
 // is a programming error rather than a runtime condition, so it stops the server
 // at startup instead of surfacing as a nil dereference on the first peer emitted.
-func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver, rateLimits config.RateLimitsConfig, registrationMode config.RegistrationMode) mtproto.Handler {
+func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver, rateLimits config.RateLimitsConfig, registrationMode config.RegistrationMode, rateLimitMetrics ...*store.NotificationMetrics) mtproto.Handler {
 	if peers == nil {
 		panic("api: nil peer hash deriver")
+	}
+	var denialMetrics *store.NotificationMetrics
+	if len(rateLimitMetrics) > 0 {
+		denialMetrics = rateLimitMetrics[0]
 	}
 	h := &handlers{
 		peers:                    peers,
@@ -175,6 +194,8 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitSearchContacts:  rateLimits.SearchContacts,
 		rateLimitSearchGlobal:    rateLimits.SearchGlobal,
 		rateLimitSaveFilePart:    rateLimits.SaveFilePart,
+		rateLimitGetFile:         rateLimits.GetFile,
+		getFileReplicaLimiter:    newDownloadRateLimiter(rateLimits.GetFileReplica),
 		rateLimitSendCodeIP:      rateLimits.SendCodeIP,
 		rateLimitSignInFailIP:    rateLimits.SignInFailIP,
 		rateLimitCheckPassword:   rateLimits.CheckPassword,
@@ -183,10 +204,13 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitSignUpIP:        rateLimits.SignUpIP,
 		rateLimitPasswordProof:   rateLimits.PasswordProof,
 		rateLimitGetPassword:     rateLimits.GetPassword,
+		rateLimitUpdateProfile:   rateLimits.UpdateProfile,
 		registrationMode:         registrationMode,
+		rateLimitMetrics:         denialMetrics,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
+	register(d, tg.HelpGetAppConfigRequestTypeID, h.handleGetAppConfig)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	registerWithConn(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
 	register(d, tg.AuthSignUpRequestTypeID, h.handleSignUp)
@@ -194,9 +218,13 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.UsersGetUsersRequestTypeID, h.handleGetUsers)
 	register(d, tg.AccountGetAuthorizationsRequestTypeID, h.handleGetAuthorizations)
 	registerRevoke(d, tg.AccountResetAuthorizationRequestTypeID, h.handleResetAuthorization)
+	register(d, tg.AccountGetContentSettingsRequestTypeID, h.handleGetContentSettings)
+	register(d, tg.AccountGetGlobalPrivacySettingsRequestTypeID, h.handleGetGlobalPrivacySettings)
+	register(d, tg.AccountGetThemesRequestTypeID, h.handleGetThemes)
 	register(d, tg.AccountGetPasswordRequestTypeID, h.handleGetPassword)
 	register(d, tg.AccountUpdateStatusRequestTypeID, h.handleUpdateStatus)
 	register(d, tg.AccountUpdateUsernameRequestTypeID, h.handleUpdateUsername)
+	register(d, tg.AccountUpdateProfileRequestTypeID, h.handleUpdateProfile)
 	register(d, tg.AuthCheckPasswordRequestTypeID, h.handleCheckPassword)
 	register(d, tg.AccountUpdatePasswordSettingsRequestTypeID, h.handleUpdatePasswordSettings)
 	register(d, tg.AccountGetPasswordSettingsRequestTypeID, h.handleGetPasswordSettings)
@@ -205,6 +233,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.UpdatesGetChannelDifferenceRequestTypeID, h.handleGetChannelDifference)
 	register(d, tg.MessagesSendMessageRequestTypeID, h.handleSendMessage)
 	register(d, tg.MessagesGetDialogsRequestTypeID, h.handleGetDialogs)
+	register(d, tg.MessagesGetPeerDialogsRequestTypeID, h.handleGetPeerDialogs)
 	register(d, tg.MessagesGetHistoryRequestTypeID, h.handleGetHistory)
 	register(d, tg.MessagesReadHistoryRequestTypeID, h.handleReadHistory)
 	register(d, tg.MessagesEditMessageRequestTypeID, h.handleEditMessage)
@@ -212,6 +241,11 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesSetTypingRequestTypeID, h.handleSetTyping)
 	register(d, tg.MessagesSendReactionRequestTypeID, h.handleSendReaction)
 	register(d, tg.MessagesGetMessagesReactionsRequestTypeID, h.handleGetMessagesReactions)
+	register(d, tg.MessagesGetSavedReactionTagsRequestTypeID, h.handleGetSavedReactionTags)
+	register(d, tg.MessagesGetAttachMenuBotsRequestTypeID, h.handleGetAttachMenuBots)
+	register(d, tg.MessagesGetStickerSetRequestTypeID, h.handleGetStickerSet)
+	register(d, tg.MessagesGetAllDraftsRequestTypeID, h.handleGetAllDrafts)
+	register(d, tg.MessagesReceivedMessagesRequestTypeID, h.handleReceivedMessages)
 	register(d, tg.MessagesForwardMessagesRequestTypeID, h.handleForwardMessages)
 	register(d, tg.MessagesUpdatePinnedMessageRequestTypeID, h.handleUpdatePinnedMessage)
 	register(d, tg.MessagesCreateChatRequestTypeID, h.handleCreateChat)
@@ -222,7 +256,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesExportChatInviteRequestTypeID, h.handleExportChatInvite)
 	register(d, tg.MessagesCheckChatInviteRequestTypeID, h.handleCheckChatInvite)
 	register(d, tg.MessagesImportChatInviteRequestTypeID, h.handleImportChatInvite)
-	register(d, revokeExportedChatInviteTypeID, h.handleRevokeExportedChatInvite)
+	registerNamed(d, revokeExportedChatInviteTypeID, "messages.revokeExportedChatInvite", h.handleRevokeExportedChatInvite)
 	register(d, tg.MessagesSendMediaRequestTypeID, h.handleSendMedia)
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
 	register(d, tg.ChannelsGetChannelsRequestTypeID, h.handleGetChannels)
@@ -248,6 +282,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesReceivedQueueRequestTypeID, h.handleReceivedQueue)
 	register(d, tg.MessagesSearchRequestTypeID, h.handleSearch)
 	register(d, tg.MessagesSearchGlobalRequestTypeID, h.handleSearchGlobal)
+	register(d, tg.CommunitiesGetJoinedCommunitiesRequestTypeID, h.handleGetJoinedCommunities)
 	d.Fallback(mtproto.HandlerFunc(h.handleUnknownGated))
 	return mtproto.UnpackInvoke(d)
 }
@@ -267,6 +302,7 @@ func (h *handlers) checkRateLimitCost(r *mtproto.Request, surface string, cfg st
 		return errInternal
 	}
 	if result != nil {
+		h.recordRateLimitDenial(surface)
 		return FloodWaitError(int(result.Wait / time.Second))
 	}
 	return nil
@@ -282,6 +318,7 @@ func (h *handlers) checkAndChargeRateLimitIP(r *mtproto.Request, surface string,
 	}
 	key, ok := store.IPBucketKey(r.ClientAddr)
 	if !ok {
+		h.recordRateLimitDenial(surface)
 		return FloodWaitError(int(cfg.Window / time.Second))
 	}
 	subjectID, err := keyToSubjectID(key)
@@ -295,6 +332,7 @@ func (h *handlers) checkAndChargeRateLimitIP(r *mtproto.Request, surface string,
 		return errInternal
 	}
 	if result != nil {
+		h.recordRateLimitDenial(surface)
 		return FloodWaitError(int(result.Wait / time.Second))
 	}
 	return nil
@@ -309,6 +347,7 @@ func (h *handlers) reserveRateLimitIP(r *mtproto.Request, surface string, cfg st
 	}
 	key, ok := store.IPBucketKey(r.ClientAddr)
 	if !ok {
+		h.recordRateLimitDenial(surface)
 		return nil, nil, FloodWaitError(int(cfg.Window / time.Second))
 	}
 	subjectID, err := keyToSubjectID(key)
@@ -337,11 +376,32 @@ func (h *handlers) refundRateLimitIP(r *mtproto.Request, surface string, res *st
 	return h.store.RefundRateLimit(r.Ctx, subjectID, surface, res)
 }
 
+// recordRateLimitDenial keeps telemetry observational: a broken recorder must
+// never change the rate-limit decision or the RPC response.
+func (h *handlers) recordRateLimitDenial(surface string) {
+	if h.rateLimitMetrics == nil && h.rateLimitRecorder == nil {
+		return
+	}
+	var failed bool
+	if h.rateLimitRecorder != nil {
+		failed = store.InvokeRecorder(func() error { return h.rateLimitRecorder(surface) })
+	} else {
+		failed = store.InvokeRecorder(func() error {
+			return h.rateLimitMetrics.RecordRateLimitDenialResult(surface)
+		})
+	}
+	if failed {
+		store.ReportRecorderFailure(h.log, h.rateLimitMetrics, store.RecorderFailureRateLimitDenial)
+	}
+}
+
 // provisionalAllowList holds the method IDs that a provisional session may call.
-// A provisional session is a username-mode account with no verifier: it can set
-// its password, check password state, or log out — but nothing else.
+// A provisional session is a username-mode account with no verifier: it can
+// read server configuration, set its password, check password state, or log
+// out — but nothing else.
 var provisionalAllowList = map[uint32]bool{
 	tg.HelpGetConfigRequestTypeID:                 true,
+	tg.HelpGetAppConfigRequestTypeID:              true,
 	tg.AccountGetPasswordRequestTypeID:            true,
 	tg.AccountUpdatePasswordSettingsRequestTypeID: true,
 	tg.AuthLogOutRequestTypeID:                    true,
@@ -378,7 +438,11 @@ func fnv1a64(s string) uint64 {
 }
 
 func register(d *mtproto.Dispatcher, id uint32, fn methodFunc) {
-	registerReply(d, id, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
+	registerNamed(d, id, "", fn)
+}
+
+func registerNamed(d *mtproto.Dispatcher, id uint32, name string, fn methodFunc) {
+	registerReplyNamed(d, id, name, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
 		res, err := fn(req)
 		return res, nil, err
 	})
@@ -406,7 +470,11 @@ func registerRevoke(d *mtproto.Dispatcher, id uint32, fn revokeFunc) {
 // registerReply applies the common provisional gate, RPC error mapping, and
 // reply write around a method-specific function.
 func registerReply(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
-	d.HandleFunc(id, func(c *mtproto.Conn, req *mtproto.Request) error {
+	registerReplyNamed(d, id, "", fn)
+}
+
+func registerReplyNamed(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc) {
+	handler := func(c *mtproto.Conn, req *mtproto.Request) error {
 		// Provisional gate: blocks all authorized RPCs except the allow-list.
 		// Does not apply when UserID == 0 (unauthenticated keys already
 		// handled per-method).
@@ -426,5 +494,10 @@ func registerReply(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
 			afterReply()
 		}
 		return sendErr
-	})
+	}
+	if name == "" {
+		d.HandleFunc(id, handler)
+		return
+	}
+	d.HandleFuncNamed(id, name, handler)
 }

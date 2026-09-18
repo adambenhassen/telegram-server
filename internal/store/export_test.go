@@ -34,6 +34,35 @@ func SetDeniedHook(s *Store, fn func()) { s.deniedHook = fn }
 // without racing.
 func SetNowFunc(s *Store, fn func() time.Time) { s.now = fn }
 
+// SetNotificationMetricsPushHooks installs the deterministic pause used by the
+// concurrent push snapshot tests.
+func SetNotificationMetricsPushHooks(m *NotificationMetrics, beforeLatency func()) {
+	m.beforePushLatency = beforeLatency
+}
+
+// SetListenerRecorderHooks installs deterministic listener recorder outcomes
+// for tests. Production leaves the hooks nil and uses NotificationMetrics.
+func SetListenerRecorderHooks(l *Listener, valid func(string) error, invalid func() error) {
+	l.validNotificationRecorder = valid
+	l.invalidNotificationRecorder = invalid
+}
+
+// NotificationMetricsPushBucketSnapshot reads one bucket's push publication
+// state for the concurrent push snapshot tests.
+func NotificationMetricsPushBucketSnapshot(m *NotificationMetrics, second int64) (PushOutcomeCounts, [pushLatencyBucketCount]int64, bool) {
+	epoch, counts, denials, outcomes, latencies, failures, ok := m.buckets[notificationBucketIndex(second)].snapshot()
+	_ = epoch
+	_ = counts
+	_ = denials
+	_ = failures
+	return PushOutcomeCounts{
+		Success:       outcomes[PushOutcomeSuccess],
+		OwnerMismatch: outcomes[PushOutcomeOwnerMismatch],
+		EncodeFailure: outcomes[PushOutcomeEncodeFailure],
+		WriteFailure:  outcomes[PushOutcomeWriteFailure],
+	}, latencies, ok
+}
+
 // RateLimitExpiresAt reads a rate-limit row's stored deadline — the value the
 // wait is computed from, and the one a test has to know to name a remainder
 // relative to it.

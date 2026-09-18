@@ -190,6 +190,7 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 		return nil, errInternal
 	}
 	if rl != nil {
+		h.recordRateLimitDenial("check_password")
 		return nil, FloodWaitError(int(rl.Wait / time.Second))
 	}
 
@@ -206,6 +207,7 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 		if err := h.store.RefundRateLimit(r.Ctx, pendingUserID, "check_password", accountReserve); err != nil {
 			h.log.Error("check password: refund account reserve", "err", err)
 		}
+		h.recordRateLimitDenial("check_password_ip")
 		return nil, FloodWaitError(int(rl.Wait / time.Second))
 	}
 
@@ -282,6 +284,7 @@ func (h *handlers) consumeAndVerifyWithRateLimit(ctx context.Context, authKeyID 
 		return 0, errInternal
 	}
 	if rl != nil {
+		h.recordRateLimitDenial("password_proof")
 		return 0, FloodWaitError(int(rl.Wait / time.Second))
 	}
 

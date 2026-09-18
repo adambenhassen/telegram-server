@@ -200,6 +200,15 @@ type LoginHandlerConfig struct {
 	// A nil value registers the route but reports it unavailable, so the
 	// dashboard falls back to its server-rendered first paint.
 	Events *Broadcaster
+	// NotifyMetrics is the process-local Postgres notification recorder shared
+	// by the listener and every admin metrics surface.
+	NotifyMetrics *store.NotificationMetrics
+	// DeliveryLag is the process-local live-connection lag sampler shared by
+	// JSON, dashboard, and SSE metrics surfaces.
+	DeliveryLag *DeliveryLagSampler
+	// Metrics is the shared complete-snapshot cache used by JSON and dashboard
+	// handlers and, in production, by the SSE sampler as well.
+	Metrics *MetricsSnapshotCache
 }
 
 // handleLoginGET serves the login form with a CSRF token.
@@ -440,6 +449,14 @@ func SecurityHeaders(next http.Handler) http.Handler {
 // hard-coding them.
 func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http.Handler {
 	rl := newRateLimiter()
+	metricsCache := cfg.Metrics
+	if metricsCache == nil {
+		deliveryLag := cfg.DeliveryLag
+		if deliveryLag == nil {
+			deliveryLag = NewDeliveryLagSampler()
+		}
+		metricsCache = NewMetricsSnapshotCache(registry, cfg.Store, defaultProcessIdentity, deliveryLag, cfg.NotifyMetrics)
+	}
 
 	// Protected routes (behind RequireAdmin). Track registered patterns so
 	// the gate test can enumerate them without hard-coding.
@@ -449,8 +466,8 @@ func AdminRouter(cfg LoginHandlerConfig, registry *mtproto.SessionRegistry) http
 		protectedPatterns = append(protectedPatterns, pattern)
 		protectedMux.HandleFunc(pattern, handler)
 	}
-	registerProtected("GET /admin/metrics", Handler(registry, cfg.Store))
-	registerProtected("GET /admin/dashboard", DashboardHandler(registry, cfg.Store, cfg.TokenHash))
+	registerProtected("GET /admin/metrics", HandlerWithSnapshotCache(metricsCache))
+	registerProtected("GET /admin/dashboard", DashboardHandlerWithSnapshotCache(metricsCache, cfg.TokenHash))
 	registerProtected("GET /admin/events", EventsHandler(cfg.Events))
 
 	// Top-level mux: specific public routes registered first (they take priority

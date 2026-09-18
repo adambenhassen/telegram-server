@@ -3,6 +3,7 @@ package mtproto
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -19,6 +20,34 @@ import (
 	"github.com/gotd/td/tgerr"
 	"github.com/gotd/td/transport"
 )
+
+// pushEncodeError marks an encoder failure so delivery telemetry can
+// distinguish it from a failure after encoding. It carries no additional
+// message, preserving the existing error text and unwrap chain.
+type pushEncodeError struct {
+	err error
+}
+
+func (e *pushEncodeError) Error() string { return e.err.Error() }
+
+func (e *pushEncodeError) Unwrap() error { return e.err }
+
+// MarkPushEncodeError marks an error returned while encoding a server push.
+// It is useful to in-process delivery adapters that need the same fixed failure
+// classification as Conn.PushTo.
+func MarkPushEncodeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &pushEncodeError{err: err}
+}
+
+// IsPushEncodeError reports whether err originated while encoding a server
+// push. Other PushTo errors are write failures for delivery telemetry.
+func IsPushEncodeError(err error) bool {
+	var target *pushEncodeError
+	return errors.As(err, &target)
+}
 
 // Conn is a single served MTProto connection: the transport plus the crypto and
 // message-ID state needed to encrypt and send responses on the active session.
@@ -54,8 +83,8 @@ type Conn struct {
 	unimplemented unimplementedBudget
 
 	// lastPushedPts is the highest pts already pushed to this conn, so a
-	// notification never re-delivers events. Read/written only by the delivery
-	// goroutine, but atomic for safety across the registry hand-off.
+	// notification never re-delivers events. Delivery writes it and the bounded
+	// admin sampler reads it; atomic access keeps the registry hand-off safe.
 	lastPushedPts atomic.Int64
 
 	// authKeyID mirrors authKey.IntID() for readers that must not take writeMu.
@@ -230,7 +259,7 @@ func (c *Conn) sendLocked(ctx context.Context, t proto.MessageType, b *bin.Buffe
 func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int) (bool, error) {
 	var b bin.Buffer
 	if err := enc.Encode(&b); err != nil {
-		return false, fmt.Errorf("push encode [%T]: %w", enc, err)
+		return false, fmt.Errorf("push encode [%T]: %w", enc, MarkPushEncodeError(err))
 	}
 
 	c.writeMu.Lock()
@@ -257,19 +286,25 @@ func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int
 func (c *Conn) SendResult(req *Request, msg bin.Encoder) error {
 	var buf bin.Buffer
 	if err := msg.Encode(&buf); err != nil {
+		req.rpcResult = RPCResultInternal
 		return fmt.Errorf("encode result: %w", err)
 	}
 	if err := c.send(context.WithoutCancel(req.Ctx), proto.MessageServerResponse, &proto.Result{
 		RequestMessageID: req.MsgID,
 		Result:           buf.Raw(),
 	}); err != nil {
+		req.rpcResult = RPCResultTransportFailure
 		return fmt.Errorf("send result [%T]: %w", msg, err)
+	}
+	if req.rpcResult == "" {
+		req.rpcResult = RPCResultSuccess
 	}
 	return nil
 }
 
 // SendErr sends e as the RPC error result for req.
 func (c *Conn) SendErr(req *Request, e *tgerr.Error) error {
+	req.rpcResult = ClassifyRPCError(e)
 	return c.SendResult(req, &mt.RPCError{
 		ErrorCode:    e.Code,
 		ErrorMessage: e.Message,

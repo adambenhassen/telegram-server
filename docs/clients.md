@@ -28,6 +28,8 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | Variable            | Default          | Notes                                      |
 |---------------------|------------------|---------------------------------------------|
 | `TG_LISTEN_ADDR`    | `:2443`          | `host:port` (or `:port`) the server binds   |
+| `TG_WEBSOCKET_LISTEN_ADDR` | *(unset)* | Enables the WebSocket MTProto listener on this address; browser clients connect to `/apiws` |
+| `TG_WEBSOCKET_ALLOWED_ORIGINS` | *(unset)* | Comma-separated browser origins allowed to connect to `/apiws`; unset rejects every request carrying an `Origin` header |
 | `TG_ADVERTISE_ADDR` | *(derived from `TG_LISTEN_ADDR`)* | `host:port` clients are told to dial, used verbatim. Derived when unset: the listen address with an empty or wildcard host (`:2443`, `0.0.0.0`, `::`) replaced by `127.0.0.1`. A value that is not `host:port`, has no host, or has a port that is not an integer in 1–65535 fails startup |
 | `TG_POSTGRES_DSN`   | *(required)*     | Postgres connection string; no default, server fails to start without it |
 | `TG_AUTHKEY_ENC_KEY`| *(required)*     | 64 hex chars (32 bytes) — master key that encrypts auth keys at rest; must stay stable, or persisted sessions can no longer be decrypted |
@@ -44,8 +46,17 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_BLOB_S3_CA_PATH` | *(unset)*        | PEM bundle for a private endpoint CA; TLS verification remains enabled |
 | `TG_BLOB_S3_ALLOW_INSECURE_HTTP` | `false` | Explicit loopback/compose-only plaintext opt-in; startup warns when enabled |
 | `TG_DC_ID`          | `2`              | DC id this server advertises as `ThisDC`    |
+| `TG_RATE_LIMIT_DISCOVERY` | `60` | Process-wide valid local-direct preflight response attempts per fixed window; `0` disables this bound, and a negative or non-integer value fails startup |
+| `TG_RATE_LIMIT_DISCOVERY_WINDOW` | `1m` | Fixed window for the process-wide discovery bound; it must be positive while that bound is enabled |
+| `TG_RATE_LIMIT_DISCOVERY_IP` | `10` | Valid local-direct preflight response attempts per client network (`/32` for IPv4 or `/64` for IPv6) per fixed window; `0` disables this bound |
+| `TG_RATE_LIMIT_DISCOVERY_IP_WINDOW` | `1m` | Fixed window for the per-network discovery bound; it must be positive while that bound is enabled |
 | `TG_LOG_LOGIN_CODES`| `false`          | Write issued login codes to the log in cleartext. Off by default; with it off no code is delivered anywhere and sign-in cannot complete. A non-boolean value fails startup |
-| `TG_REGISTRATION`   | `closed`         | Accepted values are `closed` and `invite`. Both reject `auth.signUp` until invite admission is implemented. An unrecognized value fails startup. Sign-in for accounts that already exist is unaffected by this setting |
+| `TG_REGISTRATION`   | `closed`         | Accepted values are `closed`, `invite`, and `open`. `closed` rejects `auth.signUp`, `invite` requires an operator-issued invite, and `open` admits usernames without one. An unrecognized value fails startup. Sign-in for accounts that already exist is unaffected by this setting |
+| `TG_REPLICA_ID`     | *(unset)*        | Optional stable operator-supplied identity shown on authenticated admin metrics; 1–64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-` |
+| `TG_RATE_LIMIT_GET_FILE` | `50` | Per-account `upload.getFile` calls in one fixed window. `0` disables this bound; a negative or non-integer value fails startup |
+| `TG_RATE_LIMIT_GET_FILE_WINDOW` | `1s` | Window for the per-account `upload.getFile` bound. It must be positive while that bound is enabled; an invalid or negative duration fails startup |
+| `TG_RATE_LIMIT_GET_FILE_REPLICA` | `400` | Process-local aggregate `upload.getFile` calls across all accounts in one fixed window. `0` disables this bound; it resets on replica restart and is not a cluster-wide quota. A negative or non-integer value fails startup |
+| `TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW` | `1s` | Window for the process-local aggregate `upload.getFile` bound. It must be positive while that bound is enabled; an invalid or negative duration fails startup |
 | `TG_CLIENT_ADDR_TRUST`| `socket`       | Where the address a per-IP limit is keyed on comes from: `socket` or `proxy-v2`. Any other value fails startup by name. `socket` is the connection's own peer address and assumes one peer address is one client, which fails from either end: behind a proxy or an L4 load balancer every peer address is the balancer's, so one bucket holds every client and the per-IP cap becomes a global one; behind a carrier NAT one address covers thousands of mobile subscribers, who then spend each other's budget. The server warns about both once at startup while any per-IP limit is on. `proxy-v2` takes the address from a PROXY protocol v2 header and is what to run behind an L4 load balancer; it needs `TG_CLIENT_ADDR_PROXY_CIDRS` and emits no such warning, because the misconfiguration it warns about fails the start instead |
 | `TG_MAX_PREAUTH_CONNS`| `1024`       | Concurrent connections that have not authenticated yet, process-wide. Checked on the accept loop, so a socket past the cap is closed before it costs a goroutine, a deadline or a read — refusing is cheaper than accepting, which is what makes the cap shed load rather than apply it. `0` disables it; a negative or non-integer value fails startup |
 | `TG_MAX_PREAUTH_CONNS_PER_IP`| `64`    | The same, per client network, so one peer cannot spend the process-wide cap alone and lock everybody else out. Keyed on the network the per-IP rate limits already use — an address for IPv4, a **/64** for IPv6, since a host on a routed v6 allocation mints addresses inside its own /64 for free — and on the address `TG_CLIENT_ADDR_TRUST` names, which in `proxy-v2` mode is the one the balancer reports and never the socket peer. A connection carrying no address at all (a `LOCAL` health check, or a socket peer the transport could not report) is charged to nothing and stays bounded by the other two. It is a concurrency cap and not a rate: a handshake takes milliseconds, so 64 at once is hundreds of new sessions a second from one network, which leaves room for a carrier NAT or a corporate egress. `0` disables it; a negative or non-integer value fails startup |
@@ -53,6 +64,99 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_MAX_CONNS_PER_UNBOUND_KEY`| `8`  | Concurrent connections one auth key with nobody signed in on it may hold. It is the analogue, for keys with no user, of the per-user connection cap, and it covers the population between the two: the `TG_*PREAUTH*` bounds end at the first frame that decrypts under a server-issued key, and the per-user cap counts only signed-in sessions, so a key that completed one exchange and never signed in used to be counted by neither. A connection is charged only once one of its frames has decrypted, never on the auth key id alone — that id is on the wire in cleartext, and charging on it would let anyone who reads one fill a stranger's budget. The default is small because the legitimate holder of such a key is one client waiting on a human to read a login code, holding one connection; more keys, not more connections per key, is what a real population grows by, and each new key costs a key exchange that the pre-auth bounds already price. Past the cap the frame in hand is answered and the socket is then closed. `0` disables it; a negative or non-integer value fails startup |
 | `TG_MAX_PENDING_LOGIN_CONNS`| `1024` | Process-wide concurrent connections waiting for `auth.checkPassword` after `SESSION_PASSWORD_NEEDED`. A pending connection remains counted in the unbound-key hold and this cap, and receives a single ten-minute absolute read lease (`2 × srp.DefaultTTL`); activity never refreshes it. The SRP challenge still expires after five minutes. Past the cap the connection is closed immediately. `0` disables it; a negative or non-integer value fails startup |
 | `TG_CLIENT_ADDR_PROXY_CIDRS`| *(unset)* | Comma-separated addresses or CIDRs (`10.0.0.0/8, 192.0.2.7`) of the balancers a PROXY protocol v2 header is accepted from. An IPv4-mapped entry takes its IPv4 meaning (`::ffff:192.0.2.0/120` is `192.0.2.0/24`), since peer addresses are matched unmapped; one too short to name an IPv4 network fails startup rather than starting and matching nothing. Required by, and only read in, `TG_CLIENT_ADDR_TRUST=proxy-v2`: an empty list there fails startup, and a list set in `socket` mode does too, since it means the balancer is in place but every client is being keyed on its address. Both directions then fail closed — a connection from a listed balancer without a valid v2 header is dropped rather than served on the balancer's address, and a header from anywhere else is dropped rather than believed. Only v2: the v1 text form is refused. An address is read only from `PROXY` over `AF_INET`/`AF_INET6` with the `STREAM` transport; the two headers that name no client — the `LOCAL` command a health check sends, and `AF_UNSPEC` — connect but carry no address and so cannot call `auth.sendCode`; every other family or transport is refused. Keep this list to the balancer addresses, not a VPC or subnet range: a connection whose header names no client is charged to no bucket, so anything inside an allowlisted CIDR can send a `LOCAL`/`AF_UNSPEC` header and sit outside `TG_MAX_PREAUTH_CONNS_PER_IP` entirely — with `10.0.0.0/8` that is every workload in the network, with the balancer's own addresses it is the balancer |
+
+When `TG_WEBSOCKET_LISTEN_ADDR` is set, configure
+`TG_WEBSOCKET_ALLOWED_ORIGINS` with the browser origins that may connect to
+`/apiws`. Requests without an `Origin` header remain valid for native clients;
+requests carrying one are rejected unless it matches the configured list.
+Keep this listener within the intended network boundary.
+
+Before asking for registration details, an unauthenticated client may call
+`help.getAppConfig`. The `help.appConfig` response keeps its standard TL shape;
+its JSON object contains a `registration_mode` string with one of `closed`,
+`invite`, or `open`. The value is the running server configuration, and the
+field is an extension to the JSON object, so clients that do not read it can
+continue to ignore it. This call is also available to provisional sessions.
+
+### Static enrollment discovery and local preflight
+
+The server-side contract in this section is provided by telegram-server
+revision `b4b18c12` (`MAIN-736`). Deploy that server revision, or a later
+revision that retains the contract, as the document consumer. The command
+renders the public identity without opening Postgres or loading the auth-key
+master secret:
+
+```bash
+telegramd client-config > client.json
+```
+
+It loads or creates the same persistent 2048-bit RSA key at `TG_RSA_KEY_PATH`
+that `telegramd serve` uses. `TG_ADVERTISE_ADDR` and `TG_DC_ID` therefore need
+to resolve to the same values for both commands; both have defaults, and an
+unset advertise address is derived from `TG_LISTEN_ADDR`. The output is one
+deterministic UTF-8 JSON
+object with no private-key material and standard padded base64 of DER
+SubjectPublicKeyInfo:
+
+```json
+{"version":1,"mtproto":{"endpoint":"mtproto.example.com:443","dc_id":2,"rsa_spki":"<standard-padded-base64-DER-SPKI>"}}
+```
+
+The command does not publish or serve the file. Put `client.json` at
+`/.well-known/telegramd/client` on the selected public HTTPS origin, for
+example with a static web server or object store, and keep the file and its
+HTTPS certificate under the same deployment's control. HTTPS certificate
+serving, web-root publication, and TLS termination are outside telegramd.
+
+The optional same-endpoint local-direct preflight is a separate TCP
+discriminator. It is checked only on the normal TCP listener, after a trusted
+PROXY-v2 header has been consumed when `TG_CLIENT_ADDR_TRUST=proxy-v2`, and
+before MTProto framing detection. WebSocket does not expose it. Its exact
+wire format and delimiter are:
+
+```text
+request  = 16 ASCII bytes "telegramd-key-v1" || 32 fresh opaque nonce bytes
+response = 16 ASCII bytes "telegramd-key-r1" || 32 echoed nonce bytes
+           || uint32 body_length (big-endian)
+           || int32 dc_id (big-endian, positive)
+           || uint16 spki_length (big-endian)
+           || DER SubjectPublicKeyInfo
+```
+
+The request is exactly 48 bytes followed by the client's TCP write-half-close.
+The server observes EOF before it responds. A 49th byte, or failure to reach
+EOF within the original absolute pre-auth deadline, is malformed and receives
+no discovery data. That same deadline covers detection, waiting for EOF, and
+the complete response; a configured write timeout may shorten it but never
+extend it.
+
+`spki_length` must be 1..4096 and `body_length` must be exactly
+`6 + spki_length`; the response contains the running server's configured DC
+and RSA public key. A valid request emits at most one bounded response and
+closes without codec negotiation, auth-key or session state, RPC dispatch, or
+database access. A partial, unterminated, malformed, overlong, or wrong-version
+request receives no discovery response. Bytes consumed while identifying an
+ordinary MTProto stream are replayed in order, so plaintext and obfuscated
+MTProto retain their existing behavior.
+
+Discovery response attempts are bounded independently of the existing
+whole-operation pre-auth deadline and connection caps. By default a process may
+admit 60 valid requests to the response path per minute and one `/32` IPv4 or
+`/64` IPv6 client network may admit 10 per minute. `TG_RATE_LIMIT_DISCOVERY=0` and
+`TG_RATE_LIMIT_DISCOVERY_IP=0` disable the respective bounds; their window
+variables must remain positive while the bound is enabled. The
+`TG_DISCOVERY_RATE_LIMIT`, `TG_DISCOVERY_RATE_LIMIT_WINDOW`,
+`TG_DISCOVERY_RATE_LIMIT_PER_IP`, and `TG_DISCOVERY_RATE_LIMIT_PER_IP_WINDOW`
+spellings are accepted as aliases, but a canonical variable and its alias may
+not both be set. In PROXY-v2 mode, the per-network bucket uses the trusted
+reported client address, never the untrusted socket peer.
+
+The local TCP exchange is not an authenticity channel. A network attacker can
+race the first local connection and return a different public key; the nonce
+only prevents stale response replay. Compare the preflight SPKI with the
+HTTPS discovery document or an out-of-band fingerprint before trusting it,
+and treat HTTPS as the bootstrap trust anchor. Do not interpret a successful
+preflight as proof that the endpoint is the intended server.
 
 ### Object-store backend
 
@@ -256,27 +360,30 @@ login is possible (see section 5b for how accounts are created).
    → auth.Authorization
 ```
 
-The `phone_code` value passed in step 2 is ignored; only the `phone_code_hash`
-from step 1 is validated. If the username is unknown, step 2 returns
-`authorizationSignUpRequired` instead of `SESSION_PASSWORD_NEEDED` — see
-section 5b. If the username resolves to an account whose verifier was never set
-(a partially-created account), step 2 returns an internal error and access is
-denied.
+For an existing username account, the `phone_code` value passed in step 2 is
+ignored; only the `phone_code_hash` from step 1 is validated. If the username is
+unknown, step 2 returns `authorizationSignUpRequired` instead of
+`SESSION_PASSWORD_NEEDED` — see section 5b. In `invite` registration mode, the
+non-numeric `phone_code` is carried to step 3 as the invite secret; `open` mode
+does not require it. If the username resolves to an account whose verifier was
+never set (a partially-created account), step 2 returns an internal error and
+access is denied.
 
 ### 5b. Registering a new account
 
-New accounts cannot currently be created through `auth.signUp`. Both
-`TG_REGISTRATION=closed` (the default) and `TG_REGISTRATION=invite` reject the
-RPC at the boundary with `INPUT_REQUEST_INVALID`; `invite` is reserved for the
-invite admission path. Existing accounts are unaffected.
+Account creation through `auth.signUp` is controlled by `TG_REGISTRATION`.
+`TG_REGISTRATION=closed` (the default) rejects the RPC at the boundary with
+`INPUT_REQUEST_INVALID`. `TG_REGISTRATION=invite` requires an operator-issued
+invite, while `TG_REGISTRATION=open` admits the username without one. Existing
+accounts are unaffected.
 
-Account creation through the future invite path will use:
+Both admission modes use the same account-creation flow:
 
 ```
 1. auth.sendCode(phone_number=<username>)
    → auth.SentCode  (hash only)
 
-2. auth.signIn(phone_number=<username>, phone_code_hash=<hash>, phone_code="")
+2. auth.signIn(phone_number=<username>, phone_code_hash=<hash>, phone_code=<invite-secret-or-empty>)
    → authorizationSignUpRequired  (username is unknown)
 
 3. auth.signUp(phone_number=<username>, phone_code_hash=<hash>,
@@ -288,17 +395,17 @@ Account creation through the future invite path will use:
 ```
 
 After step 3 the session is in provisional state: only `help.getConfig`,
-`account.getPassword`, `account.updatePasswordSettings`, and `auth.logOut` may
-be called. Every other RPC returns `AUTH_KEY_UNREGISTERED` until step 4
-completes. If the client disconnects before step 4, the account remains
-provisional and the next sign-in attempt (section 5a step 2) will fail with an
-internal error — the only exits are `account.updatePasswordSettings` to set the
-password, or `auth.logOut` to remove the key.
+`help.getAppConfig`, `account.getPassword`, `account.updatePasswordSettings`,
+and `auth.logOut` may be called. Every other RPC returns
+`AUTH_KEY_UNREGISTERED` until step 4 completes. If the client disconnects
+before step 4, the account remains provisional and the next sign-in attempt
+(section 5a step 2) will fail with an internal error — the only exits are
+`account.updatePasswordSettings` to set the password, or `auth.logOut` to
+remove the key.
 
-When invite admission is implemented, a username that already exists will
-continue to return `USERNAME_OCCUPIED` from `auth.signUp`. There is no
-re-registration path: once a username is claimed it cannot be reclaimed by
-starting a new sign-up flow.
+A username that already exists continues to return `USERNAME_OCCUPIED` from
+`auth.signUp`. There is no re-registration path: once a username is claimed it
+cannot be reclaimed by starting a new sign-up flow.
 
 ### 5c. Seed account at startup (TG_BOOTSTRAP_USERNAME)
 

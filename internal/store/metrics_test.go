@@ -2,7 +2,10 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -47,6 +50,31 @@ func TestMetrics_Empty(t *testing.T) {
 	}
 	if snap.RateLimitHits1H != 0 {
 		t.Errorf("expected 0 rate limit hits, got %d", snap.RateLimitHits1H)
+	}
+}
+
+func TestMetricsOptionalEstimateFailureUsesUnavailableSentinel(t *testing.T) {
+	t.Parallel()
+
+	s := open(t)
+	ctx := context.Background()
+	pool := store.StorePool(s)
+	if _, err := pool.Exec(ctx, `ALTER TABLE files RENAME TO files_hidden`); err != nil {
+		t.Fatalf("hide optional estimate table: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `ALTER TABLE files_hidden RENAME TO files`) //nolint:errcheck // best-effort test cleanup
+	})
+
+	snap, err := s.Metrics(ctx)
+	if err != nil {
+		t.Fatalf("metrics with optional estimate failure: %v", err)
+	}
+	if snap.StorageRows.Files >= 0 {
+		t.Fatalf("failed files estimate = %d, want negative unavailable sentinel", snap.StorageRows.Files)
+	}
+	if snap.StorageRows.Users != 0 || snap.StorageRows.Channels != 0 || snap.StorageRows.Chats != 0 {
+		t.Fatalf("exact zero counts lost their meaning: users=%d channels=%d chats=%d", snap.StorageRows.Users, snap.StorageRows.Channels, snap.StorageRows.Chats)
 	}
 }
 
@@ -168,6 +196,24 @@ func TestMaxPtsGap_Empty(t *testing.T) {
 	}
 	if gap != 0 {
 		t.Errorf("expected 0 gap, got %d", gap)
+	}
+}
+
+func TestAccountHeadMissingStateIsError(t *testing.T) {
+	t.Parallel()
+
+	s := open(t)
+	ctx := context.Background()
+	user := mustUser(t, s, "+15550000743")
+	if _, err := store.StorePool(s).Exec(ctx,
+		`DELETE FROM update_state WHERE user_id = $1`, user.ID,
+	); err != nil {
+		t.Fatalf("delete update state: %v", err)
+	}
+
+	_, err := s.AccountHead(ctx, user.ID)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("AccountHead error = %v, want pgx.ErrNoRows", err)
 	}
 }
 

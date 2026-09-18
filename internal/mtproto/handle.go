@@ -92,7 +92,7 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID i
 // handle processes a single plaintext message: service messages are answered
 // directly, containers and gzip are unwrapped, and everything else is passed to
 // the RPC handler. Mirrors gotd tgtest/handle.go.
-func (s *Server) handle(c *Conn, req *Request) error {
+func (s *Server) handle(c *Conn, req *Request) (err error) {
 	in := req.Buf
 	id, err := in.PeekID()
 	if err != nil {
@@ -172,6 +172,17 @@ func (s *Server) handle(c *Conn, req *Request) error {
 		defer cancel()
 	}
 
+	if s.rpcTracer == nil || !s.rpcTracer.Enabled() {
+		return s.dispatchRPC(c, req)
+	}
+	span := s.rpcTracer.Start()
+	defer func() {
+		s.rpcTracer.Finish(span, requestRPCMethod(req), requestRPCResult(req, err))
+	}()
+	return s.dispatchRPC(c, req)
+}
+
+func (s *Server) dispatchRPC(c *Conn, req *Request) error {
 	if err := s.handler.OnMessage(c, req); err != nil {
 		if rpcErr, ok := errors.AsType[*tgerr.Error](err); ok {
 			return c.SendErr(req, rpcErr)

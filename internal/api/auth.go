@@ -90,18 +90,20 @@ func verifyToRPC(err error) *tgerr.Error {
 	}
 }
 
-// handleSignUp serves auth.signUp. Account creation is admitted only when the
-// configured mode is invite and the store can commit the complete admission
-// transaction.
+// handleSignUp serves auth.signUp. Account creation is admitted when the
+// configured mode is invite or open and the store can commit the complete
+// admission transaction.
 func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthSignUpRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
 
-	// Keep the closed gate before validation and storage work. The only supported
-	// admission mode is invite-backed registration.
-	if h.registrationMode != config.RegistrationInvite {
+	// Keep the closed gate before validation and storage work. Unknown modes also
+	// fail closed if a handler is constructed without startup validation.
+	switch h.registrationMode {
+	case config.RegistrationInvite, config.RegistrationOpen:
+	default:
 		return nil, errInputRequestInvalid
 	}
 	if !validateUsername(req.PhoneNumber) {
@@ -126,6 +128,7 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 		mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		req.FirstName,
 		req.LastName,
+		h.registrationMode == config.RegistrationInvite,
 	)
 	if err != nil {
 		switch {
@@ -219,12 +222,21 @@ func (h *handlers) checkSendCodeIP(r *mtproto.Request, phone string) error {
 			// does exactly that — so this is a request arriving on a connection
 			// that was never meant to carry one, not a fault in the server.
 			h.log.Info("send code: connection carries no client address")
+			h.recordRateLimitDenial("")
 			return FloodWaitError(int(h.sendCodeIPRetry() / time.Second))
 		}
 		h.log.Error("send code: ip rate limit", "err", err)
 		return errInternal
 	}
 	if res != nil {
+		switch res.Surface {
+		case store.RateLimitResultSurfaceSendCodeIPCalls:
+			h.recordRateLimitDenial("send_code_ip_calls")
+		case store.RateLimitResultSurfaceSendCodeIPDistinctNumbers:
+			h.recordRateLimitDenial("send_code_ip_distinct_numbers")
+		default:
+			h.recordRateLimitDenial("")
+		}
 		return FloodWaitError(int(res.Wait / time.Second))
 	}
 	return nil
@@ -302,6 +314,7 @@ func (h *handlers) handleSignInPhone(r *mtproto.Request, req tg.AuthSignInReques
 	// for existing accounts never touch the counter.
 	rateLimited, err := h.store.AttemptSignIn(r.Ctx, r.ClientAddr, req.PhoneNumber, req.PhoneCodeHash, code, h.rateLimitSignInFailIP)
 	if rateLimited != nil {
+		h.recordRateLimitDenial("sign_in_fail_ip")
 		return nil, FloodWaitError(int(rateLimited.Wait / time.Second))
 	}
 	if err != nil {

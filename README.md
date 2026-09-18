@@ -127,6 +127,9 @@ The server refuses to start without a database and a master key:
 | `TG_POSTGRES_DSN` | *(required)* | Postgres connection string, migrated schema (see below) |
 | `TG_AUTHKEY_ENC_KEY` | *(one of two required)* | 64 hex chars, the AES-256-GCM master key over stored auth keys. Alternatively set `TG_AUTHKEY_ENC_KEY_FILE` to read/generate the key from a file; one of the two must be set |
 | `TG_LISTEN_ADDR` | `:2443` | Address the MTProto listener binds |
+| `TG_WEBSOCKET_LISTEN_ADDR` | *(unset)* | Enables the WebSocket MTProto listener on this address; browser clients connect to `/apiws` |
+| `TG_WEBSOCKET_ALLOWED_ORIGINS` | *(unset)* | Comma-separated browser origins allowed to connect to `/apiws`; unset rejects every request carrying an `Origin` header |
+| `TG_ADVERTISE_ADDR` | *(derived from `TG_LISTEN_ADDR`)* | Public `host:port` written to the discovery document and advertised to clients |
 | `TG_RSA_KEY_PATH` | `server_key.pem` | Server RSA private key; generated on first start |
 | `TG_BLOB_DIR` | `blobs` | Where uploaded file bodies are written |
 | `TG_BLOB_S3_ENDPOINT` | *(unset)* | Enables the S3-compatible blob backend when non-empty; requires the other `TG_BLOB_S3_*` settings below |
@@ -139,11 +142,31 @@ The server refuses to start without a database and a master key:
 | `TG_BLOB_S3_CA_PATH` | *(unset)* | PEM bundle for a private endpoint CA; TLS verification remains enabled |
 | `TG_BLOB_S3_ALLOW_INSECURE_HTTP` | `false` | Explicit loopback/compose-only plaintext opt-in; startup warns when enabled |
 | `TG_DC_ID` | `2` | DC id the server advertises |
+| `TG_RATE_LIMIT_DISCOVERY` | `60` | Process-wide valid local-direct preflight response attempts per fixed window; `0` disables the bound |
+| `TG_RATE_LIMIT_DISCOVERY_WINDOW` | `1m` | Window for the process-wide discovery response bound |
+| `TG_RATE_LIMIT_DISCOVERY_IP` | `10` | Valid local-direct preflight response attempts per IPv4 `/32` or IPv6 `/64` network per fixed window; `0` disables the bound |
+| `TG_RATE_LIMIT_DISCOVERY_IP_WINDOW` | `1m` | Window for the per-network discovery response bound |
 | `TG_BOOTSTRAP_USERNAME` | *(unset)* | Seed a username/password operator account at startup; requires exactly one of `TG_BOOTSTRAP_PASSWORD` or `TG_BOOTSTRAP_PASSWORD_FILE` |
 | `TG_BOOTSTRAP_PASSWORD_FILE` | *(unset)* | File (mode 0600) the bootstrap password is read from. Prefer it over `TG_BOOTSTRAP_PASSWORD`: an env value stays visible in `/proc/<pid>/environ`, orchestrator inspect output and crash dumps for the life of the process |
-| `TG_REGISTRATION` | `closed` | Accepted values are `closed` and `invite`; both currently reject `auth.signUp` until invite admission is implemented |
+| `TG_REGISTRATION` | `closed` | Accepted values are `closed`, `invite`, and `open`; `closed` rejects `auth.signUp`, `invite` requires an operator-issued invite, and `open` admits usernames without one. An unrecognized value fails startup |
 | `TG_LOG_LOGIN_CODES` | `false` | Write phone-mode login codes to the log; with it off, phone-number sign-in cannot complete (username/password sign-in is unaffected) |
 | `TG_ADMIN_LISTEN_ADDR` | *(unset)* | Enables the admin HTTP server; requires `TG_ADMIN_TOKEN_HASH` (SHA-256 hex of the operator token) |
+| `TG_REPLICA_ID` | *(unset)* | Optional stable operator-supplied identity shown on authenticated admin metrics; 1–64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-` |
+
+### Publish a client discovery document
+
+After configuring the advertised endpoint, DC and RSA key, render the public
+file without Postgres or the auth-key master key:
+
+```bash
+telegramd client-config > client.json
+```
+
+Serve that file from the HTTPS origin at
+`/.well-known/telegramd/client`. The command only renders the file; telegramd
+does not run an HTTPS listener or publish to a web root. The full JSON and
+local-direct preflight contract, including PROXY-v2 ordering, rate limits and
+the residual first-contact TOFU risk, is in `docs/clients.md`.
 
 ### Object-store backend
 

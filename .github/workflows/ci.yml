@@ -108,6 +108,9 @@ jobs:
       - name: Validate migrations
         run: atlas migrate validate --dir file://migrations
 
+      - name: Measure flat parts directory ceiling
+        run: PARTS_DIR_CEILING_PROBE=1 go test -count=1 -timeout 30m ./internal/blob/ -run TestFlatPartsDirEntryCeiling -v
+
       # Postgres comes from testcontainers inside internal/pgtest, which starts
       # postgres:16-alpine with its own config. Nothing to wire up on the runner
       # beyond the Docker daemon ubuntu-latest already provides.

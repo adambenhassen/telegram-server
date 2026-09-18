@@ -9,6 +9,7 @@ import (
 
 	"github.com/adambenhassen/telegram-server/internal/admin"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 // TestAuthGate_enumerates_routes verifies that every route registered on the
@@ -128,11 +129,16 @@ func TestAuthGate_metrics_accessible_with_session(t *testing.T) {
 	rawToken := "gate-test-token"
 	tokenHash := sha256hex([]byte(rawToken))
 	registry := mtproto.NewSessionRegistry()
+	notifyMetrics := store.NewNotificationMetrics()
+	if err := notifyMetrics.RecordValidNotification(store.ChannelUpdates); err != nil {
+		t.Fatal(err)
+	}
 
 	h := admin.AdminRouter(admin.LoginHandlerConfig{
-		Store:     st,
-		TokenHash: tokenHash,
-		Logger:    slog.Default(),
+		Store:         st,
+		TokenHash:     tokenHash,
+		Logger:        slog.Default(),
+		NotifyMetrics: notifyMetrics,
 	}, registry)
 
 	// Login.
@@ -152,6 +158,9 @@ func TestAuthGate_metrics_accessible_with_session(t *testing.T) {
 	ct := rec.Header().Get("Content-Type")
 	if !strings.HasPrefix(ct, "application/json") {
 		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if !strings.Contains(rec.Body.String(), `"notify_count":1`) {
+		t.Errorf("authenticated response missing notification count: %s", rec.Body.String())
 	}
 }
 

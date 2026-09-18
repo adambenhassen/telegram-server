@@ -25,16 +25,35 @@ func (b *Broadcaster) SubscribeForTest() (<-chan []byte, []byte, func(), error) 
 	return sub.ch, last, func() { b.unsubscribe(sub) }, nil
 }
 
-// CollectMetricsStrict collects a snapshot the way the SSE sampler does: any
-// failed query fails the whole snapshot.
+// CollectMetricsStrict collects a snapshot with required-query failures
+// surfaced to the caller.
 func CollectMetricsStrict(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store) (MetricsResponse, error) {
 	return collectMetrics(ctx, reg, st, requireAllMetrics)
 }
 
-// CollectMetricsTolerant collects a snapshot the way GET /admin/metrics does: a
-// failed pts-gap query degrades to zero.
+// CollectMetricsTolerant preserves the legacy partial-snapshot test behavior:
+// a failed pts-gap query degrades to zero.
 func CollectMetricsTolerant(ctx context.Context, reg *mtproto.SessionRegistry, st *store.Store) (MetricsResponse, error) {
 	return collectMetrics(ctx, reg, st, tolerateGapFailure)
+}
+
+// PublishDeliveryLagForTest applies an aggregate sample to a sampler so
+// external package tests can cover retained-state transitions without exposing
+// that test seam in the production API.
+func PublishDeliveryLagForTest(s *DeliveryLagSampler, attempt uint64, raw mtproto.DeliveryLagSample, sampledAt time.Time) DeliveryLag {
+	return s.publish(attempt, raw, sampledAt)
+}
+
+// SampleDeliveryLagForTest runs the bounded sampler with a supplied head
+// reader, so tests can control database timing without adding a production
+// dependency seam.
+func SampleDeliveryLagForTest(
+	s *DeliveryLagSampler,
+	ctx context.Context,
+	registry *mtproto.SessionRegistry,
+	accountHead func(context.Context, int64) (int64, error),
+) DeliveryLag {
+	return s.sampleWithAccountHead(ctx, registry, accountHead)
 }
 
 // EncodeFragment exposes the SSE wire encoding so the framing rules can be
@@ -63,4 +82,13 @@ func RenderDashboard(w io.Writer, data DashboardData) error {
 // Exposed for testing DashboardFragmentRenderer without going through HTTP.
 func RenderFragment(w io.Writer, data DashboardData) error {
 	return metricsFragment(data).Render(context.Background(), w)
+}
+
+// ExpireMetricsSnapshotForTest makes the next cache read attempt a collection.
+// It keeps failure-path tests deterministic without waiting for the production
+// ten-second cadence.
+func ExpireMetricsSnapshotForTest(cache *MetricsSnapshotCache) {
+	cache.mu.Lock()
+	cache.lastAttempt = time.Time{}
+	cache.mu.Unlock()
 }

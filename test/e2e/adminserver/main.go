@@ -96,9 +96,15 @@ func run(log *slog.Logger) error {
 	defer sweepWG.Wait()
 
 	registry := mtproto.NewSessionRegistry()
+	deliveryLag := admin.NewDeliveryLagSampler()
+	processIdentity, err := admin.NewProcessIdentity(os.Getenv("TG_REPLICA_ID"))
+	if err != nil {
+		return err
+	}
+	metricsCache := admin.NewMetricsSnapshotCache(registry, st, processIdentity, deliveryLag)
 
 	events := admin.NewBroadcaster(admin.BroadcasterConfig{
-		Sample: admin.NewMetricsSampler(registry, st),
+		Sample: metricsCache.Snapshot,
 		Logger: log,
 		Render: admin.DashboardFragmentRenderer,
 	})
@@ -116,6 +122,8 @@ func run(log *slog.Logger) error {
 		Logger:      log,
 		AdminOrigin: "http://" + adminListenAddr,
 		Events:      events,
+		DeliveryLag: deliveryLag,
+		Metrics:     metricsCache,
 	}, registry)
 
 	srv := &http.Server{

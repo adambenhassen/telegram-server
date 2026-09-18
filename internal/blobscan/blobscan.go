@@ -201,7 +201,7 @@ func Scan(ctx context.Context, tree Tree, files Files, tempOlderThan time.Time) 
 			// under it earns its class by parsing, not by sitting there: the
 			// files below judge each entry on its own, and a directory that is
 			// not one of these is somebody's, not ours.
-			if blob.IsShard(e.Key) || e.Key == partsDir {
+			if blob.IsShard(e.Key) || e.Key == partsDir || blob.IsPartShardDir(e.Key) {
 				return nil
 			}
 			rep.Unexplained.add(Candidate{Key: e.Key})

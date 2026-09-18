@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -113,12 +114,16 @@ type Sampler func(context.Context) (MetricsResponse, error)
 
 // NewMetricsSampler returns a Sampler reading the same snapshot that
 // GET /admin/metrics serves.
-func NewMetricsSampler(registry *mtproto.SessionRegistry, st *store.Store) Sampler {
-	return func(ctx context.Context) (MetricsResponse, error) {
-		// requireAllMetrics: the stream stays silent on a partial snapshot
-		// rather than pushing a metric that reads as good news.
-		return collectMetrics(ctx, registry, st, requireAllMetrics)
-	}
+func NewMetricsSampler(registry *mtproto.SessionRegistry, st *store.Store, notifyMetrics ...*store.NotificationMetrics) Sampler {
+	return NewMetricsSamplerWithDeliveryLag(registry, st, NewDeliveryLagSampler(), notifyMetrics...)
+}
+
+// NewMetricsSamplerWithDeliveryLag returns a Sampler backed by the shared
+// complete-snapshot cache and using the supplied process-local lag state. The
+// production server injects one cache into all authenticated surfaces.
+func NewMetricsSamplerWithDeliveryLag(registry *mtproto.SessionRegistry, st *store.Store, deliveryLag *DeliveryLagSampler, notifyMetrics ...*store.NotificationMetrics) Sampler {
+	cache := NewMetricsSnapshotCache(registry, st, defaultProcessIdentity, deliveryLag, notifyMetrics...)
+	return cache.Snapshot
 }
 
 // BroadcasterConfig configures a Broadcaster. Every duration and bound has a
@@ -239,9 +244,10 @@ func (b *Broadcaster) Clients() int {
 	return len(b.subs)
 }
 
-// tick collects one snapshot and pushes it. A sampling or rendering failure
-// leaves the last good payload in place: clients keep their current values and
-// the dashboard's freshness threshold is what surfaces the staleness.
+// tick collects one snapshot and pushes it. Snapshot retains and returns the
+// last complete sample as stale after a required collection failure, so tick
+// renders and emits that stale fragment. Only a failure before any complete
+// sample leaves the stream unavailable.
 func (b *Broadcaster) tick(ctx context.Context) {
 	if b.Clients() == 0 {
 		return
@@ -504,16 +510,100 @@ func DefaultFragmentRenderer(m MetricsResponse) ([]Fragment, error) {
 	if err := metricsFragmentTmpl.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("render metrics fragment: %w", err)
 	}
-	return []Fragment{{Event: sseDefaultEvent, HTML: buf.String()}}, nil
+	telemetry, err := pushTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	rateLimitDenialTelemetry, err := rateLimitDenialTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	deliveryLagTelemetry, err := deliveryLagTelemetryHTML(m)
+	if err != nil {
+		return nil, err
+	}
+	html := strings.TrimSuffix(buf.String(), `</div>`) + telemetry + rateLimitDenialTelemetry + deliveryLagTelemetry + `</div>`
+	return []Fragment{{Event: sseDefaultEvent, HTML: html}}, nil
 }
 
 var metricsFragmentTmpl = template.Must(template.New("metrics-fragment").Parse(metricsFragmentHTML))
+
+type pushTelemetryPayload struct {
+	PushLatencyP50                 float64      `json:"push_latency_p50_ms"`
+	PushLatencyP50Overflow         bool         `json:"push_latency_p50_overflow"`
+	PushLatencyP95                 float64      `json:"push_latency_p95_ms"`
+	PushLatencyP95Overflow         bool         `json:"push_latency_p95_overflow"`
+	PushLatencySampleCount         int64        `json:"push_latency_sample_count"`
+	PushWindowSeconds              float64      `json:"push_window_seconds"`
+	PushOutcomes                   PushOutcomes `json:"push_outcomes"`
+	PushLatencyBucketUpperBoundsMS [15]float64  `json:"push_latency_bucket_upper_bounds_ms"`
+	PushLatencyBucketCounts        [16]int64    `json:"push_latency_bucket_counts"`
+}
+
+func pushTelemetryHTML(m MetricsResponse) (string, error) {
+	payload := pushTelemetryPayload{
+		PushLatencyP50:                 m.PushLatencyP50,
+		PushLatencyP50Overflow:         m.PushLatencyP50Overflow,
+		PushLatencyP95:                 m.PushLatencyP95,
+		PushLatencyP95Overflow:         m.PushLatencyP95Overflow,
+		PushLatencySampleCount:         m.PushLatencySampleCount,
+		PushWindowSeconds:              m.PushWindowSeconds,
+		PushOutcomes:                   m.PushOutcomes,
+		PushLatencyBucketUpperBoundsMS: m.PushLatencyBucketUpperBoundsMS,
+		PushLatencyBucketCounts:        m.PushLatencyBucketCounts,
+	}
+	if payload.PushLatencyBucketUpperBoundsMS == ([15]float64{}) {
+		payload.PushLatencyBucketUpperBoundsMS = store.PushLatencyBucketUpperBoundsMilliseconds()
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal push telemetry: %w", err)
+	}
+	return `<script id="push-telemetry" type="application/json">` + string(data) + `</script>`, nil
+}
+
+type rateLimitDenialTelemetryPayload struct {
+	RateLimitDenialsCount         int64                     `json:"rate_limit_denials_count"`
+	RateLimitDenialsWindowSeconds float64                   `json:"rate_limit_denials_window_seconds"`
+	RateLimitDenialsRatePerSecond float64                   `json:"rate_limit_denials_rate_per_second"`
+	RateLimitDenialsBySurface     RateLimitDenialsBySurface `json:"rate_limit_denials_by_surface"`
+	RateLimitDenialsDropped       int64                     `json:"rate_limit_denials_dropped"`
+}
+
+func rateLimitDenialTelemetryHTML(m MetricsResponse) (string, error) {
+	payload := rateLimitDenialTelemetryPayload{
+		RateLimitDenialsCount:         m.RateLimitDenialsCount,
+		RateLimitDenialsWindowSeconds: m.RateLimitDenialsWindowSeconds,
+		RateLimitDenialsRatePerSecond: m.RateLimitDenialsRatePerSecond,
+		RateLimitDenialsBySurface:     m.RateLimitDenialsBySurface,
+		RateLimitDenialsDropped:       m.RateLimitDenialsDropped,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal rate-limit denial telemetry: %w", err)
+	}
+	return `<script id="rate-limit-denials-telemetry" type="application/json">` + string(data) + `</script>`, nil
+}
+
+func deliveryLagTelemetryHTML(m MetricsResponse) (string, error) {
+	data, err := json.Marshal(m.DeliveryLag)
+	if err != nil {
+		return "", fmt.Errorf("marshal delivery lag telemetry: %w", err)
+	}
+	return `<script id="delivery-lag-telemetry" type="application/json">` + string(data) + `</script>`, nil
+}
 
 // metricsFragmentHTML mirrors the data-metric attributes the dashboard uses, so
 // a patch target can address the same values it server-rendered on first paint.
 // The wrapper id is the patch target agreed on MAIN-302 and is asserted by
 // TestSSE_default_contract_is_the_dashboard_contract.
-const metricsFragmentHTML = `<div id="` + sseTargetID + `" data-timestamp="{{.ServerTimestamp}}">` +
+const metricsFragmentHTML = `<div id="` + sseTargetID + `" data-timestamp="{{.ServerTimestamp}}"` +
+	` data-sample-timestamp="{{.SampleTimestamp}}"` +
+	` data-sample-age-seconds="{{.SampleAgeSeconds}}"` +
+	` data-sample-state="{{.SampleState}}"` +
+	` data-process-started-at="{{.ProcessStartedAt}}"` +
+	` data-process-generation="{{.ProcessGeneration}}"` +
+	` data-replica-id="{{.ReplicaID}}">` +
 	`<span data-metric="connections">{{.Connections}}</span>` +
 	`<span data-metric="sessions">{{.Sessions}}</span>` +
 	`<span data-metric="messages_1h">{{.Messages1H}}</span>` +

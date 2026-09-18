@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,12 +21,14 @@ import (
 	"time"
 
 	"github.com/gotd/td/exchange"
+	"github.com/gotd/td/tdsync"
 
 	"github.com/adambenhassen/telegram-server/internal/admin"
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/blobscan"
 	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/adambenhassen/telegram-server/internal/discovery"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -58,9 +61,41 @@ func runCommand(args []string, log *slog.Logger, stdout, stderr io.Writer) error
 		return run(log)
 	case args[0] == "invite":
 		return runInviteCommand(args[1:], log, stdout, stderr)
+	case args[0] == "client-config":
+		if len(args) == 2 && slices.Contains(args[1:], "--help") {
+			return writeClientConfigUsage(stdout)
+		}
+		if len(args) != 1 {
+			return errors.New("client-config takes no arguments")
+		}
+		return runClientConfigCommand(stdout)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func writeClientConfigUsage(w io.Writer) error {
+	if _, err := fmt.Fprintln(w, "usage: telegramd client-config"); err != nil {
+		return fmt.Errorf("write client-config usage: %w", err)
+	}
+	return nil
+}
+
+func runClientConfigCommand(stdout io.Writer) error {
+	cfg, err := config.LoadClientConfig()
+	if err != nil {
+		return err
+	}
+	key, err := rsakey.LoadOrGenerate(cfg.RSAKeyPath)
+	if err != nil {
+		return err
+	}
+	endpoint := net.JoinHostPort(cfg.AdvertiseHost, strconv.Itoa(cfg.AdvertisePort))
+	doc, err := discovery.NewDocument(endpoint, cfg.DCID, &key.PublicKey)
+	if err != nil {
+		return err
+	}
+	return discovery.WriteDocument(stdout, doc)
 }
 
 func runInviteCommand(args []string, log *slog.Logger, stdout, stderr io.Writer) (err error) {
@@ -217,6 +252,10 @@ func run(log *slog.Logger) error {
 	if err := cfg.ValidateRegistrationMode(); err != nil {
 		return err
 	}
+	processIdentity, err := admin.NewProcessIdentity(cfg.ReplicaID)
+	if err != nil {
+		return fmt.Errorf("process identity: %w", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -228,6 +267,10 @@ func run(log *slog.Logger) error {
 	keyID, err := rsakey.KeyID(&key.PublicKey)
 	if err != nil {
 		return err
+	}
+	advertise := net.JoinHostPort(cfg.AdvertiseHost, strconv.Itoa(cfg.AdvertisePort))
+	if _, err := discovery.NewDocument(advertise, cfg.DCID, &key.PublicKey); err != nil {
+		return fmt.Errorf("validate discovery identity: %w", err)
 	}
 	log.Info("server RSA key", "key_id", keyID, "fingerprint", rsakey.Fingerprint(&key.PublicKey), "path", cfg.RSAKeyPath)
 
@@ -319,17 +362,22 @@ func run(log *slog.Logger) error {
 	}
 
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
-	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode)
+	notifyMetrics := store.NewNotificationMetrics()
+	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode, notifyMetrics)
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
 	}
 	cfg.WarnClientAddrTrust(log)
 
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, cfg.DCID, mtproto.NewPgAuthKeyStore(st), handler, log)
+	server.SetWebSocketOriginPatterns(cfg.WebSocketOriginPatterns)
 	if err := trustClientAddr(server, cfg, log); err != nil {
 		return err
 	}
 	if err := server.SetPreAuthLimits(cfg.PreAuth); err != nil {
+		return err
+	}
+	if err := server.SetDiscoveryLimits(cfg.DiscoveryLimits); err != nil {
 		return err
 	}
 	if err := server.SetMaxConnsPerUnboundKey(cfg.MaxConnsPerUnboundKey); err != nil {
@@ -358,8 +406,8 @@ func run(log *slog.Logger) error {
 	// Cross-replica real-time delivery: the listener wakes on NOTIFY and pushes
 	// each user's pending updates to their live conns in this process. Drained
 	// before the store pool closes (defer registered after st.Close, runs first).
-	updater := api.NewUpdater(st, server.Registry(), log, peers)
-	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, log)
+	updater := api.NewUpdater(st, server.Registry(), log, peers, notifyMetrics)
+	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, log, notifyMetrics)
 	if err != nil {
 		return err
 	}
@@ -385,9 +433,13 @@ func run(log *slog.Logger) error {
 		adminOrigin := "http://" + net.JoinHostPort(adminHost, adminPort)
 
 		// One shared sampler feeds every dashboard stream; it idles while
-		// nobody is connected.
+		// nobody is connected. Delivery lag state is shared with JSON and the
+		// dashboard so all authenticated surfaces retain the same complete
+		// sample after a partial attempt.
+		deliveryLag := admin.NewDeliveryLagSampler()
+		metricsCache := admin.NewMetricsSnapshotCache(server.Registry(), st, processIdentity, deliveryLag, notifyMetrics)
 		events := admin.NewBroadcaster(admin.BroadcasterConfig{
-			Sample: admin.NewMetricsSampler(server.Registry(), st),
+			Sample: metricsCache.Snapshot,
 			Logger: log,
 			Render: admin.DashboardFragmentRenderer,
 		})
@@ -397,11 +449,14 @@ func run(log *slog.Logger) error {
 		eventsWG.Go(func() { events.Run(eventsCtx) })
 
 		adminRouter := admin.AdminRouter(admin.LoginHandlerConfig{
-			Store:       st,
-			TokenHash:   cfg.AdminTokenHash,
-			Logger:      log,
-			AdminOrigin: adminOrigin,
-			Events:      events,
+			Store:         st,
+			TokenHash:     cfg.AdminTokenHash,
+			Logger:        log,
+			AdminOrigin:   adminOrigin,
+			Events:        events,
+			NotifyMetrics: notifyMetrics,
+			DeliveryLag:   deliveryLag,
+			Metrics:       metricsCache,
 		}, server.Registry())
 		adminSrv := &http.Server{
 			Addr:              cfg.AdminListenAddr,
@@ -439,10 +494,25 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	advertise := net.JoinHostPort(cfg.AdvertiseHost, strconv.Itoa(cfg.AdvertisePort))
 	log.Info("listening", "addr", cfg.ListenAddr, "advertise", advertise, "dc", cfg.DCID)
+	if cfg.WebSocketListenAddr == "" {
+		return server.Serve(ctx, ln)
+	}
 
-	return server.Serve(ctx, ln)
+	websocketLn, err := lc.Listen(ctx, "tcp", cfg.WebSocketListenAddr)
+	if err != nil {
+		return fmt.Errorf("websocket listen: %w", err)
+	}
+	log.Info("WebSocket MTProto listening", "addr", cfg.WebSocketListenAddr)
+
+	grp := tdsync.NewCancellableGroup(ctx)
+	grp.Go(func(ctx context.Context) error {
+		return server.Serve(ctx, ln)
+	})
+	grp.Go(func(ctx context.Context) error {
+		return server.ServeWebSocket(ctx, websocketLn)
+	})
+	return grp.Wait()
 }
 
 func newBlobStore(ctx context.Context, cfg config.Config, log *slog.Logger) (blob.Store, error) {

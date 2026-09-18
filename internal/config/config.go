@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -30,19 +32,30 @@ type RegistrationMode string
 const (
 	RegistrationClosed RegistrationMode = "closed"
 	RegistrationInvite RegistrationMode = "invite"
+	RegistrationOpen   RegistrationMode = "open"
 )
 
 // Config holds server configuration.
 type Config struct {
 	ListenAddr string
+	// WebSocketListenAddr is the address the WebSocket MTProto server binds to.
+	// Empty disables the endpoint entirely.
+	WebSocketListenAddr string
+	// WebSocketOriginPatterns is the comma-separated allowlist of browser
+	// origins accepted by the WebSocket endpoint. Empty accepts no Origin
+	// header, while clients that send no Origin remain valid.
+	WebSocketOriginPatterns []string
 	// AdminListenAddr is the address the admin HTTP server binds to.
 	// Empty disables the admin server entirely.
 	AdminListenAddr string
 	// AdminTokenHash is the hex-encoded SHA-256 digest of the operator token.
 	// Only set when AdminListenAddr is non-empty.
 	AdminTokenHash string
-	PostgresDSN    string
-	RSAKeyPath     string
+	// ReplicaID is the optional operator-supplied identity of this process's
+	// deployment instance. It is exposed only on authenticated admin metrics.
+	ReplicaID   string
+	PostgresDSN string
+	RSAKeyPath  string
 	// RegistrationMode controls whether auth.signUp is available.
 	RegistrationMode RegistrationMode
 	// AuthKeyEncKey is the 32-byte master key that encrypts auth keys at rest.
@@ -164,6 +177,10 @@ type Config struct {
 	// RateLimits holds the per-surface rate-limit configurations. Zero limit
 	// disables enforcement for that surface.
 	RateLimits RateLimitsConfig
+	// DiscoveryLimits bounds valid local-direct preflight requests admitted to
+	// the response path. The connection bounds still cover partial requests;
+	// these limits cover the response attempts that pass admission.
+	DiscoveryLimits mtproto.DiscoveryLimits
 	// ClientAddrTrust names where the address a request is attributed to comes
 	// from: the connection's own peer address, or a PROXY protocol v2 header.
 	ClientAddrTrust ClientAddrTrust
@@ -207,6 +224,18 @@ type Config struct {
 	// BootstrapPasswordFile is the path to a file containing the bootstrap
 	// password. Mutually exclusive with BootstrapPassword.
 	BootstrapPasswordFile string
+}
+
+// ClientConfig contains only the identity settings needed to render the
+// public discovery document. Unlike Config, loading it does not require
+// Postgres, the auth-key encryption master key, blob storage, or any other
+// service resource.
+type ClientConfig struct {
+	ListenAddr    string
+	RSAKeyPath    string
+	AdvertiseHost string
+	AdvertisePort int
+	DCID          int
 }
 
 // ClientAddrTrust names the source a client address is taken from.
@@ -257,6 +286,14 @@ type RateLimitsConfig struct {
 	// account, on one shared budget: both write the same rows, so a budget each
 	// would let an account double its part rate by alternating between them.
 	SaveFilePart store.RateLimitConfig
+	// GetFile limits upload.getFile per account. It is backed by the existing
+	// Postgres rate-limit counter, so concurrent requests for one account are
+	// admitted exactly across connections and replicas.
+	GetFile store.RateLimitConfig
+	// GetFileReplica limits upload.getFile across this process. It is deliberately
+	// process-local: its fixed-window state is reset when the replica restarts
+	// and is not presented as a cluster-wide quota.
+	GetFileReplica store.RateLimitConfig
 	// SendCodeIP limits auth.sendCode per client network. It is keyed on the
 	// connection's address rather than an account because the surface is
 	// unauthenticated: there is no account yet to hold a budget.
@@ -277,7 +314,7 @@ type RateLimitsConfig struct {
 	// the cost being bounded.
 	GetPasswordIP store.RateLimitConfig
 	// SignUpIP limits auth.signUp calls per client network. Applied only when
-	// TG_REGISTRATION=invite; no-op in closed mode.
+	// TG_REGISTRATION is invite or open; no-op in closed mode.
 	SignUpIP store.RateLimitConfig
 	// PasswordProof limits account.getPasswordSettings and
 	// account.updatePasswordSettings (the proof-required path) per account, on
@@ -289,6 +326,11 @@ type RateLimitsConfig struct {
 	// are not subject to this limit. The per-call 2048-bit modexp and SRP
 	// challenge issuance are the costs being bounded.
 	GetPassword store.RateLimitConfig
+	// UpdateProfile limits account.updateProfile per account. Display-name
+	// changes are a rare account mutation, not a chatty RPC: 20 per 24h covers
+	// a typo retry at signup and an occasional later rename without letting a
+	// client churn the generated name_tsv index that contacts.search uses.
+	UpdateProfile store.RateLimitConfig
 }
 
 // DefaultRateLimits returns the shipped per-surface defaults: 60 sends per 60s,
@@ -301,8 +343,10 @@ type RateLimitsConfig struct {
 // network, 20 getPassword calls per hour per client network (unauthenticated
 // callers only), 5 signUp calls per hour per client network, 5 password proof
 // attempts per 10 min per account (shared by getPasswordSettings and
-// updatePasswordSettings), and 20 getPassword calls per hour per account
-// (authorized callers only).
+// updatePasswordSettings), 20 getPassword calls per hour per account
+// (authorized callers only), 20 updateProfile calls per 24h per account, 50
+// upload.getFile calls per second per account, and 400 upload.getFile calls per
+// second per process.
 // Zero disables enforcement for a surface.
 //
 // The upload number is the one derived rather than chosen: at the 512 KiB
@@ -322,6 +366,8 @@ func DefaultRateLimits() RateLimitsConfig {
 		SearchContacts: store.RateLimitConfig{Limit: 300, Window: time.Hour},
 		SearchGlobal:   store.RateLimitConfig{Limit: 300, Window: time.Hour},
 		SaveFilePart:   store.RateLimitConfig{Limit: 600, Window: 60 * time.Second},
+		GetFile:        store.RateLimitConfig{Limit: 50, Window: time.Second},
+		GetFileReplica: store.RateLimitConfig{Limit: 400, Window: time.Second},
 		SendCodeIP: store.SendCodeIPLimits{
 			Calls:  store.RateLimitConfig{Limit: 10, Window: time.Hour},
 			Phones: store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
@@ -333,7 +379,21 @@ func DefaultRateLimits() RateLimitsConfig {
 		SignUpIP:        store.RateLimitConfig{Limit: 5, Window: time.Hour},
 		PasswordProof:   store.RateLimitConfig{Limit: 5, Window: 10 * time.Minute},
 		GetPassword:     store.RateLimitConfig{Limit: 20, Window: time.Hour},
+		UpdateProfile:   store.RateLimitConfig{Limit: 20, Window: 24 * time.Hour},
 	}
+}
+
+func validateGetFileRateLimit(limitName, windowName string, cfg store.RateLimitConfig) error {
+	if cfg.Limit < 0 {
+		return fmt.Errorf("%s must not be negative; 0 disables the bound", limitName)
+	}
+	if cfg.Window < 0 {
+		return fmt.Errorf("%s must not be negative", windowName)
+	}
+	if cfg.Limit > 0 && cfg.Window == 0 {
+		return fmt.Errorf("%s must be positive when %s is enabled", windowName, limitName)
+	}
+	return nil
 }
 
 // MaxFileBytesLimit is the ceiling on TG_MAX_FILE_BYTES. It is a bound on the
@@ -363,17 +423,65 @@ const MaxFileBytesLimit int64 = 1 << 40
 // cancellations in the sweep's log, not silent truncation.
 const DefaultStatementTimeout = 17 * time.Second
 
+// LoadClientConfig is the resource-free subset used by the client-config
+// command. Keep it separate from Load: a public document needs only the
+// advertised identity and the RSA key, and must remain usable during a
+// database outage or before the auth-key master secret is provisioned.
+func LoadClientConfig() (ClientConfig, error) {
+	listenAddr := envOr("TG_LISTEN_ADDR", ":2443")
+	cfg := ClientConfig{
+		ListenAddr: listenAddr,
+		RSAKeyPath: envOr("TG_RSA_KEY_PATH", "server_key.pem"),
+		DCID:       2,
+	}
+	if v := os.Getenv("TG_DC_ID"); v != "" {
+		id, err := strconv.Atoi(v)
+		if err != nil {
+			return ClientConfig{}, errors.New("TG_DC_ID must be an integer")
+		}
+		cfg.DCID = id
+	}
+	if cfg.DCID <= 0 || int64(cfg.DCID) > math.MaxInt32 {
+		return ClientConfig{}, errors.New("TG_DC_ID must be positive and fit int32")
+	}
+	if os.Getenv("TG_ADVERTISE_ADDR") == "" {
+		if _, _, err := net.SplitHostPort(listenAddr); err != nil {
+			return ClientConfig{}, errors.New("TG_LISTEN_ADDR must be host:port when TG_ADVERTISE_ADDR is unset")
+		}
+	}
+	advertiseHost, advertisePort, err := advertiseAddr(os.Getenv("TG_ADVERTISE_ADDR"), listenAddr)
+	if err != nil {
+		return ClientConfig{}, err
+	}
+	cfg.AdvertiseHost = advertiseHost
+	cfg.AdvertisePort = advertisePort
+	return cfg, nil
+}
+
 // Load reads configuration from environment variables, applying defaults. The
 // logger is used only for the auth-key master key, which is the one value Load
 // can create rather than read, and a generated one has to say so.
 func Load(log *slog.Logger) (Config, error) {
+	identity, err := LoadClientConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	originPatterns, err := parseWebSocketOriginPatterns(os.Getenv("TG_WEBSOCKET_ALLOWED_ORIGINS"))
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
-		ListenAddr:      envOr("TG_LISTEN_ADDR", ":2443"),
-		AdminListenAddr: os.Getenv("TG_ADMIN_LISTEN_ADDR"),
-		PostgresDSN:     os.Getenv("TG_POSTGRES_DSN"),
-		RSAKeyPath:      envOr("TG_RSA_KEY_PATH", "server_key.pem"),
-		DCID:            2,
-		BlobDir:         envOr("TG_BLOB_DIR", "blobs"),
+		ListenAddr:              identity.ListenAddr,
+		WebSocketListenAddr:     os.Getenv("TG_WEBSOCKET_LISTEN_ADDR"),
+		WebSocketOriginPatterns: originPatterns,
+		AdminListenAddr:         os.Getenv("TG_ADMIN_LISTEN_ADDR"),
+		ReplicaID:               os.Getenv("TG_REPLICA_ID"),
+		PostgresDSN:             os.Getenv("TG_POSTGRES_DSN"),
+		RSAKeyPath:              identity.RSAKeyPath,
+		AdvertiseHost:           identity.AdvertiseHost,
+		AdvertisePort:           identity.AdvertisePort,
+		DCID:                    identity.DCID,
+		BlobDir:                 envOr("TG_BLOB_DIR", "blobs"),
 
 		MaxFileBytes:        100 << 20,
 		MaxUserStorageBytes: 2 << 30,
@@ -399,12 +507,8 @@ func Load(log *slog.Logger) (Config, error) {
 
 		RegistrationMode: RegistrationClosed,
 	}
-	if v := os.Getenv("TG_DC_ID"); v != "" {
-		id, err := strconv.Atoi(v)
-		if err != nil {
-			return Config{}, errors.New("TG_DC_ID must be an integer")
-		}
-		cfg.DCID = id
+	if err := validateReplicaID(cfg.ReplicaID); err != nil {
+		return Config{}, err
 	}
 	if v := os.Getenv("TG_MAX_FILE_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -672,6 +776,55 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.RateLimits.SaveFilePart.Window = d
 	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_FILE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE must be an integer")
+		}
+		if n < 0 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE must not be negative; 0 disables the bound")
+		}
+		if n > math.MaxInt32 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE must not exceed math.MaxInt32")
+		}
+		cfg.RateLimits.GetFile.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_FILE_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_WINDOW must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_WINDOW must not be negative")
+		}
+		cfg.RateLimits.GetFile.Window = d
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_FILE_REPLICA"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_REPLICA must be an integer")
+		}
+		if n < 0 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_REPLICA must not be negative; 0 disables the bound")
+		}
+		cfg.RateLimits.GetFileReplica.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW must be a duration")
+		}
+		if d < 0 {
+			return Config{}, errors.New("TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW must not be negative")
+		}
+		cfg.RateLimits.GetFileReplica.Window = d
+	}
+	if err := validateGetFileRateLimit("TG_RATE_LIMIT_GET_FILE", "TG_RATE_LIMIT_GET_FILE_WINDOW", cfg.RateLimits.GetFile); err != nil {
+		return Config{}, err
+	}
+	if err := validateGetFileRateLimit("TG_RATE_LIMIT_GET_FILE_REPLICA", "TG_RATE_LIMIT_GET_FILE_REPLICA_WINDOW", cfg.RateLimits.GetFileReplica); err != nil {
+		return Config{}, err
+	}
 	if v := os.Getenv("TG_RATE_LIMIT_SEND_CODE_IP"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -791,11 +944,30 @@ func Load(log *slog.Logger) (Config, error) {
 		}
 		cfg.RateLimits.GetPassword.Window = d
 	}
+	if v := os.Getenv("TG_RATE_LIMIT_UPDATE_PROFILE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_UPDATE_PROFILE must be an integer")
+		}
+		cfg.RateLimits.UpdateProfile.Limit = n
+	}
+	if v := os.Getenv("TG_RATE_LIMIT_UPDATE_PROFILE_WINDOW"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, errors.New("TG_RATE_LIMIT_UPDATE_PROFILE_WINDOW must be a duration")
+		}
+		cfg.RateLimits.UpdateProfile.Window = d
+	}
 	preAuth, err := preAuthLimits()
 	if err != nil {
 		return Config{}, err
 	}
 	cfg.PreAuth = preAuth
+	discoveryLimits, err := discoveryLimits()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DiscoveryLimits = discoveryLimits
 	if v := os.Getenv("TG_MAX_CONNS_PER_UNBOUND_KEY"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -826,11 +998,6 @@ func Load(log *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.ClientAddrProxies = proxies
-	advertiseHost, advertisePort, err := advertiseAddr(os.Getenv("TG_ADVERTISE_ADDR"), cfg.ListenAddr)
-	if err != nil {
-		return Config{}, err
-	}
-	cfg.AdvertiseHost, cfg.AdvertisePort = advertiseHost, advertisePort
 	// Admin server requires both env vars or neither: a listener without auth
 	// is a denial-of-service vector, and a hash with no listener is wasted work.
 	adminErr := validateAdmin(cfg)
@@ -1000,6 +1167,89 @@ func preAuthLimits() (mtproto.PreAuthLimits, error) {
 	return limits, nil
 }
 
+// discoveryLimits resolves the fixed-window bounds for valid local-direct
+// preflight requests. The TG_RATE_LIMIT_* spelling follows the other RPC
+// surfaces; the TG_DISCOVERY_* aliases keep the setting discoverable for
+// deployments that group discovery controls together.
+func discoveryLimits() (mtproto.DiscoveryLimits, error) {
+	limits := mtproto.DefaultDiscoveryLimits()
+	global, globalName, err := discoveryEnvValue("TG_RATE_LIMIT_DISCOVERY", "TG_DISCOVERY_RATE_LIMIT")
+	if err != nil {
+		return mtproto.DiscoveryLimits{}, err
+	}
+	if global != "" {
+		n, err := strconv.Atoi(global)
+		if err != nil {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must be an integer", globalName)
+		}
+		if n < 0 {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must not be negative; 0 disables the cap", globalName)
+		}
+		limits.MaxRequests = n
+	}
+	globalWindow, globalWindowName, err := discoveryEnvValue("TG_RATE_LIMIT_DISCOVERY_WINDOW", "TG_DISCOVERY_RATE_LIMIT_WINDOW")
+	if err != nil {
+		return mtproto.DiscoveryLimits{}, err
+	}
+	if globalWindow != "" {
+		d, err := time.ParseDuration(globalWindow)
+		if err != nil {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must be a duration", globalWindowName)
+		}
+		if d < 0 {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must not be negative", globalWindowName)
+		}
+		limits.Window = d
+	}
+	perNet, perNetName, err := discoveryEnvValue("TG_RATE_LIMIT_DISCOVERY_IP", "TG_DISCOVERY_RATE_LIMIT_PER_IP")
+	if err != nil {
+		return mtproto.DiscoveryLimits{}, err
+	}
+	if perNet != "" {
+		n, err := strconv.Atoi(perNet)
+		if err != nil {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must be an integer", perNetName)
+		}
+		if n < 0 {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must not be negative; 0 disables the cap", perNetName)
+		}
+		limits.MaxRequestsPerNet = n
+	}
+	perNetWindow, perNetWindowName, err := discoveryEnvValue("TG_RATE_LIMIT_DISCOVERY_IP_WINDOW", "TG_DISCOVERY_RATE_LIMIT_PER_IP_WINDOW")
+	if err != nil {
+		return mtproto.DiscoveryLimits{}, err
+	}
+	if perNetWindow != "" {
+		d, err := time.ParseDuration(perNetWindow)
+		if err != nil {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must be a duration", perNetWindowName)
+		}
+		if d < 0 {
+			return mtproto.DiscoveryLimits{}, fmt.Errorf("%s must not be negative", perNetWindowName)
+		}
+		limits.PerNetWindow = d
+	}
+	if limits.MaxRequests > 0 && limits.Window <= 0 {
+		return mtproto.DiscoveryLimits{}, errors.New("TG_RATE_LIMIT_DISCOVERY_WINDOW must be positive when TG_RATE_LIMIT_DISCOVERY is enabled")
+	}
+	if limits.MaxRequestsPerNet > 0 && limits.PerNetWindow <= 0 {
+		return mtproto.DiscoveryLimits{}, errors.New("TG_RATE_LIMIT_DISCOVERY_IP_WINDOW must be positive when TG_RATE_LIMIT_DISCOVERY_IP is enabled")
+	}
+	return limits, nil
+}
+
+func discoveryEnvValue(primary, alias string) (value, name string, err error) {
+	primaryValue := os.Getenv(primary)
+	aliasValue := os.Getenv(alias)
+	if primaryValue != "" && aliasValue != "" {
+		return "", "", fmt.Errorf("%s and %s must not both be set", primary, alias)
+	}
+	if primaryValue != "" {
+		return primaryValue, primary, nil
+	}
+	return aliasValue, alias, nil
+}
+
 // clientAddrTrust resolves the client-address source. An unset value is the
 // socket, which is the only one implemented; anything else is refused by name
 // rather than falling back, because a silent fallback to socket addresses
@@ -1121,6 +1371,24 @@ func parsePrefixes(raw string) ([]netip.Prefix, error) {
 		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
 	}
 	return prefixes, nil
+}
+
+// parseWebSocketOriginPatterns reads and validates the browser-origin
+// allowlist. Empty entries are ignored so an unset variable and a trailing
+// comma have the same fail-closed meaning: no cross-origin browser request is
+// accepted.
+func parseWebSocketOriginPatterns(raw string) ([]string, error) {
+	var patterns []string
+	for entry := range strings.SplitSeq(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry != "" {
+			if _, err := path.Match(entry, ""); err != nil {
+				return nil, fmt.Errorf("TG_WEBSOCKET_ALLOWED_ORIGINS entry %q is malformed: %w", entry, err)
+			}
+			patterns = append(patterns, entry)
+		}
+	}
+	return patterns, nil
 }
 
 // WarnClientAddrTrust states the operational assumption socket mode makes,
@@ -1376,6 +1644,15 @@ func decodeEncKey(raw, src string) ([]byte, error) {
 // adminHashRe matches a 64-character lowercase hex string (SHA-256 digest).
 var adminHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+var replicaIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+func validateReplicaID(replicaID string) error {
+	if replicaID != "" && !replicaIDRe.MatchString(replicaID) {
+		return errors.New("TG_REPLICA_ID must be 1-64 characters from [A-Za-z0-9._-]")
+	}
+	return nil
+}
+
 // validateAdmin checks that the admin server env vars are consistent.
 //
 // Both TG_ADMIN_LISTEN_ADDR and TG_ADMIN_TOKEN_HASH must be set together, or
@@ -1419,6 +1696,8 @@ func registrationMode(raw string) RegistrationMode {
 		return RegistrationClosed
 	case RegistrationMode(raw) == RegistrationInvite:
 		return RegistrationInvite
+	case RegistrationMode(raw) == RegistrationOpen:
+		return RegistrationOpen
 	}
 	return RegistrationMode(raw)
 }
@@ -1428,10 +1707,10 @@ func registrationMode(raw string) RegistrationMode {
 // operator names a mode this build does not implement.
 func (c Config) ValidateRegistrationMode() error {
 	switch c.RegistrationMode {
-	case RegistrationClosed, RegistrationInvite:
+	case RegistrationClosed, RegistrationInvite, RegistrationOpen:
 		return nil
 	}
-	return fmt.Errorf("TG_REGISTRATION must be unset, %q, or %q; got %q", RegistrationClosed, RegistrationInvite, c.RegistrationMode)
+	return fmt.Errorf("TG_REGISTRATION must be unset, %q, %q, or %q; got %q", RegistrationClosed, RegistrationInvite, RegistrationOpen, c.RegistrationMode)
 }
 
 // validateBootstrap checks that bootstrap env vars are consistent.
