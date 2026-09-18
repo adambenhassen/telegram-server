@@ -8,6 +8,43 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
+// TestChannelsIDRequiresExplicitValue proves the column default is gone: an
+// insert that omits id must fail, and one that supplies an id must succeed.
+// Without this, a path that forgets to allocate an id silently mints a dense
+// sequential one from channels_id_seq — exactly the disclosure MAIN-246 exists
+// to stop.
+func TestChannelsIDRequiresExplicitValue(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := open(t)
+	conn := store.StorePool(s)
+	u := mustUser(t, s, "+15551292005")
+
+	var hasDefault bool
+	if err := conn.QueryRow(ctx, `
+		SELECT column_default IS NOT NULL
+		FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'channels' AND column_name = 'id'`).Scan(&hasDefault); err != nil {
+		t.Fatalf("column default lookup: %v", err)
+	}
+	if hasDefault {
+		t.Fatal("channels.id still has a column default")
+	}
+
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO channels (title, about, creator_id, megagroup)
+		VALUES ('No id', '', $1, false)`, u.ID); err == nil {
+		t.Fatal("insert omitting id succeeded, want an error")
+	}
+
+	const explicitID = store.ChannelIDMin + 9001
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO channels (id, title, about, creator_id, megagroup)
+		VALUES ($1, 'With id', '', $2, false)`, explicitID, u.ID); err != nil {
+		t.Fatalf("insert with explicit id: %v", err)
+	}
+}
+
 // TestCreateChannelDrawsSparseIDs is the anti-enumeration property itself: the
 // ids a discovery surface hands out must not let a caller read the private
 // channels off the gaps between them. Sequential ids fail all three assertions
