@@ -81,20 +81,7 @@ func RequireAdmin(cfg AdminMiddlewareConfig) func(http.Handler) http.Handler {
 			now := time.Now()
 
 			// Check absolute expiry.
-			if now.After(row.ExpiresAt) {
-				w.WriteHeader(http.StatusUnauthorized)
-				return
-			}
-
-			// Check idle timeout.
-			if now.Sub(row.LastActivity) > idleTimeout {
-				w.WriteHeader(http.StatusUnauthorized)
-				return
-			}
-
-			// Check token fingerprint — changing TG_ADMIN_TOKEN_HASH
-			// invalidates all sessions on the next request.
-			if subtle.ConstantTimeCompare(row.TokenFingerprint, tokenFingerprint[:]) != 1 {
+			if !adminSessionRowValid(row, tokenFingerprint[:], now) {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
@@ -111,6 +98,17 @@ func RequireAdmin(cfg AdminMiddlewareConfig) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// adminSessionRowValid applies the same lifetime and token-fingerprint checks
+// to an already-loaded session row that RequireAdmin applies before admitting
+// a request. Stream handlers use it without touching last_activity: an open
+// response must not keep an otherwise idle or expired session alive.
+func adminSessionRowValid(row store.AdminSessionRow, tokenFingerprint []byte, now time.Time) bool {
+	if now.After(row.ExpiresAt) || now.Sub(row.LastActivity) > idleTimeout {
+		return false
+	}
+	return subtle.ConstantTimeCompare(row.TokenFingerprint, tokenFingerprint) == 1
 }
 
 // HashSessionID returns the SHA-256 hash of a session id as raw bytes. It is
