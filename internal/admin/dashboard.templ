@@ -511,6 +511,9 @@ templ chipScript() {
 			var sourceGeneration = metricsStream ? metricsStream.getAttribute('data-process-generation') || '' : '';
 			var sourceReplica = metricsStream ? metricsStream.getAttribute('data-replica-id') || '' : '';
 			var sourceNotice = '';
+			var sourceNoticeProcessAgeSeconds = NaN;
+			var sourceNoticeObservedAt = 0;
+			var sourceNoticeWindowSeconds = 3600;
 			var dataEvent = sseRoot ? sseRoot.getAttribute('data-sse-event') : '';
 			var baseChipClass = 'chip inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium';
 
@@ -536,6 +539,28 @@ templ chipScript() {
 				return Math.max(0, sampleAgeSeconds + (performance.now() - sampleObservedAt) / 1000);
 			}
 
+			function processAgeSeconds(timestamp, age, startedAt) {
+				var timestampMs = parseTimestamp(timestamp);
+				var startedAtMs = parseTimestamp(startedAt);
+				if (!isFinite(timestampMs) || !isFinite(startedAtMs)) return NaN;
+				return Math.max(0, (timestampMs - startedAtMs) / 1000) + parseAge(age);
+			}
+
+			function clearSourceNotice() {
+				sourceNotice = '';
+				sourceNoticeProcessAgeSeconds = NaN;
+				sourceNoticeObservedAt = 0;
+				if (bannerSource) bannerSource.classList.add('hidden');
+				if (bannerSourceText) bannerSourceText.textContent = '';
+			}
+
+			function expireSourceNotice() {
+				if (!sourceNotice || !isFinite(sourceNoticeProcessAgeSeconds)) return;
+				var processAge = sourceNoticeProcessAgeSeconds +
+					Math.max(0, (performance.now() - sourceNoticeObservedAt) / 1000);
+				if (processAge >= sourceNoticeWindowSeconds) clearSourceNotice();
+			}
+
 			function setStatus(text) {
 				if (statusLive && statusLive.textContent !== text) statusLive.textContent = text;
 			}
@@ -550,7 +575,30 @@ templ chipScript() {
 				var sampleTimestampMs = parseTimestamp(sampleTimestamp);
 				var newerSample = isFinite(nextTimestampMs) && (!isFinite(sampleTimestampMs) || nextTimestampMs > sampleTimestampMs);
 				var sameSample = isFinite(nextTimestampMs) && isFinite(sampleTimestampMs) && nextTimestampMs === sampleTimestampMs;
-				if (!newerSample && !sameSample) return;
+				var nextStartedAt = stream.getAttribute('data-process-started-at') || '';
+				var nextGeneration = stream.getAttribute('data-process-generation') || '';
+				var nextReplica = stream.getAttribute('data-replica-id') || '';
+				var generationChanged = nextGeneration !== sourceGeneration && (sourceGeneration !== '' || nextGeneration !== '');
+				var replicaChanged = sourceReplica !== nextReplica;
+				if (generationChanged || replicaChanged) {
+					if (generationChanged && sourceReplica !== '' && nextReplica !== '' && sourceReplica === nextReplica) {
+						sourceNotice = 'Restart detected';
+						if (bannerSourceText) bannerSourceText.textContent = 'Replica restarted. Rolling metrics reset; collecting a new window.';
+					} else {
+						sourceNotice = 'Metrics source changed';
+						if (bannerSourceText) bannerSourceText.textContent = 'Metrics source changed. Verify the replica before comparing samples.';
+					}
+					sourceNoticeProcessAgeSeconds = processAgeSeconds(nextTimestamp, nextAge, nextStartedAt);
+					if (!isFinite(sourceNoticeProcessAgeSeconds)) sourceNoticeProcessAgeSeconds = 0;
+					sourceNoticeObservedAt = observedAt;
+					if (bannerSource) bannerSource.classList.remove('hidden');
+				}
+				sourceGeneration = nextGeneration;
+				sourceReplica = nextReplica;
+				if (!newerSample && !sameSample) {
+					expireSourceNotice();
+					return;
+				}
 
 				var nextState = stream.getAttribute('data-sample-state') || '';
 				if (newerSample) {
@@ -567,22 +615,7 @@ templ chipScript() {
 					if (nextState === 'stale' || (nextState === 'available' && sampleState !== 'stale')) sampleState = nextState;
 				}
 
-				var nextGeneration = stream.getAttribute('data-process-generation') || '';
-				var nextReplica = stream.getAttribute('data-replica-id') || '';
-				var generationChanged = nextGeneration !== sourceGeneration && (sourceGeneration !== '' || nextGeneration !== '');
-				var replicaChanged = sourceReplica !== nextReplica;
-				if (generationChanged || replicaChanged) {
-					if (generationChanged && sourceReplica !== '' && nextReplica !== '' && sourceReplica === nextReplica) {
-						sourceNotice = 'Restart detected';
-						if (bannerSourceText) bannerSourceText.textContent = 'Replica restarted. Rolling metrics reset; collecting a new window.';
-					} else {
-						sourceNotice = 'Metrics source changed';
-						if (bannerSourceText) bannerSourceText.textContent = 'Metrics source changed. Verify the replica before comparing samples.';
-					}
-					if (bannerSource) bannerSource.classList.remove('hidden');
-				}
-				sourceGeneration = nextGeneration;
-				sourceReplica = nextReplica;
+				expireSourceNotice();
 			}
 
 			function setChip(cls, text) {
@@ -601,6 +634,7 @@ templ chipScript() {
 			}
 
 			function updateChip() {
+				expireSourceNotice();
 				var age = currentSampleAge();
 				var notice = sourceNotice ? ' · ' + sourceNotice : '';
 				if (authExpired) {
