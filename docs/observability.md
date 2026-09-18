@@ -37,11 +37,14 @@ by the protected routes below.
 | `GET /admin/metrics` | JSON snapshot of the same metric contract | Authenticated admin session |
 | `GET /admin/events` | Server-sent-events updates for the dashboard | Authenticated admin session, rechecked while open |
 
-All admin responses carry `Cache-Control: no-store`. The metrics routes are
-behind the admin session middleware and the SSE stream does not remain open
-after the session is revoked or expires. The admin listener is separate from
-the public MTProto listener. The existing login, logout, CSRF, secure-cookie,
-and security-header behavior remains the access boundary.
+The login response and all session-protected admin responses carry
+`Cache-Control: no-store`. The public `/admin/assets/*` responses intentionally
+carry `Cache-Control: no-cache` so browsers revalidate the static dashboard
+assets. The metrics routes are behind the admin session middleware and the SSE
+stream does not remain open after the session is revoked or expires. The admin
+listener is separate from the public MTProto listener. The existing login,
+logout, CSRF, secure-cookie, and security-header behavior remains the access
+boundary.
 
 ## Snapshot, freshness, and reset metadata
 
