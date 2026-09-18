@@ -9,7 +9,7 @@ import (
 	"github.com/adambenhassen/telegram-server/components/table"
 )
 
-// dashboardPage renders the full admin operations dashboard.
+// dashboardPage renders the authenticated admin operations dashboard.
 templ dashboardPage(d DashboardData) {
 	<!DOCTYPE html>
 	<html lang="en">
@@ -18,14 +18,7 @@ templ dashboardPage(d DashboardData) {
 			<meta name="viewport" content="width=device-width, initial-scale=1"/>
 			<title>Operations — telegram-server</title>
 			<link rel="stylesheet" href="/admin/assets/dashboard.css"/>
-			<!-- Datastar ships as an ES module: without type="module" the browser
-				 rejects the bundle's export statement and no attribute plugin ever
-				 registers, which reads as a dashboard that simply stops updating. -->
 			<script type="module" src="/admin/assets/datastar.min.js"></script>
-			<!-- defer, not plain: the script attaches a MutationObserver to
-				 document.body at parse time, which is null from <head>. Without
-				 it the component registration path dies on load and swapped-in
-				 markup is never wired up. -->
 			<script defer src="/admin/assets/shadcn-templ.js"></script>
 			<script>
 				if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
@@ -35,60 +28,73 @@ templ dashboardPage(d DashboardData) {
 		</head>
 		<body class="style-nova min-h-screen bg-background text-foreground">
 			<a href="#main" class="skip">Skip to content</a>
-			<div class="mx-auto max-w-[1440px] px-6 py-8 sm:px-4">
-				<!-- Header -->
-				<header class="mb-6 flex flex-wrap items-start justify-between gap-4">
-					<div class="flex flex-col">
+			<div class="dashboard-shell mx-auto max-w-[1440px]">
+				<header class="dashboard-header">
+					<div class="dashboard-title-block">
 						<h1 class="text-xl font-semibold leading-tight">Operations</h1>
 						<span class="text-xs text-muted-foreground">telegram-server</span>
 					</div>
-					<div class="flex flex-wrap items-center gap-3">
-						<!-- Freshness chip (updated by SSE event handlers) -->
+					<div class="dashboard-controls">
 						<span
 							id="chip"
 							class="chip chip-good inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium"
-							role="status"
-							aria-live="polite"
 							title={ "Server snapshot: " + d.ServerTimestamp }
 						>
 							<span class="chip-dot size-1.5 rounded-full bg-current flex-shrink-0"></span>
 							<span id="chip-text">Live &middot; connecting&hellip;</span>
 						</span>
-						<!-- Reload button -->
-						@button.Button(button.Props{ID: "refresh-btn", Variant: button.VariantGhost, Type: button.TypeButton, Attributes: templ.Attributes{"aria-label": "Reload page"}}) {
+						<span class="dashboard-snapshot text-xs text-muted-foreground sm:block">Snapshot { d.ServerTimestamp }</span>
+						@button.Button(button.Props{ID: "refresh-btn", Class: "dashboard-control", Variant: button.VariantGhost, Type: button.TypeButton, Attributes: templ.Attributes{"aria-label": "Reload page"}}) {
 							&#8635; Reload
 						}
-						<!-- Logout -->
 						<form method="post" action="/admin/logout" class="logout-form inline">
 							<input type="hidden" name="csrf_token" value={ d.CSRFToken }/>
-							@button.Button(button.Props{Variant: button.VariantGhost, Type: button.TypeSubmit}) {
+							@button.Button(button.Props{Class: "dashboard-control", Variant: button.VariantGhost, Type: button.TypeSubmit}) {
 								Log out
 							}
 						</form>
 					</div>
+					<p id="status-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true">Connecting to live updates…</p>
 				</header>
-				<main id="main">
-					<!-- Disconnected banner — outside SSE swap, controlled by chip script -->
+				<main id="main" aria-labelledby="h-replica">
 					@alert.Alert(alert.Props{
-						ID:      "banner-disconnected",
-						Class:   "hidden mb-4",
+						ID: "banner-disconnected",
+						Class: "hidden mb-4",
 						Variant: alert.VariantDestructive,
-						Attributes: templ.Attributes{
-							"aria-atomic": "true",
-						},
+						Attributes: templ.Attributes{"aria-atomic": "true"},
 					}) {
-						@alert.Description() {
-							<span id="banner-dc-text">Connection lost.</span>
-						}
+						@alert.Description() { <span id="banner-dc-text">Live updates disconnected. Showing the last successful sample.</span> }
 						@alert.Action() {
-							@button.Button(button.Props{Variant: button.VariantGhost, Href: "/admin/login"}) {
-								Log in again
-							}
+							@button.Button(button.Props{Variant: button.VariantGhost, Href: "/admin/login"}) { Log in again }
 						}
 					}
-					<!-- SSE-powered metrics sections. The Datastar attribute
-						 opens the SSE stream on load; openWhenHidden keeps it open
-						 for operators who park the tab in the background. -->
+					@alert.Alert(alert.Props{
+						ID: "banner-auth",
+						Class: "hidden mb-4",
+						Variant: alert.VariantDestructive,
+						Attributes: templ.Attributes{"aria-atomic": "true"},
+					}) {
+						@alert.Description() { Session ended. Log in again. }
+						@alert.Action() {
+							@button.Button(button.Props{Variant: button.VariantGhost, Href: "/admin/login"}) { Log in again }
+						}
+					}
+					@alert.Alert(alert.Props{
+						ID: "banner-stale",
+						Class: "hidden mb-4",
+						Variant: alert.VariantDefault,
+						Attributes: templ.Attributes{"aria-atomic": "true", "data-server-stale": d.SnapshotStatus},
+					}) {
+						@alert.Description() { Metrics have not refreshed. Showing the last successful sample. }
+					}
+					@alert.Alert(alert.Props{
+						ID: "banner-source",
+						Class: "hidden banner-source",
+						Variant: alert.VariantDefault,
+						Attributes: templ.Attributes{"aria-atomic": "true"},
+					}) {
+						@alert.Description() { <span id="banner-source-text"></span> }
+					}
 					<div id="sse-root" data-sse-event={ sseDefaultEvent } data-on-load="@get('/admin/events', {openWhenHidden: true})">
 						<div
 							id="metrics-stream"
@@ -109,9 +115,8 @@ templ dashboardPage(d DashboardData) {
 	</html>
 }
 
-// dashboardUnavailablePage is deliberately independent of metric data. It
-// gives an authenticated operator a safe recovery path without exposing a
-// database error or filling the dashboard with fabricated values.
+// dashboardUnavailablePage gives an authenticated operator a safe recovery
+// path without exposing collection errors or fabricated zero values.
 templ dashboardUnavailablePage(d DashboardData) {
 	<!DOCTYPE html>
 	<html lang="en">
@@ -122,28 +127,24 @@ templ dashboardUnavailablePage(d DashboardData) {
 			<link rel="stylesheet" href="/admin/assets/dashboard.css"/>
 		</head>
 		<body class="style-nova min-h-screen bg-background text-foreground">
-			<div class="mx-auto max-w-[1440px] px-6 py-8 sm:px-4">
-				<header class="mb-6 flex flex-wrap items-start justify-between gap-4">
-					<div class="flex flex-col">
+			<div class="dashboard-shell mx-auto max-w-[1440px]">
+				<header class="dashboard-header">
+					<div class="dashboard-title-block">
 						<h1 class="text-xl font-semibold leading-tight">Operations</h1>
 						<span class="text-xs text-muted-foreground">telegram-server</span>
 					</div>
-					<div class="flex flex-wrap items-center gap-3">
-						@button.Button(button.Props{ID: "refresh-btn", Variant: button.VariantGhost, Type: button.TypeButton, Attributes: templ.Attributes{"aria-label": "Reload page"}}) {
-							&#8635; Reload
-						}
+					<div class="dashboard-controls">
+						@button.Button(button.Props{ID: "refresh-btn", Class: "dashboard-control", Variant: button.VariantGhost, Type: button.TypeButton, Attributes: templ.Attributes{"aria-label": "Reload page"}}) { &#8635; Reload }
 						<form method="post" action="/admin/logout" class="logout-form inline">
 							<input type="hidden" name="csrf_token" value={ d.CSRFToken }/>
-							@button.Button(button.Props{Variant: button.VariantGhost, Type: button.TypeSubmit}) {
-								Log out
-							}
+							@button.Button(button.Props{Class: "dashboard-control", Variant: button.VariantGhost, Type: button.TypeSubmit}) { Log out }
 						</form>
 					</div>
 				</header>
-				<main id="main">
+				<main id="main" aria-labelledby="metrics-unavailable-title">
 					@alert.Alert(alert.Props{Variant: alert.VariantDestructive}) {
-						@alert.Title() { Metrics unavailable }
-						@alert.Description() { No complete metrics sample is available right now. Reload to try again. }
+						@alert.Title(alert.TitleProps{ID: "metrics-unavailable-title"}) { Metrics are unavailable. Try reloading. }
+						@alert.Description() { No complete metrics sample is available right now. }
 					}
 				</main>
 			</div>
@@ -154,288 +155,355 @@ templ dashboardUnavailablePage(d DashboardData) {
 	</html>
 }
 
-// metricsFragment renders the live-updating metrics sections. It is the SSE
-// swap target: the broadcaster calls DashboardFragmentRenderer to produce the
-// fragment (a <div id="metrics-stream"> wrapping this component), which
-// Datastar morphs in place on each tick (mergeMode morph, not innerHTML).
-//
-// Nothing session-bound (CSRF token, user identity) may appear here — the
-// fragment is rendered once per tick and fanned out to every connected client.
+// metricsFragment is the single SSE morph target. It contains only aggregate
+// allowlisted data and no session-bound values.
 templ metricsFragment(d DashboardData) {
-	<!-- Empty-deployment banner -->
 	if d.ShowEmptyAlert {
-		@alert.Alert(alert.Props{
-			ID:      "banner-empty",
-			Variant: alert.VariantDefault,
-			Attributes: templ.Attributes{
-				"aria-atomic": "true",
-			},
-		}) {
-			@alert.Description() {
-				No activity recorded yet. Every value below is a real zero, not missing data.
+		@alert.Alert(alert.Props{ID: "banner-empty", Variant: alert.VariantDefault, Attributes: templ.Attributes{"aria-atomic": "true"}}) {
+			@alert.Description() { No account or message activity recorded yet. Metric availability is shown individually. }
+		}
+	} else {
+		@alert.Alert(alert.Props{ID: "banner-empty", Class: "hidden", Variant: alert.VariantDefault, Attributes: templ.Attributes{"aria-atomic": "true"}}) {
+			@alert.Description() { No account or message activity recorded yet. Metric availability is shown individually. }
+		}
+	}
+
+	<section class="dashboard-section" aria-labelledby="h-replica">
+		<div class="dashboard-section-heading">
+			<div>
+				<h2 id="h-replica" class="dashboard-section-title">{ d.ReplicaScope }</h2>
+				<p class="dashboard-section-subtitle">Point-in-time gauges · all readings are for this replica.</p>
+			</div>
+			<p class="dashboard-reset-copy">{ d.ReplicaResetCopy }</p>
+		</div>
+		<div class="dashboard-card-grid dashboard-gauge-grid">
+			@card.Card() {
+				@card.Content() {
+					@simpleReading("v-connections", "connections", "Live connections", d.Connections, "All open MTProto connections on this replica.", "")
+				}
+			}
+			@card.Card() {
+				@card.Content() {
+					@simpleReading("v-sessions", "sessions", "Authenticated accounts connected", d.Sessions, "Distinct accounts with a live connection on this replica; an account can appear on another replica too.", "")
+				}
+			}
+		</div>
+	</section>
+
+	<section class="dashboard-section" aria-labelledby="h-delivery">
+		<div class="dashboard-section-heading">
+			<div>
+				<h2 id="h-delivery" class="dashboard-section-title">Delivery</h2>
+				<p class="dashboard-section-subtitle">This replica · sampled aggregate</p>
+			</div>
+		</div>
+		<div class="dashboard-family-grid">
+			@card.Card(card.Props{ID: "delivery-lag-card"}) {
+				@card.Header() {
+					<h3 class="dashboard-card-title">Delivery lag · gauge</h3>
+					<p class="dashboard-card-description">Worst live-connection lag, measured in PTS.</p>
+				}
+				@card.Content() {
+					@metricReading(d.Delivery.Worst, "metric-primary")
+					<dl class="dashboard-meta-grid" aria-label="Delivery lag sample details">
+						<dt>Sample</dt><dd>{ d.Delivery.Sample }</dd>
+						<dt>Coverage</dt><dd>{ d.Delivery.Coverage }</dd>
+						<dt>Sampled connections</dt><dd>{ d.Delivery.SampledConnections } of { d.Delivery.EligibleConnections }</dd>
+					</dl>
+					@metricReading(d.Delivery.AccountHeadSpread, "metric-secondary")
+				}
+			}
+			@card.Card(card.Props{ID: "push-writes-card"}) {
+				@card.Header() {
+					<h3 class="dashboard-card-title">Push writes · distribution</h3>
+					<p class="dashboard-card-description">Persisted account updates (<code>tg_updates</code>) only · successful connection writes.</p>
+				}
+				@card.Content() {
+					<div class="dashboard-two-up">
+						@metricReading(d.Push.P50, "metric-primary")
+						@metricReading(d.Push.P95, "metric-primary")
+					</div>
+					<p class="dashboard-sample-count"><span>Successful samples</span> <strong>{ d.Push.SampleCount }</strong></p>
+					<p class="dashboard-window-label">Observation window · last { d.Push.Window } · this replica</p>
+					if d.Push.WindowStatus != "" {
+						<p class="dashboard-window-status">{ d.Push.WindowStatus }</p>
+					}
+					<p class="dashboard-helper">Valid notification acceptance to completed connection write. Successful writes only; each successful connection contributes one sample.</p>
+					@countTable("push-outcomes-table", "Push write outcomes", "Outcome", d.Push.Outcomes)
+					<p class="dashboard-table-note">One outcome per attempted connection. Failed attempts do not enter successful-write percentiles.</p>
+				}
+			}
+		</div>
+	</section>
+
+	<section class="dashboard-section" aria-labelledby="h-work">
+		<div class="dashboard-section-heading">
+			<div>
+				<h2 id="h-work" class="dashboard-section-title">Notification work and denials</h2>
+				<p class="dashboard-section-subtitle">This replica · rolling windows</p>
+			</div>
+		</div>
+		<div class="dashboard-family-grid">
+			@card.Card(card.Props{ID: "notifications-card"}) {
+				@card.Header() {
+					<h3 class="dashboard-card-title">Notifications · rolling window</h3>
+					<p class="dashboard-card-description">Valid delivery work accepted by compiled channel.</p>
+				}
+				@card.Content() {
+					<div class="dashboard-two-up">
+						@metricReading(d.Notifications.Count, "metric-primary")
+						@metricReading(d.Notifications.Rate, "metric-primary")
+					</div>
+					<p class="dashboard-window-label">Rolling window · last { d.Notifications.Window } · this replica</p>
+					if d.Notifications.WindowStatus != "" {
+						<p class="dashboard-window-status">{ d.Notifications.WindowStatus }</p>
+					}
+					if d.Notifications.WindowHelper != "" {
+						<p class="dashboard-helper">{ d.Notifications.WindowHelper }</p>
+					}
+					@countTable("notifications-table", "Valid notifications by channel", "Channel", d.Notifications.Rows)
+					<div class="dashboard-secondary-count"><span>{ d.Notifications.Invalid.Label }</span><strong id={ d.Notifications.Invalid.ID }>{ d.Notifications.Invalid.Value }</strong></div>
+					<p class="dashboard-helper">Excluded from valid notifications.</p>
+				}
+			}
+			@card.Card(card.Props{ID: "denials-card"}) {
+				@card.Header() {
+					<h3 class="dashboard-card-title">Rate-limit denials · rolling window</h3>
+					<p class="dashboard-card-description">Fixed client-visible surfaces only.</p>
+				}
+				@card.Content() {
+					<div class="dashboard-two-up">
+						@metricReading(d.Denials.Count, "metric-primary")
+						@metricReading(d.Denials.Rate, "metric-primary")
+					</div>
+					<p class="dashboard-window-label">Rolling window · last { d.Denials.Window } · this replica</p>
+					if d.Denials.WindowStatus != "" {
+						<p class="dashboard-window-status">{ d.Denials.WindowStatus }</p>
+					}
+					if d.Denials.WindowHelper != "" {
+						<p class="dashboard-helper">{ d.Denials.WindowHelper }</p>
+					}
+					@countTable("denials-table", "Denials by surface", "Surface", d.Denials.Rows)
+					<div class="dashboard-secondary-count"><span>{ d.Denials.Dropped.Label }</span><strong id={ d.Denials.Dropped.ID }>{ d.Denials.Dropped.Value }</strong></div>
+					<p class="dashboard-helper">Dropped observations are excluded from denials and the surface table.</p>
+				}
+			}
+		</div>
+	</section>
+
+	<section class="dashboard-section" aria-labelledby="h-rpc">
+		@card.Card(card.Props{ID: "rpc-diagnostics-card"}) {
+			@card.Header() {
+				<h2 id="h-rpc" class="dashboard-card-title">RPC diagnostics</h2>
+				<p class="dashboard-card-description">Capability note</p>
+			}
+			@card.Content() {
+				<p class="dashboard-capability-note">{ d.RPCNote }</p>
+			}
+		}
+	</section>
+
+	<section class="dashboard-section" aria-labelledby="h-database">
+		<div class="dashboard-section-heading">
+			<div>
+				<h2 id="h-database" class="dashboard-section-title">Shared database</h2>
+				<p class="dashboard-section-subtitle">Point-in-time counts · last-hour and 24-hour activity windows</p>
+			</div>
+		</div>
+		<div class="dashboard-card-grid dashboard-database-grid">
+			@card.Card() {
+				@card.Header() { <h3 class="dashboard-card-title">Accounts</h3> }
+				@card.Content() {
+					@simpleReading("v-total_users", "total_users", "Total accounts", d.SharedDatabase.TotalUsers, "Registered accounts in the shared database.", "")
+					<hr class="dashboard-rule"/>
+					@simpleReading("v-active_users_1h", "active_users_1h", "Active accounts · last hour", d.SharedDatabase.ActiveUsers1H, "Accounts with account activity in the last hour, using last_seen_at semantics.", "")
+					<hr class="dashboard-rule"/>
+					<dl class="dashboard-reading">
+						<dt>Active accounts · last 24 hours</dt>
+						<dd id="v-active_users_24h" data-metric="active_users_24h" class="metric-value tabular-nums">{ d.SharedDatabase.ActiveUsers24H }</dd>
+						<dd>
+							if d.SharedDatabase.ActiveUsersMeta != "" {
+								<div id="meter-wrap" class="mt-2">
+									@progress.Progress(progress.Props{Value: int(d.SharedDatabase.ActiveUsersPct), Attributes: templ.Attributes{"aria-label": "Active accounts ratio"}}) {}
+									<p id="meter-text" class="mt-1 text-xs text-muted-foreground">{ d.SharedDatabase.ActiveUsersMeta }</p>
+								</div>
+							} else {
+								<div id="meter-wrap" class="hidden mt-2">
+									@progress.Progress(progress.Props{Value: 0, Attributes: templ.Attributes{"aria-label": "Active accounts ratio"}}) {}
+									<p id="meter-text" class="mt-1 text-xs text-muted-foreground"></p>
+								</div>
+							}
+							<p class="dashboard-helper">Accounts with account activity in the last 24 hours.</p>
+						</dd>
+					</dl>
+				}
+			}
+			@card.Card() {
+				@card.Header() { <h3 class="dashboard-card-title">Content</h3> }
+				@card.Content() {
+					@simpleReading("v-total_channels", "total_channels", "Channels", d.SharedDatabase.TotalChannels, "Channels in the shared database.", "")
+					<hr class="dashboard-rule"/>
+					@simpleReading("v-total_chats", "total_chats", "Group chats", d.SharedDatabase.TotalChats, "Group chats in the shared database.", "")
+					<hr class="dashboard-rule"/>
+					@simpleReading("v-messages_1h", "messages_1h", "Stored messages · last hour", d.SharedDatabase.Messages1H, "Non-deleted message rows by message date, including per-account copies and channel messages.", "")
+					<hr class="dashboard-rule"/>
+					@simpleReading("v-messages_24h", "messages_24h", "Stored messages · last 24 hours", d.SharedDatabase.Messages24H, "Non-deleted message rows by message date, including per-account copies and channel messages.", "")
+				}
+			}
+			@card.Card() {
+				@card.Header() { <h3 class="dashboard-card-title">Active limits</h3> }
+				@card.Content() {
+					@simpleReading("v-rate_limit_active", "rate_limit_active", "Active rate-limit rows", d.SharedDatabase.RateLimitActive, "Unexpired rate-limit rows. This is not a count of denied requests.", "")
+				}
+			}
+		</div>
+		@card.Card(card.Props{ID: "storage-card", Class: "mt-4"}) {
+				@card.Header() {
+					<h3 class="dashboard-card-title">Storage</h3>
+					<p class="dashboard-card-description">Approximate row counts for the allowlisted tables.</p>
+				}
+				@card.Content(card.ContentProps{Class: "p-0"}) {
+					<div class="dashboard-table-wrap">
+						@table.Table(table.Props{Class: "dashboard-table"}) {
+							@table.Caption(table.CaptionProps{Class: "sr-only"}) { Storage row counts and estimate sources }
+							@table.Header() {
+								@table.Row() {
+									@table.Head(table.HeadProps{Attributes: templ.Attributes{"scope": "col"}}) { Table }
+									@table.Head(table.HeadProps{Attributes: templ.Attributes{"scope": "col"}}) { Rows }
+									@table.Head(table.HeadProps{Attributes: templ.Attributes{"scope": "col"}}) { Source }
+								}
+							}
+							@table.Body(table.BodyProps{ID: "storage-tbody"}) {
+								for _, row := range d.StorageRows {
+									@storageRow(row)
+								}
+							}
+						}
+					</div>
+				}
+			}
+		<p class="dashboard-fleet-copy">{ d.FleetAggregation }</p>
+	</section>
+
+	if len(d.UninstrumentedNames) > 0 {
+		@card.Card(card.Props{ID: "uninstr-card", Class: "uninstr-card mt-4"}) {
+			@card.Content() {
+				<p class="mb-1 text-xs font-medium text-muted-foreground">Not yet instrumented</p>
+				<ul class="uninstr-list list-none text-xs text-muted-foreground">
+					for _, u := range d.UninstrumentedNames {
+						<li>{ u.Label }</li>
+					}
+				</ul>
+				<p class="mt-2 text-xs text-muted-foreground leading-snug">These are not measured yet. They are not readings of zero.</p>
 			}
 		}
 	} else {
-		@alert.Alert(alert.Props{
-			ID:      "banner-empty",
-			Class:   "hidden",
-			Variant: alert.VariantDefault,
-			Attributes: templ.Attributes{
-				"aria-atomic": "true",
-			},
-		}) {
-			@alert.Description() {
-				No activity recorded yet. Every value below is a real zero, not missing data.
+		@card.Card(card.Props{ID: "uninstr-card", Class: "uninstr-card hidden mt-4"}) {
+			@card.Content() {
+				<p class="mb-1 text-xs font-medium text-muted-foreground">Not yet instrumented</p>
+				<ul class="uninstr-list list-none text-xs text-muted-foreground"></ul>
+				<p class="mt-2 text-xs text-muted-foreground leading-snug">These are not measured yet. They are not readings of zero.</p>
 			}
 		}
 	}
-	<!-- LIVE section -->
-	<section class="mb-8" aria-labelledby="h-live">
-		<h2 id="h-live" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Live</h2>
-		@card.Card() {
-			@card.Content() {
-				<div class="flex flex-col gap-0 sm:flex-row sm:items-stretch">
-					<!-- Hero: connections -->
-					<dl class="flex flex-col gap-1 pb-4 pr-0 sm:pb-0 sm:pr-6">
-						<dt class="text-sm text-muted-foreground">Live connections</dt>
-						<dd class="text-5xl font-semibold leading-tight" id="v-connections" data-metric="connections">{ d.Connections }</dd>
-					</dl>
-					<div class="hidden w-px bg-border sm:block"></div>
-					<!-- Secondary stats -->
-					<dl class="flex flex-1 flex-col gap-0 sm:pl-6">
-						@secondaryStat("v-sessions", "sessions", d.Sessions, "Authenticated sessions", "Distinct users with at least one live connection.", "tip-sessions")
-						<hr class="border-border"/>
-						@secondaryStat("v-messages_1h", "messages_1h", d.Messages1H, "Messages last hour", "", "")
-						<hr class="border-border"/>
-						@secondaryStat("v-max_pts_gap", "max_pts_gap", d.MaxPtsGap, "Max pts spread", "Spread between the furthest-ahead and furthest-behind account across all connected sessions. Not a lag from the head of the stream.", "tip-pts")
-					</dl>
-				</div>
-			}
-		}
-	</section>
-	<!-- ACCOUNTS section -->
-	<section class="mb-8" aria-labelledby="h-accounts">
-		<h2 id="h-accounts" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Accounts</h2>
-		<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-			@card.Card() {
-				@card.Content() {
-					@statTile("v-total_users", "total_users", d.TotalUsers, "Total accounts", "", "")
-				}
-			}
-			@card.Card() {
-				@card.Content() {
-					@statTile("v-active_users_1h", "active_users_1h", d.ActiveUsers1H, "Active last hour", "Accounts with last_seen_at in the last hour.", "tip-active1h")
-				}
-			}
-			@card.Card() {
-				@card.Content() {
-					<dl class="flex flex-col gap-1">
-						<dt class="text-sm text-muted-foreground">Active last 24 hours</dt>
-						<dd class="text-3xl font-semibold leading-tight" id="v-active_users_24h" data-metric="active_users_24h">{ d.ActiveUsers24H }</dd>
-						if d.ActiveUsersMeta != "" {
-							<div id="meter-wrap" class="mt-2">
-								@progress.Progress(progress.Props{
-									Value: int(d.ActiveUsersPct),
-									Attributes: templ.Attributes{
-										"aria-label": "Active users ratio",
-									},
-								}) {}
-								<p id="meter-text" class="mt-1 text-xs text-muted-foreground">{ d.ActiveUsersMeta }</p>
-							</div>
-						} else {
-							<div id="meter-wrap" class="hidden mt-2">
-								@progress.Progress(progress.Props{
-									Value: 0,
-									Attributes: templ.Attributes{
-										"aria-label": "Active users ratio",
-									},
-								}) {}
-								<p id="meter-text" class="mt-1 text-xs text-muted-foreground"></p>
-							</div>
-						}
-					</dl>
-				}
-			}
-		</div>
-	</section>
-	<!-- CONTENT section -->
-	<section class="mb-8" aria-labelledby="h-content">
-		<h2 id="h-content" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Content</h2>
-		<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-			@card.Card() {
-				@card.Content() {
-					@statTile("v-total_channels", "total_channels", d.TotalChannels, "Channels", "", "")
-				}
-			}
-			@card.Card() {
-				@card.Content() {
-					@statTile("v-total_chats", "total_chats", d.TotalChats, "Group chats", "", "")
-				}
-			}
-			@card.Card() {
-				@card.Content() {
-					@statTile("v-messages_24h", "messages_24h", d.Messages24H, "Messages last 24 hours", "", "")
-				}
-			}
-		</div>
-	</section>
-	<!-- THROTTLING section -->
-	<section class="mb-8" aria-labelledby="h-throttle">
-		<h2 id="h-throttle" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Throttling</h2>
-		<div class="grid grid-cols-1 gap-4 sm:grid-cols-[auto_1fr]">
-			@card.Card(card.Props{Class: "min-w-40"}) {
-				@card.Content() {
-					@statTile("v-rate_limit_active", "rate_limit_active", d.RateLimitActive, "Active rate limits", "Rate-limit rows that have not yet expired — a live count, not a rate. Some throttling is normal.", "tip-ratelimit")
-				}
-			}
-			if len(d.UninstrumentedNames) > 0 {
-				// "uninstr-card" also appears as a class so the JS patchUninstrumented
-				// can toggle visibility via classList ("uninstr-card hidden").
-				@card.Card(card.Props{ID: "uninstr-card", Class: "uninstr-card"}) {
-					@card.Content() {
-						<p class="mb-1 text-xs font-medium text-muted-foreground">Not yet instrumented</p>
-						<ul class="uninstr-list list-none text-xs text-muted-foreground">
-							for _, u := range d.UninstrumentedNames {
-								<li>{ u.Label }</li>
-							}
-						</ul>
-						<p class="mt-2 text-xs text-muted-foreground leading-snug">These are not measured yet — the fields exist so the schema is stable. Not a reading of zero.</p>
-					}
-				}
-			} else {
-				@card.Card(card.Props{ID: "uninstr-card", Class: "uninstr-card hidden"}) {
-					@card.Content() {
-						<p class="mb-1 text-xs font-medium text-muted-foreground">Not yet instrumented</p>
-						<ul class="uninstr-list list-none text-xs text-muted-foreground"></ul>
-						<p class="mt-2 text-xs text-muted-foreground leading-snug">These are not measured yet — the fields exist so the schema is stable. Not a reading of zero.</p>
-					}
-				}
-			}
-		</div>
-	</section>
-	<!-- STORAGE section -->
-	<section class="mb-8" aria-labelledby="h-storage">
-		<h2 id="h-storage" class="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Storage</h2>
-		@card.Card() {
-			@card.Content(card.ContentProps{Class: "overflow-auto p-0"}) {
-				@table.Table() {
-					@table.Header() {
-						@table.Row() {
-							@table.Head() { Table }
-							@table.Head() { Rows }
-							@table.Head() { Source }
-						}
-					}
-					@table.Body(table.BodyProps{ID: "storage-tbody"}) {
-						for _, row := range d.StorageRows {
-							@storageRow(row)
-						}
-					}
-				}
-			}
-		}
-	</section>
 }
 
-// secondaryStat renders a stat inside the Live card's right column.
-templ secondaryStat(id, metric, value, label, tooltip, tooltipID string) {
-	<div class="flex flex-col gap-1 py-3">
-		<dt class="flex items-center gap-1 text-sm text-muted-foreground">
-			{ label }
-			if tooltip != "" {
-				<span class="relative inline-flex">
-					<button
-						class="rounded px-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-						type="button"
-						aria-describedby={ tooltipID }
-					>&#9432;</button>
-					<span
-						id={ tooltipID }
-						role="tooltip"
-						class="pointer-events-none absolute bottom-[calc(100%+6px)] left-1/2 z-10 hidden -translate-x-1/2 max-w-[280px] rounded-md bg-foreground px-2.5 py-1.5 text-xs text-background [button:focus+&]:block [button:hover~&]:block"
-					>{ tooltip }</span>
-				</span>
+templ simpleReading(id, metric, label, value, helper, state string) {
+	<dl class="dashboard-reading">
+		<dt>{ label }</dt>
+		<dd id={ id } data-metric={ metric } class="metric-value tabular-nums">
+			{ value }
+			if state != "" {
+				<p class="metric-state">{ state }</p>
 			}
-		</dt>
-		<dd class="text-2xl font-semibold leading-tight" id={ id } data-metric={ metric }>{ value }</dd>
-	</div>
-}
-
-// statTile renders a standard metric tile inside a Card.
-templ statTile(id, metric, value, label, tooltip, tooltipID string) {
-	<dl class="flex flex-col gap-1">
-		<dt class="flex items-center gap-1 text-sm text-muted-foreground">
-			{ label }
-			if tooltip != "" {
-				<span class="relative inline-flex">
-					<button
-						class="rounded px-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-						type="button"
-						aria-describedby={ tooltipID }
-					>&#9432;</button>
-					<span
-						id={ tooltipID }
-						role="tooltip"
-						class="pointer-events-none absolute bottom-[calc(100%+6px)] left-1/2 z-10 hidden -translate-x-1/2 max-w-[280px] rounded-md bg-foreground px-2.5 py-1.5 text-xs text-background [button:focus+&]:block [button:hover~&]:block"
-					>{ tooltip }</span>
-				</span>
+			if helper != "" {
+				<p class="dashboard-helper">{ helper }</p>
 			}
-		</dt>
-		<dd class="text-3xl font-semibold leading-tight" id={ id } data-metric={ metric }>{ value }</dd>
+		</dd>
 	</dl>
 }
 
-// storageRow renders one row in the storage table.
+templ metricReading(reading DashMetric, extraClass string) {
+	<dl class={ "dashboard-reading " + extraClass } data-reading-state={ reading.State }>
+		<dt>{ reading.Label }</dt>
+		<dd id={ reading.ID } data-metric={ reading.Metric } class="metric-value tabular-nums">
+			{ reading.Value }
+			if reading.State != "" && reading.State != reading.Value {
+				<p class="metric-state">{ reading.State }</p>
+			}
+			if reading.Helper != "" {
+				<p class="dashboard-helper">{ reading.Helper }</p>
+			}
+		</dd>
+	</dl>
+}
+
+templ countTable(id, caption, firstHeading string, rows []DashCountRow) {
+	<div class="dashboard-table-wrap">
+		@table.Table(table.Props{ID: id, Class: "dashboard-table"}) {
+			@table.Caption(table.CaptionProps{Class: "sr-only"}) { { caption } }
+			@table.Header() {
+				@table.Row() {
+					@table.Head(table.HeadProps{Attributes: templ.Attributes{"scope": "col"}}) { { firstHeading } }
+					@table.Head(table.HeadProps{Class: "text-right", Attributes: templ.Attributes{"scope": "col"}}) { Count }
+				}
+			}
+			@table.Body() {
+				for _, row := range rows {
+					@table.Row(table.RowProps{ID: row.ID}) {
+						@table.Cell(table.CellProps{Attributes: templ.Attributes{"data-label": firstHeading}}) { { row.Label } }
+						@table.Cell(table.CellProps{Class: "text-right tabular-nums", Attributes: templ.Attributes{"data-label": "Count"}}) { { row.Value } }
+						}
+				}
+				}
+		}
+	</div>
+}
+
 templ storageRow(row DashStorageRow) {
 	@table.Row() {
-		@table.Cell(table.CellProps{Attributes: templ.Attributes{"data-label": "Table"}}) {
-			<code class="font-mono text-xs">{ row.Table }</code>
-		}
+		@table.Cell(table.CellProps{Attributes: templ.Attributes{"data-label": "Table"}}) { <code class="font-mono text-xs">{ row.Table }</code> }
 		if row.Source == "Unknown" {
-			@table.Cell(table.CellProps{
-				Class: "font-variant-numeric tabular-nums",
-				Attributes: templ.Attributes{
-					"data-label": "Rows",
-					"title":      "Estimate not available yet — Postgres has not analyzed this table.",
-				},
-			}) {
-				{ row.Display }
+			@table.Cell(table.CellProps{Class: "tabular-nums", Attributes: templ.Attributes{"data-label": "Rows"}}) {
+				<span>Unavailable</span>
+				<span class="dashboard-cell-helper">Estimate not available yet.</span>
 			}
 		} else {
-			@table.Cell(table.CellProps{
-				Class:      "tabular-nums",
-				Attributes: templ.Attributes{"data-label": "Rows"},
-			}) {
-				{ row.Display }
-			}
+			@table.Cell(table.CellProps{Class: "tabular-nums", Attributes: templ.Attributes{"data-label": "Rows"}}) { { row.Display } }
 		}
 		@table.Cell(table.CellProps{Attributes: templ.Attributes{"data-label": "Source"}}) {
 			switch row.Source {
-				case "Exact":
-					@badge.Badge(badge.Props{Variant: badge.VariantDefault}) { Exact }
-				case "Estimated":
-					@badge.Badge(badge.Props{Variant: badge.VariantSecondary}) { Estimated }
-				default:
-					@badge.Badge(badge.Props{Variant: badge.VariantGhost}) { Unknown }
+				case "Exact": @badge.Badge(badge.Props{Variant: badge.VariantDefault}) { Exact }
+				case "Estimated": @badge.Badge(badge.Props{Variant: badge.VariantSecondary}) { Estimated }
+				default: @badge.Badge(badge.Props{Variant: badge.VariantGhost}) { Unknown }
 			}
 		}
 	}
 }
 
-// chipScript manages the freshness chip and disconnection banner via Datastar
-// SSE lifecycle events. No JSON polling — the broadcaster drives all updates.
+// chipScript is the only client-side freshness state machine. It uses the
+// server-provided sample age plus performance.now(), so heartbeats and wall
+// clock changes cannot make a retained sample fresh.
 templ chipScript() {
 	<script>
 		(function() {
 			'use strict';
-
-			var chipEl   = document.getElementById('chip');
+			var chipEl = document.getElementById('chip');
 			var chipText = document.getElementById('chip-text');
 			var bannerDc = document.getElementById('banner-disconnected');
+			var bannerAuth = document.getElementById('banner-auth');
+			var bannerStale = document.getElementById('banner-stale');
+			var bannerSource = document.getElementById('banner-source');
+			var bannerSourceText = document.getElementById('banner-source-text');
+			var statusLive = document.getElementById('status-live');
 			var refreshBtn = document.getElementById('refresh-btn');
-
-			var connected = false;
+			var sseRoot = document.getElementById('sse-root');
 			var metricsStream = document.getElementById('metrics-stream');
+			var connected = false;
+			var authExpired = false;
+			var hasLiveSignal = false;
+			var hasLiveSample = false;
+			var initialServerStale = !!(bannerStale && bannerStale.getAttribute('data-server-stale'));
 			var sampleTimestamp = metricsStream ? metricsStream.getAttribute('data-sample-timestamp') || '' : '';
 			var sampleAgeSeconds = metricsStream ? parseAge(metricsStream.getAttribute('data-sample-age-seconds')) : 0;
 			var sampleState = metricsStream ? metricsStream.getAttribute('data-sample-state') || '' : '';
@@ -443,7 +511,7 @@ templ chipScript() {
 			var sourceGeneration = metricsStream ? metricsStream.getAttribute('data-process-generation') || '' : '';
 			var sourceReplica = metricsStream ? metricsStream.getAttribute('data-replica-id') || '' : '';
 			var sourceNotice = '';
-
+			var dataEvent = sseRoot ? sseRoot.getAttribute('data-sse-event') : '';
 			var baseChipClass = 'chip inline-flex cursor-default items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-xs font-medium';
 
 			function parseAge(value) {
@@ -457,7 +525,7 @@ templ chipScript() {
 			}
 
 			function ago(seconds) {
-				var s = Math.round(seconds);
+				var s = Math.round(Math.max(0, seconds));
 				if (s < 60) return s + 's ago';
 				var m = Math.round(s / 60);
 				if (m < 60) return m + 'm ago';
@@ -468,19 +536,20 @@ templ chipScript() {
 				return Math.max(0, sampleAgeSeconds + (performance.now() - sampleObservedAt) / 1000);
 			}
 
+			function setStatus(text) {
+				if (statusLive && statusLive.textContent !== text) statusLive.textContent = text;
+			}
+
 			function updateSampleMetadata() {
 				var stream = document.getElementById('metrics-stream');
 				if (!stream) return;
-
 				var nextTimestamp = stream.getAttribute('data-sample-timestamp') || '';
 				var nextAge = parseAge(stream.getAttribute('data-sample-age-seconds'));
 				var observedAt = performance.now();
 				var nextTimestampMs = parseTimestamp(nextTimestamp);
 				var sampleTimestampMs = parseTimestamp(sampleTimestamp);
-				var newerSample = isFinite(nextTimestampMs) &&
-					(!isFinite(sampleTimestampMs) || nextTimestampMs > sampleTimestampMs);
-				var sameSample = isFinite(nextTimestampMs) && isFinite(sampleTimestampMs) &&
-					nextTimestampMs === sampleTimestampMs;
+				var newerSample = isFinite(nextTimestampMs) && (!isFinite(sampleTimestampMs) || nextTimestampMs > sampleTimestampMs);
+				var sameSample = isFinite(nextTimestampMs) && isFinite(sampleTimestampMs) && nextTimestampMs === sampleTimestampMs;
 				if (!newerSample && !sameSample) return;
 
 				var nextState = stream.getAttribute('data-sample-state') || '';
@@ -488,22 +557,14 @@ templ chipScript() {
 					sampleTimestamp = nextTimestamp;
 					sampleAgeSeconds = nextAge;
 					sampleObservedAt = observedAt;
-					if (nextState === 'available' || nextState === 'stale') {
-						sampleState = nextState;
-					}
+					if (nextState === 'available' || nextState === 'stale') sampleState = nextState;
 				} else {
-					// A cached replay or stale fragment is not a new sample. Keep
-					// monotonic elapsed time and only accept a server age that is
-					// further ahead than the local clock. Rebase when it is accepted
-					// so the elapsed interval is not counted a second time.
 					var localAge = Math.max(0, sampleAgeSeconds + (observedAt - sampleObservedAt) / 1000);
 					if (nextAge > localAge) {
 						sampleAgeSeconds = nextAge;
 						sampleObservedAt = observedAt;
 					}
-					if (nextState === 'stale' || (nextState === 'available' && sampleState !== 'stale')) {
-						sampleState = nextState;
-					}
+					if (nextState === 'stale' || (nextState === 'available' && sampleState !== 'stale')) sampleState = nextState;
 				}
 
 				var nextGeneration = stream.getAttribute('data-process-generation') || '';
@@ -513,95 +574,113 @@ templ chipScript() {
 				if (generationChanged || replicaChanged) {
 					if (generationChanged && sourceReplica !== '' && nextReplica !== '' && sourceReplica === nextReplica) {
 						sourceNotice = 'Restart detected';
+						if (bannerSourceText) bannerSourceText.textContent = 'Replica restarted. Rolling metrics reset; collecting a new window.';
 					} else {
 						sourceNotice = 'Metrics source changed';
+						if (bannerSourceText) bannerSourceText.textContent = 'Metrics source changed. Verify the replica before comparing samples.';
 					}
+					if (bannerSource) bannerSource.classList.remove('hidden');
 				}
 				sourceGeneration = nextGeneration;
 				sourceReplica = nextReplica;
 			}
 
 			function setChip(cls, text) {
+				if (!chipEl || !chipText) return;
 				chipEl.className = baseChipClass + ' ' + cls;
 				chipText.textContent = text;
+			}
+
+			function updateBanners(age) {
+				var stale = sampleState === 'stale' || age >= 40;
+				if (bannerStale) {
+					if (stale && !authExpired && (connected || (initialServerStale && !hasLiveSignal))) bannerStale.classList.remove('hidden');
+					else bannerStale.classList.add('hidden');
+				}
+				return stale;
 			}
 
 			function updateChip() {
 				var age = currentSampleAge();
 				var notice = sourceNotice ? ' · ' + sourceNotice : '';
-				if (!connected) {
-					setChip('chip-critical', '● Disconnected · last updated ' + ago(age) + notice);
+				if (authExpired) {
+					setChip('chip-critical', '● Session ended. Log in again.');
+					setStatus('Session ended. Log in again.');
 					return;
 				}
-				if (sampleState === 'stale' || age > 40) {
-					setChip('chip-warning', '● Stale · updated ' + ago(age) + notice);
+				if (!connected) {
+					if (hasLiveSignal) {
+						setChip('chip-critical', '● Reconnecting · last sample ' + ago(age));
+						setStatus('Live updates disconnected. Showing the last successful sample.');
+					} else {
+						setChip('chip-good', '● Live · connecting…');
+						setStatus('Connecting to live updates…');
+					}
+					updateBanners(age);
+					return;
+				}
+				var stale = updateBanners(age);
+				if (stale) {
+					setChip('chip-warning', '● Stale · last sample ' + ago(age));
+					setStatus('Stale · last sample ' + ago(age));
+				} else if (!hasLiveSample) {
+					setChip('chip-good', '● Live · connecting…');
+					setStatus('Connecting to live updates…');
 				} else {
 					setChip('chip-good', '● Live · updated ' + ago(age) + notice);
+					setStatus('Live · updated ' + ago(age));
 				}
 			}
 
-			// Datastar dispatches one document-level custom event per SSE
-			// transition: datastar-sse with detail {type, elId}, where elId is
-			// the id of the element that opened the stream. type is "started",
-			// "finished" or "error" for the lifecycle, and the event name for a
-			// data event — so an arriving patch is observable directly.
-			//
-			// The chip is driven only by these events, never by watching the
-			// DOM: the component script re-initialises swapped-in markup and
-			// its mutations are indistinguishable from a patch, which would
-			// leave the chip reporting a healthy stream that is in fact dead.
-			//
-			// The event name and detail shape are read off the bundled
-			// datastar.min.js; they are not part of Datastar's documented API,
-			// so a rename in a future bundle degrades the chip to "connecting…"
-			// rather than breaking the stream itself.
-			// The data event's name is the wire contract, so the page reads it
-			// off the element the server rendered rather than repeating it.
-			var sseRoot = document.getElementById('sse-root');
-			var dataEvent = sseRoot.getAttribute('data-sse-event');
+			function confirmedAuthFailure(detail) {
+				var args = detail && detail.argsRaw;
+				return !!args && (args.status === 401 || args.status === '401');
+			}
 
-			document.addEventListener('datastar-sse', function(e) {
-				if (e.detail.elId !== 'sse-root') return;
-				if (e.detail.type === dataEvent) {
+			document.addEventListener('datastar-sse', function(event) {
+				var detail = event.detail || {};
+				if (detail.elId !== 'sse-root' || authExpired) return;
+				if (detail.type === dataEvent) {
+					hasLiveSignal = true;
+					hasLiveSample = true;
 					updateSampleMetadata();
 					connected = true;
-					bannerDc.classList.add('hidden');
+					if (bannerDc) bannerDc.classList.add('hidden');
 					updateChip();
 					return;
 				}
-				switch (e.detail.type) {
-				case 'started':
+				if (detail.type === 'started') {
+					hasLiveSignal = true;
+					hasLiveSample = false;
 					connected = true;
-					bannerDc.classList.add('hidden');
+					if (bannerDc) bannerDc.classList.add('hidden');
 					setChip('chip-good', '● Live · connecting…');
-					break;
-				case 'finished':
-				case 'error':
+					setStatus('Connecting to live updates…');
+					return;
+				}
+				if (detail.type === 'error' && confirmedAuthFailure(detail)) {
+					hasLiveSignal = true;
+					authExpired = true;
 					connected = false;
-					bannerDc.classList.remove('hidden');
+					if (sseRoot) sseRoot.removeAttribute('data-on-load');
+					if (metricsStream) metricsStream.classList.add('hidden');
+					if (bannerDc) bannerDc.classList.add('hidden');
+					if (bannerStale) bannerStale.classList.add('hidden');
+					if (bannerAuth) bannerAuth.classList.remove('hidden');
 					updateChip();
-					break;
-			}
+					return;
+				}
+				if (detail.type === 'finished' || detail.type === 'error') {
+					hasLiveSignal = true;
+					connected = false;
+					if (bannerDc) bannerDc.classList.remove('hidden');
+					updateChip();
+				}
 			});
 
-			if (refreshBtn) {
-				refreshBtn.addEventListener('click', function() { location.reload(); });
-			}
-
-			document.querySelectorAll('[aria-describedby]').forEach(function(btn) {
-				btn.addEventListener('click', function() {
-					var expanded = this.getAttribute('aria-expanded') === 'true';
-					this.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-				});
-				btn.addEventListener('keydown', function(e) {
-					if (e.key === 'Escape') {
-						this.setAttribute('aria-expanded', 'false');
-						this.blur();
-					}
-				});
-			});
-
-			setInterval(updateChip, 10000);
+			if (refreshBtn) refreshBtn.addEventListener('click', function() { location.reload(); });
+			setInterval(updateChip, 1000);
+			updateBanners(currentSampleAge());
 		})();
 	</script>
 }

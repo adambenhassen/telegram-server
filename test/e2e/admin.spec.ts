@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Response } from '@playwright/test';
+import { expect, test, type Page, type Response, type Route } from '@playwright/test';
 
 // The admin token the Go e2e server (test/e2e/adminserver) was started with.
 const ADMIN_TOKEN = 'e2e-secret-token';
@@ -73,6 +73,49 @@ async function postLogout(
     headers: cookieHeader ? { Cookie: cookieHeader } : {},
     // No Origin header: the handler only rejects a present-but-wrong Origin.
   });
+}
+
+function encodeDashboardFragment(html: string): string {
+  const lines = html.replace(/\r\n?/g, '\n').split('\n');
+  return [
+    'event: datastar-merge-fragments',
+    'data: selector #metrics-stream',
+    'data: mergeMode morph',
+    ...lines.map((line) => `data: fragments ${line}`),
+    '',
+    '',
+  ].join('\n');
+}
+
+async function dashboardFixture(
+  page: Page,
+  kind: 'partial-delivery' | 'stale-delivery' | 'zero-window' | 'no-connections' | 'missing-field' | 'absent-capability',
+): Promise<string> {
+  const cookies = await page.context().cookies();
+  const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
+  const response = await page.request.get(`/admin/e2e/dashboard-fixture?kind=${kind}`, {
+    headers: { Cookie: cookieHeader },
+  });
+  expect(response.status(), `dashboard ${kind} fixture status`).toBe(200);
+  return response.text();
+}
+
+async function reloadWithDashboardFixture(page: Page, fixture: string): Promise<number> {
+  let requests = 0;
+  await page.route('**/admin/events**', async (route) => {
+    requests++;
+    await route.fulfill({
+      status: 200,
+      headers: {
+        'Cache-Control': 'no-store',
+        'Content-Type': 'text/event-stream; charset=utf-8',
+      },
+      body: encodeDashboardFragment(fixture),
+    });
+  });
+  await page.reload();
+  await expect.poll(() => requests, { message: 'fixture SSE request' }).toBeGreaterThan(0);
+  return requests;
 }
 
 test.describe('admin login/logout CSRF flow', () => {
@@ -200,7 +243,7 @@ test.describe('admin login/logout CSRF flow', () => {
 // sampled afterwards. Nothing is widened, slept on or retried: the recorder is
 // installed before the event is dispatched, and what it captures is exactly the
 // transition the handler owns. A handler that never enters its disconnect
-// branch records no "Disconnected" entry and still fails the test.
+// branch records no "Reconnecting" entry and still fails the test.
 interface DisconnectRecord {
   chip: string[];
   bannerShown: boolean;
@@ -213,6 +256,9 @@ declare global {
       heartbeats: number;
       dataEvents: number;
       disconnects: number;
+    };
+    __datastarAuthError?: {
+      status?: number | string;
     };
     __setSampleClock?: (value: number) => void;
   }
@@ -340,7 +386,7 @@ test.describe('admin SSE stream', () => {
         value: () => sampleClock,
       });
     });
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
 
     await login(page);
     await page.goto('/admin/dashboard');
@@ -380,7 +426,7 @@ test.describe('admin SSE stream', () => {
 
     // The accepted server age is 20s at monotonic time 5s. Rebased timing
     // therefore reports 25s at time 10s; the old baseline reports 30s.
-    expect(freshness).toBe('● Stale · updated 25s ago');
+    expect(freshness).toBe('● Stale · last sample 25s ago');
   });
 
   test('replays after failure preserve stale freshness state and age', async ({ page }) => {
@@ -396,7 +442,7 @@ test.describe('admin SSE stream', () => {
         value: () => sampleClock,
       });
     });
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
 
     await login(page);
     await page.goto('/admin/dashboard');
@@ -450,8 +496,8 @@ test.describe('admin SSE stream', () => {
     });
 
     expect(freshness).toEqual({
-      equalReplay: '● Stale · updated 26s ago',
-      oldReplay: '● Stale · updated 31s ago',
+      equalReplay: '● Stale · last sample 26s ago',
+      oldReplay: '● Stale · last sample 31s ago',
     });
   });
 
@@ -468,7 +514,7 @@ test.describe('admin SSE stream', () => {
         value: () => sampleClock,
       });
     });
-    await page.route('**/admin/events', (route) => route.abort());
+    await page.route('**/admin/events**', (route) => route.abort());
 
     await login(page);
     await page.goto('/admin/dashboard');
@@ -592,7 +638,7 @@ test.describe('admin SSE stream', () => {
 
     const performanceNow = await page.evaluate(() => performance.now());
     expect(performanceNow).toBeGreaterThan(40_000);
-    await expect(page.locator('#chip-text')).toHaveText(/^● Stale · updated \d+s ago$/);
+    await expect(page.locator('#chip-text')).toHaveText(/^● Stale · last sample \d+s ago$/);
     await expect(page.locator('#banner-disconnected')).toBeHidden();
 
     const state = await page.evaluate(() => {
@@ -625,7 +671,7 @@ test.describe('admin SSE stream', () => {
     await lifecycle('finished');
     await expect
       .poll(() => chipTexts(page), { message: 'chip text after "finished"' })
-      .toEqual(expect.arrayContaining([expect.stringMatching(/Disconnected/)]));
+      .toEqual(expect.arrayContaining([expect.stringMatching(/^● Reconnecting · last sample \d+s ago$/)]));
 
     // "started" sets the chip to exactly "● Live · connecting…" — distinct from
     // the data-patch branch, which calls updateChip() and writes "● Live · updated
@@ -644,7 +690,7 @@ test.describe('admin SSE stream', () => {
     await lifecycle('error');
     await expect
       .poll(() => chipTexts(page), { message: 'chip text after "error"' })
-      .toEqual(expect.arrayContaining([expect.stringMatching(/Disconnected/)]));
+      .toEqual(expect.arrayContaining([expect.stringMatching(/^● Reconnecting · last sample \d+s ago$/)]));
   });
 
   // The chip test above proves the bundle reacts to the lifecycle event, but
@@ -707,6 +753,409 @@ test.describe('admin SSE stream', () => {
     });
     expect(before, 'finished reveals the banner').toBe(false);
     expect(after, 'reconnect re-hides the banner').toBe(true);
+  });
+
+  test('initial loading keeps the connecting copy until SSE starts', async ({ page }) => {
+    await page.route('**/admin/events**', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await route.continue();
+    });
+
+    await login(page);
+    const navigation = page.goto('/admin/dashboard');
+    await expect(page.locator('#metrics-stream')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#chip-text')).toHaveText('● Live · connecting…', {
+      timeout: 2500,
+    });
+    await navigation;
+    await expect(page.locator('#chip-text')).toHaveText(/Live · updated/, {
+      timeout: 15000,
+    });
+  });
+
+  test('initial loading stays connecting while the SSE request is pending', async ({ page }) => {
+    await page.clock.install();
+    await page.addInitScript(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url.includes('/admin/events')) return new Promise<Response>(() => {});
+        return originalFetch(input, init);
+      };
+    });
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#chip-text')).toHaveText('● Live · connecting…');
+    await page.clock.fastForward(1500);
+    await expect(page.locator('#chip-text')).toHaveText('● Live · connecting…');
+  });
+
+  test('SSE started stays connecting until the first data fragment', async ({ page }) => {
+    await page.clock.install();
+    await page.addInitScript(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url.includes('/admin/events')) return new Promise<Response>(() => {});
+        return originalFetch(input, init);
+      };
+    });
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#chip-text')).toHaveText('● Live · connecting…');
+
+    await page.evaluate(() => {
+      document.dispatchEvent(
+        new CustomEvent('datastar-sse', { detail: { type: 'started', elId: 'sse-root' } }),
+      );
+    });
+    await page.clock.fastForward(1500);
+    await expect(page.locator('#chip-text')).toHaveText('● Live · connecting…');
+  });
+
+  test('revoked session closes the stream and rejects its reconnect', async ({ browser, page }) => {
+    const sessionValue = await login(page);
+    const contextA = await browser.newContext();
+    const contextB = await browser.newContext();
+    for (const context of [contextA, contextB]) {
+      await context.addCookies([{ name: SESSION_COOKIE, value: sessionValue, ...cookieAttrs }]);
+    }
+
+    const pageA = await contextA.newPage();
+    const pageB = await contextB.newPage();
+    await pageA.goto('/admin/dashboard');
+    await expect(pageA.locator('#chip-text')).toHaveText(/Live · updated/, { timeout: 15000 });
+
+    const csrfToken = await extractCsrfToken(pageB, '/admin/dashboard');
+    const logoutResponse = await postLogout(
+      pageB,
+      [{ name: SESSION_COOKIE, value: sessionValue }],
+      csrfToken,
+    );
+    expect(logoutResponse.status(), 'revocation logout status').toBe(200);
+
+    await expect(pageA.locator('#banner-disconnected')).toBeVisible({ timeout: 5000 });
+    const reconnect = await pageA.request.get('/admin/events', {
+      headers: { Cookie: `${SESSION_COOKIE}=${sessionValue}` },
+      failOnStatusCode: false,
+    });
+    expect(reconnect.status(), 'revoked SSE reconnect status').toBe(401);
+
+    await contextA.close();
+    await contextB.close();
+  });
+});
+
+test.describe('admin dashboard acceptance states', () => {
+  test('confirmed SSE 401 expiry hides metrics and offers login', async ({ page }) => {
+    let eventsRequests = 0;
+    await page.addInitScript(() => {
+      window.__datastarAuthError = undefined;
+      document.addEventListener('datastar-sse', (event) => {
+        const detail = (event as CustomEvent<{
+          type?: string;
+          elId?: string;
+          argsRaw?: { status?: number | string };
+        }>).detail;
+        if (detail?.type === 'error' && detail.elId === 'sse-root') {
+          window.__datastarAuthError = detail.argsRaw;
+        }
+      });
+    });
+    await page.route('**/admin/events**', async (route) => {
+      eventsRequests++;
+      await route.fulfill({
+        status: 401,
+        headers: { 'Content-Type': 'text/event-stream; charset=utf-8' },
+        body: '',
+      });
+    });
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#metrics-stream')).toBeAttached();
+    await expect.poll(() => eventsRequests, { message: 'authenticated SSE expiry request' }).toBeGreaterThan(0);
+    await expect
+      .poll(() => page.evaluate(() => window.__datastarAuthError?.status), {
+        message: 'Datastar receives the 401 error payload',
+      })
+      .toBe('401');
+
+    await expect(page.locator('#chip-text')).toHaveText('● Session ended. Log in again.');
+    await expect(page.locator('#metrics-stream')).toBeHidden();
+    await expect(page.locator('#banner-auth')).toBeVisible();
+    await expect(page.locator('#banner-disconnected')).toBeHidden();
+    await expect(page.locator('#sse-root')).not.toHaveAttribute('data-on-load');
+    await expect(page.locator('#banner-auth')).toContainText('Session ended. Log in again.');
+  });
+
+  test('initial paint keeps absent capabilities and empty windows safe', async ({ page }) => {
+    await page.route('**/admin/events**', (route) => route.abort());
+    await login(page);
+    const response = await page.goto('/admin/dashboard');
+    expect(response!.status()).toBe(200);
+
+    await expect(page.locator('#metrics-stream')).toBeVisible();
+    await expect(page.locator('#uninstr-card')).toBeHidden();
+    const metricValue = (selector: string) => page.locator(selector).evaluate((element) =>
+      Array.from(element.childNodes)
+        .filter((node) => node.nodeType === Node.TEXT_NODE)
+        .map((node) => node.textContent ?? '')
+        .join('')
+        .trim(),
+    );
+    expect(await metricValue('#v-push-p50')).toBe('No samples');
+    expect(await metricValue('#v-push-p95')).toBe('No samples');
+    await expect(page.locator('#push-writes-card .dashboard-sample-count strong')).toHaveText('0');
+    expect(await metricValue('#v-notify-rate')).toBe('0.00/s');
+    expect(await metricValue('#v-denials-rate')).toBe('0.00/s');
+    expect(await metricValue('#v-delivery-lag')).toBe('0 PTS');
+  });
+
+  test('delivery copy distinguishes no sampled connections and partial coverage', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    await expect(page.locator('#delivery-lag-card')).toContainText('No sampled connections');
+
+    const fixture = await dashboardFixture(page, 'partial-delivery');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#delivery-lag-card')).toContainText('Partial coverage');
+    await expect(page.locator('#delivery-lag-card')).toContainText('1 of 2');
+  });
+
+  test('server-rendered no-connection delivery keeps zero lag and safe counts', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'no-connections');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#delivery-lag-card')).toContainText('0 PTS');
+    await expect(page.locator('#delivery-lag-card')).toContainText('No live authenticated connections.');
+    await expect(page.locator('#delivery-lag-card')).toContainText('No sampled connections');
+    await expect(page.locator('#delivery-lag-card')).toContainText('0 of 0');
+  });
+
+  test('server-rendered stale delivery names the last successful sample', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'stale-delivery');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#delivery-lag-card')).toContainText(
+      'Stale · last successful sample 2026-09-15 02:00:00 UTC',
+    );
+    await expect(page.locator('#delivery-lag-card')).not.toContainText('last complete sample');
+  });
+
+  test('SSE fixture renders failed outcomes with zero-duration rates safely', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'zero-window');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#v-push-p50')).toContainText('No samples');
+    await expect(page.locator('#v-push-p95')).toContainText('No samples');
+    await expect(page.locator('#v-push-p50')).toContainText('Percentile unavailable until the observation window has elapsed.');
+    await expect(page.locator('#v-push-p95')).toContainText('Percentile unavailable until the observation window has elapsed.');
+    await expect(page.locator('#push-writes-card .dashboard-sample-count strong')).toHaveText('2');
+    await expect(page.locator('#push-writes-card .dashboard-window-status')).toHaveText('Window just started');
+    await expect(page.locator('#push-outcome-owner-mismatch td[data-label="Count"]')).toHaveText('2');
+    await expect(page.locator('#push-outcome-encode-failure td[data-label="Count"]')).toHaveText('1');
+    await expect(page.locator('#push-outcome-write-failure td[data-label="Count"]')).toHaveText('3');
+    await expect(page.locator('#v-notify-rate')).toContainText('0.00/s');
+    await expect(page.locator('#v-denials-rate')).toContainText('0.00/s');
+  });
+
+  test('server-rendered absent capabilities stay unavailable and hide unknown fields', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'absent-capability');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#uninstr-card')).toBeVisible();
+    await expect(page.locator('#uninstr-card')).toContainText('Push latency p50');
+    await expect(page.locator('#uninstr-card')).not.toContainText('unknown_metric');
+    await expect(page.locator('#v-push-p50')).toContainText('Not yet instrumented');
+    await expect(page.locator('#v-push-p50')).not.toContainText('0');
+  });
+
+  test('server-rendered missing fields stay unavailable without leaking unknown keys', async ({ page }) => {
+    const abortEvents = (route: Route) => route.abort();
+    await page.route('**/admin/events**', abortEvents);
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const fixture = await dashboardFixture(page, 'missing-field');
+    await page.unroute('**/admin/events**', abortEvents);
+    await reloadWithDashboardFixture(page, fixture);
+
+    await expect(page.locator('#v-delivery-lag')).toContainText('Unavailable');
+    await expect(page.locator('#delivery-lag-card')).toContainText('Coverage unavailable');
+    const bodyText = await page.locator('body').innerText();
+    expect(bodyText).not.toContain('unknown_metric');
+    expect(bodyText).not.toMatch(/(?:^|\s)-1(?:$|\s)/);
+  });
+
+  test('fixed operational families retain their browser labels', async ({ page }) => {
+    await page.route('**/admin/events**', (route) => route.abort());
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const labels = await page.evaluate(() => {
+      const read = (selector: string) => Array.from(document.querySelectorAll(selector), (el) => el.textContent?.trim() ?? '');
+      return {
+        outcomes: read('#push-outcomes-table tbody tr td[data-label="Outcome"]'),
+        channels: read('#notifications-table tbody tr td[data-label="Channel"]'),
+        surfaces: read('#denials-table tbody tr td[data-label="Surface"]'),
+      };
+    });
+    expect(labels.outcomes).toEqual(['Successful write', 'Owner mismatch', 'Encoding failed', 'Write failed']);
+    expect(labels.channels).toEqual([
+      'tg_updates', 'tg_typing', 'tg_evict', 'tg_channel_post', 'tg_encryption',
+      'tg_status', 'tg_encrypted_msg', 'tg_reactions', 'tg_pinned',
+    ]);
+    expect(labels.surfaces).toEqual([
+      'message_send', 'create_chat', 'add_chat_user', 'create_channel', 'messages_search',
+      'contacts_search', 'messages_search_global', 'save_file_part', 'upload_get_file',
+      'send_code_ip_calls', 'send_code_ip_distinct_numbers', 'sign_in_fail_ip',
+      'check_password', 'check_password_ip', 'get_password_ip', 'sign_up_ip',
+      'password_proof', 'get_password', 'update_profile',
+    ]);
+  });
+
+  test('renders exact push copy', async ({ page }) => {
+    await page.route('**/admin/events**', (route) => route.abort());
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    await expect(page.locator('#push-writes-card .dashboard-card-description')).toHaveText(
+      'Persisted account updates (tg_updates) only · successful connection writes.',
+    );
+  });
+
+  test('keeps dashboard reading semantics valid', async ({ page }) => {
+    await page.route('**/admin/events**', (route) => route.abort());
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const invalidChildren = await page.locator('dl.dashboard-reading').evaluateAll((readings) =>
+      readings.flatMap((reading) =>
+        Array.from(reading.children)
+          .filter((child) => child.tagName !== 'DT' && child.tagName !== 'DD')
+          .map((child) => child.tagName),
+      ),
+    );
+    expect(invalidChildren).toEqual([]);
+  });
+
+  test('320px viewport has no horizontal overflow', async ({ page }) => {
+    await page.route('**/admin/events**', (route) => route.abort());
+    await page.setViewportSize({ width: 320, height: 720 });
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const layout = await page.evaluate(() => ({
+      viewport: document.documentElement.clientWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      bodyWidth: document.body.scrollWidth,
+    }));
+    expect(layout.documentWidth).toBeLessThanOrEqual(layout.viewport + 1);
+    expect(layout.bodyWidth).toBeLessThanOrEqual(layout.viewport + 1);
+  });
+
+  test('dashboard follows light and dark theme preference', async ({ page }) => {
+    await page.route('**/admin/events**', (route) => route.abort());
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('html')).toHaveClass(/dark/);
+
+    await page.emulateMedia({ colorScheme: 'light' });
+    await page.reload();
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
+  });
+
+  test('sentinel values never reach the rendered dashboard', async ({ page }) => {
+    await page.route('**/admin/events**', (route) => route.abort());
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const text = await page.locator('body').innerText();
+    expect(text).not.toMatch(/\b(?:NaN|undefined|null)\b/);
+    expect(text).not.toMatch(/(?:^|\s)-1(?:$|\s)/);
+    expect(text).not.toContain('push_latency_bucket');
+    expect(text).not.toContain('unknown_metric');
+  });
+
+  test('keyboard focus order reaches skip link and controls', async ({ page }) => {
+    await page.route('**/admin/events**', (route) => route.abort());
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    await page.keyboard.press('Tab');
+    await expect(page.locator('a.skip')).toBeFocused();
+    expect(await page.locator('a.skip').evaluate((el) => el.matches(':focus-visible'))).toBe(true);
+
+    await page.keyboard.press('Tab');
+    await expect(page.locator('#refresh-btn')).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.locator('form.logout-form button')).toBeFocused();
+  });
+
+  test('200 percent zoom keeps the dashboard inside the viewport', async ({ page }) => {
+    await page.route('**/admin/events**', (route) => route.abort());
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    await page.evaluate(() => {
+      document.documentElement.style.zoom = '2';
+    });
+    const layout = await page.evaluate(() => ({
+      viewport: document.documentElement.clientWidth,
+      content: document.documentElement.scrollWidth,
+      refreshRight: document.getElementById('refresh-btn')?.getBoundingClientRect().right ?? 0,
+    }));
+    expect(layout.content).toBeLessThanOrEqual(layout.viewport + 1);
+    expect(layout.refreshRight).toBeLessThanOrEqual(layout.viewport);
+    await expect(page.locator('#refresh-btn')).toBeVisible();
+  });
+
+  test('reduced motion disables dashboard animation', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.route('**/admin/events**', (route) => route.abort());
+    await login(page);
+    await page.goto('/admin/dashboard');
+
+    const motion = await page.evaluate(() => {
+      const dot = document.querySelector('.chip-dot');
+      return {
+        dotAnimation: dot ? getComputedStyle(dot).animationName : '',
+      };
+    });
+    expect(motion.dotAnimation).toBe('none');
   });
 });
 
