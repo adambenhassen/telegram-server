@@ -88,7 +88,7 @@ These values are not rolling process counters:
 
 | JSON field | Classification and scope |
 |---|---|
-| `connections` | Live gauge: all open MTProto connections on this replica. |
+| `connections` | Live gauge: live authenticated MTProto connections on this replica. |
 | `sessions` | Live gauge: distinct authenticated accounts with at least one live connection on this replica. It is not a distinct fleet-account count. |
 | `max_pts_gap` | Live account-head spread: the maximum difference between `pts` heads for accounts with a live connection here. It is not connection delivery lag and is not a fallback for missing lag. With no live accounts it is zero. |
 | `total_users` | Shared database count of registered accounts. |
