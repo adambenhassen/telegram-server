@@ -151,7 +151,12 @@ The server refuses to start without a database and a master key:
 | `TG_REGISTRATION` | `closed` | Accepted values are `closed`, `invite`, and `open`; `closed` rejects `auth.signUp`, `invite` requires an operator-issued invite, and `open` admits usernames without one. An unrecognized value fails startup |
 | `TG_LOG_LOGIN_CODES` | `false` | Write phone-mode login codes to the log; with it off, phone-number sign-in cannot complete (username/password sign-in is unaffected) |
 | `TG_ADMIN_LISTEN_ADDR` | *(unset)* | Enables the admin HTTP server; requires `TG_ADMIN_TOKEN_HASH` (SHA-256 hex of the operator token) |
+| `TG_ADMIN_TOKEN_HASH` | *(unset)* | Lowercase SHA-256 hex digest of the admin token; must be set with `TG_ADMIN_LISTEN_ADDR` and never contains the raw token |
 | `TG_REPLICA_ID` | *(unset)* | Optional stable operator-supplied identity shown on authenticated admin metrics; 1–64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-` |
+
+The authenticated admin metrics contract, reset semantics, fleet aggregation
+rules, tracing posture, and operator runbook are in
+[`docs/observability.md`](docs/observability.md).
 
 ### Publish a client discovery document
 
@@ -287,13 +292,15 @@ make sqlc        # regenerate internal/store/db (alias: make generate)
 | `migrations/` | Atlas migration files + `atlas.sum` |
 | `test/e2e` | End-to-end suite: a real gotd client against a full server; `admin.spec.ts` + `adminserver` for the browser suite (config: `playwright.config.ts`) |
 | `tools/` | Separate Go module pinning the sqlc binary |
-| `docs/` | `clients.md` (connecting clients, sign-in flows, full config reference), `migrations.md`, `testing.md` |
+| `docs/` | `clients.md` (connecting clients, sign-in flows, full config reference), `observability.md`, `migrations.md`, `testing.md` |
 | `ROADMAP.md` | Milestone history and plans |
 
 ## Further reading
 
 - `docs/clients.md`: connecting a gotd client or a patched Telegram Desktop,
   the sign-in and sign-up flows, the complete configuration reference
+- `docs/observability.md`: authenticated admin metrics, M21 metric semantics,
+  fleet aggregation, tracing posture, and the operator runbook
 - `docs/migrations.md`: the Atlas workflow in detail
 - `docs/testing.md`: how the Postgres tests get a database, running inside
   containers
