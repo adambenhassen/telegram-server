@@ -35,6 +35,8 @@ var (
 	// past the budget, never inside it.
 	errMethodNotImplFlood = rpcErr(420, "FLOOD_WAIT_30")
 	errAuthKeyUnreg       = rpcErr(401, "AUTH_KEY_UNREGISTERED")
+	// errInputPeersEmpty rejects messages.getPeerDialogs without any peers.
+	errInputPeersEmpty = rpcErr(400, "INPUT_PEERS_EMPTY")
 	// errHashInvalid rejects account.resetAuthorization for a session hash that is
 	// not one of the caller's own auth keys, so a user cannot revoke another's.
 	errHashInvalid = rpcErr(400, "HASH_INVALID")

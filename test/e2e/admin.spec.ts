@@ -209,6 +209,12 @@ interface DisconnectRecord {
 declare global {
   interface Window {
     __disconnectRecord?: DisconnectRecord;
+    __heartbeatState?: {
+      heartbeats: number;
+      dataEvents: number;
+      disconnects: number;
+    };
+    __setSampleClock?: (value: number) => void;
   }
 }
 
@@ -319,6 +325,283 @@ test.describe('admin SSE stream', () => {
     await expect(page.locator('#storage-tbody tr').first()).toBeVisible();
     // The fragment carries the target id: merged into itself, never nested.
     await expect(page.locator('#metrics-stream #metrics-stream')).toHaveCount(0);
+  });
+
+  test('same-sample server age rebases the monotonic clock', async ({ page }) => {
+    await page.addInitScript(() => {
+      let sampleClock = 0;
+      Object.defineProperty(window, '__setSampleClock', {
+        value: (value: number) => {
+          sampleClock = value;
+        },
+      });
+      Object.defineProperty(performance, 'now', {
+        configurable: true,
+        value: () => sampleClock,
+      });
+    });
+    await page.route('**/admin/events', (route) => route.abort());
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    const freshness = await page.evaluate(() => {
+      const clock = window.__setSampleClock;
+      const stream = document.getElementById('metrics-stream');
+      const sseRoot = document.getElementById('sse-root');
+      const dataEvent = sseRoot?.getAttribute('data-sse-event');
+      if (!clock || !stream || !dataEvent) {
+        throw new Error('dashboard freshness test hooks are missing');
+      }
+
+      const emit = (type: string) => {
+        document.dispatchEvent(new CustomEvent('datastar-sse', {
+          detail: { type, elId: 'sse-root' },
+        }));
+      };
+
+      emit('started');
+      clock(0);
+      stream.setAttribute('data-sample-timestamp', '2099-09-14T12:00:00Z');
+      stream.setAttribute('data-sample-age-seconds', '10');
+      stream.setAttribute('data-sample-state', 'available');
+      emit(dataEvent);
+
+      clock(5000);
+      stream.setAttribute('data-sample-age-seconds', '20');
+      stream.setAttribute('data-sample-state', 'stale');
+      emit(dataEvent);
+
+      clock(10000);
+      emit(dataEvent);
+      return document.getElementById('chip-text')?.textContent ?? '';
+    });
+
+    // The accepted server age is 20s at monotonic time 5s. Rebased timing
+    // therefore reports 25s at time 10s; the old baseline reports 30s.
+    expect(freshness).toBe('● Stale · updated 25s ago');
+  });
+
+  test('replays after failure preserve stale freshness state and age', async ({ page }) => {
+    await page.addInitScript(() => {
+      let sampleClock = 0;
+      Object.defineProperty(window, '__setSampleClock', {
+        value: (value: number) => {
+          sampleClock = value;
+        },
+      });
+      Object.defineProperty(performance, 'now', {
+        configurable: true,
+        value: () => sampleClock,
+      });
+    });
+    await page.route('**/admin/events', (route) => route.abort());
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    const freshness = await page.evaluate(() => {
+      const clock = window.__setSampleClock;
+      const stream = document.getElementById('metrics-stream');
+      const sseRoot = document.getElementById('sse-root');
+      const dataEvent = sseRoot?.getAttribute('data-sse-event');
+      if (!clock || !stream || !dataEvent) {
+        throw new Error('dashboard freshness test hooks are missing');
+      }
+
+      const emit = (type: string) => {
+        document.dispatchEvent(new CustomEvent('datastar-sse', {
+          detail: { type, elId: 'sse-root' },
+        }));
+      };
+
+      emit('started');
+      clock(0);
+      stream.setAttribute('data-sample-timestamp', '2099-09-14T12:00:00Z');
+      stream.setAttribute('data-sample-age-seconds', '10');
+      stream.setAttribute('data-sample-state', 'available');
+      emit(dataEvent);
+
+      // A failed refresh retains the complete sample as stale.
+      clock(5000);
+      stream.setAttribute('data-sample-age-seconds', '20');
+      stream.setAttribute('data-sample-state', 'stale');
+      emit(dataEvent);
+
+      // An equal-timestamp replay may advance server age, but cannot recover
+      // freshness from the retained stale sample.
+      clock(10000);
+      stream.setAttribute('data-sample-age-seconds', '26');
+      stream.setAttribute('data-sample-state', 'available');
+      emit(dataEvent);
+      const equalReplay = document.getElementById('chip-text')?.textContent ?? '';
+
+      // An older replay cannot reset the timestamp or monotonic age baseline.
+      clock(15000);
+      stream.setAttribute('data-sample-timestamp', '2099-09-14T11:59:00Z');
+      stream.setAttribute('data-sample-age-seconds', '0');
+      stream.setAttribute('data-sample-state', 'available');
+      emit(dataEvent);
+      const oldReplay = document.getElementById('chip-text')?.textContent ?? '';
+
+      return { equalReplay, oldReplay };
+    });
+
+    expect(freshness).toEqual({
+      equalReplay: '● Stale · updated 26s ago',
+      oldReplay: '● Stale · updated 31s ago',
+    });
+  });
+
+  test('source identity notices distinguish restarts from source changes', async ({ page }) => {
+    await page.addInitScript(() => {
+      let sampleClock = 0;
+      Object.defineProperty(window, '__setSampleClock', {
+        value: (value: number) => {
+          sampleClock = value;
+        },
+      });
+      Object.defineProperty(performance, 'now', {
+        configurable: true,
+        value: () => sampleClock,
+      });
+    });
+    await page.route('**/admin/events', (route) => route.abort());
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    const notices = await page.evaluate(() => {
+      const clock = window.__setSampleClock;
+      const stream = document.getElementById('metrics-stream');
+      const sseRoot = document.getElementById('sse-root');
+      const dataEvent = sseRoot?.getAttribute('data-sse-event');
+      if (!clock || !stream || !dataEvent) {
+        throw new Error('dashboard freshness test hooks are missing');
+      }
+
+      const emit = (type: string) => {
+        document.dispatchEvent(new CustomEvent('datastar-sse', {
+          detail: { type, elId: 'sse-root' },
+        }));
+      };
+      const sample = (
+        clockValue: number,
+        timestamp: string,
+        age: string,
+        generation: string,
+        replica: string,
+      ) => {
+        clock(clockValue);
+        stream.setAttribute('data-sample-timestamp', timestamp);
+        stream.setAttribute('data-sample-age-seconds', age);
+        stream.setAttribute('data-sample-state', 'available');
+        stream.setAttribute('data-process-generation', generation);
+        stream.setAttribute('data-replica-id', replica);
+        emit(dataEvent);
+        return document.getElementById('chip-text')?.textContent ?? '';
+      };
+
+      emit('started');
+      sample(0, '2099-09-14T12:00:00Z', '10', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'edge-a');
+      const restart = sample(
+        1000,
+        '2099-09-14T12:00:01Z',
+        '11',
+        'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        'edge-a',
+      );
+      const swappedReplica = sample(
+        2000,
+        '2099-09-14T12:00:02Z',
+        '12',
+        'cccccccccccccccccccccccccccccccc',
+        'edge-b',
+      );
+      const nullReplica = sample(
+        3000,
+        '2099-09-14T12:00:03Z',
+        '13',
+        'dddddddddddddddddddddddddddddddd',
+        '',
+      );
+
+      return { restart, swappedReplica, nullReplica };
+    });
+
+    expect(notices).toEqual({
+      restart: '● Live · updated 11s ago · Restart detected',
+      swappedReplica: '● Live · updated 12s ago · Metrics source changed',
+      nullReplica: '● Live · updated 13s ago · Metrics source changed',
+    });
+  });
+
+  test('heartbeat-only aging marks the connected stream stale', async ({ page }) => {
+    await page.clock.install({ time: new Date('2099-09-14T12:00:00Z') });
+    await page.addInitScript(() => {
+      const state = { heartbeats: 0, dataEvents: 0, disconnects: 0 };
+      window.__heartbeatState = state;
+      document.addEventListener('datastar-sse', (event) => {
+        const type = (event as CustomEvent<{ type?: string }>).detail?.type;
+        if (type === 'datastar-merge-fragments') state.dataEvents++;
+        if (type === 'finished' || type === 'error') state.disconnects++;
+      });
+
+      const realFetch = window.fetch.bind(window);
+      window.fetch = async (input, init) => {
+        const inputURL = input instanceof Request ? input.url : input.toString();
+        const url = new URL(inputURL, window.location.href);
+        if (url.pathname !== '/admin/events') return realFetch(input, init);
+
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const encoder = new TextEncoder();
+            const sendHeartbeat = () => {
+              state.heartbeats++;
+              controller.enqueue(encoder.encode(': keepalive\n\n'));
+            };
+            sendHeartbeat();
+            const interval = window.setInterval(sendHeartbeat, 15_000);
+            init?.signal?.addEventListener(
+              'abort',
+              () => {
+                window.clearInterval(interval);
+                controller.close();
+              },
+              { once: true },
+            );
+          },
+        });
+        return new window.Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      };
+    });
+
+    await login(page);
+    await page.goto('/admin/dashboard');
+    await expect(page.locator('#v-connections')).toBeVisible();
+
+    // Advance only the browser clock. The response contains keepalive comments
+    // but never a data event, so the connected chip must age on its own timer.
+    await page.clock.fastForward(41_000);
+
+    const performanceNow = await page.evaluate(() => performance.now());
+    expect(performanceNow).toBeGreaterThan(40_000);
+    await expect(page.locator('#chip-text')).toHaveText(/^● Stale · updated \d+s ago$/);
+    await expect(page.locator('#banner-disconnected')).toBeHidden();
+
+    const state = await page.evaluate(() => {
+      if (!window.__heartbeatState) throw new Error('heartbeat test state is missing');
+      return window.__heartbeatState;
+    });
+    expect(state.heartbeats).toBeGreaterThan(1);
+    expect(state.dataEvents).toBe(0);
+    expect(state.disconnects).toBe(0);
   });
 
   // Criterion: the chip flips to its critical state when the stream ends and

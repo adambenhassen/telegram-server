@@ -40,11 +40,21 @@ func SetNotificationMetricsPushHooks(m *NotificationMetrics, beforeLatency func(
 	m.beforePushLatency = beforeLatency
 }
 
+// SetListenerRecorderHooks installs deterministic listener recorder outcomes
+// for tests. Production leaves the hooks nil and uses NotificationMetrics.
+func SetListenerRecorderHooks(l *Listener, valid func(string) error, invalid func() error) {
+	l.validNotificationRecorder = valid
+	l.invalidNotificationRecorder = invalid
+}
+
 // NotificationMetricsPushBucketSnapshot reads one bucket's push publication
 // state for the concurrent push snapshot tests.
 func NotificationMetricsPushBucketSnapshot(m *NotificationMetrics, second int64) (PushOutcomeCounts, [pushLatencyBucketCount]int64, bool) {
-	_, _, denials, outcomes, latencies, ok := m.buckets[notificationBucketIndex(second)].snapshot()
+	epoch, counts, denials, outcomes, latencies, failures, ok := m.buckets[notificationBucketIndex(second)].snapshot()
+	_ = epoch
+	_ = counts
 	_ = denials
+	_ = failures
 	return PushOutcomeCounts{
 		Success:       outcomes[PushOutcomeSuccess],
 		OwnerMismatch: outcomes[PushOutcomeOwnerMismatch],

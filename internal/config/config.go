@@ -51,8 +51,11 @@ type Config struct {
 	// AdminTokenHash is the hex-encoded SHA-256 digest of the operator token.
 	// Only set when AdminListenAddr is non-empty.
 	AdminTokenHash string
-	PostgresDSN    string
-	RSAKeyPath     string
+	// ReplicaID is the optional operator-supplied identity of this process's
+	// deployment instance. It is exposed only on authenticated admin metrics.
+	ReplicaID   string
+	PostgresDSN string
+	RSAKeyPath  string
 	// RegistrationMode controls whether auth.signUp is available.
 	RegistrationMode RegistrationMode
 	// AuthKeyEncKey is the 32-byte master key that encrypts auth keys at rest.
@@ -472,6 +475,7 @@ func Load(log *slog.Logger) (Config, error) {
 		WebSocketListenAddr:     os.Getenv("TG_WEBSOCKET_LISTEN_ADDR"),
 		WebSocketOriginPatterns: originPatterns,
 		AdminListenAddr:         os.Getenv("TG_ADMIN_LISTEN_ADDR"),
+		ReplicaID:               os.Getenv("TG_REPLICA_ID"),
 		PostgresDSN:             os.Getenv("TG_POSTGRES_DSN"),
 		RSAKeyPath:              identity.RSAKeyPath,
 		AdvertiseHost:           identity.AdvertiseHost,
@@ -502,6 +506,9 @@ func Load(log *slog.Logger) (Config, error) {
 		StatementTimeout: DefaultStatementTimeout,
 
 		RegistrationMode: RegistrationClosed,
+	}
+	if err := validateReplicaID(cfg.ReplicaID); err != nil {
+		return Config{}, err
 	}
 	if v := os.Getenv("TG_MAX_FILE_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -1636,6 +1643,15 @@ func decodeEncKey(raw, src string) ([]byte, error) {
 
 // adminHashRe matches a 64-character lowercase hex string (SHA-256 digest).
 var adminHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+var replicaIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+func validateReplicaID(replicaID string) error {
+	if replicaID != "" && !replicaIDRe.MatchString(replicaID) {
+		return errors.New("TG_REPLICA_ID must be 1-64 characters from [A-Za-z0-9._-]")
+	}
+	return nil
+}
 
 // validateAdmin checks that the admin server env vars are consistent.
 //

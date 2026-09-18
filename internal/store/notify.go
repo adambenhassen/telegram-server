@@ -101,6 +101,10 @@ type Listener struct {
 	// metrics is the only recorder accepted by StartListener. Its fixed
 	// in-process operation runs before the delivery callback.
 	metrics *NotificationMetrics
+	// These overrides exist only in package tests to inject recorder outcomes;
+	// production leaves them nil and uses the fixed metrics recorder above.
+	validNotificationRecorder   func(channel string) error
+	invalidNotificationRecorder func() error
 
 	// closeErr is the loop's final connection close error. The loop goroutine
 	// writes it before returning and stop reads it after wg.Wait, so the
@@ -397,32 +401,38 @@ func (l *Listener) dispatch(
 // recordValidNotification isolates the listener from recorder failures. A
 // recorder is telemetry only: an error or panic must not alter delivery.
 func (l *Listener) recordValidNotification(channel string) {
-	if l.metrics != nil {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				return
-			}
-		}()
-		if err := l.metrics.RecordValidNotification(channel); err != nil {
-			return
-		}
+	if l.metrics == nil && l.validNotificationRecorder == nil {
 		return
+	}
+	var failed bool
+	if l.validNotificationRecorder != nil {
+		failed = InvokeRecorder(func() error { return l.validNotificationRecorder(channel) })
+	} else {
+		failed = InvokeRecorder(func() error {
+			return l.metrics.RecordValidNotification(channel)
+		})
+	}
+	if failed {
+		ReportRecorderFailure(l.log, l.metrics, RecorderFailureNotification)
 	}
 }
 
 // recordInvalidNotification isolates malformed-input accounting from the
 // listener. Invalid notifications carry no channel or payload to telemetry.
 func (l *Listener) recordInvalidNotification() {
-	if l.metrics != nil {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				return
-			}
-		}()
-		if err := l.metrics.RecordInvalidNotification(); err != nil {
-			return
-		}
+	if l.metrics == nil && l.invalidNotificationRecorder == nil {
 		return
+	}
+	var failed bool
+	if l.invalidNotificationRecorder != nil {
+		failed = InvokeRecorder(func() error { return l.invalidNotificationRecorder() })
+	} else {
+		failed = InvokeRecorder(func() error {
+			return l.metrics.RecordInvalidNotification()
+		})
+	}
+	if failed {
+		ReportRecorderFailure(l.log, l.metrics, RecorderFailureNotification)
 	}
 }
 

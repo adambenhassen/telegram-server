@@ -510,6 +510,16 @@ func GetDialogsPageForTest(s *store.Store, userID int64, req *tg.MessagesGetDial
 	return testHandlers(s).handleGetDialogs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// GetPeerDialogsForTest encodes req and invokes handleGetPeerDialogs for the
+// caller.
+func GetPeerDialogsForTest(s *store.Store, userID int64, req *tg.MessagesGetPeerDialogsRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetPeerDialogs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // ReadHistoryForTest encodes req and invokes handleReadHistory for the caller.
 func ReadHistoryForTest(s *store.Store, userID int64, req *tg.MessagesReadHistoryRequest) (bin.Encoder, error) {
 	var buf bin.Buffer

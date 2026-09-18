@@ -52,6 +52,7 @@ Configuration is read from environment variables in `internal/config/config.go`:
 | `TG_RATE_LIMIT_DISCOVERY_IP_WINDOW` | `1m` | Fixed window for the per-network discovery bound; it must be positive while that bound is enabled |
 | `TG_LOG_LOGIN_CODES`| `false`          | Write issued login codes to the log in cleartext. Off by default; with it off no code is delivered anywhere and sign-in cannot complete. A non-boolean value fails startup |
 | `TG_REGISTRATION`   | `closed`         | Accepted values are `closed`, `invite`, and `open`. `closed` rejects `auth.signUp`, `invite` requires an operator-issued invite, and `open` admits usernames without one. An unrecognized value fails startup. Sign-in for accounts that already exist is unaffected by this setting |
+| `TG_REPLICA_ID`     | *(unset)*        | Optional stable operator-supplied identity shown on authenticated admin metrics; 1–64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-` |
 | `TG_RATE_LIMIT_GET_FILE` | `50` | Per-account `upload.getFile` calls in one fixed window. `0` disables this bound; a negative or non-integer value fails startup |
 | `TG_RATE_LIMIT_GET_FILE_WINDOW` | `1s` | Window for the per-account `upload.getFile` bound. It must be positive while that bound is enabled; an invalid or negative duration fails startup |
 | `TG_RATE_LIMIT_GET_FILE_REPLICA` | `400` | Process-local aggregate `upload.getFile` calls across all accounts in one fixed window. `0` disables this bound; it resets on replica restart and is not a cluster-wide quota. A negative or non-integer value fails startup |
@@ -69,6 +70,13 @@ When `TG_WEBSOCKET_LISTEN_ADDR` is set, configure
 `/apiws`. Requests without an `Origin` header remain valid for native clients;
 requests carrying one are rejected unless it matches the configured list.
 Keep this listener within the intended network boundary.
+
+Before asking for registration details, an unauthenticated client may call
+`help.getAppConfig`. The `help.appConfig` response keeps its standard TL shape;
+its JSON object contains a `registration_mode` string with one of `closed`,
+`invite`, or `open`. The value is the running server configuration, and the
+field is an extension to the JSON object, so clients that do not read it can
+continue to ignore it. This call is also available to provisional sessions.
 
 ### Static enrollment discovery and local preflight
 
@@ -387,12 +395,13 @@ Both admission modes use the same account-creation flow:
 ```
 
 After step 3 the session is in provisional state: only `help.getConfig`,
-`account.getPassword`, `account.updatePasswordSettings`, and `auth.logOut` may
-be called. Every other RPC returns `AUTH_KEY_UNREGISTERED` until step 4
-completes. If the client disconnects before step 4, the account remains
-provisional and the next sign-in attempt (section 5a step 2) will fail with an
-internal error — the only exits are `account.updatePasswordSettings` to set the
-password, or `auth.logOut` to remove the key.
+`help.getAppConfig`, `account.getPassword`, `account.updatePasswordSettings`,
+and `auth.logOut` may be called. Every other RPC returns
+`AUTH_KEY_UNREGISTERED` until step 4 completes. If the client disconnects
+before step 4, the account remains provisional and the next sign-in attempt
+(section 5a step 2) will fail with an internal error — the only exits are
+`account.updatePasswordSettings` to set the password, or `auth.logOut` to
+remove the key.
 
 A username that already exists continues to return `USERNAME_OCCUPIED` from
 `auth.signUp`. There is no re-registration path: once a username is claimed it

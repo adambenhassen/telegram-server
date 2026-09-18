@@ -71,6 +71,12 @@ type Store struct {
 	// Scoped to the Store for the reason searchPageHook is.
 	deleteWalkHook func()
 
+	// peerDialogsSnapshotHook is a test-only callback fired after the
+	// messages.getPeerDialogs transaction starts and before its first read. It
+	// gives concurrency tests a deterministic point to commit a membership
+	// change before selection and hydration use the snapshot.
+	peerDialogsSnapshotHook func()
+
 	// eraseHook is a test-only callback fired in SweepMediaErasure between the
 	// scan that names a candidate and the transaction that erases it, carrying
 	// the file id. That gap is where every race this pass has to survive lands —

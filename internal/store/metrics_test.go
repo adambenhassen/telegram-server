@@ -53,6 +53,31 @@ func TestMetrics_Empty(t *testing.T) {
 	}
 }
 
+func TestMetricsOptionalEstimateFailureUsesUnavailableSentinel(t *testing.T) {
+	t.Parallel()
+
+	s := open(t)
+	ctx := context.Background()
+	pool := store.StorePool(s)
+	if _, err := pool.Exec(ctx, `ALTER TABLE files RENAME TO files_hidden`); err != nil {
+		t.Fatalf("hide optional estimate table: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `ALTER TABLE files_hidden RENAME TO files`) //nolint:errcheck // best-effort test cleanup
+	})
+
+	snap, err := s.Metrics(ctx)
+	if err != nil {
+		t.Fatalf("metrics with optional estimate failure: %v", err)
+	}
+	if snap.StorageRows.Files >= 0 {
+		t.Fatalf("failed files estimate = %d, want negative unavailable sentinel", snap.StorageRows.Files)
+	}
+	if snap.StorageRows.Users != 0 || snap.StorageRows.Channels != 0 || snap.StorageRows.Chats != 0 {
+		t.Fatalf("exact zero counts lost their meaning: users=%d channels=%d chats=%d", snap.StorageRows.Users, snap.StorageRows.Channels, snap.StorageRows.Chats)
+	}
+}
+
 func TestMetrics_WithUsers(t *testing.T) {
 	t.Parallel()
 
