@@ -74,10 +74,13 @@ type BootstrapResult struct {
 // BootstrapAccount creates the first username-mode operator account, or verifies
 // that an existing one matches the bootstrap credential.
 //
-// It performs three writes in a single transaction:
+// It performs all account-creation writes in a single transaction:
 //  1. INSERT users (username-mode, no phone)
 //  2. INSERT usernames (claim the handle)
-//  3. INSERT user_passwords (SRP verifier)
+//  3. UPDATE users.username (denormalized handle)
+//  4. INSERT update_state (account state, if absent)
+//  5. UPSERT user_passwords (SRP verifier)
+//  6. Lock and conditionally update server_administration (administrator election)
 //
 // If the username already exists, it checks for an idempotent match by running
 // a real SRP round trip against the stored verifier.
@@ -169,6 +172,9 @@ func (s *Store) BootstrapAccount(ctx context.Context, p BootstrapParams) (Bootst
 	})
 	if err != nil {
 		return BootstrapResult{}, fmt.Errorf("upsert password: %w", err)
+	}
+	if err := s.electServerAdministrator(ctx, qtx, u.ID); err != nil {
+		return BootstrapResult{}, fmt.Errorf("bootstrap election: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
