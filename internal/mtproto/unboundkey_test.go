@@ -308,6 +308,11 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	sendFrame(t, ctx, connA, keys.key, 100, int64(2)<<32)
 	wantRequests(t, seen, 1)
 
+	// A's next frame is an ordering barrier: the server cannot dispatch it until
+	// the previous frame's post-dispatch binding re-read has released A's slot.
+	sendFrame(t, ctx, connA, keys.key, 100, int64(3)<<32)
+	wantRequests(t, seen, 1)
+
 	// 3. The binding is now removed, so a new connection can take the released
 	// slot. If charge used the pre-dispatch userID of 0, A would still occupy it.
 	keys.bind(0)
