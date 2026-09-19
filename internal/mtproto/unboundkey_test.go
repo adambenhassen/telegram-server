@@ -278,19 +278,39 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
 	keys := newSignInStore()
 	seen := make(chan struct{}, 64)
+	thirdReady := make(chan struct{})
+	thirdRelease := make(chan struct{})
+	thirdDone := make(chan struct{})
+	bSeen := make(chan struct{})
 
 	// Handler binds on the second request only. The first fills the cap while
 	// unbound; the second binds that already-charged connection mid-dispatch.
+	// The third request waits in the handler so B can be attempted after the
+	// second frame's post-dispatch charge, but before the third frame's charge.
 	var reqCount int
 	mu := sync.Mutex{}
-	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, _ *mtproto.Request) error {
+	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, req *mtproto.Request) error {
 		mu.Lock()
 		reqCount++
-		if reqCount == 2 {
+		request := reqCount
+		mu.Unlock()
+		switch request {
+		case 2:
 			// Second request: bind the key during dispatch.
 			keys.bind(7)
+		case 3:
+			// The server cannot reach this handler until frame 2's
+			// post-dispatch charge has completed. Keep frame 3 from charging
+			// itself until B has tested the released slot.
+			close(thirdReady)
+			select {
+			case <-thirdRelease:
+			case <-req.Ctx.Done():
+			}
+			close(thirdDone)
+		case 4:
+			close(bSeen)
 		}
-		mu.Unlock()
 		select {
 		case seen <- struct{}{}:
 		default:
@@ -311,13 +331,17 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	// A's next frame is an ordering barrier: the server cannot dispatch it until
 	// the previous frame's post-dispatch binding re-read has released A's slot.
 	sendFrame(t, ctx, connA, keys.key, 100, int64(3)<<32)
-	wantRequests(t, seen, 1)
+	wantSignal(t, thirdReady, "A's third frame")
 
-	// 3. The binding is now removed, so a new connection can take the released
-	// slot. If charge used the pre-dispatch userID of 0, A would still occupy it.
+	// 3. The binding is now removed while A's third frame is still in its
+	// handler, so a new connection can take the released slot. If frame 2's
+	// post-dispatch charge used the pre-dispatch userID of 0, A still occupies
+	// it and B never reaches its handler.
 	keys.bind(0)
 	rawB, connB := keyClient(t, ctx, addr, keys.key, 200)
-	wantRequests(t, seen, 1)
+	wantSignal(t, bSeen, "connection B's first frame")
+	close(thirdRelease)
+	wantSignal(t, thirdDone, "A's third frame completion")
 	if closedByServer(t, rawB, 2*time.Second) {
 		t.Fatal("connection did not take the slot released by the same-frame bind")
 	}
@@ -483,6 +507,17 @@ func wantRequests(t *testing.T, seen <-chan struct{}, n int) {
 		case <-time.After(15 * time.Second):
 			t.Fatalf("only %d of %d frames reached the handler", i, n)
 		}
+	}
+}
+
+// wantSignal waits for a named test transition, bounded so a connection the
+// server dropped fails the test rather than running it out.
+func wantSignal(t *testing.T, signal <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("%s did not reach the handler", what)
 	}
 }
 
