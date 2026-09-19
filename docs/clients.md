@@ -409,30 +409,11 @@ A username that already exists continues to return `USERNAME_OCCUPIED` from
 `auth.signUp`. There is no re-registration path: once a username is claimed it
 cannot be reclaimed by starting a new sign-up flow.
 
-### 5c. Seed account at startup (TG_BOOTSTRAP_USERNAME)
-
-`TG_BOOTSTRAP_USERNAME` and `TG_BOOTSTRAP_PASSWORD` (or `TG_BOOTSTRAP_PASSWORD_FILE`)
-create a fully provisioned username-mode operator account before the server binds
-its port, bypassing the registration flow entirely. This is the recommended way
-to create the first account on a server running in `closed` mode.
-
-```bash
-TG_BOOTSTRAP_USERNAME=operator \
-TG_BOOTSTRAP_PASSWORD=<at-least-12-chars> \
-  ./telegramd
-```
-
-The operation is idempotent: if the username already exists as a user-type account
-with `login_mode='username'` and the stored verifier matches the supplied password,
-startup succeeds without modifying anything. It does not rotate passwords: if the
-password in the environment differs from the one stored, startup fails. To change
-a bootstrap account's password, update it through `account.updatePasswordSettings`
-and then update the env var to match.
-
-`TG_BOOTSTRAP_PASSWORD` places the cleartext password in the process environment
-for the life of the process — visible via `/proc/self/environ`, orchestrator
-inspect output, and crash dumps. Use `TG_BOOTSTRAP_PASSWORD_FILE` pointing to a
-mode-0600 file in production environments.
+On a fresh database, use `TG_REGISTRATION=open` for the first account, complete
+this flow, and then restart with `TG_REGISTRATION=closed`. The first account
+committed by the admission transaction becomes the durable server administrator.
+After that, `invite` mode provides single-use operator-issued admission without
+changing the account-creation flow.
 
 ## 6. Telegram Desktop, patched
 

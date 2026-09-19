@@ -769,16 +769,9 @@ Tracked so shortcuts don't rot into "later means never".
   `invite` mode requires an operator-issued invite; and `open` mode admits usernames without
   one. Sign-in for accounts that already exist is unaffected. An unrecognized value fails
   startup.
-- **`TG_BOOTSTRAP_USERNAME` / `TG_BOOTSTRAP_PASSWORD`** (or `TG_BOOTSTRAP_PASSWORD_FILE`).
-  Creates a seed username-mode account with a verifier before the server binds its port.
-  Idempotent when the username already exists, is a user-type owner with `login_mode='username'`,
-  and the stored verifier SRP-verifies against the supplied password; otherwise fails startup.
-  Does not rotate passwords: changing `TG_BOOTSTRAP_PASSWORD` on an existing account fails
-  startup until the value is restored or the credential is updated through the application.
-  Password must be at least 12 bytes. Warning: `TG_BOOTSTRAP_PASSWORD` places the cleartext
-  password in the process environment and retains it for the process lifetime; use
-  `TG_BOOTSTRAP_PASSWORD_FILE` (mode 0600) in any environment where `/proc/self/environ` or
-  orchestrator inspect output is visible to untrusted parties.
+- First-account authority is elected durably by the database singleton as part of
+  the normal account-admission transaction. Startup does not create, verify, or
+  modify an account from environment values.
 - New rate-limit env vars (defaults apply; `0` disables a surface):
   - `TG_RATE_LIMIT_CHECK_PASSWORD` / `_WINDOW` — failed `auth.checkPassword` SRP proofs per
     account (default 5/10 min). Charged only on failures; a valid proof is never charged.
