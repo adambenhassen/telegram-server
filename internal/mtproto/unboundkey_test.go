@@ -342,6 +342,9 @@ func TestUnboundKeyCapBindDuringDispatchAtFullCap(t *testing.T) {
 	wantSignal(t, bSeen, "connection B's first frame")
 	close(thirdRelease)
 	wantSignal(t, thirdDone, "A's third frame completion")
+	// Drain the handler signals for B's first frame and A's blocked third
+	// frame before using seen to verify B's final frame.
+	wantRequests(t, seen, 2)
 	if closedByServer(t, rawB, 2*time.Second) {
 		t.Fatal("connection did not take the slot released by the same-frame bind")
 	}
