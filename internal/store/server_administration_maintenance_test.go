@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -160,6 +161,17 @@ func TestAssignOperatorServerAdministratorRejectsUsernameAmbiguity(t *testing.T)
 					UPDATE usernames SET owner_id = 999999999 WHERE handle = 'operator'
 				`); err != nil {
 					t.Fatalf("make dangling owner: %v", err)
+				}
+			},
+		},
+		{
+			name: "missing operator row",
+			mutate: func(t *testing.T, s *store.Store, _ int64) {
+				t.Helper()
+				if _, err := store.StorePool(s).Exec(context.Background(), `
+					DELETE FROM usernames WHERE handle = 'operator'
+				`); err != nil {
+					t.Fatalf("delete operator username: %v", err)
 				}
 			},
 		},
@@ -352,6 +364,77 @@ func TestConcurrentAssignOperatorServerAdministrator(t *testing.T) {
 	}
 	if ok, err := s.IsServerAdministrator(ctx, operatorID); err != nil || !ok {
 		t.Fatalf("operator administrator after concurrent assignment: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestAssignOperatorServerAdministratorSerializesConcurrentUserCreation(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	seedOperator(t, s)
+
+	// Hold the update_state relation so CreateUsernameUser has inserted its
+	// user, but cannot reach the election row yet. The maintenance transaction
+	// must wait on that transaction's users-table lock before it can decide that
+	// exactly one user exists.
+	blocker, err := store.StorePool(s).Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin update-state blocker: %v", err)
+	}
+	defer func() { _ = blocker.Rollback(context.Background()) }() //nolint:errcheck // cleanup after explicit release
+	if _, err := blocker.Exec(ctx, `LOCK TABLE update_state IN SHARE MODE`); err != nil {
+		t.Fatalf("lock update_state: %v", err)
+	}
+
+	createDone := make(chan error, 1)
+	go func() {
+		_, err := s.CreateUsernameUser(ctx, "racer", "Racer", "")
+		createDone <- err
+	}()
+	waitForMaintenanceLocks := func(n int) error {
+		waitCtx, cancelWait := context.WithTimeout(ctx, 3*time.Second)
+		defer cancelWait()
+		return store.WaitForLockWaiters(waitCtx, s, n)
+	}
+	if err := waitForMaintenanceLocks(1); err != nil {
+		_ = blocker.Rollback(context.Background()) //nolint:errcheck // release before reporting the setup failure
+		t.Fatalf("CreateUsernameUser did not reach its blocked election step: %v", err)
+	}
+
+	assignDone := make(chan error, 1)
+	go func() { assignDone <- s.AssignOperatorServerAdministrator(ctx) }()
+	if err := waitForMaintenanceLocks(2); err != nil {
+		_ = blocker.Rollback(context.Background()) //nolint:errcheck // release before collecting goroutines
+		createErr := <-createDone
+		assignErr := <-assignDone
+		t.Fatalf("maintenance did not wait for the in-flight user insert: %v (create=%v assign=%v)", err, createErr, assignErr)
+	}
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("release update-state blocker: %v", err)
+	}
+	if err := <-createDone; err != nil {
+		t.Fatalf("concurrent user creation: %v", err)
+	}
+	if err := <-assignDone; !errors.Is(err, store.ErrOperatorAdministrationInvalid) {
+		t.Fatalf("assignment with concurrent user creation: err=%v, want ErrOperatorAdministrationInvalid", err)
+	}
+
+	var users int
+	var administratorID *int64
+	if err := store.StorePool(s).QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM users), administrator_user_id
+		FROM server_administration
+		WHERE singleton_id = 1
+	`).Scan(&users, &administratorID); err != nil {
+		t.Fatalf("read post-race state: %v", err)
+	}
+	if users != 2 {
+		t.Fatalf("users after rejected assignment = %d, want 2", users)
+	}
+	if administratorID != nil {
+		t.Fatalf("administrator after rejected assignment = %d, want nil", *administratorID)
 	}
 }
 
