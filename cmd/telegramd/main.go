@@ -61,6 +61,8 @@ func runCommand(args []string, log *slog.Logger, stdout, stderr io.Writer) error
 		return run(log)
 	case args[0] == "invite":
 		return runInviteCommand(args[1:], log, stdout, stderr)
+	case args[0] == "maintenance":
+		return runMaintenanceCommand(args[1:], log, stdout, stderr)
 	case args[0] == "client-config":
 		if len(args) == 2 && slices.Contains(args[1:], "--help") {
 			return writeClientConfigUsage(stdout)
@@ -72,6 +74,46 @@ func runCommand(args []string, log *slog.Logger, stdout, stderr io.Writer) error
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runMaintenanceCommand(args []string, log *slog.Logger, _ io.Writer, stderr io.Writer) (err error) {
+	if len(args) != 1 || args[0] != "assign-operator" {
+		return maintenanceUsageError()
+	}
+
+	cfg, err := config.Load(log)
+	if err != nil {
+		return err
+	}
+
+	// Maintenance commands deliberately do not validate TG_REGISTRATION or
+	// initialize any of the server's listeners, keys, blob backends, or sweeps.
+	ctx := context.Background()
+	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey,
+		store.WithLogger(log),
+		store.WithStatementTimeout(cfg.StatementTimeout),
+		store.WithoutBlobStore(),
+	)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer func() {
+		if closeErr := st.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close store: %w", closeErr))
+		}
+	}()
+
+	if err := st.AssignOperatorServerAdministrator(ctx); err != nil {
+		return fmt.Errorf("assign operator server administrator: %w", err)
+	}
+	if _, err := fmt.Fprintln(stderr, "Operator server administrator assigned"); err != nil {
+		return fmt.Errorf("write maintenance confirmation: %w", err)
+	}
+	return nil
+}
+
+func maintenanceUsageError() error {
+	return errors.New("usage: telegramd maintenance assign-operator")
 }
 
 func writeClientConfigUsage(w io.Writer) error {

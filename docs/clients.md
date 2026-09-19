@@ -415,6 +415,23 @@ committed by the admission transaction becomes the durable server administrator.
 After that, `invite` mode provides single-use operator-issued admission without
 changing the account-creation flow.
 
+### 5c. Promote an existing operator after the administration migration
+
+When applying the server-administration migration to a non-empty deployment,
+the existing account remains unchanged and the durable administrator grant is
+left unassigned. Run this one-shot local maintenance command with the same
+database and encryption-key environment as the deployment:
+
+```bash
+./telegramd maintenance assign-operator
+```
+
+The command takes no user ID. It succeeds only when the database contains
+exactly one canonical username-mode `operator` account with one readable
+verifier and a closed, unassigned administration singleton. A retry after a
+successful assignment is a no-op; account, username, and verifier data are
+never created or changed.
+
 ## 6. Telegram Desktop, patched
 
 Stock Telegram Desktop has no user-facing way to change either the DC address
