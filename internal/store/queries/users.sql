@@ -1,3 +1,14 @@
+-- name: InsertUser :one
+INSERT INTO users (phone)
+VALUES ($1)
+ON CONFLICT (phone) WHERE phone IS NOT NULL DO NOTHING
+RETURNING id;
+
+-- name: CreateUsernameUser :one
+INSERT INTO users (phone, login_mode, first_name, last_name)
+VALUES (NULL, 'username', $1, $2)
+RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at;
+
 -- Every query that loads a user reads the handle from the usernames row, never
 -- from the denormalized users.username column. The two are written in one
 -- transaction today, but only the usernames row is authoritative: it is what
@@ -6,22 +17,6 @@
 -- is a nested loop on usernames_owner_idx (owner_type, owner_id), 0.11 ms for a
 -- user lookup against 200k handles, so the hot per-peer read pays an index
 -- probe rather than the copy's zero.
-
--- name: CreateUser :one
-WITH upserted AS (
-    INSERT INTO users (phone) VALUES ($1)
-    ON CONFLICT (phone) WHERE phone IS NOT NULL DO UPDATE SET phone = EXCLUDED.phone
-    RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at
-)
-SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
-       un.handle AS username
-FROM upserted u
-LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id;
-
--- name: CreateUsernameUser :one
-INSERT INTO users (phone, login_mode, first_name, last_name)
-VALUES (NULL, 'username', $1, $2)
-RETURNING id, phone, first_name, last_name, created_at, is_online, last_seen_at;
 
 -- name: UserByPhone :one
 SELECT u.id, u.phone, u.first_name, u.last_name, u.created_at, u.is_online, u.last_seen_at,
@@ -163,5 +158,3 @@ LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = u.id
 WHERE u.id IN (SELECT id FROM matched)
 ORDER BY u.id
 LIMIT sqlc.arg(lim)::int;
-
-
