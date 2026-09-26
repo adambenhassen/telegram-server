@@ -2,7 +2,6 @@ package api
 
 import (
 	"errors"
-	"regexp"
 	"strings"
 
 	"github.com/gotd/td/bin"
@@ -128,9 +127,9 @@ var reservedUsernames = map[string]bool{
 	"signup":   true,
 }
 
-// usernameRe validates a non-empty username: 5–32 chars, ASCII letters/digits/
-// underscore, first char must be a letter.
-var usernameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{4,31}$`)
+func isReservedUsername(username string) bool {
+	return reservedUsernames[strings.ToLower(username)]
+}
 
 // handleUpdateUsername serves account.updateUsername. An authenticated caller
 // sets or clears their own username.
@@ -151,11 +150,10 @@ func (h *handlers) handleUpdateUsername(r *mtproto.Request) (bin.Encoder, error)
 	username := req.Username
 	// Non-empty usernames must pass validation before any DB access.
 	if username != "" {
-		if !usernameRe.MatchString(username) {
+		if !validateUsername(username) {
 			return nil, errUsernameInvalid
 		}
-		normalized := strings.ToLower(username)
-		if reservedUsernames[normalized] {
+		if isReservedUsername(username) {
 			return nil, errUsernameInvalid
 		}
 	}
