@@ -704,8 +704,15 @@ func ResolveUsernameForTest(s *store.Store, userID int64, req *tg.ContactsResolv
 
 // GetUsersForTest invokes handleGetUsers for the caller.
 func GetUsersForTest(s *store.Store, userID int64) (bin.Encoder, error) {
+	return GetUsersForTestWithRequest(s, userID, &tg.UsersGetUsersRequest{
+		ID: []tg.InputUserClass{&tg.InputUserSelf{}},
+	})
+}
+
+// GetUsersForTestWithRequest invokes handleGetUsers with the requested input users.
+func GetUsersForTestWithRequest(s *store.Store, userID int64, req *tg.UsersGetUsersRequest) (bin.Encoder, error) {
 	var buf bin.Buffer
-	if err := (&tg.UsersGetUsersRequest{}).Encode(&buf); err != nil {
+	if err := req.Encode(&buf); err != nil {
 		return nil, err
 	}
 	return testHandlers(s).handleGetUsers(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})

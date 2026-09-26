@@ -386,11 +386,10 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	}, nil
 }
 
-// handleGetUsers serves users.getUsers. The request's auth key is resolved to a
-// bound user (req.UserID); an unbound key (0) is reported as unregistered, which
-// the client treats as "not logged in" and starts the auth flow. A bound key
-// returns the account, so a client keeps its authorization across reconnects and
-// server restarts without a new handshake.
+// handleGetUsers serves users.getUsers. Each requested input user must carry a
+// reference authorized for this viewer before any account rows are read. The
+// per-viewer hash is the authorization: a reference returned by search can be
+// refreshed before a dialog exists, while a bare id cannot enumerate users.
 func (h *handlers) handleGetUsers(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.UsersGetUsersRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -399,15 +398,44 @@ func (h *handlers) handleGetUsers(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	user, ok, err := h.store.UserByID(r.Ctx, r.UserID)
+	if len(req.ID) > maxPeerDialogs {
+		return nil, errLimitInvalid
+	}
+
+	ids := make([]int64, len(req.ID))
+	uniqueIDs := make([]int64, 0, len(req.ID))
+	seen := make(map[int64]bool, len(req.ID))
+	for i, input := range req.ID {
+		id, err := h.inputUserID(input, r.UserID)
+		if err != nil {
+			return nil, err
+		}
+		ids[i] = id
+		if !seen[id] {
+			seen[id] = true
+			uniqueIDs = append(uniqueIDs, id)
+		}
+	}
+
+	users, err := h.store.UsersByID(r.Ctx, uniqueIDs)
 	if err != nil {
-		h.log.Error("get users: load user", "user_id", r.UserID, "err", err)
+		h.log.Error("get users: load requested users", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	if !ok {
-		return nil, errAuthKeyUnreg
+	if seen[r.UserID] {
+		if _, ok := users[r.UserID]; !ok {
+			return nil, errAuthKeyUnreg
+		}
 	}
-	return &tg.UserClassVector{Elems: []tg.UserClass{
-		h.userToTL(user, r.UserID, true),
-	}}, nil
+
+	out := make([]tg.UserClass, len(ids))
+	for i, id := range ids {
+		user, ok := users[id]
+		if !ok {
+			out[i] = &tg.UserEmpty{ID: id}
+			continue
+		}
+		out[i] = h.userToTL(user, r.UserID, id == r.UserID)
+	}
+	return &tg.UserClassVector{Elems: out}, nil
 }
