@@ -207,7 +207,6 @@ func TestSavedMessagesPeerAuthorizationIsSessionBound(t *testing.T) {
 	} {
 		peer := &tg.InputPeerUser{UserID: a.ID, AccessHash: tc.hash}
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
 			_, err := api.SendMessageForTest(s, b.ID, &tg.MessagesSendMessageRequest{
 				Peer: peer, Message: "forbidden", RandomID: 4922,
 			})
