@@ -191,11 +191,11 @@ func (s *Server) dispatchRPC(c *Conn, req *Request) error {
 		// not fatal to the connection: the client gets the same generic INTERNAL
 		// any transient failure produces, and the next frame on this socket
 		// starts a fresh request with a full budget. The underlying error still
-		// goes to the log first — a defect that happens to coincide with the
-		// timeout must leave a trace — and the reply write detaches from the
-		// spent request context inside SendResult.
+		// is recorded as a sampled request-handling category without exposing its
+		// details, and the reply write detaches from the spent request context
+		// inside SendResult.
 		if errors.Is(req.Ctx.Err(), context.DeadlineExceeded) {
-			s.log.Error("rpc abandoned at request deadline", "err", err)
+			s.logServerFailure(serverFailureRequest)
 			return c.SendErr(req, errInternalRPC)
 		}
 		return err

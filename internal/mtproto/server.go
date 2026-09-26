@@ -60,7 +60,10 @@ const (
 )
 
 var (
-	errAuthKeyLookupFailure = errors.New("auth key lookup failed")
+	errAuthKeyLookupFailure      = errors.New("auth key lookup failed")
+	errAuthKeyPersistenceFailure = errors.New("auth key persistence failed")
+	errAuthKeyExchangeFailure    = errors.New("auth key exchange failed")
+	errRequestHandlingFailure    = errors.New("request handling failed")
 )
 
 type authKeyNotFoundReason string
@@ -68,6 +71,14 @@ type authKeyNotFoundReason string
 const (
 	authKeyLookupMiss        authKeyNotFoundReason = "lookup_miss"
 	authKeyExchangeNonzeroID authKeyNotFoundReason = "exchange_nonzero_id"
+)
+
+type serverFailureCategory string
+
+const (
+	serverFailureKeyPersistence serverFailureCategory = "key_persistence"
+	serverFailureExchange       serverFailureCategory = "exchange"
+	serverFailureRequest        serverFailureCategory = "request_handling"
 )
 
 // Server is an MTProto server: it accepts transport connections, performs key
@@ -133,10 +144,12 @@ type Server struct {
 	// A failed store lookup may include an at-rest decryption error. Report the
 	// lookup failure without exposing the underlying storage or cipher error.
 	authKeyLookupErrorLog logSampler
-	// Handler failures may include errors from parsing untrusted frames or RPC
-	// bodies. Keep these generic and sampled so neither secrets nor peer-driven
-	// error volume reaches the logs.
-	connectionHandlerLog logSampler
+	// Keep each server-side failure class sampled independently. The category
+	// names are fixed; raw storage, exchange, and request errors may carry secrets
+	// or attacker-controlled data and never reach these log records.
+	keyPersistenceErrorLog  logSampler
+	exchangeErrorLog        logSampler
+	requestHandlingErrorLog logSampler
 	// Keep the two server-generated -404 paths independently sampled across all
 	// connections handled by this server.
 	lookupMissLog        logSampler
@@ -479,10 +492,38 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 				s.log.Info("auth key lookup failed", "suppressed", dropped)
 			}
 		default:
-			if dropped, ok := s.connectionHandlerLog.allow(time.Now(), preAuthLogInterval); ok {
-				s.log.Info("connection handler error", "suppressed", dropped)
-			}
+			s.logConnectionFailure(err)
 		}
+	}
+}
+
+func (s *Server) logConnectionFailure(err error) {
+	category := serverFailureRequest
+	switch {
+	case errors.Is(err, errAuthKeyPersistenceFailure):
+		category = serverFailureKeyPersistence
+	case errors.Is(err, errAuthKeyExchangeFailure):
+		category = serverFailureExchange
+	case errors.Is(err, errRequestHandlingFailure):
+		category = serverFailureRequest
+	}
+	s.logServerFailure(category)
+}
+
+func (s *Server) logServerFailure(category serverFailureCategory) {
+	var sampler *logSampler
+	switch category {
+	case serverFailureKeyPersistence:
+		sampler = &s.keyPersistenceErrorLog
+	case serverFailureExchange:
+		sampler = &s.exchangeErrorLog
+	case serverFailureRequest:
+		sampler = &s.requestHandlingErrorLog
+	default:
+		return
+	}
+	if dropped, ok := sampler.allow(time.Now(), preAuthLogInterval); ok {
+		s.log.Warn("server operation failed", "category", string(category), "suppressed", dropped)
 	}
 }
 
@@ -725,7 +766,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 				}
 				return nil
 			}
-			return err
+			return errors.Join(errRequestHandlingFailure, err)
 		}
 
 		// auth.signIn marks the serving conn only after SetPendingUser commits.
@@ -836,7 +877,7 @@ func (s *Server) touch(ctx context.Context, id [8]byte, last *time.Time) {
 	}
 	*last = now
 	if err := s.keys.Touch(ctx, id); err != nil {
-		s.log.Info("touch auth key", "err", err)
+		s.logServerFailure(serverFailureKeyPersistence)
 	}
 }
 
@@ -862,11 +903,11 @@ func (s *Server) runExchange(ctx context.Context, tconn transport.Conn, first *b
 			}
 			return nil
 		}
-		return errors.Join(errors.New("key exchange"), err)
+		return errors.Join(errAuthKeyExchangeFailure, errors.Join(errors.New("key exchange"), err))
 	}
 
 	if err := s.keys.Save(ctx, key); err != nil {
-		return errors.Join(errors.New("save auth key"), err)
+		return errors.Join(errAuthKeyPersistenceFailure, errors.Join(errors.New("save auth key"), err))
 	}
 	return nil
 }
