@@ -174,7 +174,7 @@ func (h *handlers) channelToTLPublic(c store.Channel, participants int64, viewer
 // zero and is capped at 50. It bounds each returned vector: MyResults spends
 // one budget across the two arms it unions, and Results has its own.
 //
-// Three arms, each with its own predicate and none relaxed to match another:
+// Four arms, each with its own predicate and none relaxed to match another:
 //
 //   - MyResults users — users the caller has an existing 1:1 dialog with. No
 //     global user search, no cross-dialog leak.
@@ -185,6 +185,9 @@ func (h *handlers) channelToTLPublic(c store.Channel, participants int64, viewer
 //     nothing in it varies with the caller and can be read back. A channel
 //     without a username is filtered inside the SQL, before the LIMIT, so it
 //     never occupies a row that a caller could count as evidence it exists.
+//   - Results users — the owner of a syntactically valid exact username query,
+//     if a quota-charged lookup resolves it to a user. Prefix and pattern
+//     search is deliberately not part of this arm.
 //
 // A channel that is both public and the caller's own matches two arms and is
 // named in both peer vectors, but is rendered once in Chats, as the member view
@@ -221,10 +224,33 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 		limit = maxContactsSearchLimit
 	}
 
-	// Rate limit before the lookup, charged identically whether or not the
-	// query matches, so the quota cannot be read as an existence oracle.
+	// Charge the contacts.search call identically whether or not the query
+	// matches, so this rate limit cannot be read as an existence oracle.
 	if err := h.checkRateLimit(r, "contacts_search", h.rateLimitSearchContacts); err != nil {
 		return nil, err
+	}
+
+	username := strings.ToLower(strings.TrimPrefix(req.Q, "@"))
+	var exactUser *store.User
+	if usernameRe.MatchString(username) {
+		// Share resolveUsername's per-account distinct-handle and burst budgets.
+		// Charge before any username lookup, even when this resolves to a channel
+		// or misses, so contacts.search cannot buy a second lookup path.
+		if err := h.store.CheckAndChargeUsernameLookup(r.Ctx, r.UserID, username); err != nil {
+			if !errors.Is(err, store.ErrUsernameLookupQuotaExceeded) {
+				h.log.Error("contacts.search: username quota", "user_id", r.UserID, "err", err)
+				return nil, errInternal
+			}
+		} else {
+			resolution, ok, err := h.store.UsernameByHandle(r.Ctx, username)
+			if err != nil {
+				h.log.Error("contacts.search: username lookup", "user_id", r.UserID, "err", err)
+				return nil, errInternal
+			}
+			if ok && resolution.Kind == store.UsernameKindUser {
+				exactUser = &resolution.User
+			}
+		}
 	}
 
 	contacts, err := h.store.SearchContacts(r.Ctx, r.UserID, req.Q, limit)
@@ -246,8 +272,16 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	// Nothing matched anywhere: one empty response, the same one a query naming
 	// a private channel produces. "No match", "a private channel matched" and
 	// "no such channel" must not be three answers.
-	if len(contacts) == 0 && len(myChannels) == 0 && len(publicChannels) == 0 {
+	if len(contacts) == 0 && len(myChannels) == 0 && len(publicChannels) == 0 && exactUser == nil {
 		return &tg.ContactsFound{}, nil
+	}
+
+	// Results has one limit shared by the exact user and public channels. Put
+	// the exact handle match first so title matches cannot crowd it out; the
+	// channel arm keeps its original order within the remaining budget.
+	resultChannels := publicChannels
+	if exactUser != nil && len(resultChannels) >= int(limit) {
+		resultChannels = resultChannels[:int(limit)-1]
 	}
 
 	// MyResults unions two arms, so the limit is one budget across both rather
@@ -285,8 +319,8 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	// It is a separate query and not a viewer joined into the discovery arm on
 	// purpose: which rows Results contains stays caller-independent, and
 	// membership is applied afterwards, as a rendering input only.
-	unknown := make([]int64, 0, len(publicChannels))
-	for _, p := range publicChannels {
+	unknown := make([]int64, 0, len(resultChannels))
+	for _, p := range resultChannels {
 		if _, ok := memberOf[p.Channel.ID]; !ok {
 			unknown = append(unknown, p.Channel.ID)
 		}
@@ -312,16 +346,26 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	}
 
 	// Only a channel some vector names is rendered, and each is rendered once.
-	chats := make([]tg.ChatClass, 0, len(namedChannels)+len(publicChannels))
-	rendered := make(map[int64]bool, len(namedChannels)+len(publicChannels))
+	chats := make([]tg.ChatClass, 0, len(namedChannels)+len(resultChannels))
+	rendered := make(map[int64]bool, len(namedChannels)+len(resultChannels))
 	for _, m := range namedChannels {
 		myResults = append(myResults, &tg.PeerChannel{ChannelID: m.Channel.ID})
 		chats = append(chats, h.channelToTL(m.Channel, m.Member, true, r.UserID))
 		rendered[m.Channel.ID] = true
 	}
 
-	results := make([]tg.PeerClass, 0, len(publicChannels))
-	for _, p := range publicChannels {
+	results := make([]tg.PeerClass, 0, len(resultChannels)+1)
+	userIDs := make(map[int64]bool, len(contacts)+1)
+	for _, c := range contacts {
+		userIDs[c.ID] = true
+	}
+	if exactUser != nil {
+		results = append(results, &tg.PeerUser{UserID: exactUser.ID})
+		if !userIDs[exactUser.ID] {
+			users = append(users, h.userToTL(*exactUser, r.UserID, exactUser.ID == r.UserID))
+		}
+	}
+	for _, p := range resultChannels {
 		results = append(results, &tg.PeerChannel{ChannelID: p.Channel.ID})
 		if rendered[p.Channel.ID] {
 			continue
