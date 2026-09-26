@@ -79,6 +79,7 @@ const (
 	serverFailureKeyPersistence serverFailureCategory = "key_persistence"
 	serverFailureExchange       serverFailureCategory = "exchange"
 	serverFailureRequest        serverFailureCategory = "request_handling"
+	serverFailureAuthKeyLookup  serverFailureCategory = "auth_key_lookup"
 )
 
 // Server is an MTProto server: it accepts transport connections, performs key
@@ -486,20 +487,18 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 		return
 	}
 	if err := s.serveConn(ctx, conn, addr, slot); err != nil && !isDisconnect(err) {
-		switch {
-		case errors.Is(err, errAuthKeyLookupFailure):
-			if dropped, ok := s.authKeyLookupErrorLog.allow(time.Now(), preAuthLogInterval); ok {
-				s.log.Info("auth key lookup failed", "suppressed", dropped)
-			}
-		default:
-			s.logConnectionFailure(err)
-		}
+		s.logConnectionFailure(err)
 	}
 }
 
 func (s *Server) logConnectionFailure(err error) {
 	category := serverFailureRequest
 	switch {
+	case errors.Is(err, errAuthKeyLookupFailure):
+		if dropped, ok := s.authKeyLookupErrorLog.allow(time.Now(), preAuthLogInterval); ok {
+			s.log.Info("auth key lookup failed", "category", string(serverFailureAuthKeyLookup), "suppressed", dropped)
+		}
+		return
 	case errors.Is(err, errAuthKeyPersistenceFailure):
 		category = serverFailureKeyPersistence
 	case errors.Is(err, errAuthKeyExchangeFailure):

@@ -80,3 +80,31 @@ func TestConnectionFailureLogsUseSampledSafeCategories(t *testing.T) {
 		t.Fatalf("key persistence suppressed count = %v, want 1", got)
 	}
 }
+
+func TestConnectionFailureLogsAuthKeyLookupWithSampledCategory(t *testing.T) {
+	sink := &serverErrorLogSink{}
+	server := New(exchange.PrivateKey{}, 2, NewMemoryAuthKeyStore(), nil, slog.New(sink))
+	const rawDetail = "UNTRUSTED-LOOKUP-ERROR"
+	err := errors.Join(errAuthKeyLookupFailure, errors.New(rawDetail))
+
+	server.logConnectionFailure(err)
+	server.logConnectionFailure(err)
+	if len(sink.records) != 1 {
+		t.Fatalf("records after sampled lookup repeats = %d, want 1", len(sink.records))
+	}
+	if record := sink.records[0]; record.message != "auth key lookup failed" || record.attrs["category"] != "auth_key_lookup" {
+		t.Fatalf("lookup failure record = %+v, want fixed auth_key_lookup category", record)
+	}
+	if strings.Contains(sink.records[0].message+fmt.Sprint(sink.records[0].attrs), rawDetail) {
+		t.Fatalf("lookup log exposed raw error details: %+v", sink.records[0])
+	}
+
+	server.authKeyLookupErrorLog.last.Store(time.Now().Add(-preAuthLogInterval).UnixNano())
+	server.logConnectionFailure(err)
+	if len(sink.records) != 2 {
+		t.Fatalf("records after lookup sample window = %d, want 2", len(sink.records))
+	}
+	if got := sink.records[1].attrs["suppressed"]; got != int64(1) {
+		t.Fatalf("lookup suppressed count = %v, want 1", got)
+	}
+}
