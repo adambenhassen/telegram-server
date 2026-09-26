@@ -85,7 +85,7 @@ func TestConnectionFailureLogsAuthKeyLookupWithSampledCategory(t *testing.T) {
 	sink := &serverErrorLogSink{}
 	server := New(exchange.PrivateKey{}, 2, NewMemoryAuthKeyStore(), nil, slog.New(sink))
 	const rawDetail = "UNTRUSTED-LOOKUP-ERROR"
-	err := errors.Join(errAuthKeyLookupFailure, errors.New(rawDetail))
+	err := errors.Join(errAuthKeyExchangeFailure, errAuthKeyLookupFailure, errors.New(rawDetail))
 
 	server.logConnectionFailure(err)
 	server.logConnectionFailure(err)

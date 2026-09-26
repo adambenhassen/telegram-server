@@ -69,8 +69,8 @@ var (
 type authKeyNotFoundReason string
 
 const (
-	authKeyLookupMiss        authKeyNotFoundReason = "lookup_miss"
-	authKeyExchangeNonzeroID authKeyNotFoundReason = "exchange_nonzero_id"
+	authKeyLookupMiss         authKeyNotFoundReason = "lookup_miss"
+	authKeyExchangeLookupMiss authKeyNotFoundReason = "exchange_lookup_miss"
 )
 
 type serverFailureCategory string
@@ -153,8 +153,8 @@ type Server struct {
 	requestHandlingErrorLog logSampler
 	// Keep the two server-generated -404 paths independently sampled across all
 	// connections handled by this server.
-	lookupMissLog        logSampler
-	exchangeNonzeroIDLog logSampler
+	lookupMissLog         logSampler
+	exchangeLookupMissLog logSampler
 	// pendingLogins bounds the process-wide connections that have received
 	// SESSION_PASSWORD_NEEDED. Written once before Serve and only read after,
 	// like the other connection bounds.
@@ -531,8 +531,8 @@ func (s *Server) logAuthKeyNotFound(reason authKeyNotFoundReason, id [8]byte, pe
 	switch reason {
 	case authKeyLookupMiss:
 		sampler = &s.lookupMissLog
-	case authKeyExchangeNonzeroID:
-		sampler = &s.exchangeNonzeroIDLog
+	case authKeyExchangeLookupMiss:
+		sampler = &s.exchangeLookupMissLog
 	default:
 		return
 	}
@@ -703,9 +703,15 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			// DefaultTimeout per handshake read, wider than the frame deadline.
 			bind(0)
 			if err := s.runExchange(ctx, tconn, b, clientAddr); err != nil {
-				return err
+				unexpected, ok := errors.AsType[*exchange.UnexpectedEncryptedError](err)
+				if !ok {
+					return err
+				}
+				b.ResetTo(unexpected.Frame)
+				authKeyID = unexpected.AuthKeyID
+			} else {
+				continue
 			}
-			continue
 		}
 
 		key, userID, provisional, ok, err := s.keys.Get(ctx, authKeyID)
@@ -890,11 +896,15 @@ func (s *Server) runExchange(ctx context.Context, tconn transport.Conn, first *b
 
 	key, err := s.exchange(ctx, exchangeConn{
 		Conn: bc,
-		onRejected: func(id [8]byte) {
-			s.logAuthKeyNotFound(authKeyExchangeNonzeroID, id, clientAddr)
+		keys: s.keys,
+		onLookupMiss: func(id [8]byte) {
+			s.logAuthKeyNotFound(authKeyExchangeLookupMiss, id, clientAddr)
 		},
 	})
 	if err != nil {
+		if unexpected, ok := errors.AsType[*exchange.UnexpectedEncryptedError](err); ok {
+			return unexpected
+		}
 		if exErr, ok := errors.AsType[*exchange.ServerExchangeError](err); ok {
 			// Report the failure to the client and close quietly, matching
 			// gotd tgtest: a bad handshake is not a server-side error.
