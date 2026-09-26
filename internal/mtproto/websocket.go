@@ -394,7 +394,7 @@ func (s *Server) handleWebSocket(ctx context.Context, w http.ResponseWriter, r *
 		return
 	}
 	if err := s.serveConn(ctx, conn, state.addr, state.slot); err != nil && !isDisconnect(err) {
-		s.log.Info("WebSocket connection handler error", "err", err)
+		s.logConnectionFailure(err)
 	}
 }
 

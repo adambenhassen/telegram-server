@@ -6,6 +6,7 @@ package mtproto
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -56,6 +57,29 @@ const (
 	// touchInterval throttles per-connection last-seen updates so an active
 	// session writes its activity time at most once per interval, not per frame.
 	touchInterval = 60 * time.Second
+)
+
+var (
+	errAuthKeyLookupFailure      = errors.New("auth key lookup failed")
+	errAuthKeyPersistenceFailure = errors.New("auth key persistence failed")
+	errAuthKeyExchangeFailure    = errors.New("auth key exchange failed")
+	errRequestHandlingFailure    = errors.New("request handling failed")
+)
+
+type authKeyNotFoundReason string
+
+const (
+	authKeyLookupMiss        authKeyNotFoundReason = "lookup_miss"
+	authKeyExchangeNonzeroID authKeyNotFoundReason = "exchange_nonzero_id"
+)
+
+type serverFailureCategory string
+
+const (
+	serverFailureKeyPersistence serverFailureCategory = "key_persistence"
+	serverFailureExchange       serverFailureCategory = "exchange"
+	serverFailureRequest        serverFailureCategory = "request_handling"
+	serverFailureAuthKeyLookup  serverFailureCategory = "auth_key_lookup"
 )
 
 // Server is an MTProto server: it accepts transport connections, performs key
@@ -118,6 +142,19 @@ type Server struct {
 	// are driven by a peer reusing one key, and a flood against this bound must
 	// not spend the window that says which other bound is firing.
 	unboundKeyLog logSampler
+	// A failed store lookup may include an at-rest decryption error. Report the
+	// lookup failure without exposing the underlying storage or cipher error.
+	authKeyLookupErrorLog logSampler
+	// Keep each server-side failure class sampled independently. The category
+	// names are fixed; raw storage, exchange, and request errors may carry secrets
+	// or attacker-controlled data and never reach these log records.
+	keyPersistenceErrorLog  logSampler
+	exchangeErrorLog        logSampler
+	requestHandlingErrorLog logSampler
+	// Keep the two server-generated -404 paths independently sampled across all
+	// connections handled by this server.
+	lookupMissLog        logSampler
+	exchangeNonzeroIDLog logSampler
 	// pendingLogins bounds the process-wide connections that have received
 	// SESSION_PASSWORD_NEEDED. Written once before Serve and only read after,
 	// like the other connection bounds.
@@ -450,8 +487,67 @@ func (s *Server) serveSocket(ctx context.Context, sock net.Conn, slot *preAuthSl
 		return
 	}
 	if err := s.serveConn(ctx, conn, addr, slot); err != nil && !isDisconnect(err) {
-		s.log.Info("connection handler error", "err", err)
+		s.logConnectionFailure(err)
 	}
+}
+
+func (s *Server) logConnectionFailure(err error) {
+	category := serverFailureRequest
+	switch {
+	case errors.Is(err, errAuthKeyLookupFailure):
+		if dropped, ok := s.authKeyLookupErrorLog.allow(time.Now(), preAuthLogInterval); ok {
+			s.log.Info("auth key lookup failed", "category", string(serverFailureAuthKeyLookup), "suppressed", dropped)
+		}
+		return
+	case errors.Is(err, errAuthKeyPersistenceFailure):
+		category = serverFailureKeyPersistence
+	case errors.Is(err, errAuthKeyExchangeFailure):
+		category = serverFailureExchange
+	case errors.Is(err, errRequestHandlingFailure):
+		category = serverFailureRequest
+	}
+	s.logServerFailure(category)
+}
+
+func (s *Server) logServerFailure(category serverFailureCategory) {
+	var sampler *logSampler
+	switch category {
+	case serverFailureKeyPersistence:
+		sampler = &s.keyPersistenceErrorLog
+	case serverFailureExchange:
+		sampler = &s.exchangeErrorLog
+	case serverFailureRequest:
+		sampler = &s.requestHandlingErrorLog
+	default:
+		return
+	}
+	if dropped, ok := sampler.allow(time.Now(), preAuthLogInterval); ok {
+		s.log.Warn("server operation failed", "category", string(category), "suppressed", dropped)
+	}
+}
+
+func (s *Server) logAuthKeyNotFound(reason authKeyNotFoundReason, id [8]byte, peer netip.Addr) {
+	var sampler *logSampler
+	switch reason {
+	case authKeyLookupMiss:
+		sampler = &s.lookupMissLog
+	case authKeyExchangeNonzeroID:
+		sampler = &s.exchangeNonzeroIDLog
+	default:
+		return
+	}
+	now := time.Now()
+	dropped, ok := sampler.allow(now, preAuthLogInterval)
+	if !ok {
+		return
+	}
+	s.log.Info("server rejected MTProto auth key",
+		"reason", string(reason),
+		"auth_key_id", hex.EncodeToString(id[:]),
+		"peer_addr", peer.String(),
+		"event_time", now,
+		"suppressed", dropped,
+	)
 }
 
 // logNegotiation reports a connection that never became one, sampled: a refused
@@ -606,7 +702,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			// Before runExchange, not after: gotd applies its own 60s
 			// DefaultTimeout per handshake read, wider than the frame deadline.
 			bind(0)
-			if err := s.runExchange(ctx, tconn, b); err != nil {
+			if err := s.runExchange(ctx, tconn, b, clientAddr); err != nil {
 				return err
 			}
 			continue
@@ -614,7 +710,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 
 		key, userID, provisional, ok, err := s.keys.Get(ctx, authKeyID)
 		if err != nil {
-			return errors.Join(errors.New("get auth key"), err)
+			return errors.Join(errAuthKeyLookupFailure, errors.Join(errors.New("get auth key"), err))
 		}
 		if !ok {
 			// A key that previously resolved to a user and is now gone means the
@@ -634,7 +730,11 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			if err := s.sendProtoError(ctx, tconn, codec.CodeAuthKeyNotFound); err != nil {
 				return err
 			}
+			s.logAuthKeyNotFound(authKeyLookupMiss, authKeyID, clientAddr)
 			continue
+		}
+		if key.ID != authKeyID {
+			return errors.New("auth key ID mismatch")
 		}
 
 		conn.setKey(key)
@@ -665,7 +765,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 				}
 				return nil
 			}
-			return err
+			return errors.Join(errRequestHandlingFailure, err)
 		}
 
 		// auth.signIn marks the serving conn only after SetPendingUser commits.
@@ -719,7 +819,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			var err error
 			_, chargeUser, _, ok, err = s.keys.Get(ctx, authKeyID)
 			if err != nil {
-				return errors.Join(errors.New("get auth key"), err)
+				return errors.Join(errAuthKeyLookupFailure, errors.Join(errors.New("get auth key"), err))
 			}
 			if !ok {
 				// Key was revoked between dispatch and re-read; fall back to the
@@ -729,9 +829,10 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			}
 		}
 		if !hold.charge(authKeyID, chargeUser) {
-			// The key is not named: it identifies a client's session, no line
-			// elsewhere writes one, and what the operator needs from this line
-			// is which bound is firing and how hard.
+			// This cap log intentionally omits the auth key ID: the cap and
+			// suppressed count show the pressure without identifying a client's
+			// session. Sampled -404 diagnostics are a separate exception and
+			// include the hex key ID.
 			if dropped, ok := s.unboundKeyLog.allow(time.Now(), preAuthLogInterval); ok {
 				s.log.Info("connection closed at the cap on one unbound auth key",
 					"cap", s.unboundKeys.max, "suppressed", dropped)
@@ -776,18 +877,23 @@ func (s *Server) touch(ctx context.Context, id [8]byte, last *time.Time) {
 	}
 	*last = now
 	if err := s.keys.Touch(ctx, id); err != nil {
-		s.log.Info("touch auth key", "err", err)
+		s.logServerFailure(serverFailureKeyPersistence)
 	}
 }
 
 // runExchange performs key exchange, replaying the already-read first frame, and
 // persists the resulting auth key. A ServerExchangeError is reported to the
 // client as a protocol error and ends the connection.
-func (s *Server) runExchange(ctx context.Context, tconn transport.Conn, first *bin.Buffer) error {
+func (s *Server) runExchange(ctx context.Context, tconn transport.Conn, first *bin.Buffer, clientAddr netip.Addr) error {
 	bc := newBufferedConn(tconn)
 	bc.Push(first)
 
-	key, err := s.exchange(ctx, exchangeConn{Conn: bc})
+	key, err := s.exchange(ctx, exchangeConn{
+		Conn: bc,
+		onRejected: func(id [8]byte) {
+			s.logAuthKeyNotFound(authKeyExchangeNonzeroID, id, clientAddr)
+		},
+	})
 	if err != nil {
 		if exErr, ok := errors.AsType[*exchange.ServerExchangeError](err); ok {
 			// Report the failure to the client and close quietly, matching
@@ -797,11 +903,11 @@ func (s *Server) runExchange(ctx context.Context, tconn transport.Conn, first *b
 			}
 			return nil
 		}
-		return errors.Join(errors.New("key exchange"), err)
+		return errors.Join(errAuthKeyExchangeFailure, errors.Join(errors.New("key exchange"), err))
 	}
 
 	if err := s.keys.Save(ctx, key); err != nil {
-		return errors.Join(errors.New("save auth key"), err)
+		return errors.Join(errAuthKeyPersistenceFailure, errors.Join(errors.New("save auth key"), err))
 	}
 	return nil
 }

@@ -34,6 +34,8 @@ func (s *Server) exchange(ctx context.Context, conn transport.Conn) (crypto.Auth
 // registered key mid-handshake). Mirrors gotd tgtest/exchange.go.
 type exchangeConn struct {
 	transport.Conn
+
+	onRejected func([8]byte)
 }
 
 // Recv reads the next handshake frame, replying with an AuthKeyNotFound proto
@@ -53,6 +55,9 @@ func (e exchangeConn) Recv(ctx context.Context, b *bin.Buffer) error {
 			buf.PutInt32(-codec.CodeAuthKeyNotFound)
 			if err := e.Send(ctx, &buf); err != nil {
 				return fmt.Errorf("send: %w", err)
+			}
+			if e.onRejected != nil {
+				e.onRejected(authKeyID)
 			}
 			continue
 		}
