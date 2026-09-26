@@ -150,6 +150,10 @@ func TestInputPeer(t *testing.T) {
 	if err != nil || pt != store.PeerTypeUser || id != 5 {
 		t.Fatalf("inputPeer(user 5) = (%d, %d, %v), want (user, 5, nil)", pt, id, err)
 	}
+	pt, id, err = api.InputPeer(&tg.InputPeerSelf{}, 5)
+	if err != nil || pt != store.PeerTypeUser || id != 5 {
+		t.Fatalf("inputPeer(self) = (%d, %d, %v), want (user, 5, nil)", pt, id, err)
+	}
 	for _, p := range []tg.InputPeerClass{
 		&tg.InputPeerUser{UserID: 5, AccessHash: 4},
 		&tg.InputPeerChat{ChatID: 0},

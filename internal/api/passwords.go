@@ -38,17 +38,9 @@ func randBytes(n int) ([]byte, error) {
 	return b, nil
 }
 
-// userTL maps a stored user to the tg.User returned in an authorization.
-// Self always carries UserStatusRecently per Telegram's privacy model.
-func userTL(u store.User) *tg.User {
-	return &tg.User{
-		ID:         u.ID,
-		Self:       true,
-		Phone:      u.Phone,
-		FirstName:  u.FirstName,
-		AccessHash: u.ID, // self access hash placeholder
-		Status:     &tg.UserStatusRecently{},
-	}
+// userTL maps the signed-in account into its authorization response.
+func (h *handlers) userTL(u store.User) *tg.User {
+	return h.userToTL(u, u.ID, true)
 }
 
 // handleGetPassword serves account.getPassword. It advertises the KDF params and
@@ -250,7 +242,7 @@ func (h *handlers) handleCheckPassword(r *mtproto.Request) (bin.Encoder, error) 
 		h.log.Error("check password: load user", "user_id", userID, "ok", found, "err", err)
 		return nil, errInternal
 	}
-	return &tg.AuthAuthorization{User: userTL(user)}, nil
+	return &tg.AuthAuthorization{User: h.userTL(user)}, nil
 }
 
 // resolvePendingUserID resolves the user id from the pending state of the

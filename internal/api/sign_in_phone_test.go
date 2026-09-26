@@ -141,4 +141,15 @@ func TestSignInKnownPhoneStillAuthorizes(t *testing.T) {
 	if got.ID != user.ID {
 		t.Errorf("authorized user id = %d, want %d", got.ID, user.ID)
 	}
+	wantHash := api.DeriveUserHash(user.ID, user.ID)
+	if got.AccessHash != wantHash {
+		t.Fatalf("authorized self access_hash = %d, want derived hash %d", got.AccessHash, wantHash)
+	}
+	if _, err := api.SendMessageForTest(s, user.ID, &tg.MessagesSendMessageRequest{
+		Peer:     &tg.InputPeerUser{UserID: got.ID, AccessHash: got.AccessHash},
+		Message:  "first saved message",
+		RandomID: 9803,
+	}); err != nil {
+		t.Fatalf("first send with auth self hash: %v", err)
+	}
 }

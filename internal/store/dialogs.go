@@ -61,8 +61,10 @@ func (s *Store) CountDialogs(ctx context.Context, ownerID int64) (int, error) {
 // (monotonic; never regresses), recomputes the reader's unread count, and
 // advances the peer's outbox read marker to the mirror position. It emits a
 // read-inbox event for the reader and a read-outbox event for the peer, bumping
-// both owners' pts. Returns each owner's new pts. If the reader has no dialog
-// with peer there is nothing to read: both current pts are returned unchanged.
+// both owners' pts. A self dialog has no mirror row, so it emits only the
+// reader's read-inbox event. Returns each owner's new pts. If the reader has no
+// dialog with peer there is nothing to read: both current pts are returned
+// unchanged.
 func (s *Store) ReadHistory(ctx context.Context, ownerID, peerID, maxID int64) (readerPts, peerPts int, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -86,6 +88,19 @@ func (s *Store) ReadHistory(ctx context.Context, ownerID, peerID, maxID int64) (
 	}
 	if err != nil {
 		return 0, 0, fmt.Errorf("advance read inbox: %w", err)
+	}
+	if ownerID == peerID {
+		rPts, e := qtx.BumpPtsOnly(ctx, ownerID)
+		if e != nil {
+			return 0, 0, fmt.Errorf("bump self reader: %w", e)
+		}
+		if err = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: ownerID, Pts: rPts, Type: int16(EventReadIn), LocalID: inbox.ReadInboxMaxID}); err != nil {
+			return 0, 0, fmt.Errorf("self read event: %w", err)
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return 0, 0, fmt.Errorf("commit: %w", err)
+		}
+		return int(rPts), int(rPts), nil
 	}
 
 	// Translate the reader's maxID into the peer's outbox local-id space via the

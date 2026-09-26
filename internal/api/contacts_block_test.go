@@ -99,6 +99,8 @@ func TestContactsBlockRejectsInvalidTargets(t *testing.T) {
 
 	_, err = api.BlockForTest(s, blocker.ID, &tg.ContactsBlockRequest{ID: api.InputPeerUser(blocker.ID, blocker.ID)})
 	wantRPC(t, err, "PEER_ID_INVALID")
+	_, err = api.BlockForTest(s, blocker.ID, &tg.ContactsBlockRequest{ID: &tg.InputPeerSelf{}})
+	wantRPC(t, err, "PEER_ID_INVALID")
 
 	_, err = api.BlockForTest(s, blocker.ID, &tg.ContactsBlockRequest{ID: &tg.InputPeerChat{ChatID: 1}})
 	wantRPC(t, err, "PEER_ID_INVALID")

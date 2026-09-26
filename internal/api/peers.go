@@ -7,22 +7,28 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
-// peerUserID resolves an input peer to a 1:1 user id, validating that
-// access_hash was derived for (viewerID, peer). Only user peers are in scope;
-// anything else is PEER_ID_INVALID.
+// peerUserID resolves an input peer to a 1:1 user id. InputPeerSelf is bound to
+// viewerID; InputPeerUser still requires an access_hash derived for
+// (viewerID, peer). Anything else is PEER_ID_INVALID.
 func (h *handlers) peerUserID(peer tg.InputPeerClass, viewerID int64) (int64, error) {
-	p, ok := peer.(*tg.InputPeerUser)
-	if !ok {
+	switch p := peer.(type) {
+	case *tg.InputPeerSelf:
+		if viewerID == 0 {
+			return 0, errPeerIDInvalid
+		}
+		return viewerID, nil
+	case *tg.InputPeerUser:
+		if p.UserID == 0 {
+			return 0, errPeerIDInvalid
+		}
+		wantHash := h.peers.Derive(viewerID, peerhash.KindUser, p.UserID)
+		if p.AccessHash != wantHash {
+			return 0, errPeerIDInvalid
+		}
+		return p.UserID, nil
+	default:
 		return 0, errPeerIDInvalid
 	}
-	if p.UserID == 0 {
-		return 0, errPeerIDInvalid
-	}
-	wantHash := h.peers.Derive(viewerID, peerhash.KindUser, p.UserID)
-	if p.AccessHash != wantHash {
-		return 0, errPeerIDInvalid
-	}
-	return p.UserID, nil
 }
 
 // peerToTL names a stored peer on the wire. peer_id alone is ambiguous — chat

@@ -214,7 +214,9 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	h.notify(r.Ctx, r.UserID)
-	h.notify(r.Ctx, toID)
+	if toID != r.UserID {
+		h.notify(r.Ctx, toID)
+	}
 
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
@@ -505,7 +507,9 @@ func (h *handlers) handleReadHistory(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 	h.notify(r.Ctx, r.UserID)
-	h.notify(r.Ctx, toID)
+	if toID != r.UserID {
+		h.notify(r.Ctx, toID)
+	}
 	return &tg.MessagesAffectedMessages{Pts: readerPts, PtsCount: 1}, nil
 }
 
@@ -532,7 +536,9 @@ func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 	h.notify(r.Ctx, r.UserID)
-	h.notify(r.Ctx, peerID)
+	if peerID != r.UserID {
+		h.notify(r.Ctx, peerID)
+	}
 
 	edited, ok, err := h.store.MessageByOwnerLocal(r.Ctx, r.UserID, int64(req.ID))
 	if err != nil || !ok {

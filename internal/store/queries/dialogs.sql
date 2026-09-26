@@ -25,6 +25,11 @@ SELECT count(*)::int FROM dialogs WHERE owner_id = $1;
 -- name: AdvanceReadInbox :one
 UPDATE dialogs SET
   read_inbox_max_id = GREATEST(read_inbox_max_id, sqlc.arg(max_id)::bigint),
+  read_outbox_max_id = CASE
+    WHEN dialogs.owner_id = dialogs.peer_id
+      THEN GREATEST(dialogs.read_outbox_max_id, sqlc.arg(max_id)::bigint)
+    ELSE dialogs.read_outbox_max_id
+  END,
   unread_count = (
     SELECT count(*) FROM messages m
     WHERE m.owner_id = dialogs.owner_id AND m.peer_type = dialogs.peer_type AND m.peer_id = dialogs.peer_id

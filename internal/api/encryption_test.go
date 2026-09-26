@@ -207,6 +207,13 @@ func TestRequestEncryptionRejectsSelfAndUnknownTarget(t *testing.T) {
 	} else if msg := rpcMessage(t, err); msg != "USER_ID_INVALID" {
 		t.Errorf("self chat: error = %s, want USER_ID_INVALID", msg)
 	}
+	if _, err := api.RequestEncryptionForTest(s, a, &tg.MessagesRequestEncryptionRequest{
+		UserID: &tg.InputUserSelf{}, RandomID: 3, GA: validGA(),
+	}); err == nil {
+		t.Error("InputUserSelf chat: expected an error, got nil")
+	} else if msg := rpcMessage(t, err); msg != "USER_ID_INVALID" {
+		t.Errorf("InputUserSelf chat: error = %s, want USER_ID_INVALID", msg)
+	}
 
 	// An account that does not exist must be rejected before a row is allocated,
 	// not left to the foreign key.

@@ -138,10 +138,11 @@ func (s *Store) MessageByRandomID(ctx context.Context, ownerID, randomID int64) 
 }
 
 // SendMessage persists both sides of a 1:1 message in one transaction. Each side
-// gets its own local_id and its own pts++. A repeated randomID (per sender) is
-// deduped: the original sender message is returned with dup=true and no new rows
-// or events. replyToMsgID is the sender's local_id of the message being replied to
-// (0 if no reply). Returns the sender's stored copy plus both owners' resulting pts.
+// gets its own local_id and its own pts++. A self message has one owner row and
+// one pts event. A repeated randomID (per sender) is deduped: the original sender
+// message is returned with dup=true and no new rows or events. replyToMsgID is
+// the sender's local_id of the message being replied to (0 if no reply). Returns
+// the sender's stored copy plus both owners' resulting pts.
 func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string, randomID, fileID, replyToMsgID int64) (sender Message, senderPts, recipientPts int, dup bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -189,6 +190,40 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 		case !errors.Is(e, pgx.ErrNoRows):
 			return Message{}, 0, 0, false, fmt.Errorf("random_id lookup: %w", e)
 		}
+	}
+
+	if fromID == toID {
+		b, err := qtx.BumpState(ctx, fromID)
+		if err != nil {
+			return Message{}, 0, 0, false, fmt.Errorf("bump self: %w", err)
+		}
+		var replyTo *int32
+		if replyToMsgID > 0 {
+			v := int32(replyToMsgID) //nolint:gosec // G115: local_id fits int32 wire space
+			replyTo = &v
+		}
+		if err = qtx.InsertMessage(ctx, db.InsertMessageParams{
+			OwnerID: fromID, LocalID: b.LocalID, PeerType: int16(PeerTypeUser), PeerID: fromID, FromID: fromID,
+			Message: text, Out: true, RandomID: randomID, PeerLocalID: 0,
+			FanoutID: 0, ActionType: 0, ActionUserID: 0, FileID: fileID, ReplyToMsgID: replyTo,
+			FwdFromID: nil, FwdDate: pgtype.Timestamptz{}, FwdChannelID: nil, FwdChannelPost: nil,
+		}); err != nil {
+			return Message{}, 0, 0, false, fmt.Errorf("insert self message: %w", err)
+		}
+		if err = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: fromID, Pts: b.Pts, Type: int16(EventNewMessage), LocalID: b.LocalID}); err != nil {
+			return Message{}, 0, 0, false, fmt.Errorf("self message event: %w", err)
+		}
+		if err = qtx.UpsertDialog(ctx, db.UpsertDialogParams{OwnerID: fromID, PeerType: int16(PeerTypeUser), PeerID: fromID, TopMessage: b.LocalID, UnreadCount: 0}); err != nil {
+			return Message{}, 0, 0, false, fmt.Errorf("self dialog: %w", err)
+		}
+		stored, err := qtx.MessageByOwnerLocal(ctx, db.MessageByOwnerLocalParams{OwnerID: fromID, LocalID: b.LocalID})
+		if err != nil {
+			return Message{}, 0, 0, false, fmt.Errorf("reload self message: %w", err)
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return Message{}, 0, 0, false, fmt.Errorf("commit: %w", err)
+		}
+		return messageFromRow(stored), int(b.Pts), int(b.Pts), false, nil
 	}
 
 	sb, err := qtx.BumpState(ctx, fromID)
@@ -355,8 +390,10 @@ func (s *Store) EditMessage(ctx context.Context, ownerID, localID int64, text st
 	if err = qtx.SetEditedText(ctx, db.SetEditedTextParams{OwnerID: ownerID, LocalID: localID, Message: text}); err != nil {
 		return 0, 0, fmt.Errorf("edit owner row: %w", err)
 	}
-	if err = qtx.SetEditedText(ctx, db.SetEditedTextParams{OwnerID: peerID, LocalID: msg.PeerLocalID, Message: text}); err != nil {
-		return 0, 0, fmt.Errorf("edit mirror row: %w", err)
+	if ownerID != peerID {
+		if err = qtx.SetEditedText(ctx, db.SetEditedTextParams{OwnerID: peerID, LocalID: msg.PeerLocalID, Message: text}); err != nil {
+			return 0, 0, fmt.Errorf("edit mirror row: %w", err)
+		}
 	}
 
 	ownerPts, err := qtx.BumpPtsOnly(ctx, ownerID)
@@ -365,6 +402,12 @@ func (s *Store) EditMessage(ctx context.Context, ownerID, localID int64, text st
 	}
 	if err = qtx.InsertEvent(ctx, db.InsertEventParams{OwnerID: ownerID, Pts: ownerPts, Type: int16(EventEdit), LocalID: localID}); err != nil {
 		return 0, 0, fmt.Errorf("owner edit event: %w", err)
+	}
+	if ownerID == peerID {
+		if err = tx.Commit(ctx); err != nil {
+			return 0, 0, fmt.Errorf("commit: %w", err)
+		}
+		return peerID, int(ownerPts), nil
 	}
 	peerPts, err := qtx.BumpPtsOnly(ctx, peerID)
 	if err != nil {
@@ -707,7 +750,7 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 			return nil, fmt.Errorf("owner delete event: %w", e)
 		}
 		perOwner[ownerID] = int(ownerPts)
-		if !revoke {
+		if !revoke || m.PeerID == ownerID {
 			continue
 		}
 		// The mirror is the peer's own copy. If the peer already cleared it with
@@ -750,6 +793,9 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 // it: the record is what keeps the branch observable if a caller ever starts
 // reading the value.
 func mirrorPts(ctx context.Context, q *db.Queries, log *slog.Logger, existing db.Message, toID int64) (int, error) {
+	if PeerType(existing.PeerType) == PeerTypeUser && existing.OwnerID == toID && existing.PeerID == toID {
+		return newMessagePts(ctx, q, existing.OwnerID, existing.LocalID)
+	}
 	if PeerType(existing.PeerType) != PeerTypeUser || existing.PeerID != toID || existing.PeerLocalID == 0 {
 		st, err := q.GetState(ctx, toID)
 		if err != nil {
