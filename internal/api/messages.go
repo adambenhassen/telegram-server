@@ -73,9 +73,11 @@ func (h *handlers) notifyEncryptedMsg(ctx context.Context, recipientID int64, qt
 	}
 }
 
-// twoUsers hydrates the caller and the validated direct user peer for getHistory.
+// twoUsers hydrates the caller and another user using the standard live-edge
+// entitlement gate. Request-validated direct peers use loadUsersForUserPeer at
+// the read path that validated them.
 func (h *handlers) twoUsers(ctx context.Context, selfID, peerID int64) ([]tg.UserClass, error) {
-	return h.loadUsersForUserPeer(ctx, selfID, peerID)
+	return h.loadUsers(ctx, map[int64]bool{selfID: true, peerID: true}, selfID)
 }
 
 // loadFiles hydrates the files referenced by a batch of message rows into wire
@@ -409,7 +411,12 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	for i, m := range msgs {
 		tlMsgs[i] = messageToTL(m, nil, files, nil, reactionsByMsg[m.LocalID])
 	}
-	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
+	var users []tg.UserClass
+	if peerType == store.PeerTypeUser {
+		users, err = h.loadUsersForUserPeer(r.Ctx, r.UserID, toID)
+	} else {
+		users, err = h.loadUsers(r.Ctx, map[int64]bool{r.UserID: true, toID: true}, r.UserID)
+	}
 	if err != nil {
 		h.log.Error("get history users", "err", err)
 		return nil, errInternal
