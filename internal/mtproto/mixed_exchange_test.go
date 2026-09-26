@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 )
 
 type mixedExchangeKeyStore struct {
+	mu        sync.Mutex
 	key       crypto.AuthKey
 	userID    int64
 	present   bool
@@ -32,7 +34,16 @@ type mixedExchangeKeyStore struct {
 	touches int
 }
 
+type mixedExchangeKeyStoreState struct {
+	userID  int64
+	present bool
+	saves   int
+	touches int
+}
+
 func (s *mixedExchangeKeyStore) Save(_ context.Context, key crypto.AuthKey) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.saves = append(s.saves, key)
 	s.key = key
 	s.present = true
@@ -40,6 +51,8 @@ func (s *mixedExchangeKeyStore) Save(_ context.Context, key crypto.AuthKey) erro
 }
 
 func (s *mixedExchangeKeyStore) Get(_ context.Context, id [8]byte) (crypto.AuthKey, int64, bool, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.gets++
 	if s.lookupErr != nil {
 		return crypto.AuthKey{}, 0, false, false, s.lookupErr
@@ -51,8 +64,27 @@ func (s *mixedExchangeKeyStore) Get(_ context.Context, id [8]byte) (crypto.AuthK
 }
 
 func (s *mixedExchangeKeyStore) Touch(context.Context, [8]byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.touches++
 	return nil
+}
+
+func (s *mixedExchangeKeyStore) snapshot() mixedExchangeKeyStoreState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return mixedExchangeKeyStoreState{
+		userID:  s.userID,
+		present: s.present,
+		saves:   len(s.saves),
+		touches: s.touches,
+	}
+}
+
+func (s *mixedExchangeKeyStore) setPresent(present bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.present = present
 }
 
 type mixedExchangeRun struct {
@@ -66,13 +98,16 @@ type mixedExchangeRun struct {
 
 func startMixedExchangeServer(t *testing.T, keys mtproto.AuthKeyStore, handler mtproto.Handler) *mixedExchangeRun {
 	t.Helper()
+	return startMixedExchangeConn(t, newMixedExchangeServer(t, keys, handler))
+}
 
+func newMixedExchangeServer(t *testing.T, keys mtproto.AuthKeyStore, handler mtproto.Handler) *mtproto.Server {
+	t.Helper()
 	rsaKey, err := rsa.GenerateKey(crand.Reader, crypto.RSAKeyBits)
 	if err != nil {
 		t.Fatalf("generate RSA key: %v", err)
 	}
-	server := mtproto.New(exchange.PrivateKey{RSA: rsaKey}, 2, keys, handler, nil)
-	return startMixedExchangeConn(t, server)
+	return mtproto.New(exchange.PrivateKey{RSA: rsaKey}, 2, keys, handler, nil)
 }
 
 func startMixedExchangeConn(t *testing.T, server *mtproto.Server) *mixedExchangeRun {
@@ -176,14 +211,15 @@ func TestServeConnProcessesStoredKeyFrameDuringExchange(t *testing.T) {
 		t.Fatalf("close client: %v", err)
 	}
 	<-run.done
-	if len(keys.saves) != 0 {
-		t.Fatalf("saved auth keys = %d, want no exchange key saved", len(keys.saves))
+	state := keys.snapshot()
+	if state.saves != 0 {
+		t.Fatalf("saved auth keys = %d, want no exchange key saved", state.saves)
 	}
-	if !keys.present || keys.userID != 7 {
-		t.Fatalf("stored key state = present %t, user %d; want present and still bound to user 7", keys.present, keys.userID)
+	if !state.present || state.userID != 7 {
+		t.Fatalf("stored key state = present %t, user %d; want present and still bound to user 7", state.present, state.userID)
 	}
-	if keys.touches != 1 {
-		t.Fatalf("last-seen touches = %d, want one authenticated request touch", keys.touches)
+	if state.touches != 1 {
+		t.Fatalf("last-seen touches = %d, want one authenticated request touch", state.touches)
 	}
 }
 
@@ -209,7 +245,7 @@ func TestMixedExchangeFrameKeepsRevocationCheckOnNextFrame(t *testing.T) {
 		t.Fatal("mixed frame did not reach the handler")
 	}
 
-	keys.present = false
+	keys.setPresent(false)
 	if err := run.client.Send(run.ctx, &bin.Buffer{Buf: clientFrame(t, key, 59, int64(2)<<32, &tg.HelpGetConfigRequest{})}); err != nil {
 		t.Fatalf("send frame after revocation: %v", err)
 	}
@@ -222,8 +258,9 @@ func TestMixedExchangeFrameKeepsRevocationCheckOnNextFrame(t *testing.T) {
 	if serveErr := <-run.done; serveErr != nil {
 		t.Fatalf("ServeConn after revocation = %v, want clean close", serveErr)
 	}
-	if len(requests) != 0 || keys.touches != 1 || len(keys.saves) != 0 {
-		t.Fatalf("revocation side effects: requests=%d touches=%d saves=%d, want no second request, touch, or exchange key", len(requests), keys.touches, len(keys.saves))
+	state := keys.snapshot()
+	if len(requests) != 0 || state.touches != 1 || state.saves != 0 {
+		t.Fatalf("revocation side effects: requests=%d touches=%d saves=%d, want no second request, touch, or exchange key", len(requests), state.touches, state.saves)
 	}
 	if got := run.server.Registry().TotalConns(); got != 0 {
 		t.Fatalf("registered connections after revocation = %d, want 0", got)
@@ -238,10 +275,11 @@ func TestMixedExchangeFrameUsesUnboundKeyCap(t *testing.T) {
 		requests <- req
 		return nil
 	})
-	first := startMixedExchangeServer(t, keys, handler)
-	if err := first.server.SetMaxConnsPerUnboundKey(1); err != nil {
+	server := newMixedExchangeServer(t, keys, handler)
+	if err := server.SetMaxConnsPerUnboundKey(1); err != nil {
 		t.Fatalf("set unbound-key cap: %v", err)
 	}
+	first := startMixedExchangeConn(t, server)
 	beginMixedExchange(t, first)
 	if err := first.client.Send(first.ctx, &bin.Buffer{Buf: clientFrame(t, key, 56, int64(1)<<32, &tg.HelpGetConfigRequest{})}); err != nil {
 		t.Fatalf("send first mixed frame: %v", err)
@@ -276,8 +314,8 @@ func TestMixedExchangeFrameUsesUnboundKeyCap(t *testing.T) {
 	if len(requests) != 0 {
 		t.Fatalf("handler received %d requests after cap was full, want zero", len(requests))
 	}
-	if len(keys.saves) != 0 {
-		t.Fatalf("saved auth keys = %d, want no exchange key saved", len(keys.saves))
+	if state := keys.snapshot(); state.saves != 0 {
+		t.Fatalf("saved auth keys = %d, want no exchange key saved", state.saves)
 	}
 	if err := first.client.Close(); err != nil {
 		t.Fatalf("close first client: %v", err)
@@ -321,8 +359,8 @@ func TestMixedExchangeFrameUsesPerUserConnectionCap(t *testing.T) {
 	if got := len(run.server.Registry().Conns(7)); got != mtproto.MaxUserConns {
 		t.Fatalf("user 7 connections after refusal = %d, want existing cap %d", got, mtproto.MaxUserConns)
 	}
-	if keys.touches != 0 || len(keys.saves) != 0 {
-		t.Fatalf("user-cap side effects: touches=%d saves=%d, want no touch after refusal and no exchanged key", keys.touches, len(keys.saves))
+	if state := keys.snapshot(); state.touches != 0 || state.saves != 0 {
+		t.Fatalf("user-cap side effects: touches=%d saves=%d, want no touch after refusal and no exchanged key", state.touches, state.saves)
 	}
 }
 
@@ -369,14 +407,15 @@ func TestServeConnRejectsInvalidMACForStoredKeyFrameDuringExchange(t *testing.T)
 	if serveErr == nil || errors.Is(serveErr, io.EOF) {
 		t.Fatalf("ServeConn error = %v, want a decryption failure", serveErr)
 	}
-	if len(requests) != 0 || keys.touches != 1 || len(keys.saves) != 0 {
-		t.Fatalf("invalid-MAC side effects: requests=%d touches=%d saves=%d, want no extra request or touch and no exchanged key", len(requests), keys.touches, len(keys.saves))
+	state := keys.snapshot()
+	if len(requests) != 0 || state.touches != 1 || state.saves != 0 {
+		t.Fatalf("invalid-MAC side effects: requests=%d touches=%d saves=%d, want no extra request or touch and no exchanged key", len(requests), state.touches, state.saves)
 	}
 	if got := run.server.Registry().TotalConns(); got != 0 {
 		t.Fatalf("registered connections after invalid MAC = %d, want 0", got)
 	}
-	if !keys.present || keys.userID != 7 {
-		t.Fatalf("stored key state = present %t, user %d; want unchanged user 7 binding", keys.present, keys.userID)
+	if !state.present || state.userID != 7 {
+		t.Fatalf("stored key state = present %t, user %d; want unchanged user 7 binding", state.present, state.userID)
 	}
 }
 
@@ -417,10 +456,11 @@ func TestServeConnKeepsExchangeLookupMissesAt404(t *testing.T) {
 				t.Fatalf("close client: %v", err)
 			}
 			<-run.done
-			if requests != 0 || len(keys.saves) != 0 {
-				t.Fatalf("miss side effects: requests=%d saved keys=%d, want zero", requests, len(keys.saves))
+			state := keys.snapshot()
+			if requests != 0 || state.saves != 0 {
+				t.Fatalf("miss side effects: requests=%d saved keys=%d, want zero", requests, state.saves)
 			}
-			if test.row && !keys.present {
+			if test.row && !state.present {
 				t.Fatal("unknown-key lookup changed the unrelated stored row")
 			}
 		})
@@ -453,7 +493,7 @@ func TestServeConnClosesOnExchangeKeyLookupErrorWithout404(t *testing.T) {
 	if serveErr := <-run.done; serveErr == nil || errors.Is(serveErr, io.EOF) {
 		t.Fatalf("ServeConn error = %v, want lookup failure", serveErr)
 	}
-	if requests != 0 || len(keys.saves) != 0 || keys.touches != 0 {
-		t.Fatalf("lookup-error side effects: requests=%d saves=%d touches=%d, want zero", requests, len(keys.saves), keys.touches)
+	if state := keys.snapshot(); requests != 0 || state.saves != 0 || state.touches != 0 {
+		t.Fatalf("lookup-error side effects: requests=%d saves=%d touches=%d, want zero", requests, state.saves, state.touches)
 	}
 }
