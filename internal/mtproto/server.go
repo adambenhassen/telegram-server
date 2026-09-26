@@ -829,9 +829,10 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			}
 		}
 		if !hold.charge(authKeyID, chargeUser) {
-			// The key is not named: it identifies a client's session, no line
-			// elsewhere writes one, and what the operator needs from this line
-			// is which bound is firing and how hard.
+			// This cap log intentionally omits the auth key ID: the cap and
+			// suppressed count show the pressure without identifying a client's
+			// session. Sampled -404 diagnostics are a separate exception and
+			// include the hex key ID.
 			if dropped, ok := s.unboundKeyLog.allow(time.Now(), preAuthLogInterval); ok {
 				s.log.Info("connection closed at the cap on one unbound auth key",
 					"cap", s.unboundKeys.max, "suppressed", dropped)
