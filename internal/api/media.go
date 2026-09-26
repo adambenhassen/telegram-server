@@ -297,7 +297,9 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	h.notify(r.Ctx, r.UserID)
-	h.notify(r.Ctx, toID)
+	if toID != r.UserID {
+		h.notify(r.Ctx, toID)
+	}
 
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {

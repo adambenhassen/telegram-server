@@ -97,6 +97,12 @@ func (s *Store) SendReaction(ctx context.Context, ownerID, localID int64, reacti
 	}); err != nil {
 		return nil, fmt.Errorf("upsert owner reaction: %w", err)
 	}
+	if ownerID == peerID {
+		if err = tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("commit: %w", err)
+		}
+		return []ReactionTarget{{OwnerID: ownerID, LocalID: localID}}, nil
+	}
 
 	// Upsert on peer's copy.
 	if err = qtx.UpsertReaction(ctx, db.UpsertReactionParams{
@@ -175,6 +181,12 @@ func (s *Store) ClearReaction(ctx context.Context, ownerID, localID int64) ([]Re
 		ReactorID: ownerID,
 	}); err != nil {
 		return nil, fmt.Errorf("delete owner reaction: %w", err)
+	}
+	if ownerID == peerID {
+		if err = tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("commit: %w", err)
+		}
+		return []ReactionTarget{{OwnerID: ownerID, LocalID: localID}}, nil
 	}
 
 	if err = qtx.DeleteReaction(ctx, db.DeleteReactionParams{

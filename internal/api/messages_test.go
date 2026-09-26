@@ -32,12 +32,17 @@ func TestPeerUserIDValidatesAccessHash(t *testing.T) {
 	if _, err := api.PeerUserID(&tg.InputPeerUser{UserID: 5, AccessHash: 5}, 5); err == nil {
 		t.Error("M1 placeholder: expected PEER_ID_INVALID, got nil")
 	}
+	if id, err := api.PeerUserID(&tg.InputPeerSelf{}, 5); err != nil || id != 5 {
+		t.Fatalf("authenticated self peer: id=%d err=%v, want id 5", id, err)
+	}
+	if _, err := api.PeerUserID(&tg.InputPeerSelf{}, 0); err == nil {
+		t.Error("unauthenticated self peer: expected PEER_ID_INVALID, got nil")
+	}
 
 	for name, peer := range map[string]tg.InputPeerClass{
 		"wrong hash":           &tg.InputPeerUser{UserID: 5, AccessHash: 6},
 		"cross-account replay": &tg.InputPeerUser{UserID: 5, AccessHash: api.DeriveUserHash(999, 5)},
 		"zero id":              &tg.InputPeerUser{UserID: 0, AccessHash: 0},
-		"self":                 &tg.InputPeerSelf{},
 		"chat":                 &tg.InputPeerChat{ChatID: 1},
 	} {
 		if _, err := api.PeerUserID(peer, 5); err == nil {

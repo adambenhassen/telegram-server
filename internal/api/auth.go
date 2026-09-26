@@ -144,7 +144,7 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 			return nil, errInternal
 		}
 	}
-	return &tg.AuthAuthorization{User: userTL(user)}, nil
+	return &tg.AuthAuthorization{User: h.userTL(user)}, nil
 }
 
 func (h *handlers) handleSendCode(r *mtproto.Request) (bin.Encoder, error) {
@@ -358,7 +358,7 @@ func (h *handlers) handleSignInPhone(r *mtproto.Request, req tg.AuthSignInReques
 		h.log.Error("bind auth key", "user_id", user.ID, "err", err)
 		return nil, errInternal
 	}
-	return &tg.AuthAuthorization{User: userTL(user)}, nil
+	return &tg.AuthAuthorization{User: h.userTL(user)}, nil
 }
 
 // handleSignInUsername is the username-mode signIn path. It validates the code
