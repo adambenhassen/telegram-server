@@ -40,7 +40,7 @@ func getUsersErrorBytes(t *testing.T, s *store.Store, viewerID int64, input tg.I
 	if !errors.As(err, &rpc) {
 		t.Fatalf("users.getUsers error = %v, want RPC error", err)
 	}
-	return []byte(fmt.Sprintf("%d\x00%s\x00%s\x00%d", rpc.Code, rpc.Type, rpc.Message, rpc.Argument))
+	return fmt.Appendf(nil, "%d\x00%s\x00%s\x00%d", rpc.Code, rpc.Type, rpc.Message, rpc.Argument)
 }
 
 // TestGetUsersRefreshesExactSearchBeforeDialog demonstrates the reported
