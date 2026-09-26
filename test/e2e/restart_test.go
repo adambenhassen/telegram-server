@@ -91,6 +91,7 @@ func TestRestartPersistence(t *testing.T) {
 	client := newClient(port)
 
 	phone := "+15551239999"
+	const savedText = "saved through restart"
 	seedPhoneUsers(t, ctx, st, phone)
 	flow := auth.NewFlow(
 		auth.Constant(phone, "", auth.CodeAuthenticatorFunc(
@@ -102,9 +103,15 @@ func TestRestartPersistence(t *testing.T) {
 
 	// Run #1: log in against server #1.
 	if err := client.Run(ctx, func(ctx context.Context) error {
-		return client.Auth().IfNecessary(ctx, flow)
+		if err := client.Auth().IfNecessary(ctx, flow); err != nil {
+			return err
+		}
+		_, err := client.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: &tg.InputPeerSelf{}, Message: savedText, RandomID: 39999,
+		})
+		return err
 	}); err != nil {
-		t.Fatalf("login flow: %v", err)
+		t.Fatalf("login and self send: %v", err)
 	}
 
 	u, ok, err := st.UserByPhone(ctx, phone)
@@ -135,9 +142,26 @@ func TestRestartPersistence(t *testing.T) {
 			return serr
 		}
 		status = s
+		history, serr := client2.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer: &tg.InputPeerSelf{}, Limit: 10,
+		})
+		if serr != nil {
+			return serr
+		}
+		messages, ok := history.(*tg.MessagesMessages)
+		if !ok {
+			return fmt.Errorf("post-restart self history = %T, want *tg.MessagesMessages", history)
+		}
+		if len(messages.Messages) != 1 {
+			return fmt.Errorf("post-restart self history = %T with %d messages, want one", history, len(messages.Messages))
+		}
+		message, ok := messages.Messages[0].(*tg.Message)
+		if !ok || message.Message != savedText || !message.Out {
+			return fmt.Errorf("post-restart self message = %#v, want outgoing %q", messages.Messages[0], savedText)
+		}
 		return nil
 	}); err != nil {
-		t.Fatalf("post-restart run: %v", err)
+		t.Fatalf("post-restart run and self history: %v", err)
 	}
 
 	if !status.Authorized {
