@@ -317,10 +317,10 @@ func (h *handlers) handleGetPeerDialogs(r *mtproto.Request) (bin.Encoder, error)
 	return h.peerDialogsToTL(snapshot, r.UserID), nil
 }
 
-// peerDialogsToTL is the response-only half of the snapshot path. Every map
-// here was populated by the store's repeatable-read selection and the same
-// viewer-aware entitlement gates used by getDialogs; this function performs no
-// further database reads.
+// peerDialogsToTL is the response-only half of the snapshot path. Row-derived
+// users remain behind the viewer-aware entitlement gate; explicitly requested
+// user peers were admitted by their validated access hashes. This function
+// performs no further database reads.
 func (h *handlers) peerDialogsToTL(snapshot store.PeerDialogsSnapshot, viewerID int64) *tg.MessagesPeerDialogs {
 	tlDialogs := make([]tg.DialogClass, 0, len(snapshot.Dialogs))
 	tlMsgs := make([]tg.MessageClass, 0, len(snapshot.Dialogs))
@@ -373,7 +373,7 @@ func (h *handlers) peerDialogsToTL(snapshot store.PeerDialogsSnapshot, viewerID 
 
 	users := make([]tg.UserClass, 0, len(snapshot.Users))
 	for id, user := range snapshot.Users {
-		if id != viewerID && !snapshot.EntitledUsers[id] {
+		if id != viewerID && !snapshot.EntitledUsers[id] && !snapshot.ExplicitUserPeers[id] {
 			users = append(users, &tg.UserEmpty{ID: id})
 			continue
 		}

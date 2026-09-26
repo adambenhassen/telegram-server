@@ -33,16 +33,17 @@ type PeerDialog struct {
 // read-only transaction so selection, entitlement, hydration, and state all
 // describe the same database snapshot.
 type PeerDialogsSnapshot struct {
-	Dialogs        []PeerDialog
-	State          State
-	Users          map[int64]User
-	EntitledUsers  map[int64]bool
-	Chats          map[int64]Chat
-	ChatMembers    map[int64][]Participant
-	ChatMembership map[int64]bool
-	Channels       map[int64]Channel
-	ChannelMembers map[int64]ChannelMember
-	Files          map[int64]File
+	Dialogs           []PeerDialog
+	State             State
+	Users             map[int64]User
+	EntitledUsers     map[int64]bool
+	ExplicitUserPeers map[int64]bool
+	Chats             map[int64]Chat
+	ChatMembers       map[int64][]Participant
+	ChatMembership    map[int64]bool
+	Channels          map[int64]Channel
+	ChannelMembers    map[int64]ChannelMember
+	Files             map[int64]File
 }
 
 // SetPeerDialogsSnapshotHook installs the test-only synchronization seam used
@@ -51,18 +52,20 @@ type PeerDialogsSnapshot struct {
 func SetPeerDialogsSnapshotHook(s *Store, fn func()) { s.peerDialogsSnapshotHook = fn }
 
 // PeerDialogsSnapshot selects and hydrates the requested peers for ownerID.
-// The caller has already validated the input constructors and access hashes;
-// this method only reads the exact owner-scoped rows that those keys name.
+// The caller has already validated the input constructors and access hashes.
+// User peers from that set may receive a public profile by the validated hash;
+// user ids derived from selected dialog rows remain subject to live entitlement.
 func (s *Store) PeerDialogsSnapshot(ctx context.Context, ownerID int64, peers []PeerDialogKey) (PeerDialogsSnapshot, error) {
 	snapshot := PeerDialogsSnapshot{
-		Users:          map[int64]User{},
-		EntitledUsers:  map[int64]bool{},
-		Chats:          map[int64]Chat{},
-		ChatMembers:    map[int64][]Participant{},
-		ChatMembership: map[int64]bool{},
-		Channels:       map[int64]Channel{},
-		ChannelMembers: map[int64]ChannelMember{},
-		Files:          map[int64]File{},
+		Users:             map[int64]User{},
+		EntitledUsers:     map[int64]bool{},
+		ExplicitUserPeers: map[int64]bool{},
+		Chats:             map[int64]Chat{},
+		ChatMembers:       map[int64][]Participant{},
+		ChatMembership:    map[int64]bool{},
+		Channels:          map[int64]Channel{},
+		ChannelMembers:    map[int64]ChannelMember{},
+		Files:             map[int64]File{},
 	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
@@ -184,7 +187,12 @@ func (s *Store) PeerDialogsSnapshot(ctx context.Context, ownerID int64, peers []
 		}
 	}
 
-	userIDs = peerDialogUserIDs(ownerID, snapshot.Dialogs, snapshot.ChatMembers, snapshot.ChatMembership)
+	for _, peer := range peers {
+		if peer.PeerType == PeerTypeUser {
+			snapshot.ExplicitUserPeers[peer.PeerID] = true
+		}
+	}
+	userIDs = peerDialogUserIDs(ownerID, snapshot.Dialogs, snapshot.ChatMembers, snapshot.ChatMembership, peers)
 	userRows, err := qtx.UsersByID(ctx, userIDs)
 	if err != nil {
 		return PeerDialogsSnapshot{}, fmt.Errorf("peer dialog users: %w", err)
@@ -264,13 +272,18 @@ func selectedChatIDs(dialogs []PeerDialog) []int64 {
 	return ids
 }
 
-func peerDialogUserIDs(ownerID int64, dialogs []PeerDialog, chatMembers map[int64][]Participant, chatMembership map[int64]bool) []int64 {
+func peerDialogUserIDs(ownerID int64, dialogs []PeerDialog, chatMembers map[int64][]Participant, chatMembership map[int64]bool, requestedPeers []PeerDialogKey) []int64 {
 	seen := map[int64]bool{ownerID: true}
 	ids := []int64{ownerID}
 	add := func(id int64) {
 		if id != 0 && !seen[id] {
 			seen[id] = true
 			ids = append(ids, id)
+		}
+	}
+	for _, peer := range requestedPeers {
+		if peer.PeerType == PeerTypeUser {
+			add(peer.PeerID)
 		}
 	}
 	for _, d := range dialogs {

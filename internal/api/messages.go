@@ -73,9 +73,9 @@ func (h *handlers) notifyEncryptedMsg(ctx context.Context, recipientID int64, qt
 	}
 }
 
-// twoUsers hydrates the caller and the peer into the update user list.
+// twoUsers hydrates the caller and the validated direct user peer for getHistory.
 func (h *handlers) twoUsers(ctx context.Context, selfID, peerID int64) ([]tg.UserClass, error) {
-	return h.loadUsers(ctx, map[int64]bool{selfID: true, peerID: true}, selfID)
+	return h.loadUsersForUserPeer(ctx, selfID, peerID)
 }
 
 // loadFiles hydrates the files referenced by a batch of message rows into wire
