@@ -2,6 +2,7 @@ package mtproto
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -29,17 +30,19 @@ func (s *Server) exchange(ctx context.Context, conn transport.Conn) (crypto.Auth
 	return r.Key, nil
 }
 
-// exchangeConn wraps a transport.Conn for the key-exchange flow, rejecting any
-// frame that carries a non-zero auth key ID (a client must not present a
-// registered key mid-handshake). Mirrors gotd tgtest/exchange.go.
+// exchangeConn wraps a transport.Conn for the key-exchange flow, returning a
+// known encrypted frame to serveConn and rejecting lookup misses with -404.
 type exchangeConn struct {
 	transport.Conn
 
-	onRejected func([8]byte)
+	keys         AuthKeyStore
+	onLookupMiss func([8]byte)
 }
 
 // Recv reads the next handshake frame, replying with an AuthKeyNotFound proto
-// error and retrying if the frame presents a non-zero auth key ID.
+// error and retrying if the frame presents an unknown non-zero auth key ID. A
+// known key ID returns the frame to serveConn so it can use the normal decrypt
+// and dispatch path.
 func (e exchangeConn) Recv(ctx context.Context, b *bin.Buffer) error {
 	for {
 		if err := e.Conn.Recv(ctx, b); err != nil {
@@ -51,13 +54,24 @@ func (e exchangeConn) Recv(ctx context.Context, b *bin.Buffer) error {
 			return fmt.Errorf("peek id: %w", err)
 		}
 		if authKeyID != [8]byte{} {
+			_, _, _, ok, err := e.keys.Get(ctx, authKeyID)
+			if err != nil {
+				return errors.Join(errAuthKeyLookupFailure, fmt.Errorf("get exchange auth key: %w", err))
+			}
+			if ok {
+				return &exchange.UnexpectedEncryptedError{
+					AuthKeyID: authKeyID,
+					Frame:     b.Copy(),
+				}
+			}
+
 			var buf bin.Buffer
 			buf.PutInt32(-codec.CodeAuthKeyNotFound)
 			if err := e.Send(ctx, &buf); err != nil {
 				return fmt.Errorf("send: %w", err)
 			}
-			if e.onRejected != nil {
-				e.onRejected(authKeyID)
+			if e.onLookupMiss != nil {
+				e.onLookupMiss(authKeyID)
 			}
 			continue
 		}

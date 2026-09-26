@@ -2,6 +2,8 @@ package mtproto_test
 
 import (
 	"context"
+	crand "crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"net"
 	"net/netip"
@@ -295,6 +297,69 @@ func TestPreAuthAuthenticatedConnectionOutlivesTheCeiling(t *testing.T) {
 	}
 
 	waitServed(t, ctx, nl.Addr().String(), nil)
+}
+
+func TestPreAuthSlotClearsForStoredKeyFrameDuringExchange(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	nl := mustListenTCP(t, ctx, "127.0.0.1:0")
+	rsaKey, err := rsa.GenerateKey(crand.Reader, crypto.RSAKeyBits)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+	key := rebindTestKey()
+	keys := mtproto.NewMemoryAuthKeyStore()
+	if err := keys.Save(ctx, key); err != nil {
+		t.Fatalf("save auth key: %v", err)
+	}
+	seen := make(chan struct{}, 1)
+	handler := mtproto.HandlerFunc(func(_ *mtproto.Conn, _ *mtproto.Request) error {
+		seen <- struct{}{}
+		return nil
+	})
+	server := mtproto.New(exchange.PrivateKey{RSA: rsaKey}, 2, keys, handler, nil)
+	if err := server.SetPreAuthLimits(mtproto.PreAuthLimits{MaxConns: 1, MaxConnsPerNet: 1}); err != nil {
+		t.Fatalf("set pre-auth limits: %v", err)
+	}
+	serverCtx, stopServer := context.WithCancel(ctx)
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(serverCtx, nl) }()
+	t.Cleanup(func() {
+		stopServer()
+		if err := <-served; err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	})
+
+	firstRaw := dialClient(t, ctx, nl.Addr().String())
+	first, err := transport.Abridged.Handshake(firstRaw)
+	if err != nil {
+		t.Fatalf("first transport handshake: %v", err)
+	}
+	beginKeyExchange(t, ctx, first)
+	if err := first.Send(ctx, &bin.Buffer{Buf: clientFrame(t, key, 62, int64(1)<<32, &tg.HelpGetConfigRequest{})}); err != nil {
+		t.Fatalf("send stored-key frame during exchange: %v", err)
+	}
+	var response bin.Buffer
+	if err := first.Recv(ctx, &response); err != nil {
+		t.Fatalf("receive mixed-frame response: %v", err)
+	}
+	select {
+	case <-seen:
+	case <-ctx.Done():
+		t.Fatal("stored-key frame during exchange did not reach the handler")
+	}
+
+	// This second socket is admitted while the authenticated first one remains
+	// open only if the mixed frame cleared its pre-auth slot after MAC verify.
+	secondServed, err := probeServed(ctx, nl.Addr().String(), nil)
+	if err != nil {
+		t.Fatalf("probe second connection: %v", err)
+	}
+	if !secondServed {
+		t.Fatal("pre-auth slot remained held after the stored-key frame authenticated")
+	}
 }
 
 // TestPreAuthCeilingEndsAtTheProvenKeyNotAtTheHandler pins where the pre-auth
