@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/gotd/td/bin"
@@ -189,5 +190,44 @@ func TestServeConnResyncsRegistryWithKeyBinding(t *testing.T) {
 				t.Fatalf("after the conn ended, registered users = %v, want none", users)
 			}
 		})
+	}
+}
+
+type mismatchedAuthKeyStore struct {
+	key     crypto.AuthKey
+	touches int
+}
+
+func (s *mismatchedAuthKeyStore) Save(context.Context, crypto.AuthKey) error { return nil }
+func (s *mismatchedAuthKeyStore) Get(context.Context, [8]byte) (crypto.AuthKey, int64, bool, bool, error) {
+	return s.key, 7, false, true, nil
+}
+func (s *mismatchedAuthKeyStore) Touch(context.Context, [8]byte) error {
+	s.touches++
+	return nil
+}
+
+func TestServeConnRejectsAuthKeyIDMismatch(t *testing.T) {
+	t.Parallel()
+
+	presented := rebindTestKey()
+	loaded := makeTestKey(0x22)
+	keys := &mismatchedAuthKeyStore{key: loaded}
+	handlerCalls := 0
+	srv := mtproto.New(exchange.PrivateKey{}, 2, keys, mtproto.HandlerFunc(func(*mtproto.Conn, *mtproto.Request) error {
+		handlerCalls++
+		return nil
+	}), nil)
+	frame := clientFrame(t, presented, 42, 1<<32, &mt.PingRequest{PingID: 1})
+
+	err := srv.ServeConn(context.Background(), &frameConn{frames: [][]byte{frame}, before: func(int) {}})
+	if err == nil || !strings.Contains(err.Error(), "auth key ID mismatch") {
+		t.Fatalf("ServeConn error = %v, want auth key ID mismatch", err)
+	}
+	if handlerCalls != 0 {
+		t.Fatalf("handler calls = %d, want 0", handlerCalls)
+	}
+	if keys.touches != 0 {
+		t.Fatalf("auth key touches = %d, want 0", keys.touches)
 	}
 }
