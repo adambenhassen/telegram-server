@@ -49,14 +49,15 @@ func getUsersErrorBytes(t *testing.T, s *store.Store, viewerID int64, input tg.I
 // first message has established a dialog.
 func TestGetUsersRefreshesExactSearchBeforeDialog(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		callerName string
-		targetName string
-		query      string
-		handle     string
+		name            string
+		callerName      string
+		targetName      string
+		targetFirstName string
+		query           string
+		handle          string
 	}{
-		{name: "test1 to operator", callerName: "test1", targetName: "operator", query: "@operator", handle: "operator"},
-		{name: "operator to test1", callerName: "operator", targetName: "test1", query: "@test1", handle: "test1"},
+		{name: "test1 to operator", callerName: "test1", targetName: "operator", targetFirstName: "Operator", query: "@operator", handle: "operator"},
+		{name: "operator to test1", callerName: "operator", targetName: "test1", targetFirstName: "Test1 User", query: "@test1", handle: "test1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -68,6 +69,9 @@ func TestGetUsersRefreshesExactSearchBeforeDialog(t *testing.T) {
 			}
 			target, err := s.CreateUser(ctx, "15551290002")
 			if err != nil {
+				t.Fatal(err)
+			}
+			if err := api.SetUserFirstNameForTest(dsn, target.ID, tc.targetFirstName); err != nil {
 				t.Fatal(err)
 			}
 			if err := api.ClaimUsernameForTest(s, caller.ID, tc.callerName); err != nil {
@@ -123,9 +127,9 @@ func TestGetUsersRefreshesExactSearchBeforeDialog(t *testing.T) {
 			if !ok {
 				t.Fatalf("users.getUsers element = %T, want the searched user", refreshed.Elems[0])
 			}
-			if refreshedUser.ID != target.ID || refreshedUser.Username != tc.handle || refreshedUser.Self || refreshedUser.Phone != "" {
-				t.Errorf("users.getUsers user = {id:%d username:%q self:%t phone:%q}, want public target %q",
-					refreshedUser.ID, refreshedUser.Username, refreshedUser.Self, refreshedUser.Phone, tc.handle)
+			if refreshedUser.ID != target.ID || refreshedUser.Username != tc.handle || refreshedUser.FirstName != tc.targetFirstName || refreshedUser.Self || refreshedUser.Phone != "" {
+				t.Errorf("users.getUsers user = {id:%d username:%q first_name:%q self:%t phone:%q}, want public target %q with first name %q",
+					refreshedUser.ID, refreshedUser.Username, refreshedUser.FirstName, refreshedUser.Self, refreshedUser.Phone, tc.handle, tc.targetFirstName)
 			}
 
 			if err := lookups.QueryRow(ctx, "SELECT count(*) FROM username_lookups WHERE caller_id = $1 AND handle = $2", caller.ID, tc.handle).Scan(&lookupCount); err != nil {
@@ -136,7 +140,7 @@ func TestGetUsersRefreshesExactSearchBeforeDialog(t *testing.T) {
 			}
 
 			if _, err := api.SendMessageForTest(s, caller.ID, &tg.MessagesSendMessageRequest{
-				Peer:     &tg.InputPeerUser{UserID: target.ID, AccessHash: searchUser.AccessHash},
+				Peer:     &tg.InputPeerUser{UserID: target.ID, AccessHash: refreshedUser.AccessHash},
 				Message:  "first message",
 				RandomID: 1,
 			}); err != nil {
