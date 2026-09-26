@@ -35,7 +35,10 @@ services:
   # RustFS starts with no buckets. This one-shot uses the standard S3 client
   # only to create the local bucket; telegramd still owns every blob operation.
   rustfs-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: telegramd-mc-init:local
+    build:
+      context: .
+      dockerfile: Dockerfile.mc
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - >-
