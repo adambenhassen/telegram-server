@@ -1091,11 +1091,10 @@ func (h *handlers) handleEditChannelUsername(r *mtproto.Request) (bin.Encoder, e
 	username := req.Username
 	// Non-empty usernames must pass validation before any DB access.
 	if username != "" {
-		if !usernameRe.MatchString(username) {
+		if !validateUsername(username) {
 			return nil, errUsernameInvalid
 		}
-		normalized := strings.ToLower(username)
-		if reservedUsernames[normalized] {
+		if isReservedUsername(username) {
 			return nil, errUsernameInvalid
 		}
 	}

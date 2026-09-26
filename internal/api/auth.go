@@ -18,7 +18,7 @@ import (
 
 var (
 	phoneRE    = regexp.MustCompile(`^\+?[0-9]{5,15}$`)
-	usernameRE = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{4,31}$`)
+	usernameRE = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{1,31}$`)
 )
 
 const (
@@ -119,6 +119,9 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	// whether its identifier is known or its code hash is valid.
 	if err := h.checkAndChargeRateLimitIP(r, "sign_up_ip", h.rateLimitSignUpIP); err != nil {
 		return nil, err
+	}
+	if isReservedUsername(username) {
+		return nil, errInputRequestInvalid
 	}
 
 	user, err := h.store.AdmitUsername(

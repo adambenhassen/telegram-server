@@ -299,7 +299,7 @@ func TestUpdateUsernameClearIdempotent(t *testing.T) {
 	}
 }
 
-// TestUpdateUsernameTooShort proves a username shorter than 5 characters is
+// TestUpdateUsernameTooShort proves a username shorter than 2 characters is
 // rejected with USERNAME_INVALID.
 func TestUpdateUsernameTooShort(t *testing.T) {
 	t.Parallel()
@@ -310,7 +310,7 @@ func TestUpdateUsernameTooShort(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = api.UpdateUsernameForTest(s, user.ID, "ab")
+	_, err = api.UpdateUsernameForTest(s, user.ID, "A")
 	if err == nil {
 		t.Fatal("expected error for too-short username")
 	}
@@ -387,6 +387,9 @@ func TestUpdateUsernameInvalidChar(t *testing.T) {
 // with USERNAME_INVALID.
 func TestUpdateUsernameReserved(t *testing.T) {
 	t.Parallel()
+	if !api.ValidateUsername("me") {
+		t.Fatal("me should pass username format validation")
+	}
 	ctx := context.Background()
 	s := openStore(t)
 	user, err := s.CreateUser(ctx, "+15550001013")
@@ -394,7 +397,7 @@ func TestUpdateUsernameReserved(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = api.UpdateUsernameForTest(s, user.ID, "admin")
+	_, err = api.UpdateUsernameForTest(s, user.ID, "me")
 	if err == nil {
 		t.Fatal("expected error for reserved username")
 	}
@@ -415,7 +418,7 @@ func TestUpdateUsernameReservedCaseInsensitive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = api.UpdateUsernameForTest(s, user.ID, "ADMIN")
+	_, err = api.UpdateUsernameForTest(s, user.ID, "ME")
 	if err == nil {
 		t.Fatal("expected error for reserved username (uppercase)")
 	}
@@ -607,7 +610,7 @@ func TestUpdateUsernameTooLong(t *testing.T) {
 	}
 }
 
-// TestUpdateUsernameExactLength proves boundary lengths (5 and 32) are accepted.
+// TestUpdateUsernameExactLength proves boundary lengths (2 and 32) are accepted.
 func TestUpdateUsernameExactLength(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -621,10 +624,10 @@ func TestUpdateUsernameExactLength(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 5 chars (minimum)
-	_, err = api.UpdateUsernameForTest(s, user1.ID, "abcde")
+	// 2 chars (minimum)
+	_, err = api.UpdateUsernameForTest(s, user1.ID, "Ab")
 	if err != nil {
-		t.Fatalf("5-char username: %v", err)
+		t.Fatalf("2-char username: %v", err)
 	}
 
 	// 32 chars (maximum) — use a second user to avoid rate limit

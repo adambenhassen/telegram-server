@@ -14,8 +14,10 @@ import (
 )
 
 func TestValidateUsername(t *testing.T) {
-	// Valid usernames: 5–32 chars, letter-first, alphanumeric + underscore.
+	// Valid usernames: 2–32 chars, letter-first, alphanumeric + underscore.
 	for _, u := range []string{
+		"Ab",
+		"Abc_",
 		"alice",
 		"abcde",
 		"a1234",
@@ -28,12 +30,10 @@ func TestValidateUsername(t *testing.T) {
 		}
 	}
 
-	// Invalid: too short (less than 5 chars).
+	// Invalid: too short (less than 2 chars).
 	for _, u := range []string{
 		"",
-		"a",
-		"abc",
-		"abcd",
+		"A",
 	} {
 		if api.ValidateUsername(u) {
 			t.Errorf("%q should not be a valid username (too short)", u)
@@ -73,7 +73,7 @@ func TestSendCodeAcceptsUsername(t *testing.T) {
 	s := openStore(t)
 	addr := netip.MustParseAddr("198.51.100.60")
 
-	res, err := api.SendCodeForTest(s, addr, generousIPLimits, "alice")
+	res, err := api.SendCodeForTest(s, addr, generousIPLimits, "Ab")
 	if err != nil {
 		t.Fatalf("sendCode for username: %v", err)
 	}
