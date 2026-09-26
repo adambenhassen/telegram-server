@@ -125,6 +125,28 @@ func TestContactsSearchFindsExactUsername(t *testing.T) {
 	}
 }
 
+func TestContactsSearchFindsTwoCharacterUsername(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	ctx := context.Background()
+	caller, err := s.CreateUser(ctx, "15550009003")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := s.CreateUser(ctx, "15550009004")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimUsernameForTest(s, target.ID, "ab"); err != nil {
+		t.Fatal(err)
+	}
+
+	found := contactsSearchUsernames(t, s, caller.ID, "@ab")
+	if got := userPeerIDs(found.Results); len(got) != 1 || got[0] != target.ID {
+		t.Errorf("search(@ab) user Results = %v, want [%d]", got, target.ID)
+	}
+}
+
 func TestContactsSearchUsernameRequiresExactHandle(t *testing.T) {
 	t.Parallel()
 	s, dsn := openStoreDSN(t)

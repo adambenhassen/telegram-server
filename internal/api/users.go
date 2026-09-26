@@ -232,7 +232,7 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 
 	username := strings.ToLower(strings.TrimPrefix(req.Q, "@"))
 	var exactUser *store.User
-	if usernameRe.MatchString(username) {
+	if validateUsername(username) {
 		// Share resolveUsername's per-account distinct-handle and burst budgets.
 		// Charge before any username lookup, even when this resolves to a channel
 		// or misses, so contacts.search cannot buy a second lookup path.
