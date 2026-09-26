@@ -405,12 +405,12 @@ func TestSignInUsernameCaseInsensitive(t *testing.T) {
 	s := openStore(t)
 
 	// Create a username-mode user.
-	user, err := s.CreateUsernameUser(ctx, "caseuser", "Test", "User")
+	user, err := s.CreateUsernameUser(ctx, "ab", "Test", "User")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Claim the username directly (UpdateUsername rejects for login_mode='username').
-	if err := s.ClaimUsername(ctx, user.ID, "caseuser"); err != nil {
+	if err := s.ClaimUsername(ctx, user.ID, "ab"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -425,7 +425,7 @@ func TestSignInUsernameCaseInsensitive(t *testing.T) {
 	}
 
 	// Issue a code for the username (lowercase).
-	hash, _, err := s.IssueCodeForUsername(ctx, "caseuser")
+	hash, _, err := s.IssueCodeForUsername(ctx, "ab")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,12 +440,55 @@ func TestSignInUsernameCaseInsensitive(t *testing.T) {
 
 	// signIn with mixed case — should resolve the same user.
 	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, cfg, &tg.AuthSignInRequest{
-		PhoneNumber:   "CaseUser",
+		PhoneNumber:   "Ab",
 		PhoneCodeHash: hash,
 		PhoneCode:     "",
 	})
 	if !isSessionPasswordNeeded(err) {
 		t.Fatalf("signIn with mixed-case username: expected SESSION_PASSWORD_NEEDED, got %v", err)
+	}
+}
+
+func TestSignInReservedUsernameHolder(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	user, err := s.CreateUsernameUser(ctx, "me", "Reserved", "User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimUsername(ctx, user.ID, "me"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertPassword(ctx, store.UserPassword{
+		UserID:   user.ID,
+		Salt1:    []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		Salt2:    []byte{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+		Verifier: []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveAuthKey(ctx, int64(0x1), make([]byte, 256)); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := netip.MustParseAddr("10.0.0.8")
+	sent, err := api.SendCodeForTest(s, addr, store.SendCodeIPLimits{}, "ME")
+	if err != nil {
+		t.Fatalf("sendCode for reserved handle: %v", err)
+	}
+	sentCode, ok := sent.(*tg.AuthSentCode)
+	if !ok {
+		t.Fatalf("sendCode result = %T, want *tg.AuthSentCode", sent)
+	}
+
+	_, err = api.SignInForTestWithLimits(s, [8]byte{1}, addr, store.RateLimitConfig{}, &tg.AuthSignInRequest{
+		PhoneNumber:   "Me",
+		PhoneCodeHash: sentCode.PhoneCodeHash,
+	})
+	if !isSessionPasswordNeeded(err) {
+		t.Fatalf("signIn for reserved handle: got %v, want SESSION_PASSWORD_NEEDED", err)
 	}
 }
 

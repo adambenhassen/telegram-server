@@ -501,10 +501,6 @@ jobs:
               status=0
               pnpm exec playwright install-deps --dry-run chromium >deps-after-update.txt 2>&1 || status=$?
               cat deps-after-update.txt
-              if [ "$status" -ne 0 ]; then
-                echo "::error::could not determine Playwright dependencies after apt-get update"
-                return "$status"
-              fi
               if grep -q 'All system dependencies are installed' deps-after-update.txt; then
                 : >apt-install-packages.txt
               elif grep -q 'Missing system dependencies' deps-after-update.txt; then
@@ -513,6 +509,9 @@ jobs:
                   echo "::error::could not parse Playwright dependencies after apt-get update"
                   return 1
                 fi
+              elif [ "$status" -ne 0 ]; then
+                echo "::error::could not determine Playwright dependencies after apt-get update"
+                return "$status"
               else
                 echo "::error::Playwright did not report dependencies after apt-get update"
                 return 1

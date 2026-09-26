@@ -389,7 +389,7 @@ Secret chats
 ### M12 — Usernames & public channels
 - Shared `usernames` table: globally unique, case-insensitive handles covering
   both user and channel names.
-- `account.updateUsername` — self-service username set/clear; 5–32 chars
+- `account.updateUsername` — self-service username set/clear; 2–32 chars
   `[a-z0-9_]` letter-first; reserved-handle blocklist; 2 changes/24h rate limit.
 - `channels.updateUsername` — admin-only; same validation and rate limit as
   `account.updateUsername`.
@@ -742,7 +742,7 @@ Tracked so shortcuts don't rot into "later means never".
 
 ### M16 — Username/password authentication
 
-- `auth.sendCode` and `auth.signIn` extended to accept a username (5–32 chars `[a-z0-9_]`
+- `auth.sendCode` and `auth.signIn` extended to accept a username (2–32 chars `[a-z0-9_]`
   letter-first) in place of a phone number. `auth.signUp` added as the registration entry point.
   On `auth.sendCode` with a username the server issues a code hash (no code value is delivered
   anywhere; the log delivery channel `TG_LOG_LOGIN_CODES=true` still applies).
