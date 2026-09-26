@@ -1,0 +1,354 @@
+package api_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"testing"
+
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/store"
+)
+
+func getUsersForTest(t *testing.T, s *store.Store, viewerID int64, ids ...tg.InputUserClass) *tg.UserClassVector {
+	t.Helper()
+	res, err := api.GetUsersForTestWithRequest(s, viewerID, &tg.UsersGetUsersRequest{ID: ids})
+	if err != nil {
+		t.Fatalf("users.getUsers: %v", err)
+	}
+	vec, ok := res.(*tg.UserClassVector)
+	if !ok {
+		t.Fatalf("users.getUsers result type = %T, want *tg.UserClassVector", res)
+	}
+	assertEncodes(t, res)
+	return vec
+}
+
+func getUsersErrorBytes(t *testing.T, s *store.Store, viewerID int64, input tg.InputUserClass) []byte {
+	t.Helper()
+	_, err := api.GetUsersForTestWithRequest(s, viewerID, &tg.UsersGetUsersRequest{ID: []tg.InputUserClass{input}})
+	if err == nil {
+		t.Fatal("users.getUsers: expected error, got nil")
+	}
+	var rpc *tgerr.Error
+	if !errors.As(err, &rpc) {
+		t.Fatalf("users.getUsers error = %v, want RPC error", err)
+	}
+	return []byte(fmt.Sprintf("%d\x00%s\x00%s\x00%d", rpc.Code, rpc.Type, rpc.Message, rpc.Argument))
+}
+
+// TestGetUsersRefreshesExactSearchBeforeDialog demonstrates the reported
+// regression in both directions: exact search gives the caller a handle and a
+// viewer-valid reference, and getUsers must refresh that same user before the
+// first message has established a dialog.
+func TestGetUsersRefreshesExactSearchBeforeDialog(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		callerName string
+		targetName string
+		query      string
+		handle     string
+	}{
+		{name: "test1 to operator", callerName: "test1", targetName: "operator", query: "@operator", handle: "operator"},
+		{name: "operator to test1", callerName: "operator", targetName: "test1", query: "@test1", handle: "test1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			s, dsn := openStoreDSN(t)
+			caller, err := s.CreateUser(ctx, "15551290001")
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := s.CreateUser(ctx, "15551290002")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := api.ClaimUsernameForTest(s, caller.ID, tc.callerName); err != nil {
+				t.Fatal(err)
+			}
+			if err := api.ClaimUsernameForTest(s, target.ID, tc.targetName); err != nil {
+				t.Fatal(err)
+			}
+
+			before, err := s.History(ctx, caller.ID, store.PeerTypeUser, target.ID, 0, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(before) != 0 {
+				t.Fatalf("history before search has %d messages, want no dialog", len(before))
+			}
+
+			found, err := api.ContactsSearchForTest(s, caller.ID, &tg.ContactsSearchRequest{Q: tc.query, Limit: 10})
+			if err != nil {
+				t.Fatalf("contacts.search(%q): %v", tc.query, err)
+			}
+			search, ok := found.(*tg.ContactsFound)
+			if !ok || len(search.Results) != 1 || len(search.Users) != 1 {
+				t.Fatalf("contacts.search(%q) = %#v, want one exact user", tc.query, found)
+			}
+			searchUser, ok := search.Users[0].(*tg.User)
+			if !ok {
+				t.Fatalf("contacts.search user type = %T, want *tg.User", search.Users[0])
+			}
+			if searchUser.ID != target.ID || searchUser.Username != tc.handle || searchUser.AccessHash != api.DeriveUserHash(caller.ID, target.ID) {
+				t.Fatalf("contacts.search user = {id:%d username:%q access_hash:%d}, want target %q with viewer hash",
+					searchUser.ID, searchUser.Username, searchUser.AccessHash, tc.handle)
+			}
+
+			lookups, err := pgxpool.New(ctx, dsn)
+			if err != nil {
+				t.Fatalf("open username lookup pool: %v", err)
+			}
+			t.Cleanup(lookups.Close)
+			var lookupCount int
+			if err := lookups.QueryRow(ctx, "SELECT count(*) FROM username_lookups WHERE caller_id = $1 AND handle = $2", caller.ID, tc.handle).Scan(&lookupCount); err != nil {
+				t.Fatalf("count search lookup: %v", err)
+			}
+			if lookupCount != 1 {
+				t.Fatalf("search lookup count = %d, want 1", lookupCount)
+			}
+
+			refreshed := getUsersForTest(t, s, caller.ID, &tg.InputUser{UserID: target.ID, AccessHash: searchUser.AccessHash})
+			if len(refreshed.Elems) != 1 {
+				t.Fatalf("users.getUsers elements = %d, want 1", len(refreshed.Elems))
+			}
+			refreshedUser, ok := refreshed.Elems[0].(*tg.User)
+			if !ok {
+				t.Fatalf("users.getUsers element = %T, want the searched user", refreshed.Elems[0])
+			}
+			if refreshedUser.ID != target.ID || refreshedUser.Username != tc.handle || refreshedUser.Self || refreshedUser.Phone != "" {
+				t.Errorf("users.getUsers user = {id:%d username:%q self:%t phone:%q}, want public target %q",
+					refreshedUser.ID, refreshedUser.Username, refreshedUser.Self, refreshedUser.Phone, tc.handle)
+			}
+
+			if err := lookups.QueryRow(ctx, "SELECT count(*) FROM username_lookups WHERE caller_id = $1 AND handle = $2", caller.ID, tc.handle).Scan(&lookupCount); err != nil {
+				t.Fatalf("count lookup after refresh: %v", err)
+			}
+			if lookupCount != 1 {
+				t.Errorf("lookup count after getUsers = %d, want 1 (refresh must not charge username lookup quota)", lookupCount)
+			}
+
+			if _, err := api.SendMessageForTest(s, caller.ID, &tg.MessagesSendMessageRequest{
+				Peer:     &tg.InputPeerUser{UserID: target.ID, AccessHash: searchUser.AccessHash},
+				Message:  "first message",
+				RandomID: 1,
+			}); err != nil {
+				t.Fatalf("first message to exact-search result: %v", err)
+			}
+			received, err := s.History(ctx, target.ID, store.PeerTypeUser, caller.ID, 0, 10)
+			if err != nil {
+				t.Fatalf("recipient history: %v", err)
+			}
+			if len(received) != 1 || received[0].Text != "first message" {
+				t.Fatalf("recipient history = %#v, want the first message", received)
+			}
+		})
+	}
+}
+
+func TestGetUsersRejectsInvalidReferencesWithoutExistenceOracle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	caller, err := s.CreateUser(ctx, "15551290101")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherViewer, err := s.CreateUser(ctx, "15551290102")
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing, err := s.CreateUser(ctx, "15551290103")
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingID := existing.ID + 1_000_000
+
+	badExisting := &tg.InputUser{UserID: existing.ID, AccessHash: api.DeriveUserHash(caller.ID, existing.ID) + 1}
+	badMissing := &tg.InputUser{UserID: missingID, AccessHash: api.DeriveUserHash(caller.ID, missingID) + 1}
+	cases := []struct {
+		name  string
+		input tg.InputUserClass
+	}{
+		{name: "wrong hash for existing id", input: badExisting},
+		{name: "wrong hash for missing id", input: badMissing},
+		{name: "other viewer hash", input: api.InputUser(otherViewer.ID, existing.ID)},
+		{name: "zero hash", input: &tg.InputUser{UserID: existing.ID}},
+		{name: "zero hash for missing id", input: &tg.InputUser{UserID: missingID}},
+		{name: "inputUserEmpty", input: &tg.InputUserEmpty{}},
+		{name: "inputUserFromMessage", input: &tg.InputUserFromMessage{Peer: &tg.InputPeerUser{UserID: existing.ID}, MsgID: 1, UserID: existing.ID}},
+	}
+
+	var want []byte
+	for i, tc := range cases {
+		got := getUsersErrorBytes(t, s, caller.ID, tc.input)
+		if string(got) != "400\x00PEER_ID_INVALID\x00PEER_ID_INVALID\x000" {
+			t.Errorf("%s error bytes = %q, want PEER_ID_INVALID", tc.name, got)
+		}
+		if i == 0 {
+			want = got
+		} else if !bytes.Equal(got, want) {
+			t.Errorf("%s error bytes = %q, want byte-identical %q", tc.name, got, want)
+		}
+	}
+
+	_, err = api.GetUsersForTestWithRequest(s, caller.ID, &tg.UsersGetUsersRequest{ID: []tg.InputUserClass{
+		api.InputUser(caller.ID, existing.ID),
+		badMissing,
+	}})
+	if err == nil || rpcMessage(t, err) != "PEER_ID_INVALID" {
+		t.Fatalf("valid reference followed by bad hash error = %v, want whole-call PEER_ID_INVALID", err)
+	}
+}
+
+func TestGetUsersPreservesOrderAndSelfPrivacy(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	caller, err := s.CreateUser(ctx, "15551290201")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger, err := s.CreateUser(ctx, "15551290202")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, err := s.CreateUser(ctx, "15551290203")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimUsernameForTest(s, caller.ID, "caller"); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimUsernameForTest(s, stranger.ID, "stranger"); err != nil {
+		t.Fatal(err)
+	}
+	missingID := last.ID + 1_000_000
+
+	vec := getUsersForTest(t, s, caller.ID,
+		api.InputUser(caller.ID, last.ID),
+		&tg.InputUserSelf{},
+		api.InputUser(caller.ID, caller.ID),
+		api.InputUser(caller.ID, stranger.ID),
+		api.InputUser(caller.ID, missingID),
+		api.InputUser(caller.ID, last.ID),
+	)
+	wantIDs := []int64{last.ID, caller.ID, caller.ID, stranger.ID, missingID, last.ID}
+	if len(vec.Elems) != len(wantIDs) {
+		t.Fatalf("users.getUsers elements = %d, want %d", len(vec.Elems), len(wantIDs))
+	}
+	for i, wantID := range wantIDs {
+		switch got := vec.Elems[i].(type) {
+		case *tg.User:
+			if got.ID != wantID {
+				t.Errorf("element %d id = %d, want %d", i, got.ID, wantID)
+			}
+			if wantID == caller.ID {
+				if !got.Self || got.Phone != caller.Phone {
+					t.Errorf("self element %d = {self:%t phone:%q}, want caller phone %q", i, got.Self, got.Phone, caller.Phone)
+				}
+			} else {
+				if got.Self || got.Phone != "" {
+					t.Errorf("stranger element %d = {self:%t phone:%q}, want no self flag or phone", i, got.Self, got.Phone)
+				}
+			}
+		case *tg.UserEmpty:
+			if wantID != missingID || got.ID != wantID {
+				t.Errorf("element %d userEmpty id = %d, want user %d", i, got.ID, wantID)
+			}
+		default:
+			t.Errorf("element %d type = %T, want *tg.User or missing *tg.UserEmpty", i, vec.Elems[i])
+		}
+	}
+
+	gotStranger, ok := vec.Elems[3].(*tg.User)
+	if !ok {
+		t.Fatalf("stranger element type = %T, want *tg.User", vec.Elems[3])
+	}
+	loadedStranger, ok, err := s.UserByID(ctx, stranger.ID)
+	if err != nil || !ok {
+		t.Fatalf("load stranger: found=%v err=%v", ok, err)
+	}
+	wantPublic := api.UserToTL(loadedStranger, caller.ID, false)
+	assertEncodes(t, wantPublic)
+	if !reflect.DeepEqual(gotStranger, wantPublic) {
+		t.Errorf("stranger rendering = %#v, want the existing public view %#v", gotStranger, wantPublic)
+	}
+}
+
+func TestGetUsersRejectsOverCapAndKeepsAuthenticationErrors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	caller, err := s.CreateUser(ctx, "15551290301")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tooMany := make([]tg.InputUserClass, 101)
+	for i := range tooMany {
+		tooMany[i] = api.InputUser(caller.ID, caller.ID)
+	}
+	if _, err := api.GetUsersForTestWithRequest(s, caller.ID, &tg.UsersGetUsersRequest{ID: tooMany}); err == nil || rpcMessage(t, err) != "LIMIT_INVALID" {
+		t.Fatalf("101 requested users error = %v, want LIMIT_INVALID", err)
+	}
+
+	if _, err := api.GetUsersForTestWithRequest(s, 0, &tg.UsersGetUsersRequest{ID: []tg.InputUserClass{&tg.InputUserSelf{}}}); err == nil || rpcMessage(t, err) != "AUTH_KEY_UNREGISTERED" {
+		t.Fatalf("unbound self request error = %v, want AUTH_KEY_UNREGISTERED", err)
+	}
+	if _, err := api.GetUsersForTestWithRequest(s, caller.ID+1_000_000, &tg.UsersGetUsersRequest{ID: []tg.InputUserClass{&tg.InputUserSelf{}}}); err == nil || rpcMessage(t, err) != "AUTH_KEY_UNREGISTERED" {
+		t.Fatalf("missing caller self request error = %v, want AUTH_KEY_UNREGISTERED", err)
+	}
+}
+
+func TestGetUsersReturnsUserEmptyForMissingViewerValidReference(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	caller, err := s.CreateUser(ctx, "15551290401")
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingID := caller.ID + 1_000_000
+
+	vec := getUsersForTest(t, s, caller.ID, api.InputUser(caller.ID, missingID))
+	if len(vec.Elems) != 1 {
+		t.Fatalf("users.getUsers elements = %d, want 1", len(vec.Elems))
+	}
+	got, ok := vec.Elems[0].(*tg.UserEmpty)
+	if !ok || got.ID != missingID {
+		t.Fatalf("users.getUsers missing result = %#v, want userEmpty{%d}", vec.Elems[0], missingID)
+	}
+}
+
+func TestGetUsersBatchDedupePreservesRepeatedSlots(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	caller, err := s.CreateUser(ctx, "15551290501")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := s.CreateUser(ctx, "15551290502")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := api.InputUser(caller.ID, peer.ID)
+	vec := getUsersForTest(t, s, caller.ID, ref, ref, ref)
+	if len(vec.Elems) != 3 {
+		t.Fatalf("users.getUsers elements = %d, want 3", len(vec.Elems))
+	}
+	for i, elem := range vec.Elems {
+		got, ok := elem.(*tg.User)
+		if !ok || got.ID != peer.ID {
+			t.Errorf("element %d = %#v, want user %d", i, elem, peer.ID)
+		}
+	}
+}
