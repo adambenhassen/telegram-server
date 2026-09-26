@@ -414,6 +414,34 @@ func TestDeleteChatUserAnnouncesToRemainingAndRemoved(t *testing.T) {
 	}
 }
 
+func TestDeleteChatUserResponseHidesRemovedMemberWithoutLiveEdge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	viewer := chatUser(t, s, 44)
+	removed := chatUser(t, s, 45)
+	chat, err := s.CreateChat(ctx, viewer.ID, "Removal", []int64{removed.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+
+	enc, err := api.DeleteChatUserForTest(s, viewer.ID, &tg.MessagesDeleteChatUserRequest{
+		ChatID: chat.ID,
+		UserID: api.InputUser(viewer.ID, removed.ID),
+	})
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	ups, ok := enc.(*tg.Updates)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.Updates", enc)
+	}
+	got := loadUsersWire(t, ups.Users, removed.ID)
+	if _, ok := got.(*tg.UserEmpty); !ok {
+		t.Errorf("removed user response = %T, want *tg.UserEmpty", got)
+	}
+}
+
 func TestDeleteChatUserNonMemberChangesNothing(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

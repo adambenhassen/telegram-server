@@ -65,6 +65,90 @@ func TestGetPeerDialogsReturnsRequestedUserDialog(t *testing.T) {
 	assertEncodes(t, enc)
 }
 
+func TestGetPeerDialogsReturnsValidatedNoDialogUser(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	viewer, err := s.CreateUser(ctx, "+15551298021")
+	if err != nil {
+		t.Fatalf("viewer: %v", err)
+	}
+	peer, err := s.CreateUser(ctx, "+15551298022")
+	if err != nil {
+		t.Fatalf("peer: %v", err)
+	}
+	if err := api.SetUserFirstNameForTest(dsn, peer.ID, "Operator"); err != nil {
+		t.Fatalf("set peer name: %v", err)
+	}
+	if err := api.ClaimUsernameForTest(s, peer.ID, "operator"); err != nil {
+		t.Fatalf("claim peer username: %v", err)
+	}
+	missingID := peer.ID + 1_000_000
+
+	beforeState, err := s.State(ctx, viewer.ID)
+	if err != nil {
+		t.Fatalf("state before: %v", err)
+	}
+	beforeDialogs, err := s.Dialogs(ctx, viewer.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("dialogs before: %v", err)
+	}
+	beforeEvents, err := s.EventsSince(ctx, viewer.ID, 0)
+	if err != nil {
+		t.Fatalf("events before: %v", err)
+	}
+
+	enc, err := api.GetPeerDialogsForTest(s, viewer.ID, &tg.MessagesGetPeerDialogsRequest{
+		Peers: []tg.InputDialogPeerClass{
+			&tg.InputDialogPeer{Peer: api.InputPeerUser(viewer.ID, peer.ID)},
+			&tg.InputDialogPeer{Peer: api.InputPeerUser(viewer.ID, missingID)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("get peer dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesPeerDialogs)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.MessagesPeerDialogs", enc)
+	}
+	if len(res.Dialogs) != 0 || len(res.Messages) != 0 || len(res.Chats) != 0 {
+		t.Fatalf("no-dialog response = dialogs:%d messages:%d chats:%d, want no fabricated rows", len(res.Dialogs), len(res.Messages), len(res.Chats))
+	}
+	gotPeer, ok := loadUsersWire(t, res.Users, peer.ID).(*tg.User)
+	if !ok {
+		t.Fatalf("requested peer = %T, want live user %d", loadUsersWire(t, res.Users, peer.ID), peer.ID)
+	}
+	if gotPeer.FirstName != "Operator" || gotPeer.Username != "operator" || gotPeer.AccessHash != api.DeriveUserHash(viewer.ID, peer.ID) || gotPeer.Phone != "" || gotPeer.Self || gotPeer.Status == nil {
+		t.Errorf("peer = {first_name:%q username:%q access_hash:%d phone:%q self:%t status:%T}, want public profile without phone",
+			gotPeer.FirstName, gotPeer.Username, gotPeer.AccessHash, gotPeer.Phone, gotPeer.Self, gotPeer.Status)
+	}
+	for _, user := range res.Users {
+		if got, ok := user.(*tg.User); ok && got.ID == missingID {
+			t.Fatalf("missing account %d unexpectedly has a live profile", missingID)
+		}
+		if got, ok := user.(*tg.UserEmpty); ok && got.ID == missingID {
+			t.Fatalf("missing account %d unexpectedly has a profile placeholder", missingID)
+		}
+	}
+	assertEncodes(t, enc)
+
+	afterState, err := s.State(ctx, viewer.ID)
+	if err != nil {
+		t.Fatalf("state after: %v", err)
+	}
+	afterDialogs, err := s.Dialogs(ctx, viewer.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("dialogs after: %v", err)
+	}
+	afterEvents, err := s.EventsSince(ctx, viewer.ID, 0)
+	if err != nil {
+		t.Fatalf("events after: %v", err)
+	}
+	if !reflect.DeepEqual(beforeState, afterState) || !reflect.DeepEqual(beforeDialogs, afterDialogs) || !reflect.DeepEqual(beforeEvents, afterEvents) {
+		t.Fatal("getPeerDialogs changed state, dialogs, or events")
+	}
+}
+
 func TestGetPeerDialogsValidatesBeforeStorage(t *testing.T) {
 	t.Parallel()
 
@@ -128,6 +212,22 @@ func TestGetPeerDialogsValidatesBeforeStorage(t *testing.T) {
 			userID: 1,
 			req: &tg.MessagesGetPeerDialogsRequest{Peers: []tg.InputDialogPeerClass{
 				&tg.InputDialogPeer{Peer: api.InputPeerUser(2, 9)},
+			}},
+			want: "PEER_ID_INVALID",
+		},
+		{
+			name:   "zero user hash for existing id",
+			userID: 1,
+			req: &tg.MessagesGetPeerDialogsRequest{Peers: []tg.InputDialogPeerClass{
+				&tg.InputDialogPeer{Peer: &tg.InputPeerUser{UserID: 9}},
+			}},
+			want: "PEER_ID_INVALID",
+		},
+		{
+			name:   "zero user hash for missing id",
+			userID: 1,
+			req: &tg.MessagesGetPeerDialogsRequest{Peers: []tg.InputDialogPeerClass{
+				&tg.InputDialogPeer{Peer: &tg.InputPeerUser{UserID: 9_999_999}},
 			}},
 			want: "PEER_ID_INVALID",
 		},
@@ -263,6 +363,63 @@ func TestGetPeerDialogsPreservesFirstOrderAndOmitsUnknown(t *testing.T) {
 	if !reflect.DeepEqual(beforeState, afterState) || !reflect.DeepEqual(beforeDialogs, afterDialogs) || !reflect.DeepEqual(beforeEvents, afterEvents) {
 		t.Fatal("getPeerDialogs changed state, dialogs, or events")
 	}
+}
+
+func TestGetPeerDialogsKeepsRequestedPeerSeparateFromRowEntitlement(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, err := s.CreateUser(ctx, "+15551298023")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	viewer, err := s.CreateUser(ctx, "+15551298024")
+	if err != nil {
+		t.Fatalf("viewer: %v", err)
+	}
+	removed, err := s.CreateUser(ctx, "+15551298025")
+	if err != nil {
+		t.Fatalf("removed: %v", err)
+	}
+	stranger, err := s.CreateUser(ctx, "+15551298026")
+	if err != nil {
+		t.Fatalf("stranger: %v", err)
+	}
+	if err := api.SetUserFirstNameForTest(dsn, stranger.ID, "Stranger"); err != nil {
+		t.Fatalf("set stranger name: %v", err)
+	}
+	chat, err := s.CreateChat(ctx, creator.ID, "Mixed peers", []int64{viewer.ID, removed.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	if _, _, _, err := s.RemoveChatUser(ctx, chat.ID, removed.ID, creator.ID); err != nil {
+		t.Fatalf("remove user: %v", err)
+	}
+
+	enc, err := api.GetPeerDialogsForTest(s, viewer.ID, &tg.MessagesGetPeerDialogsRequest{
+		Peers: []tg.InputDialogPeerClass{
+			&tg.InputDialogPeer{Peer: api.InputPeerUser(viewer.ID, stranger.ID)},
+			&tg.InputDialogPeer{Peer: api.InputPeerChat(viewer.ID, chat.ID)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("get peer dialogs: %v", err)
+	}
+	res, ok := enc.(*tg.MessagesPeerDialogs)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.MessagesPeerDialogs", enc)
+	}
+	if len(res.Dialogs) != 1 || len(res.Messages) != 1 {
+		t.Fatalf("dialogs=%d messages=%d, want only the existing chat row", len(res.Dialogs), len(res.Messages))
+	}
+	requested, ok := loadUsersWire(t, res.Users, stranger.ID).(*tg.User)
+	if !ok || requested.AccessHash != api.DeriveUserHash(viewer.ID, stranger.ID) || requested.Phone != "" {
+		t.Fatalf("requested stranger = %T/%v, want the viewer-scoped public profile", loadUsersWire(t, res.Users, stranger.ID), loadUsersWire(t, res.Users, stranger.ID))
+	}
+	if degraded, ok := loadUsersWire(t, res.Users, removed.ID).(*tg.UserEmpty); !ok || degraded.ID != removed.ID {
+		t.Fatalf("removed row user = %T/%v, want userEmpty %d", loadUsersWire(t, res.Users, removed.ID), loadUsersWire(t, res.Users, removed.ID), removed.ID)
+	}
+	assertEncodes(t, enc)
 }
 
 func TestGetPeerDialogsRemovedChatKeepsForbiddenDialog(t *testing.T) {

@@ -106,6 +106,56 @@ func TestGetUsersRefreshesExactSearchBeforeDialog(t *testing.T) {
 					searchUser.ID, searchUser.Username, searchUser.AccessHash, tc.handle)
 			}
 
+			historyEnc, err := api.GetHistoryForTest(s, caller.ID, &tg.MessagesGetHistoryRequest{
+				Peer:  api.InputPeerUser(caller.ID, target.ID),
+				Limit: 30,
+			})
+			if err != nil {
+				t.Fatalf("getHistory before dialog: %v", err)
+			}
+			history, ok := historyEnc.(*tg.MessagesMessages)
+			if !ok {
+				t.Fatalf("getHistory before dialog = %T, want *tg.MessagesMessages", historyEnc)
+			}
+			if len(history.Messages) != 0 {
+				t.Fatalf("getHistory before dialog messages = %d, want 0", len(history.Messages))
+			}
+			historyUser, ok := loadUsersWire(t, history.Users, target.ID).(*tg.User)
+			if !ok {
+				t.Fatalf("getHistory user = %T, want searched user %d", loadUsersWire(t, history.Users, target.ID), target.ID)
+			}
+			if historyUser.FirstName != tc.targetFirstName || historyUser.Username != tc.handle || historyUser.AccessHash != api.DeriveUserHash(caller.ID, target.ID) || historyUser.Self || historyUser.Phone != "" || historyUser.Status == nil {
+				t.Errorf("getHistory user = {first_name:%q username:%q access_hash:%d self:%t phone:%q status:%T}, want public profile for %q without phone",
+					historyUser.FirstName, historyUser.Username, historyUser.AccessHash, historyUser.Self, historyUser.Phone, historyUser.Status, tc.handle)
+			}
+			missingID := target.ID + 1_000_000
+			missingEnc, err := api.GetHistoryForTest(s, caller.ID, &tg.MessagesGetHistoryRequest{
+				Peer:  api.InputPeerUser(caller.ID, missingID),
+				Limit: 30,
+			})
+			if err != nil {
+				t.Fatalf("getHistory for missing account: %v", err)
+			}
+			missingHistory, ok := missingEnc.(*tg.MessagesMessages)
+			if !ok {
+				t.Fatalf("missing-account history = %T, want *tg.MessagesMessages", missingEnc)
+			}
+			if len(missingHistory.Messages) != 0 {
+				t.Fatalf("missing-account history messages = %d, want 0", len(missingHistory.Messages))
+			}
+			for _, user := range missingHistory.Users {
+				switch got := user.(type) {
+				case *tg.User:
+					if got.ID == missingID {
+						t.Fatalf("missing account %d unexpectedly has a live profile", missingID)
+					}
+				case *tg.UserEmpty:
+					if got.ID == missingID {
+						t.Fatalf("missing account %d unexpectedly has a profile placeholder", missingID)
+					}
+				}
+			}
+
 			lookups, err := pgxpool.New(ctx, dsn)
 			if err != nil {
 				t.Fatalf("open username lookup pool: %v", err)
@@ -140,7 +190,7 @@ func TestGetUsersRefreshesExactSearchBeforeDialog(t *testing.T) {
 			}
 
 			if _, err := api.SendMessageForTest(s, caller.ID, &tg.MessagesSendMessageRequest{
-				Peer:     &tg.InputPeerUser{UserID: target.ID, AccessHash: refreshedUser.AccessHash},
+				Peer:     &tg.InputPeerUser{UserID: target.ID, AccessHash: historyUser.AccessHash},
 				Message:  "first message",
 				RandomID: 1,
 			}); err != nil {
@@ -152,6 +202,31 @@ func TestGetUsersRefreshesExactSearchBeforeDialog(t *testing.T) {
 			}
 			if len(received) != 1 || received[0].Text != "first message" {
 				t.Fatalf("recipient history = %#v, want the first message", received)
+			}
+		})
+	}
+}
+
+func TestGetHistoryRejectsInvalidUserPeersBeforeStorage(t *testing.T) {
+	viewerID := int64(1)
+	otherViewerID := int64(2)
+	existingID := int64(3)
+	missingID := int64(1_000_003)
+	tests := []struct {
+		name string
+		peer *tg.InputPeerUser
+	}{
+		{name: "wrong hash for existing id", peer: &tg.InputPeerUser{UserID: existingID, AccessHash: api.DeriveUserHash(viewerID, existingID) + 1}},
+		{name: "wrong hash for missing id", peer: &tg.InputPeerUser{UserID: missingID, AccessHash: api.DeriveUserHash(viewerID, missingID) + 1}},
+		{name: "zero hash for existing id", peer: &tg.InputPeerUser{UserID: existingID}},
+		{name: "zero hash for missing id", peer: &tg.InputPeerUser{UserID: missingID}},
+		{name: "another viewer's hash", peer: api.InputPeerUser(otherViewerID, existingID)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := api.GetHistoryForTest(nil, viewerID, &tg.MessagesGetHistoryRequest{Peer: tt.peer})
+			if got := rpcMessage(t, err); got != "PEER_ID_INVALID" {
+				t.Fatalf("error = %s, want PEER_ID_INVALID", got)
 			}
 		})
 	}

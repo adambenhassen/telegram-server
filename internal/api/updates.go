@@ -541,25 +541,27 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 	}
 }
 
-// loadUsers hydrates the given user ids into wire users, marking selfID as
+// loadUsers hydrates server-derived user ids into wire users, marking selfID as
 // Self. viewerID is the account receiving this response; it is used to derive
-// the per-viewer access hash for each user.
-//
-// Every id the viewer is not entitled to see degrades to tg.UserEmpty: it
-// carries the id and nothing else, which is what tells a client to stop
-// rendering the account as reachable. Entitlement holds iff the id is the
-// viewer, the two share a 1:1 dialog row, both are current participants of
-// some chat, or both are current (unbanned) members of some channel. A
-// removed member keeps their dialog row and their retained message copies by
-// design, so without this gate a batched read of the ids their own rows
-// reference would keep serving live profiles — names, handles, presence —
-// for accounts they no longer share anything live with.
-//
-// The predicate is two store round trips per call: one UsersByID fetch of the
-// whole id set, and one EntitledUserIDs query that takes the id set and the
-// viewer and returns only the ids a live edge admits. The viewer's dialog,
-// chat and channel neighbourhood is never materialized on the client side.
+// the per-viewer access hash for each user. These ids remain subject to the
+// live-edge entitlement check; explicit user peers authorized by a validated
+// access hash use loadUsersForUserPeer instead.
 func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, viewerID int64) ([]tg.UserClass, error) {
+	return h.loadUsersWithExplicitUserPeers(ctx, ids, viewerID, nil)
+}
+
+// loadUsersForUserPeer hydrates the viewer and one user peer that was validated
+// at the RPC boundary for this request. The peer's valid per-viewer access hash
+// permits its public profile even without a live dialog edge.
+func (h *handlers) loadUsersForUserPeer(ctx context.Context, viewerID, peerID int64) ([]tg.UserClass, error) {
+	ids := map[int64]bool{viewerID: true, peerID: true}
+	return h.loadUsersWithExplicitUserPeers(ctx, ids, viewerID, map[int64]bool{peerID: true})
+}
+
+// loadUsersWithExplicitUserPeers keeps row-derived and server-derived ids
+// behind the live-edge gate. explicitUserPeers contains only user peers whose
+// per-viewer access hashes were validated in the current request.
+func (h *handlers) loadUsersWithExplicitUserPeers(ctx context.Context, ids map[int64]bool, viewerID int64, explicitUserPeers map[int64]bool) ([]tg.UserClass, error) {
 	if len(ids) == 0 {
 		return []tg.UserClass{}, nil
 	}
@@ -577,7 +579,7 @@ func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, viewerID i
 	}
 	out := make([]tg.UserClass, 0, len(users))
 	for id, u := range users {
-		if id != viewerID && !entitled[id] {
+		if id != viewerID && !entitled[id] && !explicitUserPeers[id] {
 			out = append(out, &tg.UserEmpty{ID: id})
 			continue
 		}

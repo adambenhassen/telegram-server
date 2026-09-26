@@ -458,6 +458,49 @@ func TestBuildUpdatesChatMessage(t *testing.T) {
 	}
 }
 
+func TestGetDifferenceDegradesRemovedChatMate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, users, chat := chatFixture(t, "+1555134", 3)
+	viewer, removed := users[1], users[2]
+	before, err := s.State(ctx, viewer.ID)
+	if err != nil {
+		t.Fatalf("state before removal: %v", err)
+	}
+	if _, _, _, err := s.RemoveChatUser(ctx, chat.ID, removed.ID, users[0].ID); err != nil {
+		t.Fatalf("remove chat user: %v", err)
+	}
+
+	enc, err := api.GetDifferenceForTest(s, viewer.ID, &tg.UpdatesGetDifferenceRequest{Pts: before.Pts})
+	if err != nil {
+		t.Fatalf("get difference: %v", err)
+	}
+	diff, ok := enc.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("difference = %T, want *tg.UpdatesDifference", enc)
+	}
+	if len(diff.NewMessages) != 1 {
+		t.Fatalf("difference messages = %d, want one removal message", len(diff.NewMessages))
+	}
+	var gotRemoved tg.UserClass
+	for _, user := range diff.Users {
+		switch got := user.(type) {
+		case *tg.User:
+			if got.ID == removed.ID {
+				gotRemoved = got
+			}
+		case *tg.UserEmpty:
+			if got.ID == removed.ID {
+				gotRemoved = got
+			}
+		}
+	}
+	if _, ok := gotRemoved.(*tg.UserEmpty); !ok {
+		t.Fatalf("removed chat mate = %T/%v, want userEmpty %d", gotRemoved, gotRemoved, removed.ID)
+	}
+	assertEncodes(t, enc)
+}
+
 // A chat the viewer is not a member of must come back as chatForbidden: their
 // retained message copies outlive membership, so loadChats is the gate that
 // stops title/version/participant count leaking after removal.
