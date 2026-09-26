@@ -33,17 +33,17 @@ func TestSignUpInviteAdmissionCreatesProvisionalAccount(t *testing.T) {
 	if err := s.SaveAuthKey(ctx, keyID, make([]byte, 256)); err != nil {
 		t.Fatal(err)
 	}
-	invite, secret, err := s.IssueInvite(ctx, "alice")
+	invite, secret, err := s.IssueInvite(ctx, "ab")
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash, _, err := s.IssueCodeForUsername(ctx, "alice")
+	hash, _, err := s.IssueCodeForUsername(ctx, "ab")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	res, err := api.SignInForTestWithLimits(s, [8]byte{1}, netip.MustParseAddr("10.0.0.1"), store.RateLimitConfig{}, &tg.AuthSignInRequest{
-		PhoneNumber:   "alice",
+		PhoneNumber:   "Ab",
 		PhoneCodeHash: hash,
 		PhoneCode:     secret,
 	})
@@ -72,7 +72,7 @@ func TestSignUpInviteAdmissionCreatesProvisionalAccount(t *testing.T) {
 
 	before := countUsers(t, dsn)
 	res, err = api.SignUpForTest(s, [8]byte{1}, netip.MustParseAddr("10.0.0.1"), store.RateLimitConfig{}, config.RegistrationInvite, &tg.AuthSignUpRequest{
-		PhoneNumber:   "alice",
+		PhoneNumber:   "Ab",
 		PhoneCodeHash: hash,
 		FirstName:     "Alice",
 	})
@@ -94,7 +94,7 @@ func TestSignUpInviteAdmissionCreatesProvisionalAccount(t *testing.T) {
 		t.Fatalf("users table grew from %d to %d, want +1", before, after)
 	}
 
-	resolved, found, err := s.UserByUsernameWithLoginMode(ctx, "alice")
+	resolved, found, err := s.UserByUsernameWithLoginMode(ctx, "ab")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +127,62 @@ func TestSignUpInviteAdmissionCreatesProvisionalAccount(t *testing.T) {
 	}
 	if storedCode != "" {
 		t.Fatalf("stored code after admission = %q, want empty", storedCode)
+	}
+}
+
+func TestSignUpRejectsReservedHandles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	addr := netip.MustParseAddr("10.0.0.13")
+	limits := store.RateLimitConfig{}
+
+	for i, handle := range []string{"help", "ADMIN", "me"} {
+		keyID := int64(i + 1)
+		authKeyID := [8]byte{byte(i + 1)}
+		if err := s.SaveAuthKey(ctx, keyID, make([]byte, 256)); err != nil {
+			t.Fatalf("save auth key %q: %v", handle, err)
+		}
+
+		sent, err := api.SendCodeForTest(s, addr, store.SendCodeIPLimits{}, handle)
+		if err != nil {
+			t.Fatalf("sendCode %q: %v", handle, err)
+		}
+		sentCode, ok := sent.(*tg.AuthSentCode)
+		if !ok {
+			t.Fatalf("sendCode result = %T, want *tg.AuthSentCode", sent)
+		}
+
+		_, err = api.SignInForTestWithLimits(s, authKeyID, addr, limits, &tg.AuthSignInRequest{
+			PhoneNumber:   handle,
+			PhoneCodeHash: sentCode.PhoneCodeHash,
+			PhoneCode:     "admission-secret",
+		})
+		if err != nil {
+			t.Fatalf("signIn %q: %v", handle, err)
+		}
+
+		_, err = api.SignUpForTest(s, authKeyID, addr, limits, config.RegistrationOpen, &tg.AuthSignUpRequest{
+			PhoneNumber:   handle,
+			PhoneCodeHash: sentCode.PhoneCodeHash,
+			FirstName:     "Reserved",
+		})
+		if !isInputRequestInvalid(err) {
+			t.Fatalf("signUp %q: expected INPUT_REQUEST_INVALID, got %v", handle, err)
+		}
+
+		if _, found, err := s.UserByUsernameWithLoginMode(ctx, strings.ToLower(handle)); err != nil {
+			t.Fatalf("lookup reserved handle %q: %v", handle, err)
+		} else if found {
+			t.Errorf("reserved handle %q created a user", handle)
+		}
+		key, found, err := s.AuthKeyByID(ctx, keyID)
+		if err != nil {
+			t.Fatalf("lookup auth key %q: %v", handle, err)
+		}
+		if !found || key.UserID != 0 || key.PendingUserID != 0 {
+			t.Errorf("signUp %q changed auth key binding: %#v found=%v", handle, key, found)
+		}
 	}
 }
 

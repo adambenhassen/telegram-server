@@ -240,7 +240,7 @@ func TestHandleEditChannelUsernameRejectsInvalidUsername(t *testing.T) {
 	}
 
 	for name, username := range map[string]string{
-		"too short":        "abc",
+		"too short":        "A",
 		"digit first":      "1abcde",
 		"underscore first": "_abcde",
 		"bad chars":        "ab@de",
@@ -260,6 +260,9 @@ func TestHandleEditChannelUsernameRejectsInvalidUsername(t *testing.T) {
 // handle (e.g. "admin") returns USERNAME_INVALID.
 func TestHandleEditChannelUsernameRejectsReserved(t *testing.T) {
 	t.Parallel()
+	if !api.ValidateUsername("me") {
+		t.Fatal("me should pass username format validation")
+	}
 	ctx := context.Background()
 	s := openStore(t)
 	creator, err := s.CreateUser(ctx, "+15551295071")
@@ -271,7 +274,7 @@ func TestHandleEditChannelUsernameRejectsReserved(t *testing.T) {
 		t.Fatalf("create channel: %v", err)
 	}
 
-	for _, username := range []string{"admin", "support", "help", "me", "telegram", "bot"} {
+	for _, username := range []string{"admin", "support", "help", "me", "ME", "telegram", "bot"} {
 		_, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 			Channel:  api.InputChannel(creator.ID, ch.ID),
 			Username: username,
@@ -932,7 +935,7 @@ func TestHandleEditChannelUsernameStoreErrorNotMember(t *testing.T) {
 	}
 }
 
-// TestHandleEditChannelUsernameMaxLengthBoundary covers the 5 and 32 character
+// TestHandleEditChannelUsernameMaxLengthBoundary covers the 2 and 32 character
 // boundaries.
 func TestHandleEditChannelUsernameMaxLengthBoundary(t *testing.T) {
 	t.Parallel()
@@ -947,22 +950,22 @@ func TestHandleEditChannelUsernameMaxLengthBoundary(t *testing.T) {
 		t.Fatalf("create channel: %v", err)
 	}
 
-	// 4 chars — too short.
+	// 1 char — too short.
 	_, err = api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 		Channel:  api.InputChannel(creator.ID, ch.ID),
-		Username: "abcd",
+		Username: "A",
 	})
 	if msg := rpcMessage(t, err); msg != "USERNAME_INVALID" {
-		t.Errorf("4 chars: got %s, want USERNAME_INVALID", msg)
+		t.Errorf("1 char: got %s, want USERNAME_INVALID", msg)
 	}
 
-	// 5 chars — minimum valid.
+	// 2 chars — minimum valid.
 	res, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 		Channel:  api.InputChannel(creator.ID, ch.ID),
-		Username: "abcde",
+		Username: "Ab",
 	})
 	if err != nil {
-		t.Errorf("5 chars: %v", err)
+		t.Errorf("2 chars: %v", err)
 	} else {
 		assertEncodes(t, res)
 	}
