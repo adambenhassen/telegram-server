@@ -134,11 +134,18 @@ func TestContactsSearchUsernameRequiresExactHandle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	target, err := s.CreateUser(ctx, "15550009102")
+	operator, err := s.CreateUser(ctx, "15550009102")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := api.ClaimUsernameForTest(s, target.ID, "abcde"); err != nil {
+	if err := api.ClaimUsernameForTest(s, operator.ID, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	wildcardTarget, err := s.CreateUser(ctx, "15550009103")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.ClaimUsernameForTest(s, wildcardTarget.ID, "abcde"); err != nil {
 		t.Fatal(err)
 	}
 
