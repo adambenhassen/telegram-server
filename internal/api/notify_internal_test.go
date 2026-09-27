@@ -397,6 +397,43 @@ func TestDeliverOverflowSuppressionSurvivesQueuedBarriers(t *testing.T) {
 	}
 }
 
+func TestDeliverOverflowSuppressionStartsBeforeQueuedBarriersDrain(t *testing.T) {
+	t.Parallel()
+
+	originTransport := &retryNotifyTransport{done: make(chan struct{})}
+	origin := mtproto.NewTestConn(originTransport, replyTestKey())
+	origin.SetOwner(7)
+	keyID := origin.AuthKeyID()
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := origin.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !origin.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender barrier %d", pts)
+		}
+	}
+	_, ok := origin.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok {
+		t.Fatal("overflow sender attempt unexpectedly registered")
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !origin.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if pts, pending := origin.PendingRPCUpdate(7); !pending || pts != 0 {
+		t.Fatalf("overflow barrier after queue drain = (%d, %t), want (0, true)", pts, pending)
+	}
+
+	testUpdater().deliver(
+		context.Background(),
+		7,
+		[]pushConn{origin},
+		func(fromPts int) (updateBatch, error) { return batch(fromPts, 65, 65), nil },
+	)
+	if got := originTransport.count(); got != 0 {
+		t.Fatalf("origin pushes before overflow commit marker = %d, want 0", got)
+	}
+}
+
 func TestDeliverPendingSenderSuppressionAccountsKeyedEventAfterPrefix(t *testing.T) {
 	t.Parallel()
 
