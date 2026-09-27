@@ -351,6 +351,124 @@ func TestPendingRPCUpdateOverflowReservationClearsBeforeCommit(t *testing.T) {
 	}
 }
 
+func TestPendingRPCUpdateOverflowReservationsRollbackTogether(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := c.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !c.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender reservation %d", pts)
+		}
+	}
+	first, ok := c.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok {
+		t.Fatal("first overflow sender reservation unexpectedly registered")
+	}
+	second, ok := c.BeginRPCUpdateAttempt(7, keyID, 66)
+	if ok {
+		t.Fatal("second overflow sender reservation unexpectedly registered")
+	}
+	if !c.ClearRPCUpdateAttempt(first) {
+		t.Fatal("first precommit overflow reservation did not clear")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 1 {
+		t.Fatalf("queued barrier after first overflow rollback = (%d, %t), want (1, true)", pts, pending)
+	}
+	if !c.ClearRPCUpdateAttempt(second) {
+		t.Fatal("second precommit overflow reservation did not clear")
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !c.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("all-failed overflow reservations left origin suppression active")
+	}
+}
+
+func TestPendingRPCUpdateOverflowResultClearsAfterWatermark(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := c.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !c.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender reservation %d", pts)
+		}
+	}
+	overflow, ok := c.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok || !c.SetRPCUpdatePtsAttempt(overflow, 65) {
+		t.Fatal("stage overflow sender reservation")
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !c.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if err := c.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: context.Background(), MsgID: 7},
+		&mt.Pong{PingID: 7}, 7, keyID, 65,
+	); err != nil {
+		t.Fatalf("send overflow result: %v", err)
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("successful overflow result left origin suppression active")
+	}
+	if got := c.LastPushedPts(); got != 65 {
+		t.Fatalf("watermark after overflow result = %d, want 65", got)
+	}
+}
+
+func TestPendingRPCUpdateOverflowResultWaitsForKeyedDelivery(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := c.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !c.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender reservation %d", pts)
+		}
+	}
+	overflow, ok := c.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok || !c.SetRPCUpdatePtsAttempt(overflow, 65) {
+		t.Fatal("stage overflow sender reservation")
+	}
+	if err := c.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: context.Background(), MsgID: 8},
+		&mt.Pong{PingID: 8}, 7, keyID, 65,
+	); err != nil {
+		t.Fatalf("send noncontiguous overflow result: %v", err)
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !c.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 65 {
+		t.Fatalf("overflow barrier before keyed delivery = (%d, %t), want (65, true)", pts, pending)
+	}
+	if !c.MarkRPCUpdate(7, keyID, 65) {
+		t.Fatal("keyed overflow delivery did not account its event")
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("keyed overflow delivery left origin suppression active")
+	}
+	if got := c.LastPushedPts(); got != 65 {
+		t.Fatalf("watermark after keyed overflow delivery = %d, want 65", got)
+	}
+}
+
 func TestSendResultAndMarkRPCUpdate(t *testing.T) {
 	t.Parallel()
 	key := testKey(t)

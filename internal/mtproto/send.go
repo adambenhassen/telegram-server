@@ -101,13 +101,12 @@ type Conn struct {
 	pendingRPCPts     []int
 	pendingRPCIDs     []uint64
 	nextPendingRPCID  uint64
-	// pendingRPCOverflow holds the origin when the bounded barrier queue is
-	// full. The overflow event remains recoverable through getDifference, while
-	// this one bit prevents a later generic suffix from echoing it after the
-	// older barriers drain. A reconnect creates a fresh Conn and clears it.
-	pendingRPCOverflow          bool
-	pendingRPCOverflowID        uint64
-	pendingRPCOverflowCommitted bool
+	// pendingRPCOverflow holds sender-result barriers that arrive after the
+	// regular queue reaches its cap. The slice is bounded separately because a
+	// burst can have several concurrent cap-refused attempts; each entry keeps
+	// its own reservation so an aborted attempt cannot release another one.
+	pendingRPCOverflow          []pendingRPCOverflowEntry
+	pendingRPCOverflowSaturated bool
 
 	// authKeyID mirrors authKey.IntID() for readers that must not take writeMu.
 	// Eviction runs on the single LISTEN goroutine and matches conns by key id,
@@ -130,8 +129,8 @@ type Conn struct {
 // RPCUpdateReservation identifies the sender-result barrier registered by one
 // request attempt. A deduplicated retry receives a valid reservation without
 // owning a queue entry, so its failure cannot clear the original attempt. An
-// overflow reservation owns the bounded origin-suppression bit established at
-// reservation time; it does not consume another queue entry.
+// overflow reservation owns one entry in the bounded origin-suppression hold
+// established at reservation time; it does not consume another queue entry.
 type RPCUpdateReservation struct {
 	owner    int64
 	authKey  int64
@@ -140,12 +139,22 @@ type RPCUpdateReservation struct {
 	overflow bool
 }
 
-// maxPendingRPCUpdates bounds unresolved sender-result bookkeeping. Once the
-// bound is reached, BeginRPCUpdate declines another queue barrier and enables
-// one bounded origin-suppression bit immediately. The persisted event remains
-// recoverable through getDifference instead of growing this connection-local
-// queue without limit.
+type pendingRPCOverflowEntry struct {
+	id  uint64
+	pts int
+}
+
+// maxPendingRPCUpdates bounds the regular unresolved sender-result queue. Once
+// the bound is reached, BeginRPCUpdate records the attempt in the separately
+// bounded overflow hold. The persisted event remains recoverable through
+// getDifference instead of growing this connection-local queue without limit.
 const maxPendingRPCUpdates = 64
+
+// maxPendingRPCOverflowUpdates keeps the fallback bookkeeping bounded even if
+// callers keep starting sends while the regular barrier queue is full. Once
+// this cap is reached, a conservative saturated hold remains until rebind;
+// getDifference still recovers the durable events.
+const maxPendingRPCOverflowUpdates = maxPendingRPCUpdates
 
 // LastPushedPts returns the highest contiguous owner pts already pushed to this
 // connection or accounted for by a successful RPC result.
@@ -203,20 +212,39 @@ func (c *Conn) BeginRPCUpdateAttempt(owner, authKeyID int64, pts int) (RPCUpdate
 				id:      c.pendingRPCIDs[i],
 			}, true
 		}
+		for _, entry := range c.pendingRPCOverflow {
+			if entry.pts == pts {
+				return RPCUpdateReservation{
+					owner:    owner,
+					authKey:  authKeyID,
+					id:       entry.id,
+					overflow: true,
+				}, true
+			}
+		}
 	}
-	if c.pendingRPCOverflow {
-		c.pendingRPCOverflowCommitted = true
-		return RPCUpdateReservation{owner: owner, authKey: authKeyID, overflow: true}, false
-	}
-	if len(c.pendingRPCPts) >= maxPendingRPCUpdates {
-		c.pendingRPCOverflow = true
+	if len(c.pendingRPCOverflow) > 0 || c.pendingRPCOverflowSaturated {
+		if c.pendingRPCOverflowSaturated {
+			return RPCUpdateReservation{owner: owner, authKey: authKeyID, overflow: true}, false
+		}
+		if len(c.pendingRPCOverflow) >= maxPendingRPCOverflowUpdates {
+			c.pendingRPCOverflowSaturated = true
+			return RPCUpdateReservation{owner: owner, authKey: authKeyID, overflow: true}, false
+		}
 		c.nextPendingRPCID++
 		if c.nextPendingRPCID == 0 {
 			c.nextPendingRPCID = 1
 		}
-		c.pendingRPCOverflowID = c.nextPendingRPCID
-		c.pendingRPCOverflowCommitted = false
-		return RPCUpdateReservation{owner: owner, authKey: authKeyID, id: c.pendingRPCOverflowID, overflow: true}, false
+		c.pendingRPCOverflow = append(c.pendingRPCOverflow, pendingRPCOverflowEntry{id: c.nextPendingRPCID})
+		return RPCUpdateReservation{owner: owner, authKey: authKeyID, id: c.nextPendingRPCID, owned: true, overflow: true}, false
+	}
+	if len(c.pendingRPCPts) >= maxPendingRPCUpdates {
+		c.nextPendingRPCID++
+		if c.nextPendingRPCID == 0 {
+			c.nextPendingRPCID = 1
+		}
+		c.pendingRPCOverflow = append(c.pendingRPCOverflow, pendingRPCOverflowEntry{id: c.nextPendingRPCID})
+		return RPCUpdateReservation{owner: owner, authKey: authKeyID, id: c.nextPendingRPCID, owned: true, overflow: true}, false
 	}
 	c.nextPendingRPCID++
 	if c.nextPendingRPCID == 0 {
@@ -256,8 +284,8 @@ func (c *Conn) SetRPCUpdatePts(owner, authKeyID int64, pts int) bool {
 }
 
 // SetRPCUpdatePtsAttempt records the committed sender event's pts on the
-// barrier owned by one request attempt. An overflow reservation seals the
-// bounded suppression bit so post-commit cleanup cannot release it.
+// barrier owned by one request attempt. An overflow reservation keeps its own
+// pts so the result write and keyed delivery can release only that hold.
 func (c *Conn) SetRPCUpdatePtsAttempt(reservation RPCUpdateReservation, pts int) bool {
 	if pts <= 0 {
 		return false
@@ -268,13 +296,23 @@ func (c *Conn) SetRPCUpdatePtsAttempt(reservation RPCUpdateReservation, pts int)
 		return false
 	}
 	if reservation.overflow {
-		if !c.pendingRPCOverflow {
-			return false
+		if reservation.id == 0 {
+			return c.pendingRPCOverflowSaturated
 		}
-		if reservation.id == c.pendingRPCOverflowID {
-			c.pendingRPCOverflowCommitted = true
+		for i := range c.pendingRPCOverflow {
+			if c.pendingRPCOverflow[i].id != reservation.id {
+				continue
+			}
+			if !reservation.owned {
+				return c.pendingRPCOverflow[i].pts == pts
+			}
+			if c.pendingRPCOverflow[i].pts == 0 {
+				c.pendingRPCOverflow[i].pts = pts
+				return true
+			}
+			return c.pendingRPCOverflow[i].pts == pts
 		}
-		return true
+		return false
 	}
 	if !reservation.owned {
 		return false
@@ -307,21 +345,25 @@ func (c *Conn) ClearRPCUpdate(owner, authKeyID int64) bool {
 	return c.clearRPCUpdateLocked(owner, authKeyID)
 }
 
-// ClearRPCUpdateAttempt releases only the queue barrier registered by the
-// given request attempt. Deduplicated attempts own nothing. An overflow
-// attempt can release its suppression bit before commit; once sealed by a
-// committed event, the bit is intentionally retained until the connection is
-// rebound.
+// ClearRPCUpdateAttempt releases only the barrier registered by the given
+// request attempt. Deduplicated attempts own nothing. A committed overflow
+// attempt is cleared here when its result write fails, allowing the generic
+// notification to deliver the durable event instead.
 func (c *Conn) ClearRPCUpdateAttempt(reservation RPCUpdateReservation) bool {
 	if reservation.overflow {
 		c.writeMu.Lock()
 		defer c.writeMu.Unlock()
-		if !c.pendingRPCOverflow || reservation.id == 0 || reservation.id != c.pendingRPCOverflowID || c.pendingRPCOverflowCommitted || c.owner != reservation.owner || c.authKeyID.Load() != reservation.authKey {
+		if reservation.id == 0 || !reservation.owned || c.owner != reservation.owner || c.authKeyID.Load() != reservation.authKey {
 			return false
 		}
-		c.pendingRPCOverflow = false
-		c.pendingRPCOverflowID = 0
-		return true
+		for i, entry := range c.pendingRPCOverflow {
+			if entry.id != reservation.id {
+				continue
+			}
+			c.removePendingRPCOverflowAtLocked(i)
+			return true
+		}
+		return false
 	}
 	if !reservation.owned {
 		return false
@@ -360,6 +402,11 @@ func (c *Conn) removePendingRPCAtLocked(index int) {
 	}
 }
 
+func (c *Conn) removePendingRPCOverflowAtLocked(index int) {
+	copy(c.pendingRPCOverflow[index:], c.pendingRPCOverflow[index+1:])
+	c.pendingRPCOverflow = c.pendingRPCOverflow[:len(c.pendingRPCOverflow)-1]
+}
+
 // PendingRPCUpdate reports the sender-result barrier for owner. A true result
 // with pts=0 means the send is committed-or-in-flight but its event pts is not
 // known yet, so generic delivery must wait rather than risk crossing it.
@@ -369,8 +416,13 @@ func (c *Conn) PendingRPCUpdate(owner int64) (pts int, pending bool) {
 	if c.pendingRPCOwner == owner && len(c.pendingRPCPts) > 0 {
 		return c.pendingRPCPts[0], true
 	}
-	if c.pendingRPCOverflow && c.owner == owner {
-		return 0, true
+	if c.owner == owner {
+		if len(c.pendingRPCOverflow) > 0 {
+			return c.pendingRPCOverflow[0].pts, true
+		}
+		if c.pendingRPCOverflowSaturated {
+			return 0, true
+		}
 	}
 	return 0, false
 }
@@ -395,6 +447,20 @@ func (c *Conn) markRPCUpdateLocked(owner, authKeyID int64, pts int) bool {
 			c.lastPushedPts.Store(int64(pts))
 		}
 		c.removePendingRPCAtLocked(0)
+		return true
+	}
+	if len(c.pendingRPCOverflow) > 0 {
+		pendingPts := c.pendingRPCOverflow[0].pts
+		if pendingPts == 0 {
+			return false
+		}
+		if pendingPts != pts {
+			return int64(pts) <= current
+		}
+		if int64(pts) > current {
+			c.lastPushedPts.Store(int64(pts))
+		}
+		c.removePendingRPCOverflowAtLocked(0)
 		return true
 	}
 	if int64(pts) > current {
@@ -450,9 +516,8 @@ func (c *Conn) setOwner(userID int64) {
 	c.pendingRPCAuthKey = 0
 	c.pendingRPCPts = nil
 	c.pendingRPCIDs = nil
-	c.pendingRPCOverflow = false
-	c.pendingRPCOverflowID = 0
-	c.pendingRPCOverflowCommitted = false
+	c.pendingRPCOverflow = nil
+	c.pendingRPCOverflowSaturated = false
 }
 
 func newConn(
@@ -485,9 +550,8 @@ func (c *Conn) setKey(key crypto.AuthKey) {
 		c.pendingRPCAuthKey = 0
 		c.pendingRPCPts = nil
 		c.pendingRPCIDs = nil
-		c.pendingRPCOverflow = false
-		c.pendingRPCOverflowID = 0
-		c.pendingRPCOverflowCommitted = false
+		c.pendingRPCOverflow = nil
+		c.pendingRPCOverflowSaturated = false
 	}
 	c.writeMu.Unlock()
 	c.authKeyID.Store(keyID)
@@ -622,16 +686,27 @@ func (c *Conn) markRPCResultLocked(owner, authKeyID int64, pts int) bool {
 			}
 		}
 	}
+	overflowIndex := -1
+	for i := range slices.Backward(c.pendingRPCOverflow) {
+		if c.pendingRPCOverflow[i].pts == pts {
+			overflowIndex = i
+			break
+		}
+	}
 	current := c.lastPushedPts.Load()
 	switch {
 	case int64(pts) <= current:
 		if pendingIndex >= 0 {
 			c.removePendingRPCAtLocked(pendingIndex)
+		} else if overflowIndex >= 0 {
+			c.removePendingRPCOverflowAtLocked(overflowIndex)
 		}
 	case int64(pts) == current+1:
 		c.lastPushedPts.Store(int64(pts))
 		if pendingIndex >= 0 {
 			c.removePendingRPCAtLocked(pendingIndex)
+		} else if overflowIndex >= 0 {
+			c.removePendingRPCOverflowAtLocked(overflowIndex)
 		}
 	}
 	return true

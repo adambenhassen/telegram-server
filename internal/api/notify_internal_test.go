@@ -434,6 +434,67 @@ func TestDeliverOverflowSuppressionStartsBeforeQueuedBarriersDrain(t *testing.T)
 	}
 }
 
+func TestDeliverOverflowSuppressionReleasesAfterResultWatermark(t *testing.T) {
+	t.Parallel()
+
+	originTransport := &retryNotifyTransport{done: make(chan struct{})}
+	origin := mtproto.NewTestConn(originTransport, replyTestKey())
+	origin.SetOwner(7)
+	keyID := origin.AuthKeyID()
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := origin.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !origin.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender barrier %d", pts)
+		}
+	}
+	overflow, ok := origin.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok || !origin.SetRPCUpdatePtsAttempt(overflow, 65) {
+		t.Fatal("stage overflow sender barrier")
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !origin.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if err := origin.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: context.Background(), MsgID: 8},
+		&tg.BoolTrue{}, 7, keyID, 65,
+	); err != nil {
+		t.Fatalf("send overflow result: %v", err)
+	}
+	if _, pending := origin.PendingRPCUpdate(7); pending {
+		t.Fatal("successful overflow result left origin suppression active")
+	}
+	before := originTransport.count()
+	testUpdater().deliver(
+		context.Background(),
+		7,
+		[]pushConn{origin},
+		func(fromPts int) (updateBatch, error) {
+			b := batch(fromPts, 66, 66)
+			for i, pts := range b.pts {
+				b.ups[i] = &tg.UpdateNewMessage{
+					Message: &tg.Message{
+						ID:      pts,
+						PeerID:  &tg.PeerUser{UserID: 7},
+						Date:    1,
+						Message: "post-overflow",
+					},
+					Pts:      pts,
+					PtsCount: 1,
+				}
+			}
+			return b, nil
+		},
+	)
+	if got := originTransport.count(); got != before+1 {
+		t.Fatalf("origin pushes after overflow result = %d, want %d", got, before+1)
+	}
+	if got := origin.LastPushedPts(); got != 66 {
+		t.Fatalf("origin watermark after post-overflow push = %d, want 66", got)
+	}
+}
+
 func TestDeliverPendingSenderSuppressionAccountsKeyedEventAfterPrefix(t *testing.T) {
 	t.Parallel()
 
