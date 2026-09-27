@@ -106,9 +106,23 @@ func TestUsernameClaimProbesShareLookupQuotaAndConcurrentBoundary(t *testing.T) 
 	if got := rpcMessage(t, err); got != "FLOOD_WAIT_86400" {
 		t.Fatalf("free channel claim after quota exhaustion = %s, want FLOOD_WAIT_86400", got)
 	}
+	channel, ok, err := s.ChannelByID(ctx, channels[0].ID)
+	if err != nil || !ok {
+		t.Fatalf("load channel after rejected claim: channel=%t err=%v", ok, err)
+	}
+	if channel.Username != nil {
+		t.Errorf("channel username after rejected claim = %q, want unchanged empty username", *channel.Username)
+	}
 
 	_, err = api.UpdateUsernameForTest(s, caller.ID, "availableuser")
 	if got := rpcMessage(t, err); got != "FLOOD_WAIT_86400" {
 		t.Fatalf("free account claim after quota exhaustion = %s, want FLOOD_WAIT_86400", got)
+	}
+	user, ok, err := s.UserByID(ctx, caller.ID)
+	if err != nil || !ok {
+		t.Fatalf("load user after rejected claim: user=%t err=%v", ok, err)
+	}
+	if user.Username != nil {
+		t.Errorf("user username after rejected claim = %q, want unchanged empty username", *user.Username)
 	}
 }
