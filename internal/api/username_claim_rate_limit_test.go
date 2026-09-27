@@ -98,4 +98,17 @@ func TestUsernameClaimProbesShareLookupQuotaAndConcurrentBoundary(t *testing.T) 
 	if floodWait != concurrentProbes-(store.UsernameLookupBurstLimit-1) {
 		t.Errorf("quota responses = %d, want %d", floodWait, concurrentProbes-(store.UsernameLookupBurstLimit-1))
 	}
+
+	_, err = api.EditChannelUsernameForTest(s, caller.ID, &tg.ChannelsUpdateUsernameRequest{
+		Channel:  api.InputChannel(caller.ID, channels[0].ID),
+		Username: "availablechannel",
+	})
+	if got := rpcMessage(t, err); got != "FLOOD_WAIT_86400" {
+		t.Fatalf("free channel claim after quota exhaustion = %s, want FLOOD_WAIT_86400", got)
+	}
+
+	_, err = api.UpdateUsernameForTest(s, caller.ID, "availableuser")
+	if got := rpcMessage(t, err); got != "FLOOD_WAIT_86400" {
+		t.Fatalf("free account claim after quota exhaustion = %s, want FLOOD_WAIT_86400", got)
+	}
 }

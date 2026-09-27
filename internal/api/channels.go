@@ -1107,6 +1107,11 @@ func (h *handlers) handleEditChannelUsername(r *mtproto.Request) (bin.Encoder, e
 	if member.Role < 1 {
 		return nil, errChatAdminRequired
 	}
+	if username != "" {
+		if err := h.checkUsernameClaimQuota(r.Ctx, r.UserID, username); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := h.store.EditChannelUsername(r.Ctx, channelID, r.UserID, username); err != nil {
 		switch {
@@ -1115,7 +1120,7 @@ func (h *handlers) handleEditChannelUsername(r *mtproto.Request) (bin.Encoder, e
 			// transaction). Same wire error as the handler-level check.
 			return nil, errPeerIDInvalid
 		case errors.Is(err, store.ErrUsernameOccupied):
-			return nil, h.usernameClaimOccupiedError(r.Ctx, r.UserID, username)
+			return nil, errUsernameOccupied
 		case errors.Is(err, store.ErrUsernameFloodWait):
 			return nil, errUsernameFloodWait
 		default:
