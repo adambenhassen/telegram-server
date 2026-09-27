@@ -321,13 +321,17 @@ func newConn(
 
 // setKey binds the connection to the auth key for the frame being handled.
 func (c *Conn) setKey(key crypto.AuthKey) {
+	keyID := key.IntID()
 	c.writeMu.Lock()
+	keyChanged := c.authKey.IntID() != keyID
 	c.authKey = key
-	c.pendingRPCOwner = 0
-	c.pendingRPCAuthKey = 0
-	c.pendingRPCPts = nil
+	if keyChanged {
+		c.pendingRPCOwner = 0
+		c.pendingRPCAuthKey = 0
+		c.pendingRPCPts = nil
+	}
 	c.writeMu.Unlock()
-	c.authKeyID.Store(key.IntID())
+	c.authKeyID.Store(keyID)
 }
 
 // setSession records the client session id for subsequent server writes.
