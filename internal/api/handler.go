@@ -124,6 +124,14 @@ type connMethodFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, er
 
 type registeredFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error)
 
+type orderedRegisteredFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error)
+
+type replyUpdate struct {
+	owner   int64
+	authKey int64
+	pts     int
+}
+
 // revokeFunc is a methodFunc that also returns work to run once the reply is on
 // the wire. Exactly one revocation needs it: the one whose eviction closes the
 // socket the reply goes out on. Nothing orders a Postgres round trip against a
@@ -231,7 +239,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.UpdatesGetStateRequestTypeID, h.handleGetState)
 	register(d, tg.UpdatesGetDifferenceRequestTypeID, h.handleGetDifference)
 	register(d, tg.UpdatesGetChannelDifferenceRequestTypeID, h.handleGetChannelDifference)
-	registerReplyAfterSuccess(d, tg.MessagesSendMessageRequestTypeID, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
+	registerReplyAfterSuccess(d, tg.MessagesSendMessageRequestTypeID, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 		return h.handleSendMessageAfterReply(req)
 	})
 	register(d, tg.MessagesGetDialogsRequestTypeID, h.handleGetDialogs)
@@ -259,7 +267,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesCheckChatInviteRequestTypeID, h.handleCheckChatInvite)
 	register(d, tg.MessagesImportChatInviteRequestTypeID, h.handleImportChatInvite)
 	registerNamed(d, revokeExportedChatInviteTypeID, "messages.revokeExportedChatInvite", h.handleRevokeExportedChatInvite)
-	registerReplyAfterSuccess(d, tg.MessagesSendMediaRequestTypeID, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
+	registerReplyAfterSuccess(d, tg.MessagesSendMediaRequestTypeID, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 		return h.handleSendMediaAfterReply(req)
 	})
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
@@ -485,8 +493,31 @@ func registerReplyNamed(d *mtproto.Dispatcher, id uint32, name string, fn regist
 // returned hook runs only after the RPC result reached the transport. A sender
 // notification emitted before that point can push a later pts to the same
 // connection before its RPC result establishes the skipped pts.
-func registerReplyAfterSuccess(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
-	registerReplyNamedMode(d, id, "", fn, true)
+func registerReplyAfterSuccess(d *mtproto.Dispatcher, id uint32, fn orderedRegisteredFunc) {
+	handler := func(c *mtproto.Conn, req *mtproto.Request) error {
+		if provisionalBlocked(id, req) {
+			return c.SendErr(req, errAuthKeyUnreg)
+		}
+		res, update, afterReply, err := fn(c, req)
+		if err != nil {
+			var rpc *tgerr.Error
+			if !errors.As(err, &rpc) {
+				rpc = errInternal
+			}
+			return c.SendErr(req, rpc)
+		}
+		var sendErr error
+		if update == nil {
+			sendErr = c.SendResult(req, res)
+		} else {
+			sendErr = c.SendResultAndMarkRPCUpdate(req, res, update.owner, update.authKey, update.pts)
+		}
+		if sendErr == nil && afterReply != nil {
+			afterReply()
+		}
+		return sendErr
+	}
+	d.HandleFunc(id, handler)
 }
 
 func registerReplyNamedMode(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc, afterOnlyOnSuccess bool) {

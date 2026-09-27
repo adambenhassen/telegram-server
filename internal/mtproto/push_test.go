@@ -114,6 +114,55 @@ func TestMarkRPCUpdateRequiresCurrentOwnerAndKey(t *testing.T) {
 	}
 }
 
+func TestSendResultAndMarkRPCUpdate(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	if !c.MarkRPCUpdate(7, mtproto.AuthKeyIDInt64(key.ID), 4) {
+		t.Fatal("seed sender watermark")
+	}
+
+	err := c.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: context.Background(), MsgID: 2},
+		&mt.Pong{PingID: 2},
+		7,
+		mtproto.AuthKeyIDInt64(key.ID),
+		5,
+	)
+	if err != nil {
+		t.Fatalf("send result and mark: %v", err)
+	}
+	if got := c.LastPushedPts(); got != 5 {
+		t.Fatalf("watermark = %d, want 5 after successful result", got)
+	}
+}
+
+func TestPushToAtWatermarkRejectsStaleBatch(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	fc := &fakeConn{}
+	c := mtproto.NewTestConn(fc, key)
+	c.SetOwner(7)
+	if !c.MarkRPCUpdate(7, mtproto.AuthKeyIDInt64(key.ID), 4) {
+		t.Fatal("seed sender watermark")
+	}
+
+	pushed, stale, err := c.PushToAtWatermark(context.Background(), 7, 3, &mt.Pong{PingID: 1}, 5)
+	if err != nil {
+		t.Fatalf("stale push: %v", err)
+	}
+	if pushed || !stale {
+		t.Fatalf("stale push result = pushed:%v stale:%v, want false:true", pushed, stale)
+	}
+	if got := fc.writes(); got != 0 {
+		t.Fatalf("stale push wrote %d frames", got)
+	}
+	if got := c.LastPushedPts(); got != 4 {
+		t.Fatalf("stale push watermark = %d, want 4", got)
+	}
+}
+
 // TestPushConcurrentWithResult drives PushTo and SendResult on one conn from two
 // goroutines; -race proves the write mutex serializes them.
 func TestPushConcurrentWithResult(t *testing.T) {

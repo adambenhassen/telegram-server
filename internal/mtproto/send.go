@@ -106,7 +106,8 @@ type Conn struct {
 	pendingLoginAt atomic.Int64
 }
 
-// LastPushedPts returns the highest pts already pushed to this connection.
+// LastPushedPts returns the highest contiguous owner pts already pushed to this
+// connection or accounted for by a successful RPC result.
 func (c *Conn) LastPushedPts() int {
 	return int(c.lastPushedPts.Load())
 }
@@ -128,6 +129,13 @@ func (c *Conn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.markRPCUpdateLocked(owner, authKeyID, pts)
+}
+
+func (c *Conn) markRPCUpdateLocked(owner, authKeyID int64, pts int) bool {
+	if authKeyID == 0 || pts <= 0 {
+		return false
+	}
 	if c.owner != owner || c.authKeyID.Load() != authKeyID {
 		return false
 	}
@@ -304,20 +312,96 @@ func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int
 // deadline that kills the reply would turn finished work into a dropped
 // connection. What bounds a socket write is conn.writeTimeout, applied below.
 func (c *Conn) SendResult(req *Request, msg bin.Encoder) error {
+	return c.sendResult(req, msg, nil)
+}
+
+// SendResultAndMarkRPCUpdate writes msg and advances the originating session's
+// contiguous push watermark while the result write still holds writeMu. A
+// concurrent push therefore cannot land between the result and its watermark,
+// which would expose a later pts before the client has received the result
+// update.
+func (c *Conn) SendResultAndMarkRPCUpdate(req *Request, msg bin.Encoder, owner, authKeyID int64, pts int) error {
+	return c.sendResult(req, msg, func() {
+		c.markRPCResultLocked(owner, authKeyID, pts)
+	})
+}
+
+// markRPCResultLocked advances the contiguous push watermark for an RPC result.
+// A result can carry a later pts while this connection still lacks an earlier
+// event. Leave that gap visible so the keyed notification can push the prefix
+// before MarkRPCUpdate accounts for the origin.
+func (c *Conn) markRPCResultLocked(owner, authKeyID int64, pts int) bool {
+	if authKeyID == 0 || pts <= 0 {
+		return false
+	}
+	if c.owner != owner || c.authKeyID.Load() != authKeyID {
+		return false
+	}
+	current := c.lastPushedPts.Load()
+	if int64(pts) == current+1 {
+		c.lastPushedPts.Store(int64(pts))
+	}
+	return true
+}
+
+// PushToAtWatermark is the ordered-update variant of PushTo. It drops a batch
+// that was built from a stale watermark so the delivery loop can rebuild it
+// after a concurrent RPC result or push changes the connection state.
+func (c *Conn) PushToAtWatermark(ctx context.Context, owner int64, expectedPts int, enc bin.Encoder, pts int) (bool, bool, error) {
+	var b bin.Buffer
+	if err := enc.Encode(&b); err != nil {
+		return false, false, fmt.Errorf("push encode [%T]: %w", enc, MarkPushEncodeError(err))
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.owner != owner {
+		return false, false, nil
+	}
+	if int(c.lastPushedPts.Load()) != expectedPts {
+		return false, true, nil
+	}
+	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
+		return false, false, fmt.Errorf("push [%T]: %w", enc, err)
+	}
+	if pts > 0 && int64(pts) > c.lastPushedPts.Load() {
+		c.lastPushedPts.Store(int64(pts))
+	}
+	return true, false, nil
+}
+
+func (c *Conn) sendResult(req *Request, msg bin.Encoder, onSuccess func()) error {
 	var buf bin.Buffer
 	if err := msg.Encode(&buf); err != nil {
 		req.rpcResult = RPCResultInternal
 		return fmt.Errorf("encode result: %w", err)
 	}
-	if err := c.send(context.WithoutCancel(req.Ctx), proto.MessageServerResponse, &proto.Result{
+	var wire bin.Buffer
+	if err := (&proto.Result{
 		RequestMessageID: req.MsgID,
 		Result:           buf.Raw(),
-	}); err != nil {
-		req.rpcResult = RPCResultTransportFailure
-		return fmt.Errorf("send result [%T]: %w", msg, err)
+	}).Encode(&wire); err != nil {
+		req.rpcResult = RPCResultInternal
+		return fmt.Errorf("encode result envelope: %w", err)
 	}
-	if req.rpcResult == "" {
-		req.rpcResult = RPCResultSuccess
+	var sendErr error
+	func() {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		sendErr = c.sendLocked(context.WithoutCancel(req.Ctx), proto.MessageServerResponse, &wire)
+		if sendErr != nil {
+			req.rpcResult = RPCResultTransportFailure
+			return
+		}
+		if req.rpcResult == "" {
+			req.rpcResult = RPCResultSuccess
+		}
+		if onSuccess != nil {
+			onSuccess()
+		}
+	}()
+	if sendErr != nil {
+		return fmt.Errorf("send result [%T]: %w", msg, sendErr)
 	}
 	return nil
 }

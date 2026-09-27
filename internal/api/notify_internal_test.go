@@ -176,10 +176,15 @@ func TestRegisterReplyAfterSuccessRunsHookAfterWire(t *testing.T) {
 
 	events := []string{}
 	d := mtproto.NewDispatcher()
-	registerReplyAfterSuccess(d, tg.HelpGetConfigRequestTypeID, func(_ *mtproto.Conn, _ *mtproto.Request) (bin.Encoder, func(), error) {
+	key := replyTestKey()
+	var conn *mtproto.Conn
+	registerReplyAfterSuccess(d, tg.HelpGetConfigRequestTypeID, func(_ *mtproto.Conn, _ *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 		events = append(events, "handler")
-		return &tg.BoolTrue{}, func() {
+		return &tg.BoolTrue{}, &replyUpdate{owner: 1, authKey: mtproto.AuthKeyIDInt64(key.ID), pts: 7}, func() {
 			events = append(events, "after")
+			if got := conn.LastPushedPts(); got != 7 {
+				t.Errorf("watermark in post-reply hook = %d, want 7", got)
+			}
 		}, nil
 	})
 
@@ -187,7 +192,11 @@ func TestRegisterReplyAfterSuccessRunsHookAfterWire(t *testing.T) {
 	if err := (&tg.HelpGetConfigRequest{}).Encode(&body); err != nil {
 		t.Fatalf("encode request: %v", err)
 	}
-	conn := mtproto.NewTestConn(&replyOrderTransport{events: &events}, replyTestKey())
+	conn = mtproto.NewTestConn(&replyOrderTransport{events: &events}, key)
+	conn.SetOwner(1)
+	if !conn.MarkRPCUpdate(1, mtproto.AuthKeyIDInt64(key.ID), 6) {
+		t.Fatal("seed sender watermark")
+	}
 	err := d.OnMessage(conn, &mtproto.Request{
 		Ctx:    context.Background(),
 		UserID: 1,
@@ -205,6 +214,27 @@ func TestRegisterReplyAfterSuccessRunsHookAfterWire(t *testing.T) {
 		if events[i] != want[i] {
 			t.Fatalf("events = %v, want %v", events, want)
 		}
+	}
+}
+
+func TestSenderNotifyContextOutlivesRPCContext(t *testing.T) {
+	t.Parallel()
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, cancel := senderNotifyContext(parent)
+	defer cancel()
+	cancelParent()
+
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("sender notify context canceled with parent: %v", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("sender notify context has no deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > senderNotifyTimeout {
+		t.Fatalf("sender notify deadline in %s, want (0, %s]", remaining, senderNotifyTimeout)
 	}
 }
 

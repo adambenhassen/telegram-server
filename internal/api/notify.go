@@ -52,6 +52,10 @@ type pushConn interface {
 	PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int) (bool, error)
 }
 
+type orderedPushConn interface {
+	PushToAtWatermark(ctx context.Context, owner int64, expectedPts int, enc bin.Encoder, pts int) (pushed, stale bool, err error)
+}
+
 type rpcUpdatePushConn interface {
 	pushConn
 	AuthKeyID() int64
@@ -85,6 +89,8 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 // amplification this path exists to avoid.
 const maxDeliveryRounds = 2
 
+const maxDeliveryRetries = 4
+
 // deliver builds one batch from the lowest watermark among conns and gives each
 // conn the suffix above its own, so the store work one notification costs does
 // not multiply with the number of sockets a user holds. The window is
@@ -115,7 +121,8 @@ func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn,
 
 func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error), acceptedAt time.Time, suppressed store.SuppressedUpdate) {
 	var head int
-	for round := 0; round < maxDeliveryRounds && len(conns) > 0; round++ {
+	retries := 0
+	for round := 0; round < maxDeliveryRounds && len(conns) > 0; {
 		lo, hi := conns[0].LastPushedPts(), conns[0].LastPushedPts()
 		for _, c := range conns[1:] {
 			w := c.LastPushedPts()
@@ -147,6 +154,7 @@ func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns [
 		}
 
 		var ahead []pushConn
+		retry := false
 		for _, c := range conns {
 			watermark := c.LastPushedPts()
 			if watermark < from {
@@ -169,7 +177,10 @@ func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns [
 				target := sort.SearchInts(b.pts, suppressed.Pts)
 				if target < len(b.pts) && b.pts[target] == suppressed.Pts && target >= start {
 					if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); isNewMessage {
-						u.deliverWithSuppression(ctx, userID, rpcConn, b, start, target, suppressed, acceptedAt)
+						if u.deliverWithSuppression(ctx, userID, rpcConn, b, watermark, start, target, suppressed, acceptedAt) {
+							retry = true
+							break
+						}
 						if b.more && rpcConn.LastPushedPts() < b.state.Pts {
 							ahead = append(ahead, c)
 						}
@@ -184,41 +195,69 @@ func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns [
 			//
 			// users covers the whole batch, so a conn taking a suffix gets a
 			// superset of the users it needs, which a client ignores.
-			pushed, err := c.PushTo(ctx, userID, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts)
+			pushed, stale, err := pushOrdered(ctx, c, userID, watermark, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts)
+			if stale {
+				retry = true
+				break
+			}
 			u.recordPushOutcome(acceptedAt, pushed, err)
 			if err != nil {
 				u.log.Info("deliver push", "user_id", userID, "err", err)
 			}
 		}
+		if retry {
+			retries++
+			if retries > maxDeliveryRetries {
+				return
+			}
+			continue
+		}
+		retries = 0
 		conns = ahead
+		round++
 	}
 }
 
-func (u *Updater) deliverWithSuppression(ctx context.Context, userID int64, conn rpcUpdatePushConn, b updateBatch, start, target int, suppressed store.SuppressedUpdate, acceptedAt time.Time) {
+func pushOrdered(ctx context.Context, conn pushConn, owner int64, expectedPts int, enc bin.Encoder, pts int) (pushed, stale bool, err error) {
+	if guarded, ok := conn.(orderedPushConn); ok {
+		return guarded.PushToAtWatermark(ctx, owner, expectedPts, enc, pts)
+	}
+	pushed, err = conn.PushTo(ctx, owner, enc, pts)
+	return pushed, false, err
+}
+
+func (u *Updater) deliverWithSuppression(ctx context.Context, userID int64, conn rpcUpdatePushConn, b updateBatch, watermark, start, target int, suppressed store.SuppressedUpdate, acceptedAt time.Time) bool {
 	if target > start {
 		prefixPts := b.pts[target-1]
-		pushed, err := conn.PushTo(ctx, userID, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts)
+		pushed, stale, err := pushOrdered(ctx, conn, userID, watermark, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts)
+		if stale {
+			return true
+		}
 		u.recordPushOutcome(acceptedAt, pushed, err)
 		if err != nil {
 			u.log.Info("deliver push before RPC update", "user_id", userID, "err", err)
-			return
+			return false
 		}
 		if !pushed {
-			return
+			return false
 		}
 	}
 	if !conn.MarkRPCUpdate(userID, suppressed.AuthKeyID, suppressed.Pts) {
-		return
+		return false
 	}
 	if target+1 == len(b.ups) {
-		return
+		return false
 	}
 	last := len(b.ups) - 1
-	pushed, err := conn.PushTo(ctx, userID, wrapUpdates(b.ups[target+1:], b.users, b.chats, b.state), b.pts[last])
+	pushed, stale, err := pushOrdered(ctx, conn, userID, suppressed.Pts, wrapUpdates(b.ups[target+1:], b.users, b.chats, b.state), b.pts[last])
+	if stale {
+		return true
+	}
 	u.recordPushOutcome(acceptedAt, pushed, err)
 	if err != nil {
 		u.log.Info("deliver push after RPC update", "user_id", userID, "err", err)
 	}
+	return false
 }
 
 func (u *Updater) recordPushOutcome(acceptedAt time.Time, pushed bool, err error) {
