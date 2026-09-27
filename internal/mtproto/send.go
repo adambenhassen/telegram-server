@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,14 +89,16 @@ type Conn struct {
 	// access keeps the registry hand-off safe.
 	lastPushedPts atomic.Int64
 
-	// pendingRPCUpdate is the sender event committed by the request currently
-	// being prepared for this connection. A zero pts is a barrier before the
-	// store commit returns; delivery must hold the origin back until the event's
-	// pts is known. It is guarded by writeMu with the socket state so a generic
-	// notification cannot pass the result write between its check and push.
+	// pendingRPCUpdate holds sender events whose RPC result reached this
+	// connection but whose keyed notification has not yet accounted the event.
+	// A zero pts is a barrier before the store commit returns; delivery must hold
+	// the origin back until the event's pts is known. The slice is ordered by
+	// request, so back-to-back sends cannot replace an unresolved earlier result.
+	// It is guarded by writeMu with the socket state so a generic notification
+	// cannot pass the result write between its check and push.
 	pendingRPCOwner   int64
 	pendingRPCAuthKey int64
-	pendingRPCPts     int
+	pendingRPCPts     []int
 
 	// authKeyID mirrors authKey.IntID() for readers that must not take writeMu.
 	// Eviction runs on the single LISTEN goroutine and matches conns by key id,
@@ -155,7 +158,7 @@ func (c *Conn) BeginRPCUpdate(owner, authKeyID int64, pts int) bool {
 	}
 	c.pendingRPCOwner = owner
 	c.pendingRPCAuthKey = authKeyID
-	c.pendingRPCPts = pts
+	c.pendingRPCPts = append(c.pendingRPCPts, pts)
 	return true
 }
 
@@ -171,8 +174,13 @@ func (c *Conn) SetRPCUpdatePts(owner, authKeyID int64, pts int) bool {
 	if c.pendingRPCOwner != owner || c.pendingRPCAuthKey != authKeyID || c.owner != owner || c.authKeyID.Load() != authKeyID {
 		return false
 	}
-	c.pendingRPCPts = pts
-	return true
+	for i := range slices.Backward(c.pendingRPCPts) {
+		if c.pendingRPCPts[i] == 0 {
+			c.pendingRPCPts[i] = pts
+			return true
+		}
+	}
+	return false
 }
 
 // ClearRPCUpdate releases a result barrier after the result write or an
@@ -188,13 +196,20 @@ func (c *Conn) ClearRPCUpdate(owner, authKeyID int64) bool {
 }
 
 func (c *Conn) clearRPCUpdateLocked(owner, authKeyID int64) bool {
-	if c.pendingRPCOwner != owner || c.pendingRPCAuthKey != authKeyID {
+	if c.pendingRPCOwner != owner || c.pendingRPCAuthKey != authKeyID || len(c.pendingRPCPts) == 0 {
 		return false
 	}
-	c.pendingRPCOwner = 0
-	c.pendingRPCAuthKey = 0
-	c.pendingRPCPts = 0
+	c.removePendingRPCAtLocked(len(c.pendingRPCPts) - 1)
 	return true
+}
+
+func (c *Conn) removePendingRPCAtLocked(index int) {
+	copy(c.pendingRPCPts[index:], c.pendingRPCPts[index+1:])
+	c.pendingRPCPts = c.pendingRPCPts[:len(c.pendingRPCPts)-1]
+	if len(c.pendingRPCPts) == 0 {
+		c.pendingRPCOwner = 0
+		c.pendingRPCAuthKey = 0
+	}
 }
 
 // PendingRPCUpdate reports the sender-result barrier for owner. A true result
@@ -203,10 +218,10 @@ func (c *Conn) clearRPCUpdateLocked(owner, authKeyID int64) bool {
 func (c *Conn) PendingRPCUpdate(owner int64) (pts int, pending bool) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.pendingRPCOwner != owner {
+	if c.pendingRPCOwner != owner || len(c.pendingRPCPts) == 0 {
 		return 0, false
 	}
-	return c.pendingRPCPts, true
+	return c.pendingRPCPts[0], true
 }
 
 func (c *Conn) markRPCUpdateLocked(owner, authKeyID int64, pts int) bool {
@@ -216,11 +231,23 @@ func (c *Conn) markRPCUpdateLocked(owner, authKeyID int64, pts int) bool {
 	if c.owner != owner || c.authKeyID.Load() != authKeyID {
 		return false
 	}
-	if current := c.lastPushedPts.Load(); int64(pts) > current {
-		c.lastPushedPts.Store(int64(pts))
+	current := c.lastPushedPts.Load()
+	if len(c.pendingRPCPts) > 0 {
+		pendingPts := c.pendingRPCPts[0]
+		if pendingPts == 0 {
+			return false
+		}
+		if pendingPts != pts {
+			return int64(pts) <= current
+		}
+		if int64(pts) > current {
+			c.lastPushedPts.Store(int64(pts))
+		}
+		c.removePendingRPCAtLocked(0)
+		return true
 	}
-	if c.pendingRPCOwner == owner && c.pendingRPCAuthKey == authKeyID && c.pendingRPCPts == pts {
-		c.clearRPCUpdateLocked(owner, authKeyID)
+	if int64(pts) > current {
+		c.lastPushedPts.Store(int64(pts))
 	}
 	return true
 }
@@ -270,7 +297,7 @@ func (c *Conn) setOwner(userID int64) {
 	c.lastPushedPts.Store(0)
 	c.pendingRPCOwner = 0
 	c.pendingRPCAuthKey = 0
-	c.pendingRPCPts = 0
+	c.pendingRPCPts = nil
 }
 
 func newConn(
@@ -298,7 +325,7 @@ func (c *Conn) setKey(key crypto.AuthKey) {
 	c.authKey = key
 	c.pendingRPCOwner = 0
 	c.pendingRPCAuthKey = 0
-	c.pendingRPCPts = 0
+	c.pendingRPCPts = nil
 	c.writeMu.Unlock()
 	c.authKeyID.Store(key.IntID())
 }
@@ -423,17 +450,25 @@ func (c *Conn) markRPCResultLocked(owner, authKeyID int64, pts int) bool {
 	if c.owner != owner || c.authKeyID.Load() != authKeyID {
 		return false
 	}
-	pendingMatch := c.pendingRPCOwner == owner && c.pendingRPCAuthKey == authKeyID && c.pendingRPCPts == pts
+	pendingIndex := -1
+	if c.pendingRPCOwner == owner && c.pendingRPCAuthKey == authKeyID {
+		for i := range slices.Backward(c.pendingRPCPts) {
+			if c.pendingRPCPts[i] == pts {
+				pendingIndex = i
+				break
+			}
+		}
+	}
 	current := c.lastPushedPts.Load()
 	switch {
 	case int64(pts) <= current:
-		if pendingMatch {
-			c.clearRPCUpdateLocked(owner, authKeyID)
+		if pendingIndex >= 0 {
+			c.removePendingRPCAtLocked(pendingIndex)
 		}
 	case int64(pts) == current+1:
 		c.lastPushedPts.Store(int64(pts))
-		if pendingMatch {
-			c.clearRPCUpdateLocked(owner, authKeyID)
+		if pendingIndex >= 0 {
+			c.removePendingRPCAtLocked(pendingIndex)
 		}
 	}
 	return true

@@ -183,6 +183,51 @@ func TestPendingRPCUpdateBarrierSurvivesNoncontiguousResult(t *testing.T) {
 	}
 }
 
+func TestPendingRPCUpdateBarrierPreservesBackToBackResults(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for _, tc := range []struct {
+		msgID int64
+		pts   int
+	}{{msgID: 5, pts: 5}, {msgID: 6, pts: 6}} {
+		msgID, pts := tc.msgID, tc.pts
+		if !c.BeginRPCUpdate(7, keyID, 0) || !c.SetRPCUpdatePts(7, keyID, pts) {
+			t.Fatalf("stage sender result pts %d", pts)
+		}
+		if err := c.SendResultAndMarkRPCUpdate(
+			&mtproto.Request{Ctx: context.Background(), MsgID: msgID},
+			&mt.Pong{PingID: msgID}, 7, keyID, pts,
+		); err != nil {
+			t.Fatalf("send result pts %d: %v", pts, err)
+		}
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 5 {
+		t.Fatalf("first pending barrier = (%d, %t), want (5, true)", pts, pending)
+	}
+	if !c.MarkRPCUpdate(7, keyID, 5) {
+		t.Fatal("MarkRPCUpdate refused the first keyed sender event")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 6 {
+		t.Fatalf("second pending barrier = (%d, %t), want (6, true)", pts, pending)
+	}
+	if got := c.LastPushedPts(); got != 5 {
+		t.Fatalf("watermark after first keyed event = %d, want 5", got)
+	}
+	if !c.MarkRPCUpdate(7, keyID, 6) {
+		t.Fatal("MarkRPCUpdate refused the second keyed sender event")
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("back-to-back keyed delivery left a pending barrier active")
+	}
+	if got := c.LastPushedPts(); got != 6 {
+		t.Fatalf("watermark after back-to-back keyed events = %d, want 6", got)
+	}
+}
+
 func TestSendResultAndMarkRPCUpdate(t *testing.T) {
 	t.Parallel()
 	key := testKey(t)

@@ -300,11 +300,20 @@ func (u *Updater) deliverWithSuppression(ctx context.Context, userID int64, conn
 	if !conn.MarkRPCUpdate(userID, suppressed.AuthKeyID, suppressed.Pts) {
 		return false
 	}
-	if target+1 == len(b.ups) {
+	suffixStart := target + 1
+	suffixEnd := len(b.ups)
+	if pendingConn, ok := conn.(pendingRPCUpdateConn); ok {
+		if nextPts, pending := pendingConn.PendingRPCUpdate(userID); pending && nextPts > suppressed.Pts {
+			nextTarget := sort.SearchInts(b.pts, nextPts)
+			if nextTarget < suffixEnd && nextTarget >= suffixStart {
+				suffixEnd = nextTarget
+			}
+		}
+	}
+	if suffixStart >= suffixEnd {
 		return false
 	}
-	last := len(b.ups) - 1
-	pushed, stale, err := pushOrdered(ctx, conn, userID, suppressed.Pts, wrapUpdates(b.ups[target+1:], b.users, b.chats, b.state), b.pts[last])
+	pushed, stale, err := pushOrdered(ctx, conn, userID, suppressed.Pts, wrapUpdates(b.ups[suffixStart:suffixEnd], b.users, b.chats, b.state), b.pts[suffixEnd-1])
 	if stale {
 		return true
 	}

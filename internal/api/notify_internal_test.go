@@ -77,6 +77,68 @@ type blockedResultTransport struct {
 	release chan struct{}
 }
 
+type queuedRPCBatchPushConn struct {
+	mu          sync.Mutex
+	pts         int
+	got         []*tg.Updates
+	authKeyID   int64
+	pending     []int
+	marked      []int
+	markEntered chan struct{}
+	releaseMark chan struct{}
+	markOnce    sync.Once
+}
+
+func (f *queuedRPCBatchPushConn) LastPushedPts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pts
+}
+
+func (f *queuedRPCBatchPushConn) PushTo(_ context.Context, _ int64, enc bin.Encoder, pts int) (bool, error) {
+	ups, ok := enc.(*tg.Updates)
+	if !ok {
+		return false, errors.New("unexpected encoder")
+	}
+	f.mu.Lock()
+	f.got = append(f.got, ups)
+	f.pts = pts
+	f.mu.Unlock()
+	return true, nil
+}
+
+func (f *queuedRPCBatchPushConn) PendingRPCUpdate(int64) (int, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.pending) == 0 {
+		return 0, false
+	}
+	return f.pending[0], true
+}
+
+func (f *queuedRPCBatchPushConn) AuthKeyID() int64 { return f.authKeyID }
+
+func (f *queuedRPCBatchPushConn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
+	if owner != 7 || authKeyID != f.authKeyID {
+		return false
+	}
+	if f.markEntered != nil {
+		f.markOnce.Do(func() { close(f.markEntered) })
+		<-f.releaseMark
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.pending) == 0 || f.pending[0] != pts {
+		return false
+	}
+	f.marked = append(f.marked, pts)
+	if pts > f.pts {
+		f.pts = pts
+	}
+	f.pending = f.pending[1:]
+	return true
+}
+
 func (t *blockedResultTransport) Send(context.Context, *bin.Buffer) error {
 	t.mu.Lock()
 	t.sends++
@@ -396,6 +458,87 @@ func TestPendingSenderResultGapSerializesGenericAndKeyedDelivery(t *testing.T) {
 	}
 	if got := transport.sendCount(); got != 2 {
 		t.Fatalf("origin transport sends = %d, want result plus prefix only", got)
+	}
+}
+
+func TestDeliverBackToBackSenderSuppressionKeepsFirstBarrier(t *testing.T) {
+	t.Parallel()
+
+	origin := &queuedRPCBatchPushConn{
+		authKeyID:   11,
+		pending:     []int{5, 6},
+		markEntered: make(chan struct{}),
+		releaseMark: make(chan struct{}),
+	}
+	sibling := &fakePushConn{}
+	u := testUpdater()
+	u.deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
+		return batch(fromPts, 6, 6), nil
+	})
+	if got := origin.LastPushedPts(); got != 4 {
+		t.Fatalf("origin watermark before keyed delivery = %d, want 4", got)
+	}
+	if len(origin.got) != 1 || !slices.Equal(ptsOf(t, origin.got[0]), []int{1, 2, 3, 4}) {
+		t.Fatalf("origin prefix = %d/%v, want one push [1 2 3 4]", len(origin.got), ptsOf(t, origin.got[0]))
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		u.deliverAtSuppressed(
+			context.Background(),
+			7,
+			[]pushConn{origin, sibling},
+			func(fromPts int) (updateBatch, error) { return batch(fromPts, 6, 6), nil },
+			time.Time{},
+			store.SuppressedUpdate{AuthKeyID: 11, Pts: 5},
+		)
+		close(firstDone)
+	}()
+	select {
+	case <-origin.markEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first keyed delivery did not reach its accounting barrier")
+	}
+
+	u.deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
+		return batch(fromPts, 6, 6), nil
+	})
+	if got := origin.LastPushedPts(); got != 4 {
+		t.Fatalf("origin watermark while first keyed delivery paused = %d, want 4", got)
+	}
+	if len(origin.got) != 1 {
+		t.Fatalf("origin pushes while first keyed delivery paused = %d, want 1", len(origin.got))
+	}
+
+	close(origin.releaseMark)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first keyed delivery did not finish")
+	}
+	if got := origin.LastPushedPts(); got != 5 {
+		t.Fatalf("origin watermark after first keyed delivery = %d, want 5", got)
+	}
+
+	u.deliverAtSuppressed(
+		context.Background(),
+		7,
+		[]pushConn{origin, sibling},
+		func(fromPts int) (updateBatch, error) { return batch(fromPts, 6, 6), nil },
+		time.Time{},
+		store.SuppressedUpdate{AuthKeyID: 11, Pts: 6},
+	)
+	if got := origin.LastPushedPts(); got != 6 {
+		t.Fatalf("origin watermark after second keyed delivery = %d, want 6", got)
+	}
+	if len(origin.pending) != 0 {
+		t.Fatalf("pending sender barriers = %v, want none", origin.pending)
+	}
+	if !slices.Equal(origin.marked, []int{5, 6}) {
+		t.Fatalf("origin keyed marks = %v, want [5 6]", origin.marked)
+	}
+	if len(origin.got) != 1 {
+		t.Fatalf("origin pushes after both keyed deliveries = %d, want prefix only", len(origin.got))
 	}
 }
 
