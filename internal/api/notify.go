@@ -291,7 +291,7 @@ func (u *Updater) deliverWithSuppression(ctx context.Context, userID int64, conn
 		u.recordPushOutcome(acceptedAt, pushed, err)
 		if err != nil {
 			u.log.Info("deliver push before RPC update", "user_id", userID, "err", err)
-			return false
+			return true
 		}
 		if !pushed {
 			return false

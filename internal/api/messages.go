@@ -74,9 +74,14 @@ func (h *handlers) notifySendAfterFailure(r *mtproto.Request) {
 }
 
 func beginSenderRPC(c *mtproto.Conn, r *mtproto.Request) {
-	if c != nil {
-		c.BeginRPCUpdate(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), 0)
+	beginSenderRPCAt(c, r, 0)
+}
+
+func beginSenderRPCAt(c *mtproto.Conn, r *mtproto.Request, pts int) {
+	if c == nil {
+		return
 	}
+	c.BeginRPCUpdate(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
 }
 
 func setSenderRPCPts(c *mtproto.Conn, r *mtproto.Request, pts int) {
@@ -280,7 +285,7 @@ func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
 				return nil, nil, nil, errInternal
 			}
-			beginSenderRPC(c, r)
+			beginSenderRPCAt(c, r, pts)
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 			if err != nil {
 				h.log.Error("load users on retry", "user_id", r.UserID, "err", err)

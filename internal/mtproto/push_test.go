@@ -228,6 +228,46 @@ func TestPendingRPCUpdateBarrierPreservesBackToBackResults(t *testing.T) {
 	}
 }
 
+func TestPendingRPCUpdateBarrierDeduplicatesKnownResult(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	first := c.BeginRPCUpdate(7, keyID, 5)
+	retry := c.BeginRPCUpdate(7, keyID, 5)
+	if !first || !retry {
+		t.Fatal("BeginRPCUpdate refused a known sender result or its retry")
+	}
+	if !c.MarkRPCUpdate(7, keyID, 5) {
+		t.Fatal("MarkRPCUpdate refused the known sender result")
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("deduplicated sender retry left a duplicate barrier")
+	}
+}
+
+func TestPendingRPCUpdateBarrierCapsQueuedResults(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		if !c.BeginRPCUpdate(7, keyID, pts) {
+			t.Fatalf("BeginRPCUpdate refused barrier %d before the queue cap", pts)
+		}
+	}
+	if c.BeginRPCUpdate(7, keyID, 65) {
+		t.Fatal("BeginRPCUpdate accepted a barrier beyond the queue cap")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 1 {
+		t.Fatalf("first queued barrier = (%d, %t), want (1, true)", pts, pending)
+	}
+}
+
 func TestSendResultAndMarkRPCUpdate(t *testing.T) {
 	t.Parallel()
 	key := testKey(t)

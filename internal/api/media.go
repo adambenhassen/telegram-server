@@ -233,7 +233,7 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 				update, afterReply := h.retryReplyAfterSuccess(c, r, peerType, pts)
 				return res, update, afterReply, nil
 			}
-			beginSenderRPC(c, r)
+			beginSenderRPCAt(c, r, pts)
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 			if err != nil {
 				h.log.Error("load users on retry", "err", err)

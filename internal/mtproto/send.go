@@ -118,6 +118,12 @@ type Conn struct {
 	pendingLoginAt atomic.Int64
 }
 
+// maxPendingRPCUpdates bounds unresolved sender-result bookkeeping. Once the
+// bound is reached, BeginRPCUpdate declines another barrier and the persisted
+// event remains recoverable through getDifference instead of growing this
+// connection-local queue without limit.
+const maxPendingRPCUpdates = 64
+
 // LastPushedPts returns the highest contiguous owner pts already pushed to this
 // connection or accounted for by a successful RPC result.
 func (c *Conn) LastPushedPts() int {
@@ -154,6 +160,14 @@ func (c *Conn) BeginRPCUpdate(owner, authKeyID int64, pts int) bool {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if c.owner != owner || c.authKeyID.Load() != authKeyID {
+		return false
+	}
+	if pts > 0 {
+		if slices.Contains(c.pendingRPCPts, pts) {
+			return true
+		}
+	}
+	if len(c.pendingRPCPts) >= maxPendingRPCUpdates {
 		return false
 	}
 	c.pendingRPCOwner = owner

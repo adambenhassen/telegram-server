@@ -70,6 +70,20 @@ type pendingRPCBatchPushConn struct {
 	marked     []int
 }
 
+type flakyPendingRPCBatchPushConn struct {
+	pendingRPCBatchPushConn
+
+	failures int
+}
+
+func (f *flakyPendingRPCBatchPushConn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int) (bool, error) {
+	if f.failures > 0 {
+		f.failures--
+		return false, errors.New("prefix write")
+	}
+	return f.pendingRPCBatchPushConn.PushTo(ctx, owner, enc, pts)
+}
+
 type blockedResultTransport struct {
 	mu      sync.Mutex
 	sends   int
@@ -374,6 +388,41 @@ func TestDeliverPendingSenderSuppressionAccountsKeyedEventAfterPrefix(t *testing
 	}
 	if len(origin.got) != 1 {
 		t.Fatalf("origin pushes = %d, want prefix only without sender echo", len(origin.got))
+	}
+}
+
+func TestDeliverPendingSenderSuppressionRetriesPrefixWrite(t *testing.T) {
+	t.Parallel()
+
+	origin := &flakyPendingRPCBatchPushConn{
+		pendingRPCBatchPushConn: pendingRPCBatchPushConn{
+			fakePushConn: fakePushConn{pts: 0},
+			authKeyID:    11,
+			pendingPts:   5,
+		},
+		failures: 1,
+	}
+	u := testUpdater()
+	u.deliverAtSuppressed(
+		context.Background(),
+		7,
+		[]pushConn{origin},
+		func(fromPts int) (updateBatch, error) { return batch(fromPts, 5, 5), nil },
+		time.Time{},
+		store.SuppressedUpdate{AuthKeyID: 11, Pts: 5},
+	)
+
+	if origin.failures != 0 {
+		t.Fatalf("prefix write retries = %d, want exhausted", origin.failures)
+	}
+	if !slices.Equal(origin.marked, []int{5}) {
+		t.Fatalf("origin RPC marks = %v, want [5] after retry", origin.marked)
+	}
+	if origin.pendingPts != 0 {
+		t.Fatalf("origin pending pts = %d, want cleared after retry", origin.pendingPts)
+	}
+	if origin.pts != 5 {
+		t.Fatalf("origin watermark = %d, want 5 after retry", origin.pts)
 	}
 }
 

@@ -157,20 +157,30 @@ func TestStoredRetryNotifiesSiblingAfterResultWriteFailure(t *testing.T) {
 					Message:  "retry media",
 					RandomID: randomID,
 				}
-				first, firstUpdate, firstAfter, err = h.handleSendMediaAfterReply(encode(req))
+				first, firstUpdate, firstAfter, err = h.handleSendMediaAfterReplyOnConn(originConn, encode(req))
 				if err != nil {
 					t.Fatalf("first media send: %v", err)
 				}
-				retry, retryUpdate, retryAfter, err = h.handleSendMediaAfterReply(encode(req))
+				for range 70 {
+					retry, retryUpdate, retryAfter, err = h.handleSendMediaAfterReplyOnConn(originConn, encode(req))
+					if err != nil {
+						t.Fatalf("stored media retry: %v", err)
+					}
+				}
 			} else {
 				req := &tg.MessagesSendMessageRequest{
 					Peer: InputPeerUser(alice.ID, bob.ID), Message: "retry text", RandomID: randomID,
 				}
-				first, firstUpdate, firstAfter, err = h.handleSendMessageAfterReply(encode(req))
+				first, firstUpdate, firstAfter, err = h.handleSendMessageAfterReplyOnConn(originConn, encode(req))
 				if err != nil {
 					t.Fatalf("first text send: %v", err)
 				}
-				retry, retryUpdate, retryAfter, err = h.handleSendMessageAfterReply(encode(req))
+				for range 70 {
+					retry, retryUpdate, retryAfter, err = h.handleSendMessageAfterReplyOnConn(originConn, encode(req))
+					if err != nil {
+						t.Fatalf("stored text retry: %v", err)
+					}
+				}
 			}
 			if err != nil {
 				t.Fatalf("stored retry: %v", err)
