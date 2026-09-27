@@ -268,6 +268,59 @@ func TestPendingRPCUpdateBarrierCapsQueuedResults(t *testing.T) {
 	}
 }
 
+func TestPendingRPCUpdateReservationClearIsAttemptScoped(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	first, ok := c.BeginRPCUpdateAttempt(7, keyID, 5)
+	if !ok {
+		t.Fatal("first sender reservation refused")
+	}
+	retry, ok := c.BeginRPCUpdateAttempt(7, keyID, 5)
+	if !ok {
+		t.Fatal("deduplicated sender reservation refused")
+	}
+	if c.ClearRPCUpdateAttempt(retry) {
+		t.Fatal("deduplicated retry cleared the original barrier")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 5 {
+		t.Fatalf("barrier after deduplicated retry failure = (%d, %t), want (5, true)", pts, pending)
+	}
+	if !c.ClearRPCUpdateAttempt(first) {
+		t.Fatal("original sender reservation did not clear its barrier")
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("original sender reservation left a barrier")
+	}
+}
+
+func TestPendingRPCUpdateReservationRefusalCannotClearQueue(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		if _, ok := c.BeginRPCUpdateAttempt(7, keyID, pts); !ok {
+			t.Fatalf("sender reservation %d refused before the queue cap", pts)
+		}
+	}
+	refused, ok := c.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok {
+		t.Fatal("sender reservation beyond the queue cap succeeded")
+	}
+	if c.ClearRPCUpdateAttempt(refused) {
+		t.Fatal("capacity-refused sender attempt cleared a queued barrier")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 1 {
+		t.Fatalf("first queued barrier after capacity refusal = (%d, %t), want (1, true)", pts, pending)
+	}
+}
+
 func TestSendResultAndMarkRPCUpdate(t *testing.T) {
 	t.Parallel()
 	key := testKey(t)

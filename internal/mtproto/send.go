@@ -99,6 +99,8 @@ type Conn struct {
 	pendingRPCOwner   int64
 	pendingRPCAuthKey int64
 	pendingRPCPts     []int
+	pendingRPCIDs     []uint64
+	nextPendingRPCID  uint64
 
 	// authKeyID mirrors authKey.IntID() for readers that must not take writeMu.
 	// Eviction runs on the single LISTEN goroutine and matches conns by key id,
@@ -116,6 +118,16 @@ type Conn struct {
 	// timestamp lock-free while the deadline remains tied to the first marker
 	// transition rather than to a later client frame.
 	pendingLoginAt atomic.Int64
+}
+
+// RPCUpdateReservation identifies the sender-result barrier registered by one
+// request attempt. A deduplicated retry receives a valid reservation without
+// owning a queue entry, so its failure cannot clear the original attempt.
+type RPCUpdateReservation struct {
+	owner   int64
+	authKey int64
+	id      uint64
+	owned   bool
 }
 
 // maxPendingRPCUpdates bounds unresolved sender-result bookkeeping. Once the
@@ -154,26 +166,50 @@ func (c *Conn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
 // a sender result is being prepared. Pass pts=0 before the store commit and
 // set it with SetRPCUpdatePts as soon as the commit returns.
 func (c *Conn) BeginRPCUpdate(owner, authKeyID int64, pts int) bool {
+	_, ok := c.BeginRPCUpdateAttempt(owner, authKeyID, pts)
+	return ok
+}
+
+// BeginRPCUpdateAttempt blocks generic delivery to the originating connection
+// while one sender result is being prepared and returns ownership for that
+// request attempt. A known pts retry deduplicates against the existing barrier;
+// it does not own that barrier. Pass pts=0 before the store commit and set it
+// with SetRPCUpdatePtsAttempt as soon as the commit returns.
+func (c *Conn) BeginRPCUpdateAttempt(owner, authKeyID int64, pts int) (RPCUpdateReservation, bool) {
 	if owner <= 0 || authKeyID == 0 || pts < 0 {
-		return false
+		return RPCUpdateReservation{}, false
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if c.owner != owner || c.authKeyID.Load() != authKeyID {
-		return false
+		return RPCUpdateReservation{}, false
 	}
 	if pts > 0 {
-		if slices.Contains(c.pendingRPCPts, pts) {
-			return true
+		if i := slices.Index(c.pendingRPCPts, pts); i >= 0 {
+			return RPCUpdateReservation{
+				owner:   owner,
+				authKey: authKeyID,
+				id:      c.pendingRPCIDs[i],
+			}, true
 		}
 	}
 	if len(c.pendingRPCPts) >= maxPendingRPCUpdates {
-		return false
+		return RPCUpdateReservation{}, false
+	}
+	c.nextPendingRPCID++
+	if c.nextPendingRPCID == 0 {
+		c.nextPendingRPCID = 1
 	}
 	c.pendingRPCOwner = owner
 	c.pendingRPCAuthKey = authKeyID
 	c.pendingRPCPts = append(c.pendingRPCPts, pts)
-	return true
+	c.pendingRPCIDs = append(c.pendingRPCIDs, c.nextPendingRPCID)
+	return RPCUpdateReservation{
+		owner:   owner,
+		authKey: authKeyID,
+		id:      c.nextPendingRPCID,
+		owned:   true,
+	}, true
 }
 
 // SetRPCUpdatePts records the committed sender event's pts on an in-flight
@@ -197,6 +233,30 @@ func (c *Conn) SetRPCUpdatePts(owner, authKeyID int64, pts int) bool {
 	return false
 }
 
+// SetRPCUpdatePtsAttempt records the committed sender event's pts on the
+// barrier owned by one request attempt.
+func (c *Conn) SetRPCUpdatePtsAttempt(reservation RPCUpdateReservation, pts int) bool {
+	if !reservation.owned || pts <= 0 {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.pendingRPCOwner != reservation.owner || c.pendingRPCAuthKey != reservation.authKey || c.owner != reservation.owner || c.authKeyID.Load() != reservation.authKey {
+		return false
+	}
+	for i, id := range c.pendingRPCIDs {
+		if id != reservation.id {
+			continue
+		}
+		if c.pendingRPCPts[i] == 0 {
+			c.pendingRPCPts[i] = pts
+			return true
+		}
+		return c.pendingRPCPts[i] == pts
+	}
+	return false
+}
+
 // ClearRPCUpdate releases a result barrier after the result write or an
 // aborted post-commit path. A failed result can then use a generic nudge to
 // recover the event for every live sender session.
@@ -209,6 +269,26 @@ func (c *Conn) ClearRPCUpdate(owner, authKeyID int64) bool {
 	return c.clearRPCUpdateLocked(owner, authKeyID)
 }
 
+// ClearRPCUpdateAttempt releases only the barrier registered by the given
+// request attempt. Deduplicated and capacity-refused attempts own nothing.
+func (c *Conn) ClearRPCUpdateAttempt(reservation RPCUpdateReservation) bool {
+	if !reservation.owned {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.pendingRPCOwner != reservation.owner || c.pendingRPCAuthKey != reservation.authKey || c.owner != reservation.owner || c.authKeyID.Load() != reservation.authKey {
+		return false
+	}
+	for i, id := range c.pendingRPCIDs {
+		if id == reservation.id {
+			c.removePendingRPCAtLocked(i)
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Conn) clearRPCUpdateLocked(owner, authKeyID int64) bool {
 	if c.pendingRPCOwner != owner || c.pendingRPCAuthKey != authKeyID || len(c.pendingRPCPts) == 0 {
 		return false
@@ -219,10 +299,13 @@ func (c *Conn) clearRPCUpdateLocked(owner, authKeyID int64) bool {
 
 func (c *Conn) removePendingRPCAtLocked(index int) {
 	copy(c.pendingRPCPts[index:], c.pendingRPCPts[index+1:])
+	copy(c.pendingRPCIDs[index:], c.pendingRPCIDs[index+1:])
 	c.pendingRPCPts = c.pendingRPCPts[:len(c.pendingRPCPts)-1]
+	c.pendingRPCIDs = c.pendingRPCIDs[:len(c.pendingRPCIDs)-1]
 	if len(c.pendingRPCPts) == 0 {
 		c.pendingRPCOwner = 0
 		c.pendingRPCAuthKey = 0
+		c.pendingRPCIDs = nil
 	}
 }
 
@@ -312,6 +395,7 @@ func (c *Conn) setOwner(userID int64) {
 	c.pendingRPCOwner = 0
 	c.pendingRPCAuthKey = 0
 	c.pendingRPCPts = nil
+	c.pendingRPCIDs = nil
 }
 
 func newConn(
@@ -343,6 +427,7 @@ func (c *Conn) setKey(key crypto.AuthKey) {
 		c.pendingRPCOwner = 0
 		c.pendingRPCAuthKey = 0
 		c.pendingRPCPts = nil
+		c.pendingRPCIDs = nil
 	}
 	c.writeMu.Unlock()
 	c.authKeyID.Store(keyID)
