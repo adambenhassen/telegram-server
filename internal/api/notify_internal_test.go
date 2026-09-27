@@ -342,6 +342,61 @@ func TestDeliverPendingSenderSuppressionLeavesOriginAtBarrier(t *testing.T) {
 	}
 }
 
+func TestDeliverOverflowSuppressionSurvivesQueuedBarriers(t *testing.T) {
+	t.Parallel()
+
+	originTransport := &retryNotifyTransport{done: make(chan struct{})}
+	origin := mtproto.NewTestConn(originTransport, replyTestKey())
+	origin.SetOwner(7)
+	keyID := origin.AuthKeyID()
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := origin.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !origin.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender barrier %d", pts)
+		}
+	}
+	overflow, ok := origin.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok {
+		t.Fatal("overflow sender attempt unexpectedly registered")
+	}
+	if !origin.SetRPCUpdatePtsAttempt(overflow, 65) {
+		t.Fatal("overflow sender attempt did not activate origin suppression")
+	}
+
+	sibling := &fakePushConn{}
+	u := testUpdater()
+	u.deliverAtSuppressed(
+		context.Background(),
+		7,
+		[]pushConn{origin, sibling},
+		func(fromPts int) (updateBatch, error) { return batch(fromPts, 65, 65), nil },
+		time.Time{},
+		store.SuppressedUpdate{AuthKeyID: keyID, Pts: 65},
+	)
+	for pts := 1; pts <= 64; pts++ {
+		if !origin.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	u.deliver(
+		context.Background(),
+		7,
+		[]pushConn{origin, sibling},
+		func(fromPts int) (updateBatch, error) { return batch(fromPts, 65, 65), nil },
+	)
+
+	if got := originTransport.count(); got != 0 {
+		t.Fatalf("origin pushes after queued barriers drained = %d, want 0", got)
+	}
+	expected := make([]int, 65)
+	for i := range expected {
+		expected[i] = i + 1
+	}
+	if len(sibling.got) != 1 || !slices.Equal(ptsOf(t, sibling.got[0]), expected) {
+		t.Fatalf("sibling pushes = %d, want one full overflow batch", len(sibling.got))
+	}
+}
+
 func TestDeliverPendingSenderSuppressionAccountsKeyedEventAfterPrefix(t *testing.T) {
 	t.Parallel()
 

@@ -254,6 +254,7 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 				Users: users,
 				Date:  int(existing.Date.Unix()),
 			}
+			setSenderRPCPts(attempt, pts)
 			update, afterReply := h.retryReplyAfterSuccess(attempt, r, peerType, pts)
 			return res, update, afterReply, nil
 		}

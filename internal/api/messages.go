@@ -76,7 +76,6 @@ func (h *handlers) notifySendAfterFailure(r *mtproto.Request) {
 type senderRPCAttempt struct {
 	conn        *mtproto.Conn
 	reservation mtproto.RPCUpdateReservation
-	registered  bool
 }
 
 func beginSenderRPC(c *mtproto.Conn, r *mtproto.Request) senderRPCAttempt {
@@ -87,18 +86,18 @@ func beginSenderRPCAt(c *mtproto.Conn, r *mtproto.Request, pts int) senderRPCAtt
 	if c == nil {
 		return senderRPCAttempt{}
 	}
-	reservation, ok := c.BeginRPCUpdateAttempt(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
-	return senderRPCAttempt{conn: c, reservation: reservation, registered: ok}
+	reservation, _ := c.BeginRPCUpdateAttempt(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
+	return senderRPCAttempt{conn: c, reservation: reservation}
 }
 
 func setSenderRPCPts(attempt senderRPCAttempt, pts int) {
-	if attempt.registered {
+	if attempt.conn != nil {
 		attempt.conn.SetRPCUpdatePtsAttempt(attempt.reservation, pts)
 	}
 }
 
 func clearSenderRPC(attempt senderRPCAttempt) {
-	if attempt.registered {
+	if attempt.conn != nil {
 		attempt.conn.ClearRPCUpdateAttempt(attempt.reservation)
 	}
 }
@@ -307,6 +306,7 @@ func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 				Users: users,
 				Date:  int(existing.Date.Unix()),
 			}
+			setSenderRPCPts(attempt, pts)
 			update, afterReply := h.retryReplyAfterSuccess(attempt, r, peerType, pts)
 			return res, update, afterReply, nil
 		} else if err != nil {
