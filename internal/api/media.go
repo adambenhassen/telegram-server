@@ -217,7 +217,7 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 					h.log.Error("load files on retry", "err", err)
 					return nil, nil, nil, errInternal
 				}
-				return &tg.Updates{
+				res := &tg.Updates{
 					Updates: []tg.UpdateClass{
 						&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
 						&tg.UpdateNewMessage{Message: messageToTL(existing, nil, files, nil, nil), Pts: pts, PtsCount: 1},
@@ -225,7 +225,9 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 					Users: users,
 					Chats: chats,
 					Date:  int(existing.Date.Unix()),
-				}, nil, nil, nil
+				}
+				update, afterReply := h.retryReplyAfterSuccess(r, peerType, pts)
+				return res, update, afterReply, nil
 			}
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 			if err != nil {
@@ -237,14 +239,16 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 				h.log.Error("load files on retry", "err", err)
 				return nil, nil, nil, errInternal
 			}
-			return &tg.Updates{
+			res := &tg.Updates{
 				Updates: []tg.UpdateClass{
 					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
 					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, files, nil, nil), Pts: pts, PtsCount: 1},
 				},
 				Users: users,
 				Date:  int(existing.Date.Unix()),
-			}, nil, nil, nil
+			}
+			update, afterReply := h.retryReplyAfterSuccess(r, peerType, pts)
+			return res, update, afterReply, nil
 		}
 	}
 

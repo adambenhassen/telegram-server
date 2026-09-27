@@ -67,6 +67,24 @@ func (h *handlers) notifySendAfterReply(r *mtproto.Request, pts int) {
 	h.notifySend(ctx, r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
 }
 
+// retryReplyAfterSuccess restores the sender-keyed notification for a stored
+// 1:1 retry. A retry can be the first request whose RPC result reaches the
+// client after the original committed its message, so it needs the same
+// post-reply push as a new send. Chat retries keep their existing fan-out
+// notification behaviour and therefore do not return sender metadata here.
+func (h *handlers) retryReplyAfterSuccess(r *mtproto.Request, peerType store.PeerType, pts int) (*replyUpdate, func()) {
+	if peerType != store.PeerTypeUser {
+		return nil, nil
+	}
+	return &replyUpdate{
+		owner:   r.UserID,
+		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
+		pts:     pts,
+	}, func() {
+		h.notifySendAfterReply(r, pts)
+	}
+}
+
 // notifyTyping emits the transient typing nudge to peerID from fromID.
 func (h *handlers) notifyTyping(ctx context.Context, peerID, fromID int64) {
 	if err := h.store.Notify(ctx, store.ChannelTyping, store.TypingPayload(peerID, fromID)); err != nil {
@@ -229,14 +247,16 @@ func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder,
 				h.log.Error("load users on retry", "user_id", r.UserID, "err", err)
 				return nil, nil, nil, errInternal
 			}
-			return &tg.Updates{
+			res := &tg.Updates{
 				Updates: []tg.UpdateClass{
 					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
 					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: pts, PtsCount: 1},
 				},
 				Users: users,
 				Date:  int(existing.Date.Unix()),
-			}, nil, nil, nil
+			}
+			update, afterReply := h.retryReplyAfterSuccess(r, peerType, pts)
+			return res, update, afterReply, nil
 		} else if err != nil {
 			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
 			return nil, nil, nil, errInternal

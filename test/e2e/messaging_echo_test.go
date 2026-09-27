@@ -190,10 +190,10 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	if warmupPts != 2 {
 		t.Fatalf("A warmup RPC pts = %d, want 2 after its saved message", warmupPts)
 	}
-	assertObservedMessage(t, ctx, collA1, "A to B warmup", warmupMessage.ID, true, b1.id, warmupPts, "A1 RPC result")
-	assertObservedMessage(t, ctx, collA2, "A to B warmup", warmupMessage.ID, true, b1.id, warmupPts, "A2 other session")
-	assertObservedMessage(t, ctx, collB1, "A to B warmup", 1, false, a1.id, 1, "B1 incoming")
-	assertObservedMessage(t, ctx, collB2, "A to B warmup", 1, false, a1.id, 1, "B2 incoming")
+	assertObservedMessage(t, ctx, collA1, "A to B warmup", warmupMessage.ID, true, b1.id, warmupPts, "A1 RPC result", true)
+	assertObservedMessage(t, ctx, collA2, "A to B warmup", warmupMessage.ID, true, b1.id, warmupPts, "A2 other session", true)
+	assertObservedMessage(t, ctx, collB1, "A to B warmup", 1, false, a1.id, 1, "B1 incoming", true)
+	assertObservedMessage(t, ctx, collB2, "A to B warmup", 1, false, a1.id, 1, "B2 incoming", true)
 	assertObservedMessage(t, ctx, pushA1, "A saved id seed", int(seedMessage.LocalID), true, a1.id, seedPts, "A1 initial catch-up push")
 	assertObservedMessage(t, ctx, pushA2, "A saved id seed", int(seedMessage.LocalID), true, a1.id, seedPts, "A2 initial catch-up push")
 	assertObservedMessage(t, ctx, pushA2, "A to B warmup", warmupMessage.ID, true, b1.id, warmupPts, "A2 push")
@@ -220,10 +220,10 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	if senderPts != 2 {
 		t.Fatalf("sender RPC pts = %d, want 2 after A's message", senderPts)
 	}
-	assertObservedMessage(t, ctx, collB1, "sender echo target", senderMessage.ID, true, a1.id, senderPts, "B1 RPC result")
-	assertObservedMessage(t, ctx, collB2, "sender echo target", senderMessage.ID, true, a1.id, senderPts, "B2 other session")
-	assertObservedMessage(t, ctx, collA1, "sender echo target", 3, false, b1.id, 3, "A1 incoming")
-	assertObservedMessage(t, ctx, collA2, "sender echo target", 3, false, b1.id, 3, "A2 incoming")
+	assertObservedMessage(t, ctx, collB1, "sender echo target", senderMessage.ID, true, a1.id, senderPts, "B1 RPC result", true)
+	assertObservedMessage(t, ctx, collB2, "sender echo target", senderMessage.ID, true, a1.id, senderPts, "B2 other session", true)
+	assertObservedMessage(t, ctx, collA1, "sender echo target", 3, false, b1.id, 3, "A1 incoming", true)
+	assertObservedMessage(t, ctx, collA2, "sender echo target", 3, false, b1.id, 3, "A2 incoming", true)
 	assertObservedMessage(t, ctx, pushB2, "sender echo target", senderMessage.ID, true, a1.id, senderPts, "B2 push")
 	assertObservedMessage(t, ctx, pushA1, "sender echo target", 3, false, b1.id, 3, "A1 push")
 	assertObservedMessage(t, ctx, pushA2, "sender echo target", 3, false, b1.id, 3, "A2 push")
@@ -249,10 +249,10 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	if secondBPts != 3 {
 		t.Fatalf("second B sender pts = %d, want 3", secondBPts)
 	}
-	assertObservedMessage(t, ctx, collB2, "second B to A", secondBMessage.ID, true, a1.id, secondBPts, "B2 RPC result")
-	assertObservedMessage(t, ctx, collB1, "second B to A", secondBMessage.ID, true, a1.id, 3, "B1 other session")
-	assertObservedMessage(t, ctx, collA1, "second B to A", 4, false, b1.id, 4, "A1 incoming second")
-	assertObservedMessage(t, ctx, collA2, "second B to A", 4, false, b1.id, 4, "A2 incoming second")
+	assertObservedMessage(t, ctx, collB2, "second B to A", secondBMessage.ID, true, a1.id, secondBPts, "B2 RPC result", true)
+	assertObservedMessage(t, ctx, collB1, "second B to A", secondBMessage.ID, true, a1.id, 3, "B1 other session", true)
+	assertObservedMessage(t, ctx, collA1, "second B to A", 4, false, b1.id, 4, "A1 incoming second", true)
+	assertObservedMessage(t, ctx, collA2, "second B to A", 4, false, b1.id, 4, "A2 incoming second", true)
 	assertObservedMessage(t, ctx, pushB1, "second B to A", secondBMessage.ID, true, a1.id, 3, "B1 push")
 	assertObservedMessage(t, ctx, pushA1, "second B to A", 4, false, b1.id, 4, "A1 push second")
 	assertObservedMessage(t, ctx, pushA2, "second B to A", 4, false, b1.id, 4, "A2 push second")
@@ -459,20 +459,18 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	if !ok || countOutgoingMessages(recoveryResult, "A to B offline recovery") != 1 {
 		t.Fatal("A recovery RPC result omitted its outgoing message")
 	}
-	assertObservedMessage(t, ctx, collA1, "A to B offline recovery", recoveryMessage.ID, true, b1.id, recoveryPts, "A1 recovery RPC result")
+	assertObservedMessage(t, ctx, collA1, "A to B offline recovery", recoveryMessage.ID, true, b1.id, recoveryPts, "A1 recovery RPC result", true)
 	assertDifferenceMessage(t, ctx, collA2, "A to B offline recovery", recoveryMessage.ID, true, b1.id, "A2 recovery other session")
-	assertObservedMessage(t, ctx, collB2, "A to B offline recovery", 4, false, a1.id, 6, "B2 recovery incoming")
+	assertObservedMessage(t, ctx, collB2, "A to B offline recovery", 4, false, a1.id, 6, "B2 recovery incoming", true)
 	assertObservedMessage(t, ctx, pushA2, "A to B offline recovery", recoveryMessage.ID, true, b1.id, recoveryPts, "A2 recovery push")
 	assertObservedMessage(t, ctx, pushB2, "A to B offline recovery", 4, false, a1.id, 6, "B2 recovery push")
 	if recoveryPts != 7 {
 		t.Fatalf("A recovery pts = %d, want 7 after two reads", recoveryPts)
 	}
-	b1Reconnected := launchClient(phoneB, pushB1, managerB1, sessB1, false)
+	pushB1Reconnected := newUpdateCollector()
+	b1Reconnected := launchClient(phoneB, pushB1Reconnected, managerB1, sessB1, false)
 	waitClient(phoneB, b1Reconnected)
 	assertDifferenceMessage(t, ctx, collB1, "A to B offline recovery", 4, false, a1.id, "B1 Manager recovery difference")
-	if got := takeMessage(t, pushB1.newMsg); got != nil {
-		t.Fatalf("B1 recovery update unexpectedly arrived as a live push: %+v", got)
-	}
 
 	var senderDifference tg.UpdatesDifferenceClass
 	if err := exec(b1Reconnected, func(ctx context.Context, api *tg.Client) error {
@@ -563,6 +561,63 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		t.Fatalf("C isolation difference: %v", err)
 	}
 
+	const mediaFileID int64 = 82505
+	const mediaRandomID int64 = 82506
+	const mediaCaption = "A to B direct media"
+	mediaPayload := []byte("direct media echo")
+	if err := exec(a1, func(ctx context.Context, api *tg.Client) error {
+		ok, err := api.UploadSaveFilePart(ctx, &tg.UploadSaveFilePartRequest{
+			FileID: mediaFileID, FilePart: 0, Bytes: mediaPayload,
+		})
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("upload.saveFilePart returned false")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("A media upload: %v", err)
+	}
+
+	var mediaResult tg.UpdatesClass
+	if err := exec(a1, func(ctx context.Context, api *tg.Client) error {
+		res, err := api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+			Peer: peerUser(a1.id, b1.id),
+			Media: &tg.InputMediaUploadedDocument{
+				File:     &tg.InputFile{ID: mediaFileID, Parts: 1, Name: "echo.txt"},
+				MimeType: "text/plain",
+			},
+			Message:  mediaCaption,
+			RandomID: mediaRandomID,
+		})
+		mediaResult = res
+		return err
+	}); err != nil {
+		t.Fatalf("A direct media send: %v", err)
+	}
+	mediaMessage, mediaPts, ok := outgoingMessage(t, mediaResult, mediaCaption)
+	if !ok || countOutgoingMessages(mediaResult, mediaCaption) != 1 {
+		t.Fatal("A direct media RPC result omitted or duplicated its outgoing message")
+	}
+	if mediaPts != recoveryPts+1 {
+		t.Fatalf("A direct media RPC pts = %d, want %d", mediaPts, recoveryPts+1)
+	}
+	mediaDocument := documentOf(t, mediaMessage)
+	if int(mediaDocument.Size) != len(mediaPayload) {
+		t.Fatalf("A direct media document size = %d, want %d", mediaDocument.Size, len(mediaPayload))
+	}
+	assertObservedMessage(t, ctx, collA1, mediaCaption, mediaMessage.ID, true, b1.id, mediaPts, "A1 media RPC result", true)
+	assertObservedMessage(t, ctx, collA2, mediaCaption, mediaMessage.ID, true, b1.id, mediaPts, "A2 media other session", true)
+	assertObservedMessage(t, ctx, pushA2, mediaCaption, mediaMessage.ID, true, b1.id, mediaPts, "A2 media push")
+	assertObservedMessage(t, ctx, collB1, mediaCaption, 5, false, a1.id, 7, "B1 media incoming", true)
+	assertObservedMessage(t, ctx, collB2, mediaCaption, 5, false, a1.id, 7, "B2 media incoming", true)
+	drainPushBacklog(t, ctx, pushB1Reconnected)
+	drainPushBacklog(t, ctx, pushB2)
+	if got := takeMessage(t, pushA1.newMsg); got != nil {
+		t.Fatalf("A1 media origin received its own send by push: %+v", got)
+	}
+
 	for _, session := range []struct {
 		name string
 		coll *updateCollector
@@ -575,6 +630,7 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		{name: "A1 raw push", coll: pushA1},
 		{name: "A2 raw push", coll: pushA2},
 		{name: "B1 raw push", coll: pushB1},
+		{name: "B1 reconnect raw push", coll: pushB1Reconnected},
 		{name: "B2 raw push", coll: pushB2},
 		{name: "C raw push", coll: pushC},
 	} {
@@ -620,6 +676,28 @@ func waitForDistinctAuthKeys(t *testing.T, ctx context.Context, registry *mtprot
 	}
 }
 
+func drainPushBacklog(t *testing.T, ctx context.Context, coll *updateCollector) {
+	t.Helper()
+	for {
+		select {
+		case <-coll.newMsg:
+			select {
+			case <-coll.points:
+			case <-ctx.Done():
+				t.Fatalf("draining push points: %v", ctx.Err())
+			}
+		case <-coll.readOutbox:
+			select {
+			case <-coll.readOutboxPts:
+			case <-ctx.Done():
+				t.Fatalf("draining push read marker pts: %v", ctx.Err())
+			}
+		default:
+			return
+		}
+	}
+}
+
 func outgoingMessage(t *testing.T, result tg.UpdatesClass, text string) (*tg.Message, int, bool) {
 	t.Helper()
 	updates, ok := result.(*tg.Updates)
@@ -658,7 +736,7 @@ func countOutgoingMessages(result tg.UpdatesClass, text string) int {
 	return count
 }
 
-func assertObservedMessage(t *testing.T, ctx context.Context, coll *updateCollector, text string, id int, out bool, peerID int64, pts int, label string) {
+func assertObservedMessage(t *testing.T, ctx context.Context, coll *updateCollector, text string, id int, out bool, peerID int64, pts int, label string, allowUnspecifiedPts ...bool) {
 	t.Helper()
 	message := recvOrCtx(t, ctx, coll.newMsg, label+" message")
 	if message.Message != text || message.ID != id || message.Out != out {
@@ -668,8 +746,13 @@ func assertObservedMessage(t *testing.T, ctx context.Context, coll *updateCollec
 	if !ok || peer.UserID != peerID {
 		t.Fatalf("%s peer_id = %+v, want sender/peer user %d", label, message.PeerID, peerID)
 	}
-	if got := recvOrCtx(t, ctx, coll.points, label+" pts"); got != pts {
-		t.Fatalf("%s pts = %d, want %d", label, got, pts)
+	gotPts := recvOrCtx(t, ctx, coll.points, label+" pts")
+	// A gotd updates manager can surface a concurrent live update through a
+	// difference response with an unspecified pts marker. The message identity
+	// and direction remain authoritative in that path.
+	unspecified := len(allowUnspecifiedPts) > 0 && allowUnspecifiedPts[0] && gotPts < 0
+	if gotPts != pts && !unspecified {
+		t.Fatalf("%s pts = %d, want %d", label, gotPts, pts)
 	}
 }
 
