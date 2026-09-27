@@ -12,6 +12,8 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/dcs"
+	"github.com/gotd/td/telegram/updates"
+	"github.com/gotd/td/telegram/updates/hook"
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
@@ -49,14 +51,22 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	registry, stop := bootServerWithRegistry(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
 	t.Cleanup(stop)
 
-	newClient := func(collector *updateCollector, sess *session.StorageMemory) *telegram.Client {
+	type clientUpdates struct {
+		manager *updates.Manager
+		pushes  *updateCollector
+	}
+	newClient := func(updates clientUpdates, sess *session.StorageMemory) *telegram.Client {
 		return telegram.NewClient(1, "hash", telegram.Options{
 			DC:             dcID,
 			DCList:         dcs.List{Options: []tg.DCOption{{ID: dcID, IPAddress: "127.0.0.1", Port: addr.Port}}},
 			PublicKeys:     []telegram.PublicKey{{RSA: &key.PublicKey}},
 			Resolver:       dcs.Plain(dcs.PlainOptions{}),
 			SessionStorage: sess,
-			UpdateHandler:  collector,
+			UpdateHandler:  observedManagerHandler{observer: updates.pushes, manager: updates.manager},
+			Middlewares: []telegram.Middleware{
+				hook.UpdateHook(updates.manager.Handle),
+				hook.AffectedHook(updates.manager),
+			},
 		})
 	}
 	flowFor := func(phone string) auth.Flow {
@@ -71,20 +81,41 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 
 	const phoneA, phoneB, phoneC = "+15551282501", "+15551282502", "+15551282503"
 	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneC)
+	seedA, ok, err := st.UserByPhone(ctx, phoneA)
+	if err != nil || !ok {
+		t.Fatalf("look up A seed user: found=%v err=%v", ok, err)
+	}
+	seedMessage, seedPts, _, _, err := st.SendMessage(ctx, seedA.ID, seedA.ID, "A saved id seed", 82500, 0, 0)
+	if err != nil {
+		t.Fatalf("seed A saved message: %v", err)
+	}
+	if seedPts != 1 || seedMessage.LocalID != 1 {
+		t.Fatalf("A seed message = id %d pts %d, want id 1 pts 1", seedMessage.LocalID, seedPts)
+	}
 
 	type runningClient struct {
-		cmds chan command
-		err  chan error
-		id   int64
+		cmds    chan command
+		err     chan error
+		ready   chan struct{}
+		id      int64
+		manager *updates.Manager
 	}
-	startClient := func(phone string, client *telegram.Client) *runningClient {
-		run := &runningClient{cmds: make(chan command), err: make(chan error, 1)}
+	startClient := func(phone string, pushes *updateCollector, manager *updates.Manager, sess *session.StorageMemory, forget bool) *runningClient {
+		run := &runningClient{cmds: make(chan command), err: make(chan error, 1), ready: make(chan struct{}), manager: manager}
 		ids := make(chan int64, 1)
-		go func() { run.err <- runInteractive(ctx, client, flowFor(phone), ids, run.cmds) }()
+		client := newClient(clientUpdates{manager: manager, pushes: pushes}, sess)
+		go func() {
+			run.err <- runManagedInteractive(ctx, client, flowFor(phone), ids, run.ready, run.cmds, manager, forget)
+		}()
 		select {
 		case run.id = <-ids:
 		case <-ctx.Done():
 			t.Fatalf("login %s timeout: %v", phone, ctx.Err())
+		}
+		select {
+		case <-run.ready:
+		case <-ctx.Done():
+			t.Fatalf("update manager %s startup timeout: %v", phone, ctx.Err())
 		}
 		return run
 	}
@@ -107,15 +138,23 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		if err := <-run.err; err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("client run: %v", err)
 		}
+		run.manager.Reset()
 	}
 
-	sessB1, sessB2 := &session.StorageMemory{}, &session.StorageMemory{}
+	sessA1, sessA2, sessB1, sessB2 := &session.StorageMemory{}, &session.StorageMemory{}, &session.StorageMemory{}, &session.StorageMemory{}
+	collA1, collA2 := newUpdateCollector(), newUpdateCollector()
 	collB1, collB2 := newUpdateCollector(), newUpdateCollector()
-	b1 := startClient(phoneB, newClient(collB1, sessB1))
-	b2 := startClient(phoneB, newClient(collB2, sessB2))
-	collA, collC := newUpdateCollector(), newUpdateCollector()
-	a := startClient(phoneA, newClient(collA, &session.StorageMemory{}))
-	c := startClient(phoneC, newClient(collC, &session.StorageMemory{}))
+	pushA1, pushA2 := newUpdateCollector(), newUpdateCollector()
+	pushB1, pushB2 := newUpdateCollector(), newUpdateCollector()
+	managerA1, managerA2 := updates.New(updates.Config{Handler: collA1}), updates.New(updates.Config{Handler: collA2})
+	managerB1, managerB2 := updates.New(updates.Config{Handler: collB1}), updates.New(updates.Config{Handler: collB2})
+	a1 := startClient(phoneA, pushA1, managerA1, sessA1, true)
+	a2 := startClient(phoneA, pushA2, managerA2, sessA2, true)
+	b1 := startClient(phoneB, pushB1, managerB1, sessB1, true)
+	b2 := startClient(phoneB, pushB2, managerB2, sessB2, true)
+	collC, pushC := newUpdateCollector(), newUpdateCollector()
+	managerC := updates.New(updates.Config{Handler: collC})
+	c := startClient(phoneC, pushC, managerC, &session.StorageMemory{}, true)
 
 	conns := registry.Conns(b1.id)
 	if len(conns) != 2 {
@@ -124,14 +163,18 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	if conns[0].AuthKeyID() == 0 || conns[1].AuthKeyID() == 0 || conns[0].AuthKeyID() == conns[1].AuthKeyID() {
 		t.Fatalf("B auth key ids = %d, %d; want distinct nonzero keys", conns[0].AuthKeyID(), conns[1].AuthKeyID())
 	}
-
-	if _, _, _, _, err := st.SendMessage(ctx, a.id, a.id, "A saved id seed", 82500, 0, 0); err != nil {
-		t.Fatalf("seed A saved message: %v", err)
+	aConns := registry.Conns(a1.id)
+	if len(aConns) != 2 {
+		t.Fatalf("A live connections = %d, want 2", len(aConns))
 	}
+	if aConns[0].AuthKeyID() == 0 || aConns[1].AuthKeyID() == 0 || aConns[0].AuthKeyID() == aConns[1].AuthKeyID() {
+		t.Fatalf("A auth key ids = %d, %d; want distinct nonzero keys", aConns[0].AuthKeyID(), aConns[1].AuthKeyID())
+	}
+
 	var warmup tg.UpdatesClass
-	if err := exec(a, func(ctx context.Context, api *tg.Client) error {
+	if err := exec(a1, func(ctx context.Context, api *tg.Client) error {
 		res, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer: peerUser(a.id, b1.id), Message: "A to B warmup", RandomID: 82501,
+			Peer: peerUser(a1.id, b1.id), Message: "A to B warmup", RandomID: 82501,
 		})
 		warmup = res
 		return err
@@ -139,43 +182,29 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		t.Fatalf("A warmup send: %v", err)
 	}
 	warmupMessage, warmupPts, ok := outgoingMessage(t, warmup, "A to B warmup")
-	if !ok {
+	if !ok || countOutgoingMessages(warmup, "A to B warmup") != 1 {
 		t.Fatal("A warmup RPC result omitted its outgoing message")
 	}
 	if warmupPts != 2 {
 		t.Fatalf("A warmup RPC pts = %d, want 2 after its saved message", warmupPts)
 	}
-	b1Warmup := recvOrCtx(t, ctx, collB1.newMsg, "first B session incoming warmup")
-	if b1Warmup.Message != "A to B warmup" || b1Warmup.Out {
-		t.Fatalf("first B session warmup = %+v, want incoming A message", b1Warmup)
-	}
-	if pts := recvOrCtx(t, ctx, collB1.points, "first B session incoming warmup pts"); pts != 1 {
-		t.Fatalf("first B session warmup pts = %d, want 1", pts)
-	}
-	b2Warmup := recvOrCtx(t, ctx, collB2.newMsg, "second B session incoming warmup")
-	if b2Warmup.Message != "A to B warmup" || b2Warmup.Out {
-		t.Fatalf("second B session warmup = %+v, want incoming A message", b2Warmup)
-	}
-	if pts := recvOrCtx(t, ctx, collB2.points, "second B session incoming warmup pts"); pts != 1 {
-		t.Fatalf("second B session warmup pts = %d, want 1", pts)
-	}
-	if warmupMessage.ID == b2Warmup.ID {
-		t.Fatalf("A and B warmup ids unexpectedly equal: A=%d B=%d", warmupMessage.ID, b2Warmup.ID)
-	}
-	if got := recvOrCtx(t, ctx, collA.newMsg, "A saved message event"); got.Message != "A saved id seed" || !got.Out {
-		t.Fatalf("A saved message event = %+v", got)
-	}
-	if pts := recvOrCtx(t, ctx, collA.points, "A saved message pts"); pts != 1 {
-		t.Fatalf("A saved message pts = %d, want 1", pts)
-	}
-	if got := takeMessage(t, collA.newMsg); got != nil {
-		t.Fatalf("originating A auth key received its own send echo: %+v", got)
+	assertObservedMessage(t, ctx, collA1, "A to B warmup", warmupMessage.ID, true, b1.id, warmupPts, "A1 RPC result")
+	assertObservedMessage(t, ctx, collA2, "A to B warmup", warmupMessage.ID, true, b1.id, warmupPts, "A2 other session")
+	assertObservedMessage(t, ctx, collB1, "A to B warmup", 1, false, a1.id, 1, "B1 incoming")
+	assertObservedMessage(t, ctx, collB2, "A to B warmup", 1, false, a1.id, 1, "B2 incoming")
+	assertObservedMessage(t, ctx, pushA1, "A saved id seed", int(seedMessage.LocalID), true, a1.id, seedPts, "A1 initial catch-up push")
+	assertObservedMessage(t, ctx, pushA2, "A saved id seed", int(seedMessage.LocalID), true, a1.id, seedPts, "A2 initial catch-up push")
+	assertObservedMessage(t, ctx, pushA2, "A to B warmup", warmupMessage.ID, true, b1.id, warmupPts, "A2 push")
+	assertObservedMessage(t, ctx, pushB1, "A to B warmup", 1, false, a1.id, 1, "B1 push")
+	assertObservedMessage(t, ctx, pushB2, "A to B warmup", 1, false, a1.id, 1, "B2 push")
+	if warmupMessage.ID == 1 {
+		t.Fatal("A and B warmup ids unexpectedly equal")
 	}
 
 	var sendResult tg.UpdatesClass
 	if err := exec(b1, func(ctx context.Context, api *tg.Client) error {
 		res, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer: peerUser(b1.id, a.id), Message: "sender echo target", RandomID: 82502,
+			Peer: peerUser(b1.id, a1.id), Message: "sender echo target", RandomID: 82502,
 		})
 		sendResult = res
 		return err
@@ -183,36 +212,55 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		t.Fatalf("B send to A: %v", err)
 	}
 	senderMessage, senderPts, ok := outgoingMessage(t, sendResult, "sender echo target")
-	if !ok {
+	if !ok || countOutgoingMessages(sendResult, "sender echo target") != 1 {
 		t.Fatal("sendMessage RPC result omitted its outgoing message")
 	}
 	if senderPts != 2 {
 		t.Fatalf("sender RPC pts = %d, want 2 after A's message", senderPts)
 	}
-	secondSessionMessage := recvOrCtx(t, ctx, collB2.newMsg, "second B session outgoing update")
-	if secondSessionMessage.Message != "sender echo target" || !secondSessionMessage.Out || secondSessionMessage.ID != senderMessage.ID {
-		t.Fatalf("second B session update = %+v, want outgoing id %d", secondSessionMessage, senderMessage.ID)
+	assertObservedMessage(t, ctx, collB1, "sender echo target", senderMessage.ID, true, a1.id, senderPts, "B1 RPC result")
+	assertObservedMessage(t, ctx, collB2, "sender echo target", senderMessage.ID, true, a1.id, senderPts, "B2 other session")
+	assertObservedMessage(t, ctx, collA1, "sender echo target", 3, false, b1.id, 3, "A1 incoming")
+	assertObservedMessage(t, ctx, collA2, "sender echo target", 3, false, b1.id, 3, "A2 incoming")
+	assertObservedMessage(t, ctx, pushB2, "sender echo target", senderMessage.ID, true, a1.id, senderPts, "B2 push")
+	assertObservedMessage(t, ctx, pushA1, "sender echo target", 3, false, b1.id, 3, "A1 push")
+	assertObservedMessage(t, ctx, pushA2, "sender echo target", 3, false, b1.id, 3, "A2 push")
+	if senderMessage.ID == 3 {
+		t.Fatal("B sender id unexpectedly equals A recipient id")
 	}
-	if pts := recvOrCtx(t, ctx, collB2.points, "second B session outgoing pts"); pts != 2 {
-		t.Fatalf("second B session outgoing pts = %d, want 2", pts)
+	recipientMessage := &tg.Message{ID: 3}
+
+	var secondBResult tg.UpdatesClass
+	if err := exec(b2, func(ctx context.Context, api *tg.Client) error {
+		res, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerUser(b2.id, a1.id), Message: "second B to A", RandomID: 82503,
+		})
+		secondBResult = res
+		return err
+	}); err != nil {
+		t.Fatalf("B2 send to A: %v", err)
 	}
-	recipientMessage := recvOrCtx(t, ctx, collA.newMsg, "A incoming update")
-	if recipientMessage.Message != "sender echo target" || recipientMessage.Out {
-		t.Fatalf("A incoming message = %+v", recipientMessage)
+	secondBMessage, secondBPts, ok := outgoingMessage(t, secondBResult, "second B to A")
+	if !ok || countOutgoingMessages(secondBResult, "second B to A") != 1 {
+		t.Fatal("second B send RPC result omitted its outgoing message")
 	}
-	if recipientMessage.ID == senderMessage.ID {
-		t.Fatalf("owner-local message ids unexpectedly equal: A=%d B=%d", recipientMessage.ID, senderMessage.ID)
+	if secondBPts != 3 {
+		t.Fatalf("second B sender pts = %d, want 3", secondBPts)
 	}
-	if pts := recvOrCtx(t, ctx, collA.points, "A incoming pts"); pts != 3 {
-		t.Fatalf("A incoming pts = %d, want 3", pts)
-	}
+	assertObservedMessage(t, ctx, collB2, "second B to A", secondBMessage.ID, true, a1.id, secondBPts, "B2 RPC result")
+	assertObservedMessage(t, ctx, collB1, "second B to A", secondBMessage.ID, true, a1.id, 3, "B1 other session")
+	assertObservedMessage(t, ctx, collA1, "second B to A", 4, false, b1.id, 4, "A1 incoming second")
+	assertObservedMessage(t, ctx, collA2, "second B to A", 4, false, b1.id, 4, "A2 incoming second")
+	assertObservedMessage(t, ctx, pushB1, "second B to A", secondBMessage.ID, true, a1.id, 3, "B1 push")
+	assertObservedMessage(t, ctx, pushA1, "second B to A", 4, false, b1.id, 4, "A1 push second")
+	assertObservedMessage(t, ctx, pushA2, "second B to A", 4, false, b1.id, 4, "A2 push second")
 
 	// The read uses A's owner-local id. B must receive the mirrored sender id,
 	// and an oversized request must not move B's marker beyond that row.
 	read := func(maxID int) error {
-		return exec(a, func(ctx context.Context, api *tg.Client) error {
+		return exec(a1, func(ctx context.Context, api *tg.Client) error {
 			_, err := api.MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{
-				Peer: peerUser(a.id, b1.id), MaxID: maxID,
+				Peer: peerUser(a1.id, b1.id), MaxID: maxID,
 			})
 			return err
 		})
@@ -220,17 +268,30 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	if err := read(recipientMessage.ID); err != nil {
 		t.Fatalf("A readHistory through its local id: %v", err)
 	}
-	if got := recvOrCtx(t, ctx, collB2.readOutbox, "B mirrored read marker"); got != senderMessage.ID {
-		t.Fatalf("B outbox marker = %d, want sender-local id %d", got, senderMessage.ID)
+	for _, session := range []struct {
+		name string
+		coll *updateCollector
+		push *updateCollector
+	}{
+		{name: "B1", coll: collB1, push: pushB1},
+		{name: "B2", coll: collB2, push: pushB2},
+	} {
+		assertObservedReadMarker(t, ctx, session.coll, senderMessage.ID, 4, session.name+" mirrored read")
+		assertObservedReadMarker(t, ctx, session.push, senderMessage.ID, 4, session.name+" mirrored read push")
 	}
 	if err := read(int(1<<31 - 1)); err != nil {
 		t.Fatalf("A oversized readHistory: %v", err)
 	}
-	if got := recvOrCtx(t, ctx, collB2.readOutbox, "B oversized read marker"); got != senderMessage.ID {
-		t.Fatalf("oversized read advanced B outbox marker to %d, want %d", got, senderMessage.ID)
-	}
-	if got := takeMessage(t, collB1.newMsg); got != nil {
-		t.Fatalf("originating B auth key received duplicate updateNewMessage: %+v", got)
+	for _, session := range []struct {
+		name string
+		coll *updateCollector
+		push *updateCollector
+	}{
+		{name: "B1", coll: collB1, push: pushB1},
+		{name: "B2", coll: collB2, push: pushB2},
+	} {
+		assertObservedReadMarker(t, ctx, session.coll, secondBMessage.ID, 5, session.name+" oversized read")
+		assertObservedReadMarker(t, ctx, session.push, secondBMessage.ID, 5, session.name+" oversized read push")
 	}
 
 	checkHistory := func(run *runningClient, viewerID, peerID int64) {
@@ -244,8 +305,8 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 			if !ok {
 				return fmt.Errorf("history response = %T", res)
 			}
-			if len(history.Messages) != 2 {
-				return fmt.Errorf("history messages = %d, want 2", len(history.Messages))
+			if len(history.Messages) != 3 {
+				return fmt.Errorf("history messages = %d, want 3", len(history.Messages))
 			}
 			found := map[string]bool{}
 			for _, class := range history.Messages {
@@ -253,14 +314,28 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 				if !ok {
 					return fmt.Errorf("history message = %+v", class)
 				}
-				if msg.Message == "A to B warmup" || msg.Message == "sender echo target" {
+				if msg.Message == "A to B warmup" || msg.Message == "sender echo target" || msg.Message == "second B to A" {
 					found[msg.Message] = true
+					wantID := map[string]int{"A to B warmup": 1, "sender echo target": 2, "second B to A": 3}[msg.Message]
+					if viewerID == a1.id {
+						wantID = map[string]int{"A to B warmup": warmupMessage.ID, "sender echo target": 3, "second B to A": 4}[msg.Message]
+					}
+					if msg.ID != wantID {
+						return fmt.Errorf("history %q id = %d for owner %d, want %d", msg.Message, msg.ID, viewerID, wantID)
+					}
+					msgPeer, ok := msg.PeerID.(*tg.PeerUser)
+					if !ok || msgPeer.UserID != peerID {
+						return fmt.Errorf("history %q peer_id = %+v, want %d", msg.Message, msg.PeerID, peerID)
+					}
 				}
-				if viewerID == a.id && msg.Message == "A to B warmup" && !msg.Out {
+				if viewerID == a1.id && msg.Message == "A to B warmup" && !msg.Out {
 					return fmt.Errorf("A warmup history message is not outgoing: %+v", msg)
 				}
-				if viewerID == a.id && msg.Message == "sender echo target" && msg.Out {
+				if viewerID == a1.id && msg.Message == "sender echo target" && msg.Out {
 					return fmt.Errorf("A target history message is outgoing: %+v", msg)
+				}
+				if viewerID == a1.id && msg.Message == "second B to A" && msg.Out {
+					return fmt.Errorf("A second target history message is outgoing: %+v", msg)
 				}
 				if viewerID == b1.id && msg.Message == "A to B warmup" && msg.Out {
 					return fmt.Errorf("B warmup history message is outgoing: %+v", msg)
@@ -268,8 +343,11 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 				if viewerID == b1.id && msg.Message == "sender echo target" && !msg.Out {
 					return fmt.Errorf("B target history message is incoming: %+v", msg)
 				}
+				if viewerID == b1.id && msg.Message == "second B to A" && !msg.Out {
+					return fmt.Errorf("B second target history message is incoming: %+v", msg)
+				}
 			}
-			if !found["A to B warmup"] || !found["sender echo target"] {
+			if !found["A to B warmup"] || !found["sender echo target"] || !found["second B to A"] {
 				return fmt.Errorf("history messages missing round trip: %v", found)
 			}
 			return nil
@@ -277,11 +355,82 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 			t.Fatalf("history for %d with peer %d: %v", viewerID, peerID, err)
 		}
 	}
-	checkHistory(a, a.id, b1.id)
-	checkHistory(b2, b1.id, a.id)
+	checkHistory(a1, a1.id, b1.id)
+	checkHistory(a2, a2.id, b1.id)
+	checkHistory(b1, b1.id, a1.id)
+	checkHistory(b2, b1.id, a1.id)
+	for _, peerID := range []int64{a1.id, b1.id} {
+		if err := exec(c, func(ctx context.Context, api *tg.Client) error {
+			res, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peerUser(c.id, peerID), Limit: 10})
+			if err != nil {
+				return err
+			}
+			history, ok := res.(*tg.MessagesMessages)
+			if !ok {
+				return fmt.Errorf("C history response = %T", res)
+			}
+			if len(history.Messages) != 0 {
+				return fmt.Errorf("C history with %d exposed %d A/B messages", peerID, len(history.Messages))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("C history with peer %d: %v", peerID, err)
+		}
+	}
+	aStateBeforeCRead, err := st.State(ctx, a1.id)
+	if err != nil {
+		t.Fatalf("A state before C read: %v", err)
+	}
+	aDialogsBeforeCRead, err := st.Dialogs(ctx, a1.id, 0, 100)
+	if err != nil {
+		t.Fatalf("A dialogs before C read: %v", err)
+	}
+	if err := exec(c, func(ctx context.Context, api *tg.Client) error {
+		_, err := api.MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{
+			Peer: peerUser(c.id, a1.id), MaxID: int(1<<31 - 1),
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("C readHistory without a dialog: %v", err)
+	}
+	aStateAfterCRead, err := st.State(ctx, a1.id)
+	if err != nil {
+		t.Fatalf("A state after C read: %v", err)
+	}
+	if aStateAfterCRead.Pts != aStateBeforeCRead.Pts {
+		t.Fatalf("C no-dialog read changed A pts from %d to %d", aStateBeforeCRead.Pts, aStateAfterCRead.Pts)
+	}
+	aDialogsAfterCRead, err := st.Dialogs(ctx, a1.id, 0, 100)
+	if err != nil {
+		t.Fatalf("A dialogs after C read: %v", err)
+	}
+	if len(aDialogsAfterCRead) != len(aDialogsBeforeCRead) {
+		t.Fatalf("C no-dialog read changed A dialog count from %d to %d", len(aDialogsBeforeCRead), len(aDialogsAfterCRead))
+	}
+	for i := range aDialogsBeforeCRead {
+		before, after := aDialogsBeforeCRead[i], aDialogsAfterCRead[i]
+		if before.PeerType != after.PeerType || before.PeerID != after.PeerID || before.ReadOutboxMaxID != after.ReadOutboxMaxID {
+			t.Fatalf("C no-dialog read changed A outbox marker: before=%+v after=%+v", before, after)
+		}
+	}
+	if err := managerA1.Handle(ctx, warmup); err != nil {
+		t.Fatalf("replay duplicate RPC update through Manager: %v", err)
+	}
+	if got := takeMessage(t, collA1.newMsg); got != nil {
+		t.Fatalf("Manager surfaced a duplicate pts update: %+v", got)
+	}
 
-	if got := takeMessage(t, collB1.newMsg); got != nil {
-		t.Fatalf("originating B auth key later received a duplicate updateNewMessage: %+v", got)
+	for _, session := range []struct {
+		name string
+		coll *updateCollector
+	}{
+		{name: "A1", coll: pushA1},
+		{name: "B1", coll: pushB1},
+		{name: "B2", coll: pushB2},
+	} {
+		if got := takeMessage(t, session.coll.newMsg); got != nil {
+			t.Fatalf("originating session %s received its own send by push: %+v", session.name, got)
+		}
 	}
 	if got := takeMessage(t, collC.newMsg); got != nil {
 		t.Fatalf("C received an A/B message: %+v", got)
@@ -289,10 +438,40 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	if got := takeReadOutbox(t, collC.readOutbox); got != nil {
 		t.Fatalf("C received an A/B read marker: %d", *got)
 	}
+	if got := takeReadOutbox(t, pushC.readOutbox); got != nil {
+		t.Fatalf("C received an A/B read marker push: %d", *got)
+	}
 
 	stopClient(b1)
+	var recoveryResult tg.UpdatesClass
+	if err := exec(a1, func(ctx context.Context, api *tg.Client) error {
+		res, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerUser(a1.id, b1.id), Message: "A to B offline recovery", RandomID: 82504,
+		})
+		recoveryResult = res
+		return err
+	}); err != nil {
+		t.Fatalf("A recovery send while B1 is offline: %v", err)
+	}
+	recoveryMessage, recoveryPts, ok := outgoingMessage(t, recoveryResult, "A to B offline recovery")
+	if !ok || countOutgoingMessages(recoveryResult, "A to B offline recovery") != 1 {
+		t.Fatal("A recovery RPC result omitted its outgoing message")
+	}
+	assertObservedMessage(t, ctx, collA1, "A to B offline recovery", recoveryMessage.ID, true, b1.id, recoveryPts, "A1 recovery RPC result")
+	assertDifferenceMessage(t, ctx, collA2, "A to B offline recovery", recoveryMessage.ID, true, b1.id, "A2 recovery other session")
+	assertObservedMessage(t, ctx, collB2, "A to B offline recovery", 4, false, a1.id, 6, "B2 recovery incoming")
+	assertObservedMessage(t, ctx, pushA2, "A to B offline recovery", recoveryMessage.ID, true, b1.id, recoveryPts, "A2 recovery push")
+	assertObservedMessage(t, ctx, pushB2, "A to B offline recovery", 4, false, a1.id, 6, "B2 recovery push")
+	if recoveryPts != 7 {
+		t.Fatalf("A recovery pts = %d, want 7 after two reads", recoveryPts)
+	}
+	b1Reconnected := startClient(phoneB, pushB1, managerB1, sessB1, false)
+	assertDifferenceMessage(t, ctx, collB1, "A to B offline recovery", 4, false, a1.id, "B1 Manager recovery difference")
+	if got := takeMessage(t, pushB1.newMsg); got != nil {
+		t.Fatalf("B1 recovery update unexpectedly arrived as a live push: %+v", got)
+	}
+
 	var senderDifference tg.UpdatesDifferenceClass
-	b1Reconnected := startClient(phoneB, newClient(collB1, sessB1))
 	if err := exec(b1Reconnected, func(ctx context.Context, api *tg.Client) error {
 		diff, err := api.UpdatesGetDifference(ctx, &tg.UpdatesGetDifferenceRequest{Pts: 0, Date: 0, Qts: 0})
 		senderDifference = diff
@@ -304,10 +483,10 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	if !ok {
 		t.Fatalf("B difference = %T, want *tg.UpdatesDifference", senderDifference)
 	}
-	if len(full.NewMessages) != 2 {
-		t.Fatalf("B difference new messages = %d, want incoming warmup and sent message", len(full.NewMessages))
+	if len(full.NewMessages) != 4 {
+		t.Fatalf("B difference new messages = %d, want four owner-local messages", len(full.NewMessages))
 	}
-	pts := []int{1, senderPts}
+	pts := []int{1, senderPts, secondBPts}
 	foundDifferenceMessages := map[string]bool{}
 	for _, class := range full.NewMessages {
 		msg, ok := class.(*tg.Message)
@@ -317,35 +496,52 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		if msg.Message == "A to B warmup" && msg.Out {
 			t.Fatalf("B backfill warmup unexpectedly outgoing: %+v", msg)
 		}
+		if msg.Message == "A to B warmup" && msg.ID != 1 {
+			t.Fatalf("B backfill warmup id = %d, want B-local id 1", msg.ID)
+		}
 		if msg.Message == "sender echo target" && !msg.Out {
 			t.Fatalf("B backfill target unexpectedly incoming: %+v", msg)
+		}
+		if msg.Message == "sender echo target" && msg.ID != senderMessage.ID {
+			t.Fatalf("B backfill target id = %d, want B-local id %d", msg.ID, senderMessage.ID)
+		}
+		if msg.Message == "second B to A" && !msg.Out {
+			t.Fatalf("B backfill second target unexpectedly incoming: %+v", msg)
+		}
+		if msg.Message == "second B to A" && msg.ID != secondBMessage.ID {
+			t.Fatalf("B backfill second target id = %d, want B-local id %d", msg.ID, secondBMessage.ID)
+		}
+		if msg.Message == "A to B offline recovery" && (msg.Out || msg.ID != 4) {
+			t.Fatalf("B backfill recovery message = %+v, want incoming local id 4", msg)
 		}
 		foundDifferenceMessages[msg.Message] = true
 		if msg.Message == "sender echo target" && msg.ID != senderMessage.ID {
 			t.Fatalf("B backfill id = %d, want %d", msg.ID, senderMessage.ID)
 		}
 	}
-	if !foundDifferenceMessages["A to B warmup"] || !foundDifferenceMessages["sender echo target"] {
+	if !foundDifferenceMessages["A to B warmup"] || !foundDifferenceMessages["sender echo target"] || !foundDifferenceMessages["second B to A"] || !foundDifferenceMessages["A to B offline recovery"] {
 		t.Fatalf("B difference messages = %v", foundDifferenceMessages)
 	}
-	if full.State.Pts != 4 {
-		t.Fatalf("B backfill state pts = %d, want contiguous head 4", full.State.Pts)
+	if full.State.Pts != 6 {
+		t.Fatalf("B backfill state pts = %d, want contiguous head 6", full.State.Pts)
 	}
 	readMarkers := 0
+	wantReadMarkers := []int{senderMessage.ID, secondBMessage.ID}
 	for _, update := range full.OtherUpdates {
 		if outbox, ok := update.(*tg.UpdateReadHistoryOutbox); ok {
-			readMarkers++
-			if outbox.MaxID != senderMessage.ID {
-				t.Fatalf("B backfilled read marker = %d, want %d", outbox.MaxID, senderMessage.ID)
+			if readMarkers >= len(wantReadMarkers) || outbox.MaxID != wantReadMarkers[readMarkers] {
+				t.Fatalf("B backfilled read marker = %d at index %d, want %v", outbox.MaxID, readMarkers, wantReadMarkers)
 			}
+			readMarkers++
 			pts = append(pts, outbox.Pts)
 		}
 	}
+	pts = append(pts, 6)
 	if readMarkers != 2 {
 		t.Fatalf("B read outbox updates = %d, want 2", readMarkers)
 	}
-	if len(pts) != 4 || pts[0] != 1 || pts[1] != 2 || pts[2] != 3 || pts[3] != 4 {
-		t.Fatalf("B backfill pts = %v, want [1 2 3 4]", pts)
+	if len(pts) != 6 || pts[0] != 1 || pts[1] != 2 || pts[2] != 3 || pts[3] != 4 || pts[4] != 5 || pts[5] != 6 {
+		t.Fatalf("B backfill pts = %v, want [1 2 3 4 5 6]", pts)
 	}
 
 	if err := exec(c, func(ctx context.Context, api *tg.Client) error {
@@ -364,9 +560,31 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		t.Fatalf("C isolation difference: %v", err)
 	}
 
+	for _, session := range []struct {
+		name string
+		coll *updateCollector
+	}{
+		{name: "A1", coll: collA1},
+		{name: "A2", coll: collA2},
+		{name: "B1", coll: collB1},
+		{name: "B2", coll: collB2},
+		{name: "C", coll: collC},
+		{name: "A1 raw push", coll: pushA1},
+		{name: "A2 raw push", coll: pushA2},
+		{name: "B1 raw push", coll: pushB1},
+		{name: "B2 raw push", coll: pushB2},
+		{name: "C raw push", coll: pushC},
+	} {
+		assertNoMessageFor(t, ctx, session.coll.newMsg, session.name)
+		if marker := takeReadOutbox(t, session.coll.readOutbox); marker != nil {
+			t.Fatalf("%s received an unexpected read outbox marker %d", session.name, *marker)
+		}
+	}
+
 	stopClient(b1Reconnected)
 	stopClient(b2)
-	stopClient(a)
+	stopClient(a1)
+	stopClient(a2)
 	stopClient(c)
 }
 
@@ -389,6 +607,78 @@ func outgoingMessage(t *testing.T, result tg.UpdatesClass, text string) (*tg.Mes
 	return nil, 0, false
 }
 
+func countOutgoingMessages(result tg.UpdatesClass, text string) int {
+	updates, ok := result.(*tg.Updates)
+	if !ok {
+		return 0
+	}
+	count := 0
+	for _, update := range updates.Updates {
+		newMessage, ok := update.(*tg.UpdateNewMessage)
+		if !ok {
+			continue
+		}
+		message, ok := newMessage.Message.(*tg.Message)
+		if ok && message.Message == text && message.Out {
+			count++
+		}
+	}
+	return count
+}
+
+func assertObservedMessage(t *testing.T, ctx context.Context, coll *updateCollector, text string, id int, out bool, peerID int64, pts int, label string) {
+	t.Helper()
+	message := recvOrCtx(t, ctx, coll.newMsg, label+" message")
+	if message.Message != text || message.ID != id || message.Out != out {
+		t.Fatalf("%s message = {text:%q id:%d out:%v}, want {text:%q id:%d out:%v}", label, message.Message, message.ID, message.Out, text, id, out)
+	}
+	peer, ok := message.PeerID.(*tg.PeerUser)
+	if !ok || peer.UserID != peerID {
+		t.Fatalf("%s peer_id = %+v, want sender/peer user %d", label, message.PeerID, peerID)
+	}
+	if got := recvOrCtx(t, ctx, coll.points, label+" pts"); got != pts {
+		t.Fatalf("%s pts = %d, want %d", label, got, pts)
+	}
+}
+
+func assertDifferenceMessage(t *testing.T, ctx context.Context, coll *updateCollector, text string, id int, out bool, peerID int64, label string) {
+	t.Helper()
+	message := recvOrCtx(t, ctx, coll.newMsg, label+" message")
+	if message.Message != text || message.ID != id || message.Out != out {
+		t.Fatalf("%s message = {text:%q id:%d out:%v}, want {text:%q id:%d out:%v}", label, message.Message, message.ID, message.Out, text, id, out)
+	}
+	peer, ok := message.PeerID.(*tg.PeerUser)
+	if !ok || peer.UserID != peerID {
+		t.Fatalf("%s peer_id = %+v, want sender/peer user %d", label, message.PeerID, peerID)
+	}
+	if got := recvOrCtx(t, ctx, coll.points, label+" pts"); got >= 0 {
+		t.Fatalf("%s pts = %d, want Manager difference output with unspecified pts", label, got)
+	}
+}
+
+func assertNoMessageFor(t *testing.T, ctx context.Context, updates <-chan *tg.Message, label string) {
+	t.Helper()
+	timer := time.NewTimer(50 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case message := <-updates:
+		t.Fatalf("%s received unexpected message during drain: %+v", label, message)
+	case <-timer.C:
+	case <-ctx.Done():
+		t.Fatalf("waiting for %s drain: %v", label, ctx.Err())
+	}
+}
+
+func assertObservedReadMarker(t *testing.T, ctx context.Context, coll *updateCollector, maxID, pts int, label string) {
+	t.Helper()
+	if got := recvOrCtx(t, ctx, coll.readOutbox, label+" max_id"); got != maxID {
+		t.Fatalf("%s max_id = %d, want %d", label, got, maxID)
+	}
+	if got := recvOrCtx(t, ctx, coll.readOutboxPts, label+" pts"); got != pts {
+		t.Fatalf("%s pts = %d, want %d", label, got, pts)
+	}
+}
+
 func takeMessage(t *testing.T, updates <-chan *tg.Message) *tg.Message {
 	t.Helper()
 	select {
@@ -407,4 +697,75 @@ func takeReadOutbox(t *testing.T, updates <-chan int) *int {
 	default:
 		return nil
 	}
+}
+
+type observedManagerHandler struct {
+	observer *updateCollector
+	manager  *updates.Manager
+}
+
+func (h observedManagerHandler) Handle(ctx context.Context, upd tg.UpdatesClass) error {
+	if err := h.observer.Handle(ctx, upd); err != nil {
+		return err
+	}
+	return h.manager.Handle(ctx, upd)
+}
+
+func runManagedInteractive(ctx context.Context, client *telegram.Client, flow auth.Flow, selfOut chan<- int64, readyOut chan<- struct{}, cmds <-chan command, manager *updates.Manager, forget bool) error {
+	return client.Run(ctx, func(ctx context.Context) error {
+		if err := client.Auth().IfNecessary(ctx, flow); err != nil {
+			return err
+		}
+		self, err := client.Self(ctx)
+		if err != nil {
+			return err
+		}
+		selfOut <- self.ID
+
+		managerCtx, cancelManager := context.WithCancel(ctx)
+		defer cancelManager()
+		managerReady := make(chan struct{})
+		managerDone := make(chan error, 1)
+		go func() {
+			managerDone <- manager.Run(managerCtx, client.API(), self.ID, updates.AuthOptions{
+				Forget: forget,
+				OnStart: func(context.Context) {
+					close(managerReady)
+				},
+			})
+		}()
+		select {
+		case <-managerReady:
+			readyOut <- struct{}{}
+		case err := <-managerDone:
+			if err == nil {
+				return errors.New("update manager stopped before startup")
+			}
+			return err
+		case <-ctx.Done():
+			return nil
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				cancelManager()
+				err := <-managerDone
+				if err != nil && !errors.Is(err, context.Canceled) {
+					return err
+				}
+				return nil
+			case c, ok := <-cmds:
+				if !ok {
+					cancelManager()
+					err := <-managerDone
+					if err != nil && !errors.Is(err, context.Canceled) {
+						return err
+					}
+					return nil
+				}
+				c.done <- c.fn(ctx, client.API())
+			}
+		}
+	})
 }
