@@ -89,17 +89,18 @@ type Conn struct {
 	// access keeps the registry hand-off safe.
 	lastPushedPts atomic.Int64
 
-	// pendingRPCUpdate holds sender events whose RPC result reached this
-	// connection but whose keyed notification has not yet accounted the event.
-	// A zero pts is a barrier before the store commit returns; delivery must hold
-	// the origin back until the event's pts is known. The slice is ordered by
-	// request, so back-to-back sends cannot replace an unresolved earlier result.
+	// pendingRPCUpdate holds sender-result barriers from commit through keyed
+	// notification accounting. A zero pts is a barrier before the store commit
+	// returns; a known pts remains unready until the RPC result reaches the
+	// connection. The slice is ordered by request, so back-to-back sends cannot
+	// replace an unresolved earlier result.
 	// It is guarded by writeMu with the socket state so a generic notification
 	// cannot pass the result write between its check and push.
 	pendingRPCOwner   int64
 	pendingRPCAuthKey int64
 	pendingRPCPts     []int
 	pendingRPCIDs     []uint64
+	pendingRPCReady   []bool
 	nextPendingRPCID  uint64
 	// pendingRPCOverflow holds sender-result barriers that arrive after the
 	// regular queue reaches its cap. The slice is bounded separately because a
@@ -140,8 +141,9 @@ type RPCUpdateReservation struct {
 }
 
 type pendingRPCOverflowEntry struct {
-	id  uint64
-	pts int
+	id    uint64
+	pts   int
+	ready bool
 }
 
 // maxPendingRPCUpdates bounds the regular unresolved sender-result queue. Once
@@ -254,6 +256,7 @@ func (c *Conn) BeginRPCUpdateAttempt(owner, authKeyID int64, pts int) (RPCUpdate
 	c.pendingRPCAuthKey = authKeyID
 	c.pendingRPCPts = append(c.pendingRPCPts, pts)
 	c.pendingRPCIDs = append(c.pendingRPCIDs, c.nextPendingRPCID)
+	c.pendingRPCReady = append(c.pendingRPCReady, false)
 	return RPCUpdateReservation{
 		owner:   owner,
 		authKey: authKeyID,
@@ -393,12 +396,15 @@ func (c *Conn) clearRPCUpdateLocked(owner, authKeyID int64) bool {
 func (c *Conn) removePendingRPCAtLocked(index int) {
 	copy(c.pendingRPCPts[index:], c.pendingRPCPts[index+1:])
 	copy(c.pendingRPCIDs[index:], c.pendingRPCIDs[index+1:])
+	copy(c.pendingRPCReady[index:], c.pendingRPCReady[index+1:])
 	c.pendingRPCPts = c.pendingRPCPts[:len(c.pendingRPCPts)-1]
 	c.pendingRPCIDs = c.pendingRPCIDs[:len(c.pendingRPCIDs)-1]
+	c.pendingRPCReady = c.pendingRPCReady[:len(c.pendingRPCReady)-1]
 	if len(c.pendingRPCPts) == 0 {
 		c.pendingRPCOwner = 0
 		c.pendingRPCAuthKey = 0
 		c.pendingRPCIDs = nil
+		c.pendingRPCReady = nil
 	}
 }
 
@@ -425,6 +431,23 @@ func (c *Conn) PendingRPCUpdate(owner int64) (pts int, pending bool) {
 		}
 	}
 	return 0, false
+}
+
+// PendingRPCUpdateReady reports whether the first sender-result barrier has
+// reached the wire. Delivery must hold a known-pts barrier until this becomes
+// true: the handler records the committed pts before the RPC result write, so
+// a generic notification can otherwise push its prefix while the result is
+// still paused or fails.
+func (c *Conn) PendingRPCUpdateReady(owner int64) bool {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.pendingRPCOwner == owner && len(c.pendingRPCPts) > 0 {
+		return len(c.pendingRPCReady) > 0 && c.pendingRPCReady[0]
+	}
+	if c.owner == owner && len(c.pendingRPCOverflow) > 0 {
+		return c.pendingRPCOverflow[0].ready
+	}
+	return false
 }
 
 func (c *Conn) markRPCUpdateLocked(owner, authKeyID int64, pts int) bool {
@@ -516,6 +539,7 @@ func (c *Conn) setOwner(userID int64) {
 	c.pendingRPCAuthKey = 0
 	c.pendingRPCPts = nil
 	c.pendingRPCIDs = nil
+	c.pendingRPCReady = nil
 	c.pendingRPCOverflow = nil
 	c.pendingRPCOverflowSaturated = false
 }
@@ -550,6 +574,7 @@ func (c *Conn) setKey(key crypto.AuthKey) {
 		c.pendingRPCAuthKey = 0
 		c.pendingRPCPts = nil
 		c.pendingRPCIDs = nil
+		c.pendingRPCReady = nil
 		c.pendingRPCOverflow = nil
 		c.pendingRPCOverflowSaturated = false
 	}
@@ -694,6 +719,12 @@ func (c *Conn) markRPCResultLocked(owner, authKeyID int64, pts int) bool {
 		}
 	}
 	current := c.lastPushedPts.Load()
+	if pendingIndex >= 0 && pendingIndex < len(c.pendingRPCReady) {
+		c.pendingRPCReady[pendingIndex] = true
+	}
+	if overflowIndex >= 0 {
+		c.pendingRPCOverflow[overflowIndex].ready = true
+	}
 	switch {
 	case int64(pts) <= current:
 		if pendingIndex >= 0 {

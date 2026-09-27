@@ -136,6 +136,9 @@ func TestPendingRPCUpdateBarrierTracksCommitAndClearsWithResult(t *testing.T) {
 	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 5 {
 		t.Fatalf("committed barrier = (%d, %t), want (5, true)", pts, pending)
 	}
+	if c.PendingRPCUpdateReady(7) {
+		t.Fatal("committed barrier reported ready before the result write")
+	}
 	if err := c.SendResultAndMarkRPCUpdate(
 		&mtproto.Request{Ctx: context.Background(), MsgID: 1},
 		&mt.Pong{PingID: 1}, 7, keyID, 5,
@@ -171,6 +174,9 @@ func TestPendingRPCUpdateBarrierSurvivesNoncontiguousResult(t *testing.T) {
 	}
 	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 5 {
 		t.Fatalf("pending barrier = (%d, %t), want (5, true) until keyed delivery", pts, pending)
+	}
+	if !c.PendingRPCUpdateReady(7) {
+		t.Fatal("successful noncontiguous result did not mark the barrier ready")
 	}
 	if !c.MarkRPCUpdate(7, keyID, 5) {
 		t.Fatal("MarkRPCUpdate refused the keyed sender event")
