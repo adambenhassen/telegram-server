@@ -606,7 +606,7 @@ func TestDeliverPendingSenderSuppressionAdvancesAcrossCappedNotifications(t *tes
 		u.deliver(context.Background(), 7, []pushConn{origin, sibling}, buildCapped(head))
 	}
 
-	var pushed []int
+	pushed := make([]int, 0, 1205)
 	for _, up := range origin.got {
 		pushed = append(pushed, ptsOf(t, up)...)
 	}
