@@ -126,17 +126,17 @@ func TestReplyPersisted(t *testing.T) {
 		t.Fatal("first message ID is zero")
 	}
 
-	// Drain both sides' push for the first message.
+	// B receives the incoming update; A's outgoing message is in the RPC result.
 	firstFromB := recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage for first message")
 	if firstFromB.Message != "first message" {
 		t.Fatalf("B first message = %q, want %q", firstFromB.Message, "first message")
 	}
-	firstFromA := recvOrCtx(t, ctx, collA.newMsg, "A updateNewMessage for first message")
-	if firstFromA.Message != "first message" {
-		t.Fatalf("A first message = %q, want %q", firstFromA.Message, "first message")
+	if got := takeMessage(t, collA.newMsg); got != nil {
+		t.Fatalf("A received a live echo for its send: %+v", got)
 	}
 
 	// 2. A sends a reply to the first message.
+	var aReplyMessage *tg.Message
 	if err := exec(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		req := &tg.MessagesSendMessageRequest{
 			Peer:     peerB,
@@ -144,7 +144,10 @@ func TestReplyPersisted(t *testing.T) {
 			RandomID: 90002,
 		}
 		req.SetReplyTo(&tg.InputReplyToMessage{ReplyToMsgID: firstMsgID})
-		_, err := c.MessagesSendMessage(ctx, req)
+		res, err := c.MessagesSendMessage(ctx, req)
+		if err == nil {
+			aReplyMessage, _, _ = outgoingMessage(t, res, "reply to first")
+		}
 		return err
 	}); err != nil {
 		t.Fatalf("A send reply: %v", err)
@@ -165,16 +168,22 @@ func TestReplyPersisted(t *testing.T) {
 		t.Fatalf("ReplyToMsgID = %d, want %d", id, firstMsgID)
 	}
 
-	// 4. A's own view of the reply also has ReplyTo set.
-	aReplyMsg := recvOrCtx(t, ctx, collA.newMsg, "A updateNewMessage for reply")
+	// 4. A's RPC result carries the outgoing reply and its ReplyTo header.
+	if aReplyMessage == nil {
+		t.Fatal("A send reply RPC result omitted the outgoing message")
+	}
+	aReplyMsg := aReplyMessage
 	if replyTo, ok := aReplyMsg.GetReplyTo(); !ok {
-		t.Fatal("A's own reply message missing ReplyTo field")
+		t.Fatal("A's RPC result reply message missing ReplyTo field")
 	} else if hdr, ok := replyTo.(*tg.MessageReplyHeader); !ok {
 		t.Fatalf("A ReplyTo type = %T, want *tg.MessageReplyHeader", replyTo)
 	} else if id, ok := hdr.GetReplyToMsgID(); !ok {
 		t.Fatal("A ReplyTo header missing ReplyToMsgID")
 	} else if id != firstMsgID {
 		t.Fatalf("A ReplyToMsgID = %d, want %d", id, firstMsgID)
+	}
+	if got := takeMessage(t, collA.newMsg); got != nil {
+		t.Fatalf("A received a live echo for its reply: %+v", got)
 	}
 
 	close(aCmds)
@@ -294,9 +303,12 @@ func TestReplyInHistory(t *testing.T) {
 		t.Fatalf("A send first message: %v", err)
 	}
 
-	// Drain both sides' push for the first message.
+	// B receives the incoming update; A already has its outgoing message from
+	// the RPC result parsed above.
 	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage for original")
-	recvOrCtx(t, ctx, collA.newMsg, "A updateNewMessage for original")
+	if got := takeMessage(t, collA.newMsg); got != nil {
+		t.Fatalf("A received a live echo for its send: %+v", got)
+	}
 
 	// 2. A sends a reply.
 	if err := exec(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -311,9 +323,6 @@ func TestReplyInHistory(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A send reply: %v", err)
 	}
-
-	// Drain updates so history is clean.
-	time.Sleep(200 * time.Millisecond)
 
 	// 3. B calls getHistory and verifies the reply message has ReplyTo set.
 	if err := exec(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
@@ -440,15 +449,25 @@ func TestNoReplyToWhenZero(t *testing.T) {
 	peerA := peerUser(bUserID, aUserID)
 
 	// 1. A sends a message with no reply_to — neither side should see ReplyTo.
+	var senderMessage *tg.Message
 	if err := exec(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
-		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerB,
 			Message:  "no reply here",
 			RandomID: 92001,
 		})
+		if err == nil {
+			senderMessage, _, _ = outgoingMessage(t, res, "no reply here")
+		}
 		return err
 	}); err != nil {
 		t.Fatalf("A send: %v", err)
+	}
+	if senderMessage == nil {
+		t.Fatal("A send RPC result omitted the outgoing message")
+	}
+	if replyTo, ok := senderMessage.GetReplyTo(); ok {
+		t.Fatalf("RPC result non-reply message has ReplyTo = %+v, want none", replyTo)
 	}
 
 	// B receives via updateNewMessage.
@@ -457,10 +476,8 @@ func TestNoReplyToWhenZero(t *testing.T) {
 		t.Fatalf("non-reply message has ReplyTo = %+v, want none", replyTo)
 	}
 
-	// A also receives their own copy.
-	aGot := recvOrCtx(t, ctx, collA.newMsg, "A updateNewMessage")
-	if replyTo, ok := aGot.GetReplyTo(); ok {
-		t.Fatalf("A's own non-reply message has ReplyTo = %+v, want none", replyTo)
+	if got := takeMessage(t, collA.newMsg); got != nil {
+		t.Fatalf("A received a live echo for its send: %+v", got)
 	}
 
 	// 2. Verify via getHistory as well.

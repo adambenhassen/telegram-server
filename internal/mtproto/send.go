@@ -82,9 +82,10 @@ type Conn struct {
 	// dispatches this connection's frames.
 	unimplemented unimplementedBudget
 
-	// lastPushedPts is the highest pts already pushed to this conn, so a
-	// notification never re-delivers events. Delivery writes it and the bounded
-	// admin sampler reads it; atomic access keeps the registry hand-off safe.
+	// lastPushedPts is the highest owner pts delivered to this conn by a push or
+	// accounted for by its send RPC result, so a notification never re-delivers
+	// events. Delivery writes it and the bounded admin sampler reads it; atomic
+	// access keeps the registry hand-off safe.
 	lastPushedPts atomic.Int64
 
 	// authKeyID mirrors authKey.IntID() for readers that must not take writeMu.
@@ -115,6 +116,25 @@ func (c *Conn) LastPushedPts() int {
 // on purpose: it is read while matching an eviction against live conns.
 func (c *Conn) AuthKeyID() int64 {
 	return c.authKeyID.Load()
+}
+
+// MarkRPCUpdate accounts for the message update identified in the send RPC
+// result for this auth key. If that reply is lost, getDifference still replays
+// the event because only this connection's push watermark advances. The owner,
+// key check and watermark advance share writeMu with pushes and rebinds.
+func (c *Conn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
+	if authKeyID == 0 || pts <= 0 {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.owner != owner || c.authKeyID.Load() != authKeyID {
+		return false
+	}
+	if current := c.lastPushedPts.Load(); int64(pts) > current {
+		c.lastPushedPts.Store(int64(pts))
+	}
+	return true
 }
 
 // PendingLogin reports whether auth.signIn has staged a password challenge on

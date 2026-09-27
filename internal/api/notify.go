@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -51,6 +52,12 @@ type pushConn interface {
 	PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int) (bool, error)
 }
 
+type rpcUpdatePushConn interface {
+	pushConn
+	AuthKeyID() int64
+	MarkRPCUpdate(owner, authKeyID int64, pts int) bool
+}
+
 // Deliver pushes userID's not-yet-delivered events to each of its live conns,
 // advancing each conn's last-pushed pts. It is best-effort: a push failure is
 // logged and the client's next getDifference backfills.
@@ -59,14 +66,15 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	if len(conns) == 0 {
 		return
 	}
+	suppressed, _ := store.SuppressedUpdateFromContext(ctx)
 	targets := make([]pushConn, len(conns))
 	for i, c := range conns {
 		targets[i] = c
 	}
 	acceptedAt, _ := store.NotificationAcceptedAt(ctx)
-	u.deliverAt(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
+	u.deliverAtSuppressed(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
 		return u.h.buildUpdates(ctx, userID, fromPts)
-	}, acceptedAt)
+	}, acceptedAt, suppressed)
 }
 
 // maxDeliveryRounds caps the store round trips one notification may cost. Two
@@ -102,6 +110,10 @@ func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, b
 }
 
 func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error), acceptedAt time.Time) {
+	u.deliverAtSuppressed(ctx, userID, conns, build, acceptedAt, store.SuppressedUpdate{})
+}
+
+func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error), acceptedAt time.Time, suppressed store.SuppressedUpdate) {
 	var head int
 	for round := 0; round < maxDeliveryRounds && len(conns) > 0; round++ {
 		lo, hi := conns[0].LastPushedPts(), conns[0].LastPushedPts()
@@ -152,6 +164,19 @@ func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn,
 			if len(ups) == 0 {
 				continue
 			}
+			if rpcConn, ok := c.(rpcUpdatePushConn); ok && suppressed.AuthKeyID != 0 && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+				start := sort.SearchInts(b.pts, watermark+1)
+				target := sort.SearchInts(b.pts, suppressed.Pts)
+				if target < len(b.pts) && b.pts[target] == suppressed.Pts && target >= start {
+					if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); isNewMessage {
+						u.deliverWithSuppression(ctx, userID, rpcConn, b, start, target, suppressed, acceptedAt)
+						if b.more && rpcConn.LastPushedPts() < b.state.Pts {
+							ahead = append(ahead, c)
+						}
+						continue
+					}
+				}
+			}
 			// Addressed to userID: this snapshot was taken before the batch was
 			// built, and the conn's auth key can rebind to another user in between.
 			// A push dropped for that reason costs nothing — the user's next poll
@@ -166,6 +191,33 @@ func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn,
 			}
 		}
 		conns = ahead
+	}
+}
+
+func (u *Updater) deliverWithSuppression(ctx context.Context, userID int64, conn rpcUpdatePushConn, b updateBatch, start, target int, suppressed store.SuppressedUpdate, acceptedAt time.Time) {
+	if target > start {
+		prefixPts := b.pts[target-1]
+		pushed, err := conn.PushTo(ctx, userID, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts)
+		u.recordPushOutcome(acceptedAt, pushed, err)
+		if err != nil {
+			u.log.Info("deliver push before RPC update", "user_id", userID, "err", err)
+			return
+		}
+		if !pushed {
+			return
+		}
+	}
+	if !conn.MarkRPCUpdate(userID, suppressed.AuthKeyID, suppressed.Pts) {
+		return
+	}
+	if target+1 == len(b.ups) {
+		return
+	}
+	last := len(b.ups) - 1
+	pushed, err := conn.PushTo(ctx, userID, wrapUpdates(b.ups[target+1:], b.users, b.chats, b.state), b.pts[last])
+	u.recordPushOutcome(acceptedAt, pushed, err)
+	if err != nil {
+		u.log.Info("deliver push after RPC update", "user_id", userID, "err", err)
 	}
 }
 

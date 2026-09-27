@@ -40,6 +40,19 @@ func (h *handlers) notify(ctx context.Context, userID int64) {
 	}
 }
 
+// notifySend records which authenticated key receives the sender's new-message
+// update in the sendMessage RPC result, so that key can skip only that live echo.
+func (h *handlers) notifySend(ctx context.Context, userID, authKeyID int64, pts int) {
+	if authKeyID == 0 || pts <= 0 {
+		h.notify(ctx, userID)
+		return
+	}
+	payload := strconv.FormatInt(userID, 10) + "|" + strconv.FormatInt(authKeyID, 10) + "|" + strconv.Itoa(pts)
+	if err := h.store.Notify(ctx, store.ChannelUpdates, payload); err != nil {
+		h.log.Error("notify updates", "user_id", userID, "err", err)
+	}
+}
+
 // notifyTyping emits the transient typing nudge to peerID from fromID.
 func (h *handlers) notifyTyping(ctx context.Context, peerID, fromID int64) {
 	if err := h.store.Notify(ctx, store.ChannelTyping, store.TypingPayload(peerID, fromID)); err != nil {
@@ -215,7 +228,7 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 
-	h.notify(r.Ctx, r.UserID)
+	h.notifySend(r.Ctx, r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), senderPts)
 	if toID != r.UserID {
 		h.notify(r.Ctx, toID)
 	}

@@ -79,6 +79,41 @@ func TestPushErrorsOnWriteFailure(t *testing.T) {
 	}
 }
 
+func TestMarkRPCUpdateRequiresCurrentOwnerAndKey(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	if !c.MarkRPCUpdate(7, keyID, 5) {
+		t.Fatal("MarkRPCUpdate refused the current owner and key")
+	}
+	if got := c.LastPushedPts(); got != 5 {
+		t.Fatalf("watermark = %d, want RPC result pts 5", got)
+	}
+	if c.MarkRPCUpdate(8, keyID, 8) {
+		t.Fatal("MarkRPCUpdate accepted a different owner")
+	}
+	if c.MarkRPCUpdate(7, keyID+1, 8) {
+		t.Fatal("MarkRPCUpdate accepted a different auth key")
+	}
+	if !c.MarkRPCUpdate(7, keyID, 3) {
+		t.Fatal("MarkRPCUpdate refused a current key with an older pts")
+	}
+	if got := c.LastPushedPts(); got != 5 {
+		t.Fatalf("watermark regressed to %d, want 5", got)
+	}
+
+	c.SetOwner(9)
+	if c.MarkRPCUpdate(7, keyID, 9) {
+		t.Fatal("MarkRPCUpdate accepted the previous owner after rebind")
+	}
+	if got := c.LastPushedPts(); got != 0 {
+		t.Fatalf("watermark after rebind = %d, want 0", got)
+	}
+}
+
 // TestPushConcurrentWithResult drives PushTo and SendResult on one conn from two
 // goroutines; -race proves the write mutex serializes them.
 func TestPushConcurrentWithResult(t *testing.T) {
