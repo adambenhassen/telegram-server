@@ -120,6 +120,9 @@ func TestPendingRPCUpdateBarrierTracksCommitAndClearsWithResult(t *testing.T) {
 	c := mtproto.NewTestConn(&fakeConn{}, key)
 	c.SetOwner(7)
 	keyID := mtproto.AuthKeyIDInt64(key.ID)
+	if !c.MarkRPCUpdate(7, keyID, 4) {
+		t.Fatal("seed sender watermark")
+	}
 
 	if !c.BeginRPCUpdate(7, keyID, 0) {
 		t.Fatal("BeginRPCUpdate refused the current owner and key")
@@ -141,6 +144,42 @@ func TestPendingRPCUpdateBarrierTracksCommitAndClearsWithResult(t *testing.T) {
 	}
 	if _, pending := c.PendingRPCUpdate(7); pending {
 		t.Fatal("successful result left the pending barrier active")
+	}
+}
+
+func TestPendingRPCUpdateBarrierSurvivesNoncontiguousResult(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	if !c.BeginRPCUpdate(7, keyID, 0) {
+		t.Fatal("BeginRPCUpdate refused the current owner and key")
+	}
+	if !c.SetRPCUpdatePts(7, keyID, 5) {
+		t.Fatal("SetRPCUpdatePts refused the in-flight barrier")
+	}
+	if err := c.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: context.Background(), MsgID: 3},
+		&mt.Pong{PingID: 3}, 7, keyID, 5,
+	); err != nil {
+		t.Fatalf("send result: %v", err)
+	}
+	if got := c.LastPushedPts(); got != 0 {
+		t.Fatalf("watermark = %d, want 0 while the prefix is missing", got)
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 5 {
+		t.Fatalf("pending barrier = (%d, %t), want (5, true) until keyed delivery", pts, pending)
+	}
+	if !c.MarkRPCUpdate(7, keyID, 5) {
+		t.Fatal("MarkRPCUpdate refused the keyed sender event")
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("keyed sender delivery left the pending barrier active")
+	}
+	if got := c.LastPushedPts(); got != 5 {
+		t.Fatalf("watermark after keyed delivery = %d, want 5", got)
 	}
 }
 

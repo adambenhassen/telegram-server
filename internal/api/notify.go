@@ -179,11 +179,18 @@ func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns [
 			if pendingConn, ok := c.(pendingRPCUpdateConn); ok {
 				pendingPts, pending := pendingConn.PendingRPCUpdate(userID)
 				if pending {
+					keyedPending := false
+					if rpcConn, ok := c.(rpcUpdatePushConn); ok && pendingPts > 0 && suppressed.AuthKeyID != 0 && suppressed.Pts == pendingPts && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+						// Let the keyed notification account the sender event after
+						// its prefix has been delivered. A non-contiguous RPC result
+						// deliberately keeps this barrier active.
+						keyedPending = true
+					}
 					// While the sender result is in flight, hold the origin at its
 					// current watermark. A zero pts is the pre-commit barrier; a
 					// known pts lets us deliver only the contiguous prefix before
 					// the sender event. Sibling sessions still take the full batch.
-					if pendingPts == 0 || pendingPts <= b.state.Pts {
+					if !keyedPending && (pendingPts == 0 || pendingPts <= b.state.Pts) {
 						if pendingPts > watermark {
 							target := sort.SearchInts(b.pts, pendingPts)
 							if target < len(b.pts) && b.pts[target] == pendingPts {

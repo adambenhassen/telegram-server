@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,6 +60,62 @@ type pendingRPCPushConn struct {
 
 func (f *pendingRPCPushConn) PendingRPCUpdate(int64) (int, bool) {
 	return f.pendingPts, f.pendingPts != 0
+}
+
+type pendingRPCBatchPushConn struct {
+	fakePushConn
+
+	authKeyID  int64
+	pendingPts int
+	marked     []int
+}
+
+type blockedResultTransport struct {
+	mu      sync.Mutex
+	sends   int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (t *blockedResultTransport) Send(context.Context, *bin.Buffer) error {
+	t.mu.Lock()
+	t.sends++
+	first := t.sends == 1
+	t.mu.Unlock()
+	if first {
+		close(t.entered)
+		<-t.release
+	}
+	return nil
+}
+
+func (*blockedResultTransport) Recv(context.Context, *bin.Buffer) error { return errors.New("unused") }
+func (*blockedResultTransport) Close() error                            { return nil }
+
+func (t *blockedResultTransport) sendCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sends
+}
+
+func (f *pendingRPCBatchPushConn) PendingRPCUpdate(int64) (int, bool) {
+	return f.pendingPts, f.pendingPts != 0
+}
+
+func (f *pendingRPCBatchPushConn) AuthKeyID() int64 { return f.authKeyID }
+
+func (f *pendingRPCBatchPushConn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
+	if owner != 7 || authKeyID != f.authKeyID {
+		return false
+	}
+	f.marked = append(f.marked, pts)
+	if pts > f.pts {
+		f.pts = pts
+	}
+	if f.pendingPts == pts {
+		f.pendingPts = 0
+	}
+	return true
 }
 
 func (f *rpcBatchPushConn) AuthKeyID() int64 { return f.authKeyID }
@@ -206,6 +263,139 @@ func TestDeliverPendingSenderSuppressionLeavesOriginAtBarrier(t *testing.T) {
 	}
 	if len(sibling.got) != 1 || !slices.Equal(ptsOf(t, sibling.got[0]), []int{1, 2, 3}) {
 		t.Fatalf("sibling pushes = %d/%v, want one full batch", len(sibling.got), ptsOf(t, sibling.got[0]))
+	}
+}
+
+func TestDeliverPendingSenderSuppressionAccountsKeyedEventAfterPrefix(t *testing.T) {
+	t.Parallel()
+
+	origin := &pendingRPCBatchPushConn{
+		fakePushConn: fakePushConn{pts: 0},
+		authKeyID:    11,
+		pendingPts:   5,
+	}
+	sibling := &fakePushConn{}
+	u := testUpdater()
+	u.deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
+		return batch(fromPts, 5, 5), nil
+	})
+
+	if len(origin.got) != 1 || !slices.Equal(ptsOf(t, origin.got[0]), []int{1, 2, 3, 4}) {
+		t.Fatalf("origin generic pushes = %d/%v, want one prefix [1 2 3 4]", len(origin.got), func() []int {
+			if len(origin.got) == 0 {
+				return nil
+			}
+			return ptsOf(t, origin.got[0])
+		}())
+	}
+	if origin.pts != 4 {
+		t.Fatalf("origin watermark after generic notification = %d, want 4", origin.pts)
+	}
+
+	u.deliverAtSuppressed(
+		context.Background(),
+		7,
+		[]pushConn{origin, sibling},
+		func(fromPts int) (updateBatch, error) { return batch(fromPts, 5, 5), nil },
+		time.Time{},
+		store.SuppressedUpdate{AuthKeyID: 11, Pts: 5},
+	)
+
+	if !slices.Equal(origin.marked, []int{5}) {
+		t.Fatalf("origin RPC marks = %v, want [5]", origin.marked)
+	}
+	if origin.pendingPts != 0 {
+		t.Fatalf("origin pending pts = %d, want cleared after keyed delivery", origin.pendingPts)
+	}
+	if origin.pts != 5 {
+		t.Fatalf("origin watermark after keyed delivery = %d, want 5", origin.pts)
+	}
+	if len(origin.got) != 1 {
+		t.Fatalf("origin pushes = %d, want prefix only without sender echo", len(origin.got))
+	}
+}
+
+func TestPendingSenderResultGapSerializesGenericAndKeyedDelivery(t *testing.T) {
+	t.Parallel()
+
+	key := replyTestKey()
+	transport := &blockedResultTransport{entered: make(chan struct{}), release: make(chan struct{})}
+	origin := mtproto.NewTestConn(transport, key)
+	origin.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+	if !origin.BeginRPCUpdate(7, keyID, 0) || !origin.SetRPCUpdatePts(7, keyID, 5) {
+		t.Fatal("failed to stage sender result barrier")
+	}
+	sibling := &fakePushConn{}
+	buildWireBatch := func(fromPts int) updateBatch {
+		b := batch(fromPts, 5, 5)
+		for _, up := range b.ups {
+			nm, ok := up.(*tg.UpdateNewMessage)
+			if !ok {
+				t.Fatalf("update type = %T, want *tg.UpdateNewMessage", up)
+			}
+			msg, ok := nm.Message.(*tg.Message)
+			if !ok {
+				t.Fatalf("message type = %T, want *tg.Message", nm.Message)
+			}
+			msg.PeerID = &tg.PeerUser{UserID: 7}
+			msg.Date = 1
+			msg.Message = "sender gap"
+		}
+		return b
+	}
+	resultDone := make(chan error, 1)
+	go func() {
+		resultDone <- origin.SendResultAndMarkRPCUpdate(
+			&mtproto.Request{Ctx: context.Background(), MsgID: 4},
+			&tg.BoolTrue{}, 7, keyID, 5,
+		)
+	}()
+	select {
+	case <-transport.entered:
+	case <-time.After(time.Second):
+		t.Fatal("sender result did not reach the transport")
+	}
+
+	deliveryDone := make(chan struct{})
+	go func() {
+		testUpdater().deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
+			return buildWireBatch(fromPts), nil
+		})
+		close(deliveryDone)
+	}()
+	close(transport.release)
+	if err := <-resultDone; err != nil {
+		t.Fatalf("send result: %v", err)
+	}
+	select {
+	case <-deliveryDone:
+	case <-time.After(time.Second):
+		t.Fatal("generic delivery did not finish")
+	}
+	if got := origin.LastPushedPts(); got != 4 {
+		t.Fatalf("origin watermark after generic delivery = %d, want prefix 4", got)
+	}
+	if pts, pending := origin.PendingRPCUpdate(7); !pending || pts != 5 {
+		t.Fatalf("origin barrier after generic delivery = (%d, %t), want (5, true)", pts, pending)
+	}
+
+	testUpdater().deliverAtSuppressed(
+		context.Background(),
+		7,
+		[]pushConn{origin, sibling},
+		func(fromPts int) (updateBatch, error) { return buildWireBatch(fromPts), nil },
+		time.Time{},
+		store.SuppressedUpdate{AuthKeyID: keyID, Pts: 5},
+	)
+	if _, pending := origin.PendingRPCUpdate(7); pending {
+		t.Fatal("keyed delivery left the sender barrier active")
+	}
+	if got := origin.LastPushedPts(); got != 5 {
+		t.Fatalf("origin watermark after keyed delivery = %d, want 5", got)
+	}
+	if got := transport.sendCount(); got != 2 {
+		t.Fatalf("origin transport sends = %d, want result plus prefix only", got)
 	}
 }
 

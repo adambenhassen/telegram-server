@@ -337,6 +337,10 @@ func TestPausedSendSiblingReadHistoryDoesNotEchoOrigin(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("sibling did not receive readHistory push: %v", ctx.Err())
 	}
+	siblingDeadline := time.Now().Add(5 * time.Second)
+	for siblingConn.LastPushedPts() < 3 && time.Now().Before(siblingDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if got := originTransport.count(); got != 0 {
 		t.Fatalf("origin received %d generic pushes while result paused", got)
 	}

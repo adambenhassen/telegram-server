@@ -219,6 +219,9 @@ func (c *Conn) markRPCUpdateLocked(owner, authKeyID int64, pts int) bool {
 	if current := c.lastPushedPts.Load(); int64(pts) > current {
 		c.lastPushedPts.Store(int64(pts))
 	}
+	if c.pendingRPCOwner == owner && c.pendingRPCAuthKey == authKeyID && c.pendingRPCPts == pts {
+		c.clearRPCUpdateLocked(owner, authKeyID)
+	}
 	return true
 }
 
@@ -411,8 +414,8 @@ func (c *Conn) SendResultAndMarkRPCUpdate(req *Request, msg bin.Encoder, owner, 
 
 // markRPCResultLocked advances the contiguous push watermark for an RPC result.
 // A result can carry a later pts while this connection still lacks an earlier
-// event. Leave that gap visible so the keyed notification can push the prefix
-// before MarkRPCUpdate accounts for the origin.
+// event. Keep the barrier active across that gap so a generic notification
+// cannot push the result event before its keyed notification accounts it.
 func (c *Conn) markRPCResultLocked(owner, authKeyID int64, pts int) bool {
 	if authKeyID == 0 || pts <= 0 {
 		return false
@@ -420,10 +423,18 @@ func (c *Conn) markRPCResultLocked(owner, authKeyID int64, pts int) bool {
 	if c.owner != owner || c.authKeyID.Load() != authKeyID {
 		return false
 	}
-	c.clearRPCUpdateLocked(owner, authKeyID)
+	pendingMatch := c.pendingRPCOwner == owner && c.pendingRPCAuthKey == authKeyID && c.pendingRPCPts == pts
 	current := c.lastPushedPts.Load()
-	if int64(pts) == current+1 {
+	switch {
+	case int64(pts) <= current:
+		if pendingMatch {
+			c.clearRPCUpdateLocked(owner, authKeyID)
+		}
+	case int64(pts) == current+1:
 		c.lastPushedPts.Store(int64(pts))
+		if pendingMatch {
+			c.clearRPCUpdateLocked(owner, authKeyID)
+		}
 	}
 	return true
 }
