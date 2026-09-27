@@ -76,13 +76,15 @@ func (h *handlers) retryReplyAfterSuccess(r *mtproto.Request, peerType store.Pee
 	if peerType != store.PeerTypeUser {
 		return nil, nil
 	}
-	return &replyUpdate{
+	update := &replyUpdate{
 		owner:   r.UserID,
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     pts,
-	}, func() {
+	}
+	afterReply := func() {
 		h.notifySendAfterReply(r, pts)
 	}
+	return update, afterReply
 }
 
 // notifyTyping emits the transient typing nudge to peerID from fromID.
@@ -292,13 +294,15 @@ func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder,
 		Users: users,
 		Date:  int(sender.Date.Unix()),
 	}
-	return res, &replyUpdate{
+	update := &replyUpdate{
 		owner:   r.UserID,
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     senderPts,
-	}, func() {
+	}
+	afterReply := func() {
 		h.notifySendAfterReply(r, senderPts)
-	}, nil
+	}
+	return res, update, afterReply, nil
 }
 
 // requireMember is the authorization boundary for a client-supplied chat id.

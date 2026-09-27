@@ -337,13 +337,15 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 		Users: users,
 		Date:  int(sender.Date.Unix()),
 	}
-	return res, &replyUpdate{
+	update := &replyUpdate{
 		owner:   r.UserID,
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     senderPts,
-	}, func() {
+	}
+	afterReply := func() {
 		h.notifySendAfterReply(r, senderPts)
-	}, nil
+	}
+	return res, update, afterReply, nil
 }
 
 // sendChatMedia fans an assembled document out to every member of chatID, whose
