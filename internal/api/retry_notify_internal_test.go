@@ -185,20 +185,40 @@ func TestStoredRetryNotifiesSiblingAfterResultWriteFailure(t *testing.T) {
 				t.Fatalf("retry pts = %d, first pts = %d", retryUpdate.pts, firstUpdate.pts)
 			}
 
-			// The first result write is deliberately treated as failed: its
-			// post-reply hook is not run. The retry is the first successful wire
-			// result and must notify the sibling sender session.
-			retryAfter()
+			// The first result write is deliberately treated as failed. Its
+			// fallback is unkeyed, so both live sender sessions receive the
+			// committed message even though the origin got no RPC result.
+			if firstUpdate.onFailure == nil {
+				t.Fatal("first send did not return a result-failure hook")
+			}
+			firstUpdate.onFailure()
 			select {
 			case <-siblingTransport.done:
 			case <-time.After(5 * time.Second):
-				t.Fatal("sibling sender session received no retry push")
+				t.Fatal("sibling sender session received no failure push")
+			}
+			select {
+			case <-originTransport.done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("origin sender session received no failure push")
 			}
 			if got := siblingTransport.count(); got != 1 {
 				t.Fatalf("sibling pushes = %d, want 1", got)
 			}
-			if got := originTransport.count(); got != 0 {
-				t.Fatalf("origin pushes = %d, want 0", got)
+			if got := originTransport.count(); got != 1 {
+				t.Fatalf("origin pushes = %d, want 1", got)
+			}
+
+			// A successful stored retry uses the keyed hook. Both sessions are
+			// already caught up from the failure fallback, so it must not echo
+			// the origin or duplicate the sibling push.
+			retryAfter()
+			time.Sleep(100 * time.Millisecond)
+			if got := siblingTransport.count(); got != 1 {
+				t.Fatalf("sibling pushes after retry = %d, want 1", got)
+			}
+			if got := originTransport.count(); got != 1 {
+				t.Fatalf("origin pushes after retry = %d, want 1", got)
 			}
 		})
 	}

@@ -67,6 +67,12 @@ func (h *handlers) notifySendAfterReply(r *mtproto.Request, pts int) {
 	h.notifySend(ctx, r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
 }
 
+func (h *handlers) notifySendAfterFailure(r *mtproto.Request) {
+	ctx, cancel := senderNotifyContext(r.Ctx)
+	defer cancel()
+	h.notify(ctx, r.UserID)
+}
+
 // retryReplyAfterSuccess restores the sender-keyed notification for a stored
 // 1:1 retry. A retry can be the first request whose RPC result reaches the
 // client after the original committed its message, so it needs the same
@@ -80,6 +86,9 @@ func (h *handlers) retryReplyAfterSuccess(r *mtproto.Request, peerType store.Pee
 		owner:   r.UserID,
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     pts,
+		onFailure: func() {
+			h.notifySendAfterFailure(r)
+		},
 	}
 	afterReply := func() {
 		h.notifySendAfterReply(r, pts)
@@ -283,6 +292,7 @@ func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder,
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("send message users", "err", err)
+		h.notifySendAfterFailure(r)
 		return nil, nil, nil, errInternal
 	}
 	res := &tg.Updates{
@@ -298,6 +308,9 @@ func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder,
 		owner:   r.UserID,
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     senderPts,
+		onFailure: func() {
+			h.notifySendAfterFailure(r)
+		},
 	}
 	afterReply := func() {
 		h.notifySendAfterReply(r, senderPts)

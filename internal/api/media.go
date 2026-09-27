@@ -319,6 +319,7 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("send media users", "err", err)
+		h.notifySendAfterFailure(r)
 		return nil, nil, nil, errInternal
 	}
 	// Hydrated off the row that was actually stored rather than off the file
@@ -327,6 +328,7 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 	files, err := h.loadFiles(r.Ctx, []store.Message{sender})
 	if err != nil {
 		h.log.Error("send media files", "user_id", r.UserID, "err", err)
+		h.notifySendAfterFailure(r)
 		return nil, nil, nil, errInternal
 	}
 	res := &tg.Updates{
@@ -341,6 +343,9 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 		owner:   r.UserID,
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     senderPts,
+		onFailure: func() {
+			h.notifySendAfterFailure(r)
+		},
 	}
 	afterReply := func() {
 		h.notifySendAfterReply(r, senderPts)

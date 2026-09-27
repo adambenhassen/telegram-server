@@ -127,9 +127,10 @@ type registeredFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, fu
 type orderedRegisteredFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error)
 
 type replyUpdate struct {
-	owner   int64
-	authKey int64
-	pts     int
+	owner     int64
+	authKey   int64
+	pts       int
+	onFailure func()
 }
 
 // revokeFunc is a methodFunc that also returns work to run once the reply is on
@@ -486,7 +487,7 @@ func registerReply(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
 }
 
 func registerReplyNamed(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc) {
-	registerReplyNamedMode(d, id, name, fn, false)
+	registerReplyNamedMode(d, id, name, fn)
 }
 
 // registerReplyAfterSuccess is the send path's reply ordering boundary: the
@@ -512,15 +513,21 @@ func registerReplyAfterSuccess(d *mtproto.Dispatcher, id uint32, fn orderedRegis
 		} else {
 			sendErr = c.SendResultAndMarkRPCUpdate(req, res, update.owner, update.authKey, update.pts)
 		}
-		if sendErr == nil && afterReply != nil {
+		if sendErr != nil {
+			if update != nil && update.onFailure != nil {
+				update.onFailure()
+			}
+			return sendErr
+		}
+		if afterReply != nil {
 			afterReply()
 		}
-		return sendErr
+		return nil
 	}
 	d.HandleFunc(id, handler)
 }
 
-func registerReplyNamedMode(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc, afterOnlyOnSuccess bool) {
+func registerReplyNamedMode(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc) {
 	handler := func(c *mtproto.Conn, req *mtproto.Request) error {
 		// Provisional gate: blocks all authorized RPCs except the allow-list.
 		// Does not apply when UserID == 0 (unauthenticated keys already
@@ -537,7 +544,7 @@ func registerReplyNamedMode(d *mtproto.Dispatcher, id uint32, name string, fn re
 			return c.SendErr(req, rpc)
 		}
 		sendErr := c.SendResult(req, res)
-		if afterReply != nil && (!afterOnlyOnSuccess || sendErr == nil) {
+		if afterReply != nil {
 			afterReply()
 		}
 		return sendErr

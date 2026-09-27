@@ -1,10 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -73,6 +75,12 @@ func (t *replyOrderTransport) Send(context.Context, *bin.Buffer) error {
 
 func (*replyOrderTransport) Recv(context.Context, *bin.Buffer) error { return errors.New("unused") }
 func (*replyOrderTransport) Close() error                            { return nil }
+
+type replyFailureTransport struct{}
+
+func (replyFailureTransport) Send(context.Context, *bin.Buffer) error { return errors.New("write") }
+func (replyFailureTransport) Recv(context.Context, *bin.Buffer) error { return errors.New("unused") }
+func (replyFailureTransport) Close() error                            { return nil }
 
 func replyTestKey() crypto.AuthKey {
 	var raw crypto.Key
@@ -214,6 +222,38 @@ func TestRegisterReplyAfterSuccessRunsHookAfterWire(t *testing.T) {
 		if events[i] != want[i] {
 			t.Fatalf("events = %v, want %v", events, want)
 		}
+	}
+}
+
+func TestRegisterReplyAfterSuccessRunsFailureHook(t *testing.T) {
+	t.Parallel()
+
+	d := mtproto.NewDispatcher()
+	key := replyTestKey()
+	failed := false
+	registerReplyAfterSuccess(d, tg.HelpGetConfigRequestTypeID, func(_ *mtproto.Conn, _ *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		return &tg.BoolTrue{}, &replyUpdate{
+			onFailure: func() { failed = true },
+		}, nil, nil
+	})
+
+	var body bin.Buffer
+	if err := (&tg.HelpGetConfigRequest{}).Encode(&body); err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	conn := mtproto.NewTestConn(replyFailureTransport{}, key)
+	conn.SetOwner(1)
+	err := d.OnMessage(conn, &mtproto.Request{
+		Ctx:    context.Background(),
+		UserID: 1,
+		MsgID:  1,
+		Buf:    &body,
+	})
+	if err == nil {
+		t.Fatal("dispatch succeeded despite result write failure")
+	}
+	if !failed {
+		t.Fatal("committed-send failure hook did not run")
 	}
 }
 
@@ -445,6 +485,45 @@ func TestDeliverPushFailureDoesNotBlockOthers(t *testing.T) {
 	}
 	if broken.pts != 0 {
 		t.Fatalf("failed push advanced the watermark to %d", broken.pts)
+	}
+}
+
+type stalePushConn struct {
+	attempts int
+}
+
+func (s *stalePushConn) LastPushedPts() int { return 0 }
+
+func (s *stalePushConn) PushTo(context.Context, int64, bin.Encoder, int) (bool, error) {
+	s.attempts++
+	return false, nil
+}
+
+func (s *stalePushConn) PushToAtWatermark(context.Context, int64, int, bin.Encoder, int) (bool, bool, error) {
+	s.attempts++
+	return false, true, nil
+}
+
+func TestDeliverLogsExhaustedRetries(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	u := &Updater{
+		log: slog.New(slog.NewTextHandler(&logs, nil)),
+	}
+	conn := &stalePushConn{}
+	u.deliver(context.Background(), 7, []pushConn{conn}, func(int) (updateBatch, error) {
+		return batch(0, 1, 1), nil
+	})
+
+	if want := maxDeliveryRetries + 1; conn.attempts != want {
+		t.Fatalf("delivery attempts = %d, want %d", conn.attempts, want)
+	}
+	if !strings.Contains(logs.String(), "deliver retries exhausted") {
+		t.Fatalf("logs = %q, want exhausted-retry record", logs.String())
+	}
+	if !strings.Contains(logs.String(), "user_id=7") || !strings.Contains(logs.String(), "retries=5") {
+		t.Fatalf("logs = %q, want user_id and retry count", logs.String())
 	}
 }
 

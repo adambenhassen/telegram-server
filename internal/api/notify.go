@@ -208,6 +208,7 @@ func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns [
 		if retry {
 			retries++
 			if retries > maxDeliveryRetries {
+				u.log.Error("deliver retries exhausted", "user_id", userID, "retries", retries)
 				return
 			}
 			continue
