@@ -16,6 +16,7 @@ import (
 	"github.com/gotd/td/telegram/updates/hook"
 	"github.com/gotd/td/tg"
 
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -97,18 +98,21 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		cmds    chan command
 		err     chan error
 		ready   chan struct{}
+		idCh    chan int64
 		id      int64
 		manager *updates.Manager
 	}
-	startClient := func(phone string, pushes *updateCollector, manager *updates.Manager, sess *session.StorageMemory, forget bool) *runningClient {
-		run := &runningClient{cmds: make(chan command), err: make(chan error, 1), ready: make(chan struct{}), manager: manager}
-		ids := make(chan int64, 1)
+	launchClient := func(phone string, pushes *updateCollector, manager *updates.Manager, sess *session.StorageMemory, forget bool) *runningClient {
+		run := &runningClient{cmds: make(chan command), err: make(chan error, 1), ready: make(chan struct{}), idCh: make(chan int64, 1), manager: manager}
 		client := newClient(clientUpdates{manager: manager, pushes: pushes}, sess)
 		go func() {
-			run.err <- runManagedInteractive(ctx, client, flowFor(phone), ids, run.ready, run.cmds, manager, forget)
+			run.err <- runManagedInteractive(ctx, client, flowFor(phone), run.idCh, run.ready, run.cmds, manager, forget)
 		}()
+		return run
+	}
+	waitClient := func(phone string, run *runningClient) {
 		select {
-		case run.id = <-ids:
+		case run.id = <-run.idCh:
 		case <-ctx.Done():
 			t.Fatalf("login %s timeout: %v", phone, ctx.Err())
 		}
@@ -117,7 +121,6 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatalf("update manager %s startup timeout: %v", phone, ctx.Err())
 		}
-		return run
 	}
 	exec := func(run *runningClient, fn func(context.Context, *tg.Client) error) error {
 		done := make(chan error, 1)
@@ -148,28 +151,27 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	pushB1, pushB2 := newUpdateCollector(), newUpdateCollector()
 	managerA1, managerA2 := updates.New(updates.Config{Handler: collA1}), updates.New(updates.Config{Handler: collA2})
 	managerB1, managerB2 := updates.New(updates.Config{Handler: collB1}), updates.New(updates.Config{Handler: collB2})
-	a1 := startClient(phoneA, pushA1, managerA1, sessA1, true)
-	a2 := startClient(phoneA, pushA2, managerA2, sessA2, true)
-	b1 := startClient(phoneB, pushB1, managerB1, sessB1, true)
-	b2 := startClient(phoneB, pushB2, managerB2, sessB2, true)
+	a1 := launchClient(phoneA, pushA1, managerA1, sessA1, true)
+	a2 := launchClient(phoneA, pushA2, managerA2, sessA2, true)
+	b1 := launchClient(phoneB, pushB1, managerB1, sessB1, true)
+	b2 := launchClient(phoneB, pushB2, managerB2, sessB2, true)
 	collC, pushC := newUpdateCollector(), newUpdateCollector()
 	managerC := updates.New(updates.Config{Handler: collC})
-	c := startClient(phoneC, pushC, managerC, &session.StorageMemory{}, true)
-
-	conns := registry.Conns(b1.id)
-	if len(conns) != 2 {
-		t.Fatalf("B live connections = %d, want 2", len(conns))
+	c := launchClient(phoneC, pushC, managerC, &session.StorageMemory{}, true)
+	for _, session := range []struct {
+		name string
+		run  *runningClient
+	}{
+		{name: "A1", run: a1},
+		{name: "A2", run: a2},
+		{name: "B1", run: b1},
+		{name: "B2", run: b2},
+		{name: "C", run: c},
+	} {
+		waitClient(session.name, session.run)
 	}
-	if conns[0].AuthKeyID() == 0 || conns[1].AuthKeyID() == 0 || conns[0].AuthKeyID() == conns[1].AuthKeyID() {
-		t.Fatalf("B auth key ids = %d, %d; want distinct nonzero keys", conns[0].AuthKeyID(), conns[1].AuthKeyID())
-	}
-	aConns := registry.Conns(a1.id)
-	if len(aConns) != 2 {
-		t.Fatalf("A live connections = %d, want 2", len(aConns))
-	}
-	if aConns[0].AuthKeyID() == 0 || aConns[1].AuthKeyID() == 0 || aConns[0].AuthKeyID() == aConns[1].AuthKeyID() {
-		t.Fatalf("A auth key ids = %d, %d; want distinct nonzero keys", aConns[0].AuthKeyID(), aConns[1].AuthKeyID())
-	}
+	waitForDistinctAuthKeys(t, ctx, registry, b1.id, 2, "B")
+	waitForDistinctAuthKeys(t, ctx, registry, a1.id, 2, "A")
 
 	var warmup tg.UpdatesClass
 	if err := exec(a1, func(ctx context.Context, api *tg.Client) error {
@@ -465,7 +467,8 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	if recoveryPts != 7 {
 		t.Fatalf("A recovery pts = %d, want 7 after two reads", recoveryPts)
 	}
-	b1Reconnected := startClient(phoneB, pushB1, managerB1, sessB1, false)
+	b1Reconnected := launchClient(phoneB, pushB1, managerB1, sessB1, false)
+	waitClient(phoneB, b1Reconnected)
 	assertDifferenceMessage(t, ctx, collB1, "A to B offline recovery", 4, false, a1.id, "B1 Manager recovery difference")
 	if got := takeMessage(t, pushB1.newMsg); got != nil {
 		t.Fatalf("B1 recovery update unexpectedly arrived as a live push: %+v", got)
@@ -586,6 +589,35 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	stopClient(a1)
 	stopClient(a2)
 	stopClient(c)
+}
+
+func waitForDistinctAuthKeys(t *testing.T, ctx context.Context, registry *mtproto.SessionRegistry, userID int64, want int, label string) []*mtproto.Conn {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		conns := registry.Conns(userID)
+		if len(conns) == want {
+			keys := make(map[int64]struct{}, len(conns))
+			ready := true
+			for _, conn := range conns {
+				keyID := conn.AuthKeyID()
+				if keyID == 0 {
+					ready = false
+					break
+				}
+				keys[keyID] = struct{}{}
+			}
+			if ready && len(keys) == want {
+				return conns
+			}
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("%s registry readiness: got %d connections with distinct keys after polling: %v", label, len(conns), ctx.Err())
+		}
+	}
 }
 
 func outgoingMessage(t *testing.T, result tg.UpdatesClass, text string) (*tg.Message, int, bool) {

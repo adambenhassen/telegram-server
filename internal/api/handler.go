@@ -231,7 +231,9 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.UpdatesGetStateRequestTypeID, h.handleGetState)
 	register(d, tg.UpdatesGetDifferenceRequestTypeID, h.handleGetDifference)
 	register(d, tg.UpdatesGetChannelDifferenceRequestTypeID, h.handleGetChannelDifference)
-	register(d, tg.MessagesSendMessageRequestTypeID, h.handleSendMessage)
+	registerReplyAfterSuccess(d, tg.MessagesSendMessageRequestTypeID, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
+		return h.handleSendMessageAfterReply(req)
+	})
 	register(d, tg.MessagesGetDialogsRequestTypeID, h.handleGetDialogs)
 	register(d, tg.MessagesGetPeerDialogsRequestTypeID, h.handleGetPeerDialogs)
 	register(d, tg.MessagesGetHistoryRequestTypeID, h.handleGetHistory)
@@ -257,7 +259,9 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesCheckChatInviteRequestTypeID, h.handleCheckChatInvite)
 	register(d, tg.MessagesImportChatInviteRequestTypeID, h.handleImportChatInvite)
 	registerNamed(d, revokeExportedChatInviteTypeID, "messages.revokeExportedChatInvite", h.handleRevokeExportedChatInvite)
-	register(d, tg.MessagesSendMediaRequestTypeID, h.handleSendMedia)
+	registerReplyAfterSuccess(d, tg.MessagesSendMediaRequestTypeID, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error) {
+		return h.handleSendMediaAfterReply(req)
+	})
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
 	register(d, tg.ChannelsGetChannelsRequestTypeID, h.handleGetChannels)
 	register(d, tg.ChannelsJoinChannelRequestTypeID, h.handleJoinChannel)
@@ -474,6 +478,18 @@ func registerReply(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
 }
 
 func registerReplyNamed(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc) {
+	registerReplyNamedMode(d, id, name, fn, false)
+}
+
+// registerReplyAfterSuccess is the send path's reply ordering boundary: the
+// returned hook runs only after the RPC result reached the transport. A sender
+// notification emitted before that point can push a later pts to the same
+// connection before its RPC result establishes the skipped pts.
+func registerReplyAfterSuccess(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
+	registerReplyNamedMode(d, id, "", fn, true)
+}
+
+func registerReplyNamedMode(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc, afterOnlyOnSuccess bool) {
 	handler := func(c *mtproto.Conn, req *mtproto.Request) error {
 		// Provisional gate: blocks all authorized RPCs except the allow-list.
 		// Does not apply when UserID == 0 (unauthenticated keys already
@@ -490,7 +506,7 @@ func registerReplyNamed(d *mtproto.Dispatcher, id uint32, name string, fn regist
 			return c.SendErr(req, rpc)
 		}
 		sendErr := c.SendResult(req, res)
-		if afterReply != nil {
+		if afterReply != nil && (!afterOnlyOnSuccess || sendErr == nil) {
 			afterReply()
 		}
 		return sendErr

@@ -106,9 +106,19 @@ func sanitizeFileName(s string) string {
 	return s
 }
 
-// handleSendMedia serves messages.sendMedia: it assembles an in-flight upload
-// into the blob store and sends it as a document message, to a user or to a
-// chat. It reuses the two send paths sendMessage already uses.
+// handleSendMedia is the direct handler entry used by tests and callers that do
+// not write an RPC result. The dispatcher uses handleSendMediaAfterReply so the
+// sender notification is published only after that result reaches the
+// originating connection.
+func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
+	res, _, err := h.handleSendMediaAfterReply(r)
+	return res, err
+}
+
+// handleSendMediaAfterReply serves messages.sendMedia: it assembles an
+// in-flight upload into the blob store and sends it as a document message, to a
+// user or to a chat. It returns a hook that advances the originating sender's
+// push watermark after the RPC result is written.
 //
 // The file id written to messages.file_id is the one this handler just
 // allocated under the caller's own account, never one the client named, so the
@@ -116,30 +126,30 @@ func sanitizeFileName(s string) string {
 // entitlement to somebody else's file. The client-supplied id in the input file
 // addresses upload parts only, and those are looked up under the caller's user
 // id.
-func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
+func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, func(), error) {
 	var req tg.MessagesSendMediaRequest
 	if err := req.Decode(r.Buf); err != nil {
-		return nil, errMethodNotImpl
+		return nil, nil, errMethodNotImpl
 	}
 	if r.UserID == 0 {
-		return nil, errAuthKeyUnreg
+		return nil, nil, errAuthKeyUnreg
 	}
 	// Validate before any expensive work.
 	if !validText(req.Message) {
-		return nil, errMessageEmpty
+		return nil, nil, errMessageEmpty
 	}
 	peerType, toID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// No channel send path exists yet, and the 1:1 fallthrough below would treat
 	// the channel id as a user id and write into that account's message rows.
 	if peerType == store.PeerTypeChannel {
-		return nil, errPeerIDInvalid
+		return nil, nil, errPeerIDInvalid
 	}
 	if peerType == store.PeerTypeChat {
 		if err = h.requireMember(r.Ctx, toID, r.UserID); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -177,10 +187,10 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 		existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, req.RandomID)
 		if err != nil {
 			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
-			return nil, errInternal
+			return nil, nil, errInternal
 		}
 		if ok && existing.Deleted {
-			return nil, errMediaInvalid
+			return nil, nil, errMediaInvalid
 		}
 		if ok {
 			// Retry: return the stored message, at the pts it occupies, without
@@ -188,23 +198,23 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 			pts, err := h.store.MessagePts(r.Ctx, r.UserID, existing.LocalID)
 			if err != nil {
 				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
-				return nil, errInternal
+				return nil, nil, errInternal
 			}
 			if peerType == store.PeerTypeChat {
 				chats, err := h.loadChats(r.Ctx, map[int64]bool{toID: true}, r.UserID, nil)
 				if err != nil {
 					h.log.Error("load chats on retry", "err", err)
-					return nil, errInternal
+					return nil, nil, errInternal
 				}
 				users, err := h.loadUsers(r.Ctx, map[int64]bool{r.UserID: true}, r.UserID)
 				if err != nil {
 					h.log.Error("load users on retry", "err", err)
-					return nil, errInternal
+					return nil, nil, errInternal
 				}
 				files, err := h.loadFiles(r.Ctx, []store.Message{existing})
 				if err != nil {
 					h.log.Error("load files on retry", "err", err)
-					return nil, errInternal
+					return nil, nil, errInternal
 				}
 				return &tg.Updates{
 					Updates: []tg.UpdateClass{
@@ -214,17 +224,17 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 					Users: users,
 					Chats: chats,
 					Date:  int(existing.Date.Unix()),
-				}, nil
+				}, nil, nil
 			}
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 			if err != nil {
 				h.log.Error("load users on retry", "err", err)
-				return nil, errInternal
+				return nil, nil, errInternal
 			}
 			files, err := h.loadFiles(r.Ctx, []store.Message{existing})
 			if err != nil {
 				h.log.Error("load files on retry", "err", err)
-				return nil, errInternal
+				return nil, nil, errInternal
 			}
 			return &tg.Updates{
 				Updates: []tg.UpdateClass{
@@ -233,7 +243,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 				},
 				Users: users,
 				Date:  int(existing.Date.Unix()),
-			}, nil
+			}, nil, nil
 		}
 	}
 
@@ -244,23 +254,23 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	// deliberately declines. A client sending a photo sends it as a document.
 	media, ok := req.Media.(*tg.InputMediaUploadedDocument)
 	if !ok {
-		return nil, errMediaInvalid
+		return nil, nil, errMediaInvalid
 	}
 	// M5 stores no thumbnails, and a thumbnail is a second file body this
 	// handler has nowhere to put.
 	if _, ok = media.GetThumb(); ok {
-		return nil, errMediaInvalid
+		return nil, nil, errMediaInvalid
 	}
 
 	// Rate limit before the expensive file assembly: new message, consume a
 	// token. The dedupe check above already caught retries.
 	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	clientFileID, parts, name, err := inputFileParts(media.File)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Assembly is the one step in this handler the send path's dedup cannot
@@ -270,18 +280,19 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	// makes a resend re-send the file the original message already names.
 	fileID, err := h.resendFileID(r.Ctx, r.UserID, req.RandomID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if fileID == 0 {
 		file, aerr := h.assembleFile(r.Ctx, r.UserID, clientFileID, parts, name, media.MimeType)
 		if aerr != nil {
-			return nil, aerr
+			return nil, nil, aerr
 		}
 		fileID = file.ID
 	}
 
 	if peerType == store.PeerTypeChat {
-		return h.sendChatMedia(r, toID, &req, fileID)
+		res, err := h.sendChatMedia(r, toID, &req, fileID)
+		return res, nil, err
 	}
 
 	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, fileID, 0)
@@ -289,14 +300,13 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	// hears that rather than an internal error for a state that is theirs to
 	// retry from.
 	if errors.Is(err, store.ErrFileMissing) {
-		return nil, errMediaInvalid
+		return nil, nil, errMediaInvalid
 	}
 	if err != nil {
 		h.log.Error("send media", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, nil, errInternal
 	}
 
-	h.notify(r.Ctx, r.UserID)
 	if toID != r.UserID {
 		h.notify(r.Ctx, toID)
 	}
@@ -304,7 +314,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("send media users", "err", err)
-		return nil, errInternal
+		return nil, nil, errInternal
 	}
 	// Hydrated off the row that was actually stored rather than off the file
 	// this call assembled: on a resend those differ, and keying the map on the
@@ -312,7 +322,7 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 	files, err := h.loadFiles(r.Ctx, []store.Message{sender})
 	if err != nil {
 		h.log.Error("send media files", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, nil, errInternal
 	}
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{
@@ -321,6 +331,8 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 		},
 		Users: users,
 		Date:  int(sender.Date.Unix()),
+	}, func() {
+		h.notifySend(r.Ctx, r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), senderPts)
 	}, nil
 }
 

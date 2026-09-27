@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/tg"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -39,6 +40,46 @@ func (f *fakePushConn) PushTo(_ context.Context, _ int64, enc bin.Encoder, pts i
 	f.got = append(f.got, ups)
 	f.pts = pts
 	return true, nil
+}
+
+type rpcBatchPushConn struct {
+	fakePushConn
+
+	authKeyID int64
+	marked    []int
+}
+
+func (f *rpcBatchPushConn) AuthKeyID() int64 { return f.authKeyID }
+
+func (f *rpcBatchPushConn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
+	if owner != 7 || authKeyID != f.authKeyID {
+		return false
+	}
+	f.marked = append(f.marked, pts)
+	if pts > f.pts {
+		f.pts = pts
+	}
+	return true
+}
+
+type replyOrderTransport struct {
+	events *[]string
+}
+
+func (t *replyOrderTransport) Send(context.Context, *bin.Buffer) error {
+	*t.events = append(*t.events, "send")
+	return nil
+}
+
+func (*replyOrderTransport) Recv(context.Context, *bin.Buffer) error { return errors.New("unused") }
+func (*replyOrderTransport) Close() error                            { return nil }
+
+func replyTestKey() crypto.AuthKey {
+	var raw crypto.Key
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	return raw.WithID()
 }
 
 type outcomePushConn struct {
@@ -90,6 +131,81 @@ func ptsOf(t *testing.T, up *tg.Updates) []int {
 		out = append(out, nm.Pts)
 	}
 	return out
+}
+
+func TestDeliverSuppressionSplitsOriginBatch(t *testing.T) {
+	t.Parallel()
+
+	origin := &rpcBatchPushConn{authKeyID: 11}
+	other := &rpcBatchPushConn{authKeyID: 22}
+	u := testUpdater()
+	u.deliverAtSuppressed(
+		context.Background(),
+		7,
+		[]pushConn{origin, other},
+		func(int) (updateBatch, error) { return batch(0, 5, 5), nil },
+		time.Time{},
+		store.SuppressedUpdate{AuthKeyID: 11, Pts: 3},
+	)
+
+	if got := len(origin.got); got != 2 {
+		t.Fatalf("origin pushes = %d, want prefix and suffix", got)
+	}
+	if got := ptsOf(t, origin.got[0]); !slices.Equal(got, []int{1, 2}) {
+		t.Fatalf("origin prefix pts = %v, want [1 2]", got)
+	}
+	if got := ptsOf(t, origin.got[1]); !slices.Equal(got, []int{4, 5}) {
+		t.Fatalf("origin suffix pts = %v, want [4 5]", got)
+	}
+	if !slices.Equal(origin.marked, []int{3}) {
+		t.Fatalf("origin RPC marks = %v, want [3]", origin.marked)
+	}
+	if got := origin.pts; got != 5 {
+		t.Fatalf("origin watermark = %d, want 5", got)
+	}
+	if len(other.got) != 1 {
+		t.Fatalf("other pushes = %d, want one full batch", len(other.got))
+	}
+	if got := ptsOf(t, other.got[0]); !slices.Equal(got, []int{1, 2, 3, 4, 5}) {
+		t.Fatalf("other pts = %v, want [1 2 3 4 5]", got)
+	}
+}
+
+func TestRegisterReplyAfterSuccessRunsHookAfterWire(t *testing.T) {
+	t.Parallel()
+
+	events := []string{}
+	d := mtproto.NewDispatcher()
+	registerReplyAfterSuccess(d, tg.HelpGetConfigRequestTypeID, func(_ *mtproto.Conn, _ *mtproto.Request) (bin.Encoder, func(), error) {
+		events = append(events, "handler")
+		return &tg.BoolTrue{}, func() {
+			events = append(events, "after")
+		}, nil
+	})
+
+	var body bin.Buffer
+	if err := (&tg.HelpGetConfigRequest{}).Encode(&body); err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	conn := mtproto.NewTestConn(&replyOrderTransport{events: &events}, replyTestKey())
+	err := d.OnMessage(conn, &mtproto.Request{
+		Ctx:    context.Background(),
+		UserID: 1,
+		MsgID:  1,
+		Buf:    &body,
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	want := []string{"handler", "send", "after"}
+	if len(events) != len(want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("events = %v, want %v", events, want)
+		}
+	}
 }
 
 func testUpdater() *Updater {
