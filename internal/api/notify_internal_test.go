@@ -582,6 +582,54 @@ func TestDeliverPendingSenderSuppressionAccountsMissingKeyedEvent(t *testing.T) 
 	}
 }
 
+func TestDeliverPendingSenderSuppressionAdvancesAcrossCappedNotifications(t *testing.T) {
+	t.Parallel()
+
+	origin := &pendingRPCBatchPushConn{
+		fakePushConn: fakePushConn{pts: 0},
+		authKeyID:    11,
+		pendingPts:   1201,
+	}
+	sibling := &fakePushConn{}
+	u := testUpdater()
+	buildCapped := func(head int) func(int) (updateBatch, error) {
+		return func(fromPts int) (updateBatch, error) {
+			return batch(fromPts, min(fromPts+maxDiffEvents, head), head), nil
+		}
+	}
+
+	// The first notification can advance each session through only two capped
+	// windows. Later notifications must continue from that prefix until the
+	// sender result's pts is reached and then resume with the suffix.
+	u.deliver(context.Background(), 7, []pushConn{origin, sibling}, buildCapped(1200))
+	for head := 1202; head <= 1206; head++ {
+		u.deliver(context.Background(), 7, []pushConn{origin, sibling}, buildCapped(head))
+	}
+
+	var pushed []int
+	for _, up := range origin.got {
+		pushed = append(pushed, ptsOf(t, up)...)
+	}
+	want := make([]int, 0, 1205)
+	for pts := 1; pts <= 1206; pts++ {
+		if pts != 1201 {
+			want = append(want, pts)
+		}
+	}
+	if !slices.Equal(pushed, want) {
+		t.Fatalf("origin pushed pts = %v, want every event except sender pts 1201", pushed)
+	}
+	if !slices.Equal(origin.marked, []int{1201}) {
+		t.Fatalf("origin RPC marks = %v, want [1201]", origin.marked)
+	}
+	if origin.pendingPts != 0 || origin.pts != 1206 {
+		t.Fatalf("origin state = pending %d, pts %d; want pending 0, pts 1206", origin.pendingPts, origin.pts)
+	}
+	if sibling.pts != 1206 {
+		t.Fatalf("sibling watermark = %d, want 1206", sibling.pts)
+	}
+}
+
 func TestDeliverPendingSenderSuppressionRetriesPrefixWrite(t *testing.T) {
 	t.Parallel()
 
