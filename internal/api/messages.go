@@ -73,12 +73,35 @@ func (h *handlers) notifySendAfterFailure(r *mtproto.Request) {
 	h.notify(ctx, r.UserID)
 }
 
+func beginSenderRPC(c *mtproto.Conn, r *mtproto.Request) {
+	if c != nil {
+		c.BeginRPCUpdate(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), 0)
+	}
+}
+
+func setSenderRPCPts(c *mtproto.Conn, r *mtproto.Request, pts int) {
+	if c != nil {
+		c.SetRPCUpdatePts(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
+	}
+}
+
+func clearSenderRPC(c *mtproto.Conn, r *mtproto.Request) {
+	if c != nil {
+		c.ClearRPCUpdate(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID))
+	}
+}
+
+func (h *handlers) clearSenderAndNotify(c *mtproto.Conn, r *mtproto.Request) {
+	clearSenderRPC(c, r)
+	h.notifySendAfterFailure(r)
+}
+
 // retryReplyAfterSuccess restores the sender-keyed notification for a stored
 // 1:1 retry. A retry can be the first request whose RPC result reaches the
 // client after the original committed its message, so it needs the same
 // post-reply push as a new send. Chat retries keep their existing fan-out
 // notification behaviour and therefore do not return sender metadata here.
-func (h *handlers) retryReplyAfterSuccess(r *mtproto.Request, peerType store.PeerType, pts int) (*replyUpdate, func()) {
+func (h *handlers) retryReplyAfterSuccess(c *mtproto.Conn, r *mtproto.Request, peerType store.PeerType, pts int) (*replyUpdate, func()) {
 	if peerType != store.PeerTypeUser {
 		return nil, nil
 	}
@@ -87,7 +110,7 @@ func (h *handlers) retryReplyAfterSuccess(r *mtproto.Request, peerType store.Pee
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     pts,
 		onFailure: func() {
-			h.notifySendAfterFailure(r)
+			h.clearSenderAndNotify(c, r)
 		},
 	}
 	afterReply := func() {
@@ -207,6 +230,10 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 // atomic watermark update plus a hook that notifies other sessions after the
 // RPC result is written.
 func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+	return h.handleSendMessageAfterReplyOnConn(nil, r)
+}
+
+func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 	var req tg.MessagesSendMessageRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, nil, nil, errMethodNotImpl
@@ -253,9 +280,11 @@ func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder,
 				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
 				return nil, nil, nil, errInternal
 			}
+			beginSenderRPC(c, r)
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 			if err != nil {
 				h.log.Error("load users on retry", "user_id", r.UserID, "err", err)
+				h.clearSenderAndNotify(c, r)
 				return nil, nil, nil, errInternal
 			}
 			res := &tg.Updates{
@@ -266,7 +295,7 @@ func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder,
 				Users: users,
 				Date:  int(existing.Date.Unix()),
 			}
-			update, afterReply := h.retryReplyAfterSuccess(r, peerType, pts)
+			update, afterReply := h.retryReplyAfterSuccess(c, r, peerType, pts)
 			return res, update, afterReply, nil
 		} else if err != nil {
 			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
@@ -279,10 +308,18 @@ func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder,
 		return nil, nil, nil, err
 	}
 
+	beginSenderRPC(c, r)
 	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0, replyToMsgID)
 	if err != nil {
+		if c != nil {
+			h.clearSenderAndNotify(c, r)
+		}
 		h.log.Error("send message", "user_id", r.UserID, "err", err)
 		return nil, nil, nil, errInternal
+	}
+	setSenderRPCPts(c, r, senderPts)
+	if h.afterSenderCommit != nil {
+		h.afterSenderCommit()
 	}
 
 	if toID != r.UserID {
@@ -292,7 +329,7 @@ func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder,
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("send message users", "err", err)
-		h.notifySendAfterFailure(r)
+		h.clearSenderAndNotify(c, r)
 		return nil, nil, nil, errInternal
 	}
 	res := &tg.Updates{
@@ -309,7 +346,7 @@ func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder,
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     senderPts,
 		onFailure: func() {
-			h.notifySendAfterFailure(r)
+			h.clearSenderAndNotify(c, r)
 		},
 	}
 	afterReply := func() {

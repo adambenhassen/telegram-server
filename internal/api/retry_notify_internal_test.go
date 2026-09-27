@@ -223,3 +223,157 @@ func TestStoredRetryNotifiesSiblingAfterResultWriteFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestPausedSendSiblingReadHistoryDoesNotEchoOrigin(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dsn := pgtest.DSN(t)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(blobs))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() }) //nolint:errcheck // teardown
+
+	alice, err := s.CreateUser(ctx, "+15557001001")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := s.CreateUser(ctx, "+15557001002")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	if _, _, _, _, err := s.SendMessage(ctx, bob.ID, alice.ID, "before", 917010, 0, 0); err != nil {
+		t.Fatalf("seed incoming message: %v", err)
+	}
+
+	registry := mtproto.NewSessionRegistry()
+	updater := NewUpdater(s, registry, nil, pgtest.PeerDeriver())
+	originKey := retryTestKey(21)
+	siblingKey := retryTestKey(121)
+	originTransport := &retryNotifyTransport{done: make(chan struct{})}
+	siblingTransport := &retryNotifyTransport{done: make(chan struct{})}
+	originConn := mtproto.NewTestConn(originTransport, originKey)
+	originConn.SetOwner(alice.ID)
+	siblingConn := mtproto.NewTestConn(siblingTransport, siblingKey)
+	siblingConn.SetOwner(alice.ID)
+	if !registry.Add(alice.ID, originConn) || !registry.Add(alice.ID, siblingConn) {
+		t.Fatal("register sender sessions")
+	}
+	t.Cleanup(func() {
+		registry.Remove(alice.ID, originConn)
+		registry.Remove(alice.ID, siblingConn)
+	})
+	if !originConn.MarkRPCUpdate(alice.ID, mtproto.AuthKeyIDInt64(originKey.ID), 1) {
+		t.Fatal("seed origin watermark")
+	}
+
+	_, stop, err := store.StartListener(ctx, dsn,
+		updater.Deliver,
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	t.Cleanup(func() { _ = stop() }) //nolint:errcheck // teardown
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for notification listener: %v", err)
+	}
+
+	h := testHandlers(s)
+	committed := make(chan struct{})
+	release := make(chan struct{})
+	h.afterSenderCommit = func() {
+		close(committed)
+		<-release
+	}
+	encode := func(req bin.Encoder, key crypto.AuthKey) *mtproto.Request {
+		var body bin.Buffer
+		if err := req.Encode(&body); err != nil {
+			t.Fatalf("encode request: %v", err)
+		}
+		return &mtproto.Request{Ctx: ctx, UserID: alice.ID, AuthKeyID: key.ID, Buf: &body}
+	}
+	sendReq := encode(&tg.MessagesSendMessageRequest{
+		Peer:     InputPeerUser(alice.ID, bob.ID),
+		Message:  "paused sender",
+		RandomID: 917011,
+	}, originKey)
+	var result bin.Encoder
+	var update *replyUpdate
+	var afterReply func()
+	var sendErr error
+	done := make(chan struct{})
+	go func() {
+		result, update, afterReply, sendErr = h.handleSendMessageAfterReplyOnConn(originConn, sendReq)
+		close(done)
+	}()
+	select {
+	case <-committed:
+	case <-ctx.Done():
+		t.Fatalf("send did not reach commit barrier: %v", ctx.Err())
+	}
+
+	if _, err := h.handleReadHistory(encode(&tg.MessagesReadHistoryRequest{
+		Peer:  InputPeerUser(alice.ID, bob.ID),
+		MaxID: 1,
+	}, siblingKey)); err != nil {
+		t.Fatalf("sibling readHistory: %v", err)
+	}
+	select {
+	case <-siblingTransport.done:
+	case <-ctx.Done():
+		t.Fatalf("sibling did not receive readHistory push: %v", ctx.Err())
+	}
+	if got := originTransport.count(); got != 0 {
+		t.Fatalf("origin received %d generic pushes while result paused", got)
+	}
+	if got := originConn.LastPushedPts(); got != 1 {
+		t.Fatalf("origin watermark = %d while result paused, want 1", got)
+	}
+	if got := siblingConn.LastPushedPts(); got != 3 {
+		t.Fatalf("sibling watermark = %d, want 3 after readHistory", got)
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatalf("send did not finish: %v", ctx.Err())
+	}
+	if sendErr != nil {
+		t.Fatalf("send: %v", sendErr)
+	}
+	if result == nil || update == nil || afterReply == nil {
+		t.Fatal("send did not return result metadata")
+	}
+	if err := originConn.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: ctx, UserID: alice.ID, AuthKeyID: originKey.ID, MsgID: 1},
+		result, alice.ID, mtproto.AuthKeyIDInt64(originKey.ID), update.pts,
+	); err != nil {
+		t.Fatalf("send result: %v", err)
+	}
+	afterReply()
+	deadline := time.Now().Add(5 * time.Second)
+	for originConn.LastPushedPts() < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := originConn.LastPushedPts(); got != 3 {
+		t.Fatalf("origin watermark after result = %d, want 3", got)
+	}
+	if got := siblingConn.LastPushedPts(); got != 3 {
+		t.Fatalf("sibling watermark after result = %d, want 3", got)
+	}
+}

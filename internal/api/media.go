@@ -128,6 +128,10 @@ func (h *handlers) handleSendMedia(r *mtproto.Request) (bin.Encoder, error) {
 // addresses upload parts only, and those are looked up under the caller's user
 // id.
 func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+	return h.handleSendMediaAfterReplyOnConn(nil, r)
+}
+
+func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 	var req tg.MessagesSendMediaRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, nil, nil, errMethodNotImpl
@@ -226,17 +230,20 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 					Chats: chats,
 					Date:  int(existing.Date.Unix()),
 				}
-				update, afterReply := h.retryReplyAfterSuccess(r, peerType, pts)
+				update, afterReply := h.retryReplyAfterSuccess(c, r, peerType, pts)
 				return res, update, afterReply, nil
 			}
+			beginSenderRPC(c, r)
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 			if err != nil {
 				h.log.Error("load users on retry", "err", err)
+				h.clearSenderAndNotify(c, r)
 				return nil, nil, nil, errInternal
 			}
 			files, err := h.loadFiles(r.Ctx, []store.Message{existing})
 			if err != nil {
 				h.log.Error("load files on retry", "err", err)
+				h.clearSenderAndNotify(c, r)
 				return nil, nil, nil, errInternal
 			}
 			res := &tg.Updates{
@@ -247,7 +254,7 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 				Users: users,
 				Date:  int(existing.Date.Unix()),
 			}
-			update, afterReply := h.retryReplyAfterSuccess(r, peerType, pts)
+			update, afterReply := h.retryReplyAfterSuccess(c, r, peerType, pts)
 			return res, update, afterReply, nil
 		}
 	}
@@ -300,16 +307,27 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 		return res, nil, nil, err
 	}
 
+	beginSenderRPC(c, r)
 	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, fileID, 0)
 	// The file this send names is gone: the send wrote nothing, and the caller
 	// hears that rather than an internal error for a state that is theirs to
 	// retry from.
 	if errors.Is(err, store.ErrFileMissing) {
+		if c != nil {
+			h.clearSenderAndNotify(c, r)
+		}
 		return nil, nil, nil, errMediaInvalid
 	}
 	if err != nil {
+		if c != nil {
+			h.clearSenderAndNotify(c, r)
+		}
 		h.log.Error("send media", "user_id", r.UserID, "err", err)
 		return nil, nil, nil, errInternal
+	}
+	setSenderRPCPts(c, r, senderPts)
+	if h.afterSenderCommit != nil {
+		h.afterSenderCommit()
 	}
 
 	if toID != r.UserID {
@@ -319,7 +337,7 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("send media users", "err", err)
-		h.notifySendAfterFailure(r)
+		h.clearSenderAndNotify(c, r)
 		return nil, nil, nil, errInternal
 	}
 	// Hydrated off the row that was actually stored rather than off the file
@@ -328,7 +346,7 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 	files, err := h.loadFiles(r.Ctx, []store.Message{sender})
 	if err != nil {
 		h.log.Error("send media files", "user_id", r.UserID, "err", err)
-		h.notifySendAfterFailure(r)
+		h.clearSenderAndNotify(c, r)
 		return nil, nil, nil, errInternal
 	}
 	res := &tg.Updates{
@@ -344,7 +362,7 @@ func (h *handlers) handleSendMediaAfterReply(r *mtproto.Request) (bin.Encoder, *
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     senderPts,
 		onFailure: func() {
-			h.notifySendAfterFailure(r)
+			h.clearSenderAndNotify(c, r)
 		},
 	}
 	afterReply := func() {

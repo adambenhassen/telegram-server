@@ -51,6 +51,16 @@ type rpcBatchPushConn struct {
 	marked    []int
 }
 
+type pendingRPCPushConn struct {
+	fakePushConn
+
+	pendingPts int
+}
+
+func (f *pendingRPCPushConn) PendingRPCUpdate(int64) (int, bool) {
+	return f.pendingPts, f.pendingPts != 0
+}
+
 func (f *rpcBatchPushConn) AuthKeyID() int64 { return f.authKeyID }
 
 func (f *rpcBatchPushConn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
@@ -176,6 +186,26 @@ func TestDeliverSuppressionSplitsOriginBatch(t *testing.T) {
 	}
 	if got := ptsOf(t, other.got[0]); !slices.Equal(got, []int{1, 2, 3, 4, 5}) {
 		t.Fatalf("other pts = %v, want [1 2 3 4 5]", got)
+	}
+}
+
+func TestDeliverPendingSenderSuppressionLeavesOriginAtBarrier(t *testing.T) {
+	t.Parallel()
+
+	origin := &pendingRPCPushConn{fakePushConn: fakePushConn{pts: 1}, pendingPts: 2}
+	sibling := &fakePushConn{}
+	testUpdater().deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
+		return batch(fromPts, 3, 3), nil
+	})
+
+	if len(origin.got) != 0 {
+		t.Fatalf("origin pushes = %d, want no push across pending sender event", len(origin.got))
+	}
+	if origin.pts != 1 {
+		t.Fatalf("origin watermark = %d, want 1 at pending barrier", origin.pts)
+	}
+	if len(sibling.got) != 1 || !slices.Equal(ptsOf(t, sibling.got[0]), []int{1, 2, 3}) {
+		t.Fatalf("sibling pushes = %d/%v, want one full batch", len(sibling.got), ptsOf(t, sibling.got[0]))
 	}
 }
 

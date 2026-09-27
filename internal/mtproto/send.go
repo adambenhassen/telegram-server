@@ -88,6 +88,15 @@ type Conn struct {
 	// access keeps the registry hand-off safe.
 	lastPushedPts atomic.Int64
 
+	// pendingRPCUpdate is the sender event committed by the request currently
+	// being prepared for this connection. A zero pts is a barrier before the
+	// store commit returns; delivery must hold the origin back until the event's
+	// pts is known. It is guarded by writeMu with the socket state so a generic
+	// notification cannot pass the result write between its check and push.
+	pendingRPCOwner   int64
+	pendingRPCAuthKey int64
+	pendingRPCPts     int
+
 	// authKeyID mirrors authKey.IntID() for readers that must not take writeMu.
 	// Eviction runs on the single LISTEN goroutine and matches conns by key id,
 	// so reading it under writeMu would let one blackholed socket — a push
@@ -130,6 +139,74 @@ func (c *Conn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.markRPCUpdateLocked(owner, authKeyID, pts)
+}
+
+// BeginRPCUpdate blocks generic delivery to the originating connection while
+// a sender result is being prepared. Pass pts=0 before the store commit and
+// set it with SetRPCUpdatePts as soon as the commit returns.
+func (c *Conn) BeginRPCUpdate(owner, authKeyID int64, pts int) bool {
+	if owner <= 0 || authKeyID == 0 || pts < 0 {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.owner != owner || c.authKeyID.Load() != authKeyID {
+		return false
+	}
+	c.pendingRPCOwner = owner
+	c.pendingRPCAuthKey = authKeyID
+	c.pendingRPCPts = pts
+	return true
+}
+
+// SetRPCUpdatePts records the committed sender event's pts on an in-flight
+// result barrier. It is separate from BeginRPCUpdate because the pts is
+// allocated by the store transaction.
+func (c *Conn) SetRPCUpdatePts(owner, authKeyID int64, pts int) bool {
+	if owner <= 0 || authKeyID == 0 || pts <= 0 {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.pendingRPCOwner != owner || c.pendingRPCAuthKey != authKeyID || c.owner != owner || c.authKeyID.Load() != authKeyID {
+		return false
+	}
+	c.pendingRPCPts = pts
+	return true
+}
+
+// ClearRPCUpdate releases a result barrier after the result write or an
+// aborted post-commit path. A failed result can then use a generic nudge to
+// recover the event for every live sender session.
+func (c *Conn) ClearRPCUpdate(owner, authKeyID int64) bool {
+	if owner <= 0 || authKeyID == 0 {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.clearRPCUpdateLocked(owner, authKeyID)
+}
+
+func (c *Conn) clearRPCUpdateLocked(owner, authKeyID int64) bool {
+	if c.pendingRPCOwner != owner || c.pendingRPCAuthKey != authKeyID {
+		return false
+	}
+	c.pendingRPCOwner = 0
+	c.pendingRPCAuthKey = 0
+	c.pendingRPCPts = 0
+	return true
+}
+
+// PendingRPCUpdate reports the sender-result barrier for owner. A true result
+// with pts=0 means the send is committed-or-in-flight but its event pts is not
+// known yet, so generic delivery must wait rather than risk crossing it.
+func (c *Conn) PendingRPCUpdate(owner int64) (pts int, pending bool) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.pendingRPCOwner != owner {
+		return 0, false
+	}
+	return c.pendingRPCPts, true
 }
 
 func (c *Conn) markRPCUpdateLocked(owner, authKeyID int64, pts int) bool {
@@ -188,6 +265,9 @@ func (c *Conn) setOwner(userID int64) {
 	}
 	c.owner = userID
 	c.lastPushedPts.Store(0)
+	c.pendingRPCOwner = 0
+	c.pendingRPCAuthKey = 0
+	c.pendingRPCPts = 0
 }
 
 func newConn(
@@ -213,6 +293,9 @@ func newConn(
 func (c *Conn) setKey(key crypto.AuthKey) {
 	c.writeMu.Lock()
 	c.authKey = key
+	c.pendingRPCOwner = 0
+	c.pendingRPCAuthKey = 0
+	c.pendingRPCPts = 0
 	c.writeMu.Unlock()
 	c.authKeyID.Store(key.IntID())
 }
@@ -337,6 +420,7 @@ func (c *Conn) markRPCResultLocked(owner, authKeyID int64, pts int) bool {
 	if c.owner != owner || c.authKeyID.Load() != authKeyID {
 		return false
 	}
+	c.clearRPCUpdateLocked(owner, authKeyID)
 	current := c.lastPushedPts.Load()
 	if int64(pts) == current+1 {
 		c.lastPushedPts.Store(int64(pts))

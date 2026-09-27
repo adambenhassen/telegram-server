@@ -114,6 +114,36 @@ func TestMarkRPCUpdateRequiresCurrentOwnerAndKey(t *testing.T) {
 	}
 }
 
+func TestPendingRPCUpdateBarrierTracksCommitAndClearsWithResult(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	if !c.BeginRPCUpdate(7, keyID, 0) {
+		t.Fatal("BeginRPCUpdate refused the current owner and key")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 0 {
+		t.Fatalf("pending barrier = (%d, %t), want (0, true)", pts, pending)
+	}
+	if !c.SetRPCUpdatePts(7, keyID, 5) {
+		t.Fatal("SetRPCUpdatePts refused the in-flight barrier")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 5 {
+		t.Fatalf("committed barrier = (%d, %t), want (5, true)", pts, pending)
+	}
+	if err := c.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: context.Background(), MsgID: 1},
+		&mt.Pong{PingID: 1}, 7, keyID, 5,
+	); err != nil {
+		t.Fatalf("send result: %v", err)
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("successful result left the pending barrier active")
+	}
+}
+
 func TestSendResultAndMarkRPCUpdate(t *testing.T) {
 	t.Parallel()
 	key := testKey(t)

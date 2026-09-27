@@ -116,6 +116,9 @@ type handlers struct {
 	// rateLimitRecorder is a test-only failure injection seam. Production uses
 	// the fixed recorder method through rateLimitMetrics.
 	rateLimitRecorder func(surface string) error
+	// afterSenderCommit is a test-only pause point immediately after a sender
+	// message commits and its origin barrier is installed.
+	afterSenderCommit func()
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -240,8 +243,8 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.UpdatesGetStateRequestTypeID, h.handleGetState)
 	register(d, tg.UpdatesGetDifferenceRequestTypeID, h.handleGetDifference)
 	register(d, tg.UpdatesGetChannelDifferenceRequestTypeID, h.handleGetChannelDifference)
-	registerReplyAfterSuccess(d, tg.MessagesSendMessageRequestTypeID, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
-		return h.handleSendMessageAfterReply(req)
+	registerReplyAfterSuccess(d, tg.MessagesSendMessageRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		return h.handleSendMessageAfterReplyOnConn(c, req)
 	})
 	register(d, tg.MessagesGetDialogsRequestTypeID, h.handleGetDialogs)
 	register(d, tg.MessagesGetPeerDialogsRequestTypeID, h.handleGetPeerDialogs)
@@ -268,8 +271,8 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesCheckChatInviteRequestTypeID, h.handleCheckChatInvite)
 	register(d, tg.MessagesImportChatInviteRequestTypeID, h.handleImportChatInvite)
 	registerNamed(d, revokeExportedChatInviteTypeID, "messages.revokeExportedChatInvite", h.handleRevokeExportedChatInvite)
-	registerReplyAfterSuccess(d, tg.MessagesSendMediaRequestTypeID, func(_ *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
-		return h.handleSendMediaAfterReply(req)
+	registerReplyAfterSuccess(d, tg.MessagesSendMediaRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		return h.handleSendMediaAfterReplyOnConn(c, req)
 	})
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
 	register(d, tg.ChannelsGetChannelsRequestTypeID, h.handleGetChannels)
