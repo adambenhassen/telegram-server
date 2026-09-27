@@ -18,6 +18,7 @@ import (
 const (
 	defaultHistoryLimit = 20
 	maxHistoryLimit     = 100
+	senderNotifyTimeout = 5 * time.Second
 
 	defaultDialogsLimit = 20
 	maxDialogsLimit     = 100
@@ -38,6 +39,95 @@ func (h *handlers) notify(ctx context.Context, userID int64) {
 	if err := h.store.Notify(ctx, store.ChannelUpdates, strconv.FormatInt(userID, 10)); err != nil {
 		h.log.Error("notify updates", "user_id", userID, "err", err)
 	}
+}
+
+// notifySend records which authenticated key receives the sender's new-message
+// update in the sendMessage RPC result, so that key can skip only that live echo.
+func (h *handlers) notifySend(ctx context.Context, userID, authKeyID int64, pts int) {
+	if authKeyID == 0 || pts <= 0 {
+		h.notify(ctx, userID)
+		return
+	}
+	payload := strconv.FormatInt(userID, 10) + "|" + strconv.FormatInt(authKeyID, 10) + "|" + strconv.Itoa(pts)
+	if err := h.store.Notify(ctx, store.ChannelUpdates, payload); err != nil {
+		h.log.Error("notify updates", "user_id", userID, "err", err)
+	}
+}
+
+func senderNotifyContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), senderNotifyTimeout)
+}
+
+func (h *handlers) notifySendAfterReply(r *mtproto.Request, pts int) {
+	ctx, cancel := senderNotifyContext(r.Ctx)
+	defer cancel()
+	h.notifySend(ctx, r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
+}
+
+func (h *handlers) notifySendAfterFailure(r *mtproto.Request) {
+	ctx, cancel := senderNotifyContext(r.Ctx)
+	defer cancel()
+	h.notify(ctx, r.UserID)
+}
+
+type senderRPCAttempt struct {
+	conn        *mtproto.Conn
+	reservation mtproto.RPCUpdateReservation
+}
+
+func beginSenderRPC(c *mtproto.Conn, r *mtproto.Request) senderRPCAttempt {
+	return beginSenderRPCAt(c, r, 0)
+}
+
+func beginSenderRPCAt(c *mtproto.Conn, r *mtproto.Request, pts int) senderRPCAttempt {
+	if c == nil {
+		return senderRPCAttempt{}
+	}
+	reservation, _ := c.BeginRPCUpdateAttempt(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
+	return senderRPCAttempt{conn: c, reservation: reservation}
+}
+
+func setSenderRPCPts(attempt senderRPCAttempt, pts int) {
+	if attempt.conn != nil {
+		attempt.conn.SetRPCUpdatePtsAttempt(attempt.reservation, pts)
+	}
+}
+
+func clearSenderRPC(attempt senderRPCAttempt) {
+	if attempt.conn != nil {
+		attempt.conn.ClearRPCUpdateAttempt(attempt.reservation)
+	}
+}
+
+func (h *handlers) clearSenderAndNotify(attempt senderRPCAttempt, r *mtproto.Request) {
+	clearSenderRPC(attempt)
+	h.notifySendAfterFailure(r)
+}
+
+// retryReplyAfterSuccess restores the sender-keyed notification for a stored
+// 1:1 retry. A retry can be the first request whose RPC result reaches the
+// client after the original committed its message, so it needs the same
+// post-reply push as a new send. Chat retries keep their existing fan-out
+// notification behaviour and therefore do not return sender metadata here.
+func (h *handlers) retryReplyAfterSuccess(attempt senderRPCAttempt, r *mtproto.Request, peerType store.PeerType, pts int) (*replyUpdate, func()) {
+	if peerType != store.PeerTypeUser {
+		return nil, nil
+	}
+	update := &replyUpdate{
+		owner:   r.UserID,
+		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
+		pts:     pts,
+		onFailure: func() {
+			h.clearSenderAndNotify(attempt, r)
+		},
+	}
+	afterReply := func() {
+		h.notifySendAfterReply(r, pts)
+	}
+	return update, afterReply
 }
 
 // notifyTyping emits the transient typing nudge to peerID from fromID.
@@ -137,40 +227,56 @@ func validText(s string) bool {
 	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
 }
 
-// handleSendMessage serves messages.sendMessage: it persists both sides, nudges
-// both users' sessions, and returns the sender-side Updates (updateMessageID +
-// updateNewMessage).
+// handleSendMessage is the direct handler entry used by tests and callers that
+// do not write an RPC result. The dispatcher uses handleSendMessageAfterReply
+// so the sender notification is published only after that result reaches the
+// originating connection.
 func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
+	res, _, _, err := h.handleSendMessageAfterReply(r)
+	return res, err
+}
+
+// handleSendMessageAfterReply serves messages.sendMessage: it persists both
+// sides, nudges recipient sessions, and returns sender reply metadata for the
+// atomic watermark update plus a hook that notifies other sessions after the
+// RPC result is written.
+func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+	return h.handleSendMessageAfterReplyOnConn(nil, r)
+}
+
+func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 	var req tg.MessagesSendMessageRequest
 	if err := req.Decode(r.Buf); err != nil {
-		return nil, errMethodNotImpl
+		return nil, nil, nil, errMethodNotImpl
 	}
 	if r.UserID == 0 {
-		return nil, errAuthKeyUnreg
+		return nil, nil, nil, errAuthKeyUnreg
 	}
 	// Validate text and resolve peer before any write.
 	if !validText(req.Message) {
-		return nil, errMessageEmpty
+		return nil, nil, nil, errMessageEmpty
 	}
 	peerType, toID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	replyToMsgID := int64(0)
 	if replyTo, ok := req.GetReplyTo(); ok {
 		if rep, ok := replyTo.(*tg.InputReplyToMessage); ok && rep.ReplyToMsgID > 0 {
 			if peer, ok := rep.GetReplyToPeerID(); ok && !replyPeerIsDest(peer, peerType, toID, r.UserID) {
-				return nil, errMessageIDInvalid
+				return nil, nil, nil, errMessageIDInvalid
 			}
 			replyToMsgID = int64(rep.ReplyToMsgID)
 		}
 	}
 	if peerType == store.PeerTypeChannel {
-		return h.sendChannelMessage(r, toID, &req, replyToMsgID)
+		res, err := h.sendChannelMessage(r, toID, &req, replyToMsgID)
+		return res, nil, nil, err
 	}
 
 	if peerType == store.PeerTypeChat {
-		return h.sendChatMessage(r, toID, &req, replyToMsgID)
+		res, err := h.sendChatMessage(r, toID, &req, replyToMsgID)
+		return res, nil, nil, err
 	}
 
 	// Check for a transport retry (already-stored random_id) before the rate
@@ -183,39 +289,49 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 			pts, err := h.store.MessagePts(r.Ctx, r.UserID, existing.LocalID)
 			if err != nil {
 				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
-				return nil, errInternal
+				return nil, nil, nil, errInternal
 			}
+			attempt := beginSenderRPCAt(c, r, pts)
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 			if err != nil {
 				h.log.Error("load users on retry", "user_id", r.UserID, "err", err)
-				return nil, errInternal
+				h.clearSenderAndNotify(attempt, r)
+				return nil, nil, nil, errInternal
 			}
-			return &tg.Updates{
+			res := &tg.Updates{
 				Updates: []tg.UpdateClass{
 					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
 					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: pts, PtsCount: 1},
 				},
 				Users: users,
 				Date:  int(existing.Date.Unix()),
-			}, nil
+			}
+			setSenderRPCPts(attempt, pts)
+			update, afterReply := h.retryReplyAfterSuccess(attempt, r, peerType, pts)
+			return res, update, afterReply, nil
 		} else if err != nil {
 			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
-			return nil, errInternal
+			return nil, nil, nil, errInternal
 		}
 	}
 
 	// Rate limit: new message, consume a token from the shared send budget.
 	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
+	attempt := beginSenderRPC(c, r)
 	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0, replyToMsgID)
 	if err != nil {
+		h.clearSenderAndNotify(attempt, r)
 		h.log.Error("send message", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, nil, nil, errInternal
+	}
+	setSenderRPCPts(attempt, senderPts)
+	if h.afterSenderCommit != nil {
+		h.afterSenderCommit()
 	}
 
-	h.notify(r.Ctx, r.UserID)
 	if toID != r.UserID {
 		h.notify(r.Ctx, toID)
 	}
@@ -223,9 +339,10 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("send message users", "err", err)
-		return nil, errInternal
+		h.clearSenderAndNotify(attempt, r)
+		return nil, nil, nil, errInternal
 	}
-	return &tg.Updates{
+	res := &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
 			// sendMessage never carries media; the media send path builds its own reply.
@@ -233,7 +350,19 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 		},
 		Users: users,
 		Date:  int(sender.Date.Unix()),
-	}, nil
+	}
+	update := &replyUpdate{
+		owner:   r.UserID,
+		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
+		pts:     senderPts,
+		onFailure: func() {
+			h.clearSenderAndNotify(attempt, r)
+		},
+	}
+	afterReply := func() {
+		h.notifySendAfterReply(r, senderPts)
+	}
+	return res, update, afterReply, nil
 }
 
 // requireMember is the authorization boundary for a client-supplied chat id.

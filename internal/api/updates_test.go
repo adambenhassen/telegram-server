@@ -140,6 +140,173 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 	}
 }
 
+func TestMessageUpdateProtocolConformance(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	a, err := s.CreateUser(ctx, "+15551290101")
+	if err != nil {
+		t.Fatalf("user A: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551290102")
+	if err != nil {
+		t.Fatalf("user B: %v", err)
+	}
+	if _, _, _, _, err := s.SendMessage(ctx, a.ID, a.ID, "id seed", 90100, 0, 0); err != nil {
+		t.Fatalf("seed A local id: %v", err)
+	}
+
+	send := func(fromID, toID int64, message string, randomID int64) (*tg.Updates, error) {
+		enc, err := api.SendMessageForTest(s, fromID, &tg.MessagesSendMessageRequest{
+			Peer: api.InputPeerUser(fromID, toID), Message: message, RandomID: randomID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		updates, ok := enc.(*tg.Updates)
+		if !ok {
+			return nil, fmt.Errorf("send result = %T, want *tg.Updates", enc)
+		}
+		return updates, nil
+	}
+	rpcA, err := send(a.ID, b.ID, "A to B", 90101)
+	if err != nil {
+		t.Fatalf("send A to B: %v", err)
+	}
+	rpcB, err := send(b.ID, a.ID, "B to A", 90102)
+	if err != nil {
+		t.Fatalf("send B to A: %v", err)
+	}
+
+	type protocolCase struct {
+		name       string
+		ownerID    int64
+		fromPts    int
+		message    string
+		wantID     int
+		wantOut    bool
+		wantPeerID int64
+		wantPts    int
+		result     *tg.Updates
+		userIDs    []int64
+	}
+	cases := []protocolCase{
+		{name: "A sender RPC and event", ownerID: a.ID, fromPts: 1, message: "A to B", wantID: 2, wantOut: true, wantPeerID: b.ID, wantPts: 2, result: rpcA, userIDs: []int64{a.ID, b.ID}},
+		{name: "B pushed incoming from A", ownerID: b.ID, fromPts: 0, message: "A to B", wantID: 1, wantPeerID: a.ID, wantPts: 1, userIDs: []int64{a.ID}},
+		{name: "B sender RPC and event", ownerID: b.ID, fromPts: 1, message: "B to A", wantID: 2, wantOut: true, wantPeerID: a.ID, wantPts: 2, result: rpcB, userIDs: []int64{a.ID, b.ID}},
+		{name: "A pushed incoming from B", ownerID: a.ID, fromPts: 2, message: "B to A", wantID: 3, wantPeerID: b.ID, wantPts: 3, userIDs: []int64{b.ID}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ups, users, state, err := api.BuildUpdatesForTest(s, tc.ownerID, tc.fromPts)
+			if err != nil {
+				t.Fatalf("build updates: %v", err)
+			}
+			if state.Pts < tc.wantPts {
+				t.Fatalf("owner %d state pts = %d, want at least %d", tc.ownerID, state.Pts, tc.wantPts)
+			}
+			var got *tg.UpdateNewMessage
+			for _, update := range ups {
+				newMessage, ok := update.(*tg.UpdateNewMessage)
+				if !ok {
+					continue
+				}
+				message, ok := newMessage.Message.(*tg.Message)
+				if ok && message.Message == tc.message {
+					if got != nil {
+						t.Fatalf("message %q appeared more than once in owner %d updates", tc.message, tc.ownerID)
+					}
+					got = newMessage
+				}
+			}
+			if got == nil {
+				t.Fatalf("message %q missing for owner %d", tc.message, tc.ownerID)
+			}
+			message, ok := got.Message.(*tg.Message)
+			if !ok {
+				t.Fatalf("owner %d message type = %T, want *tg.Message", tc.ownerID, got.Message)
+			}
+			if message.ID != tc.wantID || message.Out != tc.wantOut || got.Pts != tc.wantPts || got.PtsCount != 1 {
+				t.Fatalf("owner %d update = {id:%d out:%v pts:%d count:%d}, want {id:%d out:%v pts:%d count:1}", tc.ownerID, message.ID, message.Out, got.Pts, got.PtsCount, tc.wantID, tc.wantOut, tc.wantPts)
+			}
+			peer, ok := message.PeerID.(*tg.PeerUser)
+			if !ok || peer.UserID != tc.wantPeerID {
+				t.Fatalf("owner %d peer_id = %+v, want sender/peer %d", tc.ownerID, message.PeerID, tc.wantPeerID)
+			}
+			if tc.result != nil {
+				count := 0
+				for _, update := range tc.result.Updates {
+					if newMessage, ok := update.(*tg.UpdateNewMessage); ok {
+						if rpcMessage, ok := newMessage.Message.(*tg.Message); ok && rpcMessage.Message == tc.message && rpcMessage.Out {
+							count++
+							if rpcMessage.ID != message.ID || newMessage.Pts != got.Pts || newMessage.PtsCount != got.PtsCount {
+								t.Fatalf("RPC result message differs from durable event: rpc=%+v/%d/%d event=%+v/%d/%d", rpcMessage, newMessage.Pts, newMessage.PtsCount, message, got.Pts, got.PtsCount)
+							}
+						}
+					}
+				}
+				if count != 1 {
+					t.Fatalf("RPC result contains %d copies of %q, want 1", count, tc.message)
+				}
+			}
+			gotUsers := make(map[int64]*tg.User, len(users))
+			for _, userClass := range users {
+				user, ok := userClass.(*tg.User)
+				if !ok {
+					t.Fatalf("user type = %T", userClass)
+				}
+				gotUsers[user.ID] = user
+			}
+			for _, userID := range tc.userIDs {
+				user, ok := gotUsers[userID]
+				if !ok {
+					t.Fatalf("owner %d updates omitted required user %d", tc.ownerID, userID)
+				}
+				if user.AccessHash != api.DeriveUserHash(tc.ownerID, userID) {
+					t.Fatalf("owner %d user %d access hash = %d", tc.ownerID, userID, user.AccessHash)
+				}
+				if user.Self != (userID == tc.ownerID) {
+					t.Fatalf("owner %d user %d self = %v", tc.ownerID, userID, user.Self)
+				}
+				if user.ID != tc.ownerID && user.Phone != "" {
+					t.Fatalf("owner %d update leaked peer %d phone %q", tc.ownerID, userID, user.Phone)
+				}
+			}
+		})
+	}
+
+	for _, owner := range []struct {
+		id       int64
+		wantHead int
+	}{
+		{id: a.ID, wantHead: 3},
+		{id: b.ID, wantHead: 2},
+	} {
+		ups, _, state, err := api.BuildUpdatesForTest(s, owner.id, 0)
+		if err != nil {
+			t.Fatalf("owner %d contiguous updates: %v", owner.id, err)
+		}
+		pts := make([]int, 0, len(ups))
+		for _, update := range ups {
+			newMessage, ok := update.(*tg.UpdateNewMessage)
+			if !ok {
+				continue
+			}
+			if newMessage.PtsCount != 1 {
+				t.Fatalf("owner %d pts_count = %d, want 1", owner.id, newMessage.PtsCount)
+			}
+			pts = append(pts, newMessage.Pts)
+		}
+		want := make([]int, owner.wantHead)
+		for i := range want {
+			want[i] = i + 1
+		}
+		if !slices.Equal(pts, want) || state.Pts != owner.wantHead {
+			t.Fatalf("owner %d pts = %v with head %d, want %v", owner.id, pts, state.Pts, want)
+		}
+	}
+}
+
 func TestInputPeer(t *testing.T) {
 	t.Parallel()
 	pt, id, err := api.InputPeer(&tg.InputPeerChat{ChatID: 3}, 0)

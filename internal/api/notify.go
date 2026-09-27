@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -51,6 +52,24 @@ type pushConn interface {
 	PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int) (bool, error)
 }
 
+type orderedPushConn interface {
+	PushToAtWatermark(ctx context.Context, owner int64, expectedPts int, enc bin.Encoder, pts int) (pushed, stale bool, err error)
+}
+
+type rpcUpdatePushConn interface {
+	pushConn
+	AuthKeyID() int64
+	MarkRPCUpdate(owner, authKeyID int64, pts int) bool
+}
+
+type pendingRPCUpdateConn interface {
+	PendingRPCUpdate(owner int64) (pts int, pending bool)
+}
+
+type pendingRPCReadyConn interface {
+	PendingRPCUpdateReady(owner int64) bool
+}
+
 // Deliver pushes userID's not-yet-delivered events to each of its live conns,
 // advancing each conn's last-pushed pts. It is best-effort: a push failure is
 // logged and the client's next getDifference backfills.
@@ -59,14 +78,15 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	if len(conns) == 0 {
 		return
 	}
+	suppressed, _ := store.SuppressedUpdateFromContext(ctx)
 	targets := make([]pushConn, len(conns))
 	for i, c := range conns {
 		targets[i] = c
 	}
 	acceptedAt, _ := store.NotificationAcceptedAt(ctx)
-	u.deliverAt(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
+	u.deliverAtSuppressed(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
 		return u.h.buildUpdates(ctx, userID, fromPts)
-	}, acceptedAt)
+	}, acceptedAt, suppressed)
 }
 
 // maxDeliveryRounds caps the store round trips one notification may cost. Two
@@ -76,6 +96,8 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 // spread across many batches turn into one window per socket, which is the
 // amplification this path exists to avoid.
 const maxDeliveryRounds = 2
+
+const maxDeliveryRetries = 4
 
 // deliver builds one batch from the lowest watermark among conns and gives each
 // conn the suffix above its own, so the store work one notification costs does
@@ -102,8 +124,13 @@ func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, b
 }
 
 func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error), acceptedAt time.Time) {
+	u.deliverAtSuppressed(ctx, userID, conns, build, acceptedAt, store.SuppressedUpdate{})
+}
+
+func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error), acceptedAt time.Time, suppressed store.SuppressedUpdate) {
 	var head int
-	for round := 0; round < maxDeliveryRounds && len(conns) > 0; round++ {
+	retries := 0
+	for round := 0; round < maxDeliveryRounds && len(conns) > 0; {
 		lo, hi := conns[0].LastPushedPts(), conns[0].LastPushedPts()
 		for _, c := range conns[1:] {
 			w := c.LastPushedPts()
@@ -135,6 +162,7 @@ func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn,
 		}
 
 		var ahead []pushConn
+		retry := false
 		for _, c := range conns {
 			watermark := c.LastPushedPts()
 			if watermark < from {
@@ -152,6 +180,102 @@ func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn,
 			if len(ups) == 0 {
 				continue
 			}
+			if pendingConn, ok := c.(pendingRPCUpdateConn); ok {
+				pendingPts, pending := pendingConn.PendingRPCUpdate(userID)
+				if pending {
+					pendingReady := true
+					if readyConn, ok := c.(pendingRPCReadyConn); ok {
+						pendingReady = readyConn.PendingRPCUpdateReady(userID)
+					}
+					pendingRetry := false
+					for pending {
+						keyedPending := false
+						if rpcConn, ok := c.(rpcUpdatePushConn); ok && pendingPts > 0 && suppressed.AuthKeyID != 0 && suppressed.Pts == pendingPts && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+							// Let the keyed notification account the sender event after
+							// its prefix has been delivered. A non-contiguous RPC result
+							// deliberately keeps this barrier active.
+							keyedPending = true
+						}
+						if keyedPending || !pendingReady || pendingPts == 0 || pendingPts > b.state.Pts {
+							break
+						}
+
+						if rpcConn, ok := c.(rpcUpdatePushConn); ok {
+							if nextWatermark, accounted := accountPendingRPCUpdate(userID, rpcConn, b, watermark, pendingPts); accounted {
+								watermark = nextWatermark
+								ups = b.above(watermark)
+								pendingPts, pending = pendingConn.PendingRPCUpdate(userID)
+								if pending {
+									if readyConn, ok := c.(pendingRPCReadyConn); ok {
+										pendingReady = readyConn.PendingRPCUpdateReady(userID)
+									}
+								}
+								continue
+							}
+						}
+
+						if pendingPts > watermark {
+							target := sort.SearchInts(b.pts, pendingPts)
+							if target < len(b.pts) && b.pts[target] == pendingPts {
+								if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); isNewMessage {
+									if u.deliverBeforePendingRPC(ctx, userID, c, b, watermark, target, acceptedAt) {
+										pendingRetry = true
+										break
+									}
+									if nextWatermark := c.LastPushedPts(); nextWatermark > watermark {
+										watermark = nextWatermark
+										ups = b.above(watermark)
+										pendingPts, pending = pendingConn.PendingRPCUpdate(userID)
+										if pending {
+											if readyConn, ok := c.(pendingRPCReadyConn); ok {
+												pendingReady = readyConn.PendingRPCUpdateReady(userID)
+											}
+										}
+										continue
+									}
+								}
+							}
+						}
+						break
+					}
+					if pendingRetry {
+						retry = true
+						break
+					}
+					keyedPending := false
+					if rpcConn, ok := c.(rpcUpdatePushConn); ok && pending && pendingPts > 0 && suppressed.AuthKeyID != 0 && suppressed.Pts == pendingPts && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+						keyedPending = true
+					}
+					if pending && !keyedPending && (pendingPts == 0 || pendingPts <= b.state.Pts) {
+						// Do not put this origin in the next delivery window while
+						// its result barrier is active. Advancing past the skipped
+						// event would create a pts gap on the wire.
+						continue
+					}
+				}
+			}
+			if len(ups) == 0 {
+				if b.more && c.LastPushedPts() < b.state.Pts {
+					ahead = append(ahead, c)
+				}
+				continue
+			}
+			if rpcConn, ok := c.(rpcUpdatePushConn); ok && suppressed.AuthKeyID != 0 && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+				start := sort.SearchInts(b.pts, watermark+1)
+				target := sort.SearchInts(b.pts, suppressed.Pts)
+				if target < len(b.pts) && b.pts[target] == suppressed.Pts && target >= start {
+					if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); isNewMessage {
+						if u.deliverWithSuppression(ctx, userID, rpcConn, b, watermark, start, target, suppressed, acceptedAt) {
+							retry = true
+							break
+						}
+						if b.more && rpcConn.LastPushedPts() < b.state.Pts {
+							ahead = append(ahead, c)
+						}
+						continue
+					}
+				}
+			}
 			// Addressed to userID: this snapshot was taken before the batch was
 			// built, and the conn's auth key can rebind to another user in between.
 			// A push dropped for that reason costs nothing — the user's next poll
@@ -159,14 +283,128 @@ func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn,
 			//
 			// users covers the whole batch, so a conn taking a suffix gets a
 			// superset of the users it needs, which a client ignores.
-			pushed, err := c.PushTo(ctx, userID, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts)
+			pushed, stale, err := pushOrdered(ctx, c, userID, watermark, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts)
+			if stale {
+				retry = true
+				break
+			}
 			u.recordPushOutcome(acceptedAt, pushed, err)
 			if err != nil {
 				u.log.Info("deliver push", "user_id", userID, "err", err)
 			}
 		}
+		if retry {
+			retries++
+			if retries > maxDeliveryRetries {
+				u.log.Error("deliver retries exhausted", "user_id", userID, "retries", retries)
+				return
+			}
+			continue
+		}
+		retries = 0
 		conns = ahead
+		round++
 	}
+}
+
+// accountPendingRPCUpdate releases a known sender-result barrier when generic
+// delivery has reached the event's immediate prefix. The RPC result already
+// delivered that event to this conn, so accounting it advances the watermark
+// without writing a duplicate update; the caller then pushes the remaining
+// suffix. A barrier farther ahead still needs its prefix pushed first.
+func accountPendingRPCUpdate(owner int64, conn rpcUpdatePushConn, b updateBatch, watermark, pendingPts int) (int, bool) {
+	if pendingPts <= 0 {
+		return watermark, false
+	}
+	if pendingPts <= watermark {
+		if !conn.MarkRPCUpdate(owner, conn.AuthKeyID(), pendingPts) {
+			return watermark, false
+		}
+		return conn.LastPushedPts(), true
+	}
+	if pendingPts != watermark+1 {
+		return watermark, false
+	}
+	target := sort.SearchInts(b.pts, pendingPts)
+	start := sort.SearchInts(b.pts, watermark+1)
+	if target >= len(b.pts) || b.pts[target] != pendingPts || target < start {
+		return watermark, false
+	}
+	if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); !isNewMessage {
+		return watermark, false
+	}
+	if !conn.MarkRPCUpdate(owner, conn.AuthKeyID(), pendingPts) {
+		return watermark, false
+	}
+	return conn.LastPushedPts(), true
+}
+
+func pushOrdered(ctx context.Context, conn pushConn, owner int64, expectedPts int, enc bin.Encoder, pts int) (pushed, stale bool, err error) {
+	if guarded, ok := conn.(orderedPushConn); ok {
+		return guarded.PushToAtWatermark(ctx, owner, expectedPts, enc, pts)
+	}
+	pushed, err = conn.PushTo(ctx, owner, enc, pts)
+	return pushed, false, err
+}
+
+func (u *Updater) deliverBeforePendingRPC(ctx context.Context, userID int64, conn pushConn, b updateBatch, watermark, target int, acceptedAt time.Time) bool {
+	start := sort.SearchInts(b.pts, watermark+1)
+	if target <= start {
+		return false
+	}
+	prefixPts := b.pts[target-1]
+	pushed, stale, err := pushOrdered(ctx, conn, userID, watermark, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts)
+	if stale {
+		return true
+	}
+	u.recordPushOutcome(acceptedAt, pushed, err)
+	if err != nil {
+		u.log.Info("deliver push before pending RPC update", "user_id", userID, "err", err)
+	}
+	return false
+}
+
+func (u *Updater) deliverWithSuppression(ctx context.Context, userID int64, conn rpcUpdatePushConn, b updateBatch, watermark, start, target int, suppressed store.SuppressedUpdate, acceptedAt time.Time) bool {
+	if target > start {
+		prefixPts := b.pts[target-1]
+		pushed, stale, err := pushOrdered(ctx, conn, userID, watermark, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts)
+		if stale {
+			return true
+		}
+		u.recordPushOutcome(acceptedAt, pushed, err)
+		if err != nil {
+			u.log.Info("deliver push before RPC update", "user_id", userID, "err", err)
+			return true
+		}
+		if !pushed {
+			return false
+		}
+	}
+	if !conn.MarkRPCUpdate(userID, suppressed.AuthKeyID, suppressed.Pts) {
+		return false
+	}
+	suffixStart := target + 1
+	suffixEnd := len(b.ups)
+	if pendingConn, ok := conn.(pendingRPCUpdateConn); ok {
+		if nextPts, pending := pendingConn.PendingRPCUpdate(userID); pending && nextPts > suppressed.Pts {
+			nextTarget := sort.SearchInts(b.pts, nextPts)
+			if nextTarget < suffixEnd && nextTarget >= suffixStart {
+				suffixEnd = nextTarget
+			}
+		}
+	}
+	if suffixStart >= suffixEnd {
+		return false
+	}
+	pushed, stale, err := pushOrdered(ctx, conn, userID, suppressed.Pts, wrapUpdates(b.ups[suffixStart:suffixEnd], b.users, b.chats, b.state), b.pts[suffixEnd-1])
+	if stale {
+		return true
+	}
+	u.recordPushOutcome(acceptedAt, pushed, err)
+	if err != nil {
+		u.log.Info("deliver push after RPC update", "user_id", userID, "err", err)
+	}
+	return false
 }
 
 func (u *Updater) recordPushOutcome(acceptedAt time.Time, pushed bool, err error) {

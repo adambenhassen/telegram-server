@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,10 +83,31 @@ type Conn struct {
 	// dispatches this connection's frames.
 	unimplemented unimplementedBudget
 
-	// lastPushedPts is the highest pts already pushed to this conn, so a
-	// notification never re-delivers events. Delivery writes it and the bounded
-	// admin sampler reads it; atomic access keeps the registry hand-off safe.
+	// lastPushedPts is the highest owner pts delivered to this conn by a push or
+	// accounted for by its send RPC result, so a notification never re-delivers
+	// events. Delivery writes it and the bounded admin sampler reads it; atomic
+	// access keeps the registry hand-off safe.
 	lastPushedPts atomic.Int64
+
+	// pendingRPCUpdate holds sender-result barriers from commit through keyed
+	// notification accounting. A zero pts is a barrier before the store commit
+	// returns; a known pts remains unready until the RPC result reaches the
+	// connection. The slice is ordered by request, so back-to-back sends cannot
+	// replace an unresolved earlier result.
+	// It is guarded by writeMu with the socket state so a generic notification
+	// cannot pass the result write between its check and push.
+	pendingRPCOwner   int64
+	pendingRPCAuthKey int64
+	pendingRPCPts     []int
+	pendingRPCIDs     []uint64
+	pendingRPCReady   []bool
+	nextPendingRPCID  uint64
+	// pendingRPCOverflow holds sender-result barriers that arrive after the
+	// regular queue reaches its cap. The slice is bounded separately because a
+	// burst can have several concurrent cap-refused attempts; each entry keeps
+	// its own reservation so an aborted attempt cannot release another one.
+	pendingRPCOverflow          []pendingRPCOverflowEntry
+	pendingRPCOverflowSaturated bool
 
 	// authKeyID mirrors authKey.IntID() for readers that must not take writeMu.
 	// Eviction runs on the single LISTEN goroutine and matches conns by key id,
@@ -105,7 +127,39 @@ type Conn struct {
 	pendingLoginAt atomic.Int64
 }
 
-// LastPushedPts returns the highest pts already pushed to this connection.
+// RPCUpdateReservation identifies the sender-result barrier registered by one
+// request attempt. A deduplicated retry receives a valid reservation without
+// owning a queue entry, so its failure cannot clear the original attempt. An
+// overflow reservation owns one entry in the bounded origin-suppression hold
+// established at reservation time; it does not consume another queue entry.
+type RPCUpdateReservation struct {
+	owner    int64
+	authKey  int64
+	id       uint64
+	owned    bool
+	overflow bool
+}
+
+type pendingRPCOverflowEntry struct {
+	id    uint64
+	pts   int
+	ready bool
+}
+
+// maxPendingRPCUpdates bounds the regular unresolved sender-result queue. Once
+// the bound is reached, BeginRPCUpdate records the attempt in the separately
+// bounded overflow hold. The persisted event remains recoverable through
+// getDifference instead of growing this connection-local queue without limit.
+const maxPendingRPCUpdates = 64
+
+// maxPendingRPCOverflowUpdates keeps the fallback bookkeeping bounded even if
+// callers keep starting sends while the regular barrier queue is full. Once
+// this cap is reached, a conservative saturated hold remains until rebind;
+// getDifference still recovers the durable events.
+const maxPendingRPCOverflowUpdates = maxPendingRPCUpdates
+
+// LastPushedPts returns the highest contiguous owner pts already pushed to this
+// connection or accounted for by a successful RPC result.
 func (c *Conn) LastPushedPts() int {
 	return int(c.lastPushedPts.Load())
 }
@@ -115,6 +169,327 @@ func (c *Conn) LastPushedPts() int {
 // on purpose: it is read while matching an eviction against live conns.
 func (c *Conn) AuthKeyID() int64 {
 	return c.authKeyID.Load()
+}
+
+// MarkRPCUpdate accounts for the message update identified in the send RPC
+// result for this auth key. If that reply is lost, getDifference still replays
+// the event because only this connection's push watermark advances. The owner,
+// key check and watermark advance share writeMu with pushes and rebinds.
+func (c *Conn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
+	if authKeyID == 0 || pts <= 0 {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.markRPCUpdateLocked(owner, authKeyID, pts)
+}
+
+// BeginRPCUpdate blocks generic delivery to the originating connection while
+// a sender result is being prepared. Pass pts=0 before the store commit and
+// set it with SetRPCUpdatePts as soon as the commit returns.
+func (c *Conn) BeginRPCUpdate(owner, authKeyID int64, pts int) bool {
+	_, ok := c.BeginRPCUpdateAttempt(owner, authKeyID, pts)
+	return ok
+}
+
+// BeginRPCUpdateAttempt blocks generic delivery to the originating connection
+// while one sender result is being prepared and returns ownership for that
+// request attempt. A known pts retry deduplicates against the existing barrier;
+// it does not own that barrier. Pass pts=0 before the store commit and set it
+// with SetRPCUpdatePtsAttempt as soon as the commit returns.
+func (c *Conn) BeginRPCUpdateAttempt(owner, authKeyID int64, pts int) (RPCUpdateReservation, bool) {
+	if owner <= 0 || authKeyID == 0 || pts < 0 {
+		return RPCUpdateReservation{}, false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.owner != owner || c.authKeyID.Load() != authKeyID {
+		return RPCUpdateReservation{}, false
+	}
+	if pts > 0 {
+		if i := slices.Index(c.pendingRPCPts, pts); i >= 0 {
+			return RPCUpdateReservation{
+				owner:   owner,
+				authKey: authKeyID,
+				id:      c.pendingRPCIDs[i],
+			}, true
+		}
+		for _, entry := range c.pendingRPCOverflow {
+			if entry.pts == pts {
+				return RPCUpdateReservation{
+					owner:    owner,
+					authKey:  authKeyID,
+					id:       entry.id,
+					overflow: true,
+				}, true
+			}
+		}
+	}
+	if len(c.pendingRPCOverflow) > 0 || c.pendingRPCOverflowSaturated {
+		if c.pendingRPCOverflowSaturated {
+			return RPCUpdateReservation{owner: owner, authKey: authKeyID, overflow: true}, false
+		}
+		if len(c.pendingRPCOverflow) >= maxPendingRPCOverflowUpdates {
+			c.pendingRPCOverflowSaturated = true
+			return RPCUpdateReservation{owner: owner, authKey: authKeyID, overflow: true}, false
+		}
+		c.nextPendingRPCID++
+		if c.nextPendingRPCID == 0 {
+			c.nextPendingRPCID = 1
+		}
+		c.pendingRPCOverflow = append(c.pendingRPCOverflow, pendingRPCOverflowEntry{id: c.nextPendingRPCID})
+		return RPCUpdateReservation{owner: owner, authKey: authKeyID, id: c.nextPendingRPCID, owned: true, overflow: true}, false
+	}
+	if len(c.pendingRPCPts) >= maxPendingRPCUpdates {
+		c.nextPendingRPCID++
+		if c.nextPendingRPCID == 0 {
+			c.nextPendingRPCID = 1
+		}
+		c.pendingRPCOverflow = append(c.pendingRPCOverflow, pendingRPCOverflowEntry{id: c.nextPendingRPCID})
+		return RPCUpdateReservation{owner: owner, authKey: authKeyID, id: c.nextPendingRPCID, owned: true, overflow: true}, false
+	}
+	c.nextPendingRPCID++
+	if c.nextPendingRPCID == 0 {
+		c.nextPendingRPCID = 1
+	}
+	c.pendingRPCOwner = owner
+	c.pendingRPCAuthKey = authKeyID
+	c.pendingRPCPts = append(c.pendingRPCPts, pts)
+	c.pendingRPCIDs = append(c.pendingRPCIDs, c.nextPendingRPCID)
+	c.pendingRPCReady = append(c.pendingRPCReady, false)
+	return RPCUpdateReservation{
+		owner:   owner,
+		authKey: authKeyID,
+		id:      c.nextPendingRPCID,
+		owned:   true,
+	}, true
+}
+
+// SetRPCUpdatePts records the committed sender event's pts on an in-flight
+// result barrier. It is separate from BeginRPCUpdate because the pts is
+// allocated by the store transaction.
+func (c *Conn) SetRPCUpdatePts(owner, authKeyID int64, pts int) bool {
+	if owner <= 0 || authKeyID == 0 || pts <= 0 {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.pendingRPCOwner != owner || c.pendingRPCAuthKey != authKeyID || c.owner != owner || c.authKeyID.Load() != authKeyID {
+		return false
+	}
+	for i := range slices.Backward(c.pendingRPCPts) {
+		if c.pendingRPCPts[i] == 0 {
+			c.pendingRPCPts[i] = pts
+			return true
+		}
+	}
+	return false
+}
+
+// SetRPCUpdatePtsAttempt records the committed sender event's pts on the
+// barrier owned by one request attempt. An overflow reservation keeps its own
+// pts so the result write and keyed delivery can release only that hold.
+func (c *Conn) SetRPCUpdatePtsAttempt(reservation RPCUpdateReservation, pts int) bool {
+	if pts <= 0 {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.owner != reservation.owner || c.authKeyID.Load() != reservation.authKey {
+		return false
+	}
+	if reservation.overflow {
+		if reservation.id == 0 {
+			return c.pendingRPCOverflowSaturated
+		}
+		for i := range c.pendingRPCOverflow {
+			if c.pendingRPCOverflow[i].id != reservation.id {
+				continue
+			}
+			if !reservation.owned {
+				return c.pendingRPCOverflow[i].pts == pts
+			}
+			if c.pendingRPCOverflow[i].pts == 0 {
+				c.pendingRPCOverflow[i].pts = pts
+				return true
+			}
+			return c.pendingRPCOverflow[i].pts == pts
+		}
+		return false
+	}
+	if !reservation.owned {
+		return false
+	}
+	if c.pendingRPCOwner != reservation.owner || c.pendingRPCAuthKey != reservation.authKey {
+		return false
+	}
+	for i, id := range c.pendingRPCIDs {
+		if id != reservation.id {
+			continue
+		}
+		if c.pendingRPCPts[i] == 0 {
+			c.pendingRPCPts[i] = pts
+			return true
+		}
+		return c.pendingRPCPts[i] == pts
+	}
+	return false
+}
+
+// ClearRPCUpdate releases a result barrier after the result write or an
+// aborted post-commit path. A failed result can then use a generic nudge to
+// recover the event for every live sender session.
+func (c *Conn) ClearRPCUpdate(owner, authKeyID int64) bool {
+	if owner <= 0 || authKeyID == 0 {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.clearRPCUpdateLocked(owner, authKeyID)
+}
+
+// ClearRPCUpdateAttempt releases only the barrier registered by the given
+// request attempt. Deduplicated attempts own nothing. A committed overflow
+// attempt is cleared here when its result write fails, allowing the generic
+// notification to deliver the durable event instead.
+func (c *Conn) ClearRPCUpdateAttempt(reservation RPCUpdateReservation) bool {
+	if reservation.overflow {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		if reservation.id == 0 || !reservation.owned || c.owner != reservation.owner || c.authKeyID.Load() != reservation.authKey {
+			return false
+		}
+		for i, entry := range c.pendingRPCOverflow {
+			if entry.id != reservation.id {
+				continue
+			}
+			c.removePendingRPCOverflowAtLocked(i)
+			return true
+		}
+		return false
+	}
+	if !reservation.owned {
+		return false
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.pendingRPCOwner != reservation.owner || c.pendingRPCAuthKey != reservation.authKey || c.owner != reservation.owner || c.authKeyID.Load() != reservation.authKey {
+		return false
+	}
+	for i, id := range c.pendingRPCIDs {
+		if id == reservation.id {
+			c.removePendingRPCAtLocked(i)
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Conn) clearRPCUpdateLocked(owner, authKeyID int64) bool {
+	if c.pendingRPCOwner != owner || c.pendingRPCAuthKey != authKeyID || len(c.pendingRPCPts) == 0 {
+		return false
+	}
+	c.removePendingRPCAtLocked(len(c.pendingRPCPts) - 1)
+	return true
+}
+
+func (c *Conn) removePendingRPCAtLocked(index int) {
+	copy(c.pendingRPCPts[index:], c.pendingRPCPts[index+1:])
+	copy(c.pendingRPCIDs[index:], c.pendingRPCIDs[index+1:])
+	copy(c.pendingRPCReady[index:], c.pendingRPCReady[index+1:])
+	c.pendingRPCPts = c.pendingRPCPts[:len(c.pendingRPCPts)-1]
+	c.pendingRPCIDs = c.pendingRPCIDs[:len(c.pendingRPCIDs)-1]
+	c.pendingRPCReady = c.pendingRPCReady[:len(c.pendingRPCReady)-1]
+	if len(c.pendingRPCPts) == 0 {
+		c.pendingRPCOwner = 0
+		c.pendingRPCAuthKey = 0
+		c.pendingRPCIDs = nil
+		c.pendingRPCReady = nil
+	}
+}
+
+func (c *Conn) removePendingRPCOverflowAtLocked(index int) {
+	copy(c.pendingRPCOverflow[index:], c.pendingRPCOverflow[index+1:])
+	c.pendingRPCOverflow = c.pendingRPCOverflow[:len(c.pendingRPCOverflow)-1]
+}
+
+// PendingRPCUpdate reports the sender-result barrier for owner. A true result
+// with pts=0 means the send is committed-or-in-flight but its event pts is not
+// known yet, so generic delivery must wait rather than risk crossing it.
+func (c *Conn) PendingRPCUpdate(owner int64) (pts int, pending bool) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.pendingRPCOwner == owner && len(c.pendingRPCPts) > 0 {
+		return c.pendingRPCPts[0], true
+	}
+	if c.owner == owner {
+		if len(c.pendingRPCOverflow) > 0 {
+			return c.pendingRPCOverflow[0].pts, true
+		}
+		if c.pendingRPCOverflowSaturated {
+			return 0, true
+		}
+	}
+	return 0, false
+}
+
+// PendingRPCUpdateReady reports whether the first sender-result barrier has
+// reached the wire. Delivery must hold a known-pts barrier until this becomes
+// true: the handler records the committed pts before the RPC result write, so
+// a generic notification can otherwise push its prefix while the result is
+// still paused or fails.
+func (c *Conn) PendingRPCUpdateReady(owner int64) bool {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.pendingRPCOwner == owner && len(c.pendingRPCPts) > 0 {
+		return len(c.pendingRPCReady) > 0 && c.pendingRPCReady[0]
+	}
+	if c.owner == owner && len(c.pendingRPCOverflow) > 0 {
+		return c.pendingRPCOverflow[0].ready
+	}
+	return false
+}
+
+func (c *Conn) markRPCUpdateLocked(owner, authKeyID int64, pts int) bool {
+	if authKeyID == 0 || pts <= 0 {
+		return false
+	}
+	if c.owner != owner || c.authKeyID.Load() != authKeyID {
+		return false
+	}
+	current := c.lastPushedPts.Load()
+	if len(c.pendingRPCPts) > 0 {
+		pendingPts := c.pendingRPCPts[0]
+		if pendingPts == 0 {
+			return false
+		}
+		if pendingPts != pts {
+			return int64(pts) <= current
+		}
+		if int64(pts) > current {
+			c.lastPushedPts.Store(int64(pts))
+		}
+		c.removePendingRPCAtLocked(0)
+		return true
+	}
+	if len(c.pendingRPCOverflow) > 0 {
+		pendingPts := c.pendingRPCOverflow[0].pts
+		if pendingPts == 0 {
+			return false
+		}
+		if pendingPts != pts {
+			return int64(pts) <= current
+		}
+		if int64(pts) > current {
+			c.lastPushedPts.Store(int64(pts))
+		}
+		c.removePendingRPCOverflowAtLocked(0)
+		return true
+	}
+	if int64(pts) > current {
+		c.lastPushedPts.Store(int64(pts))
+	}
+	return true
 }
 
 // PendingLogin reports whether auth.signIn has staged a password challenge on
@@ -160,6 +535,13 @@ func (c *Conn) setOwner(userID int64) {
 	}
 	c.owner = userID
 	c.lastPushedPts.Store(0)
+	c.pendingRPCOwner = 0
+	c.pendingRPCAuthKey = 0
+	c.pendingRPCPts = nil
+	c.pendingRPCIDs = nil
+	c.pendingRPCReady = nil
+	c.pendingRPCOverflow = nil
+	c.pendingRPCOverflowSaturated = false
 }
 
 func newConn(
@@ -183,10 +565,21 @@ func newConn(
 
 // setKey binds the connection to the auth key for the frame being handled.
 func (c *Conn) setKey(key crypto.AuthKey) {
+	keyID := key.IntID()
 	c.writeMu.Lock()
+	keyChanged := c.authKey.IntID() != keyID
 	c.authKey = key
+	if keyChanged {
+		c.pendingRPCOwner = 0
+		c.pendingRPCAuthKey = 0
+		c.pendingRPCPts = nil
+		c.pendingRPCIDs = nil
+		c.pendingRPCReady = nil
+		c.pendingRPCOverflow = nil
+		c.pendingRPCOverflowSaturated = false
+	}
 	c.writeMu.Unlock()
-	c.authKeyID.Store(key.IntID())
+	c.authKeyID.Store(keyID)
 }
 
 // setSession records the client session id for subsequent server writes.
@@ -284,20 +677,130 @@ func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int
 // deadline that kills the reply would turn finished work into a dropped
 // connection. What bounds a socket write is conn.writeTimeout, applied below.
 func (c *Conn) SendResult(req *Request, msg bin.Encoder) error {
+	return c.sendResult(req, msg, nil)
+}
+
+// SendResultAndMarkRPCUpdate writes msg and advances the originating session's
+// contiguous push watermark while the result write still holds writeMu. A
+// concurrent push therefore cannot land between the result and its watermark,
+// which would expose a later pts before the client has received the result
+// update.
+func (c *Conn) SendResultAndMarkRPCUpdate(req *Request, msg bin.Encoder, owner, authKeyID int64, pts int) error {
+	return c.sendResult(req, msg, func() {
+		c.markRPCResultLocked(owner, authKeyID, pts)
+	})
+}
+
+// markRPCResultLocked advances the contiguous push watermark for an RPC result.
+// A result can carry a later pts while this connection still lacks an earlier
+// event. Keep the barrier active across that gap so a generic notification
+// cannot push the result event before its keyed notification accounts it.
+func (c *Conn) markRPCResultLocked(owner, authKeyID int64, pts int) bool {
+	if authKeyID == 0 || pts <= 0 {
+		return false
+	}
+	if c.owner != owner || c.authKeyID.Load() != authKeyID {
+		return false
+	}
+	pendingIndex := -1
+	if c.pendingRPCOwner == owner && c.pendingRPCAuthKey == authKeyID {
+		for i := range slices.Backward(c.pendingRPCPts) {
+			if c.pendingRPCPts[i] == pts {
+				pendingIndex = i
+				break
+			}
+		}
+	}
+	overflowIndex := -1
+	for i := range slices.Backward(c.pendingRPCOverflow) {
+		if c.pendingRPCOverflow[i].pts == pts {
+			overflowIndex = i
+			break
+		}
+	}
+	current := c.lastPushedPts.Load()
+	if pendingIndex >= 0 && pendingIndex < len(c.pendingRPCReady) {
+		c.pendingRPCReady[pendingIndex] = true
+	}
+	if overflowIndex >= 0 {
+		c.pendingRPCOverflow[overflowIndex].ready = true
+	}
+	switch {
+	case int64(pts) <= current:
+		if pendingIndex >= 0 {
+			c.removePendingRPCAtLocked(pendingIndex)
+		} else if overflowIndex >= 0 {
+			c.removePendingRPCOverflowAtLocked(overflowIndex)
+		}
+	case int64(pts) == current+1:
+		c.lastPushedPts.Store(int64(pts))
+		if pendingIndex >= 0 {
+			c.removePendingRPCAtLocked(pendingIndex)
+		} else if overflowIndex >= 0 {
+			c.removePendingRPCOverflowAtLocked(overflowIndex)
+		}
+	}
+	return true
+}
+
+// PushToAtWatermark is the ordered-update variant of PushTo. It drops a batch
+// that was built from a stale watermark so the delivery loop can rebuild it
+// after a concurrent RPC result or push changes the connection state.
+func (c *Conn) PushToAtWatermark(ctx context.Context, owner int64, expectedPts int, enc bin.Encoder, pts int) (bool, bool, error) {
+	var b bin.Buffer
+	if err := enc.Encode(&b); err != nil {
+		return false, false, fmt.Errorf("push encode [%T]: %w", enc, MarkPushEncodeError(err))
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.owner != owner {
+		return false, false, nil
+	}
+	if int(c.lastPushedPts.Load()) != expectedPts {
+		return false, true, nil
+	}
+	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
+		return false, false, fmt.Errorf("push [%T]: %w", enc, err)
+	}
+	if pts > 0 && int64(pts) > c.lastPushedPts.Load() {
+		c.lastPushedPts.Store(int64(pts))
+	}
+	return true, false, nil
+}
+
+func (c *Conn) sendResult(req *Request, msg bin.Encoder, onSuccess func()) error {
 	var buf bin.Buffer
 	if err := msg.Encode(&buf); err != nil {
 		req.rpcResult = RPCResultInternal
 		return fmt.Errorf("encode result: %w", err)
 	}
-	if err := c.send(context.WithoutCancel(req.Ctx), proto.MessageServerResponse, &proto.Result{
+	var wire bin.Buffer
+	if err := (&proto.Result{
 		RequestMessageID: req.MsgID,
 		Result:           buf.Raw(),
-	}); err != nil {
-		req.rpcResult = RPCResultTransportFailure
-		return fmt.Errorf("send result [%T]: %w", msg, err)
+	}).Encode(&wire); err != nil {
+		req.rpcResult = RPCResultInternal
+		return fmt.Errorf("encode result envelope: %w", err)
 	}
-	if req.rpcResult == "" {
-		req.rpcResult = RPCResultSuccess
+	var sendErr error
+	func() {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		sendErr = c.sendLocked(context.WithoutCancel(req.Ctx), proto.MessageServerResponse, &wire)
+		if sendErr != nil {
+			req.rpcResult = RPCResultTransportFailure
+			return
+		}
+		if req.rpcResult == "" {
+			req.rpcResult = RPCResultSuccess
+		}
+		if onSuccess != nil {
+			onSuccess()
+		}
+	}()
+	if sendErr != nil {
+		return fmt.Errorf("send result [%T]: %w", msg, sendErr)
 	}
 	return nil
 }
