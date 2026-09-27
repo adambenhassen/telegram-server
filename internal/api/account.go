@@ -161,7 +161,7 @@ func (h *handlers) handleUpdateUsername(r *mtproto.Request) (bin.Encoder, error)
 	if err := h.store.UpdateUsername(r.Ctx, r.UserID, username); err != nil {
 		switch {
 		case errors.Is(err, store.ErrUsernameOccupied):
-			return nil, errUsernameOccupied
+			return nil, h.usernameClaimOccupiedError(r.Ctx, r.UserID, username)
 		case errors.Is(err, store.ErrUsernameFloodWait):
 			return nil, errUsernameFloodWait
 		case errors.Is(err, store.ErrUsernameIsLoginCredential):

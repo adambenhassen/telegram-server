@@ -125,6 +125,20 @@ func (h *handlers) handleResolveUsername(r *mtproto.Request) (bin.Encoder, error
 	}
 }
 
+// usernameClaimOccupiedError charges a failed occupied-handle claim against
+// the same per-account budget used by contacts.resolveUsername before exposing
+// the collision to the caller.
+func (h *handlers) usernameClaimOccupiedError(ctx context.Context, callerID int64, handle string) error {
+	if err := h.store.CheckAndChargeUsernameLookup(ctx, callerID, strings.ToLower(handle)); err != nil {
+		if errors.Is(err, store.ErrUsernameLookupQuotaExceeded) {
+			return errUsernameLookupFloodWait
+		}
+		h.log.Error("username claim: quota", "user_id", callerID, "err", err)
+		return errInternal
+	}
+	return errUsernameOccupied
+}
+
 // channelToTLForResolve renders a channel for contacts.resolveUsername.
 // All callers see the same public view — membership is never checked.
 func (h *handlers) channelToTLForResolve(ctx context.Context, c store.Channel, viewerID int64) (tg.ChatClass, error) {

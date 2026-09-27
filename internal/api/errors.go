@@ -176,8 +176,8 @@ var (
 	// no account — indistinguishable from a private channel or a handle that
 	// was cleared, by the non-oracle invariant.
 	errUsernameNotOccupied = rpcErr(400, "USERNAME_NOT_OCCUPIED")
-	// errUsernameLookupFloodWait rejects a contacts.resolveUsername that would
-	// take the caller past their per-account username lookup quota.
+	// errUsernameLookupFloodWait rejects a username lookup or occupied claim
+	// that would take the caller past their per-account lookup quota.
 	errUsernameLookupFloodWait = rpcErr(420, "FLOOD_WAIT_86400")
 	// errUsernameNotModified rejects a username change for a login_mode='username'
 	// account — the handle is the credential, not changeable.

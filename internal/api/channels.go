@@ -1115,7 +1115,7 @@ func (h *handlers) handleEditChannelUsername(r *mtproto.Request) (bin.Encoder, e
 			// transaction). Same wire error as the handler-level check.
 			return nil, errPeerIDInvalid
 		case errors.Is(err, store.ErrUsernameOccupied):
-			return nil, errUsernameOccupied
+			return nil, h.usernameClaimOccupiedError(r.Ctx, r.UserID, username)
 		case errors.Is(err, store.ErrUsernameFloodWait):
 			return nil, errUsernameFloodWait
 		default:
