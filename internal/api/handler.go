@@ -250,7 +250,9 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesGetPeerDialogsRequestTypeID, h.handleGetPeerDialogs)
 	register(d, tg.MessagesGetHistoryRequestTypeID, h.handleGetHistory)
 	register(d, tg.MessagesReadHistoryRequestTypeID, h.handleReadHistory)
-	register(d, tg.MessagesEditMessageRequestTypeID, h.handleEditMessage)
+	registerReplyAfterSuccess(d, tg.MessagesEditMessageRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		return h.handleEditMessageAfterReplyOnConn(c, req)
+	})
 	register(d, tg.MessagesDeleteMessagesRequestTypeID, h.handleDeleteMessages)
 	register(d, tg.MessagesSetTypingRequestTypeID, h.handleSetTyping)
 	register(d, tg.MessagesSendReactionRequestTypeID, h.handleSendReaction)
@@ -260,7 +262,9 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesGetStickerSetRequestTypeID, h.handleGetStickerSet)
 	register(d, tg.MessagesGetAllDraftsRequestTypeID, h.handleGetAllDrafts)
 	register(d, tg.MessagesReceivedMessagesRequestTypeID, h.handleReceivedMessages)
-	register(d, tg.MessagesForwardMessagesRequestTypeID, h.handleForwardMessages)
+	registerReplyAfterSuccess(d, tg.MessagesForwardMessagesRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		return h.handleForwardMessagesAfterReplyOnConn(c, req)
+	})
 	register(d, tg.MessagesUpdatePinnedMessageRequestTypeID, h.handleUpdatePinnedMessage)
 	register(d, tg.MessagesCreateChatRequestTypeID, h.handleCreateChat)
 	register(d, tg.MessagesEditChatTitleRequestTypeID, h.handleEditChatTitle)

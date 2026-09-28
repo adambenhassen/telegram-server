@@ -324,6 +324,61 @@ func TestDeliverSuppressionSplitsOriginBatch(t *testing.T) {
 	}
 }
 
+func TestDeliverSuppressionSplitsOriginEditBatch(t *testing.T) {
+	t.Parallel()
+
+	origin := &rpcBatchPushConn{authKeyID: 11}
+	other := &rpcBatchPushConn{authKeyID: 22}
+	u := testUpdater()
+	u.deliverAtSuppressed(
+		context.Background(),
+		7,
+		[]pushConn{origin, other},
+		func(fromPts int) (updateBatch, error) {
+			b := batch(fromPts, 5, 5)
+			for i, pts := range b.pts {
+				b.ups[i] = &tg.UpdateEditMessage{
+					Message:  &tg.Message{ID: pts},
+					Pts:      pts,
+					PtsCount: 1,
+				}
+			}
+			return b, nil
+		},
+		time.Time{},
+		store.SuppressedUpdate{AuthKeyID: 11, Pts: 3},
+	)
+
+	if got := len(origin.got); got != 2 {
+		t.Fatalf("origin pushes = %d, want prefix and suffix", got)
+	}
+	if got := editPtsOf(t, origin.got[0]); !slices.Equal(got, []int{1, 2}) {
+		t.Fatalf("origin prefix pts = %v, want [1 2]", got)
+	}
+	if got := editPtsOf(t, origin.got[1]); !slices.Equal(got, []int{4, 5}) {
+		t.Fatalf("origin suffix pts = %v, want [4 5]", got)
+	}
+	if !slices.Equal(origin.marked, []int{3}) {
+		t.Fatalf("origin RPC marks = %v, want [3]", origin.marked)
+	}
+	if len(other.got) != 1 || !slices.Equal(editPtsOf(t, other.got[0]), []int{1, 2, 3, 4, 5}) {
+		t.Fatalf("other pushes = %d/%v, want one full batch", len(other.got), editPtsOf(t, other.got[0]))
+	}
+}
+
+func editPtsOf(t *testing.T, up *tg.Updates) []int {
+	t.Helper()
+	out := make([]int, 0, len(up.Updates))
+	for _, u := range up.Updates {
+		edit, ok := u.(*tg.UpdateEditMessage)
+		if !ok {
+			t.Fatalf("update type = %T, want *tg.UpdateEditMessage", u)
+		}
+		out = append(out, edit.Pts)
+	}
+	return out
+}
+
 func TestDeliverPendingSenderSuppressionLeavesOriginAtBarrier(t *testing.T) {
 	t.Parallel()
 
