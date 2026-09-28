@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -355,6 +356,62 @@ func TestMultiSocketSlowPushCannotStallAnotherAccount(t *testing.T) {
 	}
 	if originTransport.wasSent() {
 		t.Fatal("sender session received its own keyed update echo")
+	}
+}
+
+func TestTransientFanoutSkipsUnattemptedConnections(t *testing.T) {
+	ctx := context.Background()
+	registry := mtproto.NewSessionRegistry()
+	updater := api.NewUpdater(nil, registry, nil, nil)
+	const userID = int64(9002)
+	const attemptedWorkerCount = 8 // transientFanoutWorkerCount in api
+
+	transports := make([]*blockedPushTransport, mtproto.MaxUserConns)
+	conns := make([]*mtproto.Conn, mtproto.MaxUserConns)
+	for i := range transports {
+		transports[i] = &blockedPushTransport{entered: make(chan struct{}), closed: make(chan struct{})}
+		conns[i] = mtproto.NewTestConn(transports[i], testPushKey(byte(70+i)))
+		conns[i].SetOwner(userID)
+		if !registry.Add(userID, conns[i]) {
+			t.Fatalf("register connection %d", i)
+		}
+		conn := conns[i]
+		t.Cleanup(func() { registry.Remove(userID, conn) })
+	}
+
+	started := time.Now()
+	updater.DeliverTyping(ctx, userID, 42)
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("transient fan-out took %s, want about one write timeout", elapsed)
+	}
+
+	for i := range attemptedWorkerCount {
+		if got := transports[i].pushAttempts(); got != 1 {
+			t.Fatalf("attempted connection %d sends = %d, want one", i, got)
+		}
+		select {
+		case <-transports[i].closed:
+		default:
+			t.Fatalf("attempted connection %d was not closed after its write timeout", i)
+		}
+	}
+
+	registered := registry.Conns(userID)
+	if got := len(registered); got != mtproto.MaxUserConns-attemptedWorkerCount {
+		t.Fatalf("registered connections = %d, want %d", got, mtproto.MaxUserConns-attemptedWorkerCount)
+	}
+	for i := attemptedWorkerCount; i < len(conns); i++ {
+		if got := transports[i].pushAttempts(); got != 0 {
+			t.Fatalf("unattempted connection %d sends = %d, want zero", i, got)
+		}
+		select {
+		case <-transports[i].closed:
+			t.Fatalf("unattempted connection %d was closed", i)
+		default:
+		}
+		if !slices.Contains(registered, conns[i]) {
+			t.Fatalf("unattempted connection %d was removed from the registry", i)
+		}
 	}
 }
 
