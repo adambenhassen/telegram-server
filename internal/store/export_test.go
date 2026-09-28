@@ -787,3 +787,32 @@ func SetFileUnstored(ctx context.Context, s *Store, fileID int64) error {
 	}
 	return nil
 }
+
+// NotificationSchedulerForTest exposes the bounded callback scheduler to the
+// external store test package without making it part of the production API.
+type NotificationSchedulerForTest struct {
+	scheduler *notificationScheduler
+}
+
+// NewNotificationSchedulerForTest starts a test scheduler.
+func NewNotificationSchedulerForTest(ctx context.Context) *NotificationSchedulerForTest {
+	return &NotificationSchedulerForTest{scheduler: newNotificationScheduler(ctx)}
+}
+
+// Submit queues a test callback under key.
+func (s *NotificationSchedulerForTest) Submit(key string, ctx context.Context, coalesce bool, run func(context.Context)) bool {
+	return s.scheduler.submit(key, notificationTask{ctx: ctx, coalesce: coalesce, run: run})
+}
+
+// Pending reports the number of queued, not currently running callbacks.
+func (s *NotificationSchedulerForTest) Pending() int {
+	s.scheduler.mu.Lock()
+	defer s.scheduler.mu.Unlock()
+	return s.scheduler.pending
+}
+
+// Stop stops the test scheduler and waits for its workers.
+func (s *NotificationSchedulerForTest) Stop() { s.scheduler.stop() }
+
+// NotificationQueueLimitForTest returns the scheduler's fixed pending limit.
+func NotificationQueueLimitForTest() int { return notificationQueueLimit }

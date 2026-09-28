@@ -232,7 +232,7 @@ func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns [
 			//
 			// users covers the whole batch, so a conn taking a suffix gets a
 			// superset of the users it needs, which a client ignores.
-			pushed, stale, err := pushOrdered(ctx, c, userID, watermark, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts)
+			pushed, stale, err := u.pushOrdered(ctx, c, userID, watermark, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts)
 			if stale {
 				retry = true
 				break
@@ -256,12 +256,36 @@ func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns [
 	}
 }
 
-func pushOrdered(ctx context.Context, conn pushConn, owner int64, expectedPts int, enc bin.Encoder, pts int) (pushed, stale bool, err error) {
+func (u *Updater) pushOrdered(ctx context.Context, conn pushConn, owner int64, expectedPts int, enc bin.Encoder, pts int) (pushed, stale bool, err error) {
 	if guarded, ok := conn.(orderedPushConn); ok {
-		return guarded.PushToAtWatermark(ctx, owner, expectedPts, enc, pts)
+		pushed, stale, err = guarded.PushToAtWatermark(ctx, owner, expectedPts, enc, pts)
+	} else {
+		pushed, err = conn.PushTo(ctx, owner, enc, pts)
 	}
-	pushed, err = conn.PushTo(ctx, owner, enc, pts)
-	return pushed, false, err
+	u.handlePushFailure(owner, conn, err)
+	return pushed, stale, err
+}
+
+func (u *Updater) handlePushFailure(owner int64, conn pushConn, err error) {
+	if err == nil || mtproto.IsPushEncodeError(err) || u.registry == nil {
+		return
+	}
+	c, ok := conn.(*mtproto.Conn)
+	if !ok {
+		return
+	}
+	// Remove before closing so a queued notification cannot take another
+	// write-deadline hold while the serve goroutine is unwinding the socket.
+	u.registry.Remove(owner, c)
+	if closeErr := c.Close(); closeErr != nil {
+		u.log.Info("close failed push connection", "user_id", owner, "err", closeErr)
+	}
+}
+
+func (u *Updater) pushTransient(ctx context.Context, owner int64, conn pushConn, enc bin.Encoder) (bool, error) {
+	pushed, err := conn.PushTo(ctx, owner, enc, 0)
+	u.handlePushFailure(owner, conn, err)
+	return pushed, err
 }
 
 func (u *Updater) deliverBeforePendingRPC(ctx context.Context, userID int64, conn pushConn, b updateBatch, watermark, target int, acceptedAt time.Time) bool {
@@ -270,7 +294,7 @@ func (u *Updater) deliverBeforePendingRPC(ctx context.Context, userID int64, con
 		return false
 	}
 	prefixPts := b.pts[target-1]
-	pushed, stale, err := pushOrdered(ctx, conn, userID, watermark, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts)
+	pushed, stale, err := u.pushOrdered(ctx, conn, userID, watermark, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts)
 	if stale {
 		return true
 	}
@@ -284,7 +308,7 @@ func (u *Updater) deliverBeforePendingRPC(ctx context.Context, userID int64, con
 func (u *Updater) deliverWithSuppression(ctx context.Context, userID int64, conn rpcUpdatePushConn, b updateBatch, watermark, start, target int, suppressed store.SuppressedUpdate, acceptedAt time.Time) bool {
 	if target > start {
 		prefixPts := b.pts[target-1]
-		pushed, stale, err := pushOrdered(ctx, conn, userID, watermark, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts)
+		pushed, stale, err := u.pushOrdered(ctx, conn, userID, watermark, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts)
 		if stale {
 			return true
 		}
@@ -313,7 +337,7 @@ func (u *Updater) deliverWithSuppression(ctx context.Context, userID int64, conn
 	if suffixStart >= suffixEnd {
 		return false
 	}
-	pushed, stale, err := pushOrdered(ctx, conn, userID, suppressed.Pts, wrapUpdates(b.ups[suffixStart:suffixEnd], b.users, b.chats, b.state), b.pts[suffixEnd-1])
+	pushed, stale, err := u.pushOrdered(ctx, conn, userID, suppressed.Pts, wrapUpdates(b.ups[suffixStart:suffixEnd], b.users, b.chats, b.state), b.pts[suffixEnd-1])
 	if stale {
 		return true
 	}
@@ -365,7 +389,7 @@ func (u *Updater) DeliverTyping(ctx context.Context, peerID, fromID int64) {
 	}
 	for _, c := range conns {
 		// Carries no pts, so a conn that changed hands simply drops it.
-		if _, err := c.PushTo(ctx, peerID, short, 0); err != nil {
+		if _, err := u.pushTransient(ctx, peerID, c, short); err != nil {
 			u.log.Info("deliver typing", "peer_id", peerID, "err", err)
 		}
 	}
@@ -426,11 +450,10 @@ func (u *Updater) DeliverChannelPost(ctx context.Context, channelID int64) {
 // non-banned member that has live conns it calls build once (with the member's
 // JoinPts as the floor hint) and pushes the resulting updates to each conn.
 //
-// The callback runs on the listener's single goroutine; it must not block. All
-// pushes are inline. The bound that makes this acceptable: the number of members
-// with live conns on this replica is typically small (the replica serves a
-// fraction of all members). If that fraction grows too large for inline work,
-// the callback would need to hand off to a worker pool.
+// The callback runs on one bounded listener worker; all pushes for this channel
+// event are inline. The number of members with live conns on this replica is
+// typically small (the replica serves a fraction of all members), and the
+// scheduler keeps a blocked channel key from stalling unrelated notifications.
 func (u *Updater) deliverChannel(
 	ctx context.Context,
 	members []store.ChannelMember,
@@ -465,7 +488,7 @@ func (u *Updater) deliverChannel(
 			// Pass pts=0: this is a channel update; the conn's lastPushedPts
 			// tracks the per-account stream and must not be corrupted by a
 			// channel pts value.
-			if _, err := c.PushTo(ctx, m.UserID, env, 0); err != nil {
+			if _, err := u.pushTransient(ctx, m.UserID, c, env); err != nil {
 				u.log.Info("deliver channel push", "user_id", m.UserID, "err", err)
 			}
 		}
@@ -510,7 +533,7 @@ func (u *Updater) DeliverEncryption(ctx context.Context, userID, chatID int64) {
 	}
 	for _, c := range conns {
 		// Carries no pts, so a conn that changed hands simply drops it.
-		if _, err := c.PushTo(ctx, userID, short, 0); err != nil {
+		if _, err := u.pushTransient(ctx, userID, c, short); err != nil {
 			u.log.Info("deliver encryption", "user_id", userID, "err", err)
 		}
 	}
@@ -562,7 +585,7 @@ func (u *Updater) DeliverStatus(ctx context.Context, userID int64, online bool) 
 				Date:   int(time.Now().Unix()),
 			}
 			// Carries no pts, so a conn that changed hands simply drops it.
-			if _, err := c.PushTo(ctx, partnerID, short, 0); err != nil {
+			if _, err := u.pushTransient(ctx, partnerID, c, short); err != nil {
 				u.log.Info("deliver status push", "partner_id", partnerID, "err", err)
 			}
 		}
@@ -597,7 +620,7 @@ func (u *Updater) DeliverEncryptedMsg(ctx context.Context, recipientID int64, qt
 		Date: int(event.Date.Unix()),
 	}
 	for _, c := range conns {
-		if _, err := c.PushTo(ctx, recipientID, update, 0); err != nil {
+		if _, err := u.pushTransient(ctx, recipientID, c, update); err != nil {
 			u.log.Info("deliver encrypted msg push", "recipient_id", recipientID, "err", err)
 		}
 	}
@@ -672,7 +695,7 @@ func (u *Updater) DeliverReactions(ctx context.Context, ownerID, localID, userID
 	}
 	for _, c := range conns {
 		// Carries no pts, so a conn that changed hands simply drops it.
-		if _, err := c.PushTo(ctx, userID, update, 0); err != nil {
+		if _, err := u.pushTransient(ctx, userID, c, update); err != nil {
 			u.log.Info("deliver reactions push", "user_id", userID, "err", err)
 		}
 	}
@@ -778,7 +801,7 @@ func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, m
 		}
 		for _, c := range conns {
 			// Carries no pts, so a conn that changed hands simply drops it.
-			if _, err := c.PushTo(ctx, memberID, update, 0); err != nil {
+			if _, err := u.pushTransient(ctx, memberID, c, update); err != nil {
 				u.log.Info("deliver pinned push", "user_id", memberID, "err", err)
 			}
 		}

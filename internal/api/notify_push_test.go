@@ -2,15 +2,64 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/crypto"
+	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
+
+type blockedPushTransport struct {
+	mu        sync.Mutex
+	attempts  int
+	entered   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (t *blockedPushTransport) Send(ctx context.Context, _ *bin.Buffer) error {
+	t.mu.Lock()
+	t.attempts++
+	first := t.attempts == 1
+	t.mu.Unlock()
+	if first {
+		close(t.entered)
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (*blockedPushTransport) Recv(context.Context, *bin.Buffer) error { return errors.New("unused") }
+
+func (t *blockedPushTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
+func (t *blockedPushTransport) pushAttempts() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.attempts
+}
+
+var _ transport.Conn = (*blockedPushTransport)(nil)
+
+func testPushKey(seed byte) crypto.AuthKey {
+	var raw crypto.Key
+	for i := range raw {
+		raw[i] = seed + byte(i)
+	}
+	return raw.WithID()
+}
 
 func TestChannelUpdatesProductionDeliverRecordsOnePushSample(t *testing.T) {
 	t.Parallel()
@@ -126,4 +175,127 @@ func TestChannelUpdatesProductionDeliverRecordsOnePushSample(t *testing.T) {
 	if bucketSamples != 1 {
 		t.Fatalf("push latency buckets = %v, want exactly one sample", afterTransient.Push.LatencyBucketCounts)
 	}
+}
+
+func TestSlowPushCannotStallAnotherAccount(t *testing.T) {
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	registry := mtproto.NewSessionRegistry()
+	updater := api.NewUpdater(s, registry, nil, pgtest.PeerDeriver())
+
+	slowUser, err := s.CreateUser(ctx, "+15554127311")
+	if err != nil {
+		t.Fatalf("create slow user: %v", err)
+	}
+	slowSender, err := s.CreateUser(ctx, "+15554127312")
+	if err != nil {
+		t.Fatalf("create slow sender: %v", err)
+	}
+	healthyUser, err := s.CreateUser(ctx, "+15554127313")
+	if err != nil {
+		t.Fatalf("create healthy user: %v", err)
+	}
+	healthySender, err := s.CreateUser(ctx, "+15554127314")
+	if err != nil {
+		t.Fatalf("create healthy sender: %v", err)
+	}
+	if _, _, _, _, err := s.SendMessage(ctx, slowSender.ID, slowUser.ID, "slow", 1, 0, 0); err != nil {
+		t.Fatalf("persist slow-user event: %v", err)
+	}
+	if _, _, _, _, err := s.SendMessage(ctx, healthySender.ID, healthyUser.ID, "healthy", 2, 0, 0); err != nil {
+		t.Fatalf("persist healthy-user event: %v", err)
+	}
+
+	slowTransport := &blockedPushTransport{entered: make(chan struct{}), closed: make(chan struct{})}
+	slowConn := mtproto.NewTestConn(slowTransport, testPushKey(1))
+	slowConn.SetOwner(slowUser.ID)
+	if !registry.Add(slowUser.ID, slowConn) {
+		t.Fatal("register slow connection")
+	}
+	t.Cleanup(func() { registry.Remove(slowUser.ID, slowConn) })
+
+	originKey := testPushKey(3)
+	originTransport := &fakeTransport{}
+	originConn := mtproto.NewTestConn(originTransport, originKey)
+	originConn.SetOwner(slowUser.ID)
+	if !registry.Add(slowUser.ID, originConn) {
+		t.Fatal("register origin connection")
+	}
+	t.Cleanup(func() { registry.Remove(slowUser.ID, originConn) })
+
+	healthyTransport := &fakeTransport{}
+	healthyConn := mtproto.NewTestConn(healthyTransport, testPushKey(2))
+	healthyConn.SetOwner(healthyUser.ID)
+	if !registry.Add(healthyUser.ID, healthyConn) {
+		t.Fatal("register healthy connection")
+	}
+	t.Cleanup(func() { registry.Remove(healthyUser.ID, healthyConn) })
+
+	_, stop, err := store.StartListener(ctx, dsn,
+		updater.Deliver,
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	t.Cleanup(func() { _ = stop() }) //nolint:errcheck // teardown
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
+	slowPayload := strconv.FormatInt(slowUser.ID, 10) + "|" + strconv.FormatInt(mtproto.AuthKeyIDInt64(originKey.ID), 10) + "|1"
+	if err := s.Notify(ctx, store.ChannelUpdates, slowPayload); err != nil {
+		t.Fatalf("notify slow user: %v", err)
+	}
+	select {
+	case <-slowTransport.entered:
+	case <-time.After(time.Second):
+		t.Fatal("slow push did not reach the transport")
+	}
+	for range 8 {
+		if err := s.Notify(ctx, store.ChannelUpdates, slowPayload); err != nil {
+			t.Fatalf("repeat slow-user notify: %v", err)
+		}
+	}
+
+	started := time.Now()
+	if err := s.Notify(ctx, store.ChannelUpdates, strconv.FormatInt(healthyUser.ID, 10)); err != nil {
+		t.Fatalf("notify healthy user: %v", err)
+	}
+	if !waitSentWithin(healthyTransport, 500*time.Millisecond) {
+		t.Fatalf("healthy push waited behind slow socket for %s", time.Since(started))
+	}
+	select {
+	case <-slowTransport.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed slow socket was not closed")
+	}
+	// Repeated notifications must not get another write attempt after the first
+	// deadline closes the connection.
+	time.Sleep(100 * time.Millisecond)
+	if got := slowTransport.pushAttempts(); got != 1 {
+		t.Fatalf("slow push attempts = %d, want one before removal", got)
+	}
+	if originTransport.wasSent() {
+		t.Fatal("sender session received its own keyed update echo")
+	}
+}
+
+func waitSentWithin(ft *fakeTransport, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if ft.wasSent() {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return ft.wasSent()
 }

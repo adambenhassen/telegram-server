@@ -126,7 +126,8 @@ func nextBackoff(prev, uptime time.Duration) time.Duration {
 // notification to the delivery callbacks, reconnecting when that connection
 // breaks.
 type Listener struct {
-	log *slog.Logger
+	log       *slog.Logger
+	scheduler *notificationScheduler
 	// metrics is the only recorder accepted by StartListener. Its fixed
 	// in-process operation runs before the delivery callback.
 	metrics *NotificationMetrics
@@ -165,8 +166,9 @@ type Listener struct {
 // listener is reconnecting are lost, which push already tolerates: the client's
 // next getDifference backfills them.
 //
-// The callbacks run on this one goroutine, so none of them may block: a stalled
-// callback holds up every other user's delivery.
+// The LISTEN goroutine only parses and schedules callbacks. A fixed worker pool
+// runs them, and notifications for the same routing key remain serial while a
+// blocked key cannot occupy notification ingestion or every worker.
 func StartListener(
 	ctx context.Context,
 	dsn string,
@@ -194,8 +196,8 @@ func StartListener(
 	if len(notifyMetrics) > 0 {
 		metrics = notifyMetrics[0]
 	}
-	l := &Listener{log: log, metrics: metrics}
 	loopCtx, cancel := context.WithCancel(ctx)
+	l := &Listener{log: log, metrics: metrics, scheduler: newNotificationScheduler(loopCtx)}
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned)
@@ -204,6 +206,7 @@ func StartListener(
 	stop := func() error {
 		cancel()
 		wg.Wait()
+		l.scheduler.stop()
 		return l.closeErr
 	}
 	return l, stop, nil
@@ -311,7 +314,13 @@ func (l *Listener) dispatch(
 			if update.AuthKeyID != 0 {
 				deliveryCtx = WithSuppressedUpdate(deliveryCtx, update)
 			}
-			deliver(deliveryCtx, userID)
+			l.schedule("updates:"+strconv.FormatInt(userID, 10), notificationTask{
+				ctx:      deliveryCtx,
+				coalesce: update.AuthKeyID == 0,
+				run: func(ctx context.Context) {
+					deliver(ctx, userID)
+				},
+			})
 		case ChannelTyping:
 			peerID, fromID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -320,7 +329,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelTyping)
-			typing(ctx, peerID, fromID)
+			l.schedule("typing:"+strconv.FormatInt(peerID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					typing(ctx, peerID, fromID)
+				},
+			})
 		case ChannelEvict:
 			userID, authKeyID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -331,7 +346,12 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelEvict)
-			evict(ctx, userID, authKeyID)
+			l.schedule("evict:"+strconv.FormatInt(userID, 10), notificationTask{
+				ctx: ctx,
+				run: func(ctx context.Context) {
+					evict(ctx, userID, authKeyID)
+				},
+			})
 		case ChannelPost:
 			channelID, perr := strconv.ParseInt(n.Payload, 10, 64)
 			if perr != nil {
@@ -340,7 +360,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelPost)
-			channelPost(ctx, channelID)
+			l.schedule("post:"+strconv.FormatInt(channelID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					channelPost(ctx, channelID)
+				},
+			})
 		case ChannelEncryption:
 			userID, chatID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -349,7 +375,12 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelEncryption)
-			encryption(ctx, userID, chatID)
+			l.schedule("encryption:"+strconv.FormatInt(userID, 10), notificationTask{
+				ctx: ctx,
+				run: func(ctx context.Context) {
+					encryption(ctx, userID, chatID)
+				},
+			})
 		case ChannelStatus:
 			userID, onlineID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -358,7 +389,14 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelStatus)
-			status(ctx, userID, onlineID == 1)
+			online := onlineID == 1
+			l.schedule("status:"+strconv.FormatInt(userID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					status(ctx, userID, online)
+				},
+			})
 		case ChannelEncryptedMsg:
 			recipientID, qts64, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -367,7 +405,12 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelEncryptedMsg)
-			encryptedMsg(ctx, recipientID, int(qts64))
+			l.schedule("encrypted-msg:"+strconv.FormatInt(recipientID, 10), notificationTask{
+				ctx: ctx,
+				run: func(ctx context.Context) {
+					encryptedMsg(ctx, recipientID, int(qts64))
+				},
+			})
 		case ChannelReactions:
 			opts, perr := parseReactionPayload(n.Payload)
 			if perr != nil {
@@ -376,7 +419,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelReactions)
-			reactions(ctx, opts.ownerID, opts.localID, opts.userID)
+			l.schedule("reactions:"+strconv.FormatInt(opts.userID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					reactions(ctx, opts.ownerID, opts.localID, opts.userID)
+				},
+			})
 		case ChannelPinned:
 			payload := n.Payload
 			if len(payload) < 2 {
@@ -424,7 +473,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelPinned)
-			pinned(ctx, peerType, peerID, pinnedMsgID)
+			l.schedule("pinned:"+strconv.FormatInt(int64(peerType), 10)+":"+strconv.FormatInt(peerID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					pinned(ctx, peerType, peerID, pinnedMsgID)
+				},
+			})
 		default:
 			l.recordInvalidNotification()
 		}

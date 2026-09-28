@@ -77,6 +77,9 @@ func TestPushErrorsOnWriteFailure(t *testing.T) {
 	if _, err := c.PushTo(context.Background(), 7, &mt.Pong{PingID: 1}, 0); err == nil {
 		t.Fatal("PushTo must surface the transport write error")
 	}
+	if !fc.closed() {
+		t.Fatal("PushTo must close a connection after a transport write failure")
+	}
 }
 
 func TestMarkRPCUpdateRequiresCurrentOwnerAndKey(t *testing.T) {

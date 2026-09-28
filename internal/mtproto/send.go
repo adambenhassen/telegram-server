@@ -427,6 +427,9 @@ func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int
 		return false, nil
 	}
 	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
+		if closeErr := c.transport.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close failed push transport: %w", closeErr))
+		}
 		return false, fmt.Errorf("push [%T]: %w", enc, err)
 	}
 	if pts > 0 {
@@ -510,6 +513,9 @@ func (c *Conn) PushToAtWatermark(ctx context.Context, owner int64, expectedPts i
 		return false, true, nil
 	}
 	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
+		if closeErr := c.transport.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close failed push transport: %w", closeErr))
+		}
 		return false, false, fmt.Errorf("push [%T]: %w", enc, err)
 	}
 	if pts > 0 && int64(pts) > c.lastPushedPts.Load() {
