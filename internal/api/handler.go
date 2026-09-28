@@ -116,6 +116,9 @@ type handlers struct {
 	// rateLimitRecorder is a test-only failure injection seam. Production uses
 	// the fixed recorder method through rateLimitMetrics.
 	rateLimitRecorder func(surface string) error
+	// afterSenderCommit is a test-only pause point immediately after a sender
+	// message commits and its origin barrier is installed.
+	afterSenderCommit func()
 }
 
 type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
@@ -123,6 +126,15 @@ type methodFunc func(req *mtproto.Request) (bin.Encoder, error)
 type connMethodFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, error)
 
 type registeredFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, func(), error)
+
+type orderedRegisteredFunc func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error)
+
+type replyUpdate struct {
+	owner     int64
+	authKey   int64
+	pts       int
+	onFailure func()
+}
 
 // revokeFunc is a methodFunc that also returns work to run once the reply is on
 // the wire. Exactly one revocation needs it: the one whose eviction closes the
@@ -231,12 +243,16 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.UpdatesGetStateRequestTypeID, h.handleGetState)
 	register(d, tg.UpdatesGetDifferenceRequestTypeID, h.handleGetDifference)
 	register(d, tg.UpdatesGetChannelDifferenceRequestTypeID, h.handleGetChannelDifference)
-	register(d, tg.MessagesSendMessageRequestTypeID, h.handleSendMessage)
+	registerReplyAfterSuccess(d, tg.MessagesSendMessageRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		return h.handleSendMessageAfterReplyOnConn(c, req)
+	})
 	register(d, tg.MessagesGetDialogsRequestTypeID, h.handleGetDialogs)
 	register(d, tg.MessagesGetPeerDialogsRequestTypeID, h.handleGetPeerDialogs)
 	register(d, tg.MessagesGetHistoryRequestTypeID, h.handleGetHistory)
 	register(d, tg.MessagesReadHistoryRequestTypeID, h.handleReadHistory)
-	register(d, tg.MessagesEditMessageRequestTypeID, h.handleEditMessage)
+	registerReplyAfterSuccess(d, tg.MessagesEditMessageRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		return h.handleEditMessageAfterReplyOnConn(c, req)
+	})
 	register(d, tg.MessagesDeleteMessagesRequestTypeID, h.handleDeleteMessages)
 	register(d, tg.MessagesSetTypingRequestTypeID, h.handleSetTyping)
 	register(d, tg.MessagesSendReactionRequestTypeID, h.handleSendReaction)
@@ -246,7 +262,9 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesGetStickerSetRequestTypeID, h.handleGetStickerSet)
 	register(d, tg.MessagesGetAllDraftsRequestTypeID, h.handleGetAllDrafts)
 	register(d, tg.MessagesReceivedMessagesRequestTypeID, h.handleReceivedMessages)
-	register(d, tg.MessagesForwardMessagesRequestTypeID, h.handleForwardMessages)
+	registerReplyAfterSuccess(d, tg.MessagesForwardMessagesRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		return h.handleForwardMessagesAfterReplyOnConn(c, req)
+	})
 	register(d, tg.MessagesUpdatePinnedMessageRequestTypeID, h.handleUpdatePinnedMessage)
 	register(d, tg.MessagesCreateChatRequestTypeID, h.handleCreateChat)
 	register(d, tg.MessagesEditChatTitleRequestTypeID, h.handleEditChatTitle)
@@ -257,7 +275,9 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesCheckChatInviteRequestTypeID, h.handleCheckChatInvite)
 	register(d, tg.MessagesImportChatInviteRequestTypeID, h.handleImportChatInvite)
 	registerNamed(d, revokeExportedChatInviteTypeID, "messages.revokeExportedChatInvite", h.handleRevokeExportedChatInvite)
-	register(d, tg.MessagesSendMediaRequestTypeID, h.handleSendMedia)
+	registerReplyAfterSuccess(d, tg.MessagesSendMediaRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		return h.handleSendMediaAfterReplyOnConn(c, req)
+	})
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
 	register(d, tg.ChannelsGetChannelsRequestTypeID, h.handleGetChannels)
 	register(d, tg.ChannelsJoinChannelRequestTypeID, h.handleJoinChannel)
@@ -474,6 +494,47 @@ func registerReply(d *mtproto.Dispatcher, id uint32, fn registeredFunc) {
 }
 
 func registerReplyNamed(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc) {
+	registerReplyNamedMode(d, id, name, fn)
+}
+
+// registerReplyAfterSuccess is the send path's reply ordering boundary: the
+// returned hook runs only after the RPC result reached the transport. A sender
+// notification emitted before that point can push a later pts to the same
+// connection before its RPC result establishes the skipped pts.
+func registerReplyAfterSuccess(d *mtproto.Dispatcher, id uint32, fn orderedRegisteredFunc) {
+	handler := func(c *mtproto.Conn, req *mtproto.Request) error {
+		if provisionalBlocked(id, req) {
+			return c.SendErr(req, errAuthKeyUnreg)
+		}
+		res, update, afterReply, err := fn(c, req)
+		if err != nil {
+			var rpc *tgerr.Error
+			if !errors.As(err, &rpc) {
+				rpc = errInternal
+			}
+			return c.SendErr(req, rpc)
+		}
+		var sendErr error
+		if update == nil {
+			sendErr = c.SendResult(req, res)
+		} else {
+			sendErr = c.SendResultAndMarkRPCUpdate(req, res, update.owner, update.authKey, update.pts)
+		}
+		if sendErr != nil {
+			if update != nil && update.onFailure != nil {
+				update.onFailure()
+			}
+			return sendErr
+		}
+		if afterReply != nil {
+			afterReply()
+		}
+		return nil
+	}
+	d.HandleFunc(id, handler)
+}
+
+func registerReplyNamedMode(d *mtproto.Dispatcher, id uint32, name string, fn registeredFunc) {
 	handler := func(c *mtproto.Conn, req *mtproto.Request) error {
 		// Provisional gate: blocks all authorized RPCs except the allow-list.
 		// Does not apply when UserID == 0 (unauthenticated keys already

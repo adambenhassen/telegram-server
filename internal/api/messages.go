@@ -18,6 +18,7 @@ import (
 const (
 	defaultHistoryLimit = 20
 	maxHistoryLimit     = 100
+	senderNotifyTimeout = 5 * time.Second
 
 	defaultDialogsLimit = 20
 	maxDialogsLimit     = 100
@@ -38,6 +39,95 @@ func (h *handlers) notify(ctx context.Context, userID int64) {
 	if err := h.store.Notify(ctx, store.ChannelUpdates, strconv.FormatInt(userID, 10)); err != nil {
 		h.log.Error("notify updates", "user_id", userID, "err", err)
 	}
+}
+
+// notifySend records which authenticated key receives the sender's new-message
+// update in the sendMessage RPC result, so that key can skip only that live echo.
+func (h *handlers) notifySend(ctx context.Context, userID, authKeyID int64, pts int) {
+	if authKeyID == 0 || pts <= 0 {
+		h.notify(ctx, userID)
+		return
+	}
+	payload := strconv.FormatInt(userID, 10) + "|" + strconv.FormatInt(authKeyID, 10) + "|" + strconv.Itoa(pts)
+	if err := h.store.Notify(ctx, store.ChannelUpdates, payload); err != nil {
+		h.log.Error("notify updates", "user_id", userID, "err", err)
+	}
+}
+
+func senderNotifyContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), senderNotifyTimeout)
+}
+
+func (h *handlers) notifySendAfterReply(r *mtproto.Request, pts int) {
+	ctx, cancel := senderNotifyContext(r.Ctx)
+	defer cancel()
+	h.notifySend(ctx, r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
+}
+
+func (h *handlers) notifySendAfterFailure(r *mtproto.Request) {
+	ctx, cancel := senderNotifyContext(r.Ctx)
+	defer cancel()
+	h.notify(ctx, r.UserID)
+}
+
+type senderRPCAttempt struct {
+	conn        *mtproto.Conn
+	reservation mtproto.RPCUpdateReservation
+}
+
+func beginSenderRPC(c *mtproto.Conn, r *mtproto.Request) senderRPCAttempt {
+	return beginSenderRPCAt(c, r, 0)
+}
+
+func beginSenderRPCAt(c *mtproto.Conn, r *mtproto.Request, pts int) senderRPCAttempt {
+	if c == nil {
+		return senderRPCAttempt{}
+	}
+	reservation, _ := c.BeginRPCUpdateAttempt(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
+	return senderRPCAttempt{conn: c, reservation: reservation}
+}
+
+func setSenderRPCPts(attempt senderRPCAttempt, pts int) {
+	if attempt.conn != nil {
+		attempt.conn.SetRPCUpdatePtsAttempt(attempt.reservation, pts)
+	}
+}
+
+func clearSenderRPC(attempt senderRPCAttempt) {
+	if attempt.conn != nil {
+		attempt.conn.ClearRPCUpdateAttempt(attempt.reservation)
+	}
+}
+
+func (h *handlers) clearSenderAndNotify(attempt senderRPCAttempt, r *mtproto.Request) {
+	clearSenderRPC(attempt)
+	h.notifySendAfterFailure(r)
+}
+
+// retryReplyAfterSuccess restores the sender-keyed notification for a stored
+// 1:1 retry. A retry can be the first request whose RPC result reaches the
+// client after the original committed its message, so it needs the same
+// post-reply push as a new send. Chat retries keep their existing fan-out
+// notification behaviour and therefore do not return sender metadata here.
+func (h *handlers) retryReplyAfterSuccess(attempt senderRPCAttempt, r *mtproto.Request, peerType store.PeerType, pts int) (*replyUpdate, func()) {
+	if peerType != store.PeerTypeUser {
+		return nil, nil
+	}
+	update := &replyUpdate{
+		owner:   r.UserID,
+		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
+		pts:     pts,
+		onFailure: func() {
+			h.clearSenderAndNotify(attempt, r)
+		},
+	}
+	afterReply := func() {
+		h.notifySendAfterReply(r, pts)
+	}
+	return update, afterReply
 }
 
 // notifyTyping emits the transient typing nudge to peerID from fromID.
@@ -137,40 +227,56 @@ func validText(s string) bool {
 	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
 }
 
-// handleSendMessage serves messages.sendMessage: it persists both sides, nudges
-// both users' sessions, and returns the sender-side Updates (updateMessageID +
-// updateNewMessage).
+// handleSendMessage is the direct handler entry used by tests and callers that
+// do not write an RPC result. The dispatcher uses handleSendMessageAfterReply
+// so the sender notification is published only after that result reaches the
+// originating connection.
 func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
+	res, _, _, err := h.handleSendMessageAfterReply(r)
+	return res, err
+}
+
+// handleSendMessageAfterReply serves messages.sendMessage: it persists both
+// sides, nudges recipient sessions, and returns sender reply metadata for the
+// atomic watermark update plus a hook that notifies other sessions after the
+// RPC result is written.
+func (h *handlers) handleSendMessageAfterReply(r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+	return h.handleSendMessageAfterReplyOnConn(nil, r)
+}
+
+func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 	var req tg.MessagesSendMessageRequest
 	if err := req.Decode(r.Buf); err != nil {
-		return nil, errMethodNotImpl
+		return nil, nil, nil, errMethodNotImpl
 	}
 	if r.UserID == 0 {
-		return nil, errAuthKeyUnreg
+		return nil, nil, nil, errAuthKeyUnreg
 	}
 	// Validate text and resolve peer before any write.
 	if !validText(req.Message) {
-		return nil, errMessageEmpty
+		return nil, nil, nil, errMessageEmpty
 	}
 	peerType, toID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	replyToMsgID := int64(0)
 	if replyTo, ok := req.GetReplyTo(); ok {
 		if rep, ok := replyTo.(*tg.InputReplyToMessage); ok && rep.ReplyToMsgID > 0 {
 			if peer, ok := rep.GetReplyToPeerID(); ok && !replyPeerIsDest(peer, peerType, toID, r.UserID) {
-				return nil, errMessageIDInvalid
+				return nil, nil, nil, errMessageIDInvalid
 			}
 			replyToMsgID = int64(rep.ReplyToMsgID)
 		}
 	}
 	if peerType == store.PeerTypeChannel {
-		return h.sendChannelMessage(r, toID, &req, replyToMsgID)
+		res, err := h.sendChannelMessage(r, toID, &req, replyToMsgID)
+		return res, nil, nil, err
 	}
 
 	if peerType == store.PeerTypeChat {
-		return h.sendChatMessage(r, toID, &req, replyToMsgID)
+		res, err := h.sendChatMessage(r, toID, &req, replyToMsgID)
+		return res, nil, nil, err
 	}
 
 	// Check for a transport retry (already-stored random_id) before the rate
@@ -183,39 +289,49 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 			pts, err := h.store.MessagePts(r.Ctx, r.UserID, existing.LocalID)
 			if err != nil {
 				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
-				return nil, errInternal
+				return nil, nil, nil, errInternal
 			}
+			attempt := beginSenderRPCAt(c, r, pts)
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 			if err != nil {
 				h.log.Error("load users on retry", "user_id", r.UserID, "err", err)
-				return nil, errInternal
+				h.clearSenderAndNotify(attempt, r)
+				return nil, nil, nil, errInternal
 			}
-			return &tg.Updates{
+			res := &tg.Updates{
 				Updates: []tg.UpdateClass{
 					&tg.UpdateMessageID{ID: int(existing.LocalID), RandomID: req.RandomID},
 					&tg.UpdateNewMessage{Message: messageToTL(existing, nil, nil, nil, nil), Pts: pts, PtsCount: 1},
 				},
 				Users: users,
 				Date:  int(existing.Date.Unix()),
-			}, nil
+			}
+			setSenderRPCPts(attempt, pts)
+			update, afterReply := h.retryReplyAfterSuccess(attempt, r, peerType, pts)
+			return res, update, afterReply, nil
 		} else if err != nil {
 			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
-			return nil, errInternal
+			return nil, nil, nil, errInternal
 		}
 	}
 
 	// Rate limit: new message, consume a token from the shared send budget.
 	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
+	attempt := beginSenderRPC(c, r)
 	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0, replyToMsgID)
 	if err != nil {
+		h.clearSenderAndNotify(attempt, r)
 		h.log.Error("send message", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, nil, nil, errInternal
+	}
+	setSenderRPCPts(attempt, senderPts)
+	if h.afterSenderCommit != nil {
+		h.afterSenderCommit()
 	}
 
-	h.notify(r.Ctx, r.UserID)
 	if toID != r.UserID {
 		h.notify(r.Ctx, toID)
 	}
@@ -223,9 +339,10 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("send message users", "err", err)
-		return nil, errInternal
+		h.clearSenderAndNotify(attempt, r)
+		return nil, nil, nil, errInternal
 	}
-	return &tg.Updates{
+	res := &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateMessageID{ID: int(sender.LocalID), RandomID: req.RandomID},
 			// sendMessage never carries media; the media send path builds its own reply.
@@ -233,7 +350,19 @@ func (h *handlers) handleSendMessage(r *mtproto.Request) (bin.Encoder, error) {
 		},
 		Users: users,
 		Date:  int(sender.Date.Unix()),
-	}, nil
+	}
+	update := &replyUpdate{
+		owner:   r.UserID,
+		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
+		pts:     senderPts,
+		onFailure: func() {
+			h.clearSenderAndNotify(attempt, r)
+		},
+	}
+	afterReply := func() {
+		h.notifySendAfterReply(r, senderPts)
+	}
+	return res, update, afterReply, nil
 }
 
 // requireMember is the authorization boundary for a client-supplied chat id.
@@ -523,52 +652,120 @@ func (h *handlers) handleReadHistory(r *mtproto.Request) (bin.Encoder, error) {
 // handleEditMessage serves messages.editMessage: edits both sides and returns
 // the updateEditMessage envelope.
 func (h *handlers) handleEditMessage(r *mtproto.Request) (bin.Encoder, error) {
+	res, _, afterReply, err := h.handleEditMessageAfterReplyOnConn(nil, r)
+	if err == nil && afterReply != nil {
+		afterReply()
+	}
+	return res, err
+}
+
+func (h *handlers) handleEditMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 	var req tg.MessagesEditMessageRequest
 	if err := req.Decode(r.Buf); err != nil {
-		return nil, errMethodNotImpl
+		return nil, nil, nil, errMethodNotImpl
 	}
 	if r.UserID == 0 {
-		return nil, errAuthKeyUnreg
+		return nil, nil, nil, errAuthKeyUnreg
 	}
 	if !validText(req.Message) {
-		return nil, errMessageEmpty
+		return nil, nil, nil, errMessageEmpty
+	}
+	peerType, peerID, err := h.inputPeer(req.Peer, r.UserID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	message, ok, err := h.store.MessageByOwnerLocal(r.Ctx, r.UserID, int64(req.ID))
+	if err != nil {
+		h.log.Error("load message for edit", "user_id", r.UserID, "err", err)
+		return nil, nil, nil, errInternal
+	}
+	if !ok || message.Deleted || !message.Out || message.PeerType != peerType || message.PeerID != peerID {
+		return nil, nil, nil, errMessageIDInvalid
 	}
 
+	var attempt senderRPCAttempt
+	if peerType == store.PeerTypeUser {
+		attempt = beginSenderRPC(c, r)
+	}
 	peerID, newPts, err := h.store.EditMessage(r.Ctx, r.UserID, int64(req.ID), req.Message)
 	if errors.Is(err, store.ErrMessageInvalid) {
-		return nil, errMessageIDInvalid
+		if peerType == store.PeerTypeUser {
+			h.clearSenderAndNotify(attempt, r)
+		}
+		return nil, nil, nil, errMessageIDInvalid
 	}
 	if err != nil {
+		if peerType == store.PeerTypeUser {
+			h.clearSenderAndNotify(attempt, r)
+		}
 		h.log.Error("edit message", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, nil, nil, errInternal
 	}
-	h.notify(r.Ctx, r.UserID)
-	if peerID != r.UserID {
-		h.notify(r.Ctx, peerID)
+	if peerType == store.PeerTypeUser {
+		setSenderRPCPts(attempt, newPts)
+		if h.afterSenderCommit != nil {
+			h.afterSenderCommit()
+		}
+		if peerID != r.UserID {
+			h.notify(r.Ctx, peerID)
+		}
+	} else {
+		h.notify(r.Ctx, r.UserID)
+		if peerID != r.UserID {
+			h.notify(r.Ctx, peerID)
+		}
 	}
 
 	edited, ok, err := h.store.MessageByOwnerLocal(r.Ctx, r.UserID, int64(req.ID))
 	if err != nil || !ok {
 		h.log.Error("reload edited message", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		if peerType == store.PeerTypeUser {
+			h.clearSenderAndNotify(attempt, r)
+		}
+		return nil, nil, nil, errInternal
 	}
 	files, err := h.loadFiles(r.Ctx, []store.Message{edited})
 	if err != nil {
 		h.log.Error("edit message files", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		if peerType == store.PeerTypeUser {
+			h.clearSenderAndNotify(attempt, r)
+		}
+		return nil, nil, nil, errInternal
 	}
 	users, err := h.twoUsers(r.Ctx, r.UserID, peerID)
 	if err != nil {
 		h.log.Error("edit message users", "err", err)
-		return nil, errInternal
+		if peerType == store.PeerTypeUser {
+			h.clearSenderAndNotify(attempt, r)
+		}
+		return nil, nil, nil, errInternal
 	}
-	return &tg.Updates{
+	res := &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateEditMessage{Message: messageToTL(edited, nil, files, nil, nil), Pts: newPts, PtsCount: 1},
 		},
 		Users: users,
 		Date:  int(time.Now().Unix()),
-	}, nil
+	}
+	if peerType != store.PeerTypeUser {
+		return res, nil, nil, nil
+	}
+	update := &replyUpdate{
+		owner:   r.UserID,
+		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
+		pts:     newPts,
+		onFailure: func() {
+			h.clearSenderAndNotify(attempt, r)
+		},
+	}
+	afterReply := func() {
+		if attempt.conn == nil {
+			h.notify(r.Ctx, r.UserID)
+			return
+		}
+		h.notifySendAfterReply(r, newPts)
+	}
+	return res, update, afterReply, nil
 }
 
 // handleDeleteMessages serves messages.deleteMessages: marks the caller's ids
@@ -627,21 +824,29 @@ func (h *handlers) handleSetTyping(r *mtproto.Request) (bin.Encoder, error) {
 // messages the caller owns to a 1:1 peer or a group chat. Each forwarded message
 // is a new message row with FwdFrom populated.
 func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error) {
+	res, _, afterReply, err := h.handleForwardMessagesAfterReplyOnConn(nil, r)
+	if err == nil && afterReply != nil {
+		afterReply()
+	}
+	return res, err
+}
+
+func (h *handlers) handleForwardMessagesAfterReplyOnConn(c *mtproto.Conn, r *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 	var req tg.MessagesForwardMessagesRequest
 	if err := req.Decode(r.Buf); err != nil {
-		return nil, errMethodNotImpl
+		return nil, nil, nil, errMethodNotImpl
 	}
 	if r.UserID == 0 {
-		return nil, errAuthKeyUnreg
+		return nil, nil, nil, errAuthKeyUnreg
 	}
 	// Check the cap before retry lookup, peer resolution, or any other store
 	// call. An oversized request must report the same client error regardless of
 	// whether its ids exist or the caller may see them.
 	if len(req.ID) > maxForwardMessagesPerCall {
-		return nil, errLimitInvalid
+		return nil, nil, nil, errLimitInvalid
 	}
 	if len(req.ID) == 0 || len(req.RandomID) != len(req.ID) {
-		return nil, errPeerIDInvalid
+		return nil, nil, nil, errPeerIDInvalid
 	}
 
 	// Check for a full retry: if every random_id is already stored, return
@@ -656,7 +861,7 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		existing, ok, err := h.store.MessageByRandomID(r.Ctx, r.UserID, rid)
 		if err != nil {
 			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
-			return nil, errInternal
+			return nil, nil, nil, errInternal
 		}
 		if !ok {
 			allDup = false
@@ -674,50 +879,60 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 			pts, err := h.store.MessagePts(r.Ctx, r.UserID, m.LocalID)
 			if err != nil {
 				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
-				return nil, errInternal
+				return nil, nil, nil, errInternal
 			}
 			sentMsgs = append(sentMsgs, store.ForwardedMessage{Message: m, Pts: pts})
-			if m.PeerType == store.PeerTypeChat {
-				perOwner[m.OwnerID] = pts
+			perOwner[m.OwnerID] = pts
+			if m.PeerType == store.PeerTypeUser && m.PeerID != m.OwnerID {
+				perOwner[m.PeerID] = pts
 			}
 		}
 		destPeerType, destPeerID, err := h.inputPeer(req.ToPeer, r.UserID)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
-		return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, req.RandomID)
+		srcPeerType, _, err := h.inputPeer(req.FromPeer, r.UserID)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		pts, suppress := forwardSenderPts(r.UserID, destPeerType, srcPeerType, sentMsgs)
+		var attempt senderRPCAttempt
+		if suppress {
+			attempt = beginSenderRPCAt(c, r, pts)
+		}
+		return h.finishForwardReply(r, destPeerType, destPeerID, srcPeerType, perOwner, sentMsgs, req.RandomID, attempt)
 	}
 
 	// Rate limit: charge one token per source message requested.
 	if err := h.checkRateLimitCost(r, "message_send", h.rateLimitMessageSend, len(req.ID)); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	// Resolve destination peer.
 	destPeerType, destPeerID, err := h.inputPeer(req.ToPeer, r.UserID)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	// Secret chats and channels are not supported destinations.
 	if destPeerType == store.PeerTypeChannel {
-		return nil, errPeerIDInvalid
+		return nil, nil, nil, errPeerIDInvalid
 	}
 	if destPeerType == store.PeerTypeChat {
 		if err = h.requireMember(r.Ctx, destPeerID, r.UserID); err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 	}
 
 	// Resolve source peer.
 	srcPeerType, srcPeerID, err := h.inputPeer(req.FromPeer, r.UserID)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	// Secret chats are not supported sources.
 	if srcPeerType == store.PeerTypeChannel {
 		// Channel source: resolve each message from the channel.
 		if _, err = h.requireChannelMember(r.Ctx, srcPeerID, r.UserID); err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		localIDs := make([]int64, len(req.ID))
 		for i, v := range req.ID {
@@ -726,13 +941,13 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		chMsgs, err := h.store.ChannelMessages(r.Ctx, srcPeerID, localIDs)
 		if err != nil {
 			h.log.Error("forward channel messages", "user_id", r.UserID, "err", err)
-			return nil, errInternal
+			return nil, nil, nil, errInternal
 		}
 		sources := make([]store.ForwardSource, 0, len(req.ID))
 		for _, id := range req.ID {
 			m, ok := chMsgs[int64(id)]
 			if !ok || m.Deleted {
-				return nil, errMessageIDInvalid
+				return nil, nil, nil, errMessageIDInvalid
 			}
 			fileID := int64(0)
 			if m.FileID != nil {
@@ -752,16 +967,16 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		copy(randomIDs, req.RandomID)
 		perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
 		if errors.Is(err, store.ErrMessageInvalid) || errors.Is(err, store.ErrFileMissing) {
-			return nil, errMessageIDInvalid
+			return nil, nil, nil, errMessageIDInvalid
 		}
 		if errors.Is(err, store.ErrNotMember) {
-			return nil, errPeerIDInvalid
+			return nil, nil, nil, errPeerIDInvalid
 		}
 		if err != nil {
 			h.log.Error("forward messages", "user_id", r.UserID, "err", err)
-			return nil, errInternal
+			return nil, nil, nil, errInternal
 		}
-		return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, randomIDs)
+		return h.finishForwardReply(r, destPeerType, destPeerID, srcPeerType, perOwner, sentMsgs, randomIDs, senderRPCAttempt{})
 	}
 
 	// User or chat source: resolve each message from the messages table.
@@ -778,14 +993,14 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 		m, ok, err = h.store.MessageByOwnerLocal(r.Ctx, r.UserID, id)
 		if err != nil {
 			h.log.Error("forward lookup source", "user_id", r.UserID, "err", err)
-			return nil, errInternal
+			return nil, nil, nil, errInternal
 		}
 		if !ok || m.Deleted {
-			return nil, errPeerIDInvalid
+			return nil, nil, nil, errPeerIDInvalid
 		}
 		// The row must belong to the dialog the caller named in FromPeer.
 		if m.PeerType != srcPeerType || m.PeerID != srcPeerID {
-			return nil, errPeerIDInvalid
+			return nil, nil, nil, errPeerIDInvalid
 		}
 		sources = append(sources, store.ForwardSource{
 			FromID: m.FromID,
@@ -797,22 +1012,100 @@ func (h *handlers) handleForwardMessages(r *mtproto.Request) (bin.Encoder, error
 
 	randomIDs := make([]int64, len(req.RandomID))
 	copy(randomIDs, req.RandomID)
+	var attempt senderRPCAttempt
+	if destPeerType == store.PeerTypeUser && srcPeerType == store.PeerTypeUser && len(req.ID) == 1 {
+		attempt = beginSenderRPC(c, r)
+	}
 	perOwner, sentMsgs, err := h.store.ForwardMessages(r.Ctx, r.UserID, destPeerType, destPeerID, sources, randomIDs)
 	// A source whose file row is gone is a source that can no longer be
 	// forwarded, and it reports as the same invalid message id an already
 	// deleted one does — the caller learns nothing new about a file it was
 	// entitled to a moment ago.
 	if errors.Is(err, store.ErrMessageInvalid) || errors.Is(err, store.ErrFileMissing) {
-		return nil, errMessageIDInvalid
+		if attempt.conn != nil {
+			h.clearSenderAndNotify(attempt, r)
+		}
+		return nil, nil, nil, errMessageIDInvalid
 	}
 	if errors.Is(err, store.ErrNotMember) {
-		return nil, errPeerIDInvalid
+		if attempt.conn != nil {
+			h.clearSenderAndNotify(attempt, r)
+		}
+		return nil, nil, nil, errPeerIDInvalid
 	}
 	if err != nil {
+		if attempt.conn != nil {
+			h.clearSenderAndNotify(attempt, r)
+		}
 		h.log.Error("forward messages", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, nil, nil, errInternal
 	}
-	return h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, randomIDs)
+	if pts, suppress := forwardSenderPts(r.UserID, destPeerType, srcPeerType, sentMsgs); suppress {
+		setSenderRPCPts(attempt, pts)
+		if h.afterSenderCommit != nil {
+			h.afterSenderCommit()
+		}
+	} else if attempt.conn != nil {
+		clearSenderRPC(attempt)
+	}
+	return h.finishForwardReply(r, destPeerType, destPeerID, srcPeerType, perOwner, sentMsgs, randomIDs, attempt)
+}
+
+func forwardSenderPts(userID int64, destPeerType, srcPeerType store.PeerType, sentMsgs []store.ForwardedMessage) (int, bool) {
+	if destPeerType != store.PeerTypeUser || srcPeerType != store.PeerTypeUser || len(sentMsgs) != 1 {
+		return 0, false
+	}
+	fm := sentMsgs[0]
+	if fm.Message.OwnerID != userID || fm.Message.PeerType != store.PeerTypeUser || fm.Pts <= 0 {
+		return 0, false
+	}
+	return fm.Pts, true
+}
+
+func (h *handlers) finishForwardReply(
+	r *mtproto.Request,
+	destPeerType store.PeerType,
+	destPeerID int64,
+	srcPeerType store.PeerType,
+	perOwner map[int64]int,
+	sentMsgs []store.ForwardedMessage,
+	randomIDs []int64,
+	attempt senderRPCAttempt,
+) (bin.Encoder, *replyUpdate, func(), error) {
+	_, suppress := forwardSenderPts(r.UserID, destPeerType, srcPeerType, sentMsgs)
+	for uid := range perOwner {
+		if suppress && uid == r.UserID {
+			continue
+		}
+		h.notify(r.Ctx, uid)
+	}
+	res, err := h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, randomIDs)
+	if err != nil {
+		if suppress {
+			h.clearSenderAndNotify(attempt, r)
+		}
+		return nil, nil, nil, err
+	}
+	if !suppress {
+		return res, nil, nil, nil
+	}
+	pts := sentMsgs[0].Pts
+	update := &replyUpdate{
+		owner:   r.UserID,
+		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
+		pts:     pts,
+		onFailure: func() {
+			h.clearSenderAndNotify(attempt, r)
+		},
+	}
+	afterReply := func() {
+		if attempt.conn == nil {
+			h.notify(r.Ctx, r.UserID)
+			return
+		}
+		h.notifySendAfterReply(r, pts)
+	}
+	return res, update, afterReply, nil
 }
 
 // handleSendReaction serves messages.sendReaction: it records the caller's
@@ -996,11 +1289,6 @@ func (h *handlers) notifyReaction(ctx context.Context, userID, localID int64) {
 
 // forwardReply builds the UpdatesClass reply for a forward.
 func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType, destPeerID int64, perOwner map[int64]int, sentMsgs []store.ForwardedMessage, randomIDs []int64) (bin.Encoder, error) {
-	// Notify all affected owners.
-	for uid := range perOwner {
-		h.notify(r.Ctx, uid)
-	}
-
 	// Collect user, chat and channel references from forwarded messages.
 	userRefs := make(map[int64]bool)
 	basicChatRefs := make(map[int64]bool)

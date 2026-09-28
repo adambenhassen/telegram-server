@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"log/slog"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -51,6 +53,24 @@ type pushConn interface {
 	PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int) (bool, error)
 }
 
+type orderedPushConn interface {
+	PushToAtWatermark(ctx context.Context, owner int64, expectedPts int, enc bin.Encoder, pts int) (pushed, stale bool, err error)
+}
+
+type rpcUpdatePushConn interface {
+	pushConn
+	AuthKeyID() int64
+	MarkRPCUpdate(owner, authKeyID int64, pts int) bool
+}
+
+type pendingRPCUpdateConn interface {
+	PendingRPCUpdate(owner int64) (pts int, pending bool)
+}
+
+type pendingRPCReadyConn interface {
+	PendingRPCUpdateReady(owner int64) bool
+}
+
 // Deliver pushes userID's not-yet-delivered events to each of its live conns,
 // advancing each conn's last-pushed pts. It is best-effort: a push failure is
 // logged and the client's next getDifference backfills.
@@ -59,14 +79,15 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	if len(conns) == 0 {
 		return
 	}
+	suppressed, _ := store.SuppressedUpdateFromContext(ctx)
 	targets := make([]pushConn, len(conns))
 	for i, c := range conns {
 		targets[i] = c
 	}
 	acceptedAt, _ := store.NotificationAcceptedAt(ctx)
-	u.deliverAt(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
+	u.deliverAtSuppressed(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
 		return u.h.buildUpdates(ctx, userID, fromPts)
-	}, acceptedAt)
+	}, acceptedAt, suppressed)
 }
 
 // maxDeliveryRounds caps the store round trips one notification may cost. Two
@@ -76,6 +97,8 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 // spread across many batches turn into one window per socket, which is the
 // amplification this path exists to avoid.
 const maxDeliveryRounds = 2
+
+const maxDeliveryRetries = 4
 
 // deliver builds one batch from the lowest watermark among conns and gives each
 // conn the suffix above its own, so the store work one notification costs does
@@ -102,8 +125,13 @@ func (u *Updater) deliver(ctx context.Context, userID int64, conns []pushConn, b
 }
 
 func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error), acceptedAt time.Time) {
+	u.deliverAtSuppressed(ctx, userID, conns, build, acceptedAt, store.SuppressedUpdate{})
+}
+
+func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns []pushConn, build func(fromPts int) (updateBatch, error), acceptedAt time.Time, suppressed store.SuppressedUpdate) {
 	var head int
-	for round := 0; round < maxDeliveryRounds && len(conns) > 0; round++ {
+	retries := 0
+	for round := 0; round < maxDeliveryRounds && len(conns) > 0; {
 		lo, hi := conns[0].LastPushedPts(), conns[0].LastPushedPts()
 		for _, c := range conns[1:] {
 			w := c.LastPushedPts()
@@ -134,39 +162,409 @@ func (u *Updater) deliverAt(ctx context.Context, userID int64, conns []pushConn,
 			return
 		}
 
+		results := make([]deliveryConnResult, len(conns))
+		encoders := &deliveryEncoder{}
+		var fanout sync.WaitGroup
+		for i, c := range conns {
+			fanout.Add(1)
+			go func(i int, c pushConn) {
+				defer fanout.Done()
+				results[i] = u.deliverConn(ctx, userID, c, from, b, acceptedAt, suppressed, encoders)
+			}(i, c)
+		}
+		fanout.Wait()
+
 		var ahead []pushConn
-		for _, c := range conns {
-			watermark := c.LastPushedPts()
-			if watermark < from {
-				// This window starts past the conn: the batch is missing the
-				// events between the two, so it is not this round's to serve.
-				continue
+		retry := false
+		for _, result := range results {
+			if result.retry {
+				retry = true
 			}
-			if watermark >= b.state.Pts {
-				if b.more {
-					ahead = append(ahead, c)
-				}
-				continue
-			}
-			ups := b.above(watermark)
-			if len(ups) == 0 {
-				continue
-			}
-			// Addressed to userID: this snapshot was taken before the batch was
-			// built, and the conn's auth key can rebind to another user in between.
-			// A push dropped for that reason costs nothing — the user's next poll
-			// backfills it.
-			//
-			// users covers the whole batch, so a conn taking a suffix gets a
-			// superset of the users it needs, which a client ignores.
-			pushed, err := c.PushTo(ctx, userID, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts)
-			u.recordPushOutcome(acceptedAt, pushed, err)
-			if err != nil {
-				u.log.Info("deliver push", "user_id", userID, "err", err)
+			if result.ahead {
+				ahead = append(ahead, result.conn)
 			}
 		}
+		if retry {
+			retries++
+			if retries > maxDeliveryRetries {
+				u.log.Error("deliver retries exhausted", "user_id", userID, "retries", retries)
+				return
+			}
+			continue
+		}
+		retries = 0
 		conns = ahead
+		round++
 	}
+}
+
+type deliveryConnResult struct {
+	conn  pushConn
+	ahead bool
+	retry bool
+}
+
+type deliveryEncoder struct {
+	mu sync.Mutex
+}
+
+type synchronizedEncoder struct {
+	mu  *sync.Mutex
+	enc bin.Encoder
+}
+
+func (e synchronizedEncoder) Encode(b *bin.Buffer) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.enc.Encode(b)
+}
+
+// Transient fan-out uses a fixed worker set so one callback cannot create a
+// goroutine per socket or partner. The callback deadline is one socket write
+// timeout; sockets still waiting in the bounded queue are left untouched.
+const (
+	transientFanoutWorkerCount    = 8
+	transientFallbackWriteTimeout = 30 * time.Second
+)
+
+type transientPush struct {
+	owner   int64
+	conn    pushConn
+	enc     bin.Encoder
+	onError func(error)
+}
+
+type transientWriteTimeoutConn interface {
+	WriteTimeout() time.Duration
+}
+
+func transientFanoutTimeout(pushes []transientPush) time.Duration {
+	timeout := transientFallbackWriteTimeout
+	found := false
+	for _, push := range pushes {
+		conn, ok := push.conn.(transientWriteTimeoutConn)
+		if !ok {
+			continue
+		}
+		writeTimeout := conn.WriteTimeout()
+		if writeTimeout <= 0 {
+			continue
+		}
+		if !found || writeTimeout < timeout {
+			timeout = writeTimeout
+			found = true
+		}
+	}
+	return timeout
+}
+
+func (u *Updater) pushTransientFanout(ctx context.Context, pushes []transientPush) {
+	if len(pushes) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, transientFanoutTimeout(pushes))
+	defer cancel()
+
+	jobs := make(chan transientPush)
+	encoders := &deliveryEncoder{}
+	workers := min(transientFanoutWorkerCount, len(pushes))
+	var fanout sync.WaitGroup
+	for range workers {
+		fanout.Go(func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case push, ok := <-jobs:
+					if !ok || ctx.Err() != nil {
+						return
+					}
+					if _, err := u.pushTransientEncoded(ctx, push.owner, push.conn, push.enc, encoders); err != nil && push.onError != nil {
+						push.onError(err)
+					}
+				}
+			}
+		})
+	}
+
+producer:
+	for _, push := range pushes {
+		select {
+		case <-ctx.Done():
+			break producer
+		case jobs <- push:
+		}
+	}
+	close(jobs)
+	fanout.Wait()
+}
+
+// deliverConn handles one socket in a delivery window. Sockets for one owner
+// are independent write streams, so the caller runs these bounded by the
+// registry's per-owner connection cap. The sender barrier and per-connection
+// watermark still serialize the ordered work on each individual socket.
+func (u *Updater) deliverConn(ctx context.Context, userID int64, conn pushConn, from int, b updateBatch, acceptedAt time.Time, suppressed store.SuppressedUpdate, encoders *deliveryEncoder) deliveryConnResult {
+	result := deliveryConnResult{conn: conn}
+	watermark := conn.LastPushedPts()
+	if watermark < from {
+		// This window starts past the conn: the batch is missing the events
+		// between the two, so it is not this round's to serve.
+		return result
+	}
+	if watermark >= b.state.Pts {
+		result.ahead = b.more
+		return result
+	}
+	ups := b.above(watermark)
+	if pendingConn, ok := conn.(pendingRPCUpdateConn); ok {
+		pendingPts, pending := pendingConn.PendingRPCUpdate(userID)
+		if pending {
+			pendingReady := true
+			if readyConn, ok := conn.(pendingRPCReadyConn); ok {
+				pendingReady = readyConn.PendingRPCUpdateReady(userID)
+			}
+			pendingRetry := false
+			for pending {
+				keyedPending := false
+				if rpcConn, ok := conn.(rpcUpdatePushConn); ok && pendingPts > 0 && suppressed.AuthKeyID != 0 && suppressed.Pts == pendingPts && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+					// Let the keyed notification account the sender event after
+					// its prefix has been delivered. A non-contiguous RPC result
+					// deliberately keeps this barrier active.
+					keyedPending = true
+				}
+				if keyedPending || !pendingReady || pendingPts == 0 || pendingPts > b.state.Pts {
+					break
+				}
+
+				if rpcConn, ok := conn.(rpcUpdatePushConn); ok {
+					if nextWatermark, accounted := accountPendingRPCUpdate(userID, rpcConn, b, watermark, pendingPts); accounted {
+						watermark = nextWatermark
+						ups = b.above(watermark)
+						pendingPts, pending = pendingConn.PendingRPCUpdate(userID)
+						if pending {
+							if readyConn, ok := conn.(pendingRPCReadyConn); ok {
+								pendingReady = readyConn.PendingRPCUpdateReady(userID)
+							}
+						}
+						continue
+					}
+				}
+
+				if pendingPts > watermark {
+					target := sort.SearchInts(b.pts, pendingPts)
+					if target < len(b.pts) && b.pts[target] == pendingPts {
+						if isRPCResultUpdate(b.ups[target]) {
+							if u.deliverBeforePendingRPC(ctx, userID, conn, b, watermark, target, acceptedAt, encoders) {
+								pendingRetry = true
+								break
+							}
+							if nextWatermark := conn.LastPushedPts(); nextWatermark > watermark {
+								watermark = nextWatermark
+								ups = b.above(watermark)
+								pendingPts, pending = pendingConn.PendingRPCUpdate(userID)
+								if pending {
+									if readyConn, ok := conn.(pendingRPCReadyConn); ok {
+										pendingReady = readyConn.PendingRPCUpdateReady(userID)
+									}
+								}
+								continue
+							}
+						}
+					}
+				}
+				break
+			}
+			if pendingRetry {
+				result.retry = true
+				return result
+			}
+			keyedPending := false
+			if rpcConn, ok := conn.(rpcUpdatePushConn); ok && pending && pendingPts > 0 && suppressed.AuthKeyID != 0 && suppressed.Pts == pendingPts && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+				keyedPending = true
+			}
+			if pending && !keyedPending && (pendingPts == 0 || pendingPts <= b.state.Pts) {
+				// Do not put this origin in the next delivery window while
+				// its result barrier is active. Advancing past the skipped
+				// event would create a pts gap on the wire.
+				return result
+			}
+		}
+	}
+	if len(ups) == 0 {
+		result.ahead = b.more && conn.LastPushedPts() < b.state.Pts
+		return result
+	}
+	if rpcConn, ok := conn.(rpcUpdatePushConn); ok && suppressed.AuthKeyID != 0 && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+		start := sort.SearchInts(b.pts, watermark+1)
+		target := sort.SearchInts(b.pts, suppressed.Pts)
+		if target < len(b.pts) && b.pts[target] == suppressed.Pts && target >= start {
+			if isRPCResultUpdate(b.ups[target]) {
+				if u.deliverWithSuppression(ctx, userID, rpcConn, b, watermark, start, target, suppressed, acceptedAt, encoders) {
+					result.retry = true
+					return result
+				}
+				result.ahead = b.more && rpcConn.LastPushedPts() < b.state.Pts
+				return result
+			}
+		}
+	}
+	// Addressed to userID: this snapshot was taken before the batch was
+	// built, and the conn's auth key can rebind to another user in between.
+	// A push dropped for that reason costs nothing — the user's next poll
+	// backfills it.
+	//
+	// users covers the whole batch, so a conn taking a suffix gets a
+	// superset of the users it needs, which a client ignores.
+	pushed, stale, err := u.pushOrdered(ctx, conn, userID, watermark, wrapUpdates(ups, b.users, b.chats, b.state), b.state.Pts, encoders)
+	if stale {
+		result.retry = true
+		return result
+	}
+	u.recordPushOutcome(acceptedAt, pushed, err)
+	if err != nil {
+		u.log.Info("deliver push", "user_id", userID, "err", err)
+	}
+	return result
+}
+
+// accountPendingRPCUpdate releases a known sender-result barrier when generic
+// delivery has reached the event's immediate prefix. The RPC result already
+// delivered that event to this conn, so accounting it advances the watermark
+// without writing a duplicate update; the caller then pushes the remaining
+// suffix. A barrier farther ahead still needs its prefix pushed first.
+func accountPendingRPCUpdate(owner int64, conn rpcUpdatePushConn, b updateBatch, watermark, pendingPts int) (int, bool) {
+	if pendingPts <= 0 {
+		return watermark, false
+	}
+	if pendingPts <= watermark {
+		if !conn.MarkRPCUpdate(owner, conn.AuthKeyID(), pendingPts) {
+			return watermark, false
+		}
+		return conn.LastPushedPts(), true
+	}
+	if pendingPts != watermark+1 {
+		return watermark, false
+	}
+	target := sort.SearchInts(b.pts, pendingPts)
+	start := sort.SearchInts(b.pts, watermark+1)
+	if target >= len(b.pts) || b.pts[target] != pendingPts || target < start {
+		return watermark, false
+	}
+	if !isRPCResultUpdate(b.ups[target]) {
+		return watermark, false
+	}
+	if !conn.MarkRPCUpdate(owner, conn.AuthKeyID(), pendingPts) {
+		return watermark, false
+	}
+	return conn.LastPushedPts(), true
+}
+
+func isRPCResultUpdate(up tg.UpdateClass) bool {
+	switch up.(type) {
+	case *tg.UpdateNewMessage, *tg.UpdateEditMessage:
+		return true
+	default:
+		return false
+	}
+}
+
+func (u *Updater) pushOrdered(ctx context.Context, conn pushConn, owner int64, expectedPts int, enc bin.Encoder, pts int, encoders *deliveryEncoder) (pushed, stale bool, err error) {
+	if _, ok := conn.(*mtproto.Conn); ok && encoders != nil {
+		enc = synchronizedEncoder{mu: &encoders.mu, enc: enc}
+	}
+	if guarded, ok := conn.(orderedPushConn); ok {
+		pushed, stale, err = guarded.PushToAtWatermark(ctx, owner, expectedPts, enc, pts)
+	} else {
+		pushed, err = conn.PushTo(ctx, owner, enc, pts)
+	}
+	u.handlePushFailure(owner, conn, err)
+	return pushed, stale, err
+}
+
+func (u *Updater) handlePushFailure(owner int64, conn pushConn, err error) {
+	if err == nil || mtproto.IsPushEncodeError(err) || mtproto.IsPushNotAttempted(err) || u.registry == nil {
+		return
+	}
+	c, ok := conn.(*mtproto.Conn)
+	if !ok {
+		return
+	}
+	// Remove before closing so a queued notification cannot take another
+	// write-deadline hold while the serve goroutine is unwinding the socket.
+	u.registry.Remove(owner, c)
+	if closeErr := c.Close(); closeErr != nil {
+		u.log.Info("close failed push connection", "user_id", owner, "err", closeErr)
+	}
+}
+
+func (u *Updater) pushTransientEncoded(ctx context.Context, owner int64, conn pushConn, enc bin.Encoder, encoders *deliveryEncoder) (bool, error) {
+	if _, ok := conn.(*mtproto.Conn); ok && encoders != nil {
+		enc = synchronizedEncoder{mu: &encoders.mu, enc: enc}
+	}
+	pushed, err := conn.PushTo(ctx, owner, enc, 0)
+	u.handlePushFailure(owner, conn, err)
+	return pushed, err
+}
+
+func (u *Updater) deliverBeforePendingRPC(ctx context.Context, userID int64, conn pushConn, b updateBatch, watermark, target int, acceptedAt time.Time, encoders *deliveryEncoder) bool {
+	start := sort.SearchInts(b.pts, watermark+1)
+	if target <= start {
+		return false
+	}
+	prefixPts := b.pts[target-1]
+	pushed, stale, err := u.pushOrdered(ctx, conn, userID, watermark, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts, encoders)
+	if stale {
+		return true
+	}
+	u.recordPushOutcome(acceptedAt, pushed, err)
+	if err != nil {
+		u.log.Info("deliver push before pending RPC update", "user_id", userID, "err", err)
+	}
+	return false
+}
+
+func (u *Updater) deliverWithSuppression(ctx context.Context, userID int64, conn rpcUpdatePushConn, b updateBatch, watermark, start, target int, suppressed store.SuppressedUpdate, acceptedAt time.Time, encoders *deliveryEncoder) bool {
+	if target > start {
+		prefixPts := b.pts[target-1]
+		pushed, stale, err := u.pushOrdered(ctx, conn, userID, watermark, wrapUpdates(b.ups[start:target], b.users, b.chats, b.state), prefixPts, encoders)
+		if stale {
+			return true
+		}
+		u.recordPushOutcome(acceptedAt, pushed, err)
+		if err != nil {
+			u.log.Info("deliver push before RPC update", "user_id", userID, "err", err)
+			return true
+		}
+		if !pushed {
+			return false
+		}
+	}
+	if !conn.MarkRPCUpdate(userID, suppressed.AuthKeyID, suppressed.Pts) {
+		return false
+	}
+	suffixStart := target + 1
+	suffixEnd := len(b.ups)
+	if pendingConn, ok := conn.(pendingRPCUpdateConn); ok {
+		if nextPts, pending := pendingConn.PendingRPCUpdate(userID); pending && nextPts > suppressed.Pts {
+			nextTarget := sort.SearchInts(b.pts, nextPts)
+			if nextTarget < suffixEnd && nextTarget >= suffixStart {
+				suffixEnd = nextTarget
+			}
+		}
+	}
+	if suffixStart >= suffixEnd {
+		return false
+	}
+	pushed, stale, err := u.pushOrdered(ctx, conn, userID, suppressed.Pts, wrapUpdates(b.ups[suffixStart:suffixEnd], b.users, b.chats, b.state), b.pts[suffixEnd-1], encoders)
+	if stale {
+		return true
+	}
+	u.recordPushOutcome(acceptedAt, pushed, err)
+	if err != nil {
+		u.log.Info("deliver push after RPC update", "user_id", userID, "err", err)
+	}
+	return false
 }
 
 func (u *Updater) recordPushOutcome(acceptedAt time.Time, pushed bool, err error) {
@@ -208,12 +606,18 @@ func (u *Updater) DeliverTyping(ctx context.Context, peerID, fromID int64) {
 		Update: &tg.UpdateUserTyping{UserID: fromID, Action: &tg.SendMessageTypingAction{}},
 		Date:   int(time.Now().Unix()),
 	}
+	pushes := make([]transientPush, 0, len(conns))
 	for _, c := range conns {
-		// Carries no pts, so a conn that changed hands simply drops it.
-		if _, err := c.PushTo(ctx, peerID, short, 0); err != nil {
-			u.log.Info("deliver typing", "peer_id", peerID, "err", err)
-		}
+		pushes = append(pushes, transientPush{
+			owner: peerID,
+			conn:  c,
+			enc:   short,
+			onError: func(err error) {
+				u.log.Info("deliver typing", "peer_id", peerID, "err", err)
+			},
+		})
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // DeliverChannelPost pushes a newly-committed channel post to every non-banned
@@ -271,11 +675,10 @@ func (u *Updater) DeliverChannelPost(ctx context.Context, channelID int64) {
 // non-banned member that has live conns it calls build once (with the member's
 // JoinPts as the floor hint) and pushes the resulting updates to each conn.
 //
-// The callback runs on the listener's single goroutine; it must not block. All
-// pushes are inline. The bound that makes this acceptable: the number of members
-// with live conns on this replica is typically small (the replica serves a
-// fraction of all members). If that fraction grows too large for inline work,
-// the callback would need to hand off to a worker pool.
+// The callback runs on one bounded listener worker; all pushes for this channel
+// event are inline. The number of members with live conns on this replica is
+// typically small (the replica serves a fraction of all members), and the
+// scheduler keeps a blocked channel key from stalling unrelated notifications.
 func (u *Updater) deliverChannel(
 	ctx context.Context,
 	members []store.ChannelMember,
@@ -283,6 +686,7 @@ func (u *Updater) deliverChannel(
 	connsFor func(userID int64) []pushConn,
 	build func(memberID int64, fromPts int) (channelBatch, error),
 ) {
+	var pushes []transientPush
 	for _, m := range members {
 		if m.Banned(now) {
 			continue
@@ -306,15 +710,22 @@ func (u *Updater) deliverChannel(
 			Date:    int(now.Unix()),
 			Seq:     0,
 		}
+		memberID := m.UserID
 		for _, c := range conns {
 			// Pass pts=0: this is a channel update; the conn's lastPushedPts
 			// tracks the per-account stream and must not be corrupted by a
 			// channel pts value.
-			if _, err := c.PushTo(ctx, m.UserID, env, 0); err != nil {
-				u.log.Info("deliver channel push", "user_id", m.UserID, "err", err)
-			}
+			pushes = append(pushes, transientPush{
+				owner: memberID,
+				conn:  c,
+				enc:   env,
+				onError: func(err error) {
+					u.log.Info("deliver channel push", "user_id", memberID, "err", err)
+				},
+			})
 		}
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // DeliverEncryption pushes a secret chat's new state to userID's live conns as
@@ -353,12 +764,18 @@ func (u *Updater) DeliverEncryption(ctx context.Context, userID, chatID int64) {
 		},
 		Date: int(time.Now().Unix()),
 	}
+	pushes := make([]transientPush, 0, len(conns))
 	for _, c := range conns {
-		// Carries no pts, so a conn that changed hands simply drops it.
-		if _, err := c.PushTo(ctx, userID, short, 0); err != nil {
-			u.log.Info("deliver encryption", "user_id", userID, "err", err)
-		}
+		pushes = append(pushes, transientPush{
+			owner: userID,
+			conn:  c,
+			enc:   short,
+			onError: func(err error) {
+				u.log.Info("deliver encryption", "user_id", userID, "err", err)
+			},
+		})
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // DeliverStatus pushes updateUserStatus to every dialog partner of userID whose
@@ -399,19 +816,29 @@ func (u *Updater) DeliverStatus(ctx context.Context, userID int64, online bool) 
 		status = &tg.UserStatusOffline{WasOnline: int(wasOnline)}
 	}
 
+	var pushes []transientPush
 	for _, partnerID := range partners {
 		conns := u.registry.Conns(partnerID)
+		if len(conns) == 0 {
+			continue
+		}
+		short := &tg.UpdateShort{
+			Update: &tg.UpdateUserStatus{UserID: userID, Status: status},
+			Date:   int(time.Now().Unix()),
+		}
 		for _, c := range conns {
-			short := &tg.UpdateShort{
-				Update: &tg.UpdateUserStatus{UserID: userID, Status: status},
-				Date:   int(time.Now().Unix()),
-			}
-			// Carries no pts, so a conn that changed hands simply drops it.
-			if _, err := c.PushTo(ctx, partnerID, short, 0); err != nil {
-				u.log.Info("deliver status push", "partner_id", partnerID, "err", err)
-			}
+			partner := partnerID
+			pushes = append(pushes, transientPush{
+				owner: partner,
+				conn:  c,
+				enc:   short,
+				onError: func(err error) {
+					u.log.Info("deliver status push", "partner_id", partner, "err", err)
+				},
+			})
 		}
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // DeliverEncryptedMsg pushes updateNewEncryptedMessage to the recipient's live
@@ -441,11 +868,18 @@ func (u *Updater) DeliverEncryptedMsg(ctx context.Context, recipientID int64, qt
 		},
 		Date: int(event.Date.Unix()),
 	}
+	pushes := make([]transientPush, 0, len(conns))
 	for _, c := range conns {
-		if _, err := c.PushTo(ctx, recipientID, update, 0); err != nil {
-			u.log.Info("deliver encrypted msg push", "recipient_id", recipientID, "err", err)
-		}
+		pushes = append(pushes, transientPush{
+			owner: recipientID,
+			conn:  c,
+			enc:   update,
+			onError: func(err error) {
+				u.log.Info("deliver encrypted msg push", "recipient_id", recipientID, "err", err)
+			},
+		})
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // Evict closes the connections of userID that still hold authKeyID, which the
@@ -515,12 +949,18 @@ func (u *Updater) DeliverReactions(ctx context.Context, ownerID, localID, userID
 		},
 		Date: int(time.Now().Unix()),
 	}
+	pushes := make([]transientPush, 0, len(conns))
 	for _, c := range conns {
-		// Carries no pts, so a conn that changed hands simply drops it.
-		if _, err := c.PushTo(ctx, userID, update, 0); err != nil {
-			u.log.Info("deliver reactions push", "user_id", userID, "err", err)
-		}
+		pushes = append(pushes, transientPush{
+			owner: userID,
+			conn:  c,
+			enc:   update,
+			onError: func(err error) {
+				u.log.Info("deliver reactions push", "user_id", userID, "err", err)
+			},
+		})
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // wrapUpdates envelopes hydrated updates into a tg.Updates for a live push.
@@ -604,6 +1044,7 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, pe
 // deliverPinnedToUsers pushes the pinned update to each member with live conns.
 // pinnedMsgID is nonzero on pin, zero on unpin.
 func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64, pinnedMsgID int32) {
+	var pushes []transientPush
 	for _, memberID := range members {
 		conns := u.registry.Conns(memberID)
 		if len(conns) == 0 {
@@ -622,10 +1063,16 @@ func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, m
 			Date: int(time.Now().Unix()),
 		}
 		for _, c := range conns {
-			// Carries no pts, so a conn that changed hands simply drops it.
-			if _, err := c.PushTo(ctx, memberID, update, 0); err != nil {
-				u.log.Info("deliver pinned push", "user_id", memberID, "err", err)
-			}
+			member := memberID
+			pushes = append(pushes, transientPush{
+				owner: member,
+				conn:  c,
+				enc:   update,
+				onError: func(err error) {
+					u.log.Info("deliver pinned push", "user_id", member, "err", err)
+				},
+			})
 		}
 	}
+	u.pushTransientFanout(ctx, pushes)
 }

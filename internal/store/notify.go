@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -14,7 +15,7 @@ import (
 
 // Postgres LISTEN/NOTIFY channels used for cross-replica update delivery.
 const (
-	ChannelUpdates = "tg_updates"      // payload: "<userID>"
+	ChannelUpdates = "tg_updates"      // payload: "<userID>" or "<userID>|<authKeyID>|<pts>"
 	ChannelTyping  = "tg_typing"       // payload: "<peerUserID>|<fromUserID>"
 	ChannelEvict   = "tg_evict"        // payload: "<userID>|<authKeyID>"
 	ChannelPost    = "tg_channel_post" // payload: "<channelID>"
@@ -29,9 +30,9 @@ const (
 	// encrypted_events and pushes updateNewEncryptedMessage.
 	ChannelEncryptedMsg = "tg_encrypted_msg" // payload: "<recipientID>|<qts>"
 	// ChannelReactions carries a reaction change to all parties holding a message.
-	// payload: "<userID>". The handler pushes updateMessageReactions (transient,
-	// no pts, same model as updateUserStatus).
-	ChannelReactions = "tg_reactions" // payload: "<userID>"
+	// payload: "<ownerID>|<localID>|<userID>". The handler pushes
+	// updateMessageReactions (transient, no pts, same model as updateUserStatus).
+	ChannelReactions = "tg_reactions"
 	// ChannelPinned carries a pin/unpin change to all members of a chat or channel.
 	// payload: "c<peerID>[|<msgID>]" for chat, "h<peerID>[|<msgID>]" for channel.
 	// msgID is present on pin (nonzero), absent on unpin. The handler pushes
@@ -40,6 +41,34 @@ const (
 )
 
 type notificationAcceptedAtKey struct{}
+
+type suppressedUpdateKey struct{}
+
+// SuppressedUpdate identifies the sendMessage update that will be returned by
+// an RPC result to one authenticated key. It is carried only to the in-process
+// delivery callback; the event remains in the owner's event log.
+type SuppressedUpdate struct {
+	AuthKeyID int64
+	Pts       int
+}
+
+// WithSuppressedUpdate carries the RPC-result update identity to the delivery
+// callback for this notification.
+func WithSuppressedUpdate(ctx context.Context, update SuppressedUpdate) context.Context {
+	return context.WithValue(ctx, suppressedUpdateKey{}, update)
+}
+
+// SuppressedUpdateFromContext returns the optional RPC-result update identity.
+func SuppressedUpdateFromContext(ctx context.Context) (SuppressedUpdate, bool) {
+	if ctx == nil {
+		return SuppressedUpdate{}, false
+	}
+	update, ok := ctx.Value(suppressedUpdateKey{}).(SuppressedUpdate)
+	if !ok || update.AuthKeyID == 0 || update.Pts <= 0 {
+		return SuppressedUpdate{}, false
+	}
+	return update, true
+}
 
 // WithNotificationAcceptedAt carries a valid tg_updates acceptance timestamp
 // to the in-process delivery callback. It never leaves the process or enters a
@@ -97,7 +126,8 @@ func nextBackoff(prev, uptime time.Duration) time.Duration {
 // notification to the delivery callbacks, reconnecting when that connection
 // breaks.
 type Listener struct {
-	log *slog.Logger
+	log       *slog.Logger
+	scheduler *notificationScheduler
 	// metrics is the only recorder accepted by StartListener. Its fixed
 	// in-process operation runs before the delivery callback.
 	metrics *NotificationMetrics
@@ -136,8 +166,9 @@ type Listener struct {
 // listener is reconnecting are lost, which push already tolerates: the client's
 // next getDifference backfills them.
 //
-// The callbacks run on this one goroutine, so none of them may block: a stalled
-// callback holds up every other user's delivery.
+// The LISTEN goroutine only parses and schedules callbacks. A fixed worker pool
+// runs them, and notifications for the same routing key remain serial while a
+// blocked key cannot occupy notification ingestion or every worker.
 func StartListener(
 	ctx context.Context,
 	dsn string,
@@ -165,8 +196,8 @@ func StartListener(
 	if len(notifyMetrics) > 0 {
 		metrics = notifyMetrics[0]
 	}
-	l := &Listener{log: log, metrics: metrics}
 	loopCtx, cancel := context.WithCancel(ctx)
+	l := &Listener{log: log, metrics: metrics, scheduler: newNotificationScheduler(loopCtx)}
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned)
@@ -175,6 +206,7 @@ func StartListener(
 	stop := func() error {
 		cancel()
 		wg.Wait()
+		l.scheduler.stop()
 		return l.closeErr
 	}
 	return l, stop, nil
@@ -270,7 +302,7 @@ func (l *Listener) dispatch(
 		}
 		switch n.Channel {
 		case ChannelUpdates:
-			userID, perr := strconv.ParseInt(n.Payload, 10, 64)
+			userID, update, perr := parseUpdatesPayload(n.Payload)
 			if perr != nil {
 				l.recordInvalidNotification()
 				l.log.Warn("bad tg_updates payload", "payload", n.Payload)
@@ -278,7 +310,17 @@ func (l *Listener) dispatch(
 			}
 			acceptedAt := time.Now()
 			l.recordValidNotification(ChannelUpdates)
-			deliver(WithNotificationAcceptedAt(ctx, acceptedAt), userID)
+			deliveryCtx := WithNotificationAcceptedAt(ctx, acceptedAt)
+			if update.AuthKeyID != 0 {
+				deliveryCtx = WithSuppressedUpdate(deliveryCtx, update)
+			}
+			l.schedule("updates:"+strconv.FormatInt(userID, 10), notificationTask{
+				ctx:      deliveryCtx,
+				coalesce: update.AuthKeyID == 0,
+				run: func(ctx context.Context) {
+					deliver(ctx, userID)
+				},
+			})
 		case ChannelTyping:
 			peerID, fromID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -287,7 +329,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelTyping)
-			typing(ctx, peerID, fromID)
+			l.schedule("typing:"+strconv.FormatInt(peerID, 10)+":"+strconv.FormatInt(fromID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					typing(ctx, peerID, fromID)
+				},
+			})
 		case ChannelEvict:
 			userID, authKeyID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -298,6 +346,9 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelEvict)
+			// Eviction closes a matching transport without taking writeMu. Keep it
+			// on the listener goroutine so revocation cannot wait behind saturated
+			// push workers or be dropped by their bounded queue.
 			evict(ctx, userID, authKeyID)
 		case ChannelPost:
 			channelID, perr := strconv.ParseInt(n.Payload, 10, 64)
@@ -307,7 +358,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelPost)
-			channelPost(ctx, channelID)
+			l.schedule("post:"+strconv.FormatInt(channelID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					channelPost(ctx, channelID)
+				},
+			})
 		case ChannelEncryption:
 			userID, chatID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -316,7 +373,12 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelEncryption)
-			encryption(ctx, userID, chatID)
+			l.schedule("encryption:"+strconv.FormatInt(userID, 10), notificationTask{
+				ctx: ctx,
+				run: func(ctx context.Context) {
+					encryption(ctx, userID, chatID)
+				},
+			})
 		case ChannelStatus:
 			userID, onlineID, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -325,7 +387,14 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelStatus)
-			status(ctx, userID, onlineID == 1)
+			online := onlineID == 1
+			l.schedule("status:"+strconv.FormatInt(userID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					status(ctx, userID, online)
+				},
+			})
 		case ChannelEncryptedMsg:
 			recipientID, qts64, perr := parsePairPayload(n.Payload)
 			if perr != nil {
@@ -334,7 +403,12 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelEncryptedMsg)
-			encryptedMsg(ctx, recipientID, int(qts64))
+			l.schedule("encrypted-msg:"+strconv.FormatInt(recipientID, 10), notificationTask{
+				ctx: ctx,
+				run: func(ctx context.Context) {
+					encryptedMsg(ctx, recipientID, int(qts64))
+				},
+			})
 		case ChannelReactions:
 			opts, perr := parseReactionPayload(n.Payload)
 			if perr != nil {
@@ -343,7 +417,13 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelReactions)
-			reactions(ctx, opts.ownerID, opts.localID, opts.userID)
+			l.schedule("reactions:"+strconv.FormatInt(opts.userID, 10)+":"+strconv.FormatInt(opts.localID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					reactions(ctx, opts.ownerID, opts.localID, opts.userID)
+				},
+			})
 		case ChannelPinned:
 			payload := n.Payload
 			if len(payload) < 2 {
@@ -391,11 +471,40 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelPinned)
-			pinned(ctx, peerType, peerID, pinnedMsgID)
+			l.schedule("pinned:"+strconv.FormatInt(int64(peerType), 10)+":"+strconv.FormatInt(peerID, 10), notificationTask{
+				ctx:      ctx,
+				coalesce: true,
+				run: func(ctx context.Context) {
+					pinned(ctx, peerType, peerID, pinnedMsgID)
+				},
+			})
 		default:
 			l.recordInvalidNotification()
 		}
 	}
+}
+
+func parseUpdatesPayload(payload string) (int64, SuppressedUpdate, error) {
+	parts := strings.Split(payload, "|")
+	if len(parts) != 1 && len(parts) != 3 {
+		return 0, SuppressedUpdate{}, errors.New("invalid update payload fields")
+	}
+	userID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || userID <= 0 {
+		return 0, SuppressedUpdate{}, errors.New("invalid update owner")
+	}
+	if len(parts) == 1 {
+		return userID, SuppressedUpdate{}, nil
+	}
+	authKeyID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || authKeyID == 0 {
+		return 0, SuppressedUpdate{}, errors.New("invalid update auth key")
+	}
+	pts, err := strconv.Atoi(parts[2])
+	if err != nil || pts <= 0 {
+		return 0, SuppressedUpdate{}, errors.New("invalid update pts")
+	}
+	return userID, SuppressedUpdate{AuthKeyID: authKeyID, Pts: pts}, nil
 }
 
 // recordValidNotification isolates the listener from recorder failures. A

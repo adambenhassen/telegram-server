@@ -2,15 +2,109 @@ package api_test
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/crypto"
+	"github.com/gotd/td/mt"
+	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
+
+type blockedPushTransport struct {
+	mu        sync.Mutex
+	attempts  int
+	entered   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (t *blockedPushTransport) Send(ctx context.Context, _ *bin.Buffer) error {
+	t.mu.Lock()
+	t.attempts++
+	first := t.attempts == 1
+	t.mu.Unlock()
+	if first {
+		close(t.entered)
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (*blockedPushTransport) Recv(context.Context, *bin.Buffer) error { return errors.New("unused") }
+
+func (t *blockedPushTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
+func (t *blockedPushTransport) pushAttempts() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.attempts
+}
+
+var _ transport.Conn = (*blockedPushTransport)(nil)
+
+type serializationPushTransport struct {
+	mu      sync.Mutex
+	sends   int
+	closes  int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (t *serializationPushTransport) Send(ctx context.Context, _ *bin.Buffer) error {
+	t.mu.Lock()
+	t.sends++
+	send := t.sends
+	t.mu.Unlock()
+	if send == 1 {
+		close(t.entered)
+		<-t.release
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (*serializationPushTransport) Recv(context.Context, *bin.Buffer) error {
+	return errors.New("unused")
+}
+
+func (t *serializationPushTransport) Close() error {
+	t.mu.Lock()
+	t.closes++
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *serializationPushTransport) counts() (sends, closes int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sends, t.closes
+}
+
+var _ transport.Conn = (*serializationPushTransport)(nil)
+
+func testPushKey(seed byte) crypto.AuthKey {
+	var raw crypto.Key
+	for i := range raw {
+		raw[i] = seed + byte(i)
+	}
+	return raw.WithID()
+}
 
 func TestChannelUpdatesProductionDeliverRecordsOnePushSample(t *testing.T) {
 	t.Parallel()
@@ -126,4 +220,474 @@ func TestChannelUpdatesProductionDeliverRecordsOnePushSample(t *testing.T) {
 	if bucketSamples != 1 {
 		t.Fatalf("push latency buckets = %v, want exactly one sample", afterTransient.Push.LatencyBucketCounts)
 	}
+}
+
+func TestMultiSocketSlowPushCannotStallAnotherAccount(t *testing.T) {
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	registry := mtproto.NewSessionRegistry()
+	updater := api.NewUpdater(s, registry, nil, pgtest.PeerDeriver())
+
+	slowUser, err := s.CreateUser(ctx, "+15554127311")
+	if err != nil {
+		t.Fatalf("create slow user: %v", err)
+	}
+	slowSender, err := s.CreateUser(ctx, "+15554127312")
+	if err != nil {
+		t.Fatalf("create slow sender: %v", err)
+	}
+	healthyUser, err := s.CreateUser(ctx, "+15554127313")
+	if err != nil {
+		t.Fatalf("create healthy user: %v", err)
+	}
+	healthySender, err := s.CreateUser(ctx, "+15554127314")
+	if err != nil {
+		t.Fatalf("create healthy sender: %v", err)
+	}
+	if _, _, _, _, err := s.SendMessage(ctx, slowSender.ID, slowUser.ID, "slow", 1, 0, 0); err != nil {
+		t.Fatalf("persist slow-user event: %v", err)
+	}
+	if _, _, _, _, err := s.SendMessage(ctx, healthySender.ID, healthyUser.ID, "healthy", 2, 0, 0); err != nil {
+		t.Fatalf("persist healthy-user event: %v", err)
+	}
+
+	slowTransports := make([]*blockedPushTransport, 3)
+	slowConns := make([]*mtproto.Conn, len(slowTransports))
+	for i := range slowTransports {
+		slowTransports[i] = &blockedPushTransport{entered: make(chan struct{}), closed: make(chan struct{})}
+		keySeed := byte(i + 1)
+		if keySeed >= 3 {
+			keySeed++ // keep the sender's key out of the blocked sibling set
+		}
+		slowConns[i] = mtproto.NewTestConn(slowTransports[i], testPushKey(keySeed))
+		slowConns[i].SetOwner(slowUser.ID)
+		if !registry.Add(slowUser.ID, slowConns[i]) {
+			t.Fatalf("register slow connection %d", i)
+		}
+		conn := slowConns[i]
+		t.Cleanup(func() { registry.Remove(slowUser.ID, conn) })
+	}
+
+	originKey := testPushKey(3)
+	originTransport := &fakeTransport{}
+	originConn := mtproto.NewTestConn(originTransport, originKey)
+	originConn.SetOwner(slowUser.ID)
+	if !registry.Add(slowUser.ID, originConn) {
+		t.Fatal("register origin connection")
+	}
+	t.Cleanup(func() { registry.Remove(slowUser.ID, originConn) })
+
+	siblingTransport := &fakeTransport{}
+	siblingConn := mtproto.NewTestConn(siblingTransport, testPushKey(4))
+	siblingConn.SetOwner(slowUser.ID)
+	if !registry.Add(slowUser.ID, siblingConn) {
+		t.Fatal("register healthy sibling connection")
+	}
+	t.Cleanup(func() { registry.Remove(slowUser.ID, siblingConn) })
+
+	healthyTransport := &fakeTransport{}
+	healthyConn := mtproto.NewTestConn(healthyTransport, testPushKey(2))
+	healthyConn.SetOwner(healthyUser.ID)
+	if !registry.Add(healthyUser.ID, healthyConn) {
+		t.Fatal("register healthy connection")
+	}
+	t.Cleanup(func() { registry.Remove(healthyUser.ID, healthyConn) })
+
+	_, stop, err := store.StartListener(ctx, dsn,
+		updater.Deliver,
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	t.Cleanup(func() { _ = stop() }) //nolint:errcheck // teardown
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+	slowPayload := strconv.FormatInt(slowUser.ID, 10) + "|" + strconv.FormatInt(mtproto.AuthKeyIDInt64(originKey.ID), 10) + "|1"
+	if err := s.Notify(ctx, store.ChannelUpdates, slowPayload); err != nil {
+		t.Fatalf("notify slow user: %v", err)
+	}
+	for i, transport := range slowTransports {
+		select {
+		case <-transport.entered:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("slow push %d did not reach the transport with sibling sockets in parallel", i)
+		}
+	}
+	for range 8 {
+		if err := s.Notify(ctx, store.ChannelUpdates, slowPayload); err != nil {
+			t.Fatalf("repeat slow-user notify: %v", err)
+		}
+	}
+
+	started := time.Now()
+	if err := s.Notify(ctx, store.ChannelUpdates, strconv.FormatInt(healthyUser.ID, 10)); err != nil {
+		t.Fatalf("notify healthy user: %v", err)
+	}
+	if !waitSentWithin(healthyTransport, 500*time.Millisecond) {
+		t.Fatalf("healthy push waited behind slow socket for %s", time.Since(started))
+	}
+	if !siblingTransport.wasSent() {
+		t.Fatal("healthy sibling did not receive the update")
+	}
+	for i, transport := range slowTransports {
+		select {
+		case <-transport.closed:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("failed slow socket %d was not closed", i)
+		}
+	}
+	// Repeated notifications must not get another write attempt after the first
+	// deadline closes the connection.
+	time.Sleep(100 * time.Millisecond)
+	for i, transport := range slowTransports {
+		if got := transport.pushAttempts(); got != 1 {
+			t.Fatalf("slow push %d attempts = %d, want one before removal", i, got)
+		}
+	}
+	if originTransport.wasSent() {
+		t.Fatal("sender session received its own keyed update echo")
+	}
+}
+
+func TestTransientFanoutSkipsUnattemptedConnections(t *testing.T) {
+	ctx := context.Background()
+	registry := mtproto.NewSessionRegistry()
+	updater := api.NewUpdater(nil, registry, nil, nil)
+	const userID = int64(9002)
+	const attemptedWorkerCount = 8 // transientFanoutWorkerCount in api
+
+	transports := make([]*blockedPushTransport, mtproto.MaxUserConns)
+	conns := make([]*mtproto.Conn, mtproto.MaxUserConns)
+	for i := range transports {
+		transports[i] = &blockedPushTransport{entered: make(chan struct{}), closed: make(chan struct{})}
+		conns[i] = mtproto.NewTestConn(transports[i], testPushKey(byte(70+i)))
+		conns[i].SetOwner(userID)
+		if !registry.Add(userID, conns[i]) {
+			t.Fatalf("register connection %d", i)
+		}
+		conn := conns[i]
+		t.Cleanup(func() { registry.Remove(userID, conn) })
+	}
+
+	started := time.Now()
+	updater.DeliverTyping(ctx, userID, 42)
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("transient fan-out took %s, want about one write timeout", elapsed)
+	}
+
+	for i := range attemptedWorkerCount {
+		if got := transports[i].pushAttempts(); got != 1 {
+			t.Fatalf("attempted connection %d sends = %d, want one", i, got)
+		}
+		select {
+		case <-transports[i].closed:
+		default:
+			t.Fatalf("attempted connection %d was not closed after its write timeout", i)
+		}
+	}
+
+	registered := registry.Conns(userID)
+	if got := len(registered); got != mtproto.MaxUserConns-attemptedWorkerCount {
+		t.Fatalf("registered connections = %d, want %d", got, mtproto.MaxUserConns-attemptedWorkerCount)
+	}
+	for i := attemptedWorkerCount; i < len(conns); i++ {
+		if got := transports[i].pushAttempts(); got != 0 {
+			t.Fatalf("unattempted connection %d sends = %d, want zero", i, got)
+		}
+		select {
+		case <-transports[i].closed:
+			t.Fatalf("unattempted connection %d was closed", i)
+		default:
+		}
+		if !slices.Contains(registered, conns[i]) {
+			t.Fatalf("unattempted connection %d was removed from the registry", i)
+		}
+	}
+}
+
+func TestSaturatedTypingDoesNotStallUpdates(t *testing.T) {
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	registry := mtproto.NewSessionRegistry()
+	updater := api.NewUpdater(s, registry, nil, pgtest.PeerDeriver())
+
+	slowUser, err := s.CreateUser(ctx, "+15554127321")
+	if err != nil {
+		t.Fatalf("create slow user: %v", err)
+	}
+	typingSender, err := s.CreateUser(ctx, "+15554127322")
+	if err != nil {
+		t.Fatalf("create typing sender: %v", err)
+	}
+	healthyUser, err := s.CreateUser(ctx, "+15554127323")
+	if err != nil {
+		t.Fatalf("create healthy user: %v", err)
+	}
+	healthySender, err := s.CreateUser(ctx, "+15554127324")
+	if err != nil {
+		t.Fatalf("create healthy sender: %v", err)
+	}
+	if _, _, _, _, err := s.SendMessage(ctx, healthySender.ID, healthyUser.ID, "healthy", 1, 0, 0); err != nil {
+		t.Fatalf("persist healthy-user event: %v", err)
+	}
+
+	slowTransports := make([]*blockedPushTransport, 3)
+	for i := range slowTransports {
+		slowTransports[i] = &blockedPushTransport{entered: make(chan struct{}), closed: make(chan struct{})}
+		conn := mtproto.NewTestConn(slowTransports[i], testPushKey(byte(20+i)))
+		conn.SetOwner(slowUser.ID)
+		if !registry.Add(slowUser.ID, conn) {
+			t.Fatalf("register slow connection %d", i)
+		}
+		t.Cleanup(func() { registry.Remove(slowUser.ID, conn) })
+	}
+
+	healthyTransport := &fakeTransport{}
+	healthyConn := mtproto.NewTestConn(healthyTransport, testPushKey(30))
+	healthyConn.SetOwner(healthyUser.ID)
+	if !registry.Add(healthyUser.ID, healthyConn) {
+		t.Fatal("register healthy connection")
+	}
+	t.Cleanup(func() { registry.Remove(healthyUser.ID, healthyConn) })
+
+	typingDone := make(chan struct{}, 1)
+	_, stop, err := store.StartListener(ctx, dsn,
+		updater.Deliver,
+		func(callbackCtx context.Context, peerID, fromID int64) {
+			updater.DeliverTyping(callbackCtx, peerID, fromID)
+			typingDone <- struct{}{}
+		},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	t.Cleanup(func() { _ = stop() }) //nolint:errcheck // teardown
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
+	if err := s.Notify(ctx, store.ChannelTyping, store.TypingPayload(slowUser.ID, typingSender.ID)); err != nil {
+		t.Fatalf("notify typing: %v", err)
+	}
+	for i, transport := range slowTransports {
+		select {
+		case <-transport.entered:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("typing push %d did not reach the transport with saturated sockets in parallel", i)
+		}
+	}
+
+	if err := s.Notify(ctx, store.ChannelUpdates, strconv.FormatInt(healthyUser.ID, 10)); err != nil {
+		t.Fatalf("notify healthy user: %v", err)
+	}
+	if !waitSentWithin(healthyTransport, 500*time.Millisecond) {
+		t.Fatal("healthy update waited behind saturated typing fan-out")
+	}
+	select {
+	case <-typingDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("typing callback exceeded one write timeout")
+	}
+	for i, transport := range slowTransports {
+		select {
+		case <-transport.closed:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("typing push %d was not closed after its write timeout", i)
+		}
+	}
+}
+
+func TestSaturatedStatusDoesNotStallUpdates(t *testing.T) {
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	registry := mtproto.NewSessionRegistry()
+	updater := api.NewUpdater(s, registry, nil, pgtest.PeerDeriver())
+
+	statusUser, err := s.CreateUser(ctx, "+15554127331")
+	if err != nil {
+		t.Fatalf("create status user: %v", err)
+	}
+	slowPartner, err := s.CreateUser(ctx, "+15554127332")
+	if err != nil {
+		t.Fatalf("create slow partner: %v", err)
+	}
+	healthyPartner, err := s.CreateUser(ctx, "+15554127333")
+	if err != nil {
+		t.Fatalf("create healthy partner: %v", err)
+	}
+	healthySender, err := s.CreateUser(ctx, "+15554127334")
+	if err != nil {
+		t.Fatalf("create healthy sender: %v", err)
+	}
+	sendStatus(t, s, statusUser, slowPartner)
+	sendStatus(t, s, statusUser, healthyPartner)
+	if _, _, _, _, err := s.SendMessage(ctx, healthySender.ID, healthyPartner.ID, "healthy", 2, 0, 0); err != nil {
+		t.Fatalf("persist healthy-partner event: %v", err)
+	}
+
+	slowTransports := make([]*blockedPushTransport, 3)
+	for i := range slowTransports {
+		slowTransports[i] = &blockedPushTransport{entered: make(chan struct{}), closed: make(chan struct{})}
+		conn := mtproto.NewTestConn(slowTransports[i], testPushKey(byte(40+i)))
+		conn.SetOwner(slowPartner.ID)
+		if !registry.Add(slowPartner.ID, conn) {
+			t.Fatalf("register slow partner connection %d", i)
+		}
+		t.Cleanup(func() { registry.Remove(slowPartner.ID, conn) })
+	}
+
+	healthyTransport := &fakeTransport{}
+	healthyConn := mtproto.NewTestConn(healthyTransport, testPushKey(50))
+	healthyConn.SetOwner(healthyPartner.ID)
+	if !registry.Add(healthyPartner.ID, healthyConn) {
+		t.Fatal("register healthy partner connection")
+	}
+	t.Cleanup(func() { registry.Remove(healthyPartner.ID, healthyConn) })
+
+	statusDone := make(chan struct{}, 1)
+	_, stop, err := store.StartListener(ctx, dsn,
+		updater.Deliver,
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(callbackCtx context.Context, userID int64, online bool) {
+			updater.DeliverStatus(callbackCtx, userID, online)
+			statusDone <- struct{}{}
+		},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	t.Cleanup(func() { _ = stop() }) //nolint:errcheck // teardown
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
+	if err := s.Notify(ctx, store.ChannelStatus, store.StatusPayload(statusUser.ID, true)); err != nil {
+		t.Fatalf("notify status: %v", err)
+	}
+	for i, transport := range slowTransports {
+		select {
+		case <-transport.entered:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("status push %d did not reach the transport with saturated sockets in parallel", i)
+		}
+	}
+
+	if err := s.Notify(ctx, store.ChannelUpdates, strconv.FormatInt(healthyPartner.ID, 10)); err != nil {
+		t.Fatalf("notify healthy partner: %v", err)
+	}
+	if !waitSentWithin(healthyTransport, 500*time.Millisecond) {
+		t.Fatal("healthy update waited behind saturated status fan-out")
+	}
+	select {
+	case <-statusDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("status callback exceeded one write timeout")
+	}
+	for i, transport := range slowTransports {
+		select {
+		case <-transport.closed:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("status push %d was not closed after its write timeout", i)
+		}
+	}
+}
+
+func TestTransientDeadlineDoesNotCloseBusyConnection(t *testing.T) {
+	ctx := context.Background()
+	registry := mtproto.NewSessionRegistry()
+	updater := api.NewUpdater(nil, registry, nil, nil)
+	const userID = int64(9001)
+
+	transport := &serializationPushTransport{entered: make(chan struct{}), release: make(chan struct{})}
+	conn := mtproto.NewTestConn(transport, testPushKey(60))
+	conn.SetOwner(userID)
+	if !registry.Add(userID, conn) {
+		t.Fatal("register connection")
+	}
+	t.Cleanup(func() { registry.Remove(userID, conn) })
+
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- conn.SendResult(&mtproto.Request{Ctx: ctx, MsgID: 1}, &mt.Pong{PingID: 1})
+	}()
+	select {
+	case <-transport.entered:
+	case <-time.After(time.Second):
+		t.Fatal("did not acquire the connection write")
+	}
+
+	callbackCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	callbackDone := make(chan struct{})
+	go func() {
+		updater.DeliverTyping(callbackCtx, userID, 42)
+		close(callbackDone)
+	}()
+	<-callbackCtx.Done()
+	// Keep the first write serialized long enough for the transient callback to
+	// expire while it waits, rather than letting scheduling decide the order.
+	time.Sleep(50 * time.Millisecond)
+	close(transport.release)
+
+	select {
+	case err := <-holderDone:
+		if err != nil {
+			t.Fatalf("holder write: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("holder write did not finish")
+	}
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("expired transient callback did not finish")
+	}
+
+	if got := len(registry.Conns(userID)); got != 1 {
+		t.Fatalf("registered connections after skipped push = %d, want one", got)
+	}
+	if sends, closes := transport.counts(); sends != 1 || closes != 0 {
+		t.Fatalf("transport counts after skipped push = sends:%d closes:%d, want sends:1 closes:0", sends, closes)
+	}
+
+	updater.DeliverTyping(ctx, userID, 42)
+	if sends, closes := transport.counts(); sends != 2 || closes != 0 {
+		t.Fatalf("transport counts after later push = sends:%d closes:%d, want sends:2 closes:0", sends, closes)
+	}
+}
+
+func waitSentWithin(ft *fakeTransport, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if ft.wasSent() {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return ft.wasSent()
 }
