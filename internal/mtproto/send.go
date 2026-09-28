@@ -50,6 +50,22 @@ func IsPushEncodeError(err error) bool {
 	return errors.As(err, &target)
 }
 
+type pushNotAttemptedError struct {
+	err error
+}
+
+func (e *pushNotAttemptedError) Error() string { return e.err.Error() }
+
+func (e *pushNotAttemptedError) Unwrap() error { return e.err }
+
+// IsPushNotAttempted reports that a push was canceled after waiting for the
+// connection's write serialization and before its transport was attempted.
+// The connection remains usable because no transport failure occurred.
+func IsPushNotAttempted(err error) bool {
+	var target *pushNotAttemptedError
+	return errors.As(err, &target)
+}
+
 // Conn is a single served MTProto connection: the transport plus the crypto and
 // message-ID state needed to encrypt and send responses on the active session.
 type Conn struct {
@@ -169,6 +185,13 @@ func (c *Conn) LastPushedPts() int {
 // on purpose: it is read while matching an eviction against live conns.
 func (c *Conn) AuthKeyID() int64 {
 	return c.authKeyID.Load()
+}
+
+// WriteTimeout returns the deadline applied to each transport write. Delivery
+// fan-out uses it to bound one transient callback without multiplying the
+// deadline by the number of sockets it addresses.
+func (c *Conn) WriteTimeout() time.Duration {
+	return c.writeTimeout
 }
 
 // MarkRPCUpdate accounts for the message update identified in the send RPC
@@ -657,10 +680,16 @@ func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, fmt.Errorf("push [%T] not attempted: %w", enc, &pushNotAttemptedError{err: err})
+	}
 	if c.owner != owner {
 		return false, nil
 	}
 	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
+		if closeErr := c.transport.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close failed push transport: %w", closeErr))
+		}
 		return false, fmt.Errorf("push [%T]: %w", enc, err)
 	}
 	if pts > 0 {
@@ -754,6 +783,9 @@ func (c *Conn) PushToAtWatermark(ctx context.Context, owner int64, expectedPts i
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, false, fmt.Errorf("push [%T] not attempted: %w", enc, &pushNotAttemptedError{err: err})
+	}
 	if c.owner != owner {
 		return false, false, nil
 	}
@@ -761,6 +793,9 @@ func (c *Conn) PushToAtWatermark(ctx context.Context, owner int64, expectedPts i
 		return false, true, nil
 	}
 	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
+		if closeErr := c.transport.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close failed push transport: %w", closeErr))
+		}
 		return false, false, fmt.Errorf("push [%T]: %w", enc, err)
 	}
 	if pts > 0 && int64(pts) > c.lastPushedPts.Load() {
