@@ -166,6 +166,117 @@ func TestStartListenerDispatches(t *testing.T) {
 	}
 }
 
+func TestStartListenerPreservesDistinctTransientPayloads(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	typingStarted := make(chan struct{})
+	reactionStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFirst := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	typingDelivered := make(chan [2]int64, 2)
+	reactionsDelivered := make(chan [3]int64, 2)
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(context.Context, int64) {},
+		func(_ context.Context, peerID, fromID int64) {
+			if fromID == 9 {
+				close(typingStarted)
+				<-release
+			}
+			typingDelivered <- [2]int64{peerID, fromID}
+		},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(_ context.Context, ownerID, localID, userID int64) {
+			if localID == 5 {
+				close(reactionStarted)
+				<-release
+			}
+			reactionsDelivered <- [3]int64{ownerID, localID, userID}
+		},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	t.Cleanup(func() {
+		releaseFirst()
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	})
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
+	if err := s.Notify(ctx, store.ChannelTyping, store.TypingPayload(3, 9)); err != nil {
+		t.Fatalf("notify first typing: %v", err)
+	}
+	if err := s.Notify(ctx, store.ChannelReactions, store.ReactionPayload(20, 5, 30)); err != nil {
+		t.Fatalf("notify first reaction: %v", err)
+	}
+	for name, started := range map[string]<-chan struct{}{
+		"typing":   typingStarted,
+		"reaction": reactionStarted,
+	} {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("first %s callback did not start", name)
+		}
+	}
+
+	if err := s.Notify(ctx, store.ChannelTyping, store.TypingPayload(3, 10)); err != nil {
+		t.Fatalf("notify second typing: %v", err)
+	}
+	if err := s.Notify(ctx, store.ChannelReactions, store.ReactionPayload(20, 7, 30)); err != nil {
+		t.Fatalf("notify second reaction: %v", err)
+	}
+	select {
+	case got := <-typingDelivered:
+		if got != [2]int64{3, 10} {
+			t.Fatalf("second typing = %v, want [3 10]", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second typing callback was coalesced behind the first payload")
+	}
+	select {
+	case got := <-reactionsDelivered:
+		if got != [3]int64{20, 7, 30} {
+			t.Fatalf("second reaction = %v, want [20 7 30]", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second reaction callback was coalesced behind the first payload")
+	}
+
+	releaseFirst()
+	select {
+	case got := <-typingDelivered:
+		if got != [2]int64{3, 9} {
+			t.Fatalf("first typing = %v, want [3 9]", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first typing callback did not finish")
+	}
+	select {
+	case got := <-reactionsDelivered:
+		if got != [3]int64{20, 5, 30} {
+			t.Fatalf("first reaction = %v, want [20 5 30]", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first reaction callback did not finish")
+	}
+}
+
 func TestStartListenerEvictBypassesSaturatedPushWorkers(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

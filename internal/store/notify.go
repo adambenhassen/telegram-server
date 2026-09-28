@@ -30,9 +30,9 @@ const (
 	// encrypted_events and pushes updateNewEncryptedMessage.
 	ChannelEncryptedMsg = "tg_encrypted_msg" // payload: "<recipientID>|<qts>"
 	// ChannelReactions carries a reaction change to all parties holding a message.
-	// payload: "<userID>". The handler pushes updateMessageReactions (transient,
-	// no pts, same model as updateUserStatus).
-	ChannelReactions = "tg_reactions" // payload: "<userID>"
+	// payload: "<ownerID>|<localID>|<userID>". The handler pushes
+	// updateMessageReactions (transient, no pts, same model as updateUserStatus).
+	ChannelReactions = "tg_reactions"
 	// ChannelPinned carries a pin/unpin change to all members of a chat or channel.
 	// payload: "c<peerID>[|<msgID>]" for chat, "h<peerID>[|<msgID>]" for channel.
 	// msgID is present on pin (nonzero), absent on unpin. The handler pushes
@@ -329,7 +329,7 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelTyping)
-			l.schedule("typing:"+strconv.FormatInt(peerID, 10), notificationTask{
+			l.schedule("typing:"+strconv.FormatInt(peerID, 10)+":"+strconv.FormatInt(fromID, 10), notificationTask{
 				ctx:      ctx,
 				coalesce: true,
 				run: func(ctx context.Context) {
@@ -417,7 +417,7 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelReactions)
-			l.schedule("reactions:"+strconv.FormatInt(opts.userID, 10), notificationTask{
+			l.schedule("reactions:"+strconv.FormatInt(opts.userID, 10)+":"+strconv.FormatInt(opts.localID, 10), notificationTask{
 				ctx:      ctx,
 				coalesce: true,
 				run: func(ctx context.Context) {
