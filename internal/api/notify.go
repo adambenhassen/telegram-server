@@ -354,7 +354,7 @@ func (u *Updater) deliverConn(ctx context.Context, userID int64, conn pushConn, 
 				if pendingPts > watermark {
 					target := sort.SearchInts(b.pts, pendingPts)
 					if target < len(b.pts) && b.pts[target] == pendingPts {
-						if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); isNewMessage {
+						if isRPCResultUpdate(b.ups[target]) {
 							if u.deliverBeforePendingRPC(ctx, userID, conn, b, watermark, target, acceptedAt, encoders) {
 								pendingRetry = true
 								break
@@ -399,7 +399,7 @@ func (u *Updater) deliverConn(ctx context.Context, userID int64, conn pushConn, 
 		start := sort.SearchInts(b.pts, watermark+1)
 		target := sort.SearchInts(b.pts, suppressed.Pts)
 		if target < len(b.pts) && b.pts[target] == suppressed.Pts && target >= start {
-			if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); isNewMessage {
+			if isRPCResultUpdate(b.ups[target]) {
 				if u.deliverWithSuppression(ctx, userID, rpcConn, b, watermark, start, target, suppressed, acceptedAt, encoders) {
 					result.retry = true
 					return result
@@ -451,13 +451,22 @@ func accountPendingRPCUpdate(owner int64, conn rpcUpdatePushConn, b updateBatch,
 	if target >= len(b.pts) || b.pts[target] != pendingPts || target < start {
 		return watermark, false
 	}
-	if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); !isNewMessage {
+	if !isRPCResultUpdate(b.ups[target]) {
 		return watermark, false
 	}
 	if !conn.MarkRPCUpdate(owner, conn.AuthKeyID(), pendingPts) {
 		return watermark, false
 	}
 	return conn.LastPushedPts(), true
+}
+
+func isRPCResultUpdate(up tg.UpdateClass) bool {
+	switch up.(type) {
+	case *tg.UpdateNewMessage, *tg.UpdateEditMessage:
+		return true
+	default:
+		return false
+	}
 }
 
 func (u *Updater) pushOrdered(ctx context.Context, conn pushConn, owner int64, expectedPts int, enc bin.Encoder, pts int, encoders *deliveryEncoder) (pushed, stale bool, err error) {
