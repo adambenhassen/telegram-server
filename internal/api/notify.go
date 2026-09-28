@@ -483,7 +483,7 @@ func (u *Updater) pushOrdered(ctx context.Context, conn pushConn, owner int64, e
 }
 
 func (u *Updater) handlePushFailure(owner int64, conn pushConn, err error) {
-	if err == nil || mtproto.IsPushEncodeError(err) || u.registry == nil {
+	if err == nil || mtproto.IsPushEncodeError(err) || mtproto.IsPushNotAttempted(err) || u.registry == nil {
 		return
 	}
 	c, ok := conn.(*mtproto.Conn)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/crypto"
+	"github.com/gotd/td/mt"
 	"github.com/gotd/td/transport"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
@@ -52,6 +53,49 @@ func (t *blockedPushTransport) pushAttempts() int {
 }
 
 var _ transport.Conn = (*blockedPushTransport)(nil)
+
+type serializationPushTransport struct {
+	mu      sync.Mutex
+	sends   int
+	closes  int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (t *serializationPushTransport) Send(ctx context.Context, _ *bin.Buffer) error {
+	t.mu.Lock()
+	t.sends++
+	send := t.sends
+	t.mu.Unlock()
+	if send == 1 {
+		close(t.entered)
+		<-t.release
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (*serializationPushTransport) Recv(context.Context, *bin.Buffer) error {
+	return errors.New("unused")
+}
+
+func (t *serializationPushTransport) Close() error {
+	t.mu.Lock()
+	t.closes++
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *serializationPushTransport) counts() (sends, closes int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sends, t.closes
+}
+
+var _ transport.Conn = (*serializationPushTransport)(nil)
 
 func testPushKey(seed byte) crypto.AuthKey {
 	var raw crypto.Key
@@ -513,6 +557,70 @@ func TestSaturatedStatusDoesNotStallUpdates(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("status push %d was not closed after its write timeout", i)
 		}
+	}
+}
+
+func TestTransientDeadlineDoesNotCloseBusyConnection(t *testing.T) {
+	ctx := context.Background()
+	registry := mtproto.NewSessionRegistry()
+	updater := api.NewUpdater(nil, registry, nil, nil)
+	const userID = int64(9001)
+
+	transport := &serializationPushTransport{entered: make(chan struct{}), release: make(chan struct{})}
+	conn := mtproto.NewTestConn(transport, testPushKey(60))
+	conn.SetOwner(userID)
+	if !registry.Add(userID, conn) {
+		t.Fatal("register connection")
+	}
+	t.Cleanup(func() { registry.Remove(userID, conn) })
+
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- conn.SendResult(&mtproto.Request{Ctx: ctx, MsgID: 1}, &mt.Pong{PingID: 1})
+	}()
+	select {
+	case <-transport.entered:
+	case <-time.After(time.Second):
+		t.Fatal("did not acquire the connection write")
+	}
+
+	callbackCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	callbackDone := make(chan struct{})
+	go func() {
+		updater.DeliverTyping(callbackCtx, userID, 42)
+		close(callbackDone)
+	}()
+	<-callbackCtx.Done()
+	// Keep the first write serialized long enough for the transient callback to
+	// expire while it waits, rather than letting scheduling decide the order.
+	time.Sleep(50 * time.Millisecond)
+	close(transport.release)
+
+	select {
+	case err := <-holderDone:
+		if err != nil {
+			t.Fatalf("holder write: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("holder write did not finish")
+	}
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("expired transient callback did not finish")
+	}
+
+	if got := len(registry.Conns(userID)); got != 1 {
+		t.Fatalf("registered connections after skipped push = %d, want one", got)
+	}
+	if sends, closes := transport.counts(); sends != 1 || closes != 0 {
+		t.Fatalf("transport counts after skipped push = sends:%d closes:%d, want sends:1 closes:0", sends, closes)
+	}
+
+	updater.DeliverTyping(ctx, userID, 42)
+	if sends, closes := transport.counts(); sends != 2 || closes != 0 {
+		t.Fatalf("transport counts after later push = sends:%d closes:%d, want sends:2 closes:0", sends, closes)
 	}
 }
 
