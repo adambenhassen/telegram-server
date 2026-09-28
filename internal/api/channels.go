@@ -1107,6 +1107,11 @@ func (h *handlers) handleEditChannelUsername(r *mtproto.Request) (bin.Encoder, e
 	if member.Role < 1 {
 		return nil, errChatAdminRequired
 	}
+	if username != "" {
+		if err := h.checkUsernameClaimQuota(r.Ctx, r.UserID, username); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := h.store.EditChannelUsername(r.Ctx, channelID, r.UserID, username); err != nil {
 		switch {

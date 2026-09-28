@@ -157,6 +157,11 @@ func (h *handlers) handleUpdateUsername(r *mtproto.Request) (bin.Encoder, error)
 			return nil, errUsernameInvalid
 		}
 	}
+	if username != "" {
+		if err := h.checkUsernameClaimQuota(r.Ctx, r.UserID, username); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := h.store.UpdateUsername(r.Ctx, r.UserID, username); err != nil {
 		switch {
