@@ -177,7 +177,7 @@ func TestChannelUpdatesProductionDeliverRecordsOnePushSample(t *testing.T) {
 	}
 }
 
-func TestSlowPushCannotStallAnotherAccount(t *testing.T) {
+func TestMultiSocketSlowPushCannotStallAnotherAccount(t *testing.T) {
 	ctx := context.Background()
 	s, dsn := openStoreDSN(t)
 	registry := mtproto.NewSessionRegistry()
@@ -206,13 +206,22 @@ func TestSlowPushCannotStallAnotherAccount(t *testing.T) {
 		t.Fatalf("persist healthy-user event: %v", err)
 	}
 
-	slowTransport := &blockedPushTransport{entered: make(chan struct{}), closed: make(chan struct{})}
-	slowConn := mtproto.NewTestConn(slowTransport, testPushKey(1))
-	slowConn.SetOwner(slowUser.ID)
-	if !registry.Add(slowUser.ID, slowConn) {
-		t.Fatal("register slow connection")
+	slowTransports := make([]*blockedPushTransport, 3)
+	slowConns := make([]*mtproto.Conn, len(slowTransports))
+	for i := range slowTransports {
+		slowTransports[i] = &blockedPushTransport{entered: make(chan struct{}), closed: make(chan struct{})}
+		keySeed := byte(i + 1)
+		if keySeed >= 3 {
+			keySeed++ // keep the sender's key out of the blocked sibling set
+		}
+		slowConns[i] = mtproto.NewTestConn(slowTransports[i], testPushKey(keySeed))
+		slowConns[i].SetOwner(slowUser.ID)
+		if !registry.Add(slowUser.ID, slowConns[i]) {
+			t.Fatalf("register slow connection %d", i)
+		}
+		conn := slowConns[i]
+		t.Cleanup(func() { registry.Remove(slowUser.ID, conn) })
 	}
-	t.Cleanup(func() { registry.Remove(slowUser.ID, slowConn) })
 
 	originKey := testPushKey(3)
 	originTransport := &fakeTransport{}
@@ -222,6 +231,14 @@ func TestSlowPushCannotStallAnotherAccount(t *testing.T) {
 		t.Fatal("register origin connection")
 	}
 	t.Cleanup(func() { registry.Remove(slowUser.ID, originConn) })
+
+	siblingTransport := &fakeTransport{}
+	siblingConn := mtproto.NewTestConn(siblingTransport, testPushKey(4))
+	siblingConn.SetOwner(slowUser.ID)
+	if !registry.Add(slowUser.ID, siblingConn) {
+		t.Fatal("register healthy sibling connection")
+	}
+	t.Cleanup(func() { registry.Remove(slowUser.ID, siblingConn) })
 
 	healthyTransport := &fakeTransport{}
 	healthyConn := mtproto.NewTestConn(healthyTransport, testPushKey(2))
@@ -250,15 +267,16 @@ func TestSlowPushCannotStallAnotherAccount(t *testing.T) {
 	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
 		t.Fatalf("wait for listener: %v", err)
 	}
-
 	slowPayload := strconv.FormatInt(slowUser.ID, 10) + "|" + strconv.FormatInt(mtproto.AuthKeyIDInt64(originKey.ID), 10) + "|1"
 	if err := s.Notify(ctx, store.ChannelUpdates, slowPayload); err != nil {
 		t.Fatalf("notify slow user: %v", err)
 	}
-	select {
-	case <-slowTransport.entered:
-	case <-time.After(time.Second):
-		t.Fatal("slow push did not reach the transport")
+	for i, transport := range slowTransports {
+		select {
+		case <-transport.entered:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("slow push %d did not reach the transport with sibling sockets in parallel", i)
+		}
 	}
 	for range 8 {
 		if err := s.Notify(ctx, store.ChannelUpdates, slowPayload); err != nil {
@@ -273,16 +291,23 @@ func TestSlowPushCannotStallAnotherAccount(t *testing.T) {
 	if !waitSentWithin(healthyTransport, 500*time.Millisecond) {
 		t.Fatalf("healthy push waited behind slow socket for %s", time.Since(started))
 	}
-	select {
-	case <-slowTransport.closed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("failed slow socket was not closed")
+	if !siblingTransport.wasSent() {
+		t.Fatal("healthy sibling did not receive the update")
+	}
+	for i, transport := range slowTransports {
+		select {
+		case <-transport.closed:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("failed slow socket %d was not closed", i)
+		}
 	}
 	// Repeated notifications must not get another write attempt after the first
 	// deadline closes the connection.
 	time.Sleep(100 * time.Millisecond)
-	if got := slowTransport.pushAttempts(); got != 1 {
-		t.Fatalf("slow push attempts = %d, want one before removal", got)
+	for i, transport := range slowTransports {
+		if got := transport.pushAttempts(); got != 1 {
+			t.Fatalf("slow push %d attempts = %d, want one before removal", i, got)
+		}
 	}
 	if originTransport.wasSent() {
 		t.Fatal("sender session received its own keyed update echo")

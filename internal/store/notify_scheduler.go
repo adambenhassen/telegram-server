@@ -9,8 +9,9 @@ import (
 // worker set keeps that work off the LISTEN goroutine while the per-key lanes
 // preserve order for notifications that address the same owner.
 const (
-	notificationWorkerCount = 8
-	notificationQueueLimit  = 256
+	notificationWorkerCount      = 8
+	notificationQueueLimit       = 256
+	notificationLanePendingLimit = 32
 )
 
 type notificationTask struct {
@@ -53,8 +54,10 @@ func newNotificationScheduler(parent context.Context) *notificationScheduler {
 
 // submit adds one callback without waiting for a blocked callback or growing
 // the queue without limit. Consecutive coalescible callbacks for one key share
-// one pending slot; a full queue drops the nudge, which durable update streams
-// recover through their next difference request.
+// one pending slot. Each key also has its own pending cap, so one noisy owner
+// cannot consume the shared capacity needed to keep other owners responsive.
+// A full queue drops the nudge, which durable update streams recover through
+// their next difference request.
 func (s *notificationScheduler) submit(key string, task notificationTask) bool {
 	if task.ctx == nil {
 		task.ctx = s.ctx
@@ -77,6 +80,12 @@ func (s *notificationScheduler) submit(key string, task notificationTask) bool {
 	if task.coalesce && len(lane.pending) > 0 && lane.pending[len(lane.pending)-1].coalesce {
 		lane.pending[len(lane.pending)-1] = task
 		return true
+	}
+	if len(lane.pending) >= notificationLanePendingLimit {
+		if len(lane.pending) == 0 && !lane.running && !lane.queued {
+			delete(s.lanes, key)
+		}
+		return false
 	}
 	if s.pending >= notificationQueueLimit && !newLane {
 		if len(lane.pending) == 0 && !lane.running && !lane.queued {

@@ -1185,17 +1185,18 @@ func TestDeliverRecordsPushOutcomesPerConnection(t *testing.T) {
 	t.Parallel()
 
 	start := time.Unix(1_700_000_000, 0)
-	now := start
-	metrics := store.NewNotificationMetricsWithClock(func() time.Time { return now })
+	var now atomic.Int64
+	now.Store(start.UnixNano())
+	metrics := store.NewNotificationMetricsWithClock(func() time.Time { return time.Unix(0, now.Load()) })
 	acceptedAt := start
 
 	successA := &outcomePushConn{
 		pushed: true,
-		onPush: func() { now = start.Add(24 * time.Millisecond) },
+		onPush: func() { now.Store(start.Add(24 * time.Millisecond).UnixNano()) },
 	}
 	successB := &outcomePushConn{
 		pushed: true,
-		onPush: func() { now = start.Add(48 * time.Millisecond) },
+		onPush: func() { now.Store(start.Add(48 * time.Millisecond).UnixNano()) },
 	}
 	ownerMismatch := &outcomePushConn{}
 	encodeFailure := &outcomePushConn{err: mtproto.MarkPushEncodeError(errors.New("encode"))}
