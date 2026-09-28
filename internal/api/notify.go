@@ -66,6 +66,10 @@ type pendingRPCUpdateConn interface {
 	PendingRPCUpdate(owner int64) (pts int, pending bool)
 }
 
+type pendingRPCReadyConn interface {
+	PendingRPCUpdateReady(owner int64) bool
+}
+
 // Deliver pushes userID's not-yet-delivered events to each of its live conns,
 // advancing each conn's last-pushed pts. It is best-effort: a push failure is
 // logged and the client's next getDifference backfills.
@@ -179,35 +183,82 @@ func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns [
 			if pendingConn, ok := c.(pendingRPCUpdateConn); ok {
 				pendingPts, pending := pendingConn.PendingRPCUpdate(userID)
 				if pending {
-					keyedPending := false
-					if rpcConn, ok := c.(rpcUpdatePushConn); ok && pendingPts > 0 && suppressed.AuthKeyID != 0 && suppressed.Pts == pendingPts && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
-						// Let the keyed notification account the sender event after
-						// its prefix has been delivered. A non-contiguous RPC result
-						// deliberately keeps this barrier active.
-						keyedPending = true
+					pendingReady := true
+					if readyConn, ok := c.(pendingRPCReadyConn); ok {
+						pendingReady = readyConn.PendingRPCUpdateReady(userID)
 					}
-					// While the sender result is in flight, hold the origin at its
-					// current watermark. A zero pts is the pre-commit barrier; a
-					// known pts lets us deliver only the contiguous prefix before
-					// the sender event. Sibling sessions still take the full batch.
-					if !keyedPending && (pendingPts == 0 || pendingPts <= b.state.Pts) {
+					pendingRetry := false
+					for pending {
+						keyedPending := false
+						if rpcConn, ok := c.(rpcUpdatePushConn); ok && pendingPts > 0 && suppressed.AuthKeyID != 0 && suppressed.Pts == pendingPts && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+							// Let the keyed notification account the sender event after
+							// its prefix has been delivered. A non-contiguous RPC result
+							// deliberately keeps this barrier active.
+							keyedPending = true
+						}
+						if keyedPending || !pendingReady || pendingPts == 0 || pendingPts > b.state.Pts {
+							break
+						}
+
+						if rpcConn, ok := c.(rpcUpdatePushConn); ok {
+							if nextWatermark, accounted := accountPendingRPCUpdate(userID, rpcConn, b, watermark, pendingPts); accounted {
+								watermark = nextWatermark
+								ups = b.above(watermark)
+								pendingPts, pending = pendingConn.PendingRPCUpdate(userID)
+								if pending {
+									if readyConn, ok := c.(pendingRPCReadyConn); ok {
+										pendingReady = readyConn.PendingRPCUpdateReady(userID)
+									}
+								}
+								continue
+							}
+						}
+
 						if pendingPts > watermark {
 							target := sort.SearchInts(b.pts, pendingPts)
 							if target < len(b.pts) && b.pts[target] == pendingPts {
 								if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); isNewMessage {
 									if u.deliverBeforePendingRPC(ctx, userID, c, b, watermark, target, acceptedAt) {
-										retry = true
+										pendingRetry = true
 										break
+									}
+									if nextWatermark := c.LastPushedPts(); nextWatermark > watermark {
+										watermark = nextWatermark
+										ups = b.above(watermark)
+										pendingPts, pending = pendingConn.PendingRPCUpdate(userID)
+										if pending {
+											if readyConn, ok := c.(pendingRPCReadyConn); ok {
+												pendingReady = readyConn.PendingRPCUpdateReady(userID)
+											}
+										}
+										continue
 									}
 								}
 							}
 						}
+						break
+					}
+					if pendingRetry {
+						retry = true
+						break
+					}
+					keyedPending := false
+					if rpcConn, ok := c.(rpcUpdatePushConn); ok && pending && pendingPts > 0 && suppressed.AuthKeyID != 0 && suppressed.Pts == pendingPts && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
+						keyedPending = true
+					}
+					if pending && !keyedPending && (pendingPts == 0 || pendingPts <= b.state.Pts) {
 						// Do not put this origin in the next delivery window while
 						// its result barrier is active. Advancing past the skipped
 						// event would create a pts gap on the wire.
 						continue
 					}
 				}
+			}
+			if len(ups) == 0 {
+				if b.more && c.LastPushedPts() < b.state.Pts {
+					ahead = append(ahead, c)
+				}
+				continue
 			}
 			if rpcConn, ok := c.(rpcUpdatePushConn); ok && suppressed.AuthKeyID != 0 && suppressed.Pts > watermark && rpcConn.AuthKeyID() == suppressed.AuthKeyID {
 				start := sort.SearchInts(b.pts, watermark+1)
@@ -254,6 +305,38 @@ func (u *Updater) deliverAtSuppressed(ctx context.Context, userID int64, conns [
 		conns = ahead
 		round++
 	}
+}
+
+// accountPendingRPCUpdate releases a known sender-result barrier when generic
+// delivery has reached the event's immediate prefix. The RPC result already
+// delivered that event to this conn, so accounting it advances the watermark
+// without writing a duplicate update; the caller then pushes the remaining
+// suffix. A barrier farther ahead still needs its prefix pushed first.
+func accountPendingRPCUpdate(owner int64, conn rpcUpdatePushConn, b updateBatch, watermark, pendingPts int) (int, bool) {
+	if pendingPts <= 0 {
+		return watermark, false
+	}
+	if pendingPts <= watermark {
+		if !conn.MarkRPCUpdate(owner, conn.AuthKeyID(), pendingPts) {
+			return watermark, false
+		}
+		return conn.LastPushedPts(), true
+	}
+	if pendingPts != watermark+1 {
+		return watermark, false
+	}
+	target := sort.SearchInts(b.pts, pendingPts)
+	start := sort.SearchInts(b.pts, watermark+1)
+	if target >= len(b.pts) || b.pts[target] != pendingPts || target < start {
+		return watermark, false
+	}
+	if _, isNewMessage := b.ups[target].(*tg.UpdateNewMessage); !isNewMessage {
+		return watermark, false
+	}
+	if !conn.MarkRPCUpdate(owner, conn.AuthKeyID(), pendingPts) {
+		return watermark, false
+	}
+	return conn.LastPushedPts(), true
 }
 
 func (u *Updater) pushOrdered(ctx context.Context, conn pushConn, owner int64, expectedPts int, enc bin.Encoder, pts int) (pushed, stale bool, err error) {

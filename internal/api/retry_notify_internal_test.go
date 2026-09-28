@@ -195,6 +195,26 @@ func TestStoredRetryNotifiesSiblingAfterResultWriteFailure(t *testing.T) {
 				t.Fatalf("retry pts = %d, first pts = %d", retryUpdate.pts, firstUpdate.pts)
 			}
 
+			// A deduplicated retry that fails its result write must not clear the
+			// original sender barrier. Its failure nudge still reaches the sibling,
+			// while the origin remains suppressed until the original attempt fails.
+			if retryUpdate.onFailure == nil {
+				t.Fatal("stored retry did not return a result-failure hook")
+			}
+			retryUpdate.onFailure()
+			select {
+			case <-siblingTransport.done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("sibling sender session received no retry-failure push")
+			}
+			time.Sleep(100 * time.Millisecond)
+			if got := originTransport.count(); got != 0 {
+				t.Fatalf("origin pushes after deduplicated retry failure = %d, want 0", got)
+			}
+			if got := siblingTransport.count(); got != 1 {
+				t.Fatalf("sibling pushes after deduplicated retry failure = %d, want 1", got)
+			}
+
 			// The first result write is deliberately treated as failed. Its
 			// fallback is unkeyed, so both live sender sessions receive the
 			// committed message even though the origin got no RPC result.

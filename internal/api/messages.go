@@ -73,31 +73,37 @@ func (h *handlers) notifySendAfterFailure(r *mtproto.Request) {
 	h.notify(ctx, r.UserID)
 }
 
-func beginSenderRPC(c *mtproto.Conn, r *mtproto.Request) {
-	beginSenderRPCAt(c, r, 0)
+type senderRPCAttempt struct {
+	conn        *mtproto.Conn
+	reservation mtproto.RPCUpdateReservation
 }
 
-func beginSenderRPCAt(c *mtproto.Conn, r *mtproto.Request, pts int) {
+func beginSenderRPC(c *mtproto.Conn, r *mtproto.Request) senderRPCAttempt {
+	return beginSenderRPCAt(c, r, 0)
+}
+
+func beginSenderRPCAt(c *mtproto.Conn, r *mtproto.Request, pts int) senderRPCAttempt {
 	if c == nil {
-		return
+		return senderRPCAttempt{}
 	}
-	c.BeginRPCUpdate(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
+	reservation, _ := c.BeginRPCUpdateAttempt(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
+	return senderRPCAttempt{conn: c, reservation: reservation}
 }
 
-func setSenderRPCPts(c *mtproto.Conn, r *mtproto.Request, pts int) {
-	if c != nil {
-		c.SetRPCUpdatePts(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID), pts)
-	}
-}
-
-func clearSenderRPC(c *mtproto.Conn, r *mtproto.Request) {
-	if c != nil {
-		c.ClearRPCUpdate(r.UserID, mtproto.AuthKeyIDInt64(r.AuthKeyID))
+func setSenderRPCPts(attempt senderRPCAttempt, pts int) {
+	if attempt.conn != nil {
+		attempt.conn.SetRPCUpdatePtsAttempt(attempt.reservation, pts)
 	}
 }
 
-func (h *handlers) clearSenderAndNotify(c *mtproto.Conn, r *mtproto.Request) {
-	clearSenderRPC(c, r)
+func clearSenderRPC(attempt senderRPCAttempt) {
+	if attempt.conn != nil {
+		attempt.conn.ClearRPCUpdateAttempt(attempt.reservation)
+	}
+}
+
+func (h *handlers) clearSenderAndNotify(attempt senderRPCAttempt, r *mtproto.Request) {
+	clearSenderRPC(attempt)
 	h.notifySendAfterFailure(r)
 }
 
@@ -106,7 +112,7 @@ func (h *handlers) clearSenderAndNotify(c *mtproto.Conn, r *mtproto.Request) {
 // client after the original committed its message, so it needs the same
 // post-reply push as a new send. Chat retries keep their existing fan-out
 // notification behaviour and therefore do not return sender metadata here.
-func (h *handlers) retryReplyAfterSuccess(c *mtproto.Conn, r *mtproto.Request, peerType store.PeerType, pts int) (*replyUpdate, func()) {
+func (h *handlers) retryReplyAfterSuccess(attempt senderRPCAttempt, r *mtproto.Request, peerType store.PeerType, pts int) (*replyUpdate, func()) {
 	if peerType != store.PeerTypeUser {
 		return nil, nil
 	}
@@ -115,7 +121,7 @@ func (h *handlers) retryReplyAfterSuccess(c *mtproto.Conn, r *mtproto.Request, p
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     pts,
 		onFailure: func() {
-			h.clearSenderAndNotify(c, r)
+			h.clearSenderAndNotify(attempt, r)
 		},
 	}
 	afterReply := func() {
@@ -285,11 +291,11 @@ func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 				h.log.Error("read stored message pts on retry", "user_id", r.UserID, "err", err)
 				return nil, nil, nil, errInternal
 			}
-			beginSenderRPCAt(c, r, pts)
+			attempt := beginSenderRPCAt(c, r, pts)
 			users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 			if err != nil {
 				h.log.Error("load users on retry", "user_id", r.UserID, "err", err)
-				h.clearSenderAndNotify(c, r)
+				h.clearSenderAndNotify(attempt, r)
 				return nil, nil, nil, errInternal
 			}
 			res := &tg.Updates{
@@ -300,7 +306,8 @@ func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 				Users: users,
 				Date:  int(existing.Date.Unix()),
 			}
-			update, afterReply := h.retryReplyAfterSuccess(c, r, peerType, pts)
+			setSenderRPCPts(attempt, pts)
+			update, afterReply := h.retryReplyAfterSuccess(attempt, r, peerType, pts)
 			return res, update, afterReply, nil
 		} else if err != nil {
 			h.log.Error("random_id lookup", "user_id", r.UserID, "err", err)
@@ -313,16 +320,14 @@ func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 		return nil, nil, nil, err
 	}
 
-	beginSenderRPC(c, r)
+	attempt := beginSenderRPC(c, r)
 	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0, replyToMsgID)
 	if err != nil {
-		if c != nil {
-			h.clearSenderAndNotify(c, r)
-		}
+		h.clearSenderAndNotify(attempt, r)
 		h.log.Error("send message", "user_id", r.UserID, "err", err)
 		return nil, nil, nil, errInternal
 	}
-	setSenderRPCPts(c, r, senderPts)
+	setSenderRPCPts(attempt, senderPts)
 	if h.afterSenderCommit != nil {
 		h.afterSenderCommit()
 	}
@@ -334,7 +339,7 @@ func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 	users, err := h.twoUsers(r.Ctx, r.UserID, toID)
 	if err != nil {
 		h.log.Error("send message users", "err", err)
-		h.clearSenderAndNotify(c, r)
+		h.clearSenderAndNotify(attempt, r)
 		return nil, nil, nil, errInternal
 	}
 	res := &tg.Updates{
@@ -351,7 +356,7 @@ func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 		authKey: mtproto.AuthKeyIDInt64(r.AuthKeyID),
 		pts:     senderPts,
 		onFailure: func() {
-			h.clearSenderAndNotify(c, r)
+			h.clearSenderAndNotify(attempt, r)
 		},
 	}
 	afterReply := func() {

@@ -139,6 +139,9 @@ func TestPendingRPCUpdateBarrierTracksCommitAndClearsWithResult(t *testing.T) {
 	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 5 {
 		t.Fatalf("committed barrier = (%d, %t), want (5, true)", pts, pending)
 	}
+	if c.PendingRPCUpdateReady(7) {
+		t.Fatal("committed barrier reported ready before the result write")
+	}
 	if err := c.SendResultAndMarkRPCUpdate(
 		&mtproto.Request{Ctx: context.Background(), MsgID: 1},
 		&mt.Pong{PingID: 1}, 7, keyID, 5,
@@ -174,6 +177,9 @@ func TestPendingRPCUpdateBarrierSurvivesNoncontiguousResult(t *testing.T) {
 	}
 	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 5 {
 		t.Fatalf("pending barrier = (%d, %t), want (5, true) until keyed delivery", pts, pending)
+	}
+	if !c.PendingRPCUpdateReady(7) {
+		t.Fatal("successful noncontiguous result did not mark the barrier ready")
 	}
 	if !c.MarkRPCUpdate(7, keyID, 5) {
 		t.Fatal("MarkRPCUpdate refused the keyed sender event")
@@ -268,6 +274,207 @@ func TestPendingRPCUpdateBarrierCapsQueuedResults(t *testing.T) {
 	}
 	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 1 {
 		t.Fatalf("first queued barrier = (%d, %t), want (1, true)", pts, pending)
+	}
+}
+
+func TestPendingRPCUpdateReservationClearIsAttemptScoped(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	first, ok := c.BeginRPCUpdateAttempt(7, keyID, 5)
+	if !ok {
+		t.Fatal("first sender reservation refused")
+	}
+	retry, ok := c.BeginRPCUpdateAttempt(7, keyID, 5)
+	if !ok {
+		t.Fatal("deduplicated sender reservation refused")
+	}
+	if c.ClearRPCUpdateAttempt(retry) {
+		t.Fatal("deduplicated retry cleared the original barrier")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 5 {
+		t.Fatalf("barrier after deduplicated retry failure = (%d, %t), want (5, true)", pts, pending)
+	}
+	if !c.ClearRPCUpdateAttempt(first) {
+		t.Fatal("original sender reservation did not clear its barrier")
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("original sender reservation left a barrier")
+	}
+}
+
+func TestPendingRPCUpdateReservationRefusalCannotClearQueue(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		if _, ok := c.BeginRPCUpdateAttempt(7, keyID, pts); !ok {
+			t.Fatalf("sender reservation %d refused before the queue cap", pts)
+		}
+	}
+	refused, ok := c.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok {
+		t.Fatal("sender reservation beyond the queue cap succeeded")
+	}
+	if !c.ClearRPCUpdateAttempt(refused) {
+		t.Fatal("capacity-refused sender attempt did not clear its overflow reservation")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 1 {
+		t.Fatalf("first queued barrier after capacity refusal = (%d, %t), want (1, true)", pts, pending)
+	}
+}
+
+func TestPendingRPCUpdateOverflowReservationClearsBeforeCommit(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := c.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !c.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender reservation %d", pts)
+		}
+	}
+	overflow, ok := c.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok {
+		t.Fatal("overflow sender reservation unexpectedly registered")
+	}
+	if !c.ClearRPCUpdateAttempt(overflow) {
+		t.Fatal("precommit overflow reservation did not clear")
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !c.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("cleared overflow reservation left origin suppression active")
+	}
+}
+
+func TestPendingRPCUpdateOverflowReservationsRollbackTogether(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := c.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !c.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender reservation %d", pts)
+		}
+	}
+	first, ok := c.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok {
+		t.Fatal("first overflow sender reservation unexpectedly registered")
+	}
+	second, ok := c.BeginRPCUpdateAttempt(7, keyID, 66)
+	if ok {
+		t.Fatal("second overflow sender reservation unexpectedly registered")
+	}
+	if !c.ClearRPCUpdateAttempt(first) {
+		t.Fatal("first precommit overflow reservation did not clear")
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 1 {
+		t.Fatalf("queued barrier after first overflow rollback = (%d, %t), want (1, true)", pts, pending)
+	}
+	if !c.ClearRPCUpdateAttempt(second) {
+		t.Fatal("second precommit overflow reservation did not clear")
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !c.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("all-failed overflow reservations left origin suppression active")
+	}
+}
+
+func TestPendingRPCUpdateOverflowResultClearsAfterWatermark(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := c.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !c.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender reservation %d", pts)
+		}
+	}
+	overflow, ok := c.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok || !c.SetRPCUpdatePtsAttempt(overflow, 65) {
+		t.Fatal("stage overflow sender reservation")
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !c.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if err := c.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: context.Background(), MsgID: 7},
+		&mt.Pong{PingID: 7}, 7, keyID, 65,
+	); err != nil {
+		t.Fatalf("send overflow result: %v", err)
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("successful overflow result left origin suppression active")
+	}
+	if got := c.LastPushedPts(); got != 65 {
+		t.Fatalf("watermark after overflow result = %d, want 65", got)
+	}
+}
+
+func TestPendingRPCUpdateOverflowResultWaitsForKeyedDelivery(t *testing.T) {
+	t.Parallel()
+	key := testKey(t)
+	c := mtproto.NewTestConn(&fakeConn{}, key)
+	c.SetOwner(7)
+	keyID := mtproto.AuthKeyIDInt64(key.ID)
+
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := c.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !c.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender reservation %d", pts)
+		}
+	}
+	overflow, ok := c.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok || !c.SetRPCUpdatePtsAttempt(overflow, 65) {
+		t.Fatal("stage overflow sender reservation")
+	}
+	if err := c.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: context.Background(), MsgID: 8},
+		&mt.Pong{PingID: 8}, 7, keyID, 65,
+	); err != nil {
+		t.Fatalf("send noncontiguous overflow result: %v", err)
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !c.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if pts, pending := c.PendingRPCUpdate(7); !pending || pts != 65 {
+		t.Fatalf("overflow barrier before keyed delivery = (%d, %t), want (65, true)", pts, pending)
+	}
+	if !c.MarkRPCUpdate(7, keyID, 65) {
+		t.Fatal("keyed overflow delivery did not account its event")
+	}
+	if _, pending := c.PendingRPCUpdate(7); pending {
+		t.Fatal("keyed overflow delivery left origin suppression active")
+	}
+	if got := c.LastPushedPts(); got != 65 {
+		t.Fatalf("watermark after keyed overflow delivery = %d, want 65", got)
 	}
 }
 

@@ -130,6 +130,8 @@ func (f *queuedRPCBatchPushConn) PendingRPCUpdate(int64) (int, bool) {
 	return f.pending[0], true
 }
 
+func (f *queuedRPCBatchPushConn) PendingRPCUpdateReady(int64) bool { return false }
+
 func (f *queuedRPCBatchPushConn) AuthKeyID() int64 { return f.authKeyID }
 
 func (f *queuedRPCBatchPushConn) MarkRPCUpdate(owner, authKeyID int64, pts int) bool {
@@ -342,6 +344,159 @@ func TestDeliverPendingSenderSuppressionLeavesOriginAtBarrier(t *testing.T) {
 	}
 }
 
+func TestDeliverOverflowSuppressionSurvivesQueuedBarriers(t *testing.T) {
+	t.Parallel()
+
+	originTransport := &retryNotifyTransport{done: make(chan struct{})}
+	origin := mtproto.NewTestConn(originTransport, replyTestKey())
+	origin.SetOwner(7)
+	keyID := origin.AuthKeyID()
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := origin.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !origin.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender barrier %d", pts)
+		}
+	}
+	overflow, ok := origin.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok {
+		t.Fatal("overflow sender attempt unexpectedly registered")
+	}
+	if !origin.SetRPCUpdatePtsAttempt(overflow, 65) {
+		t.Fatal("overflow sender attempt did not activate origin suppression")
+	}
+
+	sibling := &fakePushConn{}
+	u := testUpdater()
+	u.deliverAtSuppressed(
+		context.Background(),
+		7,
+		[]pushConn{origin, sibling},
+		func(fromPts int) (updateBatch, error) { return batch(fromPts, 65, 65), nil },
+		time.Time{},
+		store.SuppressedUpdate{AuthKeyID: keyID, Pts: 65},
+	)
+	for pts := 1; pts <= 64; pts++ {
+		if !origin.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	u.deliver(
+		context.Background(),
+		7,
+		[]pushConn{origin, sibling},
+		func(fromPts int) (updateBatch, error) { return batch(fromPts, 65, 65), nil },
+	)
+
+	if got := originTransport.count(); got != 0 {
+		t.Fatalf("origin pushes after queued barriers drained = %d, want 0", got)
+	}
+	expected := make([]int, 65)
+	for i := range expected {
+		expected[i] = i + 1
+	}
+	if len(sibling.got) != 1 || !slices.Equal(ptsOf(t, sibling.got[0]), expected) {
+		t.Fatalf("sibling pushes = %d, want one full overflow batch", len(sibling.got))
+	}
+}
+
+func TestDeliverOverflowSuppressionStartsBeforeQueuedBarriersDrain(t *testing.T) {
+	t.Parallel()
+
+	originTransport := &retryNotifyTransport{done: make(chan struct{})}
+	origin := mtproto.NewTestConn(originTransport, replyTestKey())
+	origin.SetOwner(7)
+	keyID := origin.AuthKeyID()
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := origin.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !origin.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender barrier %d", pts)
+		}
+	}
+	_, ok := origin.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok {
+		t.Fatal("overflow sender attempt unexpectedly registered")
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !origin.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if pts, pending := origin.PendingRPCUpdate(7); !pending || pts != 0 {
+		t.Fatalf("overflow barrier after queue drain = (%d, %t), want (0, true)", pts, pending)
+	}
+
+	testUpdater().deliver(
+		context.Background(),
+		7,
+		[]pushConn{origin},
+		func(fromPts int) (updateBatch, error) { return batch(fromPts, 65, 65), nil },
+	)
+	if got := originTransport.count(); got != 0 {
+		t.Fatalf("origin pushes before overflow commit marker = %d, want 0", got)
+	}
+}
+
+func TestDeliverOverflowSuppressionReleasesAfterResultWatermark(t *testing.T) {
+	t.Parallel()
+
+	originTransport := &retryNotifyTransport{done: make(chan struct{})}
+	origin := mtproto.NewTestConn(originTransport, replyTestKey())
+	origin.SetOwner(7)
+	keyID := origin.AuthKeyID()
+	for pts := 1; pts <= 64; pts++ {
+		reservation, ok := origin.BeginRPCUpdateAttempt(7, keyID, pts)
+		if !ok || !origin.SetRPCUpdatePtsAttempt(reservation, pts) {
+			t.Fatalf("stage sender barrier %d", pts)
+		}
+	}
+	overflow, ok := origin.BeginRPCUpdateAttempt(7, keyID, 65)
+	if ok || !origin.SetRPCUpdatePtsAttempt(overflow, 65) {
+		t.Fatal("stage overflow sender barrier")
+	}
+	for pts := 1; pts <= 64; pts++ {
+		if !origin.MarkRPCUpdate(7, keyID, pts) {
+			t.Fatalf("account queued sender barrier %d", pts)
+		}
+	}
+	if err := origin.SendResultAndMarkRPCUpdate(
+		&mtproto.Request{Ctx: context.Background(), MsgID: 8},
+		&tg.BoolTrue{}, 7, keyID, 65,
+	); err != nil {
+		t.Fatalf("send overflow result: %v", err)
+	}
+	if _, pending := origin.PendingRPCUpdate(7); pending {
+		t.Fatal("successful overflow result left origin suppression active")
+	}
+	before := originTransport.count()
+	testUpdater().deliver(
+		context.Background(),
+		7,
+		[]pushConn{origin},
+		func(fromPts int) (updateBatch, error) {
+			b := batch(fromPts, 66, 66)
+			for i, pts := range b.pts {
+				b.ups[i] = &tg.UpdateNewMessage{
+					Message: &tg.Message{
+						ID:      pts,
+						PeerID:  &tg.PeerUser{UserID: 7},
+						Date:    1,
+						Message: "post-overflow",
+					},
+					Pts:      pts,
+					PtsCount: 1,
+				}
+			}
+			return b, nil
+		},
+	)
+	if got := originTransport.count(); got != before+1 {
+		t.Fatalf("origin pushes after overflow result = %d, want %d", got, before+1)
+	}
+	if got := origin.LastPushedPts(); got != 66 {
+		t.Fatalf("origin watermark after post-overflow push = %d, want 66", got)
+	}
+}
+
 func TestDeliverPendingSenderSuppressionAccountsKeyedEventAfterPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -353,7 +508,7 @@ func TestDeliverPendingSenderSuppressionAccountsKeyedEventAfterPrefix(t *testing
 	sibling := &fakePushConn{}
 	u := testUpdater()
 	u.deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
-		return batch(fromPts, 5, 5), nil
+		return batch(fromPts, 4, 4), nil
 	})
 
 	if len(origin.got) != 1 || !slices.Equal(ptsOf(t, origin.got[0]), []int{1, 2, 3, 4}) {
@@ -388,6 +543,90 @@ func TestDeliverPendingSenderSuppressionAccountsKeyedEventAfterPrefix(t *testing
 	}
 	if len(origin.got) != 1 {
 		t.Fatalf("origin pushes = %d, want prefix only without sender echo", len(origin.got))
+	}
+}
+
+func TestDeliverPendingSenderSuppressionAccountsMissingKeyedEvent(t *testing.T) {
+	t.Parallel()
+
+	origin := &pendingRPCBatchPushConn{
+		fakePushConn: fakePushConn{pts: 0},
+		authKeyID:    11,
+		pendingPts:   1201,
+	}
+	sibling := &fakePushConn{}
+	testUpdater().deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
+		return batch(fromPts, 1206, 1206), nil
+	})
+
+	if len(origin.got) != 2 {
+		t.Fatalf("origin pushes = %d, want prefix and suffix", len(origin.got))
+	}
+	if got := ptsOf(t, origin.got[0]); len(got) != 1200 || got[0] != 1 || got[len(got)-1] != 1200 {
+		t.Fatalf("origin prefix = %v, want pts 1..1200", got)
+	}
+	if got := ptsOf(t, origin.got[1]); !slices.Equal(got, []int{1202, 1203, 1204, 1205, 1206}) {
+		t.Fatalf("origin suffix = %v, want [1202 1203 1204 1205 1206]", got)
+	}
+	if !slices.Equal(origin.marked, []int{1201}) {
+		t.Fatalf("origin RPC marks = %v, want [1201]", origin.marked)
+	}
+	if origin.pendingPts != 0 || origin.pts != 1206 {
+		t.Fatalf("origin state = pending %d, pts %d; want pending 0, pts 1206", origin.pendingPts, origin.pts)
+	}
+	if len(sibling.got) != 1 {
+		t.Fatalf("sibling pushes = %d, want one full batch", len(sibling.got))
+	}
+	if got := ptsOf(t, sibling.got[0]); len(got) != 1206 || got[0] != 1 || got[len(got)-1] != 1206 {
+		t.Fatalf("sibling batch = pts %d..%d, want 1..1206", got[0], got[len(got)-1])
+	}
+}
+
+func TestDeliverPendingSenderSuppressionAdvancesAcrossCappedNotifications(t *testing.T) {
+	t.Parallel()
+
+	origin := &pendingRPCBatchPushConn{
+		fakePushConn: fakePushConn{pts: 0},
+		authKeyID:    11,
+		pendingPts:   1201,
+	}
+	sibling := &fakePushConn{}
+	u := testUpdater()
+	buildCapped := func(head int) func(int) (updateBatch, error) {
+		return func(fromPts int) (updateBatch, error) {
+			return batch(fromPts, min(fromPts+maxDiffEvents, head), head), nil
+		}
+	}
+
+	// The first notification can advance each session through only two capped
+	// windows. Later notifications must continue from that prefix until the
+	// sender result's pts is reached and then resume with the suffix.
+	u.deliver(context.Background(), 7, []pushConn{origin, sibling}, buildCapped(1200))
+	for head := 1202; head <= 1206; head++ {
+		u.deliver(context.Background(), 7, []pushConn{origin, sibling}, buildCapped(head))
+	}
+
+	pushed := make([]int, 0, 1205)
+	for _, up := range origin.got {
+		pushed = append(pushed, ptsOf(t, up)...)
+	}
+	want := make([]int, 0, 1205)
+	for pts := 1; pts <= 1206; pts++ {
+		if pts != 1201 {
+			want = append(want, pts)
+		}
+	}
+	if !slices.Equal(pushed, want) {
+		t.Fatalf("origin pushed pts = %v, want every event except sender pts 1201", pushed)
+	}
+	if !slices.Equal(origin.marked, []int{1201}) {
+		t.Fatalf("origin RPC marks = %v, want [1201]", origin.marked)
+	}
+	if origin.pendingPts != 0 || origin.pts != 1206 {
+		t.Fatalf("origin state = pending %d, pts %d; want pending 0, pts 1206", origin.pendingPts, origin.pts)
+	}
+	if sibling.pts != 1206 {
+		t.Fatalf("sibling watermark = %d, want 1206", sibling.pts)
 	}
 }
 
@@ -484,11 +723,11 @@ func TestPendingSenderResultGapSerializesGenericAndKeyedDelivery(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("generic delivery did not finish")
 	}
-	if got := origin.LastPushedPts(); got != 4 {
-		t.Fatalf("origin watermark after generic delivery = %d, want prefix 4", got)
+	if got := origin.LastPushedPts(); got != 5 {
+		t.Fatalf("origin watermark after generic delivery = %d, want accounted sender pts 5", got)
 	}
-	if pts, pending := origin.PendingRPCUpdate(7); !pending || pts != 5 {
-		t.Fatalf("origin barrier after generic delivery = (%d, %t), want (5, true)", pts, pending)
+	if _, pending := origin.PendingRPCUpdate(7); pending {
+		t.Fatal("origin barrier after generic delivery remained active")
 	}
 
 	testUpdater().deliverAtSuppressed(
@@ -524,11 +763,11 @@ func TestDeliverBackToBackSenderSuppressionKeepsFirstBarrier(t *testing.T) {
 	u.deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
 		return batch(fromPts, 6, 6), nil
 	})
-	if got := origin.LastPushedPts(); got != 4 {
-		t.Fatalf("origin watermark before keyed delivery = %d, want 4", got)
+	if got := origin.LastPushedPts(); got != 0 {
+		t.Fatalf("origin watermark before keyed delivery = %d, want 0", got)
 	}
-	if len(origin.got) != 1 || !slices.Equal(ptsOf(t, origin.got[0]), []int{1, 2, 3, 4}) {
-		t.Fatalf("origin prefix = %d/%v, want one push [1 2 3 4]", len(origin.got), ptsOf(t, origin.got[0]))
+	if len(origin.got) != 0 {
+		t.Fatalf("origin pushes before keyed delivery = %d, want none", len(origin.got))
 	}
 
 	firstDone := make(chan struct{})
@@ -588,6 +827,9 @@ func TestDeliverBackToBackSenderSuppressionKeepsFirstBarrier(t *testing.T) {
 	}
 	if len(origin.got) != 1 {
 		t.Fatalf("origin pushes after both keyed deliveries = %d, want prefix only", len(origin.got))
+	}
+	if got := ptsOf(t, origin.got[0]); !slices.Equal(got, []int{1, 2, 3, 4}) {
+		t.Fatalf("origin prefix after both keyed deliveries = %v, want [1 2 3 4]", got)
 	}
 }
 
