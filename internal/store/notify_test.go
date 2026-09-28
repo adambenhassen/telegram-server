@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -162,6 +163,78 @@ func TestStartListenerDispatches(t *testing.T) {
 	if snapshot.Channels.Updates != 1 || snapshot.Channels.Typing != 1 ||
 		snapshot.Channels.Evict != 1 || snapshot.Channels.Encryption != 1 {
 		t.Errorf("channel counts = %+v, want one update, typing, evict, and encryption", snapshot.Channels)
+	}
+}
+
+func TestStartListenerEvictBypassesSaturatedPushWorkers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+
+	const firstBlockedUser int64 = 100
+	workerCount := store.NotificationWorkerCountForTest()
+	started := make(chan struct{}, workerCount)
+	release := make(chan struct{})
+	evicted := make(chan [2]int64, 1)
+	var stop func() error
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(_ context.Context, userID int64) {
+			if userID < firstBlockedUser || userID >= firstBlockedUser+int64(workerCount) {
+				t.Errorf("unexpected blocked user %d", userID)
+				return
+			}
+			started <- struct{}{}
+			<-release
+		},
+		func(context.Context, int64, int64) {},
+		func(_ context.Context, userID, authKeyID int64) {
+			evicted <- [2]int64{userID, authKeyID}
+		},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	t.Cleanup(func() {
+		close(release)
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	})
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for listener: %v", err)
+	}
+
+	for userID := firstBlockedUser; userID < firstBlockedUser+int64(workerCount); userID++ {
+		if err := s.Notify(ctx, store.ChannelUpdates, strconv.FormatInt(userID, 10)); err != nil {
+			t.Fatalf("notify blocked user %d: %v", userID, err)
+		}
+	}
+	for range workerCount {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("not all push workers became blocked")
+		}
+	}
+
+	if err := s.Notify(ctx, store.ChannelEvict, store.EvictPayload(7, 42)); err != nil {
+		t.Fatalf("notify evict: %v", err)
+	}
+	select {
+	case got := <-evicted:
+		if got != [2]int64{7, 42} {
+			t.Fatalf("evict = %v, want [7 42]", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("evict waited behind saturated push workers")
 	}
 }
 

@@ -816,3 +816,6 @@ func (s *NotificationSchedulerForTest) Stop() { s.scheduler.stop() }
 
 // NotificationQueueLimitForTest returns the scheduler's fixed pending limit.
 func NotificationQueueLimitForTest() int { return notificationQueueLimit }
+
+// NotificationWorkerCountForTest returns the scheduler's fixed worker count.
+func NotificationWorkerCountForTest() int { return notificationWorkerCount }

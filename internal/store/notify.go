@@ -346,12 +346,10 @@ func (l *Listener) dispatch(
 				continue
 			}
 			l.recordValidNotification(ChannelEvict)
-			l.schedule("evict:"+strconv.FormatInt(userID, 10), notificationTask{
-				ctx: ctx,
-				run: func(ctx context.Context) {
-					evict(ctx, userID, authKeyID)
-				},
-			})
+			// Eviction closes a matching transport without taking writeMu. Keep it
+			// on the listener goroutine so revocation cannot wait behind saturated
+			// push workers or be dropped by their bounded queue.
+			evict(ctx, userID, authKeyID)
 		case ChannelPost:
 			channelID, perr := strconv.ParseInt(n.Payload, 10, 64)
 			if perr != nil {
