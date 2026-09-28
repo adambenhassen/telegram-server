@@ -82,9 +82,6 @@ func (s *notificationScheduler) submit(key string, task notificationTask) bool {
 		return true
 	}
 	if len(lane.pending) >= notificationLanePendingLimit {
-		if len(lane.pending) == 0 && !lane.running && !lane.queued {
-			delete(s.lanes, key)
-		}
 		return false
 	}
 	if s.pending >= notificationQueueLimit && !newLane {

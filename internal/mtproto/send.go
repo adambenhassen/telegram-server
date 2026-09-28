@@ -171,6 +171,13 @@ func (c *Conn) AuthKeyID() int64 {
 	return c.authKeyID.Load()
 }
 
+// WriteTimeout returns the deadline applied to each transport write. Delivery
+// fan-out uses it to bound one transient callback without multiplying the
+// deadline by the number of sockets it addresses.
+func (c *Conn) WriteTimeout() time.Duration {
+	return c.writeTimeout
+}
+
 // MarkRPCUpdate accounts for the message update identified in the send RPC
 // result for this auth key. If that reply is lost, getDifference still replays
 // the event because only this connection's push watermark advances. The owner,

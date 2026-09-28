@@ -219,6 +219,87 @@ func (e synchronizedEncoder) Encode(b *bin.Buffer) error {
 	return e.enc.Encode(b)
 }
 
+// Transient fan-out uses a fixed worker set so one callback cannot create a
+// goroutine per socket or partner. The callback deadline is one socket write
+// timeout; sockets still waiting in the bounded queue are left untouched.
+const (
+	transientFanoutWorkerCount    = 8
+	transientFallbackWriteTimeout = 30 * time.Second
+)
+
+type transientPush struct {
+	owner   int64
+	conn    pushConn
+	enc     bin.Encoder
+	onError func(error)
+}
+
+type transientWriteTimeoutConn interface {
+	WriteTimeout() time.Duration
+}
+
+func transientFanoutTimeout(pushes []transientPush) time.Duration {
+	timeout := transientFallbackWriteTimeout
+	found := false
+	for _, push := range pushes {
+		conn, ok := push.conn.(transientWriteTimeoutConn)
+		if !ok {
+			continue
+		}
+		writeTimeout := conn.WriteTimeout()
+		if writeTimeout <= 0 {
+			continue
+		}
+		if !found || writeTimeout < timeout {
+			timeout = writeTimeout
+			found = true
+		}
+	}
+	return timeout
+}
+
+func (u *Updater) pushTransientFanout(ctx context.Context, pushes []transientPush) {
+	if len(pushes) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, transientFanoutTimeout(pushes))
+	defer cancel()
+
+	jobs := make(chan transientPush)
+	encoders := &deliveryEncoder{}
+	workers := min(transientFanoutWorkerCount, len(pushes))
+	var fanout sync.WaitGroup
+	for range workers {
+		fanout.Go(func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case push, ok := <-jobs:
+					if !ok || ctx.Err() != nil {
+						return
+					}
+					if _, err := u.pushTransientEncoded(ctx, push.owner, push.conn, push.enc, encoders); err != nil && push.onError != nil {
+						push.onError(err)
+					}
+				}
+			}
+		})
+	}
+
+producer:
+	for _, push := range pushes {
+		select {
+		case <-ctx.Done():
+			break producer
+		case jobs <- push:
+		}
+	}
+	close(jobs)
+	fanout.Wait()
+}
+
 // deliverConn handles one socket in a delivery window. Sockets for one owner
 // are independent write streams, so the caller runs these bounded by the
 // registry's per-owner connection cap. The sender barrier and per-connection
@@ -408,7 +489,10 @@ func (u *Updater) handlePushFailure(owner int64, conn pushConn, err error) {
 	}
 }
 
-func (u *Updater) pushTransient(ctx context.Context, owner int64, conn pushConn, enc bin.Encoder) (bool, error) {
+func (u *Updater) pushTransientEncoded(ctx context.Context, owner int64, conn pushConn, enc bin.Encoder, encoders *deliveryEncoder) (bool, error) {
+	if _, ok := conn.(*mtproto.Conn); ok && encoders != nil {
+		enc = synchronizedEncoder{mu: &encoders.mu, enc: enc}
+	}
 	pushed, err := conn.PushTo(ctx, owner, enc, 0)
 	u.handlePushFailure(owner, conn, err)
 	return pushed, err
@@ -513,12 +597,18 @@ func (u *Updater) DeliverTyping(ctx context.Context, peerID, fromID int64) {
 		Update: &tg.UpdateUserTyping{UserID: fromID, Action: &tg.SendMessageTypingAction{}},
 		Date:   int(time.Now().Unix()),
 	}
+	pushes := make([]transientPush, 0, len(conns))
 	for _, c := range conns {
-		// Carries no pts, so a conn that changed hands simply drops it.
-		if _, err := u.pushTransient(ctx, peerID, c, short); err != nil {
-			u.log.Info("deliver typing", "peer_id", peerID, "err", err)
-		}
+		pushes = append(pushes, transientPush{
+			owner: peerID,
+			conn:  c,
+			enc:   short,
+			onError: func(err error) {
+				u.log.Info("deliver typing", "peer_id", peerID, "err", err)
+			},
+		})
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // DeliverChannelPost pushes a newly-committed channel post to every non-banned
@@ -587,6 +677,7 @@ func (u *Updater) deliverChannel(
 	connsFor func(userID int64) []pushConn,
 	build func(memberID int64, fromPts int) (channelBatch, error),
 ) {
+	var pushes []transientPush
 	for _, m := range members {
 		if m.Banned(now) {
 			continue
@@ -610,15 +701,22 @@ func (u *Updater) deliverChannel(
 			Date:    int(now.Unix()),
 			Seq:     0,
 		}
+		memberID := m.UserID
 		for _, c := range conns {
 			// Pass pts=0: this is a channel update; the conn's lastPushedPts
 			// tracks the per-account stream and must not be corrupted by a
 			// channel pts value.
-			if _, err := u.pushTransient(ctx, m.UserID, c, env); err != nil {
-				u.log.Info("deliver channel push", "user_id", m.UserID, "err", err)
-			}
+			pushes = append(pushes, transientPush{
+				owner: memberID,
+				conn:  c,
+				enc:   env,
+				onError: func(err error) {
+					u.log.Info("deliver channel push", "user_id", memberID, "err", err)
+				},
+			})
 		}
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // DeliverEncryption pushes a secret chat's new state to userID's live conns as
@@ -657,12 +755,18 @@ func (u *Updater) DeliverEncryption(ctx context.Context, userID, chatID int64) {
 		},
 		Date: int(time.Now().Unix()),
 	}
+	pushes := make([]transientPush, 0, len(conns))
 	for _, c := range conns {
-		// Carries no pts, so a conn that changed hands simply drops it.
-		if _, err := u.pushTransient(ctx, userID, c, short); err != nil {
-			u.log.Info("deliver encryption", "user_id", userID, "err", err)
-		}
+		pushes = append(pushes, transientPush{
+			owner: userID,
+			conn:  c,
+			enc:   short,
+			onError: func(err error) {
+				u.log.Info("deliver encryption", "user_id", userID, "err", err)
+			},
+		})
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // DeliverStatus pushes updateUserStatus to every dialog partner of userID whose
@@ -703,19 +807,29 @@ func (u *Updater) DeliverStatus(ctx context.Context, userID int64, online bool) 
 		status = &tg.UserStatusOffline{WasOnline: int(wasOnline)}
 	}
 
+	var pushes []transientPush
 	for _, partnerID := range partners {
 		conns := u.registry.Conns(partnerID)
+		if len(conns) == 0 {
+			continue
+		}
+		short := &tg.UpdateShort{
+			Update: &tg.UpdateUserStatus{UserID: userID, Status: status},
+			Date:   int(time.Now().Unix()),
+		}
 		for _, c := range conns {
-			short := &tg.UpdateShort{
-				Update: &tg.UpdateUserStatus{UserID: userID, Status: status},
-				Date:   int(time.Now().Unix()),
-			}
-			// Carries no pts, so a conn that changed hands simply drops it.
-			if _, err := u.pushTransient(ctx, partnerID, c, short); err != nil {
-				u.log.Info("deliver status push", "partner_id", partnerID, "err", err)
-			}
+			partner := partnerID
+			pushes = append(pushes, transientPush{
+				owner: partner,
+				conn:  c,
+				enc:   short,
+				onError: func(err error) {
+					u.log.Info("deliver status push", "partner_id", partner, "err", err)
+				},
+			})
 		}
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // DeliverEncryptedMsg pushes updateNewEncryptedMessage to the recipient's live
@@ -745,11 +859,18 @@ func (u *Updater) DeliverEncryptedMsg(ctx context.Context, recipientID int64, qt
 		},
 		Date: int(event.Date.Unix()),
 	}
+	pushes := make([]transientPush, 0, len(conns))
 	for _, c := range conns {
-		if _, err := u.pushTransient(ctx, recipientID, c, update); err != nil {
-			u.log.Info("deliver encrypted msg push", "recipient_id", recipientID, "err", err)
-		}
+		pushes = append(pushes, transientPush{
+			owner: recipientID,
+			conn:  c,
+			enc:   update,
+			onError: func(err error) {
+				u.log.Info("deliver encrypted msg push", "recipient_id", recipientID, "err", err)
+			},
+		})
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // Evict closes the connections of userID that still hold authKeyID, which the
@@ -819,12 +940,18 @@ func (u *Updater) DeliverReactions(ctx context.Context, ownerID, localID, userID
 		},
 		Date: int(time.Now().Unix()),
 	}
+	pushes := make([]transientPush, 0, len(conns))
 	for _, c := range conns {
-		// Carries no pts, so a conn that changed hands simply drops it.
-		if _, err := u.pushTransient(ctx, userID, c, update); err != nil {
-			u.log.Info("deliver reactions push", "user_id", userID, "err", err)
-		}
+		pushes = append(pushes, transientPush{
+			owner: userID,
+			conn:  c,
+			enc:   update,
+			onError: func(err error) {
+				u.log.Info("deliver reactions push", "user_id", userID, "err", err)
+			},
+		})
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // wrapUpdates envelopes hydrated updates into a tg.Updates for a live push.
@@ -908,6 +1035,7 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, pe
 // deliverPinnedToUsers pushes the pinned update to each member with live conns.
 // pinnedMsgID is nonzero on pin, zero on unpin.
 func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64, pinnedMsgID int32) {
+	var pushes []transientPush
 	for _, memberID := range members {
 		conns := u.registry.Conns(memberID)
 		if len(conns) == 0 {
@@ -926,10 +1054,16 @@ func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, m
 			Date: int(time.Now().Unix()),
 		}
 		for _, c := range conns {
-			// Carries no pts, so a conn that changed hands simply drops it.
-			if _, err := u.pushTransient(ctx, memberID, c, update); err != nil {
-				u.log.Info("deliver pinned push", "user_id", memberID, "err", err)
-			}
+			member := memberID
+			pushes = append(pushes, transientPush{
+				owner: member,
+				conn:  c,
+				enc:   update,
+				onError: func(err error) {
+					u.log.Info("deliver pinned push", "user_id", member, "err", err)
+				},
+			})
 		}
 	}
+	u.pushTransientFanout(ctx, pushes)
 }
