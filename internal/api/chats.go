@@ -25,9 +25,8 @@ const (
 	// defence in depth — but a Vector<InputUser> can carry ~1.3M ids inside
 	// gotd's 16 MB frame, and rejecting here spares even the per-id lookups.
 	maxChatUsers = 200
-	// maxGetChatIDs bounds the basic-chat metadata read before it reaches the
-	// store. Each chat contributes at most one participant and inviter id per
-	// member to its bounded profile hydration.
+	// maxGetChatIDs bounds getChats' member-selected participant-count read to
+	// 100 chats per request.
 	maxGetChatIDs = 100
 )
 
