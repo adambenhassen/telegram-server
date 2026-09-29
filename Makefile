@@ -1,4 +1,4 @@
-.PHONY: tools-check sqlc generate templ css migrate-new migrate test test-unit test-db docker-bridge lint build run
+.PHONY: tools-check check-catalog-deps sqlc generate templ css migrate-new migrate test test-unit test-db docker-bridge lint build run
 
 # sqlc lives in a separate tools module (tools/go.mod) so its broken transitive
 # dep graph (grpc test deps -> a non-existent gonum package) stays out of the
@@ -6,6 +6,9 @@
 tools-check: bin/sqlc
 	@command -v atlas >/dev/null 2>&1 || { echo "atlas not installed: see https://atlasgo.io/getting-started"; exit 1; }
 	@echo "tools ok: sqlc $$(./bin/sqlc version), atlas $$(atlas version | head -1)"
+
+check-catalog-deps:
+	./tools/check-catalog-deps.sh
 
 bin/sqlc:
 	go -C tools build -o "$(CURDIR)/bin/sqlc" github.com/sqlc-dev/sqlc/cmd/sqlc
