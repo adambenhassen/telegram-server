@@ -488,6 +488,15 @@ func TestSignUpFailureAfterInviteConsumptionRollsBack(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close inspection connection: %v", err)
+		}
+	})
 
 	invite, secret, err := s.IssueInvite(ctx, "rollback")
 	if err != nil {
@@ -497,37 +506,114 @@ func TestSignUpFailureAfterInviteConsumptionRollsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := api.SignInForTestWithLimits(s, [8]byte{1}, netip.MustParseAddr("10.0.0.3"), store.RateLimitConfig{}, &tg.AuthSignInRequest{
+	const keyID = int64(1)
+	const authKeyValue = "rollback-auth-key"
+	if err := s.SaveAuthKey(ctx, keyID, []byte(authKeyValue)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := api.SignInForTestWithLimits(s, [8]byte{1}, netip.MustParseAddr("10.0.0.3"), store.RateLimitConfig{}, &tg.AuthSignInRequest{
 		PhoneNumber:   "rollback",
 		PhoneCodeHash: hash,
 		PhoneCode:     secret,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("signIn: %v", err)
 	}
+	if !isAuthSignUpRequired(res) {
+		t.Fatalf("signIn result = %T, want *tg.AuthAuthorizationSignUpRequired", res)
+	}
 
-	before := countUsers(t, dsn)
+	// Remove the election singleton so electServerAdministrator fails only
+	// after invite and code consumption, user creation, the update-state row,
+	// and the username claim have all been attempted in AdmitUsername's
+	// transaction. The deleted singleton is the baseline state restored by the
+	// rollback assertion below.
+	if _, err := conn.Exec(ctx, `DELETE FROM server_administration`); err != nil {
+		t.Fatal(err)
+	}
+	readCounts := func() (users, claims, updateStates, administrationRows, administrators int64) {
+		t.Helper()
+		if err := conn.QueryRow(ctx, `
+			SELECT
+				(SELECT count(*) FROM users),
+				(SELECT count(*) FROM usernames WHERE handle = 'rollback'),
+				(SELECT count(*) FROM update_state),
+				(SELECT count(*) FROM server_administration),
+				(SELECT count(*) FROM server_administration WHERE administrator_user_id IS NOT NULL)
+		`).Scan(&users, &claims, &updateStates, &administrationRows, &administrators); err != nil {
+			t.Fatalf("read rollback counts: %v", err)
+		}
+		return
+	}
+	readCode := func() (code string, consumed bool) {
+		t.Helper()
+		if err := conn.QueryRow(ctx, `SELECT code, consumed_at IS NOT NULL FROM phone_codes WHERE phone = 'rollback'`).Scan(&code, &consumed); err != nil {
+			t.Fatalf("read rollback code: %v", err)
+		}
+		return
+	}
+	readKey := func() store.AuthKey {
+		t.Helper()
+		key, found, err := s.AuthKeyByID(ctx, keyID)
+		if err != nil {
+			t.Fatalf("read rollback auth key: %v", err)
+		}
+		if !found {
+			t.Fatal("rollback auth key disappeared")
+		}
+		return key
+	}
+
+	beforeUsers, beforeClaims, beforeUpdateStates, beforeAdministrationRows, beforeAdministrators := readCounts()
+	beforeCode, beforeConsumed := readCode()
+	beforeKey := readKey()
+	if beforeCode != secret || beforeConsumed {
+		t.Fatalf("pre-admission code = %q consumed=%v, want invite secret and unconsumed", beforeCode, beforeConsumed)
+	}
+	if beforeKey.UserID != 0 || beforeKey.PendingUserID != 0 || string(beforeKey.Value) != authKeyValue {
+		t.Fatalf("pre-admission auth key = %#v, want unbound saved key", beforeKey)
+	}
+
 	_, err = api.SignUpForTest(s, [8]byte{1}, netip.MustParseAddr("10.0.0.3"), store.RateLimitConfig{}, config.RegistrationInvite, &tg.AuthSignUpRequest{
 		PhoneNumber:   "rollback",
 		PhoneCodeHash: hash,
 		FirstName:     "Rollback",
 	})
-	if signUpRPCMessage(err) != "SESSION_STATE_INVALID" {
-		t.Fatalf("signUp without auth key: expected SESSION_STATE_INVALID, got %v", err)
+	if signUpRPCMessage(err) != "INTERNAL" {
+		t.Fatalf("signUp after admission writes: expected INTERNAL, got %v", err)
 	}
-	if after := countUsers(t, dsn); after != before {
-		t.Fatalf("users table grew from %d to %d after rollback, want unchanged", before, after)
+	afterUsers, afterClaims, afterUpdateStates, afterAdministrationRows, afterAdministrators := readCounts()
+	if afterUsers != beforeUsers || afterClaims != beforeClaims || afterUpdateStates != beforeUpdateStates || afterAdministrationRows != beforeAdministrationRows || afterAdministrators != beforeAdministrators {
+		t.Fatalf("rollback counts = users %d/%d claims %d/%d update_states %d/%d administration rows %d/%d administrators %d/%d, want unchanged", afterUsers, beforeUsers, afterClaims, beforeClaims, afterUpdateStates, beforeUpdateStates, afterAdministrationRows, beforeAdministrationRows, afterAdministrators, beforeAdministrators)
+	}
+	afterCode, afterConsumed := readCode()
+	if afterCode != beforeCode || afterConsumed != beforeConsumed {
+		t.Fatalf("rollback code = %q consumed=%v, want %q consumed=%v", afterCode, afterConsumed, beforeCode, beforeConsumed)
+	}
+	key := readKey()
+	if key.UserID != beforeKey.UserID || key.PendingUserID != beforeKey.PendingUserID || string(key.Value) != string(beforeKey.Value) || !key.CreatedAt.Equal(beforeKey.CreatedAt) || !key.LastSeenAt.Equal(beforeKey.LastSeenAt) {
+		t.Fatalf("rollback auth key = %#v, want unchanged binding and value", key)
 	}
 	invites, err := s.ListInvites(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(invites) != 1 || invites[0].ID != invite.ID || invites[0].State != store.InviteIssued {
-		t.Fatalf("invites = %#v, want invite %d issued after rollback", invites, invite.ID)
+		t.Fatalf("invites = %#v, want invite %d issued and unconsumed after rollback", invites, invite.ID)
+	}
+	if invites[0].ConsumedAt != nil || invites[0].RevokedAt != nil {
+		t.Fatalf("invite after rollback = %#v, want no terminal timestamps", invites[0])
+	}
+
+	// Restore the singleton so the same invite can prove that the failed
+	// transaction left every admission input reusable.
+	if _, err := conn.Exec(ctx, `INSERT INTO server_administration (singleton_id, election_closed) VALUES (1, FALSE)`); err != nil {
+		t.Fatal(err)
 	}
 	if err := s.SaveAuthKey(ctx, 2, make([]byte, 256)); err != nil {
 		t.Fatal(err)
 	}
-	res, err := api.SignUpForTest(s, [8]byte{2}, netip.MustParseAddr("10.0.0.3"), store.RateLimitConfig{}, config.RegistrationInvite, &tg.AuthSignUpRequest{
+	res, err = api.SignUpForTest(s, [8]byte{2}, netip.MustParseAddr("10.0.0.3"), store.RateLimitConfig{}, config.RegistrationInvite, &tg.AuthSignUpRequest{
 		PhoneNumber:   "rollback",
 		PhoneCodeHash: hash,
 		FirstName:     "Rollback",
