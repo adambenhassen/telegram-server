@@ -106,22 +106,35 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	default:
 		return nil, errInputRequestInvalid
 	}
-	if !validateUsername(req.PhoneNumber) {
-		return nil, errInputRequestInvalid
-	}
-	if !validateSignUpName(req.FirstName) || !validateSignUpName(req.LastName) {
-		return nil, errInputRequestInvalid
-	}
-	username := strings.ToLower(req.PhoneNumber)
-
-	// Charge the per-network budget before any invite, username, or code-state
-	// lookup. A refused request therefore costs the same token regardless of
-	// whether its identifier is known or its code hash is valid.
+	// Charge every active-mode attempt before any identifier, name, invite, or
+	// code-dependent decision. The budget is deliberately not refunded on a
+	// later rejection.
 	if err := h.checkAndChargeRateLimitIP(r, "sign_up_ip", h.rateLimitSignUpIP); err != nil {
 		return nil, err
 	}
+	key, found, err := h.store.AuthKeyByID(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID))
+	if err != nil {
+		h.log.Error("sign up: inspect auth key", "err", err)
+		return nil, errInternal
+	}
+	// A pending password challenge still has no user binding and may be
+	// replaced by signup. AdmitUsername takes the authoritative row lock and
+	// repeats this condition before any account-side write.
+	if !found || key.UserID != 0 {
+		return nil, errSessionStateInvalid
+	}
+	if !validateUsername(req.PhoneNumber) {
+		return nil, errUsernameInvalid
+	}
+	username := strings.ToLower(req.PhoneNumber)
 	if isReservedUsername(username) {
-		return nil, errInputRequestInvalid
+		return nil, errUsernameInvalid
+	}
+	if !validateSignUpName(req.FirstName) {
+		return nil, errFirstNameInvalid
+	}
+	if !validateSignUpName(req.LastName) {
+		return nil, errLastNameInvalid
 	}
 
 	user, err := h.store.AdmitUsername(
@@ -137,11 +150,14 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 		switch {
 		case errors.Is(err, store.ErrCodeInvalid),
 			errors.Is(err, store.ErrCodeExpired),
-			errors.Is(err, store.ErrCodeExhausted),
-			errors.Is(err, store.ErrInviteInvalid),
-			errors.Is(err, store.ErrUsernameOccupied),
-			errors.Is(err, store.ErrAuthKeyNotFound):
-			return nil, errInputRequestInvalid
+			errors.Is(err, store.ErrCodeExhausted):
+			return nil, errCodeInvalid
+		case errors.Is(err, store.ErrInviteInvalid):
+			return nil, errInviteHashInvalid
+		case errors.Is(err, store.ErrUsernameOccupied):
+			return nil, errUsernameOccupied
+		case errors.Is(err, store.ErrAuthKeyNotFound):
+			return nil, errSessionStateInvalid
 		default:
 			h.log.Error("sign up: admit username", "err", err)
 			return nil, errInternal
@@ -398,7 +414,7 @@ func (h *handlers) handleSignInUsername(r *mtproto.Request, username, phoneCodeH
 	// is bound here. A row disappearing after hash validation is still reported
 	// as signUpRequired to preserve the existing return behavior.
 	if !ok {
-		if !isGeneratedCode(phoneCode) {
+		if phoneCode != "" && !isGeneratedCode(phoneCode) {
 			phoneCode = capPhoneCode(phoneCode)
 			if err := h.store.SetCodeForUsername(r.Ctx, username, phoneCodeHash, phoneCode); err != nil && !errors.Is(err, store.ErrCodeInvalid) {
 				h.log.Error("sign in: store username code", "err", err)

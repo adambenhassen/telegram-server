@@ -66,6 +66,33 @@ func (q *Queries) ConsumeCode(ctx context.Context, arg ConsumeCodeParams) (int64
 	return result.RowsAffected(), nil
 }
 
+const consumeCodeForUsername = `-- name: ConsumeCodeForUsername :execrows
+UPDATE phone_codes
+SET consumed_at = now(), code = ''
+WHERE phone = $1
+  AND code_hash = $2
+  AND consumed_at IS NULL
+  AND expires_at >= now()
+  AND attempts < 3
+  AND code <> ''
+`
+
+type ConsumeCodeForUsernameParams struct {
+	Phone    string
+	CodeHash string
+}
+
+// Marks a username signup code hash single-use and clears its handoff value.
+// The guards make this a compare-and-swap against terminal code states, so a
+// concurrent admission or expiry cannot be reported as a second success.
+func (q *Queries) ConsumeCodeForUsername(ctx context.Context, arg ConsumeCodeForUsernameParams) (int64, error) {
+	result, err := q.db.Exec(ctx, consumeCodeForUsername, arg.Phone, arg.CodeHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteExpiredCodes = `-- name: DeleteExpiredCodes :execrows
 DELETE FROM phone_codes WHERE expires_at < now()
 `

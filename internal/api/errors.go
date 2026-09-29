@@ -21,7 +21,8 @@ func FloodWaitError(seconds int) *tgerr.Error {
 }
 
 var (
-	// errInputRequestInvalid is the uniform semantic refusal for auth.signUp.
+	// errInputRequestInvalid is the boundary refusal for auth.signUp when
+	// registration is closed or the configured mode is unknown.
 	errInputRequestInvalid = rpcErr(400, "INPUT_REQUEST_INVALID")
 	errPhoneInvalid        = rpcErr(400, "PHONE_NUMBER_INVALID")
 	errCodeInvalid         = rpcErr(400, "PHONE_CODE_INVALID")
@@ -167,8 +168,20 @@ var (
 	// errUsernameInvalid rejects a username that fails validation: wrong length,
 	// invalid characters, digit/underscore leading, or a reserved handle.
 	errUsernameInvalid = rpcErr(400, "USERNAME_INVALID")
+	// errFirstNameInvalid rejects a display name that is not valid UTF-8, carries
+	// a NUL byte, or exceeds the signup code-point limit.
+	errFirstNameInvalid = rpcErr(400, "FIRSTNAME_INVALID")
+	// errLastNameInvalid rejects a display name that is not valid UTF-8, carries
+	// a NUL byte, or exceeds the signup code-point limit.
+	errLastNameInvalid = rpcErr(400, "LASTNAME_INVALID")
 	// errUsernameOccupied rejects a username already claimed by another account.
 	errUsernameOccupied = rpcErr(400, "USERNAME_OCCUPIED")
+	// errInviteHashInvalid is the settled error for every registration-invite
+	// rejection, including an absent, expired, revoked, consumed, or mismatched
+	// invite.
+	errInviteHashInvalid = rpcErr(400, "INVITE_HASH_INVALID")
+	// errSessionStateInvalid rejects a missing or already-bound signup key.
+	errSessionStateInvalid = rpcErr(400, "SESSION_STATE_INVALID")
 	// errUsernameFloodWait rejects a username change that would exceed the
 	// per-account rate limit.
 	errUsernameFloodWait = rpcErr(420, "FLOOD_WAIT_86400")

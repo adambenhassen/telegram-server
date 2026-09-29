@@ -232,6 +232,9 @@ func validateCodeHash(row db.GetCodeByHashAndPhoneRow) error {
 	if row.ConsumedAt.Valid {
 		return ErrCodeInvalid
 	}
+	if row.Code == "" {
+		return ErrCodeInvalid
+	}
 	if time.Now().After(row.ExpiresAt.Time) {
 		return ErrCodeExpired
 	}

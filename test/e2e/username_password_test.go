@@ -209,6 +209,10 @@ func isAuthKeyUnregistered(err error) bool {
 
 // isInputRequestInvalid checks if the error is INPUT_REQUEST_INVALID.
 func isInputRequestInvalid(err error) bool {
+	return isRPCMessage(err, "INPUT_REQUEST_INVALID")
+}
+
+func isRPCMessage(err error, want string) bool {
 	if err == nil {
 		return false
 	}
@@ -216,7 +220,7 @@ func isInputRequestInvalid(err error) bool {
 	if !errors.As(err, &tgErr) {
 		return false
 	}
-	return tgErr.Message == "INPUT_REQUEST_INVALID"
+	return tgErr.Message == want
 }
 
 // isUsernameNotModified checks if the error is USERNAME_NOT_MODIFIED.
@@ -455,6 +459,73 @@ func TestUsernamePasswordSignUp(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("invite registration flow: %v", err)
+	}
+}
+
+// TestUsernameOpenSignUp proves open registration over one real MTProto
+// connection and checks that the next RPC observes the committed key binding.
+func TestUsernameOpenSignUp(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("store close: %v", err)
+		}
+	})
+
+	const dcID = 2
+	ln := mustListen(t, ctx, "127.0.0.1:0")
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr type = %T", ln.Addr())
+	}
+	stop := bootServerWithRegMode(t, ctx, key, dcID, st, slog.Default(), ln, config.RegistrationOpen)
+	t.Cleanup(stop)
+
+	client := newUsernameClient(addr.Port, key, dcID, nil)
+	if err := client.Run(ctx, func(ctx context.Context) error {
+		api := client.API()
+		hash, err := sendCodeUsername(ctx, api, "tester1")
+		if err != nil {
+			return fmt.Errorf("sendCode: %w", err)
+		}
+		resp, err := signInUsername(ctx, api, "tester1", hash, "")
+		if err != nil {
+			if !isSignUpRequired(err) {
+				return fmt.Errorf("signIn: expected SIGN_UP_REQUIRED, got %w", err)
+			}
+		} else if _, ok := resp.(*tg.AuthAuthorizationSignUpRequired); !ok {
+			return fmt.Errorf("signIn: unexpected response type %T", resp)
+		}
+
+		resp, err = signUpUsername(ctx, api, "tester1", hash, "Tester", "One")
+		if err != nil {
+			return fmt.Errorf("signUp: %w", err)
+		}
+		if authz, ok := resp.(*tg.AuthAuthorization); !ok || authz.User == nil {
+			return fmt.Errorf("signUp: unexpected response type %T", resp)
+		}
+
+		password, err := api.AccountGetPassword(ctx)
+		if err != nil {
+			return fmt.Errorf("next RPC after signUp: %w", err)
+		}
+		if password.HasPassword {
+			return errors.New("new account unexpectedly has a password")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("open registration flow: %v", err)
 	}
 }
 
@@ -814,13 +885,13 @@ func TestSignUpUsernameOccupied(t *testing.T) {
 			return fmt.Errorf("signIn: expected SESSION_PASSWORD_NEEDED, got %w", err)
 		}
 
-		// signUp → should be rejected at the registration boundary.
+		// signUp → the occupied handle has its settled rejection.
 		_, err = signUpUsername(ctx, api, username, hash, firstName, "")
 		if err == nil {
-			return errors.New("signUp: expected INPUT_REQUEST_INVALID, got success")
+			return errors.New("signUp: expected USERNAME_OCCUPIED, got success")
 		}
-		if !isInputRequestInvalid(err) {
-			return fmt.Errorf("signUp: expected INPUT_REQUEST_INVALID, got %w", err)
+		if !isRPCMessage(err, "USERNAME_OCCUPIED") {
+			return fmt.Errorf("signUp: expected USERNAME_OCCUPIED, got %w", err)
 		}
 
 		return nil

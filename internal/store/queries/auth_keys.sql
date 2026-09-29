@@ -15,13 +15,14 @@ LEFT JOIN user_passwords up ON up.user_id = ak.user_id
 WHERE ak.id = $1;
 
 -- name: BindAuthKeyUser :execrows
-UPDATE auth_keys SET user_id = $2 WHERE id = $1;
+UPDATE auth_keys SET user_id = $2, pending_user_id = NULL WHERE id = $1;
 
 -- name: LockUnboundAuthKey :one
--- Locks the key admission will bind, rejecting keys already authorized or
--- carrying a pending password challenge.
+-- Locks the key admission will bind, rejecting keys already authorized. A
+-- pending password challenge is cleared by the same transaction when signup
+-- binds the still-unbound key.
 SELECT id FROM auth_keys
-WHERE id = $1 AND user_id IS NULL AND pending_user_id IS NULL
+WHERE id = $1 AND user_id IS NULL
 FOR UPDATE;
 
 -- name: TouchAuthKey :exec

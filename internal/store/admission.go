@@ -26,6 +26,16 @@ func (s *Store) AdmitUsername(ctx context.Context, handle, phoneCodeHash string,
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 
+	// Serialize all attempts for the connection key before reading any handle,
+	// invite, or code-dependent state. A pending password challenge is allowed
+	// here because the key is still unbound; the bind below clears it in this
+	// same transaction. A bound or missing key fails before account-side work.
+	if _, err := qtx.LockUnboundAuthKey(ctx, authKeyID); errors.Is(err, pgx.ErrNoRows) {
+		return User{}, ErrAuthKeyNotFound
+	} else if err != nil {
+		return User{}, fmt.Errorf("admit username: lock auth key: %w", err)
+	}
+
 	codeRow, err := qtx.GetCodeByHashAndPhone(ctx, db.GetCodeByHashAndPhoneParams{
 		CodeHash: phoneCodeHash,
 		Phone:    handle,
@@ -39,17 +49,21 @@ func (s *Store) AdmitUsername(ctx context.Context, handle, phoneCodeHash string,
 	if err := validateCodeHash(codeRow); err != nil {
 		return User{}, err
 	}
-
+	if _, err := qtx.GetUsernameByHandle(ctx, handle); err == nil {
+		return User{}, ErrUsernameOccupied
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return User{}, fmt.Errorf("admit username: check username: %w", err)
+	}
 	if requireInvite {
 		if err := s.ConsumeInvite(ctx, tx, handle, codeRow.Code); err != nil {
 			return User{}, err
 		}
 	}
-	if rows, err := qtx.ClearCodeValue(ctx, db.ClearCodeValueParams{
-		CodeHash: phoneCodeHash,
+	if rows, err := qtx.ConsumeCodeForUsername(ctx, db.ConsumeCodeForUsernameParams{
 		Phone:    handle,
+		CodeHash: phoneCodeHash,
 	}); err != nil {
-		return User{}, fmt.Errorf("admit username: clear code value: %w", err)
+		return User{}, fmt.Errorf("admit username: consume code: %w", err)
 	} else if rows != 1 {
 		return User{}, ErrCodeInvalid
 	}
@@ -84,11 +98,6 @@ func (s *Store) AdmitUsername(ctx context.Context, handle, phoneCodeHash string,
 		return User{}, fmt.Errorf("admit username: election: %w", err)
 	}
 
-	if _, err := qtx.LockUnboundAuthKey(ctx, authKeyID); errors.Is(err, pgx.ErrNoRows) {
-		return User{}, ErrAuthKeyNotFound
-	} else if err != nil {
-		return User{}, fmt.Errorf("admit username: lock auth key: %w", err)
-	}
 	rows, err := qtx.BindAuthKeyUser(ctx, db.BindAuthKeyUserParams{ID: authKeyID, UserID: &u.ID})
 	if err != nil {
 		return User{}, fmt.Errorf("admit username: bind auth key: %w", err)
