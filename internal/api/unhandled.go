@@ -70,18 +70,24 @@ func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
 		if isClose {
 			if suppressed, ok := c.LogUnimplementedClose(); ok {
 				h.log.Warn("method not implemented: peek id failed",
-					"err", err,
+					"method", "unknown",
 					"error", errMethodNotImplBurst.Error(),
 					"suppressed", suppressed,
 				)
 			}
 			return errMethodNotImplBurst
 		}
-		if suppressed, ok := c.LogUnimplemented(); ok {
-			h.log.Warn("method not implemented: peek id failed", "err", err, "suppressed", suppressed)
+		if suppressed, ok := c.LogUnimplemented("unknown"); ok {
+			h.log.Warn("method not implemented: peek id failed",
+				"method", "unknown",
+				"error_code", answer.Code,
+				"error", answer.Message,
+				"suppressed", suppressed,
+			)
 		}
 		return answer
 	}
+	method := methodName(id)
 	if isClose {
 		// The line names the error the caller received. On a close the caller
 		// receives no RPC answer at all — the connection ends — so the line
@@ -89,17 +95,17 @@ func (h *handlers) handleUnknown(c *mtproto.Conn, req *mtproto.Request) error {
 		if suppressed, ok := c.LogUnimplementedClose(); ok {
 			h.log.Warn("method not implemented",
 				"type_id", fmt.Sprintf("%#x", id),
-				"method", methodName(id),
+				"method", method,
 				"error", errMethodNotImplBurst.Error(),
 				"suppressed", suppressed,
 			)
 		}
 		return errMethodNotImplBurst
 	}
-	if suppressed, ok := c.LogUnimplemented(); ok {
+	if suppressed, ok := c.LogUnimplemented(method); ok {
 		h.log.Warn("method not implemented",
 			"type_id", fmt.Sprintf("%#x", id),
-			"method", methodName(id),
+			"method", method,
 			"error_code", answer.Code,
 			"error", answer.Message,
 			"suppressed", suppressed,
@@ -146,6 +152,7 @@ func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) err
 			// behind the sampler. It consumes the pending count, so the
 			// drop's flush finds nothing left to write.
 			id, _ := req.Buf.PeekID() //nolint:errcheck // dispatcher already validated the id
+			method := methodName(id)
 			// The line names the error the caller received. On a close the
 			// caller receives no RPC answer at all — the connection ends —
 			// so the line names the non-RPC error that ended it, and carries
@@ -153,18 +160,19 @@ func (h *handlers) handleUnknownGated(c *mtproto.Conn, req *mtproto.Request) err
 			if suppressed, ok := c.LogUnimplementedClose(); ok {
 				h.log.Warn("method not implemented",
 					"type_id", fmt.Sprintf("%#x", id),
-					"method", methodName(id),
+					"method", method,
 					"error", errMethodNotImplBurst.Error(),
 					"suppressed", suppressed,
 				)
 			}
 			return errMethodNotImplBurst
 		}
-		if suppressed, ok := c.LogUnimplemented(); ok {
-			id, _ := req.Buf.PeekID() //nolint:errcheck // dispatcher already validated the id
+		id, _ := req.Buf.PeekID() //nolint:errcheck // dispatcher already validated the id
+		method := methodName(id)
+		if suppressed, ok := c.LogUnimplemented(method); ok {
 			h.log.Warn("method not implemented",
 				"type_id", fmt.Sprintf("%#x", id),
-				"method", methodName(id),
+				"method", method,
 				"error_code", answer.Code,
 				"error", answer.Message,
 				"suppressed", suppressed,

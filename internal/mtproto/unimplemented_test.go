@@ -124,7 +124,7 @@ func TestServeConnFlushesUnimplementedCountOnDrop(t *testing.T) {
 		if c.ChargeUnimplemented() == mtproto.UnimplementedClose {
 			return errCeiling
 		}
-		c.LogUnimplemented()
+		c.LogUnimplemented("test")
 		return nil
 	})
 	srv := mtproto.New(exchange.PrivateKey{}, 2, ks, h, slog.New(recorder))
