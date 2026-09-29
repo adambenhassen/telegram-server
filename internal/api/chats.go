@@ -310,7 +310,7 @@ func (h *handlers) handleGetChats(r *mtproto.Request) (bin.Encoder, error) {
 		chatIDs = append(chatIDs, id)
 	}
 
-	snapshot, err := h.store.ChatInfoForMemberSnapshot(r.Ctx, r.UserID, chatIDs)
+	snapshot, err := h.store.ChatListInfoForMemberSnapshot(r.Ctx, r.UserID, chatIDs)
 	if err != nil {
 		h.log.Error("get chats", "user_id", r.UserID, "err", err)
 		return nil, errInternal
@@ -322,7 +322,7 @@ func (h *handlers) handleGetChats(r *mtproto.Request) (bin.Encoder, error) {
 			chats = append(chats, &tg.ChatForbidden{ID: id, Title: ""})
 			continue
 		}
-		chats = append(chats, chatToTL(chat, len(snapshot.Participants[id]), r.UserID))
+		chats = append(chats, chatToTL(chat, int(snapshot.ParticipantCounts[id]), r.UserID))
 	}
 	return &tg.MessagesChats{Chats: chats}, nil
 }
