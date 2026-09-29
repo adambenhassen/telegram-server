@@ -113,6 +113,157 @@ func TestHandleCreateChatUnauthorized(t *testing.T) {
 	}
 }
 
+func TestHandleGetChatsUsesBoundedMemberRead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	viewer, err := s.CreateUser(ctx, "+15551292011")
+	if err != nil {
+		t.Fatalf("viewer: %v", err)
+	}
+	creator, err := s.CreateUser(ctx, "+15551292012")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551292013")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	outsider, err := s.CreateUser(ctx, "+15551292014")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
+	allowed, err := s.CreateChat(ctx, creator.ID, "Allowed", []int64{viewer.ID, member.ID})
+	if err != nil {
+		t.Fatalf("allowed chat: %v", err)
+	}
+	denied, err := s.CreateChat(ctx, outsider.ID, "Private", nil)
+	if err != nil {
+		t.Fatalf("inaccessible chat: %v", err)
+	}
+
+	fullHydrationRan := false
+	store.SetChatInfoSnapshotHook(s, func() { fullHydrationRan = true })
+	t.Cleanup(func() { store.SetChatInfoSnapshotHook(s, nil) })
+	var selectedIDs []int64
+	store.SetChatListInfoSnapshotHook(s, func(ids []int64) { selectedIDs = ids })
+	t.Cleanup(func() { store.SetChatListInfoSnapshotHook(s, nil) })
+
+	got, err := api.GetChatsForTest(s, viewer.ID, &tg.MessagesGetChatsRequest{
+		ID: []int64{allowed.ID, denied.ID, 999999},
+	})
+	if err != nil {
+		t.Fatalf("getChats: %v", err)
+	}
+	assertEncodes(t, got)
+	res, ok := got.(*tg.MessagesChats)
+	if !ok || len(res.Chats) != 3 {
+		t.Fatalf("getChats = %T with %d chats, want three entries", got, len(res.Chats))
+	}
+	chat, ok := res.Chats[0].(*tg.Chat)
+	if !ok || chat.ID != allowed.ID || chat.Title != "Allowed" || chat.ParticipantsCount != 3 {
+		t.Fatalf("member chat = %T/%+v, want Allowed with 3 participants", res.Chats[0], res.Chats[0])
+	}
+	for i, id := range []int64{denied.ID, 999999} {
+		forbidden, ok := res.Chats[i+1].(*tg.ChatForbidden)
+		if !ok || forbidden.ID != id || forbidden.Title != "" {
+			t.Errorf("getChats[%d] = %T/%+v, want empty forbidden chat %d", i+1, res.Chats[i+1], res.Chats[i+1], id)
+		}
+	}
+	if fullHydrationRan {
+		t.Fatal("getChats ran full participant/profile hydration")
+	}
+	if len(selectedIDs) != 1 || selectedIDs[0] != allowed.ID {
+		t.Fatalf("count IDs = %v, want only member chat %d", selectedIDs, allowed.ID)
+	}
+}
+
+func TestHandleGetChatsKeepsMembershipMetadataAndCountInOneSnapshot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551292021")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	viewer, err := s.CreateUser(ctx, "+15551292022")
+	if err != nil {
+		t.Fatalf("viewer: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551292023")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	chat, err := s.CreateChat(ctx, creator.ID, "Before", []int64{viewer.ID, member.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+
+	var mutationErr error
+	var selectedIDs []int64
+	store.SetChatListInfoSnapshotHook(s, func(ids []int64) {
+		selectedIDs = ids
+		if _, _, _, mutationErr = s.SetChatTitle(ctx, chat.ID, creator.ID, "After"); mutationErr != nil {
+			return
+		}
+		_, _, _, mutationErr = s.RemoveChatUser(ctx, chat.ID, viewer.ID, creator.ID)
+	})
+	t.Cleanup(func() { store.SetChatListInfoSnapshotHook(s, nil) })
+
+	got, err := api.GetChatsForTest(s, viewer.ID, &tg.MessagesGetChatsRequest{ID: []int64{chat.ID}})
+	if err != nil {
+		t.Fatalf("getChats: %v", err)
+	}
+	if mutationErr != nil {
+		t.Fatalf("mutate chat during read: %v", mutationErr)
+	}
+	if len(selectedIDs) != 1 || selectedIDs[0] != chat.ID {
+		t.Fatalf("selected IDs = %v, want [%d]", selectedIDs, chat.ID)
+	}
+	res, ok := got.(*tg.MessagesChats)
+	if !ok || len(res.Chats) != 1 {
+		t.Fatalf("getChats = %T with %d chats, want one entry", got, len(res.Chats))
+	}
+	wireChat, ok := res.Chats[0].(*tg.Chat)
+	if !ok || wireChat.Title != "Before" || wireChat.ParticipantsCount != 3 || wireChat.Version != chat.Version {
+		t.Fatalf("getChats snapshot = %T/%+v, want Before, version %d, count 3", res.Chats[0], res.Chats[0], chat.Version)
+	}
+
+	current, ok, err := s.ChatByID(ctx, chat.ID)
+	if err != nil || !ok {
+		t.Fatalf("current chat: ok=%v err=%v", ok, err)
+	}
+	participants, err := s.Participants(ctx, chat.ID)
+	if err != nil {
+		t.Fatalf("current participants: %v", err)
+	}
+	if current.Title != "After" || len(participants) != 2 {
+		t.Fatalf("current state = title %q, participants %d; want After and 2", current.Title, len(participants))
+	}
+}
+
+func TestHandleGetChatsReturnsInternalOnCountReadFailure(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	s := openStore(t)
+	viewer, err := s.CreateUser(context.Background(), "+15551292031")
+	if err != nil {
+		t.Fatalf("viewer: %v", err)
+	}
+	chat, err := s.CreateChat(context.Background(), viewer.ID, "Team", nil)
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	store.SetChatListInfoSnapshotHook(s, func([]int64) { cancel() })
+	t.Cleanup(func() { store.SetChatListInfoSnapshotHook(s, nil) })
+
+	_, err = api.GetChatsForTestWithContext(ctx, s, viewer.ID, &tg.MessagesGetChatsRequest{ID: []int64{chat.ID}})
+	if msg := rpcMessage(t, err); msg != "INTERNAL" {
+		t.Fatalf("count read error = %q, want INTERNAL", msg)
+	}
+}
+
 func TestHandleCreateChatFansOutToEveryMember(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

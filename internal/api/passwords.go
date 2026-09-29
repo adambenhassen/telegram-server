@@ -40,7 +40,7 @@ func randBytes(n int) ([]byte, error) {
 
 // userTL maps the signed-in account into its authorization response.
 func (h *handlers) userTL(u store.User) *tg.User {
-	return h.userToTL(u, u.ID, true)
+	return h.userToTL(u, u.ID, true, store.Contact{})
 }
 
 // handleGetPassword serves account.getPassword. It advertises the KDF params and

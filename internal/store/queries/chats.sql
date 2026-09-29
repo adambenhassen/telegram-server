@@ -56,6 +56,13 @@ WHERE p.user_id = sqlc.arg(user_id)::bigint
   AND c.id = ANY(sqlc.arg(chat_ids)::bigint[])
 ORDER BY c.id;
 
+-- name: ChatParticipantCountsByChatIDs :many
+SELECT chat_id, count(*)::bigint AS participant_count
+FROM chat_participants
+WHERE chat_id = ANY(sqlc.arg(chat_ids)::bigint[])
+GROUP BY chat_id
+ORDER BY chat_id;
+
 -- SetChatPinnedMessage sets or clears the pinned message id on a chat.
 -- The pinned_message_id is the local_id of the pinned message (identical across
 -- members for a given fanout). NULL clears the pin.

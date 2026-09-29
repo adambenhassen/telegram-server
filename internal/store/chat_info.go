@@ -19,9 +19,81 @@ type ChatInfoSnapshot struct {
 	EntitledUsers map[int64]bool
 }
 
+// ChatListInfoSnapshot is the bounded read set for messages.getChats.
+type ChatListInfoSnapshot struct {
+	Chats             map[int64]Chat
+	ParticipantCounts map[int64]int64
+}
+
 // SetChatInfoSnapshotHook installs the test-only pause between the membership
 // selection and participant/profile reads. Production callers leave it nil.
 func SetChatInfoSnapshotHook(s *Store, fn func()) { s.chatInfoSnapshotHook = fn }
+
+// SetChatListInfoSnapshotHook installs the test-only pause before the bounded
+// participant-count read. Production callers leave it nil.
+func SetChatListInfoSnapshotHook(s *Store, fn func([]int64)) {
+	s.chatListInfoSnapshotHook = fn
+}
+
+// ChatListInfoForMemberSnapshot returns metadata and participant counts only
+// for requested chats where viewerID has a participant row. Membership,
+// metadata and counts share one read-only snapshot; the count query receives
+// only chat IDs selected by that membership check.
+func (s *Store) ChatListInfoForMemberSnapshot(ctx context.Context, viewerID int64, chatIDs []int64) (ChatListInfoSnapshot, error) {
+	snapshot := ChatListInfoSnapshot{
+		Chats:             map[int64]Chat{},
+		ParticipantCounts: map[int64]int64{},
+	}
+	if len(chatIDs) == 0 {
+		return snapshot, nil
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return ChatListInfoSnapshot{}, fmt.Errorf("begin chat list info snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	chatRows, err := qtx.ChatsByIDsForMember(ctx, db.ChatsByIDsForMemberParams{
+		UserID:  viewerID,
+		ChatIds: chatIDs,
+	})
+	if err != nil {
+		return ChatListInfoSnapshot{}, fmt.Errorf("select member chats: %w", err)
+	}
+	selectedIDs := make([]int64, 0, len(chatRows))
+	for _, row := range chatRows {
+		chat := chatFromRow(row)
+		snapshot.Chats[chat.ID] = chat
+		selectedIDs = append(selectedIDs, chat.ID)
+	}
+	if len(selectedIDs) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return ChatListInfoSnapshot{}, fmt.Errorf("commit empty chat list info snapshot: %w", err)
+		}
+		return snapshot, nil
+	}
+	if hook := s.chatListInfoSnapshotHook; hook != nil {
+		hook(append([]int64(nil), selectedIDs...))
+	}
+
+	countRows, err := qtx.ChatParticipantCountsByChatIDs(ctx, selectedIDs)
+	if err != nil {
+		return ChatListInfoSnapshot{}, fmt.Errorf("count member chat participants: %w", err)
+	}
+	for _, row := range countRows {
+		snapshot.ParticipantCounts[row.ChatID] = row.ParticipantCount
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return ChatListInfoSnapshot{}, fmt.Errorf("commit chat list info snapshot: %w", err)
+	}
+	return snapshot, nil
+}
 
 // ChatInfoForMemberSnapshot returns only requested chats where viewerID has a
 // participant row, along with their participants and entitled profile source

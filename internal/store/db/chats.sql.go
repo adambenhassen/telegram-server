@@ -67,6 +67,39 @@ func (q *Queries) ChatByIDForUpdate(ctx context.Context, id int64) (Chat, error)
 	return i, err
 }
 
+const chatParticipantCountsByChatIDs = `-- name: ChatParticipantCountsByChatIDs :many
+SELECT chat_id, count(*)::bigint AS participant_count
+FROM chat_participants
+WHERE chat_id = ANY($1::bigint[])
+GROUP BY chat_id
+ORDER BY chat_id
+`
+
+type ChatParticipantCountsByChatIDsRow struct {
+	ChatID           int64
+	ParticipantCount int64
+}
+
+func (q *Queries) ChatParticipantCountsByChatIDs(ctx context.Context, chatIds []int64) ([]ChatParticipantCountsByChatIDsRow, error) {
+	rows, err := q.db.Query(ctx, chatParticipantCountsByChatIDs, chatIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChatParticipantCountsByChatIDsRow
+	for rows.Next() {
+		var i ChatParticipantCountsByChatIDsRow
+		if err := rows.Scan(&i.ChatID, &i.ParticipantCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const chatParticipants = `-- name: ChatParticipants :many
 SELECT chat_id, user_id, inviter_id, date FROM chat_participants WHERE chat_id = $1 ORDER BY user_id
 `

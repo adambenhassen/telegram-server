@@ -187,7 +187,7 @@ func (h *handlers) handleUpdateUsername(r *mtproto.Request) (bin.Encoder, error)
 	if !ok {
 		return nil, errInternal
 	}
-	return h.userToTL(updatedUser, r.UserID, true), nil
+	return h.userToTL(updatedUser, r.UserID, true, store.Contact{}), nil
 }
 
 // handleUpdateProfile serves account.updateProfile. An authenticated caller
@@ -238,5 +238,5 @@ func (h *handlers) handleUpdateProfile(r *mtproto.Request) (bin.Encoder, error) 
 	if !ok {
 		return nil, errInternal
 	}
-	return h.userToTL(updatedUser, r.UserID, true), nil
+	return h.userToTL(updatedUser, r.UserID, true, store.Contact{}), nil
 }

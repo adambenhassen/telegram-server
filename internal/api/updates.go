@@ -260,19 +260,70 @@ func (h *handlers) channelToTL(c store.Channel, m store.ChannelMember, member bo
 	return ch
 }
 
+// contactStatesForUsers loads the viewer's contact edges for the selected
+// users. The result is owner-scoped and includes reciprocal state from the
+// same query as each edge.
+func (h *handlers) contactStatesForUsers(ctx context.Context, viewerID int64, userIDs []int64) (map[int64]store.Contact, error) {
+	states := make(map[int64]store.Contact, len(userIDs))
+	if viewerID <= 0 || len(userIDs) == 0 {
+		return states, nil
+	}
+
+	selected := make([]int64, 0, len(userIDs))
+	seen := make(map[int64]bool, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 || userID == viewerID || seen[userID] {
+			continue
+		}
+		seen[userID] = true
+		selected = append(selected, userID)
+	}
+	if len(selected) == 0 {
+		return states, nil
+	}
+	contacts, err := h.store.ContactStates(ctx, viewerID, selected)
+	if err != nil {
+		return nil, err
+	}
+	for _, contact := range contacts {
+		states[contact.UserID] = contact
+	}
+	return states, nil
+}
+
+// usersToTL renders a group of users with live contact state for viewerID.
+func (h *handlers) usersToTL(ctx context.Context, users []store.User, viewerID int64, markSelf bool) ([]*tg.User, error) {
+	userIDs := make([]int64, len(users))
+	for i, user := range users {
+		userIDs[i] = user.ID
+	}
+	states, err := h.contactStatesForUsers(ctx, viewerID, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*tg.User, len(users))
+	for i, user := range users {
+		out[i] = h.userToTL(user, viewerID, markSelf && user.ID == viewerID, states[user.ID])
+	}
+	return out, nil
+}
+
 // userToTL maps a stored user to the wire tg.User. AccessHash is derived for
 // (viewerID, u.ID) so only the viewer can use it. self marks the update
-// recipient's own account. The phone number is private to its owner, so it is
-// emitted only on the self entry — names stay for every peer, since a client
-// needs them to render a conversation.
-func (h *handlers) userToTL(u store.User, viewerID int64, self bool) *tg.User {
+// recipient's own account. Contact flags come from the viewer's live directed
+// edge. The phone number is private to its owner, so it is emitted only on the
+// self entry — names stay for every peer, since a client needs them to render
+// a conversation.
+func (h *handlers) userToTL(u store.User, viewerID int64, self bool, contact store.Contact) *tg.User {
 	tlUser := &tg.User{
-		ID:         u.ID,
-		Self:       self,
-		FirstName:  u.FirstName,
-		LastName:   u.LastName,
-		AccessHash: h.peers.Derive(viewerID, peerhash.KindUser, u.ID),
-		Status:     userStatusToTL(u, self),
+		ID:            u.ID,
+		Self:          self,
+		Contact:       !self && contact.UserID == u.ID,
+		MutualContact: !self && contact.UserID == u.ID && contact.Mutual,
+		FirstName:     u.FirstName,
+		LastName:      u.LastName,
+		AccessHash:    h.peers.Derive(viewerID, peerhash.KindUser, u.ID),
+		Status:        userStatusToTL(u, self),
 	}
 	if self {
 		tlUser.Phone = u.Phone
@@ -582,13 +633,23 @@ func (h *handlers) loadUsersWithExplicitUserPeers(ctx context.Context, ids map[i
 	if err != nil {
 		return nil, err
 	}
+	visibleIDs := make([]int64, 0, len(users))
+	for id := range users {
+		if id == viewerID || entitled[id] || explicitUserPeers[id] {
+			visibleIDs = append(visibleIDs, id)
+		}
+	}
+	contactStates, err := h.contactStatesForUsers(ctx, viewerID, visibleIDs)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]tg.UserClass, 0, len(users))
 	for id, u := range users {
 		if id != viewerID && !entitled[id] && !explicitUserPeers[id] {
 			out = append(out, &tg.UserEmpty{ID: id})
 			continue
 		}
-		out = append(out, h.userToTL(u, viewerID, id == viewerID))
+		out = append(out, h.userToTL(u, viewerID, id == viewerID, contactStates[id]))
 	}
 	return out, nil
 }

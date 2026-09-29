@@ -50,10 +50,15 @@ func (h *handlers) handleResolvePhone(r *mtproto.Request) (bin.Encoder, error) {
 	if !ok {
 		return nil, errPhoneNotOccupied
 	}
+	wireUsers, err := h.usersToTL(r.Ctx, []store.User{user}, r.UserID, false)
+	if err != nil {
+		h.log.Error("resolve phone: render user", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
 
 	return &tg.ContactsResolvedPeer{
 		Peer:  &tg.PeerUser{UserID: user.ID},
-		Users: []tg.UserClass{h.userToTL(user, r.UserID, false)},
+		Users: []tg.UserClass{wireUsers[0]},
 	}, nil
 }
 
@@ -100,9 +105,14 @@ func (h *handlers) handleResolveUsername(r *mtproto.Request) (bin.Encoder, error
 
 	switch resolution.Kind {
 	case store.UsernameKindUser:
+		wireUsers, err := h.usersToTL(r.Ctx, []store.User{resolution.User}, r.UserID, false)
+		if err != nil {
+			h.log.Error("resolve username: render user", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
 		return &tg.ContactsResolvedPeer{
 			Peer:  &tg.PeerUser{UserID: resolution.User.ID},
-			Users: []tg.UserClass{h.userToTL(resolution.User, r.UserID, false)},
+			Users: []tg.UserClass{wireUsers[0]},
 		}, nil
 	case store.UsernameKindChannel:
 		ch := resolution.Channel
@@ -352,10 +362,10 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	}
 
 	myResults := make([]tg.PeerClass, 0, len(contacts)+len(namedChannels))
-	users := make([]tg.UserClass, 0, len(contacts))
+	userRecords := make([]store.User, 0, len(contacts)+1)
 	for _, c := range contacts {
 		myResults = append(myResults, &tg.PeerUser{UserID: c.ID})
-		users = append(users, h.userToTL(c, r.UserID, c.ID == r.UserID))
+		userRecords = append(userRecords, c)
 	}
 
 	// Only a channel some vector names is rendered, and each is rendered once.
@@ -375,7 +385,7 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 	if exactUser != nil {
 		results = append(results, &tg.PeerUser{UserID: exactUser.ID})
 		if !userIDs[exactUser.ID] {
-			users = append(users, h.userToTL(*exactUser, r.UserID, exactUser.ID == r.UserID))
+			userRecords = append(userRecords, *exactUser)
 		}
 	}
 	for _, p := range resultChannels {
@@ -389,6 +399,15 @@ func (h *handlers) handleContactsSearch(r *mtproto.Request) (bin.Encoder, error)
 			continue
 		}
 		chats = append(chats, h.channelToTLPublic(p.Channel, p.ParticipantsCount, r.UserID))
+	}
+	wireUsers, err := h.usersToTL(r.Ctx, userRecords, r.UserID, true)
+	if err != nil {
+		h.log.Error("contacts.search: render users", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	users := make([]tg.UserClass, len(wireUsers))
+	for i, user := range wireUsers {
+		users[i] = user
 	}
 
 	return &tg.ContactsFound{
@@ -440,6 +459,11 @@ func (h *handlers) handleGetUsers(r *mtproto.Request) (bin.Encoder, error) {
 			return nil, errAuthKeyUnreg
 		}
 	}
+	contactStates, err := h.contactStatesForUsers(r.Ctx, r.UserID, uniqueIDs)
+	if err != nil {
+		h.log.Error("get users: load contact state", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
 
 	out := make([]tg.UserClass, len(ids))
 	for i, id := range ids {
@@ -448,7 +472,7 @@ func (h *handlers) handleGetUsers(r *mtproto.Request) (bin.Encoder, error) {
 			out[i] = &tg.UserEmpty{ID: id}
 			continue
 		}
-		out[i] = h.userToTL(user, r.UserID, id == r.UserID)
+		out[i] = h.userToTL(user, r.UserID, id == r.UserID, contactStates[id])
 	}
 	return &tg.UserClassVector{Elems: out}, nil
 }

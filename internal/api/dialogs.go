@@ -307,14 +307,19 @@ func (h *handlers) handleGetPeerDialogs(r *mtproto.Request) (bin.Encoder, error)
 		h.log.Error("get peer dialogs", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	return h.peerDialogsToTL(snapshot, r.UserID), nil
+	result, err := h.peerDialogsToTL(r.Ctx, snapshot, r.UserID)
+	if err != nil {
+		h.log.Error("get peer dialogs: contact state", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return result, nil
 }
 
 // peerDialogsToTL is the response-only half of the snapshot path. Row-derived
 // users remain behind the viewer-aware entitlement gate; explicitly requested
-// user peers were admitted by their validated access hashes. This function
-// performs no further database reads.
-func (h *handlers) peerDialogsToTL(snapshot store.PeerDialogsSnapshot, viewerID int64) *tg.MessagesPeerDialogs {
+// user peers were admitted by their validated access hashes. It reads contact
+// state for only those users that will be rendered as full users.
+func (h *handlers) peerDialogsToTL(ctx context.Context, snapshot store.PeerDialogsSnapshot, viewerID int64) (*tg.MessagesPeerDialogs, error) {
 	tlDialogs := make([]tg.DialogClass, 0, len(snapshot.Dialogs))
 	tlMsgs := make([]tg.MessageClass, 0, len(snapshot.Dialogs))
 	files := make(map[int64]*tg.Document, len(snapshot.Files))
@@ -364,13 +369,23 @@ func (h *handlers) peerDialogsToTL(snapshot store.PeerDialogsSnapshot, viewerID 
 		}
 	}
 
+	userIDs := make([]int64, 0, len(snapshot.Users))
+	for id := range snapshot.Users {
+		if id == viewerID || snapshot.EntitledUsers[id] || snapshot.ExplicitUserPeers[id] {
+			userIDs = append(userIDs, id)
+		}
+	}
+	contactStates, err := h.contactStatesForUsers(ctx, viewerID, userIDs)
+	if err != nil {
+		return nil, err
+	}
 	users := make([]tg.UserClass, 0, len(snapshot.Users))
 	for id, user := range snapshot.Users {
 		if id != viewerID && !snapshot.EntitledUsers[id] && !snapshot.ExplicitUserPeers[id] {
 			users = append(users, &tg.UserEmpty{ID: id})
 			continue
 		}
-		users = append(users, h.userToTL(user, viewerID, id == viewerID))
+		users = append(users, h.userToTL(user, viewerID, id == viewerID, contactStates[id]))
 	}
 
 	chats := make([]tg.ChatClass, 0, len(chatIDs)+len(channelIDs))
@@ -399,5 +414,5 @@ func (h *handlers) peerDialogsToTL(snapshot store.PeerDialogsSnapshot, viewerID 
 		Chats:    chats,
 		Users:    users,
 		State:    *stateToTL(snapshot.State),
-	}
+	}, nil
 }
