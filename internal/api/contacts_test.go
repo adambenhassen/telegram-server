@@ -62,8 +62,16 @@ func assertContactAddReply(t *testing.T, enc bin.Encoder, target store.User, vie
 	if !ok {
 		t.Fatalf("add contact result = %T, want *tg.Updates", enc)
 	}
-	if len(updates.Updates) != 0 || len(updates.Chats) != 0 || len(updates.Users) != 1 {
-		t.Fatalf("add contact updates = %+v, want no events/chats and one user", updates)
+	if len(updates.Updates) != 1 || len(updates.Chats) != 0 || len(updates.Users) != 1 {
+		t.Fatalf("add contact updates = %+v, want one peer-settings update, no chats, and one user", updates)
+	}
+	settingsUpdate, ok := updates.Updates[0].(*tg.UpdatePeerSettings)
+	if !ok {
+		t.Fatalf("add contact update = %T, want *tg.UpdatePeerSettings", updates.Updates[0])
+	}
+	peer, ok := settingsUpdate.Peer.(*tg.PeerUser)
+	if !ok || peer.UserID != target.ID {
+		t.Errorf("peer-settings peer = %#v, want user %d", settingsUpdate.Peer, target.ID)
 	}
 	user, ok := updates.Users[0].(*tg.User)
 	if !ok {
@@ -472,8 +480,16 @@ func TestContactsConcurrentReciprocalAddsConverge(t *testing.T) {
 		}
 		assertEncodes(t, result.response)
 		updates, ok := result.response.(*tg.Updates)
-		if !ok || len(updates.Updates) != 0 || len(updates.Chats) != 0 || len(updates.Users) != 1 {
-			t.Fatalf("concurrent add reply = %#v, want Updates with one user", result.response)
+		if !ok || len(updates.Updates) != 1 || len(updates.Chats) != 0 || len(updates.Users) != 1 {
+			t.Fatalf("concurrent add reply = %#v, want one peer-settings update and one user", result.response)
+		}
+		settingsUpdate, ok := updates.Updates[0].(*tg.UpdatePeerSettings)
+		if !ok {
+			t.Fatalf("concurrent add update = %T, want *tg.UpdatePeerSettings", updates.Updates[0])
+		}
+		settingsPeer, ok := settingsUpdate.Peer.(*tg.PeerUser)
+		if !ok || settingsPeer.UserID != result.target.ID {
+			t.Fatalf("concurrent add settings peer = %#v, want user %d", settingsUpdate.Peer, result.target.ID)
 		}
 		user, ok := updates.Users[0].(*tg.User)
 		if !ok || user.ID != result.target.ID || user.AccessHash != api.DeriveUserHash(result.owner.ID, result.target.ID) || !user.Contact || user.Phone != "" {

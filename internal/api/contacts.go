@@ -61,10 +61,13 @@ func (h *handlers) handleAddContact(r *mtproto.Request) (bin.Encoder, error) {
 	wireUser.Contact = true
 	wireUser.MutualContact = mutual
 	return &tg.Updates{
-		Updates: []tg.UpdateClass{},
-		Users:   []tg.UserClass{wireUser},
-		Chats:   []tg.ChatClass{},
-		Date:    int(time.Now().Unix()),
+		Updates: []tg.UpdateClass{&tg.UpdatePeerSettings{
+			Peer:     &tg.PeerUser{UserID: targetID},
+			Settings: tg.PeerSettings{},
+		}},
+		Users: []tg.UserClass{wireUser},
+		Chats: []tg.ChatClass{},
+		Date:  int(time.Now().Unix()),
 	}, nil
 }
 

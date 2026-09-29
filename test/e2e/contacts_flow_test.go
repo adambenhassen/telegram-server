@@ -107,6 +107,17 @@ func TestContactsSearchAddGroupLive(t *testing.T) {
 	if !ok || len(addUpdates.Users) != 1 {
 		t.Fatalf("add reply = %#v, want Updates with B", added)
 	}
+	if len(addUpdates.Updates) != 1 {
+		t.Fatalf("add reply updates = %#v, want one peer-settings update", addUpdates.Updates)
+	}
+	settingsUpdate, ok := addUpdates.Updates[0].(*tg.UpdatePeerSettings)
+	if !ok {
+		t.Fatalf("add reply update = %T, want *tg.UpdatePeerSettings", addUpdates.Updates[0])
+	}
+	settingsPeer, ok := settingsUpdate.Peer.(*tg.PeerUser)
+	if !ok || settingsPeer.UserID != bUserID {
+		t.Fatalf("add reply settings peer = %#v, want B %d", settingsUpdate.Peer, bUserID)
+	}
 	addedB, ok := addUpdates.Users[0].(*tg.User)
 	if !ok || addedB.ID != bUserID || !addedB.Contact || addedB.Phone != "" || addedB.FirstName != "" {
 		t.Fatalf("add reply user = %#v, want contact B without phone", addUpdates.Users[0])
