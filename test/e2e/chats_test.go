@@ -99,6 +99,94 @@ func hasChat(chats []tg.ChatClass, id int64) bool {
 	return false
 }
 
+func checkFullChat(t *testing.T, res *tg.MessagesChatFull, chatID, creatorID, viewerID, memberBID, memberCID int64) error {
+	t.Helper()
+	full, ok := res.FullChat.(*tg.ChatFull)
+	if !ok {
+		return fmt.Errorf("full chat type = %T, want *tg.ChatFull", res.FullChat)
+	}
+	if full.ID != chatID || full.About != "" {
+		return fmt.Errorf("full chat id/about = %d/%q, want %d/empty", full.ID, full.About, chatID)
+	}
+	if _, ok := full.ChatPhoto.(*tg.PhotoEmpty); !ok {
+		return fmt.Errorf("chat photo = %T, want *tg.PhotoEmpty", full.ChatPhoto)
+	}
+	if _, ok := full.GetExportedInvite(); ok {
+		return errors.New("full chat unexpectedly includes exported invite")
+	}
+	participants, ok := full.Participants.(*tg.ChatParticipants)
+	if !ok {
+		return fmt.Errorf("participants type = %T, want *tg.ChatParticipants", full.Participants)
+	}
+	if participants.ChatID != chatID || len(participants.Participants) != 3 {
+		return fmt.Errorf("participants chat/count = %d/%d, want %d/3", participants.ChatID, len(participants.Participants), chatID)
+	}
+	roles := make(map[int64]string, len(participants.Participants))
+	for _, participant := range participants.Participants {
+		switch p := participant.(type) {
+		case *tg.ChatParticipantCreator:
+			roles[p.UserID] = "creator"
+		case *tg.ChatParticipant:
+			if p.InviterID != creatorID || p.Date <= 0 {
+				return fmt.Errorf("member %d inviter/date = %d/%d, want %d and a join date", p.UserID, p.InviterID, p.Date, creatorID)
+			}
+			roles[p.UserID] = "member"
+		default:
+			return fmt.Errorf("participant type = %T, want creator or member", participant)
+		}
+	}
+	wantIDs := map[int64]bool{creatorID: true}
+	for _, id := range []int64{memberBID, memberCID} {
+		wantIDs[id] = true
+	}
+	if len(roles) != len(wantIDs) || roles[creatorID] != "creator" {
+		return fmt.Errorf("participant roles = %v, want creator %d and members %v", roles, creatorID, wantIDs)
+	}
+	for id := range wantIDs {
+		wantRole := "member"
+		if id == creatorID {
+			wantRole = "creator"
+		}
+		if roles[id] != wantRole {
+			return fmt.Errorf("participant %d role = %q, want %q; roles=%v", id, roles[id], wantRole, roles)
+		}
+	}
+	if len(res.Chats) != 1 {
+		return fmt.Errorf("chats = %d, want 1", len(res.Chats))
+	}
+	chat, ok := res.Chats[0].(*tg.Chat)
+	if !ok || chat.ID != chatID {
+		return fmt.Errorf("chat entry = %T/%v, want basic chat %d", res.Chats[0], res.Chats[0], chatID)
+	}
+	if chat.Version != participants.Version {
+		return fmt.Errorf("chat/version = %d/%d, want the same snapshot version", chat.Version, participants.Version)
+	}
+	if len(res.Users) != 3 {
+		return fmt.Errorf("users = %d, want 3", len(res.Users))
+	}
+	users := make(map[int64]*tg.User, len(res.Users))
+	for _, user := range res.Users {
+		profile, ok := user.(*tg.User)
+		if !ok {
+			return fmt.Errorf("user entry = %T, want entitled *tg.User", user)
+		}
+		if profile.ID == viewerID {
+			if !profile.Self || profile.Phone == "" {
+				return fmt.Errorf("self profile self/phone = %t/%q, want true and a phone", profile.Self, profile.Phone)
+			}
+		} else if profile.Self || profile.Phone != "" {
+			return fmt.Errorf("non-self profile %d self/phone = %t/%q, want false/empty", profile.ID, profile.Self, profile.Phone)
+		}
+		users[profile.ID] = profile
+	}
+	for id := range roles {
+		if users[id] == nil {
+			return fmt.Errorf("participant %d missing from users", id)
+		}
+	}
+	return nil
+}
+
 // waitNoNewMsg asserts that no regular message arrives within the context
 // deadline.
 func (u *updateCollector) waitNoNewMsg(ctx context.Context) error {
@@ -207,6 +295,114 @@ func TestChatsRealtime(t *testing.T) {
 		return nil
 	})
 
+	// Every current member sees the same three participants, with profile
+	// fields gated for the current viewer.
+	for _, member := range []struct {
+		cmds   chan command
+		userID int64
+		who    string
+	}{{aCmds, aUserID, "A"}, {bCmds, bUserID, "B"}, {cCmds, cUserID, "C"}} {
+		execChat(t, ctx, member.cmds, func(ctx context.Context, c *tg.Client) error {
+			res, err := c.MessagesGetFullChat(ctx, chatID)
+			if err != nil {
+				return fmt.Errorf("%s getFullChat: %w", member.who, err)
+			}
+			return checkFullChat(t, res, chatID, aUserID, member.userID, bUserID, cUserID)
+		})
+	}
+
+	// Create a distinct inaccessible basic chat and a channel so getChats can
+	// prove it reads only the basic-chat namespace. The other group has no
+	// dialog rows; membership is the only authority this read needs.
+	otherChat, err := st.CreateChat(ctx, cUserID, "Other", []int64{bUserID})
+	if err != nil {
+		t.Fatalf("create inaccessible chat: %v", err)
+	}
+	if otherChat.ID != bUserID {
+		t.Fatalf("namespace collision fixture chat/user ids = %d/%d, want a real collision", otherChat.ID, bUserID)
+	}
+	channel, err := st.CreateChannel(ctx, dUserID, "Channel", "", true)
+	if err != nil {
+		t.Fatalf("create channel for namespace check: %v", err)
+	}
+	const absentChatID = int64(999999)
+
+	// getChats deduplicates ids, drops non-positive ids before lookup, and emits
+	// empty ChatForbidden entries for existing non-members and absent chats.
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		got, err := c.MessagesGetChats(ctx, []int64{chatID, chatID, otherChat.ID, absentChatID, dUserID, channel.ID, 0, -1})
+		if err != nil {
+			return fmt.Errorf("getChats: %w", err)
+		}
+		res, ok := got.(*tg.MessagesChats)
+		if !ok {
+			return fmt.Errorf("getChats result = %T, want *tg.MessagesChats", got)
+		}
+		if len(res.Chats) != 5 {
+			return fmt.Errorf("getChats entries = %d, want 5 positive unique ids", len(res.Chats))
+		}
+		if _, ok := res.Chats[0].(*tg.Chat); !ok {
+			return fmt.Errorf("member chat result = %T, want *tg.Chat", res.Chats[0])
+		}
+		for i, id := range []int64{otherChat.ID, absentChatID, dUserID, channel.ID} {
+			forbidden, ok := res.Chats[i+1].(*tg.ChatForbidden)
+			if !ok || forbidden.ID != id || forbidden.Title != "" {
+				return fmt.Errorf("getChats[%d] = %T/%v, want empty ChatForbidden %d", i+1, res.Chats[i+1], res.Chats[i+1], id)
+			}
+		}
+		return nil
+	})
+
+	// A non-member cannot distinguish an existing chat from a missing one by
+	// either RPC, while getChats uses the same empty forbidden constructor.
+	var deniedFull, missingFull error
+	execChat(t, ctx, dCmds, func(ctx context.Context, c *tg.Client) error {
+		_, deniedFull = c.MessagesGetFullChat(ctx, chatID)
+		_, missingFull = c.MessagesGetFullChat(ctx, absentChatID)
+		return nil
+	})
+	var deniedRPC, missingRPC *tgerr.Error
+	if !errors.As(deniedFull, &deniedRPC) || !errors.As(missingFull, &missingRPC) || deniedRPC.Code != 400 || deniedRPC.Message != "PEER_ID_INVALID" || missingRPC.Code != deniedRPC.Code || missingRPC.Message != deniedRPC.Message {
+		t.Fatalf("getFullChat denial/missing = %v/%v, want identical PEER_ID_INVALID", deniedFull, missingFull)
+	}
+	execChat(t, ctx, dCmds, func(ctx context.Context, c *tg.Client) error {
+		got, err := c.MessagesGetChats(ctx, []int64{chatID, otherChat.ID, absentChatID, 0, -1})
+		if err != nil {
+			return fmt.Errorf("non-member getChats: %w", err)
+		}
+		res, ok := got.(*tg.MessagesChats)
+		if !ok || len(res.Chats) != 3 {
+			return fmt.Errorf("non-member getChats result = %T/%v, want three positive ids", got, got)
+		}
+		for i, id := range []int64{chatID, otherChat.ID, absentChatID} {
+			forbidden, ok := res.Chats[i].(*tg.ChatForbidden)
+			if !ok || forbidden.ID != id || forbidden.Title != "" {
+				return fmt.Errorf("non-member getChats[%d] = %T/%v, want empty ChatForbidden %d", i, res.Chats[i], res.Chats[i], id)
+			}
+		}
+		return nil
+	})
+	var overCapReachedStore bool
+	store.SetChatInfoSnapshotHook(st, func() { overCapReachedStore = true })
+	assertChannelRPCError(t, ctx, aCmds, "LIMIT_INVALID", func(ctx context.Context, c *tg.Client) error {
+		tooMany := make([]int64, 101)
+		for i := range tooMany {
+			tooMany[i] = chatID
+		}
+		_, err := c.MessagesGetChats(ctx, tooMany)
+		return err
+	})
+	store.SetChatInfoSnapshotHook(st, nil)
+	if overCapReachedStore {
+		t.Fatal("oversized getChats request reached the store")
+	}
+	for _, id := range []int64{0, -1} {
+		assertChannelRPCError(t, ctx, aCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+			_, err := c.MessagesGetFullChat(ctx, id)
+			return err
+		})
+	}
+
 	// 2. B and C receive create service message.
 	waitSvc := func(coll *updateCollector, who string) {
 		t.Helper()
@@ -294,11 +490,11 @@ func TestChatsRealtime(t *testing.T) {
 	waitEditTitle(collB, "B")
 	waitEditTitle(collC, "C")
 
-	// 5. A adds D; D receives add service message.
-	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+	// 5. B adds D; D receives add service message, retaining B as inviter.
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesAddChatUser(ctx, &tg.MessagesAddChatUserRequest{
 			ChatID:   chatID,
-			UserID:   inputUser(aUserID, dUserID),
+			UserID:   inputUser(bUserID, dUserID),
 			FwdLimit: 0,
 		})
 		return err
@@ -346,7 +542,7 @@ func TestChatsRealtime(t *testing.T) {
 		return nil
 	})
 
-	// 6. A removes C; C receives delete service message.
+	// 6. A removes C; C receives delete service message and loses full-info access.
 	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesDeleteChatUser(ctx, &tg.MessagesDeleteChatUserRequest{
 			ChatID: chatID, UserID: inputUser(aUserID, cUserID),
@@ -368,6 +564,10 @@ func TestChatsRealtime(t *testing.T) {
 		}
 	}
 	waitDeleteUser(collC, "C")
+	assertChannelRPCError(t, ctx, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesGetFullChat(ctx, chatID)
+		return err
+	})
 
 	// 7. A sends one more message; B and D receive it, C does not.
 	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -387,6 +587,113 @@ func TestChatsRealtime(t *testing.T) {
 		t.Errorf("C should not receive message after removal: %v", err)
 	}
 	noCancel()
+
+	// Pause full-info hydration after its membership read, then remove the
+	// viewer and add C. The response must stay on its original repeatable-read
+	// snapshot and omit C from both participant and user vectors.
+	var snapshotMutationErr error
+	var snapshotMutationRan bool
+	store.SetChatInfoSnapshotHook(st, func() {
+		store.SetChatInfoSnapshotHook(st, nil)
+		_, _, _, snapshotMutationErr = st.RemoveChatUser(ctx, chatID, bUserID, bUserID)
+		if snapshotMutationErr != nil {
+			return
+		}
+		_, _, _, snapshotMutationErr = st.AddChatUser(ctx, chatID, cUserID, aUserID)
+		snapshotMutationRan = true
+	})
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesGetFullChat(ctx, chatID)
+		if err != nil {
+			return fmt.Errorf("concurrent getFullChat: %w", err)
+		}
+		full, ok := res.FullChat.(*tg.ChatFull)
+		if !ok {
+			return fmt.Errorf("concurrent full chat = %T, want *tg.ChatFull", res.FullChat)
+		}
+		participants, ok := full.Participants.(*tg.ChatParticipants)
+		if !ok {
+			return fmt.Errorf("concurrent participants = %T, want *tg.ChatParticipants", full.Participants)
+		}
+		if len(res.Chats) != 1 {
+			return fmt.Errorf("concurrent chats = %d, want 1", len(res.Chats))
+		}
+		chat, ok := res.Chats[0].(*tg.Chat)
+		if !ok || chat.ID != chatID || chat.Version != participants.Version || chat.ParticipantsCount != len(participants.Participants) {
+			return fmt.Errorf("concurrent chat metadata = %T/%v with participant version %d", res.Chats[0], res.Chats[0], participants.Version)
+		}
+		participantIDs := map[int64]bool{}
+		for _, participant := range participants.Participants {
+			switch p := participant.(type) {
+			case *tg.ChatParticipantCreator:
+				participantIDs[p.UserID] = true
+			case *tg.ChatParticipant:
+				participantIDs[p.UserID] = true
+			}
+		}
+		if !snapshotMutationRan || !participantIDs[bUserID] || participantIDs[cUserID] {
+			return fmt.Errorf("concurrent participant ids = %v, mutation=%t; want pre-change B and no new C", participantIDs, snapshotMutationRan)
+		}
+		for _, user := range res.Users {
+			switch u := user.(type) {
+			case *tg.User:
+				if u.ID == cUserID {
+					return errors.New("new member C leaked into concurrent users snapshot")
+				}
+			case *tg.UserEmpty:
+				if u.ID == cUserID {
+					return errors.New("new member C leaked as UserEmpty into concurrent users snapshot")
+				}
+			}
+		}
+		return nil
+	})
+	if snapshotMutationErr != nil {
+		t.Fatalf("concurrent membership mutation: %v", snapshotMutationErr)
+	}
+
+	// B invited D, then left during the snapshot hook. D still receives the raw
+	// inviter id, but B's profile is now outside D's entitlement set.
+	execChat(t, ctx, dCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesGetFullChat(ctx, chatID)
+		if err != nil {
+			return fmt.Errorf("D getFullChat after B left: %w", err)
+		}
+		full, ok := res.FullChat.(*tg.ChatFull)
+		if !ok {
+			return fmt.Errorf("D full chat = %T, want *tg.ChatFull", res.FullChat)
+		}
+		participants, ok := full.Participants.(*tg.ChatParticipants)
+		if !ok {
+			return fmt.Errorf("D participants = %T, want *tg.ChatParticipants", full.Participants)
+		}
+		inviterFound := false
+		for _, participant := range participants.Participants {
+			if member, ok := participant.(*tg.ChatParticipant); ok && member.UserID == dUserID {
+				inviterFound = member.InviterID == bUserID && member.Date > 0
+			}
+		}
+		if !inviterFound {
+			return errors.New("D participant missing B inviter id and join date")
+		}
+		bEmpty := false
+		for _, user := range res.Users {
+			if userEmpty, ok := user.(*tg.UserEmpty); ok && userEmpty.ID == bUserID {
+				bEmpty = true
+			}
+			if profile, ok := user.(*tg.User); ok && profile.ID != dUserID && profile.Phone != "" {
+				return fmt.Errorf("non-self profile %d exposes phone %q", profile.ID, profile.Phone)
+			}
+		}
+		if !bEmpty {
+			return errors.New("departed inviter B is not represented by UserEmpty")
+		}
+		return nil
+	})
+	assertChannelRPCError(t, ctx, bCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesGetFullChat(ctx, chatID)
+		return err
+	})
 
 	close(aCmds)
 	close(bCmds)

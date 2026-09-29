@@ -46,6 +46,16 @@ JOIN chat_participants p ON p.chat_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id;
 
+-- A missing chat and a chat without a membership row for the viewer both
+-- produce no result. Keep the read on the basic-chat tables so equal numeric
+-- ids in users or channels cannot resolve to those peer types.
+-- name: ChatsByIDsForMember :many
+SELECT c.* FROM chats c
+JOIN chat_participants p ON p.chat_id = c.id
+WHERE p.user_id = sqlc.arg(user_id)::bigint
+  AND c.id = ANY(sqlc.arg(chat_ids)::bigint[])
+ORDER BY c.id;
+
 -- SetChatPinnedMessage sets or clears the pinned message id on a chat.
 -- The pinned_message_id is the local_id of the pinned message (identical across
 -- members for a given fanout). NULL clears the pin.
