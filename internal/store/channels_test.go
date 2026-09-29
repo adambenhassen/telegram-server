@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -1104,6 +1105,57 @@ func TestConcurrentAddChannelMembersCannotOverfillChannel(t *testing.T) {
 	}
 	if len(members) != 2 {
 		t.Fatalf("participants after concurrent invites = %d, want 2", len(members))
+	}
+}
+
+func TestConcurrentAddChannelMembersEnforcesAccountCapAcrossChannels(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551299980")
+	const races = 20
+	targets := make([]store.User, races)
+	channels := make([][2]store.Channel, races)
+	for i := range races {
+		targets[i] = mustUser(t, s, fmt.Sprintf("+155512998%02d", i))
+		channels[i][0] = mustChannel(t, s, creator.ID, fmt.Sprintf("Race %d A", i))
+		channels[i][1] = mustChannel(t, s, creator.ID, fmt.Sprintf("Race %d B", i))
+	}
+	store.SetChannelCaps(s, 10000, 1)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make([][]int64, races*2)
+	errs := make([]error, races*2)
+	for i := range races {
+		for j, ch := range channels[i] {
+			resultIndex, targetIndex := i*2+j, i
+			wg.Go(func() {
+				<-start
+				results[resultIndex], errs[resultIndex] = s.AddChannelMembers(
+					ctx, ch.ID, creator.ID, []int64{targets[targetIndex].ID},
+				)
+			})
+		}
+	}
+	close(start)
+	wg.Wait()
+
+	for i, target := range targets {
+		first, second := results[i*2], results[i*2+1]
+		if errs[i*2] != nil || errs[i*2+1] != nil {
+			t.Fatalf("invite target %d: %v, %v", i, errs[i*2], errs[i*2+1])
+		}
+		if len(first)+len(second) != 1 {
+			t.Errorf("concurrent invites admitted target %d %d times: %v, %v", target.ID, len(first)+len(second), first, second)
+		}
+		joined, err := s.ChannelsForUser(ctx, target.ID)
+		if err != nil {
+			t.Fatalf("read target %d channels: %v", target.ID, err)
+		}
+		if len(joined) != 1 {
+			t.Errorf("target %d has %d channels after concurrent invites, want 1", target.ID, len(joined))
+		}
 	}
 }
 
