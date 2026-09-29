@@ -27,9 +27,12 @@ import (
 // The rights mutations — SetChannelRole, SetChannelBan and LeaveChannel — take
 // the channels row lock (LockChannel), first and held to commit. AddChannelMembers
 // takes that row first to re-check the caller's role, then channel_state to
-// serialize admission and record join_pts. PostChannelMessage takes only
-// channel_state, so no path takes both rows in reverse order. The invite row
-// lock is never taken alongside the channels row lock, so it cannot cycle either.
+// serialize admission and record join_pts. Posts and joins can hold channel_state
+// while their inserts request a KEY SHARE lock on channels for the foreign key;
+// LockChannel's NO KEY UPDATE mode is compatible with that check, so the insert
+// can finish and release channel_state. This preserves serialized role rechecks
+// without a channel_state/channels lock cycle. The invite row lock is never
+// taken alongside LockChannel, so it cannot cycle either.
 //
 // EditChannelUsername takes an advisory lock (pg_advisory_xact_lock on channelID)
 // first, then the channels row lock (LockChannel). The advisory lock serialises

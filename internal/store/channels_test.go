@@ -1107,6 +1107,80 @@ func TestConcurrentAddChannelMembersCannotOverfillChannel(t *testing.T) {
 	}
 }
 
+func TestConcurrentAddChannelMembersAndPostChannelMessage(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	creator := mustUser(t, s, "+15551299974")
+	target := mustUser(t, s, "+15551299975")
+	ch := mustChannel(t, s, creator.ID, "Invite and post")
+
+	release, err := store.HoldChannelStateRowLock(ctx, s, ch.ID)
+	if err != nil {
+		t.Fatalf("hold channel state lock: %v", err)
+	}
+	defer release()
+
+	type postResult struct {
+		pts int
+		err error
+	}
+	postDone := make(chan postResult, 1)
+	go func() {
+		_, pts, _, err := s.PostChannelMessage(ctx, ch.ID, creator.ID, "race", 1, nil, 0)
+		postDone <- postResult{pts: pts, err: err}
+	}()
+	if err := store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		release()
+		t.Fatalf("wait for post to queue on channel state: %v", err)
+	}
+
+	type inviteResult struct {
+		added []int64
+		err   error
+	}
+	inviteDone := make(chan inviteResult, 1)
+	go func() {
+		added, err := s.AddChannelMembers(ctx, ch.ID, creator.ID, []int64{target.ID})
+		inviteDone <- inviteResult{added: added, err: err}
+	}()
+	if err := store.WaitForLockWaiters(ctx, s, 2); err != nil {
+		release()
+		t.Fatalf("wait for invite to queue on channel state: %v", err)
+	}
+
+	release()
+	var posted postResult
+	select {
+	case posted = <-postDone:
+	case <-ctx.Done():
+		t.Fatalf("post did not finish: %v", ctx.Err())
+	}
+	var invited inviteResult
+	select {
+	case invited = <-inviteDone:
+	case <-ctx.Done():
+		t.Fatalf("invite did not finish: %v", ctx.Err())
+	}
+	if posted.err != nil {
+		t.Fatalf("post during invite: %v", posted.err)
+	}
+	if invited.err != nil {
+		t.Fatalf("invite during post: %v", invited.err)
+	}
+	if len(invited.added) != 1 || invited.added[0] != target.ID {
+		t.Fatalf("invite added %v, want target %d", invited.added, target.ID)
+	}
+	member, found, err := s.ChannelMemberOf(ctx, ch.ID, target.ID)
+	if err != nil || !found {
+		t.Fatalf("read invited member: found=%v err=%v", found, err)
+	}
+	if member.JoinPts != posted.pts {
+		t.Errorf("invited member join_pts = %d, want post pts %d", member.JoinPts, posted.pts)
+	}
+}
+
 func TestAddChannelMembersRechecksAdminAfterChannelLock(t *testing.T) {
 	t.Parallel()
 	s := open(t)

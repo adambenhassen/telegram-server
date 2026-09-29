@@ -632,13 +632,14 @@ func (q *Queries) IsChannelMember(ctx context.Context, arg IsChannelMemberParams
 }
 
 const lockChannel = `-- name: LockChannel :one
-SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable FROM channels WHERE id = $1 FOR UPDATE
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable FROM channels WHERE id = $1 FOR NO KEY UPDATE
 `
 
-// LockChannel takes the channels row lock that serialises the rights mutations:
-// the caller's and the target's participant rows are read under it and the write
-// lands under it, so a demotion cannot interleave with the promotion it revokes.
-// See the lock-order comment at the top of channels.go.
+// LockChannel serialises rights mutations while allowing FK key-share checks on
+// channels to proceed. In particular, an invite can hold channel_state while a
+// concurrent post inserts its channel_messages row without forming a lock cycle.
+// The caller's and target's participant rows are read under this lock, so a
+// demotion cannot interleave with the promotion it revokes. See channels.go.
 func (q *Queries) LockChannel(ctx context.Context, id int64) (Channel, error) {
 	row := q.db.QueryRow(ctx, lockChannel, id)
 	var i Channel
