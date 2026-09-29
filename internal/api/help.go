@@ -23,3 +23,31 @@ func (h *handlers) handleGetConfig(r *mtproto.Request) (bin.Encoder, error) {
 	cfg.Expires = int(now.Add(configTTL).Unix())
 	return &cfg, nil
 }
+
+func (h *handlers) registerHelpPolling(d *mtproto.Dispatcher) {
+	d.HandleFunc(tg.HelpGetTermsOfServiceUpdateRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) error {
+		if req.UserID == 0 || req.Provisional {
+			return h.handleUnknownGated(c, req)
+		}
+		var call tg.HelpGetTermsOfServiceUpdateRequest
+		if err := call.Decode(req.Buf); err != nil || req.Buf.Len() != 0 {
+			return c.SendErr(req, errMethodNotImpl)
+		}
+		return c.SendResult(req, &tg.HelpTermsOfServiceUpdateEmpty{
+			Expires: int(h.now().Add(configTTL).Unix()),
+		})
+	})
+
+	d.HandleFunc(tg.HelpGetPromoDataRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) error {
+		if req.UserID == 0 || req.Provisional {
+			return h.handleUnknownGated(c, req)
+		}
+		var call tg.HelpGetPromoDataRequest
+		if err := call.Decode(req.Buf); err != nil || req.Buf.Len() != 0 {
+			return c.SendErr(req, errMethodNotImpl)
+		}
+		return c.SendResult(req, &tg.HelpPromoDataEmpty{
+			Expires: int(h.now().Add(configTTL).Unix()),
+		})
+	})
+}
