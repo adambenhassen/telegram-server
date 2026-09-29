@@ -223,6 +223,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.HelpGetAppConfigRequestTypeID, h.handleGetAppConfig)
+	h.registerHelpPolling(d)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	registerWithConn(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
 	register(d, tg.AuthSignUpRequestTypeID, h.handleSignUp)
