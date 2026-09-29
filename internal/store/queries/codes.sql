@@ -46,6 +46,19 @@ UPDATE phone_codes SET code = ''
 WHERE code_hash = $1
   AND phone = $2;
 
+-- name: ConsumeCodeForUsername :execrows
+-- Marks a username signup code hash single-use and clears its handoff value.
+-- The guards make this a compare-and-swap against terminal code states, so a
+-- concurrent admission or expiry cannot be reported as a second success.
+UPDATE phone_codes
+SET consumed_at = now(), code = ''
+WHERE phone = $1
+  AND code_hash = $2
+  AND consumed_at IS NULL
+  AND expires_at >= now()
+  AND attempts < 3
+  AND code <> '';
+
 -- name: IncrementCodeAttempts :exec
 -- Scoped to the exact issued code by its hash so a concurrent resend (new hash)
 -- is never charged for a failed attempt against the old code.

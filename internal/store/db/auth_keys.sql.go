@@ -80,7 +80,7 @@ func (q *Queries) AuthKeysByUser(ctx context.Context, userID *int64) ([]AuthKey,
 }
 
 const bindAuthKeyUser = `-- name: BindAuthKeyUser :execrows
-UPDATE auth_keys SET user_id = $2 WHERE id = $1
+UPDATE auth_keys SET user_id = $2, pending_user_id = NULL WHERE id = $1
 `
 
 type BindAuthKeyUserParams struct {
@@ -107,12 +107,13 @@ func (q *Queries) DeleteAuthKey(ctx context.Context, id int64) error {
 
 const lockUnboundAuthKey = `-- name: LockUnboundAuthKey :one
 SELECT id FROM auth_keys
-WHERE id = $1 AND user_id IS NULL AND pending_user_id IS NULL
+WHERE id = $1 AND user_id IS NULL
 FOR UPDATE
 `
 
-// Locks the key admission will bind, rejecting keys already authorized or
-// carrying a pending password challenge.
+// Locks the key admission will bind, rejecting keys already authorized. A
+// pending password challenge is cleared by the same transaction when signup
+// binds the still-unbound key.
 func (q *Queries) LockUnboundAuthKey(ctx context.Context, id int64) (int64, error) {
 	row := q.db.QueryRow(ctx, lockUnboundAuthKey, id)
 	var id_2 int64
