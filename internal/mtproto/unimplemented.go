@@ -34,6 +34,9 @@ const (
 	// not-implemented line is emitted. Without it the log is the second thing
 	// the loop above costs, at a line and its attributes per call.
 	unimplementedLogInterval = 10 * time.Second
+	// unimplementedMethodLogLimit bounds how many method names one connection
+	// tracks independently. Names beyond the limit share the interval sampler.
+	unimplementedMethodLogLimit = 32
 )
 
 // UnimplementedVerdict is what one call to a method this server does not
@@ -68,10 +71,10 @@ type unimplementedBudget struct {
 	started time.Time
 	// calls counts what has been charged inside that window.
 	calls int
-	// log thins the line those calls produce. Per connection, like the counter
-	// above and for the same reason the pre-auth samplers are one per event: the
-	// operator needs the line that says this is happening, and a window shared
-	// across connections is a window one peer can spend on its own.
+	// methods gives the first distinct names on this connection their own
+	// interval sampler, so one method cannot hide another behind its first line.
+	methods map[string]*logSampler
+	// log samples names beyond methods' bounded tracking capacity.
 	log logSampler
 	// closeLineWritten is set once the connection-ending verdict has written
 	// its line. The close verdict is exempt from the interval gate, but a
@@ -100,9 +103,20 @@ func (b *unimplementedBudget) charge(now time.Time) UnimplementedVerdict {
 	}
 }
 
-// logAllow reports whether the line describing one such call may be emitted at
-// now and, when it may, how many it stands for.
-func (b *unimplementedBudget) logAllow(now time.Time) (int64, bool) {
+// logAllow reports whether the line describing method may be emitted at now
+// and, when it may, how many calls it stands for.
+func (b *unimplementedBudget) logAllow(method string, now time.Time) (int64, bool) {
+	if sampler, ok := b.methods[method]; ok {
+		return sampler.allow(now, unimplementedLogInterval)
+	}
+	if len(b.methods) < unimplementedMethodLogLimit {
+		if b.methods == nil {
+			b.methods = make(map[string]*logSampler, unimplementedMethodLogLimit)
+		}
+		sampler := &logSampler{}
+		b.methods[method] = sampler
+		return sampler.allow(now, unimplementedLogInterval)
+	}
 	return b.log.allow(now, unimplementedLogInterval)
 }
 
@@ -113,7 +127,13 @@ func (b *unimplementedBudget) logAllow(now time.Time) (int64, bool) {
 // nothing suppressed writes nothing: the last line already stood for every
 // call, and a zero-count line would be one the conn never owed.
 func (b *unimplementedBudget) logFlush(now time.Time) (int64, bool) {
-	return b.log.flush(now)
+	suppressed, owed := b.log.flush(now)
+	for _, sampler := range b.methods {
+		methodSuppressed, methodOwed := sampler.flush(now)
+		suppressed += methodSuppressed
+		owed = owed || methodOwed
+	}
+	return suppressed, owed
 }
 
 // logClose reports the suppressed count the connection-ending verdict's line
@@ -125,7 +145,7 @@ func (b *unimplementedBudget) logClose(now time.Time) (int64, bool) {
 	if b.closeLineWritten {
 		return 0, false
 	}
-	suppressed, _ := b.log.flush(now)
+	suppressed, _ := b.logFlush(now)
 	b.closeLineWritten = true
 	return suppressed, true
 }
@@ -142,10 +162,10 @@ func (c *Conn) ChargeUnimplemented() UnimplementedVerdict {
 	return c.unimplemented.charge(c.clock.Now())
 }
 
-// LogUnimplemented reports whether this connection's not-implemented line may
-// be emitted now and, when it may, how many lines it stands for.
-func (c *Conn) LogUnimplemented() (int64, bool) {
-	return c.unimplemented.logAllow(c.clock.Now())
+// LogUnimplemented reports whether this connection's line for method may be
+// emitted now and, when it may, how many calls it stands for.
+func (c *Conn) LogUnimplemented(method string) (int64, bool) {
+	return c.unimplemented.logAllow(method, c.clock.Now())
 }
 
 // LogUnimplementedClose reports the suppressed count the connection-ending
