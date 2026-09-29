@@ -482,6 +482,10 @@ func TestUsernameOpenSignUp(t *testing.T) {
 			t.Errorf("store close: %v", err)
 		}
 	})
+	pending, err := st.CreateUser(ctx, "+15551249999")
+	if err != nil {
+		t.Fatalf("create pending user: %v", err)
+	}
 
 	const dcID = 2
 	ln := mustListen(t, ctx, "127.0.0.1:0")
@@ -492,12 +496,33 @@ func TestUsernameOpenSignUp(t *testing.T) {
 	stop := bootServerWithRegMode(t, ctx, key, dcID, st, slog.Default(), ln, config.RegistrationOpen)
 	t.Cleanup(stop)
 
-	client := newUsernameClient(addr.Port, key, dcID, nil)
+	sess := &session.StorageMemory{}
+	client := newUsernameClient(addr.Port, key, dcID, sess)
 	if err := client.Run(ctx, func(ctx context.Context) error {
 		api := client.API()
 		hash, err := sendCodeUsername(ctx, api, "tester1")
 		if err != nil {
 			return fmt.Errorf("sendCode: %w", err)
+		}
+		sessionData, err := (&session.Loader{Storage: sess}).Load(ctx)
+		if err != nil {
+			return fmt.Errorf("load client session: %w", err)
+		}
+		if len(sessionData.AuthKeyID) != 8 {
+			return fmt.Errorf("client auth key id length = %d, want 8", len(sessionData.AuthKeyID))
+		}
+		var authKeyID [8]byte
+		copy(authKeyID[:], sessionData.AuthKeyID)
+		keyID := mtproto.AuthKeyIDInt64(authKeyID)
+		if err := st.SetPendingUser(ctx, keyID, pending.ID); err != nil {
+			return fmt.Errorf("stage pending challenge: %w", err)
+		}
+		staged, found, err := st.AuthKeyByID(ctx, keyID)
+		if err != nil {
+			return fmt.Errorf("inspect pending challenge: %w", err)
+		}
+		if !found || staged.UserID != 0 || staged.PendingUserID != pending.ID {
+			return fmt.Errorf("staged auth key = %#v found=%v, want pending user %d", staged, found, pending.ID)
 		}
 		resp, err := signInUsername(ctx, api, "tester1", hash, "")
 		if err != nil {

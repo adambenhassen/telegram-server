@@ -678,6 +678,146 @@ func TestSignUpRateLimitChargesBeforeIdentifierLookup(t *testing.T) {
 	}
 }
 
+func TestSignUpRateLimitVariantsReachSameThirdAttempt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+
+	known, err := s.CreateUsernameUser(ctx, "knownrate", "Known", "User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimUsername(ctx, known.ID, "knownrate"); err != nil {
+		t.Fatal(err)
+	}
+	knownHash, _, err := s.IssueCodeForUsername(ctx, "knownrate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownHash, _, err := s.IssueCodeForUsername(ctx, "unknownrate")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	limits := store.RateLimitConfig{Limit: 2, Window: time.Hour}
+	for _, tc := range []struct {
+		name      string
+		handle    string
+		hash      string
+		want      string
+		authKeyID [8]byte
+		addr      netip.Addr
+	}{
+		{
+			name:      "known-valid-hash",
+			handle:    "knownrate",
+			hash:      knownHash,
+			want:      "USERNAME_OCCUPIED",
+			authKeyID: [8]byte{0x40},
+			addr:      netip.MustParseAddr("10.0.0.40"),
+		},
+		{
+			name:      "known-invalid-hash",
+			handle:    "knownrate",
+			hash:      "invalid-known-rate",
+			want:      "PHONE_CODE_INVALID",
+			authKeyID: [8]byte{0x41},
+			addr:      netip.MustParseAddr("10.0.0.41"),
+		},
+		{
+			name:      "unknown-valid-hash",
+			handle:    "unknownrate",
+			hash:      unknownHash,
+			want:      "INVITE_HASH_INVALID",
+			authKeyID: [8]byte{0x42},
+			addr:      netip.MustParseAddr("10.0.0.42"),
+		},
+		{
+			name:      "unknown-invalid-hash",
+			handle:    "unknownrate",
+			hash:      "invalid-unknown-rate",
+			want:      "PHONE_CODE_INVALID",
+			authKeyID: [8]byte{0x43},
+			addr:      netip.MustParseAddr("10.0.0.43"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := s.SaveAuthKey(ctx, int64(tc.authKeyID[0]), make([]byte, 256)); err != nil {
+				t.Fatal(err)
+			}
+			request := &tg.AuthSignUpRequest{
+				PhoneNumber:   tc.handle,
+				PhoneCodeHash: tc.hash,
+				FirstName:     "Rate",
+			}
+			for attempt := 1; attempt <= 2; attempt++ {
+				if _, err := api.SignUpForTest(s, tc.authKeyID, tc.addr, limits, config.RegistrationInvite, request); signUpRPCMessage(err) != tc.want {
+					t.Fatalf("attempt %d: expected %s, got %v", attempt, tc.want, err)
+				}
+			}
+			if _, err := api.SignUpForTest(s, tc.authKeyID, tc.addr, limits, config.RegistrationInvite, request); !isFloodWait(err) {
+				t.Fatalf("third attempt: expected FLOOD_WAIT, got %v", err)
+			}
+		})
+	}
+}
+
+func TestSignUpClosedModesDoNotChargeEnabledRateLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	limits := store.RateLimitConfig{Limit: 1, Window: time.Hour}
+
+	for _, tc := range []struct {
+		name      string
+		mode      config.RegistrationMode
+		handle    string
+		authKeyID [8]byte
+		addr      netip.Addr
+	}{
+		{
+			name:      "closed",
+			mode:      config.RegistrationClosed,
+			handle:    "closedrate",
+			authKeyID: [8]byte{0x50},
+			addr:      netip.MustParseAddr("10.0.0.50"),
+		},
+		{
+			name:      "unknown",
+			mode:      config.RegistrationMode("unknown"),
+			handle:    "unknownmode",
+			authKeyID: [8]byte{0x51},
+			addr:      netip.MustParseAddr("10.0.0.51"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hash, _, err := s.IssueCodeForUsername(ctx, tc.handle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SaveAuthKey(ctx, int64(tc.authKeyID[0]), make([]byte, 256)); err != nil {
+				t.Fatal(err)
+			}
+			request := &tg.AuthSignUpRequest{
+				PhoneNumber:   tc.handle,
+				PhoneCodeHash: hash,
+				FirstName:     "Rate",
+			}
+			if _, err := api.SignUpForTest(s, tc.authKeyID, tc.addr, limits, tc.mode, request); signUpRPCMessage(err) != "INPUT_REQUEST_INVALID" {
+				t.Fatalf("%s registration: expected INPUT_REQUEST_INVALID, got %v", tc.mode, err)
+			}
+
+			res, err := api.SignUpForTest(s, tc.authKeyID, tc.addr, limits, config.RegistrationOpen, request)
+			if err != nil {
+				t.Fatalf("open registration after %s gate: %v", tc.mode, err)
+			}
+			if auth, ok := res.(*tg.AuthAuthorization); !ok || auth.User == nil {
+				t.Fatalf("open registration after %s gate result = %T, want authorization", tc.mode, res)
+			}
+		})
+	}
+}
+
 func TestSignUpClosedAndInviteRefuseWithoutStateChanges(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
