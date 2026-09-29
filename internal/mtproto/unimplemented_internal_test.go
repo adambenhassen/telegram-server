@@ -69,16 +69,16 @@ func TestUnimplementedBudgetSampledLogCountsSuppressed(t *testing.T) {
 	start := time.Now()
 	b := &unimplementedBudget{}
 
-	if suppressed, ok := b.logAllow(start); !ok || suppressed != 0 {
+	if suppressed, ok := b.logAllow("test", start); !ok || suppressed != 0 {
 		t.Fatalf("first line: (%d, %t), want (0, true)", suppressed, ok)
 	}
 	const burst = 300
 	for i := range burst {
-		if _, ok := b.logAllow(start.Add(time.Duration(i))); ok {
+		if _, ok := b.logAllow("test", start.Add(time.Duration(i))); ok {
 			t.Fatalf("line %d inside the interval was emitted", i)
 		}
 	}
-	suppressed, ok := b.logAllow(start.Add(unimplementedLogInterval))
+	suppressed, ok := b.logAllow("test", start.Add(unimplementedLogInterval))
 	if !ok {
 		t.Fatal("no line emitted once the interval elapsed")
 	}
