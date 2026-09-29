@@ -326,6 +326,11 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if err := st.RefreshCatalogSnapshot(ctx); err != nil {
+		// Catalog data is optional for the built-in English behavior. A failed
+		// refresh must not prevent the core server from starting.
+		log.Warn("language catalog refresh failed", "err", err)
+	}
 	log.Info("file assembly concurrency bound",
 		"limit", st.AssemblyConcurrencyLimit(),
 		"reserved_pool_connections", st.AssemblyPoolHeadroom())

@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"maps"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/catalog"
 	"github.com/adambenhassen/telegram-server/internal/keycrypt"
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
@@ -151,6 +153,11 @@ type Store struct {
 	assemblySlots    chan struct{}
 	assemblyLimit    int
 	assemblyHeadroom int
+
+	// catalogSnapshot is replaced only after a complete repeatable-read load
+	// validates every English pack. Readers never observe a partially loaded
+	// catalog and never need a database round trip.
+	catalogSnapshot atomic.Pointer[catalog.Snapshot]
 }
 
 // Sentinel errors returned by the login-code methods.
@@ -348,10 +355,9 @@ type queryRower interface {
 // version, turning a confusing runtime "column does not exist" into a clear
 // startup error.
 //
-// ponytail: presence-check of the newest migration's artifacts, not a version
-// table — pgtest applies raw SQL and has no Atlas revisions table to read. The
-// sentinels track the latest migration (server_administration) plus the ones
-// before it; update them when a migration adds new schema.
+// ponytail: presence-check of required migration artifacts, not a version
+// table — pgtest applies raw SQL and has no Atlas revisions table to read.
+// Update these sentinels when a migration adds required schema.
 //
 // Indexes count as schema here. A database that stops short of one, or carries
 // one left invalid by a failed concurrent build, still opens clean on every
@@ -359,7 +365,7 @@ type queryRower interface {
 // silently degrades to a per-row Seq Scan of messages — so either state is
 // exactly the un-migrated state this is here to refuse.
 func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
-	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload, hasMessageFileIdx, hasPartBlobKeyIdx, hasBlockedUsers, hasRegistrationInvites, hasRegistrationInviteLiveIdx, hasServerAdministration, hasFileSubtypeRights, hasValidatedFileSubtypeRights bool
+	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload, hasMessageFileIdx, hasPartBlobKeyIdx, hasBlockedUsers, hasRegistrationInvites, hasRegistrationInviteLiveIdx, hasServerAdministration, hasFileSubtypeRights, hasValidatedFileSubtypeRights, hasLanguageCatalog bool
 	err := q.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
@@ -406,12 +412,13 @@ func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
 	       EXISTS(SELECT 1 FROM pg_catalog.pg_constraint
 	              WHERE conrelid = to_regclass('public.files')
 	                AND conname = 'files_subtype_rights_valid'
-	                AND convalidated)`,
-	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload, &hasMessageFileIdx, &hasPartBlobKeyIdx, &hasBlockedUsers, &hasRegistrationInvites, &hasRegistrationInviteLiveIdx, &hasServerAdministration, &hasFileSubtypeRights, &hasValidatedFileSubtypeRights)
+	                AND convalidated),
+	       to_regclass('public.language_catalog_packs') IS NOT NULL`,
+	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload, &hasMessageFileIdx, &hasPartBlobKeyIdx, &hasBlockedUsers, &hasRegistrationInvites, &hasRegistrationInviteLiveIdx, &hasServerAdministration, &hasFileSubtypeRights, &hasValidatedFileSubtypeRights, &hasLanguageCatalog)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || hasPartPayload || !hasMessageFileIdx || !hasPartBlobKeyIdx || !hasBlockedUsers || !hasRegistrationInvites || !hasRegistrationInviteLiveIdx || !hasServerAdministration || !hasFileSubtypeRights || !hasValidatedFileSubtypeRights {
+	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || hasPartPayload || !hasMessageFileIdx || !hasPartBlobKeyIdx || !hasBlockedUsers || !hasRegistrationInvites || !hasRegistrationInviteLiveIdx || !hasServerAdministration || !hasFileSubtypeRights || !hasValidatedFileSubtypeRights || !hasLanguageCatalog {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil
