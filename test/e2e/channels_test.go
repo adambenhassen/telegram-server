@@ -1393,4 +1393,24 @@ func TestChannelsInviteToChannelPushesViewerChannelAndLivePosts(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("B timed out waiting for the post after direct invite: %v", ctx.Err())
 	}
+
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.ChannelsLeaveChannel(ctx, inputChannel(bUserID, chID))
+		return err
+	})
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:     peerChannel(aUserID, chID),
+			Message:  "post after removal",
+			RandomID: 9910002,
+		})
+		return err
+	})
+	noCtx, noCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	select {
+	case <-collB.newChannelMsg:
+		t.Error("B should not receive a channel post after leaving")
+	case <-noCtx.Done():
+	}
+	noCancel()
 }
