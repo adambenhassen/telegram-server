@@ -42,3 +42,17 @@ func CreateChatForTestWithLimits(s *store.Store, userID int64, rateLimit store.R
 
 // ChatTitle exposes the title guard for the external api_test package.
 var ChatTitle = chatTitle
+
+// GetChatsForTest encodes req and invokes handleGetChats for the caller.
+func GetChatsForTest(s *store.Store, userID int64, req *tg.MessagesGetChatsRequest) (bin.Encoder, error) {
+	return GetChatsForTestWithContext(context.Background(), s, userID, req)
+}
+
+// GetChatsForTestWithContext invokes handleGetChats with the supplied context.
+func GetChatsForTestWithContext(ctx context.Context, s *store.Store, userID int64, req *tg.MessagesGetChatsRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetChats(&mtproto.Request{Ctx: ctx, UserID: userID, Buf: &buf})
+}

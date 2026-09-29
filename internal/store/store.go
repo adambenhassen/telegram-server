@@ -82,6 +82,11 @@ type Store struct {
 	// commit membership changes between reads and verify snapshot consistency.
 	chatInfoSnapshotHook func()
 
+	// chatListInfoSnapshotHook is a test-only callback fired after the member-chat
+	// selection read and before its bounded participant-count read. It lets tests
+	// commit membership changes between reads and verify snapshot consistency.
+	chatListInfoSnapshotHook func([]int64)
+
 	// channelFullInfoSnapshotHook is a test-only callback fired after the
 	// channel and viewer membership are selected and before full-info hydration.
 	// It lets tests commit a removal or ban between those reads and verify that

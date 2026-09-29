@@ -341,8 +341,12 @@ func TestChatsRealtime(t *testing.T) {
 		if len(res.Chats) != 5 {
 			return fmt.Errorf("getChats entries = %d, want 5 positive unique ids", len(res.Chats))
 		}
-		if _, ok := res.Chats[0].(*tg.Chat); !ok {
+		memberChat, ok := res.Chats[0].(*tg.Chat)
+		if !ok {
 			return fmt.Errorf("member chat result = %T, want *tg.Chat", res.Chats[0])
+		}
+		if memberChat.ParticipantsCount != 3 {
+			return fmt.Errorf("member chat participant count = %d, want 3 to match getFullChat", memberChat.ParticipantsCount)
 		}
 		for i, id := range []int64{otherChat.ID, absentChatID, dUserID, channel.ID} {
 			forbidden, ok := res.Chats[i+1].(*tg.ChatForbidden)
@@ -383,7 +387,7 @@ func TestChatsRealtime(t *testing.T) {
 		return nil
 	})
 	var overCapReachedStore bool
-	store.SetChatInfoSnapshotHook(st, func() { overCapReachedStore = true })
+	store.SetChatListInfoSnapshotHook(st, func([]int64) { overCapReachedStore = true })
 	assertChannelRPCError(t, ctx, aCmds, "LIMIT_INVALID", func(ctx context.Context, c *tg.Client) error {
 		tooMany := make([]int64, 101)
 		for i := range tooMany {
@@ -392,7 +396,7 @@ func TestChatsRealtime(t *testing.T) {
 		_, err := c.MessagesGetChats(ctx, tooMany)
 		return err
 	})
-	store.SetChatInfoSnapshotHook(st, nil)
+	store.SetChatListInfoSnapshotHook(st, nil)
 	if overCapReachedStore {
 		t.Fatal("oversized getChats request reached the store")
 	}
