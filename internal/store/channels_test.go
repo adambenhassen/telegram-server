@@ -977,6 +977,192 @@ func TestConcurrentJoinAndRevokeRevokeWins(t *testing.T) {
 	}
 }
 
+func TestAddChannelMembersPreservesExistingMembershipState(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551299961")
+	admin := mustUser(t, s, "+15551299962")
+	banned := mustUser(t, s, "+15551299963")
+	target := mustUser(t, s, "+15551299964")
+	ch := mustChannel(t, s, creator.ID, "Direct add")
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, creator.ID)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	for _, userID := range []int64{admin.ID, banned.ID} {
+		if _, _, err = s.JoinChannelByInvite(ctx, hash, userID); err != nil {
+			t.Fatalf("seed member %d: %v", userID, err)
+		}
+	}
+	if _, _, _, err = s.PostChannelMessageAs(ctx, ch.ID, creator.ID, "before add", 1, nil, 0); err != nil {
+		t.Fatalf("post before add: %v", err)
+	}
+	if err = s.SetChannelRole(ctx, ch.ID, creator.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	if err = s.SetChannelBan(ctx, ch.ID, creator.ID, banned.ID, nil, true); err != nil {
+		t.Fatalf("ban target: %v", err)
+	}
+	beforeBanned, found, err := s.ChannelMemberOf(ctx, ch.ID, banned.ID)
+	if err != nil || !found {
+		t.Fatalf("read banned member: found=%v err=%v", found, err)
+	}
+	beforeAdmin, found, err := s.ChannelMemberOf(ctx, ch.ID, admin.ID)
+	if err != nil || !found {
+		t.Fatalf("read admin: found=%v err=%v", found, err)
+	}
+
+	added, err := s.AddChannelMembers(ctx, ch.ID, admin.ID, []int64{admin.ID, banned.ID, target.ID})
+	if err != nil {
+		t.Fatalf("add channel members: %v", err)
+	}
+	if len(added) != 1 || added[0] != target.ID {
+		t.Fatalf("added = %v, want only new target %d", added, target.ID)
+	}
+	adminAfter, found, err := s.ChannelMemberOf(ctx, ch.ID, admin.ID)
+	if err != nil || !found || adminAfter.Role != beforeAdmin.Role || adminAfter.JoinPts != beforeAdmin.JoinPts {
+		t.Errorf("existing admin after invite = %+v, want %+v (found=%v err=%v)", adminAfter, beforeAdmin, found, err)
+	}
+	bannedAfter, found, err := s.ChannelMemberOf(ctx, ch.ID, banned.ID)
+	if err != nil || !found || bannedAfter.Role != beforeBanned.Role || bannedAfter.JoinPts != beforeBanned.JoinPts || !bannedAfter.Banned(time.Now()) {
+		t.Errorf("banned member after invite = %+v, want unchanged banned row %+v (found=%v err=%v)", bannedAfter, beforeBanned, found, err)
+	}
+	newMember, found, err := s.ChannelMemberOf(ctx, ch.ID, target.ID)
+	if err != nil || !found || newMember.Role != 0 || newMember.JoinPts != 1 || newMember.Banned(time.Now()) {
+		t.Errorf("new member = %+v, want role 0 at join_pts 1 (found=%v err=%v)", newMember, found, err)
+	}
+
+	added, err = s.AddChannelMembers(ctx, ch.ID, admin.ID, []int64{banned.ID, target.ID})
+	if err != nil || len(added) != 0 {
+		t.Errorf("repeated add = %v, %v; want no changes", added, err)
+	}
+	bannedAfter, found, err = s.ChannelMemberOf(ctx, ch.ID, banned.ID)
+	if err != nil || !found || !bannedAfter.Banned(time.Now()) {
+		t.Errorf("repeated add unbanned target: member=%+v found=%v err=%v", bannedAfter, found, err)
+	}
+}
+
+func TestAddChannelMembersEnforcesAccountCapAtAdmission(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creatorOne := mustUser(t, s, "+15551299965")
+	creatorTwo := mustUser(t, s, "+15551299966")
+	target := mustUser(t, s, "+15551299967")
+	first := mustChannel(t, s, creatorOne.ID, "First")
+	second := mustChannel(t, s, creatorTwo.ID, "Second")
+	store.SetChannelCaps(s, 10000, 1)
+	hash, err := s.CreateChannelInvite(ctx, first.ID, creatorOne.ID)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if _, _, err = s.JoinChannelByInvite(ctx, hash, target.ID); err != nil {
+		t.Fatalf("seed target membership: %v", err)
+	}
+
+	added, err := s.AddChannelMembers(ctx, second.ID, creatorTwo.ID, []int64{target.ID})
+	if err != nil || len(added) != 0 {
+		t.Fatalf("add at account cap = %v, %v; want skipped without error", added, err)
+	}
+	if _, found, err := s.ChannelMemberOf(ctx, second.ID, target.ID); err != nil || found {
+		t.Errorf("target at account cap admitted: found=%v err=%v", found, err)
+	}
+}
+
+func TestConcurrentAddChannelMembersCannotOverfillChannel(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551299968")
+	first := mustUser(t, s, "+15551299969")
+	second := mustUser(t, s, "+15551299970")
+	ch := mustChannel(t, s, creator.ID, "Capacity")
+	store.SetChannelCaps(s, 2, 500)
+
+	var wg sync.WaitGroup
+	results := make([][]int64, 2)
+	errs := make([]error, 2)
+	for i, targetID := range []int64{first.ID, second.ID} {
+		wg.Go(func() {
+			results[i], errs[i] = s.AddChannelMembers(ctx, ch.ID, creator.ID, []int64{targetID})
+		})
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("invite %d: %v", i, err)
+		}
+	}
+	added := len(results[0]) + len(results[1])
+	if added != 1 {
+		t.Fatalf("concurrent invites added %d targets, want 1: %v", added, results)
+	}
+	members, err := s.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		t.Fatalf("read members: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("participants after concurrent invites = %d, want 2", len(members))
+	}
+}
+
+func TestAddChannelMembersRechecksAdminAfterChannelLock(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551299971")
+	admin := mustUser(t, s, "+15551299972")
+	target := mustUser(t, s, "+15551299973")
+	ch := mustChannel(t, s, creator.ID, "Demotion")
+	hash, err := s.CreateChannelInvite(ctx, ch.ID, creator.ID)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if _, _, err = s.JoinChannelByInvite(ctx, hash, admin.ID); err != nil {
+		t.Fatalf("seed admin member: %v", err)
+	}
+	if err = s.SetChannelRole(ctx, ch.ID, creator.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+
+	release, err := store.HoldChannelRowLock(ctx, s, ch.ID)
+	if err != nil {
+		t.Fatalf("hold channel lock: %v", err)
+	}
+	var demoteErr, inviteErr error
+	demoteDone := make(chan struct{})
+	go func() {
+		demoteErr = s.SetChannelRole(ctx, ch.ID, creator.ID, admin.ID, 0)
+		close(demoteDone)
+	}()
+	if err = store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		release()
+		t.Fatalf("wait for demotion: %v", err)
+	}
+	inviteDone := make(chan struct{})
+	go func() {
+		_, inviteErr = s.AddChannelMembers(ctx, ch.ID, admin.ID, []int64{target.ID})
+		close(inviteDone)
+	}()
+	if err = store.WaitForLockWaiters(ctx, s, 2); err != nil {
+		release()
+		t.Fatalf("wait for invite: %v", err)
+	}
+	release()
+	<-demoteDone
+	<-inviteDone
+	if demoteErr != nil {
+		t.Fatalf("demotion: %v", demoteErr)
+	}
+	if !errors.Is(inviteErr, store.ErrNotMember) {
+		t.Fatalf("invite after committed demotion = %v, want ErrNotMember", inviteErr)
+	}
+	if _, found, err := s.ChannelMemberOf(ctx, ch.ID, target.ID); err != nil || found {
+		t.Errorf("demoted caller admitted target: found=%v err=%v", found, err)
+	}
+}
+
 // TestSetChannelPinnedMessageRejectsDemotedAdmin proves the TOCTOU fix: an admin
 // who passes the handler-level role check but is demoted to role 0 before the
 // store's write transaction commits is still refused.

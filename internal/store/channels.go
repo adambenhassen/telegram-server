@@ -25,9 +25,10 @@ import (
 // neither — the channel does not exist yet.
 //
 // The rights mutations — SetChannelRole, SetChannelBan and LeaveChannel — take
-// the channels row lock instead (LockChannel), first and held to commit, and
-// take nothing else. Nothing anywhere takes the channel_state row and then the
-// channels row, or the reverse, so the two cannot form a cycle. The invite row
+// the channels row lock (LockChannel), first and held to commit. AddChannelMembers
+// takes that row first to re-check the caller's role, then channel_state to
+// serialize admission and record join_pts. PostChannelMessage takes only
+// channel_state, so no path takes both rows in reverse order. The invite row
 // lock is never taken alongside the channels row lock, so it cannot cycle either.
 //
 // EditChannelUsername takes an advisory lock (pg_advisory_xact_lock on channelID)
@@ -505,6 +506,116 @@ func (s *Store) JoinChannelByInvite(ctx context.Context, hash string, userID int
 		return Channel{}, ChannelMember{}, fmt.Errorf("commit: %w", err)
 	}
 	return channelFromRow(channel), channelMemberFromRow(member), nil
+}
+
+// AddChannelMembers directly admits targets to channelID when callerID is a
+// non-banned admin or creator. Existing rows are no-ops, including banned rows:
+// the operation never changes a role, clears a ban, or resets join_pts. Targets
+// that are already present or at either admission cap are silently skipped; the
+// returned ids name only rows this call inserted.
+//
+// Lock order is the existing rights-mutation channel row first, then the
+// channel_state row used by joins. The role is read again after LockChannel, so
+// a demotion that commits first denies this operation. channel_state serializes
+// this channel's participant count and supplies the same pts all new rows use.
+func (s *Store) AddChannelMembers(ctx context.Context, channelID, callerID int64, targetIDs []int64) ([]int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	member, err := qtx.IsChannelMember(ctx, db.IsChannelMemberParams{ChannelID: channelID, UserID: callerID})
+	if err != nil {
+		return nil, fmt.Errorf("is channel member: %w", err)
+	}
+	if !member {
+		return nil, ErrNotMember
+	}
+
+	_, err = qtx.LockChannel(ctx, channelID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotMember
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock channel: %w", err)
+	}
+	callerRow, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID, UserID: callerID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotMember
+	}
+	if err != nil {
+		return nil, fmt.Errorf("caller participant: %w", err)
+	}
+	caller := channelMemberFromRow(callerRow)
+	if caller.Role < channelRoleAdmin || caller.Banned(time.Now()) {
+		return nil, ErrNotMember
+	}
+
+	state, err := qtx.ChannelStateForUpdate(ctx, channelID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotMember
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock channel state: %w", err)
+	}
+	seats, err := qtx.CountChannelParticipants(ctx, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("count participants: %w", err)
+	}
+
+	added := make([]int64, 0, len(targetIDs))
+	seen := make(map[int64]bool, len(targetIDs))
+	for _, targetID := range targetIDs {
+		if targetID <= 0 {
+			return nil, ErrNotMember
+		}
+		if seen[targetID] {
+			continue
+		}
+		seen[targetID] = true
+
+		_, err = qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+			ChannelID: channelID, UserID: targetID,
+		})
+		switch {
+		case err == nil:
+			continue
+		case !errors.Is(err, pgx.ErrNoRows):
+			return nil, fmt.Errorf("target participant: %w", err)
+		}
+		if seats >= int64(s.maxChannelParticipants) {
+			continue
+		}
+
+		joined, err := qtx.CountChannelsForUser(ctx, targetID)
+		if err != nil {
+			return nil, fmt.Errorf("count channels for target: %w", err)
+		}
+		if joined >= int64(s.maxChannelsPerUser) {
+			continue
+		}
+
+		n, err := qtx.InsertChannelParticipantIfAbsent(ctx, db.InsertChannelParticipantIfAbsentParams{
+			ChannelID: channelID, UserID: targetID, Role: channelRoleMember, JoinPts: state.Pts,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("insert participant: %w", err)
+		}
+		if n == 0 {
+			continue
+		}
+		added = append(added, targetID)
+		seats++
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return added, nil
 }
 
 // beginChannelMutation opens the transaction SetChannelRole and SetChannelBan

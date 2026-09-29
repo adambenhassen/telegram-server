@@ -103,6 +103,27 @@ func EditBannedForTest(s *store.Store, userID int64, req *tg.ChannelsEditBannedR
 	return testHandlers(s).handleEditBanned(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// InviteToChannelForTest encodes req and invokes handleInviteToChannel.
+func InviteToChannelForTest(s *store.Store, userID int64, req *tg.ChannelsInviteToChannelRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleInviteToChannel(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// InviteToChannelForTestWithLimits invokes handleInviteToChannel with the
+// account's add-user budget set to rateLimit.
+func InviteToChannelForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.ChannelsInviteToChannelRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	h := testHandlers(s)
+	h.rateLimitAddChatUser = rateLimit
+	return h.handleInviteToChannel(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // GetChannelDifferenceForTest encodes req and invokes handleGetChannelDifference
 // for the caller.
 func GetChannelDifferenceForTest(s *store.Store, userID int64, req *tg.UpdatesGetChannelDifferenceRequest) (bin.Encoder, error) {

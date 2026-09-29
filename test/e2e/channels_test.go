@@ -1258,3 +1258,139 @@ func TestChannelsCrossReplica(t *testing.T) {
 		t.Errorf("client B run: %v", err)
 	}
 }
+
+func TestChannelsInviteToChannelPushesViewerChannelAndLivePosts(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := st.Close(); cerr != nil {
+			t.Errorf("store close: %v", cerr)
+		}
+	})
+
+	const dcID = 2
+	codes := newMultiCodeSink()
+	ln := mustListen(t, ctx, "127.0.0.1:0")
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr type = %T", ln.Addr())
+	}
+	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	t.Cleanup(stop)
+
+	const phoneA, phoneB = "+15551299981", "+15551299982"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
+
+	collB := newUpdateCollector()
+	aCmds, bCmds := make(chan command), make(chan command)
+	aID, bID := make(chan int64, 1), make(chan int64, 1)
+	errA, errB := make(chan error, 1), make(chan error, 1)
+	go func() {
+		errA <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneA, codes), aID, aCmds)
+	}()
+	go func() {
+		errB <- runInteractive(ctx, createClient(addr.Port, key, dcID, collB, nil), flowFor(phoneB, codes), bID, bCmds)
+	}()
+	defer func() {
+		close(aCmds)
+		close(bCmds)
+		if err := <-errA; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("client A run: %v", err)
+		}
+		if err := <-errB; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("client B run: %v", err)
+		}
+	}()
+
+	login := func(ch chan int64, who string) int64 {
+		select {
+		case id := <-ch:
+			return id
+		case <-ctx.Done():
+			t.Fatalf("%s login timeout", who)
+			return 0
+		}
+	}
+	aUserID := login(aID, "A")
+	bUserID := login(bID, "B")
+	chID := createBroadcastChannel(t, ctx, aCmds, "Direct invite")
+
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.ChannelsInviteToChannel(ctx, &tg.ChannelsInviteToChannelRequest{
+			Channel: inputChannel(aUserID, chID),
+			Users:   []tg.InputUserClass{inputUser(aUserID, bUserID)},
+		})
+		if err != nil {
+			return err
+		}
+		if res == nil || res.Updates == nil {
+			return errors.New("inviteToChannel response omitted updates")
+		}
+		return nil
+	})
+
+	var bChannel *tg.Channel
+	select {
+	case update := <-collB.channelUpdate:
+		if update.Update.ChannelID != chID {
+			t.Fatalf("B channel update id = %d, want %d", update.Update.ChannelID, chID)
+		}
+		for _, chat := range update.Chats {
+			if ch, ok := chat.(*tg.Channel); ok && ch.ID == chID {
+				bChannel = ch
+			}
+		}
+		if bChannel == nil {
+			t.Fatalf("B channel update omitted channel %d in its viewer context", chID)
+		}
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for its invited channel update: %v", ctx.Err())
+	}
+
+	// The hash carried by B's update must be B's own hash: it works for B's
+	// getChannels request while A's per-viewer hash does not.
+	if bChannel.AccessHash == peerChannel(aUserID, chID).AccessHash {
+		t.Fatal("B received A's channel access hash")
+	}
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.ChannelsGetChannels(ctx, []tg.InputChannelClass{&tg.InputChannel{
+			ChannelID: chID, AccessHash: bChannel.AccessHash,
+		}})
+		if err != nil {
+			return err
+		}
+		chats, ok := res.(*tg.MessagesChats)
+		if !ok || !hasChannel(chats.Chats, chID) {
+			return fmt.Errorf("B getChannels response = %T, channel %d missing", res, chID)
+		}
+		return nil
+	})
+
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:     peerChannel(aUserID, chID),
+			Message:  "direct invite live post",
+			RandomID: 9910001,
+		})
+		return err
+	})
+	select {
+	case update := <-collB.newChannelMsg:
+		if update.Msg.Message != "direct invite live post" || update.Pts != 1 {
+			t.Fatalf("B channel post = %q at pts %d, want expected message at pts 1", update.Msg.Message, update.Pts)
+		}
+	case <-ctx.Done():
+		t.Fatalf("B timed out waiting for the post after direct invite: %v", ctx.Err())
+	}
+}
