@@ -21,8 +21,7 @@ func FloodWaitError(seconds int) *tgerr.Error {
 }
 
 var (
-	// errInputRequestInvalid is the boundary refusal for auth.signUp when
-	// registration is closed or the configured mode is unknown.
+	// errInputRequestInvalid rejects a request that cannot be handled as sent.
 	errInputRequestInvalid = rpcErr(400, "INPUT_REQUEST_INVALID")
 	errPhoneInvalid        = rpcErr(400, "PHONE_NUMBER_INVALID")
 	errCodeInvalid         = rpcErr(400, "PHONE_CODE_INVALID")
