@@ -413,7 +413,16 @@ func TestConcurrentSignUpWithOneInviteHasExactlyOneWinner(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Errorf("close inspection connection: %v", err)
+		}
+	})
 
 	invite, secret, err := s.IssueInvite(ctx, "racing")
 	if err != nil {
@@ -438,6 +447,22 @@ func TestConcurrentSignUpWithOneInviteHasExactlyOneWinner(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	readAdmissionState := func() (users, usernameClaims, updateStates, administrators, boundKeys, pendingKeys int64) {
+		t.Helper()
+		if err := conn.QueryRow(ctx, `
+			SELECT
+				(SELECT count(*) FROM users),
+				(SELECT count(*) FROM usernames WHERE handle = 'racing'),
+				(SELECT count(*) FROM update_state),
+				(SELECT count(*) FROM server_administration WHERE administrator_user_id IS NOT NULL),
+				(SELECT count(*) FROM auth_keys WHERE user_id IS NOT NULL),
+				(SELECT count(*) FROM auth_keys WHERE pending_user_id IS NOT NULL)
+		`).Scan(&users, &usernameClaims, &updateStates, &administrators, &boundKeys, &pendingKeys); err != nil {
+			t.Fatalf("read concurrent admission state: %v", err)
+		}
+		return
+	}
+	beforeUsers, beforeClaims, beforeUpdateStates, beforeAdministrators, beforeBoundKeys, beforePendingKeys := readAdmissionState()
 	results := make([]error, attempts)
 	ready := make(chan struct{})
 	var readyWG sync.WaitGroup
@@ -460,20 +485,46 @@ func TestConcurrentSignUpWithOneInviteHasExactlyOneWinner(t *testing.T) {
 	close(ready)
 	wg.Wait()
 
-	var successes, invalids int
+	var successes, losers int
 	for i, err := range results {
 		switch {
 		case err == nil:
 			successes++
 		case signUpRPCMessage(err) == "INVITE_HASH_INVALID",
-			signUpRPCMessage(err) == "PHONE_CODE_INVALID":
-			invalids++
+			signUpRPCMessage(err) == "PHONE_CODE_INVALID",
+			signUpRPCMessage(err) == "USERNAME_OCCUPIED":
+			losers++
 		default:
 			t.Errorf("attempt %d: unexpected error: %v", i, err)
 		}
 	}
-	if successes != 1 || invalids != attempts-1 {
-		t.Fatalf("signUp results: successes=%d invalids=%d, want 1/%d", successes, invalids, attempts-1)
+	if successes != 1 || losers != attempts-1 {
+		t.Fatalf("signUp results: successes=%d losers=%d, want 1/%d", successes, losers, attempts-1)
+	}
+	afterUsers, afterClaims, afterUpdateStates, afterAdministrators, afterBoundKeys, afterPendingKeys := readAdmissionState()
+	if afterUsers != beforeUsers+1 || afterClaims != beforeClaims+1 || afterUpdateStates != beforeUpdateStates+1 || afterAdministrators != beforeAdministrators+1 || afterBoundKeys != beforeBoundKeys+1 || afterPendingKeys != beforePendingKeys {
+		t.Fatalf("same-invite admission state changed by more than winner: users %d/%d claims %d/%d update_states %d/%d administrators %d/%d bound_keys %d/%d pending_keys %d/%d", afterUsers, beforeUsers+1, afterClaims, beforeClaims+1, afterUpdateStates, beforeUpdateStates+1, afterAdministrators, beforeAdministrators+1, afterBoundKeys, beforeBoundKeys+1, afterPendingKeys, beforePendingKeys)
+	}
+	resolved, found, err := s.UserByUsernameWithLoginMode(ctx, "racing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || resolved.LoginMode != "username" {
+		t.Fatalf("racing handle = %#v found=%v, want one username-mode winner", resolved, found)
+	}
+	var administratorID int64
+	if err := conn.QueryRow(ctx, `SELECT administrator_user_id FROM server_administration WHERE singleton_id = 1`).Scan(&administratorID); err != nil {
+		t.Fatalf("read race administrator: %v", err)
+	}
+	if administratorID != resolved.ID {
+		t.Fatalf("administrator user = %d, want sole admitted user %d", administratorID, resolved.ID)
+	}
+	var codeConsumed bool
+	if err := conn.QueryRow(ctx, `SELECT consumed_at IS NOT NULL FROM phone_codes WHERE phone = 'racing'`).Scan(&codeConsumed); err != nil {
+		t.Fatalf("read race code state: %v", err)
+	}
+	if !codeConsumed {
+		t.Fatal("winning admission did not consume the sign-up code")
 	}
 	invites, err := s.ListInvites(ctx)
 	if err != nil {
