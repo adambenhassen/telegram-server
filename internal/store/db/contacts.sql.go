@@ -57,6 +57,25 @@ func (q *Queries) DeleteContact(ctx context.Context, arg DeleteContactParams) (i
 	return result.RowsAffected(), nil
 }
 
+const deleteContacts = `-- name: DeleteContacts :execrows
+DELETE FROM user_contacts
+WHERE owner_id = $1
+  AND contact_id = ANY($2::bigint[])
+`
+
+type DeleteContactsParams struct {
+	OwnerID    int64
+	ContactIds []int64
+}
+
+func (q *Queries) DeleteContacts(ctx context.Context, arg DeleteContactsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteContacts, arg.OwnerID, arg.ContactIds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const insertContact = `-- name: InsertContact :execrows
 INSERT INTO user_contacts (owner_id, contact_id)
 VALUES ($1, $2)

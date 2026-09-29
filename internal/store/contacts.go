@@ -106,6 +106,56 @@ func (s *Store) RemoveContact(ctx context.Context, ownerID, contactID int64) (ch
 	return n > 0, nil
 }
 
+// RemoveContacts deletes an owner's selected contact edges in one transaction.
+// The entire id set is validated before the transaction can mutate anything.
+func (s *Store) RemoveContacts(ctx context.Context, ownerID int64, contactIDs []int64) (changed bool, err error) {
+	if ownerID <= 0 {
+		return false, ErrInvalidContact
+	}
+	for _, contactID := range contactIDs {
+		if !validContactIDs(ownerID, contactID) {
+			return false, ErrInvalidContact
+		}
+	}
+	if len(contactIDs) == 0 {
+		return false, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	if err := lockOwners(ctx, tx, ownerID); err != nil {
+		return false, err
+	}
+	n, err := s.q.WithTx(tx).DeleteContacts(ctx, db.DeleteContactsParams{
+		OwnerID:    ownerID,
+		ContactIds: contactIDs,
+	})
+	if err != nil {
+		return false, fmt.Errorf("delete contacts: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return n > 0, nil
+}
+
+// IsContact reports whether ownerID has a directed edge to contactID.
+func (s *Store) IsContact(ctx context.Context, ownerID, contactID int64) (bool, error) {
+	if !validContactIDs(ownerID, contactID) {
+		return false, ErrInvalidContact
+	}
+	exists, err := s.q.ContactExists(ctx, db.ContactExistsParams{
+		OwnerID:   ownerID,
+		ContactID: contactID,
+	})
+	if err != nil {
+		return false, fmt.Errorf("check contact: %w", err)
+	}
+	return exists, nil
+}
+
 // Contacts returns an owner's contacts in contact-id order and the same
 // statement's total. Mutual state is derived from each contact's reverse edge.
 func (s *Store) Contacts(ctx context.Context, ownerID int64) ([]Contact, int, error) {

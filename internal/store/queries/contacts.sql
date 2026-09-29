@@ -16,6 +16,11 @@ ON CONFLICT (owner_id, contact_id) DO NOTHING;
 DELETE FROM user_contacts
 WHERE owner_id = $1 AND contact_id = $2;
 
+-- name: DeleteContacts :execrows
+DELETE FROM user_contacts
+WHERE owner_id = sqlc.arg(owner_id)
+  AND contact_id = ANY(sqlc.arg(contact_ids)::bigint[]);
+
 -- name: ListContacts :many
 SELECT uc.contact_id,
        EXISTS (
