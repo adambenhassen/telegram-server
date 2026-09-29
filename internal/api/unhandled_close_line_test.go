@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/tg"
+
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
@@ -218,6 +220,60 @@ func TestUnhandledCloseLineCarriesThePendingCount(t *testing.T) {
 	conn.FlushUnimplementedLog()
 	if n := len(h.records); n != 2 {
 		t.Fatalf("captured %d records after the drop, want the two lines and nothing more", n)
+	}
+}
+
+// TestUnhandledCloseLineAggregatesMethodSuppression pins the close line's
+// count across distinct method samplers. Each method gets its own first line;
+// the close line must then carry every repeated call that both samplers held.
+func TestUnhandledCloseLineAggregatesMethodSuppression(t *testing.T) {
+	t.Parallel()
+	h := &captureHandler{}
+	log := slog.New(h)
+	cl := &testClock{now: time.Now()}
+	conn := unhandledConn()
+	conn.SetClock(cl)
+	conn.SetLog(log)
+	register := registerDeviceBody(t)
+	invite := encodedUnhandledBody(t, &tg.MessagesImportChatInviteRequest{Hash: "private-invite-marker"})
+
+	for i := 1; i <= 256; i++ {
+		body := invite
+		if i%2 == 0 {
+			body = register
+		}
+		if err := api.UnhandledForTest(log, conn, body); err == nil {
+			t.Fatalf("call %d: answered with no error", i)
+		}
+	}
+
+	if n := len(h.records); n != 3 {
+		t.Fatalf("emitted %d lines, want one per method and the connection-ending line", n)
+	}
+	for i, want := range []string{
+		"messages.importChatInvite#de91436e",
+		"account.registerDevice#ec86017a",
+	} {
+		got := attrs(h.records[i])
+		if got["method"] != want {
+			t.Errorf("sample %d method = %q, want %q", i, got["method"], want)
+		}
+		if got["suppressed"] != "0" {
+			t.Errorf("sample %d suppressed = %q, want 0", i, got["suppressed"])
+		}
+	}
+	closeLine := attrs(h.records[2])
+	wantCloseLine(t, closeLine)
+	if got := closeLine["suppressed"]; got != "253" {
+		t.Errorf("close line suppressed = %q, want 253 across both method samplers", got)
+	}
+
+	// The close line consumes both samplers' pending counts, so the drop has no
+	// extra summary to write.
+	cl.Advance(11 * time.Second)
+	conn.FlushUnimplementedLog()
+	if n := len(h.records); n != 3 {
+		t.Fatalf("captured %d records after the drop, want no duplicate summary", n)
 	}
 }
 
