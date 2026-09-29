@@ -98,6 +98,49 @@ func (q *Queries) ChatParticipants(ctx context.Context, chatID int64) ([]ChatPar
 	return items, nil
 }
 
+const chatsByIDsForMember = `-- name: ChatsByIDsForMember :many
+SELECT c.id, c.title, c.creator_id, c.version, c.date, c.pinned_message_id FROM chats c
+JOIN chat_participants p ON p.chat_id = c.id
+WHERE p.user_id = $1::bigint
+  AND c.id = ANY($2::bigint[])
+ORDER BY c.id
+`
+
+type ChatsByIDsForMemberParams struct {
+	UserID  int64
+	ChatIds []int64
+}
+
+// A missing chat and a chat without a membership row for the viewer both
+// produce no result. Keep the read on the basic-chat tables so equal numeric
+// ids in users or channels cannot resolve to those peer types.
+func (q *Queries) ChatsByIDsForMember(ctx context.Context, arg ChatsByIDsForMemberParams) ([]Chat, error) {
+	rows, err := q.db.Query(ctx, chatsByIDsForMember, arg.UserID, arg.ChatIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Chat
+	for rows.Next() {
+		var i Chat
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.CreatorID,
+			&i.Version,
+			&i.Date,
+			&i.PinnedMessageID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const chatsForUser = `-- name: ChatsForUser :many
 SELECT c.id, c.title, c.creator_id, c.version, c.date, c.pinned_message_id FROM chats c
 JOIN chat_participants p ON p.chat_id = c.id

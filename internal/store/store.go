@@ -77,6 +77,11 @@ type Store struct {
 	// change before selection and hydration use the snapshot.
 	peerDialogsSnapshotHook func()
 
+	// chatInfoSnapshotHook is a test-only callback fired after the member-chat
+	// selection read and before participant/profile hydration. It lets tests
+	// commit membership changes between reads and verify snapshot consistency.
+	chatInfoSnapshotHook func()
+
 	// eraseHook is a test-only callback fired in SweepMediaErasure between the
 	// scan that names a candidate and the transaction that erases it, carrying
 	// the file id. That gap is where every race this pass has to survive lands —
