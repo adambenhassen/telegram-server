@@ -37,6 +37,26 @@ SELECT * FROM channel_participants WHERE channel_id = $1 ORDER BY user_id;
 -- name: ChannelParticipantByUser :one
 SELECT * FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
 
+-- ChannelFullInfoStats is read in the same repeatable-read transaction as the
+-- channel and viewer membership. The public participant count keeps the
+-- existing row-count meaning used by the public channel renderer; administrative
+-- counts include only current admins and bans.
+-- name: ChannelFullInfoStats :one
+SELECT
+    count(*)::bigint AS participants_count,
+    count(*) FILTER (WHERE role >= 1 AND (banned_until IS NULL OR banned_until <= now()))::bigint AS admins_count,
+    count(*) FILTER (WHERE banned_until > now())::bigint AS banned_count
+FROM channel_participants
+WHERE channel_id = $1;
+
+-- ChannelActiveInviteByChannel returns one existing active invite for a full
+-- info response. It is read-only; getFullChannel never creates or rotates one.
+-- name: ChannelActiveInviteByChannel :one
+SELECT * FROM channel_invites
+WHERE channel_id = $1 AND revoked_at IS NULL
+ORDER BY date DESC, hash DESC
+LIMIT 1;
+
 -- ChannelParticipantsForViewer answers "which of these channels is this caller
 -- in" in one query, for a caller-supplied set bounded by a page. It returns the
 -- whole participant row rather than a boolean so the ban stays ChannelMember's

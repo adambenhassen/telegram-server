@@ -11,6 +11,28 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const channelActiveInviteByChannel = `-- name: ChannelActiveInviteByChannel :one
+SELECT hash, channel_id, creator_id, date, revoked_at FROM channel_invites
+WHERE channel_id = $1 AND revoked_at IS NULL
+ORDER BY date DESC, hash DESC
+LIMIT 1
+`
+
+// ChannelActiveInviteByChannel returns one existing active invite for a full
+// info response. It is read-only; getFullChannel never creates or rotates one.
+func (q *Queries) ChannelActiveInviteByChannel(ctx context.Context, channelID int64) (ChannelInvite, error) {
+	row := q.db.QueryRow(ctx, channelActiveInviteByChannel, channelID)
+	var i ChannelInvite
+	err := row.Scan(
+		&i.Hash,
+		&i.ChannelID,
+		&i.CreatorID,
+		&i.Date,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
 const channelByID = `-- name: ChannelByID :one
 SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable FROM channels WHERE id = $1
 `
@@ -137,6 +159,32 @@ func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Ch
 		return nil, err
 	}
 	return items, nil
+}
+
+const channelFullInfoStats = `-- name: ChannelFullInfoStats :one
+SELECT
+    count(*)::bigint AS participants_count,
+    count(*) FILTER (WHERE role >= 1 AND (banned_until IS NULL OR banned_until <= now()))::bigint AS admins_count,
+    count(*) FILTER (WHERE banned_until > now())::bigint AS banned_count
+FROM channel_participants
+WHERE channel_id = $1
+`
+
+type ChannelFullInfoStatsRow struct {
+	ParticipantsCount int64
+	AdminsCount       int64
+	BannedCount       int64
+}
+
+// ChannelFullInfoStats is read in the same repeatable-read transaction as the
+// channel and viewer membership. The public participant count keeps the
+// existing row-count meaning used by the public channel renderer; administrative
+// counts include only current admins and bans.
+func (q *Queries) ChannelFullInfoStats(ctx context.Context, channelID int64) (ChannelFullInfoStatsRow, error) {
+	row := q.db.QueryRow(ctx, channelFullInfoStats, channelID)
+	var i ChannelFullInfoStatsRow
+	err := row.Scan(&i.ParticipantsCount, &i.AdminsCount, &i.BannedCount)
+	return i, err
 }
 
 const channelInviteByHash = `-- name: ChannelInviteByHash :one

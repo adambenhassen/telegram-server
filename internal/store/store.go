@@ -82,6 +82,12 @@ type Store struct {
 	// commit membership changes between reads and verify snapshot consistency.
 	chatInfoSnapshotHook func()
 
+	// channelFullInfoSnapshotHook is a test-only callback fired after the
+	// channel and viewer membership are selected and before full-info hydration.
+	// It lets tests commit a removal or ban between those reads and verify that
+	// the reply still uses one database snapshot.
+	channelFullInfoSnapshotHook func()
+
 	// eraseHook is a test-only callback fired in SweepMediaErasure between the
 	// scan that names a candidate and the transaction that erases it, carrying
 	// the file id. That gap is where every race this pass has to survive lands —
