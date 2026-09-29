@@ -123,6 +123,11 @@ func (h *handlers) handleContactsGetBlocked(r *mtproto.Request) (bin.Encoder, er
 		h.log.Error("get blocked users", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	contactStates, err := h.contactStatesForUsers(r.Ctx, r.UserID, ids)
+	if err != nil {
+		h.log.Error("get blocked users: contact state", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
 
 	blockedPeers := make([]tg.PeerBlocked, 0, len(page.Users))
 	blockedUsers := make([]tg.UserClass, 0, len(page.Users))
@@ -138,7 +143,7 @@ func (h *handlers) handleContactsGetBlocked(r *mtproto.Request) (bin.Encoder, er
 			PeerID: &tg.PeerUser{UserID: entry.UserID},
 			Date:   int(entry.Date.Unix()),
 		})
-		blockedUsers = append(blockedUsers, h.userToTL(user, r.UserID, false))
+		blockedUsers = append(blockedUsers, h.userToTL(user, r.UserID, false, contactStates[entry.UserID]))
 	}
 
 	if offset == 0 && len(page.Users) == page.Total {

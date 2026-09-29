@@ -1328,7 +1328,12 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 			chats, err = h.loadChats(r.Ctx, map[int64]bool{destPeerID: true}, r.UserID, nil)
 		}
 	}
+	if err != nil {
+		h.log.Error("forward reply", "err", err)
+		return nil, errInternal
+	}
 	// Load extra user references from fwd heads that the send/load did not cover.
+	extraUsers := make([]store.User, 0, len(userRefs))
 	for uid := range userRefs {
 		if uid != r.UserID {
 			u, ok, uerr := h.store.UserByID(r.Ctx, uid)
@@ -1337,9 +1342,17 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 				return nil, errInternal
 			}
 			if ok {
-				users = append(users, h.userToTL(u, r.UserID, uid == r.UserID))
+				extraUsers = append(extraUsers, u)
 			}
 		}
+	}
+	wireExtraUsers, err := h.usersToTL(r.Ctx, extraUsers, r.UserID, false)
+	if err != nil {
+		h.log.Error("forward reply fwd user contact state", "err", err)
+		return nil, errInternal
+	}
+	for _, user := range wireExtraUsers {
+		users = append(users, user)
 	}
 	// Load basic chat references.
 	for chid := range basicChatRefs {
@@ -1378,11 +1391,6 @@ func (h *handlers) forwardReply(r *mtproto.Request, destPeerType store.PeerType,
 		}
 		chats = append(chats, channelTL...)
 	}
-	if err != nil {
-		h.log.Error("forward reply", "err", err)
-		return nil, errInternal
-	}
-
 	// Load files for forwarded messages.
 	msgs := make([]store.Message, len(sentMsgs))
 	for i, fm := range sentMsgs {

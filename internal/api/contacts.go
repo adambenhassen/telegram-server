@@ -52,20 +52,17 @@ func (h *handlers) handleAddContact(r *mtproto.Request) (bin.Encoder, error) {
 	if !ok {
 		return nil, errPeerIDInvalid
 	}
-	mutual, err := h.store.IsContact(r.Ctx, targetID, r.UserID)
+	wireUsers, err := h.usersToTL(r.Ctx, []store.User{target}, r.UserID, false)
 	if err != nil {
-		h.log.Error("add contact mutual state", "user_id", r.UserID, "err", err)
+		h.log.Error("add contact peer state", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	wireUser := h.userToTL(target, r.UserID, false)
-	wireUser.Contact = true
-	wireUser.MutualContact = mutual
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdatePeerSettings{
 			Peer:     &tg.PeerUser{UserID: targetID},
 			Settings: tg.PeerSettings{},
 		}},
-		Users: []tg.UserClass{wireUser},
+		Users: []tg.UserClass{wireUsers[0]},
 		Chats: []tg.ChatClass{},
 		Date:  int(time.Now().Unix()),
 	}, nil
@@ -101,10 +98,32 @@ func (h *handlers) handleDeleteContacts(r *mtproto.Request) (bin.Encoder, error)
 			ids = append(ids, targetID)
 		}
 	}
+	if len(ids) == 0 {
+		return noUpdates(), nil
+	}
+	usersByID, err := h.store.UsersByID(r.Ctx, ids)
+	if err != nil {
+		h.log.Error("delete contacts users", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	for _, id := range ids {
+		if _, ok := usersByID[id]; !ok {
+			return nil, errPeerIDInvalid
+		}
+	}
 	if _, err := h.store.RemoveContacts(r.Ctx, r.UserID, ids); err != nil {
 		return nil, h.contactMutationError("delete contacts", r.UserID, err)
 	}
-	return noUpdates(), nil
+	users := make([]tg.UserClass, len(ids))
+	for i, id := range ids {
+		users[i] = h.userToTL(usersByID[id], r.UserID, false, store.Contact{})
+	}
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{},
+		Users:   users,
+		Chats:   []tg.ChatClass{},
+		Date:    int(time.Now().Unix()),
+	}, nil
 }
 
 // handleGetContacts returns the caller's directed contact list. Hashes cover
@@ -147,9 +166,7 @@ func (h *handlers) handleGetContacts(r *mtproto.Request) (bin.Encoder, error) {
 			return nil, errInternal
 		}
 		wireContacts[i] = tg.Contact{UserID: contact.UserID, Mutual: contact.Mutual}
-		wireUser := h.userToTL(user, r.UserID, false)
-		wireUser.Contact = true
-		wireUser.MutualContact = contact.Mutual
+		wireUser := h.userToTL(user, r.UserID, false, contact)
 		wireUsers[i] = wireUser
 	}
 	return &tg.ContactsContacts{

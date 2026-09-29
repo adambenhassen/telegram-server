@@ -352,7 +352,7 @@ var (
 // UserToTL exposes userToTL for the external api_test package.
 // Uses the test deriver from pgtest.
 func UserToTL(u store.User, viewerID int64, self bool) *tg.User {
-	return testHandlers(nil).userToTL(u, viewerID, self)
+	return testHandlers(nil).userToTL(u, viewerID, self, store.Contact{})
 }
 
 // ChannelToTL exposes channelToTL for the external api_test package.

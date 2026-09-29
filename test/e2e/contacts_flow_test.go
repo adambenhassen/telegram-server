@@ -170,6 +170,16 @@ func TestContactsSearchAddGroupLive(t *testing.T) {
 	if !ok || len(created.Chats) != 1 {
 		t.Fatalf("create chat updates = %#v, want chat", invited.Updates)
 	}
+	var createdB *tg.User
+	for _, user := range created.Users {
+		if peer, ok := user.(*tg.User); ok && peer.ID == bUserID {
+			createdB = peer
+			break
+		}
+	}
+	if createdB == nil || !createdB.Contact || createdB.MutualContact {
+		t.Fatalf("create chat B = %#v, want contact=true mutual_contact=false", createdB)
+	}
 	chat, ok := created.Chats[0].(*tg.Chat)
 	if !ok || chat.ParticipantsCount != 2 {
 		t.Fatalf("created chat = %#v, want two participants", created.Chats[0])

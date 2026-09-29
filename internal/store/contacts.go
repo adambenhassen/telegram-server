@@ -173,3 +173,31 @@ func (s *Store) Contacts(ctx context.Context, ownerID int64) ([]Contact, int, er
 	}
 	return contacts, total, nil
 }
+
+// ContactStates returns the owner's existing edges within contactIDs and each
+// edge's live reciprocal state. Unmatched IDs have no contact edge.
+func (s *Store) ContactStates(ctx context.Context, ownerID int64, contactIDs []int64) ([]Contact, error) {
+	if ownerID <= 0 {
+		return nil, ErrInvalidContact
+	}
+	for _, contactID := range contactIDs {
+		if !validContactIDs(ownerID, contactID) {
+			return nil, ErrInvalidContact
+		}
+	}
+	if len(contactIDs) == 0 {
+		return []Contact{}, nil
+	}
+	rows, err := s.q.ContactStates(ctx, db.ContactStatesParams{
+		OwnerID:    ownerID,
+		ContactIds: contactIDs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list contact states: %w", err)
+	}
+	contacts := make([]Contact, len(rows))
+	for i, row := range rows {
+		contacts[i] = Contact{UserID: row.ContactID, Mutual: row.Mutual}
+	}
+	return contacts, nil
+}

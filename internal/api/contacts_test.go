@@ -395,6 +395,14 @@ func TestContactsGetContactsAndIDsUseSortedOwnerScopedHash(t *testing.T) {
 		t.Fatalf("remove A -> B: %v", err)
 	}
 	assertEncodes(t, deleted)
+	deletedUpdates, ok := deleted.(*tg.Updates)
+	if !ok || len(deletedUpdates.Updates) != 0 || len(deletedUpdates.Users) != 1 {
+		t.Fatalf("delete reply = %#v, want one updated user and no events", deleted)
+	}
+	deletedB, ok := deletedUpdates.Users[0].(*tg.User)
+	if !ok || deletedB.ID != b.ID || deletedB.Contact || deletedB.MutualContact {
+		t.Fatalf("deleted peer = %#v, want B with contact=false mutual_contact=false", deletedUpdates.Users[0])
+	}
 	afterDelete, err := api.GetContactsForTest(s, a.ID, &tg.ContactsGetContactsRequest{Hash: currentHash})
 	if err != nil {
 		t.Fatalf("get contacts after delete: %v", err)
