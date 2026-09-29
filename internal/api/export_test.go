@@ -352,7 +352,7 @@ var (
 // UserToTL exposes userToTL for the external api_test package.
 // Uses the test deriver from pgtest.
 func UserToTL(u store.User, viewerID int64, self bool) *tg.User {
-	return testHandlers(nil).userToTL(u, viewerID, self)
+	return testHandlers(nil).userToTL(u, viewerID, self, store.Contact{})
 }
 
 // ChannelToTL exposes channelToTL for the external api_test package.
@@ -883,6 +883,38 @@ func ContactsSearchForTestWithLimits(s *store.Store, userID int64, rateLimit sto
 	h := testHandlers(s)
 	h.rateLimitSearchContacts = rateLimit
 	return h.handleContactsSearch(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+func AddContactForTest(s *store.Store, userID int64, req *tg.ContactsAddContactRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleAddContact(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+func DeleteContactsForTest(s *store.Store, userID int64, req *tg.ContactsDeleteContactsRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleDeleteContacts(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+func GetContactsForTest(s *store.Store, userID int64, req *tg.ContactsGetContactsRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetContacts(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+func GetContactIDsForTest(s *store.Store, userID int64, req *tg.ContactsGetContactIDsRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleGetContactIDs(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // SearchForTest invokes handleSearch for the caller against the given request.
