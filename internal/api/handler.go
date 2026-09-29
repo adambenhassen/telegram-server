@@ -281,6 +281,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		return h.handleSendMediaAfterReplyOnConn(c, req)
 	})
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
+	register(d, tg.ChannelsGetFullChannelRequestTypeID, h.handleGetFullChannel)
 	register(d, tg.ChannelsGetChannelsRequestTypeID, h.handleGetChannels)
 	register(d, tg.ChannelsJoinChannelRequestTypeID, h.handleJoinChannel)
 	register(d, tg.ChannelsLeaveChannelRequestTypeID, h.handleLeaveChannel)

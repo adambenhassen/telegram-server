@@ -215,8 +215,56 @@ func TestChannelsLifecycle(t *testing.T) {
 	aUserID := login(aID, "A")
 	bUserID := login(bID, "B")
 
-	// A creates a broadcast channel.
-	chID := createBroadcastChannel(t, ctx, aCmds, "Lifecycle")
+	// A creates a broadcast channel and immediately fetches its full info, as the
+	// client does while advancing through channel setup.
+	var chID int64
+	var chAccessHash int64
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		created, err := c.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
+			Title:     "Lifecycle",
+			About:     "Setup details",
+			Broadcast: true,
+		})
+		if err != nil {
+			return err
+		}
+		updates, ok := created.(*tg.Updates)
+		if !ok {
+			return errors.New("createChannel: unexpected updates type")
+		}
+		for _, chat := range updates.Chats {
+			if channel, ok := chat.(*tg.Channel); ok {
+				chID = channel.ID
+				chAccessHash = channel.AccessHash
+				break
+			}
+		}
+		if chID == 0 {
+			return errors.New("createChannel: no channel in response")
+		}
+
+		full, err := c.ChannelsGetFullChannel(ctx, &tg.InputChannel{
+			ChannelID:  chID,
+			AccessHash: chAccessHash,
+		})
+		if err != nil {
+			return err
+		}
+		channelFull, ok := full.FullChat.(*tg.ChannelFull)
+		if !ok {
+			return fmt.Errorf("getFullChannel: full info = %T, want *tg.ChannelFull", full.FullChat)
+		}
+		if channelFull.ID != chID || channelFull.About != "Setup details" {
+			return fmt.Errorf("getFullChannel: id/about = %d/%q, want %d/%q", channelFull.ID, channelFull.About, chID, "Setup details")
+		}
+		if count, ok := channelFull.GetParticipantsCount(); !ok || count != 1 {
+			return fmt.Errorf("getFullChannel: participant count = %d present=%v, want 1", count, ok)
+		}
+		if channelFull.Pts != 0 {
+			return fmt.Errorf("getFullChannel: pts = %d, want 0", channelFull.Pts)
+		}
+		return nil
+	})
 
 	// A exports an invite; B imports it.
 	hash := exportChannelInvite(t, ctx, aUserID, aCmds, chID)

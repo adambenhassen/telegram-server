@@ -3,17 +3,23 @@ package api_test
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/mt"
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -85,6 +91,432 @@ func createChannel(t *testing.T, s *store.Store, userID int64, req *tg.ChannelsC
 	}
 	return ch
 }
+
+func fullChannelDispatcher(s *store.Store) mtproto.Handler {
+	return api.New(
+		s,
+		2,
+		&tg.Config{},
+		slog.New(slog.DiscardHandler),
+		false,
+		api.TestMaxFileBytes,
+		nil,
+		1,
+		pgtest.PeerDeriver(),
+		config.RateLimitsConfig{},
+		config.RegistrationInvite,
+	)
+}
+
+func getFullChannelViaDispatcher(
+	t *testing.T,
+	h mtproto.Handler,
+	userID int64,
+	provisional bool,
+	channel tg.InputChannelClass,
+) (*tg.MessagesChatFull, *mt.RPCError) {
+	t.Helper()
+	method := settingsHandler{
+		name: "channels.getFullChannel",
+		request: func() bin.Encoder {
+			return &tg.ChannelsGetFullChannelRequest{Channel: channel}
+		},
+	}
+	body := dispatchSettings(t, h, method, userID, provisional)
+	var full tg.MessagesChatFull
+	if err := full.Decode(&bin.Buffer{Buf: body}); err == nil {
+		return &full, nil
+	}
+	var rpc mt.RPCError
+	if err := rpc.Decode(&bin.Buffer{Buf: body}); err != nil {
+		t.Fatalf("decode getFullChannel response: %v", err)
+	}
+	return nil, &rpc
+}
+
+func activeChannelInviteCount(t *testing.T, ctx context.Context, dsn string, channelID int64) int {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close conn: %v", err)
+		}
+	}()
+	var count int
+	if err := conn.QueryRow(ctx,
+		`SELECT count(*) FROM channel_invites WHERE channel_id = $1 AND revoked_at IS NULL`,
+		channelID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count active invites: %v", err)
+	}
+	return count
+}
+
+func requireFullChannelRPCError(t *testing.T, rpc *mt.RPCError, want string) {
+	t.Helper()
+	if rpc == nil {
+		t.Fatalf("got full-channel response, want %s", want)
+	}
+	if rpc.ErrorMessage != want {
+		t.Fatalf("RPC error = %d %q, want %q", rpc.ErrorCode, rpc.ErrorMessage, want)
+	}
+}
+
+func fullChatChannel(t *testing.T, response *tg.MessagesChatFull) *tg.Channel {
+	t.Helper()
+	if len(response.Chats) != 1 {
+		t.Fatalf("chats = %d, want 1", len(response.Chats))
+	}
+	channel, ok := response.Chats[0].(*tg.Channel)
+	if !ok {
+		t.Fatalf("chat = %T, want *tg.Channel", response.Chats[0])
+	}
+	return channel
+}
+
+func fullChannelInfo(t *testing.T, response *tg.MessagesChatFull) *tg.ChannelFull {
+	t.Helper()
+	full, ok := response.FullChat.(*tg.ChannelFull)
+	if !ok {
+		t.Fatalf("full chat = %T, want *tg.ChannelFull", response.FullChat)
+	}
+	return full
+}
+
+func TestHandleGetFullChannelImmediatelyAfterCreate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, err := s.CreateUser(ctx, "+15551294901")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	channel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{
+		Broadcast: true,
+		Title:     "Setup",
+		About:     "Channel setup info",
+	})
+
+	response, rpc := getFullChannelViaDispatcher(t, fullChannelDispatcher(s), creator.ID, false, api.InputChannel(creator.ID, channel.ID))
+	if rpc != nil {
+		t.Fatalf("getFullChannel: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	assertEncodes(t, response)
+	full := fullChannelInfo(t, response)
+	if full.ID != channel.ID || full.About != "Channel setup info" {
+		t.Errorf("full id/about = %d/%q, want %d/%q", full.ID, full.About, channel.ID, "Channel setup info")
+	}
+	if count, ok := full.GetParticipantsCount(); !ok || count != 1 {
+		t.Errorf("participant count = %d present=%v, want 1", count, ok)
+	}
+	if !full.GetCanViewParticipants() {
+		t.Error("broadcast creator cannot view participants")
+	}
+	if full.Pts != 0 {
+		t.Errorf("channel pts = %d, want 0", full.Pts)
+	}
+	chat := fullChatChannel(t, response)
+	if chat.ID != channel.ID || chat.AccessHash != api.DeriveChannelHash(creator.ID, channel.ID) || !chat.Creator {
+		t.Errorf("creator chat = id %d hash %d creator %v", chat.ID, chat.AccessHash, chat.Creator)
+	}
+	if _, ok := full.GetExportedInvite(); ok {
+		t.Error("getFullChannel exposed an invite before one was created")
+	}
+	if got := activeChannelInviteCount(t, ctx, dsn, channel.ID); got != 0 {
+		t.Errorf("getFullChannel created %d active invites, want 0", got)
+	}
+}
+
+func TestHandleGetFullChannelAppliesViewerPolicy(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, err := s.CreateUser(ctx, "+15551294911")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	admin, err := s.CreateUser(ctx, "+15551294912")
+	if err != nil {
+		t.Fatalf("admin: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551294913")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	outsider, err := s.CreateUser(ctx, "+15551294914")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
+	broadcast := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{
+		Broadcast: true,
+		Title:     "Public setup",
+		About:     "Visible description",
+	})
+	joinChannel(t, ctx, dsn, broadcast.ID, admin.ID)
+	joinChannel(t, ctx, dsn, broadcast.ID, member.ID)
+	if err := s.SetChannelRole(ctx, broadcast.ID, creator.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	if err := api.ClaimChannelUsernameForTest(s, broadcast.ID, "publicsetup"); err != nil {
+		t.Fatalf("claim username: %v", err)
+	}
+	if _, _, _, err := s.PostChannelMessageAs(ctx, broadcast.ID, creator.ID, "current post", 94911, nil, 0); err != nil {
+		t.Fatalf("post channel message: %v", err)
+	}
+	invite, err := s.CreateChannelInvite(ctx, broadcast.ID, creator.ID)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	h := fullChannelDispatcher(s)
+	creatorResponse, rpc := getFullChannelViaDispatcher(t, h, creator.ID, false, api.InputChannel(creator.ID, broadcast.ID))
+	if rpc != nil {
+		t.Fatalf("creator getFullChannel: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	creatorInvite, ok := fullChannelInfo(t, creatorResponse).GetExportedInvite()
+	if !ok {
+		t.Fatal("creator full info is missing the existing invite")
+	}
+	if got, ok := creatorInvite.(*tg.ChatInviteExported); !ok || got.Link != inviteLinkForTest(invite) {
+		t.Fatalf("creator invite = %#v, want existing link", creatorInvite)
+	}
+
+	adminResponse, rpc := getFullChannelViaDispatcher(t, h, admin.ID, false, api.InputChannel(admin.ID, broadcast.ID))
+	if rpc != nil {
+		t.Fatalf("admin getFullChannel: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	adminFull := fullChannelInfo(t, adminResponse)
+	adminChannel := fullChatChannel(t, adminResponse)
+	if adminFull.About != "Visible description" || !adminFull.GetCanViewParticipants() || adminFull.Pts != 1 {
+		t.Errorf("admin full metadata: about=%q can_view_participants=%v pts=%d", adminFull.About, adminFull.GetCanViewParticipants(), adminFull.Pts)
+	}
+	if adminChannel.Username != "publicsetup" || adminChannel.AccessHash != api.DeriveChannelHash(admin.ID, broadcast.ID) {
+		t.Errorf("admin channel username/hash = %q/%d", adminChannel.Username, adminChannel.AccessHash)
+	}
+	if count, ok := adminFull.GetAdminsCount(); !ok || count != 2 {
+		t.Errorf("admin count = %d present=%v, want 2", count, ok)
+	}
+	exported, ok := adminFull.GetExportedInvite()
+	if !ok {
+		t.Fatal("admin full info is missing the existing invite")
+	}
+	exportedInvite, ok := exported.(*tg.ChatInviteExported)
+	if !ok || exportedInvite.Link != inviteLinkForTest(invite) || !exportedInvite.Permanent {
+		t.Fatalf("exported invite = %#v, want existing permanent link", exported)
+	}
+	var creatorUser *tg.User
+	for _, item := range adminResponse.Users {
+		if user, ok := item.(*tg.User); ok && user.ID == creator.ID {
+			creatorUser = user
+		}
+	}
+	if creatorUser == nil || creatorUser.AccessHash != api.DeriveUserHash(admin.ID, creator.ID) || creatorUser.Phone != "" {
+		t.Errorf("invite creator user rendered for admin: %#v", creatorUser)
+	}
+	if got := activeChannelInviteCount(t, ctx, dsn, broadcast.ID); got != 1 {
+		t.Errorf("getFullChannel changed active invite count to %d, want 1", got)
+	}
+
+	memberResponse, rpc := getFullChannelViaDispatcher(t, h, member.ID, false, api.InputChannel(member.ID, broadcast.ID))
+	if rpc != nil {
+		t.Fatalf("member getFullChannel: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	memberFull := fullChannelInfo(t, memberResponse)
+	memberChannel := fullChatChannel(t, memberResponse)
+	if memberFull.About != "Visible description" || memberFull.GetCanViewParticipants() || memberFull.Pts != 1 {
+		t.Errorf("broadcast member metadata: about=%q can_view_participants=%v pts=%d", memberFull.About, memberFull.GetCanViewParticipants(), memberFull.Pts)
+	}
+	if _, ok := memberFull.GetAdminsCount(); ok {
+		t.Error("broadcast member received administrative counts")
+	}
+	if _, ok := memberFull.GetExportedInvite(); ok {
+		t.Error("broadcast member received an invite")
+	}
+	if memberChannel.AccessHash != api.DeriveChannelHash(member.ID, broadcast.ID) || memberChannel.Username != "publicsetup" {
+		t.Errorf("member channel hash/username = %d/%q", memberChannel.AccessHash, memberChannel.Username)
+	}
+
+	publicResponse, rpc := getFullChannelViaDispatcher(t, h, outsider.ID, false, api.InputChannel(outsider.ID, broadcast.ID))
+	if rpc != nil {
+		t.Fatalf("public outsider getFullChannel: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	publicFull := fullChannelInfo(t, publicResponse)
+	publicChannel := fullChatChannel(t, publicResponse)
+	if publicFull.About != "Visible description" {
+		t.Errorf("public about = %q, want visible description", publicFull.About)
+	}
+	if publicFull.Pts != 0 {
+		t.Errorf("public preview exposed channel pts %d", publicFull.Pts)
+	}
+	if count, ok := publicFull.GetParticipantsCount(); !ok || count != 3 {
+		t.Errorf("public participant count = %d present=%v, want 3", count, ok)
+	}
+	if publicChannel.Title != "Public setup" || publicChannel.Username != "publicsetup" || !publicChannel.Left {
+		t.Errorf("public channel preview = title %q username %q left %v", publicChannel.Title, publicChannel.Username, publicChannel.Left)
+	}
+	if publicChannel.AccessHash != api.DeriveChannelHash(outsider.ID, broadcast.ID) || publicFull.GetCanViewParticipants() {
+		t.Errorf("public preview hash/can_view_participants = %d/%v", publicChannel.AccessHash, publicFull.GetCanViewParticipants())
+	}
+	if _, ok := publicFull.GetExportedInvite(); ok {
+		t.Error("public outsider received an invite")
+	}
+	if _, ok := publicFull.GetAdminsCount(); ok {
+		t.Error("public outsider received administrative counts")
+	}
+	if len(publicResponse.Users) != 0 {
+		t.Errorf("public preview returned %d user references, want none", len(publicResponse.Users))
+	}
+
+	private := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "Private"})
+	if _, rpc = getFullChannelViaDispatcher(t, h, outsider.ID, false, api.InputChannel(outsider.ID, private.ID)); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Errorf("private outsider error = %v, want PEER_ID_INVALID", rpc)
+	}
+	if _, rpc = getFullChannelViaDispatcher(t, h, outsider.ID, false, api.InputChannel(outsider.ID, private.ID+1)); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Errorf("absent channel error = %v, want PEER_ID_INVALID", rpc)
+	}
+	if _, rpc = getFullChannelViaDispatcher(t, h, outsider.ID, false, api.InputChannel(creator.ID, broadcast.ID)); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Errorf("other viewer's hash error = %v, want PEER_ID_INVALID", rpc)
+	}
+	if _, rpc = getFullChannelViaDispatcher(t, h, creator.ID, false, &tg.InputChannel{ChannelID: broadcast.ID, AccessHash: broadcast.ID}); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Errorf("placeholder hash error = %v, want PEER_ID_INVALID", rpc)
+	}
+	if err := s.SetChannelBan(ctx, broadcast.ID, creator.ID, member.ID, nil, true); err != nil {
+		t.Fatalf("ban member: %v", err)
+	}
+	if _, rpc = getFullChannelViaDispatcher(t, h, member.ID, false, api.InputChannel(member.ID, broadcast.ID)); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Errorf("banned public member error = %v, want PEER_ID_INVALID", rpc)
+	}
+
+	for _, session := range []struct {
+		name        string
+		userID      int64
+		provisional bool
+	}{
+		{name: "unauthenticated"},
+		{name: "provisional", userID: creator.ID, provisional: true},
+	} {
+		t.Run(session.name, func(t *testing.T) {
+			_, rpc := getFullChannelViaDispatcher(t, h, session.userID, session.provisional, api.InputChannel(creator.ID, broadcast.ID))
+			requireFullChannelRPCError(t, rpc, "AUTH_KEY_UNREGISTERED")
+		})
+	}
+
+	megagroup := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Megagroup: true, Title: "Group"})
+	joinChannel(t, ctx, dsn, megagroup.ID, member.ID)
+	groupResponse, rpc := getFullChannelViaDispatcher(t, h, member.ID, false, api.InputChannel(member.ID, megagroup.ID))
+	if rpc != nil {
+		t.Fatalf("megagroup member getFullChannel: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	if !fullChannelInfo(t, groupResponse).GetCanViewParticipants() {
+		t.Error("megagroup member cannot view participants")
+	}
+}
+
+func TestHandleGetFullChannelKeepsAuthorizationAndMetadataInOneSnapshot(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name   string
+		mutate func(context.Context, *store.Store, int64, int64, int64) error
+	}{
+		{
+			name: "leave",
+			mutate: func(ctx context.Context, s *store.Store, channelID, _, memberID int64) error {
+				left, err := s.LeaveChannel(ctx, channelID, memberID)
+				if err != nil {
+					return err
+				}
+				if !left {
+					return errors.New("member did not leave")
+				}
+				return nil
+			},
+		},
+		{
+			name: "ban",
+			mutate: func(ctx context.Context, s *store.Store, channelID, creatorID, memberID int64) error {
+				until := time.Now().Add(time.Hour)
+				return s.SetChannelBan(ctx, channelID, creatorID, memberID, &until, false)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			s, dsn := openStoreDSN(t)
+			creator, err := s.CreateUser(ctx, "+15551294921")
+			if err != nil {
+				t.Fatalf("creator: %v", err)
+			}
+			member, err := s.CreateUser(ctx, "+15551294922")
+			if err != nil {
+				t.Fatalf("member: %v", err)
+			}
+			channel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "Snapshot"})
+			joinChannel(t, ctx, dsn, channel.ID, member.ID)
+
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			released := false
+			store.SetChannelFullInfoSnapshotHook(s, func() {
+				close(entered)
+				<-release
+			})
+			defer func() {
+				if !released {
+					close(release)
+				}
+				store.SetChannelFullInfoSnapshotHook(s, nil)
+			}()
+
+			type outcome struct {
+				response *tg.MessagesChatFull
+				rpc      *mt.RPCError
+			}
+			done := make(chan outcome, 1)
+			h := fullChannelDispatcher(s)
+			go func() {
+				response, rpc := getFullChannelViaDispatcher(t, h, member.ID, false, api.InputChannel(member.ID, channel.ID))
+				done <- outcome{response: response, rpc: rpc}
+			}()
+
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("full-channel snapshot did not reach its read barrier")
+			}
+			if err := tt.mutate(ctx, s, channel.ID, creator.ID, member.ID); err != nil {
+				t.Fatalf("change membership during read: %v", err)
+			}
+			close(release)
+			released = true
+
+			var result outcome
+			select {
+			case result = <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("full-channel read did not finish after membership change")
+			}
+			if result.rpc != nil {
+				t.Fatalf("in-flight snapshot response: %d %s", result.rpc.ErrorCode, result.rpc.ErrorMessage)
+			}
+			store.SetChannelFullInfoSnapshotHook(s, nil)
+			assertEncodes(t, result.response)
+			full := fullChannelInfo(t, result.response)
+			if count, ok := full.GetParticipantsCount(); !ok || count != 2 {
+				t.Errorf("snapshot participant count = %d present=%v, want 2", count, ok)
+			}
+			if got := fullChatChannel(t, result.response); got.ID != channel.ID || got.Left {
+				t.Errorf("snapshot chat = %#v, want the authorized member view", got)
+			}
+			if _, rpc := getFullChannelViaDispatcher(t, h, member.ID, false, api.InputChannel(member.ID, channel.ID)); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+				t.Errorf("post-change getFullChannel error = %v, want PEER_ID_INVALID", rpc)
+			}
+		})
+	}
+}
+
+func inviteLinkForTest(hash string) string { return "https://t.me/+" + hash }
 
 func TestHandleCreateChannelBroadcast(t *testing.T) {
 	t.Parallel()

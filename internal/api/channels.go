@@ -139,6 +139,90 @@ func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) 
 	}, nil
 }
 
+// handleGetFullChannel serves channels.getFullChannel. The store reads channel
+// visibility, membership and full-info metadata from one snapshot so a leave or
+// ban during hydration cannot combine an old authorization decision with a new
+// membership state.
+func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsGetFullChannelRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshot, found, err := h.store.ChannelFullInfoForViewer(r.Ctx, channelID, r.UserID)
+	if err != nil {
+		h.log.Error("get full channel", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !found {
+		return nil, errPeerIDInvalid
+	}
+
+	member := snapshot.HasMember && !snapshot.Member.Banned(time.Now())
+	if snapshot.HasMember && !member {
+		return nil, errPeerIDInvalid
+	}
+	if !member && snapshot.Channel.Username == nil {
+		return nil, errPeerIDInvalid
+	}
+
+	full := &tg.ChannelFull{
+		ID:             snapshot.Channel.ID,
+		About:          snapshot.Channel.About,
+		ChatPhoto:      &tg.PhotoEmpty{},
+		NotifySettings: tg.PeerNotifySettings{},
+	}
+	full.SetParticipantsCount(int(snapshot.ParticipantsCount))
+	canViewParticipants := member && (snapshot.Channel.Megagroup || snapshot.Member.Role >= channelRoleAdmin)
+	full.SetCanViewParticipants(canViewParticipants)
+	if member {
+		full.Pts = snapshot.Pts
+	}
+
+	var users []tg.UserClass
+	if member && snapshot.Member.Role >= channelRoleAdmin {
+		full.SetAdminsCount(int(snapshot.AdminsCount))
+		// ChannelFull uses one flag for both counts. This server does not retain
+		// removed-participant history, so there is no independent kicked count.
+		full.SetBannedCount(int(snapshot.BannedCount))
+		if snapshot.HasInvite {
+			full.SetExportedInvite(&tg.ChatInviteExported{
+				Link:      inviteLinkPrefix + snapshot.InviteHash,
+				AdminID:   snapshot.InviteCreatorID,
+				Date:      int(snapshot.InviteDate.Unix()),
+				Permanent: true,
+			})
+			users, err = h.loadUsers(r.Ctx, map[int64]bool{snapshot.InviteCreatorID: true}, r.UserID)
+			if err != nil {
+				h.log.Error("get full channel invite user", "channel_id", channelID, "err", err)
+				return nil, errInternal
+			}
+		}
+	}
+
+	var chat tg.ChatClass
+	if member {
+		chat = h.channelToTL(snapshot.Channel, snapshot.Member, true, r.UserID)
+		if channel, ok := chat.(*tg.Channel); ok && snapshot.Channel.Username != nil {
+			channel.Username = *snapshot.Channel.Username
+		}
+	} else {
+		chat = h.channelToTLPublic(snapshot.Channel, snapshot.ParticipantsCount, r.UserID)
+	}
+	return &tg.MessagesChatFull{
+		FullChat: full,
+		Chats:    []tg.ChatClass{chat},
+		Users:    users,
+	}, nil
+}
+
 // handleGetChannels serves channels.getChannels. Rendering goes through
 // loadChannels with the caller as viewer, which is the whole authorization
 // boundary: a non-member or banned caller gets tg.ChannelForbidden and never a
