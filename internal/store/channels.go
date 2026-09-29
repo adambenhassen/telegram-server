@@ -1074,20 +1074,20 @@ func (s *Store) SearchMemberChannels(
 	return out, nil
 }
 
-// ChannelDialogRow carries one channel's dialog data: the channel itself, its
-// pts, and the newest non-deleted post (top message). Top is nil when the
-// channel has no posts or all posts are deleted.
+// ChannelDialogRow carries one active member channel's dialog data: the channel,
+// viewer's membership, pts, and newest non-deleted post (top message). Top is
+// nil when the channel has no posts or all posts are deleted.
 type ChannelDialogRow struct {
 	Channel Channel
+	Member  ChannelMember
 	Pts     int
 	Top     *ChannelMessage
 }
 
-// ChannelDialogsForUser returns every channel the user belongs to alongside the
-// channel's pts and the newest non-deleted post. Channels with no posts or
-// whose newest post is deleted appear with Top == nil so the caller can skip
-// them. One query replaces the previous per-channel ChannelHistory +
-// ChannelState calls.
+// ChannelDialogsForUser returns every unbanned channel the user belongs to,
+// including empty channels, alongside the viewer's membership, channel pts, and
+// newest non-deleted post. Top is nil when a channel has no live post. One query
+// replaces the previous per-channel ChannelHistory + ChannelState calls.
 func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]ChannelDialogRow, error) {
 	rows, err := s.q.ChannelDialogsForUser(ctx, userID)
 	if err != nil {
@@ -1103,8 +1103,16 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 			Megagroup: r.Megagroup,
 			Version:   int(r.Version),
 			Date:      r.ChannelDate.Time,
+			Username:  r.Username,
 		}
-		row := ChannelDialogRow{Channel: ch, Pts: int(r.Pts)}
+		member := channelMemberFromRow(db.ChannelParticipant{
+			ChannelID:   r.ChannelID,
+			UserID:      userID,
+			Role:        r.MemberRole,
+			BannedUntil: r.MemberBannedUntil,
+			JoinPts:     r.MemberJoinPts,
+		})
+		row := ChannelDialogRow{Channel: ch, Member: member, Pts: int(r.Pts)}
 		if r.TopLocalID != 0 {
 			top := channelMessageFromFields(channelMsgFields{
 				r.ChannelID,

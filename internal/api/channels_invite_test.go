@@ -290,3 +290,159 @@ func TestInviteToChannelSkipsBannedAndExistingRowsWithoutTargetDetails(t *testin
 		t.Errorf("existing target removed: found=%v err=%v", found, err)
 	}
 }
+
+func TestInviteToChannelAppearsInDialogsAfterMembershipNotifyLoss(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, err := s.CreateUser(ctx, "+15551282101")
+	if err != nil {
+		t.Fatalf("create creator: %v", err)
+	}
+	invitee, err := s.CreateUser(ctx, "+15551282102")
+	if err != nil {
+		t.Fatalf("create invitee: %v", err)
+	}
+	empty, err := s.CreateChannel(ctx, creator.ID, "Empty invite", "", false)
+	if err != nil {
+		t.Fatalf("create empty channel: %v", err)
+	}
+	history, err := s.CreateChannel(ctx, creator.ID, "History invite", "", false)
+	if err != nil {
+		t.Fatalf("create history channel: %v", err)
+	}
+	for i, text := range []string{"first", "latest"} {
+		if _, _, _, err := s.PostChannelMessage(ctx, history.ID, creator.ID, text, int64(i+1), nil, 0); err != nil {
+			t.Fatalf("post history %q: %v", text, err)
+		}
+	}
+
+	// Seed 100 older memberships with ids below the channel-id range used by
+	// CreateChannel. This makes the new membership fall beyond the old 100-row
+	// dialog cap regardless of the random id drawn for the invite target.
+	channelExec(t, ctx, dsn, `
+		INSERT INTO channels (id, title, creator_id)
+		SELECT 1000000 + n, 'Existing ' || n, $1
+		FROM generate_series(1, 100) AS n`, invitee.ID)
+	channelExec(t, ctx, dsn, `
+		INSERT INTO channel_state (channel_id)
+		SELECT 1000000 + n FROM generate_series(1, 100) AS n`)
+	channelExec(t, ctx, dsn, `
+		INSERT INTO channel_participants (channel_id, user_id, role, join_pts, date)
+		SELECT 1000000 + n, $1, 2, 0, now() - interval '1 day'
+		FROM generate_series(1, 100) AS n`, invitee.ID)
+
+	older, err := s.ChannelDialogsForUser(ctx, invitee.ID)
+	if err != nil || len(older) != 100 {
+		t.Fatalf("seeded memberships = %d, err %v; want 100", len(older), err)
+	}
+
+	// testHandlers has no store listener, so these membership NOTIFYs have no
+	// receiver. A fresh getDialogs call must replay the committed membership.
+	for _, ch := range []store.Channel{empty, history} {
+		if _, err := api.InviteToChannelForTest(s, creator.ID, &tg.ChannelsInviteToChannelRequest{
+			Channel: api.InputChannel(creator.ID, ch.ID),
+			Users:   inviteUsers(creator.ID, invitee.ID),
+		}); err != nil {
+			t.Fatalf("invite to %q: %v", ch.Title, err)
+		}
+	}
+
+	pull := func() *tg.MessagesDialogs {
+		t.Helper()
+		enc, err := api.GetDialogsForTest(s, invitee.ID)
+		if err != nil {
+			t.Fatalf("getDialogs: %v", err)
+		}
+		assertEncodes(t, enc)
+		got, ok := enc.(*tg.MessagesDialogs)
+		if !ok {
+			t.Fatalf("getDialogs = %T, want *tg.MessagesDialogs", enc)
+		}
+		return got
+	}
+	first := pull()
+	dialogsByChannel := make(map[int64]*tg.Dialog)
+	for _, class := range first.Dialogs {
+		d, ok := class.(*tg.Dialog)
+		if !ok {
+			continue
+		}
+		peer, ok := d.Peer.(*tg.PeerChannel)
+		if ok {
+			dialogsByChannel[peer.ChannelID] = d
+		}
+	}
+	for _, ch := range []store.Channel{empty, history} {
+		if _, ok := dialogsByChannel[ch.ID]; !ok {
+			t.Fatalf("fresh getDialogs omitted invited channel %d with 102 memberships", ch.ID)
+		}
+	}
+	if d := dialogsByChannel[empty.ID]; d.TopMessage != 0 {
+		t.Errorf("empty channel top_message = %d, want 0", d.TopMessage)
+	} else if pts, hasPts := d.GetPts(); !hasPts || pts != 0 {
+		t.Errorf("empty channel pts = %d present=%v, want 0", pts, hasPts)
+	}
+	historyDialog := dialogsByChannel[history.ID]
+	if historyDialog.TopMessage != 2 {
+		t.Errorf("history top_message = %d, want 2", historyDialog.TopMessage)
+	}
+	if pts, hasPts := historyDialog.GetPts(); !hasPts || pts != 2 {
+		t.Errorf("history pts = %d present=%v, want 2", pts, hasPts)
+	}
+	if len(first.Messages) != 1 || first.Messages[0].GetID() != 2 {
+		t.Errorf("getDialogs messages = %v, want only history message 2", first.Messages)
+	}
+	member, found, err := s.ChannelMemberOf(ctx, history.ID, invitee.ID)
+	if err != nil || !found || member.JoinPts != 2 {
+		t.Errorf("history membership = %+v found=%v err=%v, want join_pts 2", member, found, err)
+	}
+	channelHashes := make(map[int64]int64)
+	for _, class := range first.Chats {
+		if ch, ok := class.(*tg.Channel); ok {
+			channelHashes[ch.ID] = ch.AccessHash
+		}
+	}
+	if got, want := channelHashes[empty.ID], api.DeriveChannelHash(invitee.ID, empty.ID); got != want {
+		t.Errorf("invitee channel hash = %d, want viewer-specific hash %d", got, want)
+	}
+	if got, want := channelHashes[history.ID], api.DeriveChannelHash(invitee.ID, history.ID); got != want {
+		t.Errorf("history channel hash = %d, want viewer-specific hash %d", got, want)
+	}
+
+	assertOmitted := func(channelID int64) {
+		t.Helper()
+		got := pull()
+		for _, class := range got.Dialogs {
+			if d, ok := class.(*tg.Dialog); ok {
+				if peer, ok := d.Peer.(*tg.PeerChannel); ok && peer.ChannelID == channelID {
+					t.Errorf("getDialogs retained channel %d after access ended", channelID)
+				}
+			}
+		}
+		for _, class := range got.Chats {
+			switch ch := class.(type) {
+			case *tg.Channel:
+				if ch.ID == channelID {
+					t.Errorf("getDialogs retained channel peer %d after access ended", channelID)
+				}
+			case *tg.ChannelForbidden:
+				if ch.ID == channelID {
+					t.Errorf("getDialogs returned forbidden channel %d instead of omitting it", channelID)
+				}
+			}
+		}
+	}
+
+	if err := s.SetChannelBan(ctx, empty.ID, creator.ID, invitee.ID, nil, true); err != nil {
+		t.Fatalf("ban invitee: %v", err)
+	}
+	assertOmitted(empty.ID)
+	if err := s.SetChannelBan(ctx, empty.ID, creator.ID, invitee.ID, nil, false); err != nil {
+		t.Fatalf("unban invitee: %v", err)
+	}
+	if _, err := s.LeaveChannel(ctx, empty.ID, invitee.ID); err != nil {
+		t.Fatalf("invitee leaves: %v", err)
+	}
+	assertOmitted(empty.ID)
+}

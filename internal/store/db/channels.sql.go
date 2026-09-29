@@ -123,7 +123,11 @@ SELECT
     c.creator_id,
     c.megagroup,
     c.version,
+    c.username,
     c.date AS channel_date,
+    p.role AS member_role,
+    p.banned_until AS member_banned_until,
+    p.join_pts AS member_join_pts,
     cs.pts,
     cs.next_local_id,
     cs.date AS state_date,
@@ -147,37 +151,41 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) top ON true
 WHERE p.user_id = $1
+  AND (p.banned_until IS NULL OR p.banned_until <= now())
 ORDER BY c.id
 `
 
 type ChannelDialogsForUserRow struct {
-	ChannelID       int64
-	Title           string
-	About           string
-	CreatorID       int64
-	Megagroup       bool
-	Version         int32
-	ChannelDate     pgtype.Timestamptz
-	Pts             int64
-	NextLocalID     int64
-	StateDate       pgtype.Timestamptz
-	TopLocalID      int64
-	TopFromID       int64
-	TopDate         pgtype.Timestamptz
-	TopMessage      string
-	TopEditDate     pgtype.Timestamptz
-	TopDeleted      bool
-	TopRandomID     int64
-	TopFileID       *int64
-	TopReplyToMsgID *int32
+	ChannelID         int64
+	Title             string
+	About             string
+	CreatorID         int64
+	Megagroup         bool
+	Version           int32
+	Username          *string
+	ChannelDate       pgtype.Timestamptz
+	MemberRole        int16
+	MemberBannedUntil pgtype.Timestamptz
+	MemberJoinPts     int64
+	Pts               int64
+	NextLocalID       int64
+	StateDate         pgtype.Timestamptz
+	TopLocalID        int64
+	TopFromID         int64
+	TopDate           pgtype.Timestamptz
+	TopMessage        string
+	TopEditDate       pgtype.Timestamptz
+	TopDeleted        bool
+	TopRandomID       int64
+	TopFileID         *int64
+	TopReplyToMsgID   *int32
 }
 
-// ChannelDialogsForUser returns every channel the user belongs to alongside the
-// channel's pts and the newest non-deleted post (the "top message" for the
-// dialog list). Channels with no posts or whose newest post is deleted appear
-// with top_local_id = 0 so the caller can skip them. LEFT JOIN is deliberate:
-// the 100-channel cap applies to the candidate set (all memberships), not to
-// the filtered set, so an empty channel still counts against the cap.
+// ChannelDialogsForUser returns every unbanned channel the user belongs to,
+// including empty channels, alongside the member row, channel pts, and newest
+// non-deleted post (the dialog's top message). Empty channels have top_local_id
+// 0 and still produce a dialog. LEFT JOIN ensures they count toward the bounded
+// 500-channel account cap.
 // COALESCE guards against NULL from the lateral join; local_id >= 1 so 0 is
 // a safe sentinel for "no row".
 func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]ChannelDialogsForUserRow, error) {
@@ -196,7 +204,11 @@ func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Ch
 			&i.CreatorID,
 			&i.Megagroup,
 			&i.Version,
+			&i.Username,
 			&i.ChannelDate,
+			&i.MemberRole,
+			&i.MemberBannedUntil,
+			&i.MemberJoinPts,
 			&i.Pts,
 			&i.NextLocalID,
 			&i.StateDate,
