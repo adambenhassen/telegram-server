@@ -289,6 +289,11 @@ type User struct {
 	LoginMode  string
 }
 
+type UserContact struct {
+	OwnerID   int64
+	ContactID int64
+}
+
 type UserPassword struct {
 	UserID        int64
 	Salt1         []byte
