@@ -1214,3 +1214,86 @@ func (h *handlers) handleEditChannelUsername(r *mtproto.Request) (bin.Encoder, e
 	}
 	return &tg.BoolTrue{}, nil
 }
+
+// handleCheckChannelUsername reports whether a valid username is available.
+// InputChannelEmpty is used while creating a channel; a concrete channel may
+// only be checked by one of its non-banned admins. Every authorized, valid
+// check consumes the shared username lookup budget before the namespace lookup.
+func (h *handlers) handleCheckChannelUsername(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsCheckUsernameRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if !validateUsername(req.Username) || isReservedUsername(req.Username) {
+		return nil, errUsernameInvalid
+	}
+	username := strings.ToLower(req.Username)
+
+	switch req.Channel.(type) {
+	case *tg.InputChannelEmpty:
+		// A signed-in account may check a name before it has created a channel.
+	case *tg.InputChannel:
+		channelID, err := h.inputChannelID(req.Channel, r.UserID)
+		if err != nil {
+			return nil, err
+		}
+		member, err := h.requireChannelMember(r.Ctx, channelID, r.UserID)
+		if err != nil {
+			return nil, err
+		}
+		if member.Role < 1 {
+			return nil, errChatAdminRequired
+		}
+	default:
+		return nil, errPeerIDInvalid
+	}
+
+	if err := h.store.CheckAndChargeUsernameLookup(r.Ctx, r.UserID, username); err != nil {
+		if errors.Is(err, store.ErrUsernameLookupQuotaExceeded) {
+			return nil, errUsernameLookupFloodWait
+		}
+		h.log.Error("check channel username: quota", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	_, occupied, err := h.store.UsernameByHandle(r.Ctx, username)
+	if err != nil {
+		h.log.Error("check channel username: lookup", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if occupied {
+		return &tg.BoolFalse{}, nil
+	}
+	return &tg.BoolTrue{}, nil
+}
+
+// handleGetAdminedPublicChannels returns the caller's own public channels where
+// they remain a non-banned admin or creator. Store filtering is caller-scoped;
+// each returned peer is rendered with the caller's access hash.
+func (h *handlers) handleGetAdminedPublicChannels(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsGetAdminedPublicChannelsRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+
+	admined, err := h.store.AdminedPublicChannels(r.Ctx, r.UserID)
+	if err != nil {
+		h.log.Error("get administered public channels", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	chats := make([]tg.ChatClass, len(admined))
+	for i, entry := range admined {
+		chats[i] = h.channelToTL(entry.Channel, store.ChannelMember{
+			UserID: r.UserID,
+			Role:   entry.Role,
+		}, true, r.UserID)
+	}
+	return &tg.MessagesChats{Chats: chats}, nil
+}
