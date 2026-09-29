@@ -769,6 +769,42 @@ func (s *Store) ChannelsForUser(ctx context.Context, userID int64) ([]Channel, e
 	return out, nil
 }
 
+// AdminedPublicChannel is a public channel and the caller's current role in it.
+type AdminedPublicChannel struct {
+	Channel Channel
+	Role    int
+}
+
+// AdminedPublicChannels returns only public channels where userID is a
+// non-banned admin or creator. Publicness and the reported handle come from the
+// authoritative usernames row, and the participant predicate scopes the
+// result to this account.
+func (s *Store) AdminedPublicChannels(ctx context.Context, userID int64) ([]AdminedPublicChannel, error) {
+	rows, err := s.q.AdminedPublicChannels(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("admined public channels: %w", err)
+	}
+	out := make([]AdminedPublicChannel, len(rows))
+	for i, r := range rows {
+		handle := r.Handle
+		out[i] = AdminedPublicChannel{
+			Channel: Channel{
+				ID:              r.ID,
+				Title:           r.Title,
+				About:           r.About,
+				CreatorID:       r.CreatorID,
+				Megagroup:       r.Megagroup,
+				Version:         int(r.Version),
+				Date:            r.Date.Time,
+				PinnedMessageID: r.PinnedMessageID,
+				Username:        &handle,
+			},
+			Role: int(r.Role),
+		}
+	}
+	return out, nil
+}
+
 // PublicChannelMatch is one channel matched by the public discovery arm, with
 // the participant count its public rendering puts on the wire. It carries no
 // membership: the arm is decided without reference to any caller, and nothing

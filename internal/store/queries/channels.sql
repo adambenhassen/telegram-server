@@ -37,6 +37,26 @@ SELECT * FROM channel_participants WHERE channel_id = $1 ORDER BY user_id;
 -- name: ChannelParticipantByUser :one
 SELECT * FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
 
+-- ChannelFullInfoStats is read in the same repeatable-read transaction as the
+-- channel and viewer membership. The public participant count keeps the
+-- existing row-count meaning used by the public channel renderer; administrative
+-- counts include only current admins and bans.
+-- name: ChannelFullInfoStats :one
+SELECT
+    count(*)::bigint AS participants_count,
+    count(*) FILTER (WHERE role >= 1 AND (banned_until IS NULL OR banned_until <= now()))::bigint AS admins_count,
+    count(*) FILTER (WHERE banned_until > now())::bigint AS banned_count
+FROM channel_participants
+WHERE channel_id = $1;
+
+-- ChannelActiveInviteByChannel returns one existing active invite for a full
+-- info response. It is read-only; getFullChannel never creates or rotates one.
+-- name: ChannelActiveInviteByChannel :one
+SELECT * FROM channel_invites
+WHERE channel_id = $1 AND revoked_at IS NULL
+ORDER BY date DESC, hash DESC
+LIMIT 1;
+
 -- ChannelParticipantsForViewer answers "which of these channels is this caller
 -- in" in one query, for a caller-supplied set bounded by a page. It returns the
 -- whole participant row rather than a boolean so the ban stays ChannelMember's
@@ -104,6 +124,20 @@ UPDATE channel_invites SET revoked_at = COALESCE(revoked_at, now()) WHERE hash =
 SELECT c.* FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 WHERE p.user_id = $1
+ORDER BY c.id;
+
+-- AdminedPublicChannels is scoped to the caller's own current admin rows. The
+-- usernames row is the authority for publicness and for the handle we return;
+-- channels.username is only a denormalized copy.
+-- name: AdminedPublicChannels :many
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
+       c.pinned_message_id, un.handle, p.role
+FROM channel_participants p
+JOIN channels c ON c.id = p.channel_id
+JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
+WHERE p.user_id = $1
+  AND p.role >= 1
+  AND (p.banned_until IS NULL OR p.banned_until <= now())
 ORDER BY c.id;
 
 -- SetChannelPinnedMessage sets or clears the pinned message id on a channel.

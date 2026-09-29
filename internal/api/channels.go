@@ -139,6 +139,90 @@ func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) 
 	}, nil
 }
 
+// handleGetFullChannel serves channels.getFullChannel. The store reads channel
+// visibility, membership and full-info metadata from one snapshot so a leave or
+// ban during hydration cannot combine an old authorization decision with a new
+// membership state.
+func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsGetFullChannelRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshot, found, err := h.store.ChannelFullInfoForViewer(r.Ctx, channelID, r.UserID)
+	if err != nil {
+		h.log.Error("get full channel", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !found {
+		return nil, errPeerIDInvalid
+	}
+
+	member := snapshot.HasMember && !snapshot.Member.Banned(time.Now())
+	if snapshot.HasMember && !member {
+		return nil, errPeerIDInvalid
+	}
+	if !member && snapshot.Channel.Username == nil {
+		return nil, errPeerIDInvalid
+	}
+
+	full := &tg.ChannelFull{
+		ID:             snapshot.Channel.ID,
+		About:          snapshot.Channel.About,
+		ChatPhoto:      &tg.PhotoEmpty{},
+		NotifySettings: tg.PeerNotifySettings{},
+	}
+	full.SetParticipantsCount(int(snapshot.ParticipantsCount))
+	canViewParticipants := member && (snapshot.Channel.Megagroup || snapshot.Member.Role >= channelRoleAdmin)
+	full.SetCanViewParticipants(canViewParticipants)
+	if member {
+		full.Pts = snapshot.Pts
+	}
+
+	var users []tg.UserClass
+	if member && snapshot.Member.Role >= channelRoleAdmin {
+		full.SetAdminsCount(int(snapshot.AdminsCount))
+		// ChannelFull uses one flag for both counts. This server does not retain
+		// removed-participant history, so there is no independent kicked count.
+		full.SetBannedCount(int(snapshot.BannedCount))
+		if snapshot.HasInvite {
+			full.SetExportedInvite(&tg.ChatInviteExported{
+				Link:      inviteLinkPrefix + snapshot.InviteHash,
+				AdminID:   snapshot.InviteCreatorID,
+				Date:      int(snapshot.InviteDate.Unix()),
+				Permanent: true,
+			})
+			users, err = h.loadUsers(r.Ctx, map[int64]bool{snapshot.InviteCreatorID: true}, r.UserID)
+			if err != nil {
+				h.log.Error("get full channel invite user", "channel_id", channelID, "err", err)
+				return nil, errInternal
+			}
+		}
+	}
+
+	var chat tg.ChatClass
+	if member {
+		chat = h.channelToTL(snapshot.Channel, snapshot.Member, true, r.UserID)
+		if channel, ok := chat.(*tg.Channel); ok && snapshot.Channel.Username != nil {
+			channel.Username = *snapshot.Channel.Username
+		}
+	} else {
+		chat = h.channelToTLPublic(snapshot.Channel, snapshot.ParticipantsCount, r.UserID)
+	}
+	return &tg.MessagesChatFull{
+		FullChat: full,
+		Chats:    []tg.ChatClass{chat},
+		Users:    users,
+	}, nil
+}
+
 // handleGetChannels serves channels.getChannels. Rendering goes through
 // loadChannels with the caller as viewer, which is the whole authorization
 // boundary: a non-member or banned caller gets tg.ChannelForbidden and never a
@@ -1129,4 +1213,87 @@ func (h *handlers) handleEditChannelUsername(r *mtproto.Request) (bin.Encoder, e
 		}
 	}
 	return &tg.BoolTrue{}, nil
+}
+
+// handleCheckChannelUsername reports whether a valid username is available.
+// InputChannelEmpty is used while creating a channel; a concrete channel may
+// only be checked by one of its non-banned admins. Every authorized, valid
+// check consumes the shared username lookup budget before the namespace lookup.
+func (h *handlers) handleCheckChannelUsername(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsCheckUsernameRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if !validateUsername(req.Username) || isReservedUsername(req.Username) {
+		return nil, errUsernameInvalid
+	}
+	username := strings.ToLower(req.Username)
+
+	switch req.Channel.(type) {
+	case *tg.InputChannelEmpty:
+		// A signed-in account may check a name before it has created a channel.
+	case *tg.InputChannel:
+		channelID, err := h.inputChannelID(req.Channel, r.UserID)
+		if err != nil {
+			return nil, err
+		}
+		member, err := h.requireChannelMember(r.Ctx, channelID, r.UserID)
+		if err != nil {
+			return nil, err
+		}
+		if member.Role < 1 {
+			return nil, errChatAdminRequired
+		}
+	default:
+		return nil, errPeerIDInvalid
+	}
+
+	if err := h.store.CheckAndChargeUsernameLookup(r.Ctx, r.UserID, username); err != nil {
+		if errors.Is(err, store.ErrUsernameLookupQuotaExceeded) {
+			return nil, errUsernameLookupFloodWait
+		}
+		h.log.Error("check channel username: quota", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	_, occupied, err := h.store.UsernameByHandle(r.Ctx, username)
+	if err != nil {
+		h.log.Error("check channel username: lookup", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if occupied {
+		return &tg.BoolFalse{}, nil
+	}
+	return &tg.BoolTrue{}, nil
+}
+
+// handleGetAdminedPublicChannels returns the caller's own public channels where
+// they remain a non-banned admin or creator. Store filtering is caller-scoped;
+// each returned peer is rendered with the caller's access hash.
+func (h *handlers) handleGetAdminedPublicChannels(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsGetAdminedPublicChannelsRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+
+	admined, err := h.store.AdminedPublicChannels(r.Ctx, r.UserID)
+	if err != nil {
+		h.log.Error("get administered public channels", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+
+	chats := make([]tg.ChatClass, len(admined))
+	for i, entry := range admined {
+		chats[i] = h.channelToTL(entry.Channel, store.ChannelMember{
+			UserID: r.UserID,
+			Role:   entry.Role,
+		}, true, r.UserID)
+	}
+	return &tg.MessagesChats{Chats: chats}, nil
 }

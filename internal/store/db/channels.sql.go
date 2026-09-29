@@ -11,6 +11,87 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const adminedPublicChannels = `-- name: AdminedPublicChannels :many
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
+       c.pinned_message_id, un.handle, p.role
+FROM channel_participants p
+JOIN channels c ON c.id = p.channel_id
+JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
+WHERE p.user_id = $1
+  AND p.role >= 1
+  AND (p.banned_until IS NULL OR p.banned_until <= now())
+ORDER BY c.id
+`
+
+type AdminedPublicChannelsRow struct {
+	ID              int64
+	Title           string
+	About           string
+	CreatorID       int64
+	Megagroup       bool
+	Version         int32
+	Date            pgtype.Timestamptz
+	PinnedMessageID *int32
+	Handle          string
+	Role            int16
+}
+
+// AdminedPublicChannels is scoped to the caller's own current admin rows. The
+// usernames row is the authority for publicness and for the handle we return;
+// channels.username is only a denormalized copy.
+func (q *Queries) AdminedPublicChannels(ctx context.Context, userID int64) ([]AdminedPublicChannelsRow, error) {
+	rows, err := q.db.Query(ctx, adminedPublicChannels, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AdminedPublicChannelsRow
+	for rows.Next() {
+		var i AdminedPublicChannelsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.About,
+			&i.CreatorID,
+			&i.Megagroup,
+			&i.Version,
+			&i.Date,
+			&i.PinnedMessageID,
+			&i.Handle,
+			&i.Role,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const channelActiveInviteByChannel = `-- name: ChannelActiveInviteByChannel :one
+SELECT hash, channel_id, creator_id, date, revoked_at FROM channel_invites
+WHERE channel_id = $1 AND revoked_at IS NULL
+ORDER BY date DESC, hash DESC
+LIMIT 1
+`
+
+// ChannelActiveInviteByChannel returns one existing active invite for a full
+// info response. It is read-only; getFullChannel never creates or rotates one.
+func (q *Queries) ChannelActiveInviteByChannel(ctx context.Context, channelID int64) (ChannelInvite, error) {
+	row := q.db.QueryRow(ctx, channelActiveInviteByChannel, channelID)
+	var i ChannelInvite
+	err := row.Scan(
+		&i.Hash,
+		&i.ChannelID,
+		&i.CreatorID,
+		&i.Date,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
 const channelByID = `-- name: ChannelByID :one
 SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable FROM channels WHERE id = $1
 `
@@ -137,6 +218,32 @@ func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Ch
 		return nil, err
 	}
 	return items, nil
+}
+
+const channelFullInfoStats = `-- name: ChannelFullInfoStats :one
+SELECT
+    count(*)::bigint AS participants_count,
+    count(*) FILTER (WHERE role >= 1 AND (banned_until IS NULL OR banned_until <= now()))::bigint AS admins_count,
+    count(*) FILTER (WHERE banned_until > now())::bigint AS banned_count
+FROM channel_participants
+WHERE channel_id = $1
+`
+
+type ChannelFullInfoStatsRow struct {
+	ParticipantsCount int64
+	AdminsCount       int64
+	BannedCount       int64
+}
+
+// ChannelFullInfoStats is read in the same repeatable-read transaction as the
+// channel and viewer membership. The public participant count keeps the
+// existing row-count meaning used by the public channel renderer; administrative
+// counts include only current admins and bans.
+func (q *Queries) ChannelFullInfoStats(ctx context.Context, channelID int64) (ChannelFullInfoStatsRow, error) {
+	row := q.db.QueryRow(ctx, channelFullInfoStats, channelID)
+	var i ChannelFullInfoStatsRow
+	err := row.Scan(&i.ParticipantsCount, &i.AdminsCount, &i.BannedCount)
+	return i, err
 }
 
 const channelInviteByHash = `-- name: ChannelInviteByHash :one

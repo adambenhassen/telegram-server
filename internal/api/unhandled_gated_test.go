@@ -7,10 +7,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
 )
 
 // provisionalBody drives the gated fallback through a body positioned at the
@@ -138,6 +143,55 @@ func TestGatedFallbackSharesTheBudgetWithNonProvisional(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestHelpPromoSharesTheUnsupportedBudget drives a registered polling method
+// and an unrelated fallback method through the same connection budget.
+func TestHelpPromoSharesTheUnsupportedBudget(t *testing.T) {
+	t.Parallel()
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := api.New(nil, 2, api.DefaultConfig(2, "127.0.0.1", 0), slog.New(slog.DiscardHandler), false, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)
+	conn, _ := gatedConn()
+	conn.SetClock(&testClock{now: time.Now()})
+	log := slog.New(slog.DiscardHandler)
+
+	for call := 1; call <= 300; call++ {
+		var err error
+		if call%2 == 1 {
+			req := helpPromoRequest(t)
+			err = handler.OnMessage(conn, req)
+		} else {
+			err = api.UnhandledForTest(log, conn, registerDeviceBody(t))
+		}
+		switch {
+		case call <= 64:
+			rpc := mustRPCError(t, err)
+			if rpc.Code != 400 || rpc.Message != "INPUT_METHOD_INVALID" {
+				t.Fatalf("call %d: %d %s, want 400 INPUT_METHOD_INVALID", call, rpc.Code, rpc.Message)
+			}
+		case call < 256:
+			rpc := mustRPCError(t, err)
+			if rpc.Code != 420 || rpc.Message != "FLOOD_WAIT_30" {
+				t.Fatalf("call %d: %d %s, want 420 FLOOD_WAIT_30", call, rpc.Code, rpc.Message)
+			}
+		default:
+			if err == nil || asRPC(err) {
+				t.Fatalf("call %d: err = %v, want non-RPC connection-close signal", call, err)
+			}
+		}
+	}
+}
+
+func helpPromoRequest(t *testing.T) *mtproto.Request {
+	t.Helper()
+	var buf bin.Buffer
+	if err := (&tg.HelpGetPromoDataRequest{}).Encode(&buf); err != nil {
+		t.Fatalf("encode help.getPromoData: %v", err)
+	}
+	return &mtproto.Request{Ctx: context.Background(), Buf: &buf}
 }
 
 // TestGatedFallbackSamplesTheLog covers the second cost of the burst on the
