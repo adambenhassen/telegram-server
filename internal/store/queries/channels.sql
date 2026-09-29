@@ -126,6 +126,20 @@ JOIN channel_participants p ON p.channel_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id;
 
+-- AdminedPublicChannels is scoped to the caller's own current admin rows. The
+-- usernames row is the authority for publicness and for the handle we return;
+-- channels.username is only a denormalized copy.
+-- name: AdminedPublicChannels :many
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
+       c.pinned_message_id, un.handle, p.role
+FROM channel_participants p
+JOIN channels c ON c.id = p.channel_id
+JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
+WHERE p.user_id = $1
+  AND p.role >= 1
+  AND (p.banned_until IS NULL OR p.banned_until <= now())
+ORDER BY c.id;
+
 -- SetChannelPinnedMessage sets or clears the pinned message id on a channel.
 -- The pinned_message_id is the local_id of the pinned channel post. NULL clears
 -- the pin.

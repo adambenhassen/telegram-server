@@ -228,8 +228,9 @@ func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
 // ChatForbidden: the row still changes after someone leaves, but the client is
 // no longer entitled to its live metadata.
 //
-// M7 stores no username, participants count or admin rights, so none is ever set
-// here. store.Channel.Version has no wire counterpart either: unlike tg.Chat, the
+// The member view includes a username only for a public channel. Participant
+// counts and admin rights are rendered by their dedicated RPCs.
+// store.Channel.Version has no wire counterpart either: unlike tg.Chat, the
 // current tg.Channel schema carries no version field.
 //
 // Photo is chatPhotoEmpty rather than left nil, the same as chatToTL: the field
@@ -242,7 +243,7 @@ func (h *handlers) channelToTL(c store.Channel, m store.ChannelMember, member bo
 	if !member {
 		return &tg.ChannelForbidden{ID: c.ID, AccessHash: ah, Title: ""}
 	}
-	return &tg.Channel{
+	ch := &tg.Channel{
 		ID:         c.ID,
 		Title:      c.Title,
 		AccessHash: ah,
@@ -253,6 +254,10 @@ func (h *handlers) channelToTL(c store.Channel, m store.ChannelMember, member bo
 		Left:       false,
 		Photo:      &tg.ChatPhotoEmpty{},
 	}
+	if c.Username != nil {
+		ch.Username = *c.Username
+	}
+	return ch
 }
 
 // userToTL maps a stored user to the wire tg.User. AccessHash is derived for
