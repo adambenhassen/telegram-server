@@ -379,6 +379,11 @@ Account creation through `auth.signUp` is controlled by `TG_REGISTRATION`.
 invite, while `TG_REGISTRATION=open` admits the username without one. Existing
 accounts are unaffected.
 
+When enabled, every `auth.signUp` attempt past the registration-mode gate uses
+one `sign_up_ip` network-budget token, including attempts rejected because of
+an internal server error. Closed or unknown mode uses no token. Tokens are not
+refunded.
+
 Both admission modes use the same account-creation flow:
 
 ```

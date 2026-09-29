@@ -109,6 +109,8 @@ type handlers struct {
 	rateLimitUpdateProfile store.RateLimitConfig
 	// registrationMode controls whether auth.signUp is available.
 	registrationMode config.RegistrationMode
+	// Sign-up rejection records are sampled independently by fixed reason class.
+	signUpRejectionLogs signUpRejectionSampler
 	// rateLimitMetrics records only client-visible fixed-surface FLOOD_WAITs.
 	// It is process-local and optional so tests and embedders without admin
 	// telemetry retain the same enforcement behaviour.
