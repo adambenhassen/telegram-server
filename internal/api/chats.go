@@ -25,6 +25,10 @@ const (
 	// defence in depth — but a Vector<InputUser> can carry ~1.3M ids inside
 	// gotd's 16 MB frame, and rejecting here spares even the per-id lookups.
 	maxChatUsers = 200
+	// maxGetChatIDs bounds the basic-chat metadata read before it reaches the
+	// store. Each chat contributes at most one participant and inviter id per
+	// member to its bounded profile hydration.
+	maxGetChatIDs = 100
 )
 
 // chatTitle validates a client-supplied chat title and returns the trimmed form
@@ -245,4 +249,114 @@ func (h *handlers) handleEditChatTitle(r *mtproto.Request) (bin.Encoder, error) 
 		return nil, errInternal
 	}
 	return ups, nil
+}
+
+func (h *handlers) handleGetFullChat(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesGetFullChatRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if req.ChatID <= 0 {
+		return nil, errPeerIDInvalid
+	}
+
+	snapshot, err := h.store.ChatInfoForMemberSnapshot(r.Ctx, r.UserID, []int64{req.ChatID})
+	if err != nil {
+		h.log.Error("get full chat", "chat_id", req.ChatID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	chat, ok := snapshot.Chats[req.ChatID]
+	if !ok {
+		return nil, errPeerIDInvalid
+	}
+	participants := snapshot.Participants[req.ChatID]
+	wireFull := &tg.ChatFull{
+		ID:             chat.ID,
+		About:          "",
+		Participants:   chatParticipantsToTL(chat, participants),
+		NotifySettings: tg.PeerNotifySettings{},
+	}
+	wireFull.SetChatPhoto(&tg.PhotoEmpty{})
+
+	return &tg.MessagesChatFull{
+		FullChat: wireFull,
+		Chats:    []tg.ChatClass{chatToTL(chat, len(participants), r.UserID)},
+		Users:    h.chatInfoUsers(snapshot, r.UserID),
+	}, nil
+}
+
+func (h *handlers) handleGetChats(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesGetChatsRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if len(req.ID) > maxGetChatIDs {
+		return nil, errLimitInvalid
+	}
+
+	chatIDs := make([]int64, 0, len(req.ID))
+	seen := make(map[int64]bool, len(req.ID))
+	for _, id := range req.ID {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		chatIDs = append(chatIDs, id)
+	}
+
+	snapshot, err := h.store.ChatInfoForMemberSnapshot(r.Ctx, r.UserID, chatIDs)
+	if err != nil {
+		h.log.Error("get chats", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	chats := make([]tg.ChatClass, 0, len(chatIDs))
+	for _, id := range chatIDs {
+		chat, ok := snapshot.Chats[id]
+		if !ok {
+			chats = append(chats, &tg.ChatForbidden{ID: id, Title: ""})
+			continue
+		}
+		chats = append(chats, chatToTL(chat, len(snapshot.Participants[id]), r.UserID))
+	}
+	return &tg.MessagesChats{Chats: chats}, nil
+}
+
+func chatParticipantsToTL(chat store.Chat, participants []store.Participant) *tg.ChatParticipants {
+	wireParticipants := make([]tg.ChatParticipantClass, 0, len(participants))
+	for _, participant := range participants {
+		if participant.UserID == chat.CreatorID {
+			wireParticipants = append(wireParticipants, &tg.ChatParticipantCreator{UserID: participant.UserID})
+			continue
+		}
+		wireParticipants = append(wireParticipants, &tg.ChatParticipant{
+			UserID:    participant.UserID,
+			InviterID: participant.InviterID,
+			Date:      int(participant.Date.Unix()),
+		})
+	}
+	return &tg.ChatParticipants{ChatID: chat.ID, Participants: wireParticipants, Version: chat.Version}
+}
+
+func (h *handlers) chatInfoUsers(snapshot store.ChatInfoSnapshot, viewerID int64) []tg.UserClass {
+	ids := make([]int64, 0, len(snapshot.Users))
+	for id := range snapshot.Users {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	users := make([]tg.UserClass, 0, len(ids))
+	for _, id := range ids {
+		user := snapshot.Users[id]
+		if id != viewerID && !snapshot.EntitledUsers[id] {
+			users = append(users, &tg.UserEmpty{ID: id})
+			continue
+		}
+		users = append(users, h.userToTL(user, viewerID, id == viewerID))
+	}
+	return users
 }
