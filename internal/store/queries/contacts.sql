@@ -16,6 +16,11 @@ ON CONFLICT (owner_id, contact_id) DO NOTHING;
 DELETE FROM user_contacts
 WHERE owner_id = $1 AND contact_id = $2;
 
+-- name: DeleteContacts :execrows
+DELETE FROM user_contacts
+WHERE owner_id = sqlc.arg(owner_id)
+  AND contact_id = ANY(sqlc.arg(contact_ids)::bigint[]);
+
 -- name: ListContacts :many
 SELECT uc.contact_id,
        EXISTS (
@@ -26,4 +31,16 @@ SELECT uc.contact_id,
        COUNT(*) OVER () AS total
 FROM user_contacts uc
 WHERE uc.owner_id = $1
+ORDER BY uc.contact_id;
+
+-- name: ContactStates :many
+SELECT uc.contact_id,
+       EXISTS (
+           SELECT 1 FROM user_contacts reverse
+           WHERE reverse.owner_id = uc.contact_id
+             AND reverse.contact_id = uc.owner_id
+       ) AS mutual
+FROM user_contacts uc
+WHERE uc.owner_id = $1
+  AND uc.contact_id = ANY(sqlc.arg(contact_ids)::bigint[])
 ORDER BY uc.contact_id;

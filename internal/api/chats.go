@@ -279,11 +279,16 @@ func (h *handlers) handleGetFullChat(r *mtproto.Request) (bin.Encoder, error) {
 		NotifySettings: tg.PeerNotifySettings{},
 	}
 	wireFull.SetChatPhoto(&tg.PhotoEmpty{})
+	users, err := h.chatInfoUsers(r.Ctx, snapshot, r.UserID)
+	if err != nil {
+		h.log.Error("get full chat users", "chat_id", req.ChatID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
 
 	return &tg.MessagesChatFull{
 		FullChat: wireFull,
 		Chats:    []tg.ChatClass{chatToTL(chat, len(participants), r.UserID)},
-		Users:    h.chatInfoUsers(snapshot, r.UserID),
+		Users:    users,
 	}, nil
 }
 
@@ -342,12 +347,22 @@ func chatParticipantsToTL(chat store.Chat, participants []store.Participant) *tg
 	return &tg.ChatParticipants{ChatID: chat.ID, Participants: wireParticipants, Version: chat.Version}
 }
 
-func (h *handlers) chatInfoUsers(snapshot store.ChatInfoSnapshot, viewerID int64) []tg.UserClass {
+func (h *handlers) chatInfoUsers(ctx context.Context, snapshot store.ChatInfoSnapshot, viewerID int64) ([]tg.UserClass, error) {
 	ids := make([]int64, 0, len(snapshot.Users))
 	for id := range snapshot.Users {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
+	contactIDs := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id == viewerID || snapshot.EntitledUsers[id] {
+			contactIDs = append(contactIDs, id)
+		}
+	}
+	contactStates, err := h.contactStatesForUsers(ctx, viewerID, contactIDs)
+	if err != nil {
+		return nil, err
+	}
 	users := make([]tg.UserClass, 0, len(ids))
 	for _, id := range ids {
 		user := snapshot.Users[id]
@@ -355,7 +370,7 @@ func (h *handlers) chatInfoUsers(snapshot store.ChatInfoSnapshot, viewerID int64
 			users = append(users, &tg.UserEmpty{ID: id})
 			continue
 		}
-		users = append(users, h.userToTL(user, viewerID, id == viewerID))
+		users = append(users, h.userToTL(user, viewerID, id == viewerID, contactStates[id]))
 	}
-	return users
+	return users, nil
 }

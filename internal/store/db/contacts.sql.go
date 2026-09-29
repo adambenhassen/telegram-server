@@ -28,6 +28,49 @@ func (q *Queries) ContactExists(ctx context.Context, arg ContactExistsParams) (b
 	return exists, err
 }
 
+const contactStates = `-- name: ContactStates :many
+SELECT uc.contact_id,
+       EXISTS (
+           SELECT 1 FROM user_contacts reverse
+           WHERE reverse.owner_id = uc.contact_id
+             AND reverse.contact_id = uc.owner_id
+       ) AS mutual
+FROM user_contacts uc
+WHERE uc.owner_id = $1
+  AND uc.contact_id = ANY($2::bigint[])
+ORDER BY uc.contact_id
+`
+
+type ContactStatesParams struct {
+	OwnerID    int64
+	ContactIds []int64
+}
+
+type ContactStatesRow struct {
+	ContactID int64
+	Mutual    bool
+}
+
+func (q *Queries) ContactStates(ctx context.Context, arg ContactStatesParams) ([]ContactStatesRow, error) {
+	rows, err := q.db.Query(ctx, contactStates, arg.OwnerID, arg.ContactIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ContactStatesRow
+	for rows.Next() {
+		var i ContactStatesRow
+		if err := rows.Scan(&i.ContactID, &i.Mutual); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countContacts = `-- name: CountContacts :one
 SELECT COUNT(*) FROM user_contacts WHERE owner_id = $1
 `
@@ -51,6 +94,25 @@ type DeleteContactParams struct {
 
 func (q *Queries) DeleteContact(ctx context.Context, arg DeleteContactParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteContact, arg.OwnerID, arg.ContactID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteContacts = `-- name: DeleteContacts :execrows
+DELETE FROM user_contacts
+WHERE owner_id = $1
+  AND contact_id = ANY($2::bigint[])
+`
+
+type DeleteContactsParams struct {
+	OwnerID    int64
+	ContactIds []int64
+}
+
+func (q *Queries) DeleteContacts(ctx context.Context, arg DeleteContactsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteContacts, arg.OwnerID, arg.ContactIds)
 	if err != nil {
 		return 0, err
 	}

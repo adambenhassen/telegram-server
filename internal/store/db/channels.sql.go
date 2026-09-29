@@ -11,6 +11,65 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const adminedPublicChannels = `-- name: AdminedPublicChannels :many
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date,
+       c.pinned_message_id, un.handle, p.role
+FROM channel_participants p
+JOIN channels c ON c.id = p.channel_id
+JOIN usernames un ON un.owner_type = 'channel' AND un.owner_id = c.id
+WHERE p.user_id = $1
+  AND p.role >= 1
+  AND (p.banned_until IS NULL OR p.banned_until <= now())
+ORDER BY c.id
+`
+
+type AdminedPublicChannelsRow struct {
+	ID              int64
+	Title           string
+	About           string
+	CreatorID       int64
+	Megagroup       bool
+	Version         int32
+	Date            pgtype.Timestamptz
+	PinnedMessageID *int32
+	Handle          string
+	Role            int16
+}
+
+// AdminedPublicChannels is scoped to the caller's own current admin rows. The
+// usernames row is the authority for publicness and for the handle we return;
+// channels.username is only a denormalized copy.
+func (q *Queries) AdminedPublicChannels(ctx context.Context, userID int64) ([]AdminedPublicChannelsRow, error) {
+	rows, err := q.db.Query(ctx, adminedPublicChannels, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AdminedPublicChannelsRow
+	for rows.Next() {
+		var i AdminedPublicChannelsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.About,
+			&i.CreatorID,
+			&i.Megagroup,
+			&i.Version,
+			&i.Date,
+			&i.PinnedMessageID,
+			&i.Handle,
+			&i.Role,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const channelActiveInviteByChannel = `-- name: ChannelActiveInviteByChannel :one
 SELECT hash, channel_id, creator_id, date, revoked_at FROM channel_invites
 WHERE channel_id = $1 AND revoked_at IS NULL

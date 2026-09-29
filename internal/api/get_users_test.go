@@ -232,6 +232,49 @@ func TestGetHistoryRejectsInvalidUserPeersBeforeStorage(t *testing.T) {
 	}
 }
 
+func TestGetUsersRendersViewerContactState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	owner, err := s.CreateUser(ctx, "15551290011")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := s.CreateUser(ctx, "15551290012")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.CreateUser(ctx, "15551290013")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddContact(ctx, owner.ID, peer.ID); err != nil {
+		t.Fatal(err)
+	}
+	input := api.InputUser(owner.ID, peer.ID)
+
+	oneSided := getUsersForTest(t, s, owner.ID, input)
+	ownerPeer, ok := oneSided.Elems[0].(*tg.User)
+	if !ok || !ownerPeer.Contact || ownerPeer.MutualContact {
+		t.Fatalf("one-sided peer = %#v, want contact=true mutual_contact=false", oneSided.Elems[0])
+	}
+
+	if _, err := s.AddContact(ctx, peer.ID, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	mutual := getUsersForTest(t, s, owner.ID, input)
+	mutualPeer, ok := mutual.Elems[0].(*tg.User)
+	if !ok || !mutualPeer.Contact || !mutualPeer.MutualContact {
+		t.Fatalf("mutual peer = %#v, want contact=true mutual_contact=true", mutual.Elems[0])
+	}
+
+	otherPeer := getUsersForTest(t, s, other.ID, api.InputUser(other.ID, peer.ID))
+	otherUser, ok := otherPeer.Elems[0].(*tg.User)
+	if !ok || otherUser.Contact || otherUser.MutualContact {
+		t.Fatalf("other viewer peer = %#v, want contact=false mutual_contact=false", otherPeer.Elems[0])
+	}
+}
+
 func TestGetUsersRejectsInvalidReferencesWithoutExistenceOracle(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
