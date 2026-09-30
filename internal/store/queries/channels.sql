@@ -38,6 +38,60 @@ SELECT * FROM channel_participants WHERE channel_id = $1 ORDER BY user_id;
 -- name: ChannelParticipantByUser :one
 SELECT * FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
 
+-- Participant list reads run in one repeatable-read transaction with the
+-- viewer's membership check. The handler chooses only filters it can serve;
+-- both the count and page use the same filter so offsets cannot disclose rows
+-- outside the selected set.
+-- name: ChannelParticipantsPageCount :one
+SELECT count(*)::bigint
+FROM channel_participants cp
+JOIN users u ON u.id = cp.user_id
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = cp.user_id
+WHERE cp.channel_id = sqlc.arg(channel_id)::bigint
+  AND (
+      (sqlc.arg(filter)::int = 0 AND (cp.banned_until IS NULL OR cp.banned_until <= now()))
+      OR (sqlc.arg(filter)::int = 1 AND cp.role >= 1 AND (cp.banned_until IS NULL OR cp.banned_until <= now()))
+      OR (sqlc.arg(filter)::int IN (2, 3) AND cp.banned_until > now())
+      OR (sqlc.arg(filter)::int = 4 AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+          AND (u.name_tsv @@ plainto_tsquery('simple', sqlc.arg(query)::text)
+               OR strpos(lower(COALESCE(un.handle, '')), lower(sqlc.arg(query)::text)) > 0))
+      OR (sqlc.arg(filter)::int = 5 AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+          AND EXISTS (
+              SELECT 1 FROM user_contacts uc
+              WHERE uc.owner_id = sqlc.arg(viewer_id)::bigint
+                AND uc.contact_id = cp.user_id
+          ))
+  )
+  AND (sqlc.arg(filter)::int NOT IN (2, 3) OR sqlc.arg(query)::text = ''
+       OR u.name_tsv @@ plainto_tsquery('simple', sqlc.arg(query)::text)
+       OR strpos(lower(COALESCE(un.handle, '')), lower(sqlc.arg(query)::text)) > 0);
+
+-- name: ChannelParticipantsPage :many
+SELECT cp.*
+FROM channel_participants cp
+JOIN users u ON u.id = cp.user_id
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = cp.user_id
+WHERE cp.channel_id = sqlc.arg(channel_id)::bigint
+  AND (
+      (sqlc.arg(filter)::int = 0 AND (cp.banned_until IS NULL OR cp.banned_until <= now()))
+      OR (sqlc.arg(filter)::int = 1 AND cp.role >= 1 AND (cp.banned_until IS NULL OR cp.banned_until <= now()))
+      OR (sqlc.arg(filter)::int IN (2, 3) AND cp.banned_until > now())
+      OR (sqlc.arg(filter)::int = 4 AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+          AND (u.name_tsv @@ plainto_tsquery('simple', sqlc.arg(query)::text)
+               OR strpos(lower(COALESCE(un.handle, '')), lower(sqlc.arg(query)::text)) > 0))
+      OR (sqlc.arg(filter)::int = 5 AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+          AND EXISTS (
+              SELECT 1 FROM user_contacts uc
+              WHERE uc.owner_id = sqlc.arg(viewer_id)::bigint
+                AND uc.contact_id = cp.user_id
+          ))
+  )
+  AND (sqlc.arg(filter)::int NOT IN (2, 3) OR sqlc.arg(query)::text = ''
+       OR u.name_tsv @@ plainto_tsquery('simple', sqlc.arg(query)::text)
+       OR strpos(lower(COALESCE(un.handle, '')), lower(sqlc.arg(query)::text)) > 0)
+ORDER BY cp.user_id
+LIMIT sqlc.arg(page_limit)::int OFFSET sqlc.arg(page_offset)::int;
+
 -- ChannelFullInfoStats is read in the same repeatable-read transaction as the
 -- channel and viewer membership. The public participant count keeps the
 -- existing row-count meaning used by the public channel renderer; administrative
