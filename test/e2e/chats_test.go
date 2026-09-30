@@ -610,6 +610,18 @@ func TestChatsRealtime(t *testing.T) {
 	// Seed a separate user-peer history after each owner's group service rows so
 	// all three copies have owner-local ids above the around-unread boundary.
 	peerAB, peerBA := peerUser(aUserID, bUserID), peerUser(bUserID, aUserID)
+	// Advance only B's local id space so an A-owned copy cannot pass B's
+	// expected-id assertion by coincidence.
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerUser(bUserID, cUserID), Message: "owner id spacer", RandomID: 100100,
+		})
+		return err
+	})
+	spacerUpdate := recvOrCtx(t, ctx, collC.newMsg, "C owner id spacer user-peer update")
+	if spacerUpdate.Message != "owner id spacer" {
+		t.Fatalf("C owner id spacer update = %q, want %q", spacerUpdate.Message, "owner id spacer")
+	}
 	for _, message := range []struct {
 		cmds     chan command
 		peer     tg.InputPeerClass
@@ -633,14 +645,79 @@ func TestChatsRealtime(t *testing.T) {
 		}
 	}
 	wantUserTexts := []string{"user newest", "user middle", "user oldest"}
+	type userHistoryCopy struct {
+		localID int64
+		out     bool
+	}
+	storedCopies := map[int64]map[string]userHistoryCopy{
+		aUserID: {},
+		bUserID: {},
+	}
+	for _, ownerPeer := range []struct{ ownerID, peerID int64 }{
+		{aUserID, bUserID},
+		{bUserID, aUserID},
+	} {
+		rows, err := st.History(ctx, ownerPeer.ownerID, store.PeerTypeUser, ownerPeer.peerID, 0, 50)
+		if err != nil {
+			t.Fatalf("load %d's user-peer rows: %v", ownerPeer.ownerID, err)
+		}
+		for _, row := range rows {
+			switch row.Text {
+			case "user oldest", "user middle", "user newest":
+				storedCopies[ownerPeer.ownerID][row.Text] = userHistoryCopy{localID: row.LocalID, out: row.Out}
+			}
+		}
+	}
+	senderByText := map[string]int64{
+		"user oldest": aUserID,
+		"user middle": bUserID,
+		"user newest": aUserID,
+	}
+	for _, text := range wantUserTexts {
+		aCopy, haveA := storedCopies[aUserID][text]
+		bCopy, haveB := storedCopies[bUserID][text]
+		if !haveA || !haveB {
+			t.Fatalf("stored copies for %q: A=%t B=%t, want both owners", text, haveA, haveB)
+		}
+		if aCopy.localID == bCopy.localID {
+			t.Fatalf("stored copies for %q share local id %d, want distinct owner ids", text, aCopy.localID)
+		}
+		wantAOut := senderByText[text] == aUserID
+		wantBOut := senderByText[text] == bUserID
+		if aCopy.out != wantAOut || bCopy.out != wantBOut || aCopy.out == bCopy.out {
+			t.Fatalf("stored copies for %q have Out A=%t B=%t, want inverse A=%t B=%t", text, aCopy.out, bCopy.out, wantAOut, wantBOut)
+		}
+	}
+	assertOwnerCopies := func(who string, ownerID int64, history *tg.MessagesMessages) {
+		t.Helper()
+		for _, msg := range history.Messages {
+			got, ok := msg.(*tg.Message)
+			if !ok || got.Message == "" {
+				continue
+			}
+			want, ok := storedCopies[ownerID][got.Message]
+			if !ok {
+				t.Errorf("%s history contains unexpected message %q", who, got.Message)
+				continue
+			}
+			if int64(got.ID) != want.localID {
+				t.Errorf("%s copy of %q has local id %d, want owner's id %d", who, got.Message, got.ID, want.localID)
+			}
+			if got.Out != want.out {
+				t.Errorf("%s copy of %q has Out=%t, want owner's Out=%t", who, got.Message, got.Out, want.out)
+			}
+		}
+	}
 	for _, userPeer := range []struct {
-		cmds chan command
-		peer tg.InputPeerClass
-		who  string
-	}{{aCmds, peerAB, "A"}, {bCmds, peerBA, "B"}} {
+		cmds    chan command
+		peer    tg.InputPeerClass
+		who     string
+		ownerID int64
+	}{{aCmds, peerAB, "A", aUserID}, {bCmds, peerBA, "B", bUserID}} {
 		around := getHistory(userPeer.cmds, userPeer.peer, 1, -25, 50, userPeer.who)
 		assertTexts(userPeer.who+" around-unread user peer", messageTexts(around), wantUserTexts)
 		assertLocalIDsAboveOne(userPeer.who+" around-unread user peer", around)
+		assertOwnerCopies(userPeer.who+" around-unread user peer", userPeer.ownerID, around)
 
 		newest := getHistory(userPeer.cmds, userPeer.peer, 0, 0, 50, userPeer.who+" newest")
 		assertTexts(userPeer.who+" offset zero", messageTexts(newest), wantUserTexts)
