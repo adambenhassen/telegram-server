@@ -527,7 +527,7 @@ func TestChannelDialogsForUserReturnsChannelsWithTopMessageAndPts(t *testing.T) 
 	}
 }
 
-func TestChannelDialogsForUserSkipsEmptyChannel(t *testing.T) {
+func TestChannelDialogsForUserIncludesEmptyChannel(t *testing.T) {
 	t.Parallel()
 	s := open(t)
 	ctx := context.Background()

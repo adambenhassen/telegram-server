@@ -1511,7 +1511,7 @@ func TestGetDialogsListsTheCallersChannels(t *testing.T) {
 		t.Fatalf("create channel: %v", err)
 	}
 	joinChannelByInvite(t, s, ch, member.ID)
-	// An empty channel has no top message and must not appear in the list.
+	// This empty channel has no membership for member and must not appear.
 	if _, err = s.CreateChannel(ctx, creator.ID, "Empty", "", false); err != nil {
 		t.Fatalf("create empty channel: %v", err)
 	}

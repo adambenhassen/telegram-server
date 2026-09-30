@@ -41,6 +41,14 @@ func (h *handlers) notify(ctx context.Context, userID int64) {
 	}
 }
 
+// notifyChannelMembership asks every replica to push the invited user's own
+// view of a channel after the admission transaction commits.
+func (h *handlers) notifyChannelMembership(ctx context.Context, userID, channelID int64) {
+	if err := h.store.Notify(ctx, store.ChannelUpdates, store.ChannelMembershipPayload(userID, channelID)); err != nil {
+		h.log.Error("notify channel membership", "user_id", userID, "channel_id", channelID, "err", err)
+	}
+}
+
 // notifySend records which authenticated key receives the sender's new-message
 // update in the sendMessage RPC result, so that key can skip only that live echo.
 func (h *handlers) notifySend(ctx context.Context, userID, authKeyID int64, pts int) {

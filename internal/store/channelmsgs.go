@@ -143,8 +143,9 @@ func (s *Store) ChannelPostPts(ctx context.Context, channelID, localID int64) (i
 //
 // Locking: no Go-level lock and no advisory lock, only the channel_state row
 // lock, taken by the LockChannelState read ahead of the dedup lookup and held to
-// commit. That is the ordering every future channel write inherits — the
-// channel's own row first, before any channel_messages or channel_events write.
+// commit. The channel_messages foreign key checks channel_id with KEY SHARE on
+// channels; that is compatible with LockChannel's NO KEY UPDATE lock, allowing
+// the post to commit while an invite waits for channel_state.
 func (s *Store) PostChannelMessage(
 	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64, replyToMsgID int64,
 ) (ChannelMessage, int, bool, error) {

@@ -833,8 +833,9 @@ func currentPts(ctx context.Context, q *db.Queries, aID, bID int64) (int, int, e
 //
 // The argument space is user ids only. Never pass a chat id: advisory locks are
 // one flat int64 space, so chat 7 and user 7 would falsely serialize against each
-// other. A chat serializes on its chats row lock instead, which is always taken
-// before any of these and never inside one.
+// other. Chat send and membership paths take their chats row lock before these;
+// channel admission paths take their channel-specific locks before them. Other
+// call sites document their own lock order.
 func lockOwners(ctx context.Context, tx pgx.Tx, ids ...int64) error {
 	for _, id := range ascendingUnique(ids) {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, id); err != nil {

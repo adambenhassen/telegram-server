@@ -15,7 +15,9 @@ import (
 
 // Postgres LISTEN/NOTIFY channels used for cross-replica update delivery.
 const (
-	ChannelUpdates = "tg_updates"      // payload: "<userID>" or "<userID>|<authKeyID>|<pts>"
+	// ChannelUpdates carries user update nudges. Payloads are a user id, a
+	// sender-suppression tuple, or ChannelMembershipPayload.
+	ChannelUpdates = "tg_updates"
 	ChannelTyping  = "tg_typing"       // payload: "<peerUserID>|<fromUserID>"
 	ChannelEvict   = "tg_evict"        // payload: "<userID>|<authKeyID>"
 	ChannelPost    = "tg_channel_post" // payload: "<channelID>"
@@ -40,9 +42,13 @@ const (
 	ChannelPinned = "tg_pinned"
 )
 
+const channelMembershipPayloadPrefix = "channel_membership|"
+
 type notificationAcceptedAtKey struct{}
 
 type suppressedUpdateKey struct{}
+
+type channelMembershipUpdateKey struct{}
 
 // SuppressedUpdate identifies the sendMessage update that will be returned by
 // an RPC result to one authenticated key. It is carried only to the in-process
@@ -68,6 +74,22 @@ func SuppressedUpdateFromContext(ctx context.Context) (SuppressedUpdate, bool) {
 		return SuppressedUpdate{}, false
 	}
 	return update, true
+}
+
+// WithChannelMembershipUpdate marks a user-update notification as a prompt to
+// push the named channel's membership view to that user.
+func WithChannelMembershipUpdate(ctx context.Context, channelID int64) context.Context {
+	return context.WithValue(ctx, channelMembershipUpdateKey{}, channelID)
+}
+
+// ChannelMembershipUpdateFromContext returns the channel id carried by a
+// membership notification, if this delivery is one.
+func ChannelMembershipUpdateFromContext(ctx context.Context) (int64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	channelID, ok := ctx.Value(channelMembershipUpdateKey{}).(int64)
+	return channelID, ok && channelID > 0
 }
 
 // WithNotificationAcceptedAt carries a valid tg_updates acceptance timestamp
@@ -302,6 +324,22 @@ func (l *Listener) dispatch(
 		}
 		switch n.Channel {
 		case ChannelUpdates:
+			if strings.HasPrefix(n.Payload, channelMembershipPayloadPrefix) {
+				userID, channelID, perr := parseChannelMembershipPayload(n.Payload)
+				if perr != nil {
+					l.recordInvalidNotification()
+					l.log.Warn("bad tg_updates membership payload")
+					continue
+				}
+				l.recordValidNotification(ChannelUpdates)
+				l.schedule("channel-membership:"+strconv.FormatInt(userID, 10)+":"+strconv.FormatInt(channelID, 10), notificationTask{
+					ctx: WithChannelMembershipUpdate(ctx, channelID),
+					run: func(ctx context.Context) {
+						deliver(ctx, userID)
+					},
+				})
+				continue
+			}
 			userID, update, perr := parseUpdatesPayload(n.Payload)
 			if perr != nil {
 				l.recordInvalidNotification()
@@ -507,6 +545,17 @@ func parseUpdatesPayload(payload string) (int64, SuppressedUpdate, error) {
 	return userID, SuppressedUpdate{AuthKeyID: authKeyID, Pts: pts}, nil
 }
 
+func parseChannelMembershipPayload(payload string) (int64, int64, error) {
+	if !strings.HasPrefix(payload, channelMembershipPayloadPrefix) {
+		return 0, 0, errors.New("invalid channel membership payload prefix")
+	}
+	userID, channelID, err := parsePairPayload(strings.TrimPrefix(payload, channelMembershipPayloadPrefix))
+	if err != nil || userID <= 0 || channelID <= 0 {
+		return 0, 0, errors.New("invalid channel membership payload")
+	}
+	return userID, channelID, nil
+}
+
 // recordValidNotification isolates the listener from recorder failures. A
 // recorder is telemetry only: an error or panic must not alter delivery.
 func (l *Listener) recordValidNotification(channel string) {
@@ -561,6 +610,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // ChannelPostPayload formats a tg_channel_post NOTIFY payload from channelID.
 func ChannelPostPayload(channelID int64) string {
 	return strconv.FormatInt(channelID, 10)
+}
+
+// ChannelMembershipPayload formats a tg_updates notification that pushes
+// channelID's viewer-specific membership view to userID.
+func ChannelMembershipPayload(userID, channelID int64) string {
+	return channelMembershipPayloadPrefix + pairPayload(userID, channelID)
 }
 
 // EncryptionPayload formats a tg_encryption NOTIFY payload naming the party to

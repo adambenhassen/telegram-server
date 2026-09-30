@@ -12,10 +12,12 @@ import (
 )
 
 // A chats row lock (SELECT ... FROM chats WHERE id = $1 FOR UPDATE) is the
-// serialisation point for everything that touches one chat's member set. It is
-// always taken BEFORE any lockOwners advisory lock and never inside one, and a
-// transaction locks at most one chats row. lockOwners' argument space is user
-// ids only — never pass a chat id, or chat 7 and user 7 falsely serialise.
+// serialisation point for everything that touches one chat's member set. Chat
+// paths always take it BEFORE any lockOwners advisory lock and never inside one,
+// and a transaction locks at most one chats row. Channel admission also uses
+// lockOwners after its channel-specific locks; see channels.go. lockOwners'
+// argument space is user ids only — never pass a chat id, or chat 7 and user 7
+// falsely serialise.
 //
 // CreateChat does not take it — the chat does not exist yet. The fan-out in
 // fanout.go takes it, and every membership mutation acquires it after
