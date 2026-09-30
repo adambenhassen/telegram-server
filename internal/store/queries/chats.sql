@@ -37,6 +37,12 @@ UPDATE chats SET version = version + 1 WHERE id = $1 RETURNING *;
 -- name: SetChatTitle :one
 UPDATE chats SET title = $2, version = version + 1 WHERE id = $1 RETURNING *;
 
+-- name: SetChatDefaultBannedRights :one
+UPDATE chats
+SET default_banned_rights = $2, version = version + 1
+WHERE id = $1
+RETURNING *;
+
 -- name: IsChatMember :one
 SELECT EXISTS(SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2);
 

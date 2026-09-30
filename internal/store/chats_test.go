@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -382,7 +383,7 @@ func TestSetChatTitleRequiresCreator(t *testing.T) {
 	if !errors.Is(err, store.ErrNotMember) {
 		t.Fatalf("member rename: err = %v, want ErrNotMember", err)
 	}
-	if got != (store.Chat{}) || perOwner != nil {
+	if !reflect.DeepEqual(got, store.Chat{}) || perOwner != nil {
 		t.Fatalf("rejected rename: chat=%+v perOwner=%+v, want zero/nil", got, perOwner)
 	}
 	stored, ok, err := s.ChatByID(ctx, chat.ID)

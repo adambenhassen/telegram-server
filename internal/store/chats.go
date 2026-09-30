@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -31,12 +32,13 @@ const maxChatParticipants = 200
 
 // Chat is a basic group chat.
 type Chat struct {
-	ID              int64
-	Title           string
-	CreatorID       int64
-	Version         int
-	Date            time.Time
-	PinnedMessageID *int32
+	ID                  int64
+	Title               string
+	CreatorID           int64
+	Version             int
+	Date                time.Time
+	PinnedMessageID     *int32
+	DefaultBannedRights []string
 }
 
 // Participant is one member of a chat.
@@ -48,12 +50,13 @@ type Participant struct {
 
 func chatFromRow(r db.Chat) Chat {
 	return Chat{
-		ID:              r.ID,
-		Title:           r.Title,
-		CreatorID:       r.CreatorID,
-		Version:         int(r.Version),
-		Date:            r.Date.Time,
-		PinnedMessageID: r.PinnedMessageID,
+		ID:                  r.ID,
+		Title:               r.Title,
+		CreatorID:           r.CreatorID,
+		Version:             int(r.Version),
+		Date:                r.Date.Time,
+		PinnedMessageID:     r.PinnedMessageID,
+		DefaultBannedRights: r.DefaultBannedRights,
 	}
 }
 
@@ -490,6 +493,51 @@ func (s *Store) SetChatTitle(ctx context.Context, chatID, callerID int64, title 
 		return Chat{}, Message{}, nil, fmt.Errorf("commit: %w", err)
 	}
 	return chatFromRow(row), sender, perOwner, nil
+}
+
+// SetChatDefaultBannedRights replaces a basic chat's default restriction set.
+// Only the current creator may write it. Authorization and equality are both
+// decided under the chat row lock, so an unauthorized caller never learns that
+// a requested value is already stored. changed=false means the authorized
+// request matched the stored set and wrote nothing.
+func (s *Store) SetChatDefaultBannedRights(ctx context.Context, chatID, callerID int64, rights []string) (chat Chat, changed bool, err error) {
+	m, err := s.beginChatMutation(ctx, chatID, callerID)
+	if err != nil {
+		return Chat{}, false, err
+	}
+	defer func() { _ = m.tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	if callerID != m.creatorID {
+		return Chat{}, false, ErrNotMember
+	}
+	if sameChatDefaultRights(m.defaultBannedRights, rights) {
+		if err = m.tx.Commit(ctx); err != nil {
+			return Chat{}, false, fmt.Errorf("commit unchanged default rights: %w", err)
+		}
+		return Chat{}, false, nil
+	}
+
+	row, err := m.qtx.SetChatDefaultBannedRights(ctx, db.SetChatDefaultBannedRightsParams{
+		ID:                  chatID,
+		DefaultBannedRights: rights,
+	})
+	if err != nil {
+		return Chat{}, false, fmt.Errorf("set default banned rights: %w", err)
+	}
+	if err = m.tx.Commit(ctx); err != nil {
+		return Chat{}, false, fmt.Errorf("commit default rights: %w", err)
+	}
+	return chatFromRow(row), true, nil
+}
+
+func sameChatDefaultRights(a, b []string) bool {
+	left := slices.Clone(a)
+	right := slices.Clone(b)
+	slices.Sort(left)
+	slices.Sort(right)
+	left = slices.Compact(left)
+	right = slices.Compact(right)
+	return slices.Equal(left, right)
 }
 
 // ChatsForUser returns every chat the user participates in.
