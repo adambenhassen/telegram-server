@@ -473,6 +473,9 @@ func (h *handlers) sendChannelMessage(r *mtproto.Request, channelID int64, req *
 	// PostChannelMessageAs, never PostChannelMessage: the latter is the
 	// unchecked primitive and trusts its caller to have decided post rights.
 	msg, pts, dup, err := h.store.PostChannelMessageAs(r.Ctx, channelID, r.UserID, req.Message, req.RandomID, nil, replyToMsgID)
+	if slowModeWait, ok := errors.AsType[*store.SlowModeWaitError](err); ok {
+		return nil, rpcErr(420, slowModeWait.Error())
+	}
 	if errors.Is(err, store.ErrChatWriteForbidden) {
 		return nil, errChatWriteForbidden
 	}

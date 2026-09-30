@@ -21,6 +21,16 @@ type ChannelEvent struct {
 	LocalID int64
 }
 
+// SlowModeWaitError reports how many seconds an ordinary megagroup member must
+// wait before their next distinct post.
+type SlowModeWaitError struct {
+	Seconds int
+}
+
+func (e *SlowModeWaitError) Error() string {
+	return fmt.Sprintf("SLOWMODE_WAIT_%d", e.Seconds)
+}
+
 // ChannelMessage is a persisted channel post. Unlike Message there is one row
 // per channel rather than one per member, so it carries no owner and no Out.
 // FileID is nil for "no media" — channel_messages.file_id is a nullable FK,
@@ -167,10 +177,14 @@ func (s *Store) PostChannelMessage(
 // Locking and ordering, which is the point of this function existing rather than
 // the check living in a handler: the channel row and the caller's participant
 // row are read AFTER LockChannelState and before any write, inside the
-// transaction that does the insert. It takes no new lock — the channel_state row
-// lock is already held and the two reads join under it. A handler-level check
-// runs in its own transaction, so a member banned concurrently would still land
-// a post. That ordering is what every future channel write inherits.
+// transaction that does the insert. The same state lock serializes slow-mode
+// checks and marker updates with posts; the marker row is updated only after
+// authorization, deduplication, restrictions, reply validation and event
+// creation succeed. Role, ban and leave mutations can hold channels before a
+// participant row, but do not then acquire channel_state; admission takes
+// channel_state before participant insertion. A handler-level check runs in its
+// own transaction, so a member banned concurrently would still land a post.
+// That ordering is what every future channel write inherits.
 func (s *Store) PostChannelMessageAs(
 	ctx context.Context, channelID, fromID int64, text string, randomID int64, fileID *int64, replyToMsgID int64,
 ) (ChannelMessage, int, bool, error) {
@@ -213,8 +227,8 @@ func (s *Store) postChannelMessage(
 
 	// The authoritative check: under the row lock taken above, before the dedup
 	// read and before any write, so a ban committing concurrently is seen. A
-	// caller with no right to post here must not be able to probe random_ids
-	// either.
+	// caller with no right to post here must not be able to probe random_ids or
+	// slow-mode state either.
 	var role int
 	if checkRights {
 		if role, err = checkPostRights(ctx, qtx, channelID, fromID); err != nil {
@@ -244,17 +258,39 @@ func (s *Store) postChannelMessage(
 			return ChannelMessage{}, 0, false, fmt.Errorf("random_id lookup: %w", e)
 		}
 	}
+	var megagroup bool
 	if checkRights {
-		channel, e := qtx.ChannelByID(ctx, channelID)
+		channel, e := qtx.ChannelPostDefaults(ctx, channelID)
 		switch {
 		case errors.Is(e, pgx.ErrNoRows):
 			return ChannelMessage{}, 0, false, ErrNotMember
 		case e != nil:
-			return ChannelMessage{}, 0, false, fmt.Errorf("channel defaults by id: %w", e)
+			return ChannelMessage{}, 0, false, fmt.Errorf("channel post defaults: %w", e)
 		}
+		megagroup = channel.Megagroup
 		if channel.Megagroup {
 			if err = checkDefaultMessageRestriction(channel.DefaultBannedRights, role >= channelRoleAdmin, fileID != nil, nil); err != nil {
 				return ChannelMessage{}, 0, false, err
+			}
+		}
+	}
+
+	if checkRights && megagroup && role == channelRoleMember {
+		state, e := qtx.ChannelSlowModePostState(ctx, db.ChannelSlowModePostStateParams{
+			ChannelID: channelID,
+			UserID:    fromID,
+		})
+		switch {
+		case errors.Is(e, pgx.ErrNoRows):
+			return ChannelMessage{}, 0, false, ErrNotMember
+		case e != nil:
+			return ChannelMessage{}, 0, false, fmt.Errorf("channel slow-mode post state: %w", e)
+		}
+		if state.SlowmodeSeconds > 0 && state.LastPostAt.Valid {
+			remaining := time.Duration(state.SlowmodeSeconds)*time.Second - state.CheckedAt.Time.Sub(state.LastPostAt.Time)
+			if remaining > 0 {
+				waitSeconds := int((remaining + time.Second - 1) / time.Second)
+				return ChannelMessage{}, 0, false, &SlowModeWaitError{Seconds: waitSeconds}
 			}
 		}
 	}
@@ -292,6 +328,18 @@ func (s *Store) postChannelMessage(
 	}); err != nil {
 		return ChannelMessage{}, 0, false, fmt.Errorf("insert channel event: %w", err)
 	}
+	if checkRights {
+		n, e := qtx.UpdateChannelParticipantLastPostAt(ctx, db.UpdateChannelParticipantLastPostAtParams{
+			ChannelID: channelID,
+			UserID:    fromID,
+		})
+		if e != nil {
+			return ChannelMessage{}, 0, false, fmt.Errorf("update channel last-post time: %w", e)
+		}
+		if n != 1 {
+			return ChannelMessage{}, 0, false, ErrNotMember
+		}
+	}
 
 	stored, err := qtx.ChannelMessageByLocal(ctx, db.ChannelMessageByLocalParams{
 		ChannelID: channelID, LocalID: b.LocalID,
@@ -306,18 +354,12 @@ func (s *Store) postChannelMessage(
 }
 
 // checkPostRights answers whether fromID is a current, unbanned channel poster.
+// No slow-mode comparison occurs until post authorization and default
+// restrictions have passed.
 // Default message restrictions are checked after the dedup read so a committed
 // retry remains idempotent. Every rejection here is ErrNotMember; see
 // PostChannelMessageAs for why they are not distinguishable.
 func checkPostRights(ctx context.Context, qtx *db.Queries, channelID, fromID int64) (int, error) {
-	ch, err := qtx.ChannelByID(ctx, channelID)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return 0, ErrNotMember
-	case err != nil:
-		return 0, fmt.Errorf("channel by id: %w", err)
-	}
-
 	row, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
 		ChannelID: channelID, UserID: fromID,
 	})
@@ -332,8 +374,16 @@ func checkPostRights(ctx context.Context, qtx *db.Queries, channelID, fromID int
 	if member.Banned(time.Now()) {
 		return 0, ErrNotMember
 	}
+
+	megagroup, err := qtx.ChannelMegagroup(ctx, channelID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, ErrNotMember
+	case err != nil:
+		return 0, fmt.Errorf("channel kind: %w", err)
+	}
 	// Broadcast: posting is an admin right. Megagroup: any unbanned participant.
-	if !ch.Megagroup && member.Role < 1 {
+	if !megagroup && member.Role < 1 {
 		return 0, ErrNotMember
 	}
 	return member.Role, nil

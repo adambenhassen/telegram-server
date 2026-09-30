@@ -306,6 +306,20 @@ func (q *Queries) ChannelInviteByHashForUpdate(ctx context.Context, hash string)
 	return i, err
 }
 
+const channelMegagroup = `-- name: ChannelMegagroup :one
+SELECT megagroup FROM channels WHERE id = $1
+`
+
+// ChannelMegagroup reads only the channel kind needed for post authorization.
+// In particular, this check must not fetch slow-mode state before membership
+// and ban authorization has passed.
+func (q *Queries) ChannelMegagroup(ctx context.Context, id int64) (bool, error) {
+	row := q.db.QueryRow(ctx, channelMegagroup, id)
+	var megagroup bool
+	err := row.Scan(&megagroup)
+	return megagroup, err
+}
+
 const channelParticipantByUser = `-- name: ChannelParticipantByUser :one
 SELECT channel_id, user_id, role, banned_until, join_pts, date, last_post_at FROM channel_participants WHERE channel_id = $1 AND user_id = $2
 `
@@ -523,6 +537,55 @@ func (q *Queries) ChannelParticipantsPageCount(ctx context.Context, arg ChannelP
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const channelPostDefaults = `-- name: ChannelPostDefaults :one
+SELECT megagroup, default_banned_rights FROM channels WHERE id = $1
+`
+
+type ChannelPostDefaultsRow struct {
+	Megagroup           bool
+	DefaultBannedRights []string
+}
+
+// ChannelPostDefaults reads the stored restrictions after post authorization
+// and random_id deduplication. Keep slowmode_seconds out of this projection so
+// a default-rights refusal takes precedence without observing slow-mode state.
+func (q *Queries) ChannelPostDefaults(ctx context.Context, id int64) (ChannelPostDefaultsRow, error) {
+	row := q.db.QueryRow(ctx, channelPostDefaults, id)
+	var i ChannelPostDefaultsRow
+	err := row.Scan(&i.Megagroup, &i.DefaultBannedRights)
+	return i, err
+}
+
+const channelSlowModePostState = `-- name: ChannelSlowModePostState :one
+SELECT c.slowmode_seconds, cp.last_post_at, clock_timestamp()::timestamptz AS checked_at
+FROM channels c
+JOIN channel_participants cp ON cp.channel_id = c.id
+WHERE c.id = $1::bigint
+  AND cp.user_id = $2::bigint
+`
+
+type ChannelSlowModePostStateParams struct {
+	ChannelID int64
+	UserID    int64
+}
+
+type ChannelSlowModePostStateRow struct {
+	SlowmodeSeconds int16
+	LastPostAt      pgtype.Timestamptz
+	CheckedAt       pgtype.Timestamptz
+}
+
+// ChannelSlowModePostState is called only after membership, ban, post rights,
+// deduplication and default restrictions are decided. clock_timestamp() is
+// sampled after the caller took channel_state FOR UPDATE, so a transaction that
+// waited for another post cannot compare against a stale transaction start.
+func (q *Queries) ChannelSlowModePostState(ctx context.Context, arg ChannelSlowModePostStateParams) (ChannelSlowModePostStateRow, error) {
+	row := q.db.QueryRow(ctx, channelSlowModePostState, arg.ChannelID, arg.UserID)
+	var i ChannelSlowModePostStateRow
+	err := row.Scan(&i.SlowmodeSeconds, &i.LastPostAt, &i.CheckedAt)
+	return i, err
 }
 
 const channelStateForUpdate = `-- name: ChannelStateForUpdate :one
@@ -1175,6 +1238,29 @@ type UpdateChannelParticipantBanParams struct {
 // the parameter is a pgtype.Timestamptz — the same type the column decodes into.
 func (q *Queries) UpdateChannelParticipantBan(ctx context.Context, arg UpdateChannelParticipantBanParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateChannelParticipantBan, arg.ChannelID, arg.UserID, arg.BannedUntil)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateChannelParticipantLastPostAt = `-- name: UpdateChannelParticipantLastPostAt :execrows
+UPDATE channel_participants
+SET last_post_at = clock_timestamp()
+WHERE channel_id = $1 AND user_id = $2
+`
+
+type UpdateChannelParticipantLastPostAtParams struct {
+	ChannelID int64
+	UserID    int64
+}
+
+// Posts already hold channel_state FOR UPDATE before touching this participant
+// row. Role, ban and leave mutations may hold channels before a participant row,
+// but do not acquire channel_state after it; admission paths take channel_state
+// before inserting participant rows. This preserves a one-way lock order.
+func (q *Queries) UpdateChannelParticipantLastPostAt(ctx context.Context, arg UpdateChannelParticipantLastPostAtParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateChannelParticipantLastPostAt, arg.ChannelID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}
