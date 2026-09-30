@@ -1203,42 +1203,62 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      - name: Check sanitized smoke failure diagnostics
+        run: bash .github/scripts/test-smoke-diagnostics.sh
+
       - name: Run uncached core smoke selector
         timeout-minutes: 5
         shell: bash
         run: |
           output=""
           status=0
-          output=$(go test -count=1 -timeout 2m -v ./test/e2e -run '^TestSmoke' 2>&1) || status=$?
+          output=$(go test -json -count=1 -timeout 2m -v ./test/e2e -run '^TestSmoke' 2>&1) || status=$?
+          source .github/scripts/smoke-diagnostics.sh
+
+          has_test_event() {
+            jq -Re --arg action "$1" --arg test "$2" '
+              fromjson?
+              | select(.Package == "github.com/adambenhassen/telegram-server/test/e2e"
+                  and .Action == $action and (.Test // "") == $test)
+            ' <<<"$output" >/dev/null
+          }
+
           if [ "$status" -ne 0 ]; then
-            echo "::error::TestSmoke failed with exit status $status; test output is suppressed to protect test data"
+            report_smoke_failure_diagnostics <<<"$output"
             exit "$status"
           fi
 
-          if ! grep -Fq -- '=== RUN   TestSmoke' <<<"$output"; then
-            echo "::error::TestSmoke did not run"
-            exit 1
-          fi
-
-          for scenario in one-to-one saved-messages basic-group channel contacts-search username-registration; do
-            if ! grep -Fq -- "=== RUN   TestSmoke/$scenario" <<<"$output"; then
-              echo "::error::TestSmoke/$scenario was not selected"
-              exit 1
-            fi
-            if ! grep -Fq -- "--- PASS: TestSmoke/$scenario" <<<"$output"; then
-              echo "::error::TestSmoke/$scenario did not pass"
+          for test in TestSmoke TestSmoke/one-to-one TestSmoke/saved-messages TestSmoke/basic-group TestSmoke/channel TestSmoke/contacts-search TestSmoke/username-registration; do
+            if has_test_event skip "$test"; then
+              echo "::error::$test was skipped (category: scenario-skipped; details redacted)"
               exit 1
             fi
           done
 
-          if grep -Eq '^--- SKIP: TestSmoke(/|[[:space:]]|$)' <<<"$output"; then
-            echo "::error::TestSmoke or one of its scenarios was skipped"
+          if ! has_test_event run TestSmoke; then
+            echo "::error::TestSmoke did not run (category: selection-failure; details redacted)"
             exit 1
           fi
 
-          summary=$(grep -E '^ok[[:space:]]+github.com/adambenhassen/telegram-server/test/e2e[[:space:]]+[0-9.]+s$' <<<"$output" | tail -n 1)
-          if [ -z "$summary" ]; then
-            echo "::error::TestSmoke did not report a completed package run"
+          for scenario in one-to-one saved-messages basic-group channel contacts-search username-registration; do
+            if ! has_test_event run "TestSmoke/$scenario"; then
+              echo "::error::TestSmoke/$scenario was not selected (category: selection-failure; details redacted)"
+              exit 1
+            fi
+            if ! has_test_event pass "TestSmoke/$scenario"; then
+              echo "::error::TestSmoke/$scenario did not pass (category: scenario-incomplete; details redacted)"
+              exit 1
+            fi
+          done
+
+          summary=$(jq -Rr '
+            fromjson?
+            | select(.Package == "github.com/adambenhassen/telegram-server/test/e2e"
+                and .Action == "pass" and (.Test // "") == "")
+            | .Elapsed // empty
+          ' <<<"$output" | tail -n 1)
+          if [[ ! "$summary" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echo "::error::TestSmoke did not report a completed package run (category: package-incomplete; details redacted)"
             exit 1
           fi
-          printf '%s\n' "$summary"
+          printf 'ok github.com/adambenhassen/telegram-server/test/e2e %ss\n' "$summary"
