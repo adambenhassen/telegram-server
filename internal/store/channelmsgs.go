@@ -253,7 +253,7 @@ func (s *Store) postChannelMessage(
 			return ChannelMessage{}, 0, false, fmt.Errorf("channel defaults by id: %w", e)
 		}
 		if channel.Megagroup {
-			if err = checkDefaultMessageRestriction(channel.DefaultBannedRights, role >= channelRoleAdmin, false, nil); err != nil {
+			if err = checkDefaultMessageRestriction(channel.DefaultBannedRights, role >= channelRoleAdmin, fileID != nil, nil); err != nil {
 				return ChannelMessage{}, 0, false, err
 			}
 		}

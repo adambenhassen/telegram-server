@@ -94,6 +94,58 @@ func TestPostChannelMessageAsClassifiesEveryStoredDefaultRight(t *testing.T) {
 	}
 }
 
+func TestPostChannelMessageAsChecksMediaRestrictionsForFilePosts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openStore(t, dsn)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	creator := mustUser(t, s, "+15551293501")
+	member := mustUser(t, s, "+15551293502")
+	channel := mustMegagroup(t, s, creator.ID, "Media restrictions")
+	seat(t, s, channel, creator.ID, member.ID, 0)
+	file := storedFile(t, s, member.ID)
+	cases := []string{"send_media", "send_docs", "send_videos"}
+
+	for i, right := range cases {
+		t.Run(right, func(t *testing.T) {
+			if _, err := conn.Exec(ctx, `UPDATE channels SET default_banned_rights = $2 WHERE id = $1`, channel.ID, []string{right}); err != nil {
+				t.Fatalf("set %s: %v", right, err)
+			}
+			fileID := file.ID
+			if _, _, _, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "attachment", int64(93500+i), &fileID, 0); !errors.Is(err, store.ErrChatWriteForbidden) {
+				t.Fatalf("post with file and %s = %v, want ErrChatWriteForbidden", right, err)
+			}
+			if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 0 {
+				t.Fatalf("channel pts after refused %s post = %d, err %v; want 0", right, pts, err)
+			}
+			events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 0, 10)
+			if err != nil {
+				t.Fatalf("events after refused %s post: %v", right, err)
+			}
+			if len(events) != 0 {
+				t.Fatalf("events after refused %s post = %d, want 0", right, len(events))
+			}
+			messages, err := s.ChannelMessages(ctx, channel.ID, []int64{1})
+			if err != nil {
+				t.Fatalf("messages after refused %s post: %v", right, err)
+			}
+			if len(messages) != 0 {
+				t.Fatalf("messages after refused %s post = %d, want 0", right, len(messages))
+			}
+		})
+	}
+}
+
 func TestPostChannelMessageDedupPrecedesDefaultRestriction(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
