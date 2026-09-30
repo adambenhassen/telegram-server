@@ -34,6 +34,10 @@ func TestSmoke(t *testing.T) {
 		t.Parallel()
 		testSmokeSavedMessages(t)
 	})
+	t.Run("basic-group", func(t *testing.T) {
+		t.Parallel()
+		testSmokeBasicGroup(t)
+	})
 }
 
 func testSmokeOneToOne(t *testing.T) {
@@ -184,6 +188,95 @@ func testSmokeSavedMessages(t *testing.T) {
 		t.Fatalf("getHistory for Saved Messages: %v", err)
 	}
 	assertNoMessageFor(t, f.ctx, client.seen.newMsg, "Saved Messages session")
+}
+
+func testSmokeBasicGroup(t *testing.T) {
+	t.Helper()
+	f := newSmokeFixture(t)
+	const phoneA, phoneB, phoneC = "+15551047001", "+15551047002", "+15551047003"
+	seedPhoneUsers(t, f.ctx, f.store, phoneA, phoneB, phoneC)
+	a, b, c := newSmokeClient(t, f, phoneA), newSmokeClient(t, f, phoneB), newSmokeClient(t, f, phoneC)
+
+	var chatID int64
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		created, err := api.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
+			Title: "Smoke group",
+			Users: []tg.InputUserClass{inputUser(a.id, b.id), inputUser(a.id, c.id)},
+		})
+		if err != nil {
+			return err
+		}
+		updates, ok := created.Updates.(*tg.Updates)
+		if !ok {
+			return fmt.Errorf("createChat updates = %T, want *tg.Updates", created.Updates)
+		}
+		if len(updates.Chats) != 1 {
+			return fmt.Errorf("createChat chats = %d, want one chat", len(updates.Chats))
+		}
+		chat, ok := updates.Chats[0].(*tg.Chat)
+		if !ok {
+			return fmt.Errorf("createChat chat = %T, want *tg.Chat", updates.Chats[0])
+		}
+		if chat.ParticipantsCount != 3 {
+			return fmt.Errorf("createChat participants = %d, want 3", chat.ParticipantsCount)
+		}
+		chatID = chat.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("create smoke group: %v", err)
+	}
+
+	wantSenders := map[string]int64{
+		"group-a": a.id,
+		"group-b": b.id,
+		"group-c": c.id,
+	}
+	for _, send := range []struct {
+		client   *smokeClient
+		text     string
+		randomID int64
+	}{{a, "group-a", 1047001}, {b, "group-b", 1047002}, {c, "group-c", 1047003}} {
+		var result tg.UpdatesClass
+		if err := send.client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+			var err error
+			result, err = api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+				Peer: &tg.InputPeerChat{ChatID: chatID}, Message: send.text, RandomID: send.randomID,
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("%s send to group: %v", send.text, err)
+		}
+		message, pts, ok := outgoingMessage(t, result, send.text)
+		if !ok || countOutgoingMessages(result, send.text) != 1 {
+			t.Fatalf("%s send result omitted exactly one outgoing message", send.text)
+		}
+		if message.ID <= 0 || pts <= 0 || !message.Out {
+			t.Fatalf("%s outgoing id/pts/out = %d/%d/%t, want positive id and pts and outgoing", send.text, message.ID, pts, message.Out)
+		}
+		peer, ok := message.PeerID.(*tg.PeerChat)
+		if !ok || peer.ChatID != chatID {
+			t.Fatalf("%s outgoing peer = %+v, want chat %d", send.text, message.PeerID, chatID)
+		}
+		from, ok := message.FromID.(*tg.PeerUser)
+		if !ok || from.UserID != send.client.id {
+			t.Fatalf("%s outgoing sender = %+v, want user %d", send.text, message.FromID, send.client.id)
+		}
+	}
+
+	for _, member := range []*smokeClient{a, b, c} {
+		if err := member.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+			if err := verifySmokeGroupHistory(ctx, api, chatID, member.id, wantSenders); err != nil {
+				return err
+			}
+			full, err := api.MessagesGetFullChat(ctx, chatID)
+			if err != nil {
+				return fmt.Errorf("getFullChat: %w", err)
+			}
+			return checkFullChat(t, full, chatID, a.id, member.id, b.id, c.id)
+		}); err != nil {
+			t.Fatalf("smoke group for member %d: %v", member.id, err)
+		}
+	}
 }
 
 type smokeFixture struct {
@@ -408,6 +501,64 @@ func verifySmokeHistory(
 	for text := range want {
 		if !seen[text] {
 			return fmt.Errorf("history is missing %q", text)
+		}
+	}
+	return nil
+}
+
+func verifySmokeGroupHistory(
+	ctx context.Context,
+	api *tg.Client,
+	chatID, viewerID int64,
+	want map[string]int64,
+) error {
+	result, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		Peer: &tg.InputPeerChat{ChatID: chatID}, Limit: 10,
+	})
+	if err != nil {
+		return err
+	}
+	history, ok := result.(*tg.MessagesMessages)
+	if !ok {
+		return fmt.Errorf("group history response = %T, want *tg.MessagesMessages", result)
+	}
+	seen := make(map[string]bool, len(want))
+	ids := make(map[int]bool, len(want))
+	for _, class := range history.Messages {
+		message, ok := class.(*tg.Message)
+		if !ok {
+			if _, service := class.(*tg.MessageService); service {
+				continue
+			}
+			return fmt.Errorf("group history message = %T, want *tg.Message or *tg.MessageService", class)
+		}
+		senderID, ok := want[message.Message]
+		if !ok {
+			return fmt.Errorf("group history contains unexpected text %q", message.Message)
+		}
+		if seen[message.Message] {
+			return fmt.Errorf("group history contains duplicate text %q", message.Message)
+		}
+		seen[message.Message] = true
+		if message.ID <= 0 || ids[message.ID] {
+			return fmt.Errorf("group history %q has invalid owner-local id %d", message.Message, message.ID)
+		}
+		ids[message.ID] = true
+		if message.Out != (senderID == viewerID) {
+			return fmt.Errorf("group history %q out = %t for viewer %d, want %t", message.Message, message.Out, viewerID, senderID == viewerID)
+		}
+		from, ok := message.FromID.(*tg.PeerUser)
+		if !ok || from.UserID != senderID {
+			return fmt.Errorf("group history %q sender = %+v, want user %d", message.Message, message.FromID, senderID)
+		}
+		peer, ok := message.PeerID.(*tg.PeerChat)
+		if !ok || peer.ChatID != chatID {
+			return fmt.Errorf("group history %q peer = %+v, want chat %d", message.Message, message.PeerID, chatID)
+		}
+	}
+	for text := range want {
+		if !seen[text] {
+			return fmt.Errorf("group history for %d is missing %q", viewerID, text)
 		}
 	}
 	return nil
