@@ -10,7 +10,7 @@ import (
 )
 
 const bumpChatVersion = `-- name: BumpChatVersion :one
-UPDATE chats SET version = version + 1 WHERE id = $1 RETURNING id, title, creator_id, version, date, pinned_message_id
+UPDATE chats SET version = version + 1 WHERE id = $1 RETURNING id, title, creator_id, version, date, pinned_message_id, default_banned_rights
 `
 
 func (q *Queries) BumpChatVersion(ctx context.Context, id int64) (Chat, error) {
@@ -23,12 +23,13 @@ func (q *Queries) BumpChatVersion(ctx context.Context, id int64) (Chat, error) {
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.DefaultBannedRights,
 	)
 	return i, err
 }
 
 const chatByID = `-- name: ChatByID :one
-SELECT id, title, creator_id, version, date, pinned_message_id FROM chats WHERE id = $1
+SELECT id, title, creator_id, version, date, pinned_message_id, default_banned_rights FROM chats WHERE id = $1
 `
 
 func (q *Queries) ChatByID(ctx context.Context, id int64) (Chat, error) {
@@ -41,12 +42,13 @@ func (q *Queries) ChatByID(ctx context.Context, id int64) (Chat, error) {
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.DefaultBannedRights,
 	)
 	return i, err
 }
 
 const chatByIDForUpdate = `-- name: ChatByIDForUpdate :one
-SELECT id, title, creator_id, version, date, pinned_message_id FROM chats WHERE id = $1 FOR UPDATE
+SELECT id, title, creator_id, version, date, pinned_message_id, default_banned_rights FROM chats WHERE id = $1 FOR UPDATE
 `
 
 // ChatByIDForUpdate takes the chats row lock that serialises everything touching
@@ -63,6 +65,7 @@ func (q *Queries) ChatByIDForUpdate(ctx context.Context, id int64) (Chat, error)
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.DefaultBannedRights,
 	)
 	return i, err
 }
@@ -132,7 +135,7 @@ func (q *Queries) ChatParticipants(ctx context.Context, chatID int64) ([]ChatPar
 }
 
 const chatsByIDsForMember = `-- name: ChatsByIDsForMember :many
-SELECT c.id, c.title, c.creator_id, c.version, c.date, c.pinned_message_id FROM chats c
+SELECT c.id, c.title, c.creator_id, c.version, c.date, c.pinned_message_id, c.default_banned_rights FROM chats c
 JOIN chat_participants p ON p.chat_id = c.id
 WHERE p.user_id = $1::bigint
   AND c.id = ANY($2::bigint[])
@@ -163,6 +166,7 @@ func (q *Queries) ChatsByIDsForMember(ctx context.Context, arg ChatsByIDsForMemb
 			&i.Version,
 			&i.Date,
 			&i.PinnedMessageID,
+			&i.DefaultBannedRights,
 		); err != nil {
 			return nil, err
 		}
@@ -175,7 +179,7 @@ func (q *Queries) ChatsByIDsForMember(ctx context.Context, arg ChatsByIDsForMemb
 }
 
 const chatsForUser = `-- name: ChatsForUser :many
-SELECT c.id, c.title, c.creator_id, c.version, c.date, c.pinned_message_id FROM chats c
+SELECT c.id, c.title, c.creator_id, c.version, c.date, c.pinned_message_id, c.default_banned_rights FROM chats c
 JOIN chat_participants p ON p.chat_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id
@@ -197,6 +201,7 @@ func (q *Queries) ChatsForUser(ctx context.Context, userID int64) ([]Chat, error
 			&i.Version,
 			&i.Date,
 			&i.PinnedMessageID,
+			&i.DefaultBannedRights,
 		); err != nil {
 			return nil, err
 		}
@@ -241,7 +246,7 @@ func (q *Queries) GetChatPinnedMessage(ctx context.Context, id int64) (*int32, e
 
 const insertChat = `-- name: InsertChat :one
 INSERT INTO chats (title, creator_id) VALUES ($1, $2)
-RETURNING id, title, creator_id, version, date, pinned_message_id
+RETURNING id, title, creator_id, version, date, pinned_message_id, default_banned_rights
 `
 
 type InsertChatParams struct {
@@ -259,6 +264,7 @@ func (q *Queries) InsertChat(ctx context.Context, arg InsertChatParams) (Chat, e
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.DefaultBannedRights,
 	)
 	return i, err
 }
@@ -316,7 +322,7 @@ func (q *Queries) IsChatMember(ctx context.Context, arg IsChatMemberParams) (boo
 }
 
 const setChatPinnedMessage = `-- name: SetChatPinnedMessage :one
-UPDATE chats SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, creator_id, version, date, pinned_message_id
+UPDATE chats SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, creator_id, version, date, pinned_message_id, default_banned_rights
 `
 
 type SetChatPinnedMessageParams struct {
@@ -337,12 +343,13 @@ func (q *Queries) SetChatPinnedMessage(ctx context.Context, arg SetChatPinnedMes
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.DefaultBannedRights,
 	)
 	return i, err
 }
 
 const setChatTitle = `-- name: SetChatTitle :one
-UPDATE chats SET title = $2, version = version + 1 WHERE id = $1 RETURNING id, title, creator_id, version, date, pinned_message_id
+UPDATE chats SET title = $2, version = version + 1 WHERE id = $1 RETURNING id, title, creator_id, version, date, pinned_message_id, default_banned_rights
 `
 
 type SetChatTitleParams struct {
@@ -360,6 +367,7 @@ func (q *Queries) SetChatTitle(ctx context.Context, arg SetChatTitleParams) (Cha
 		&i.Version,
 		&i.Date,
 		&i.PinnedMessageID,
+		&i.DefaultBannedRights,
 	)
 	return i, err
 }

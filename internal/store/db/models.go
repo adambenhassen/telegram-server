@@ -45,6 +45,8 @@ type Channel struct {
 	Username             *string
 	TitleTsv             interface{}
 	PubliclyDiscoverable bool
+	DefaultBannedRights  []string
+	SlowmodeSeconds      int16
 }
 
 type ChannelEvent struct {
@@ -83,6 +85,7 @@ type ChannelParticipant struct {
 	BannedUntil pgtype.Timestamptz
 	JoinPts     int64
 	Date        pgtype.Timestamptz
+	LastPostAt  pgtype.Timestamptz
 }
 
 type ChannelState struct {
@@ -98,12 +101,13 @@ type ChannelUsernameChange struct {
 }
 
 type Chat struct {
-	ID              int64
-	Title           string
-	CreatorID       int64
-	Version         int32
-	Date            pgtype.Timestamptz
-	PinnedMessageID *int32
+	ID                  int64
+	Title               string
+	CreatorID           int64
+	Version             int32
+	Date                pgtype.Timestamptz
+	PinnedMessageID     *int32
+	DefaultBannedRights []string
 }
 
 type ChatParticipant struct {

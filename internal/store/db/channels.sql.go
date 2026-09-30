@@ -93,7 +93,7 @@ func (q *Queries) ChannelActiveInviteByChannel(ctx context.Context, channelID in
 }
 
 const channelByID = `-- name: ChannelByID :one
-SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable FROM channels WHERE id = $1
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable, default_banned_rights, slowmode_seconds FROM channels WHERE id = $1
 `
 
 func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
@@ -111,6 +111,8 @@ func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
 		&i.Username,
 		&i.TitleTsv,
 		&i.PubliclyDiscoverable,
+		&i.DefaultBannedRights,
+		&i.SlowmodeSeconds,
 	)
 	return i, err
 }
@@ -290,7 +292,7 @@ func (q *Queries) ChannelInviteByHashForUpdate(ctx context.Context, hash string)
 }
 
 const channelParticipantByUser = `-- name: ChannelParticipantByUser :one
-SELECT channel_id, user_id, role, banned_until, join_pts, date FROM channel_participants WHERE channel_id = $1 AND user_id = $2
+SELECT channel_id, user_id, role, banned_until, join_pts, date, last_post_at FROM channel_participants WHERE channel_id = $1 AND user_id = $2
 `
 
 type ChannelParticipantByUserParams struct {
@@ -308,12 +310,13 @@ func (q *Queries) ChannelParticipantByUser(ctx context.Context, arg ChannelParti
 		&i.BannedUntil,
 		&i.JoinPts,
 		&i.Date,
+		&i.LastPostAt,
 	)
 	return i, err
 }
 
 const channelParticipants = `-- name: ChannelParticipants :many
-SELECT channel_id, user_id, role, banned_until, join_pts, date FROM channel_participants WHERE channel_id = $1 ORDER BY user_id
+SELECT channel_id, user_id, role, banned_until, join_pts, date, last_post_at FROM channel_participants WHERE channel_id = $1 ORDER BY user_id
 `
 
 func (q *Queries) ChannelParticipants(ctx context.Context, channelID int64) ([]ChannelParticipant, error) {
@@ -332,6 +335,7 @@ func (q *Queries) ChannelParticipants(ctx context.Context, channelID int64) ([]C
 			&i.BannedUntil,
 			&i.JoinPts,
 			&i.Date,
+			&i.LastPostAt,
 		); err != nil {
 			return nil, err
 		}
@@ -344,7 +348,7 @@ func (q *Queries) ChannelParticipants(ctx context.Context, channelID int64) ([]C
 }
 
 const channelParticipantsForViewer = `-- name: ChannelParticipantsForViewer :many
-SELECT channel_id, user_id, role, banned_until, join_pts, date FROM channel_participants
+SELECT channel_id, user_id, role, banned_until, join_pts, date, last_post_at FROM channel_participants
 WHERE user_id = $1::bigint
   AND channel_id = ANY($2::bigint[])
 `
@@ -375,6 +379,7 @@ func (q *Queries) ChannelParticipantsForViewer(ctx context.Context, arg ChannelP
 			&i.BannedUntil,
 			&i.JoinPts,
 			&i.Date,
+			&i.LastPostAt,
 		); err != nil {
 			return nil, err
 		}
@@ -407,7 +412,7 @@ func (q *Queries) ChannelStateForUpdate(ctx context.Context, channelID int64) (C
 }
 
 const channelsForUser = `-- name: ChannelsForUser :many
-SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id, c.username, c.title_tsv, c.publicly_discoverable FROM channels c
+SELECT c.id, c.title, c.about, c.creator_id, c.megagroup, c.version, c.date, c.pinned_message_id, c.username, c.title_tsv, c.publicly_discoverable, c.default_banned_rights, c.slowmode_seconds FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 WHERE p.user_id = $1
 ORDER BY c.id
@@ -434,6 +439,8 @@ func (q *Queries) ChannelsForUser(ctx context.Context, userID int64) ([]Channel,
 			&i.Username,
 			&i.TitleTsv,
 			&i.PubliclyDiscoverable,
+			&i.DefaultBannedRights,
+			&i.SlowmodeSeconds,
 		); err != nil {
 			return nil, err
 		}
@@ -500,7 +507,7 @@ func (q *Queries) GetChannelPinnedMessage(ctx context.Context, id int64) (*int32
 
 const insertChannel = `-- name: InsertChannel :one
 INSERT INTO channels (id, title, about, creator_id, megagroup) VALUES ($1, $2, $3, $4, $5)
-RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable
+RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable, default_banned_rights, slowmode_seconds
 `
 
 type InsertChannelParams struct {
@@ -538,6 +545,8 @@ func (q *Queries) InsertChannel(ctx context.Context, arg InsertChannelParams) (C
 		&i.Username,
 		&i.TitleTsv,
 		&i.PubliclyDiscoverable,
+		&i.DefaultBannedRights,
+		&i.SlowmodeSeconds,
 	)
 	return i, err
 }
@@ -632,7 +641,7 @@ func (q *Queries) IsChannelMember(ctx context.Context, arg IsChannelMemberParams
 }
 
 const lockChannel = `-- name: LockChannel :one
-SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable FROM channels WHERE id = $1 FOR UPDATE
+SELECT id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable, default_banned_rights, slowmode_seconds FROM channels WHERE id = $1 FOR UPDATE
 `
 
 // LockChannel takes the channels row lock that serialises the rights mutations:
@@ -654,6 +663,8 @@ func (q *Queries) LockChannel(ctx context.Context, id int64) (Channel, error) {
 		&i.Username,
 		&i.TitleTsv,
 		&i.PubliclyDiscoverable,
+		&i.DefaultBannedRights,
+		&i.SlowmodeSeconds,
 	)
 	return i, err
 }
@@ -907,7 +918,7 @@ func (q *Queries) SearchPublicChannels(ctx context.Context, arg SearchPublicChan
 }
 
 const setChannelPinnedMessage = `-- name: SetChannelPinnedMessage :one
-UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable
+UPDATE channels SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable, default_banned_rights, slowmode_seconds
 `
 
 type SetChannelPinnedMessageParams struct {
@@ -933,6 +944,8 @@ func (q *Queries) SetChannelPinnedMessage(ctx context.Context, arg SetChannelPin
 		&i.Username,
 		&i.TitleTsv,
 		&i.PubliclyDiscoverable,
+		&i.DefaultBannedRights,
+		&i.SlowmodeSeconds,
 	)
 	return i, err
 }
