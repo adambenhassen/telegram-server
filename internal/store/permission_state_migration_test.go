@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,10 +19,11 @@ import (
 func TestGroupChannelPermissionStateMigrationPreservesDataAndChecksValues(t *testing.T) {
 	ctx := context.Background()
 	const (
-		administrationMigration = "20260913000039_server_administration.sql"
-		permissionMigration     = "20260930000041_group_channel_permission_state.sql"
-		bulkRows                = 50000
-		bulkChannelID           = int64(3000000000)
+		administrationMigration       = "20260913000039_server_administration.sql"
+		permissionMigration           = "20260930000041_group_channel_permission_state.sql"
+		permissionValidationMigration = "20260930000042_validate_group_channel_permission_state.sql"
+		bulkRows                      = 50000
+		bulkChannelID                 = int64(3000000000)
 	)
 	migrationsDir := filepath.Join("..", "..", "migrations")
 	entries, err := os.ReadDir(migrationsDir)
@@ -176,6 +178,48 @@ func TestGroupChannelPermissionStateMigrationPreservesDataAndChecksValues(t *tes
 	if _, err := conn.Exec(ctx, readMigration(permissionMigration)); err != nil {
 		t.Fatalf("apply permission state migration: %v", err)
 	}
+	for _, constraintName := range []string{
+		"chats_default_banned_rights_valid",
+		"channels_default_banned_rights_valid",
+		"channels_slowmode_seconds_valid",
+	} {
+		var validated bool
+		if err := conn.QueryRow(ctx, `SELECT convalidated FROM pg_constraint WHERE conname = $1`, constraintName).Scan(&validated); err != nil {
+			t.Fatalf("read validation state for %s: %v", constraintName, err)
+		}
+		if validated {
+			t.Fatalf("constraint %s validated in the column-addition migration; want validation in a later migration", constraintName)
+		}
+	}
+	var bulkChatID int64
+	if err := conn.QueryRow(ctx, `SELECT id FROM chats WHERE title = 'bulk group' ORDER BY id LIMIT 1`).Scan(&bulkChatID); err != nil {
+		t.Fatalf("read bulk chat id: %v", err)
+	}
+	testPermissionStateValidationAllowsConcurrentAccess(
+		t,
+		ctx,
+		dbName,
+		conn,
+		readMigration(permissionValidationMigration),
+		chatID,
+		bulkChatID,
+		existingChannelID,
+		bulkChannelID+1,
+		memberID,
+	)
+	for _, constraintName := range []string{
+		"chats_default_banned_rights_valid",
+		"channels_default_banned_rights_valid",
+		"channels_slowmode_seconds_valid",
+	} {
+		var validated bool
+		if err := conn.QueryRow(ctx, `SELECT convalidated FROM pg_constraint WHERE conname = $1`, constraintName).Scan(&validated); err != nil {
+			t.Fatalf("read validation state for %s: %v", constraintName, err)
+		}
+		if !validated {
+			t.Fatalf("constraint %s remains unvalidated after validation migration", constraintName)
+		}
+	}
 	t.Logf("permission state migration applied to %d chats, %d channels, and %d channel participants in %s", bulkRows+1, bulkRows+1, bulkRows+2, time.Since(started))
 
 	var chatVersion int
@@ -296,4 +340,232 @@ func TestGroupChannelPermissionStateMigrationPreservesDataAndChecksValues(t *tes
 func checkViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23514"
+}
+
+func testPermissionStateValidationAllowsConcurrentAccess(
+	t *testing.T,
+	ctx context.Context,
+	dbName string,
+	conn *pgx.Conn,
+	validationMigration string,
+	chatID int64,
+	bulkChatID int64,
+	channelID int64,
+	bulkChannelID int64,
+	memberID int64,
+) {
+	t.Helper()
+
+	const (
+		chatGateName    = "test_permission_state_chat_validation_gate"
+		channelGateName = "test_permission_state_channel_validation_gate"
+		chatLockKey     = int32(52041)
+		channelLockKey  = int32(52042)
+	)
+	if _, err := conn.Exec(ctx, `
+		CREATE FUNCTION test_permission_state_validation_gate(
+			row_id BIGINT, gate_row_id BIGINT, lock_key INTEGER, constraint_name TEXT
+		) RETURNS BOOLEAN
+		LANGUAGE plpgsql VOLATILE AS $$
+		BEGIN
+			IF row_id = gate_row_id AND position(constraint_name IN current_query()) > 0 THEN
+				PERFORM pg_advisory_lock(hashtext(current_database()), lock_key);
+				PERFORM pg_advisory_unlock(hashtext(current_database()), lock_key);
+			END IF;
+			RETURN true;
+		END;
+		$$
+	`); err != nil {
+		t.Fatalf("create validation gate function: %v", err)
+	}
+	for _, constraint := range []struct {
+		table string
+		name  string
+		id    int64
+		key   int32
+	}{
+		{table: "chats", name: chatGateName, id: chatID, key: chatLockKey},
+		{table: "channels", name: channelGateName, id: channelID, key: channelLockKey},
+	} {
+		statement := fmt.Sprintf(
+			"ALTER TABLE %s ADD CONSTRAINT %s CHECK (test_permission_state_validation_gate(id, %d, %d, '%s')) NOT VALID",
+			constraint.table,
+			constraint.name,
+			constraint.id,
+			constraint.key,
+			constraint.name,
+		)
+		if _, err := conn.Exec(ctx, statement); err != nil {
+			t.Fatalf("add %s validation gate: %v", constraint.name, err)
+		}
+	}
+
+	gateConn, err := pgx.Connect(ctx, pgtest.DSNFrom(dbName))
+	if err != nil {
+		t.Fatalf("connect validation gate: %v", err)
+	}
+	defer func() { _ = gateConn.Close(ctx) }() //nolint:errcheck // best-effort close releases session locks
+	for _, key := range []int32{chatLockKey, channelLockKey} {
+		if _, err := gateConn.Exec(ctx, `SELECT pg_advisory_lock(hashtext(current_database()), $1)`, key); err != nil {
+			t.Fatalf("hold validation gate lock %d: %v", key, err)
+		}
+	}
+
+	validationConn, err := pgx.Connect(ctx, pgtest.DSNFrom(dbName))
+	if err != nil {
+		t.Fatalf("connect validation session: %v", err)
+	}
+	defer func() { _ = validationConn.Close(ctx) }() //nolint:errcheck // best-effort close
+	validationCtx, cancelValidation := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelValidation()
+	validationPID := validationConn.PgConn().PID()
+	validationDone := make(chan error, 1)
+	go func() {
+		statements := []string{
+			"BEGIN",
+			validationMigration,
+			"ALTER TABLE chats VALIDATE CONSTRAINT " + chatGateName,
+			"ALTER TABLE channels VALIDATE CONSTRAINT " + channelGateName,
+			"COMMIT",
+		}
+		for _, statement := range statements {
+			if _, err := validationConn.Exec(validationCtx, statement); err != nil {
+				validationDone <- err
+				return
+			}
+		}
+		validationDone <- nil
+	}()
+
+	waitForPermissionStateValidationGate(t, ctx, conn, validationPID, chatGateName, validationDone)
+	exercisePermissionStateReadsAndWrites(t, ctx, conn, chatID, bulkChatID, channelID, bulkChannelID, memberID)
+	unlockPermissionStateValidationGate(t, ctx, gateConn, chatLockKey)
+
+	waitForPermissionStateValidationGate(t, ctx, conn, validationPID, channelGateName, validationDone)
+	exercisePermissionStateReadsAndWrites(t, ctx, conn, chatID, bulkChatID, channelID, bulkChannelID, memberID)
+	unlockPermissionStateValidationGate(t, ctx, gateConn, channelLockKey)
+	select {
+	case err := <-validationDone:
+		if err != nil {
+			t.Fatalf("validate permission state constraints: %v", err)
+		}
+	case <-validationCtx.Done():
+		t.Fatalf("validation transaction did not finish: %v", validationCtx.Err())
+	}
+
+	for _, constraint := range []struct {
+		table string
+		name  string
+	}{
+		{table: "chats", name: chatGateName},
+		{table: "channels", name: channelGateName},
+	} {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s", constraint.table, constraint.name)); err != nil {
+			t.Fatalf("drop %s validation gate: %v", constraint.name, err)
+		}
+	}
+	if _, err := conn.Exec(ctx, `DROP FUNCTION test_permission_state_validation_gate(BIGINT, BIGINT, INTEGER, TEXT)`); err != nil {
+		t.Fatalf("drop validation gate function: %v", err)
+	}
+}
+
+func waitForPermissionStateValidationGate(
+	t *testing.T,
+	ctx context.Context,
+	conn *pgx.Conn,
+	validationPID uint32,
+	constraintName string,
+	validationDone <-chan error,
+) {
+	t.Helper()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := conn.QueryRow(waitCtx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE pid = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory'
+				  AND position($2 IN query) > 0
+			)
+		`, validationPID, constraintName).Scan(&waiting); err != nil {
+			t.Fatalf("check validation gate for %s: %v", constraintName, err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case err := <-validationDone:
+			t.Fatalf("validation finished before reaching %s gate: %v", constraintName, err)
+		case <-waitCtx.Done():
+			t.Fatalf("validation did not reach %s gate: %v", constraintName, waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func unlockPermissionStateValidationGate(t *testing.T, ctx context.Context, conn *pgx.Conn, key int32) {
+	t.Helper()
+	var unlocked bool
+	if err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock(hashtext(current_database()), $1)`, key).Scan(&unlocked); err != nil {
+		t.Fatalf("release validation gate lock %d: %v", key, err)
+	}
+	if !unlocked {
+		t.Fatalf("validation gate lock %d was not held", key)
+	}
+}
+
+func exercisePermissionStateReadsAndWrites(
+	t *testing.T,
+	ctx context.Context,
+	conn *pgx.Conn,
+	chatID int64,
+	bulkChatID int64,
+	channelID int64,
+	bulkChannelID int64,
+	memberID int64,
+) {
+	t.Helper()
+	accessCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var title string
+	if err := conn.QueryRow(accessCtx, `SELECT title FROM chats WHERE id = $1`, chatID).Scan(&title); err != nil {
+		t.Fatalf("read chat during validation: %v", err)
+	}
+	tag, err := conn.Exec(accessCtx, `UPDATE chats SET version = version WHERE id = $1`, bulkChatID)
+	if err != nil {
+		t.Fatalf("write chat during validation: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("chat writes during validation affected %d rows, want 1", tag.RowsAffected())
+	}
+	if err := conn.QueryRow(accessCtx, `SELECT title FROM channels WHERE id = $1`, channelID).Scan(&title); err != nil {
+		t.Fatalf("read channel during validation: %v", err)
+	}
+	tag, err = conn.Exec(accessCtx, `UPDATE channels SET version = version WHERE id = $1`, bulkChannelID)
+	if err != nil {
+		t.Fatalf("write channel during validation: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("channel writes during validation affected %d rows, want 1", tag.RowsAffected())
+	}
+	var lastPostAt *time.Time
+	if err := conn.QueryRow(accessCtx, `
+		SELECT last_post_at FROM channel_participants WHERE channel_id = $1 AND user_id = $2
+	`, channelID, memberID).Scan(&lastPostAt); err != nil {
+		t.Fatalf("read participant during validation: %v", err)
+	}
+	tag, err = conn.Exec(accessCtx, `
+		UPDATE channel_participants SET last_post_at = last_post_at WHERE channel_id = $1 AND user_id = $2
+	`, channelID, memberID)
+	if err != nil {
+		t.Fatalf("write participant during validation: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("participant writes during validation affected %d rows, want 1", tag.RowsAffected())
+	}
 }

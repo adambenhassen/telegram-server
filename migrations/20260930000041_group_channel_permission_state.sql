@@ -70,8 +70,3 @@ ALTER TABLE channels
 
 ALTER TABLE channel_participants
     ADD COLUMN last_post_at TIMESTAMPTZ NULL;
-
--- Validate without holding the stronger lock used while adding each constraint.
-ALTER TABLE chats VALIDATE CONSTRAINT chats_default_banned_rights_valid;
-ALTER TABLE channels VALIDATE CONSTRAINT channels_default_banned_rights_valid;
-ALTER TABLE channels VALIDATE CONSTRAINT channels_slowmode_seconds_valid;
