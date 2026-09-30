@@ -46,26 +46,25 @@ func (h *handlers) createUsersForDialog(ctx context.Context, chatID, viewerID in
 // maxChannelDialogs caps the channels one getDialogs reply carries.
 //
 // Channel dialogs are deliberately NOT paged: channels write no dialogs row, so
-// there is no page key to offset them by, and every page of the dialog list
-// carries the caller's channels again. The account cap is 500 channels, so this
-// is bounded but not free — several queries per channel per call — and the
-// shape is the M6 chat-list deferral again (ROADMAP.md:242). Paging them needs
-// a sort key channels do not yet have. Batching the reads and paging the block
-// is MAIN-109.
-const maxChannelDialogs = 100
+// there is no page key to offset them by. The account cap is 500 memberships,
+// so listing the full set keeps a newly admitted channel replayable on a fresh
+// pull while remaining bounded. Channel rows carry their member and peer data
+// in one query. Paging this separate block would need a cursor clients do not
+// have; it remains on the first page only.
+const maxChannelDialogs = 500
 
 // maxPeerDialogs bounds one messages.getPeerDialogs request and all of the
 // selected-row and hydration work it can trigger.
 const maxPeerDialogs = 100
 
-// channelDialogs builds the dialog entries for the channels userID belongs to,
-// returning the channel ids referenced, the entries, and the top post of each so
-// the caller can hydrate media for the whole reply in one query. A channel with
-// no posts is skipped: a dialog must name a top message and there is none.
+// channelDialogs builds dialog entries and channel peers for the unbanned
+// memberships of userID, returning the top posts so the caller can hydrate
+// media for the whole reply in one query. Empty channels get top_message 0 and
+// remain discoverable through getDialogs.
 //
 // Single query via ChannelDialogsForUser replaces the previous per-channel
 // ChannelHistory + ChannelState loop (2N queries).
-func (h *handlers) channelDialogs(ctx context.Context, userID int64) (map[int64]bool, []tg.DialogClass, []store.ChannelMessage, error) {
+func (h *handlers) channelDialogs(ctx context.Context, userID int64) ([]tg.ChatClass, []tg.DialogClass, []store.ChannelMessage, error) {
 	rows, err := h.store.ChannelDialogsForUser(ctx, userID)
 	if err != nil {
 		return nil, nil, nil, err
@@ -74,26 +73,25 @@ func (h *handlers) channelDialogs(ctx context.Context, userID int64) (map[int64]
 		rows = rows[:maxChannelDialogs]
 	}
 
-	ids := make(map[int64]bool, len(rows))
+	chats := make([]tg.ChatClass, 0, len(rows))
 	dialogs := make([]tg.DialogClass, 0, len(rows))
 	tops := make([]store.ChannelMessage, 0, len(rows))
 	for _, r := range rows {
-		if r.Top == nil {
-			continue
-		}
 		d := &tg.Dialog{
-			Peer:       &tg.PeerChannel{ChannelID: r.Channel.ID},
-			TopMessage: int(r.Top.LocalID),
+			Peer: &tg.PeerChannel{ChannelID: r.Channel.ID},
 			// Channels keep no per-member read state in M7, so there is no read
 			// marker and no honest unread count to report.
 			UnreadCount: 0,
 		}
+		if r.Top != nil {
+			d.TopMessage = int(r.Top.LocalID)
+			tops = append(tops, *r.Top)
+		}
 		d.SetPts(r.Pts)
-		ids[r.Channel.ID] = true
 		dialogs = append(dialogs, d)
-		tops = append(tops, *r.Top)
+		chats = append(chats, h.channelToTL(r.Channel, r.Member, true, userID))
 	}
-	return ids, dialogs, tops, nil
+	return chats, dialogs, tops, nil
 }
 
 // handleGetDialogs serves messages.getDialogs: the caller's conversation list
@@ -202,10 +200,10 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	// First page only: the block is not part of the paged sequence, so repeating
 	// it on every page would hand a client that pages to the end one copy per
 	// page. offset_id == 0 is the only honest test for "first page".
-	var channelIDs map[int64]bool
+	var channelPeers []tg.ChatClass
 	var channelDialogs []tg.DialogClass
 	if req.OffsetID == 0 {
-		ids, ds, channelTops, cerr := h.channelDialogs(r.Ctx, r.UserID)
+		peers, ds, channelTops, cerr := h.channelDialogs(r.Ctx, r.UserID)
 		if cerr != nil {
 			h.log.Error("get dialogs channels", "user_id", r.UserID, "err", cerr)
 			return nil, errInternal
@@ -215,7 +213,7 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 			h.log.Error("get dialogs channel files", "user_id", r.UserID, "err", ferr)
 			return nil, errInternal
 		}
-		channelIDs, channelDialogs = ids, ds
+		channelPeers, channelDialogs = peers, ds
 		tlDialogs = append(channelDialogs, tlDialogs...)
 		channelMsgs := make([]tg.MessageClass, 0, len(channelTops)+len(tlMsgs))
 		for _, m := range channelTops {
@@ -241,12 +239,7 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("get dialogs chats", "err", err)
 		return nil, errInternal
 	}
-	channels, err := h.loadChannels(r.Ctx, channelIDs, r.UserID)
-	if err != nil {
-		h.log.Error("get dialogs channel peers", "err", err)
-		return nil, errInternal
-	}
-	chats = append(chats, channels...)
+	chats = append(chats, channelPeers...)
 	// A short page reached the end of the list, so the plain reply is accurate. A
 	// full page may have more behind it and must say so, the way getDifference
 	// returns differenceSlice when it truncates. The count is only paid for on
