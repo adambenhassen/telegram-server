@@ -10,6 +10,7 @@ import (
 
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
@@ -537,6 +538,46 @@ func TestSendMediaRateLimit(t *testing.T) {
 	})
 	if !isFloodWait(err) {
 		t.Fatalf("send media: expected FLOOD_WAIT, got %v", err)
+	}
+}
+
+func TestDeniedChatMediaSendConsumesRateLimitToken(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	creator := chatUser(t, s, 7601)
+	member := chatUser(t, s, 7602)
+	chat, err := s.CreateChat(ctx, creator.ID, "Rate-limited media restriction", []int64{member.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	setChatDefaultRights(t, conn, chat.ID, "send_docs")
+
+	blobs := newBlobs(t)
+	cfg := store.RateLimitConfig{Limit: 1, Window: 10 * time.Second}
+	send := func(randomID int64) error {
+		_, err := api.SendMediaForTestWithLimits(s, member.ID, blobs, api.TestMaxUserStorageBytes, cfg, &tg.MessagesSendMediaRequest{
+			Peer: api.InputPeerChat(member.ID, chat.ID), Message: "blocked media", RandomID: randomID,
+			Media: &tg.InputMediaUploadedDocument{
+				File:     &tg.InputFile{ID: randomID, Parts: 1, Name: "blocked.txt"},
+				MimeType: "text/plain",
+			},
+		})
+		return err
+	}
+
+	// The first denied send may pass the rate limiter, then fails the chat
+	// restriction check. Later denied sends must be throttled before checking
+	// permissions under the chat row lock.
+	wantRPC(t, send(76011), "CHAT_WRITE_FORBIDDEN")
+	if err := send(76012); !isFloodWait(err) {
+		t.Fatalf("second denied media send: expected FLOOD_WAIT, got %v", err)
 	}
 }
 

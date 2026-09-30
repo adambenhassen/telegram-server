@@ -278,6 +278,13 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 		return nil, nil, nil, errMediaInvalid
 	}
 	mediaRights := chatDocumentRestrictionRights(media)
+	// Committed retries returned above. Charge new sends before checking chat
+	// permissions, since that check takes the chat row lock. A concurrent
+	// duplicate may spend a token, but repeated denied sends are throttled before
+	// they can contend with other chat writes.
+	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+		return nil, nil, nil, err
+	}
 	duplicate := false
 	if peerType == store.PeerTypeChat {
 		duplicate, err = h.store.CheckChatWritePermission(r.Ctx, toID, r.UserID, req.RandomID, mediaRights)
@@ -297,11 +304,6 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 	var parts int
 	var name string
 	if !duplicate {
-		// Rate limit before the expensive file assembly: new message, consume a
-		// token. The dedupe checks above already caught committed retries.
-		if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
-			return nil, nil, nil, err
-		}
 		clientFileID, parts, name, err = inputFileParts(media.File)
 		if err != nil {
 			return nil, nil, nil, err
