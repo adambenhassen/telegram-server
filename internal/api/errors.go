@@ -60,6 +60,9 @@ var (
 	errMessageIDInvalid = rpcErr(400, "MESSAGE_ID_INVALID")
 	// errPeerIDInvalid rejects an unresolvable or unauthorized input peer.
 	errPeerIDInvalid = rpcErr(400, "PEER_ID_INVALID")
+	// errChatNotModified answers an authorized default-rights save whose value
+	// already matches the basic group's stored restriction set.
+	errChatNotModified = rpcErr(400, "CHAT_NOT_MODIFIED")
 	// errChatTitleInvalid rejects an empty, whitespace-only or over-length chat
 	// title on createChat and editChatTitle.
 	errChatTitleInvalid = rpcErr(400, "CHAT_TITLE_EMPTY")
@@ -101,11 +104,9 @@ var (
 	// turn the download path into an existence-and-enumeration oracle over every
 	// file on the server.
 	errLocationInvalid = rpcErr(400, "LOCATION_INVALID")
-	// errBannedRightsInvalid rejects a channels.editBanned rights struct that
-	// revokes something other than view_messages. M7 stores no partial
-	// restriction, so there is nothing to write for one, and treating it as an
-	// unban would clear a live ban for a caller who asked to tighten it. Decided
-	// on the client's own input before any row is read, like errUntilDateInvalid.
+	// errBannedRightsInvalid rejects rights outside the relevant write path's
+	// allowlist: channels.editBanned accepts only view_messages, while basic-chat
+	// defaults accept only the restrictions stored by the group permission model.
 	errBannedRightsInvalid = rpcErr(400, "BANNED_RIGHTS_INVALID")
 	// errUntilDateInvalid rejects a channels.editBanned whose until_date has
 	// already passed. It is decided entirely on the client's own input, before

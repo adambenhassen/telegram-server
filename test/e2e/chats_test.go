@@ -266,6 +266,7 @@ func TestChatsRealtime(t *testing.T) {
 
 	// 1. A creates chat with B and C, title "Team".
 	var chatID int64
+	var chatVersion int
 	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		inv, err := c.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
 			Title: "Team",
@@ -292,11 +293,53 @@ func TestChatsRealtime(t *testing.T) {
 			return errors.New("createChat: participants_count != 3")
 		}
 		chatID = chat.ID
+		chatVersion = chat.Version
+		return nil
+	})
+
+	// A saves a poll restriction. The response is the versioned rights update,
+	// and a repeated save is reported as unchanged instead of advancing the chat.
+	var savedRightsVersion int
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		result, err := c.MessagesEditChatDefaultBannedRights(ctx, &tg.MessagesEditChatDefaultBannedRightsRequest{
+			Peer:         &tg.InputPeerChat{ChatID: chatID},
+			BannedRights: tg.ChatBannedRights{SendPolls: true},
+		})
+		if err != nil {
+			return fmt.Errorf("edit default rights: %w", err)
+		}
+		updates, ok := result.(*tg.Updates)
+		if !ok || len(updates.Updates) != 1 {
+			return fmt.Errorf("edit default rights result = %T, want Updates with one entry", result)
+		}
+		updated, ok := updates.Updates[0].(*tg.UpdateChatDefaultBannedRights)
+		if !ok {
+			return fmt.Errorf("default rights update = %T, want *tg.UpdateChatDefaultBannedRights", updates.Updates[0])
+		}
+		peer, ok := updated.Peer.(*tg.PeerChat)
+		if !ok || peer.ChatID != chatID {
+			return fmt.Errorf("default rights peer = %T/%v, want chat %d", updated.Peer, updated.Peer, chatID)
+		}
+		if !updated.DefaultBannedRights.SendPolls || updated.DefaultBannedRights.SendMessages || updated.Version != chatVersion+1 {
+			return fmt.Errorf("default rights update = %+v, want SendPolls only at version %d", updated, chatVersion+1)
+		}
+		savedRightsVersion = updated.Version
+		return nil
+	})
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesEditChatDefaultBannedRights(ctx, &tg.MessagesEditChatDefaultBannedRightsRequest{
+			Peer:         &tg.InputPeerChat{ChatID: chatID},
+			BannedRights: tg.ChatBannedRights{SendPolls: true},
+		})
+		var rpc *tgerr.Error
+		if !errors.As(err, &rpc) || rpc.Message != "CHAT_NOT_MODIFIED" {
+			return fmt.Errorf("unchanged default rights error = %w, want CHAT_NOT_MODIFIED", err)
+		}
 		return nil
 	})
 
 	// Every current member sees the same three participants, with profile
-	// fields gated for the current viewer.
+	// fields gated for the current viewer. Each read reopens the saved rights.
 	for _, member := range []struct {
 		cmds   chan command
 		userID int64
@@ -307,7 +350,18 @@ func TestChatsRealtime(t *testing.T) {
 			if err != nil {
 				return fmt.Errorf("%s getFullChat: %w", member.who, err)
 			}
-			return checkFullChat(t, res, chatID, aUserID, member.userID, bUserID, cUserID)
+			if err := checkFullChat(t, res, chatID, aUserID, member.userID, bUserID, cUserID); err != nil {
+				return err
+			}
+			chat, ok := res.Chats[0].(*tg.Chat)
+			if !ok {
+				return fmt.Errorf("%s getFullChat chat = %T, want *tg.Chat", member.who, res.Chats[0])
+			}
+			rights, ok := chat.GetDefaultBannedRights()
+			if !ok || !rights.SendPolls || rights.SendMessages || chat.Version != savedRightsVersion {
+				return fmt.Errorf("%s getFullChat rights/version = %+v/%d, want SendPolls only/version %d", member.who, rights, chat.Version, savedRightsVersion)
+			}
+			return nil
 		})
 	}
 
@@ -347,6 +401,10 @@ func TestChatsRealtime(t *testing.T) {
 		}
 		if memberChat.ParticipantsCount != 3 {
 			return fmt.Errorf("member chat participant count = %d, want 3 to match getFullChat", memberChat.ParticipantsCount)
+		}
+		defaultRights, ok := memberChat.GetDefaultBannedRights()
+		if !ok || !defaultRights.SendPolls || memberChat.Version != savedRightsVersion {
+			return fmt.Errorf("member getChats default rights/version = %+v/%d, want SendPolls/version %d", defaultRights, memberChat.Version, savedRightsVersion)
 		}
 		for i, id := range []int64{otherChat.ID, absentChatID, dUserID, channel.ID} {
 			forbidden, ok := res.Chats[i+1].(*tg.ChatForbidden)

@@ -250,6 +250,49 @@ func (h *handlers) handleEditChatTitle(r *mtproto.Request) (bin.Encoder, error) 
 	return ups, nil
 }
 
+// handleEditChatDefaultBannedRights saves basic-group default restrictions.
+// The store re-checks current membership and creator authority under the chat
+// row lock before it compares values or writes. Rights updates have no message
+// event or owner pts, so the reply carries Telegram's chat-version update alone.
+func (h *handlers) handleEditChatDefaultBannedRights(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesEditChatDefaultBannedRightsRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	peer, ok := req.Peer.(*tg.InputPeerChat)
+	if !ok || peer.ChatID <= 0 {
+		return nil, errPeerIDInvalid
+	}
+	rights, err := chatDefaultBannedRightsFromTL(req.BannedRights)
+	if err != nil {
+		return nil, err
+	}
+
+	chat, changed, err := h.store.SetChatDefaultBannedRights(r.Ctx, peer.ChatID, r.UserID, rights)
+	if errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	}
+	if err != nil {
+		h.log.Error("edit chat default banned rights", "chat_id", peer.ChatID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !changed {
+		return nil, errChatNotModified
+	}
+
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateChatDefaultBannedRights{
+			Peer:                &tg.PeerChat{ChatID: chat.ID},
+			DefaultBannedRights: chatDefaultBannedRightsToTL(chat.DefaultBannedRights),
+			Version:             chat.Version,
+		}},
+		Date: int(h.now().Unix()),
+	}, nil
+}
+
 func (h *handlers) handleGetFullChat(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesGetFullChatRequest
 	if err := req.Decode(r.Buf); err != nil {

@@ -321,6 +321,33 @@ func (q *Queries) IsChatMember(ctx context.Context, arg IsChatMemberParams) (boo
 	return exists, err
 }
 
+const setChatDefaultBannedRights = `-- name: SetChatDefaultBannedRights :one
+UPDATE chats
+SET default_banned_rights = $2, version = version + 1
+WHERE id = $1
+RETURNING id, title, creator_id, version, date, pinned_message_id, default_banned_rights
+`
+
+type SetChatDefaultBannedRightsParams struct {
+	ID                  int64
+	DefaultBannedRights []string
+}
+
+func (q *Queries) SetChatDefaultBannedRights(ctx context.Context, arg SetChatDefaultBannedRightsParams) (Chat, error) {
+	row := q.db.QueryRow(ctx, setChatDefaultBannedRights, arg.ID, arg.DefaultBannedRights)
+	var i Chat
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.CreatorID,
+		&i.Version,
+		&i.Date,
+		&i.PinnedMessageID,
+		&i.DefaultBannedRights,
+	)
+	return i, err
+}
+
 const setChatPinnedMessage = `-- name: SetChatPinnedMessage :one
 UPDATE chats SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING id, title, creator_id, version, date, pinned_message_id, default_banned_rights
 `

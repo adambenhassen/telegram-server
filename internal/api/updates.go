@@ -207,7 +207,7 @@ func actionToTL(m store.Message, createUsers []int64) tg.MessageActionClass {
 // Photo is mandatory on the wire, not optional: (*tg.Chat).EncodeBare fails the
 // whole reply when it is nil, so a chat with no photo must say so explicitly.
 func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
-	return &tg.Chat{
+	chat := &tg.Chat{
 		ID:                c.ID,
 		Title:             c.Title,
 		Creator:           c.CreatorID == selfID,
@@ -216,6 +216,10 @@ func chatToTL(c store.Chat, participantsCount int, selfID int64) *tg.Chat {
 		Version:           c.Version,
 		Photo:             &tg.ChatPhotoEmpty{},
 	}
+	if len(c.DefaultBannedRights) > 0 {
+		chat.SetDefaultBannedRights(chatDefaultBannedRightsToTL(c.DefaultBannedRights))
+	}
+	return chat
 }
 
 // channelToTL maps a stored channel to the wire. member says whether the viewer

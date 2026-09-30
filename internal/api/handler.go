@@ -271,6 +271,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesGetFullChatRequestTypeID, h.handleGetFullChat)
 	register(d, tg.MessagesGetChatsRequestTypeID, h.handleGetChats)
 	register(d, tg.MessagesEditChatTitleRequestTypeID, h.handleEditChatTitle)
+	register(d, tg.MessagesEditChatDefaultBannedRightsRequestTypeID, h.handleEditChatDefaultBannedRights)
 	register(d, tg.MessagesAddChatUserRequestTypeID, h.handleAddChatUser)
 	register(d, tg.MessagesDeleteChatUserRequestTypeID, h.handleDeleteChatUser)
 	register(d, tg.ChannelsGetMessagesRequestTypeID, h.handleGetChannelMessages)
