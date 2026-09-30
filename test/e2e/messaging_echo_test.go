@@ -152,24 +152,17 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	managerA1, managerA2 := updates.New(updates.Config{Handler: collA1}), updates.New(updates.Config{Handler: collA2})
 	managerB1, managerB2 := updates.New(updates.Config{Handler: collB1}), updates.New(updates.Config{Handler: collB2})
 	a1 := launchClient(phoneA, pushA1, managerA1, sessA1, true)
+	waitClient("A1", a1)
 	a2 := launchClient(phoneA, pushA2, managerA2, sessA2, true)
+	waitClient("A2", a2)
 	b1 := launchClient(phoneB, pushB1, managerB1, sessB1, true)
+	waitClient("B1", b1)
 	b2 := launchClient(phoneB, pushB2, managerB2, sessB2, true)
+	waitClient("B2", b2)
 	collC, pushC := newUpdateCollector(), newUpdateCollector()
 	managerC := updates.New(updates.Config{Handler: collC})
 	c := launchClient(phoneC, pushC, managerC, &session.StorageMemory{}, true)
-	for _, session := range []struct {
-		name string
-		run  *runningClient
-	}{
-		{name: "A1", run: a1},
-		{name: "A2", run: a2},
-		{name: "B1", run: b1},
-		{name: "B2", run: b2},
-		{name: "C", run: c},
-	} {
-		waitClient(session.name, session.run)
-	}
+	waitClient("C", c)
 	waitForDistinctAuthKeys(t, ctx, registry, b1.id, 2, "B")
 	waitForDistinctAuthKeys(t, ctx, registry, a1.id, 2, "A")
 

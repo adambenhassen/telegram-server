@@ -76,18 +76,68 @@ type pendingRPCReadyConn interface {
 // logged and the client's next getDifference backfills.
 func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	conns := u.registry.Conns(userID)
+	if len(conns) > 0 {
+		suppressed, _ := store.SuppressedUpdateFromContext(ctx)
+		targets := make([]pushConn, len(conns))
+		for i, c := range conns {
+			targets[i] = c
+		}
+		acceptedAt, _ := store.NotificationAcceptedAt(ctx)
+		u.deliverAtSuppressed(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
+			return u.h.buildUpdates(ctx, userID, fromPts)
+		}, acceptedAt, suppressed)
+	}
+	if channelID, ok := store.ChannelMembershipUpdateFromContext(ctx); ok {
+		u.deliverChannelMembership(ctx, userID, channelID)
+	}
+}
+
+// deliverChannelMembership pushes a newly invited user their own channel peer
+// hash. Membership is re-read so a ban or removal committed before delivery
+// suppresses the update.
+func (u *Updater) deliverChannelMembership(ctx context.Context, userID, channelID int64) {
+	conns := u.registry.Conns(userID)
 	if len(conns) == 0 {
 		return
 	}
-	suppressed, _ := store.SuppressedUpdateFromContext(ctx)
-	targets := make([]pushConn, len(conns))
-	for i, c := range conns {
-		targets[i] = c
+	channel, found, err := u.h.store.ChannelByID(ctx, channelID)
+	if err != nil {
+		u.log.Error("deliver channel membership channel", "channel_id", channelID, "user_id", userID, "err", err)
+		return
 	}
-	acceptedAt, _ := store.NotificationAcceptedAt(ctx)
-	u.deliverAtSuppressed(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
-		return u.h.buildUpdates(ctx, userID, fromPts)
-	}, acceptedAt, suppressed)
+	if !found {
+		return
+	}
+	member, found, err := u.h.store.ChannelMemberOf(ctx, channelID, userID)
+	if err != nil {
+		u.log.Error("deliver channel membership participant", "channel_id", channelID, "user_id", userID, "err", err)
+		return
+	}
+	if !found || member.Banned(time.Now()) {
+		return
+	}
+	chat, ok := u.h.channelToTL(channel, member, true, userID).(*tg.Channel)
+	if !ok {
+		return
+	}
+	env := &tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: channelID}},
+		Chats:   []tg.ChatClass{chat},
+		Date:    int(time.Now().Unix()),
+		Seq:     0,
+	}
+	pushes := make([]transientPush, 0, len(conns))
+	for _, conn := range conns {
+		pushes = append(pushes, transientPush{
+			owner: userID,
+			conn:  conn,
+			enc:   env,
+			onError: func(err error) {
+				u.log.Info("deliver channel membership", "channel_id", channelID, "user_id", userID, "err", err)
+			},
+		})
+	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // maxDeliveryRounds caps the store round trips one notification may cost. Two

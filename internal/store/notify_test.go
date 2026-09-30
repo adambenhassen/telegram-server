@@ -745,9 +745,16 @@ func TestStartListenerDeliversChannelPost(t *testing.T) {
 	s := openDSN(t, dsn)
 
 	delivered := make(chan int64, 1)
+	membership := make(chan [2]int64, 1)
 	posted := make(chan int64, 1)
 	_, stop, err := store.StartListener(ctx, dsn,
-		func(_ context.Context, userID int64) { delivered <- userID },
+		func(ctx context.Context, userID int64) {
+			if channelID, ok := store.ChannelMembershipUpdateFromContext(ctx); ok {
+				membership <- [2]int64{userID, channelID}
+				return
+			}
+			delivered <- userID
+		},
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, _, _ int64) {},
 		func(_ context.Context, channelID int64) { posted <- channelID },
@@ -782,6 +789,17 @@ func TestStartListenerDeliversChannelPost(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("deliver callback not invoked after malformed channel-post payload")
+	}
+	if err := s.Notify(ctx, store.ChannelUpdates, store.ChannelMembershipPayload(7, 42)); err != nil {
+		t.Fatalf("notify channel membership: %v", err)
+	}
+	select {
+	case got := <-membership:
+		if got != [2]int64{7, 42} {
+			t.Fatalf("channel membership notification = %v, want [7 42]", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel membership delivery not invoked")
 	}
 
 	// Valid channel-post payload must reach the callback.

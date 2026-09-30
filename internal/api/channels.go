@@ -26,6 +26,9 @@ const (
 	// ~650k ids inside gotd's 16 MB frame, so an uncapped vector is free
 	// amplification. 100 is Telegram's own documented limit for the method.
 	maxGetChannels = 100
+	// maxChannelInviteTargets bounds request work and the target-count cost
+	// charged to the shared add-user rate limit.
+	maxChannelInviteTargets = 100
 )
 
 // The coarse participant roles M7 stores, mirroring internal/store's own
@@ -253,6 +256,77 @@ func (h *handlers) handleGetChannels(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 	return &tg.MessagesChats{Chats: chats}, nil
+}
+
+// handleInviteToChannel serves channels.inviteToChannel. Direct admission is
+// restricted to creator/admin callers by the store transaction; all peer hashes
+// are checked here against the requester's own view before any write.
+func (h *handlers) handleInviteToChannel(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsInviteToChannelRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if len(req.Users) > maxChannelInviteTargets {
+		return nil, errUsersTooMuch
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+
+	targetIDs := make([]int64, len(req.Users))
+	for i, input := range req.Users {
+		if _, ok := input.(*tg.InputUser); !ok {
+			return nil, errPeerIDInvalid
+		}
+		targetID, err := h.inputUserID(input, r.UserID)
+		if err != nil {
+			return nil, err
+		}
+		_, found, err := h.store.UserByID(r.Ctx, targetID)
+		if err != nil {
+			h.log.Error("invite channel target", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		if !found {
+			return nil, errPeerIDInvalid
+		}
+		targetIDs[i] = targetID
+	}
+	if len(targetIDs) > 0 {
+		if err := h.checkRateLimitCost(r, "add_chat_user", h.rateLimitAddChatUser, len(targetIDs)); err != nil {
+			return nil, err
+		}
+	}
+
+	added, err := h.store.AddChannelMembers(r.Ctx, channelID, r.UserID, targetIDs)
+	if errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	}
+	if err != nil {
+		h.log.Error("invite channel members", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	for _, targetID := range added {
+		h.notifyChannelMembership(r.Ctx, targetID, channelID)
+	}
+
+	chats, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
+	if err != nil {
+		h.log.Error("invite channel render", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return &tg.MessagesInvitedUsers{
+		Updates: &tg.Updates{
+			Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: channelID}},
+			Chats:   chats,
+			Date:    int(time.Now().Unix()),
+		},
+		MissingInvitees: []tg.MissingInvitee{},
+	}, nil
 }
 
 // handleLeaveChannel serves channels.leaveChannel.
