@@ -404,7 +404,7 @@ func (q *Queries) ChannelParticipantsForViewer(ctx context.Context, arg ChannelP
 }
 
 const channelParticipantsPage = `-- name: ChannelParticipantsPage :many
-SELECT cp.channel_id, cp.user_id, cp.role, cp.banned_until, cp.join_pts, cp.date
+SELECT cp.channel_id, cp.user_id, cp.role, cp.banned_until, cp.join_pts, cp.date, cp.last_post_at
 FROM channel_participants cp
 JOIN users u ON u.id = cp.user_id
 LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = cp.user_id
@@ -462,6 +462,7 @@ func (q *Queries) ChannelParticipantsPage(ctx context.Context, arg ChannelPartic
 			&i.BannedUntil,
 			&i.JoinPts,
 			&i.Date,
+			&i.LastPostAt,
 		); err != nil {
 			return nil, err
 		}
