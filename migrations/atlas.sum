@@ -1,4 +1,4 @@
-h1:M0+t3rT7Q5dzWM1FFVgP1Opdy1hjQ5MO1SDE/fWviPQ=
+h1:JSV35PD45kqH6StF4DWMDq1Rc1zY1Y083E7yul5EmhE=
 20260721000001_baseline.sql h1:cnO6K1z0Uv3goEvecgJixKSio6ziaB1rF7cQLoCWOxs=
 20260721000002_auth_keys.sql h1:+vNabm6vdEAgu3H5ZGw2Wr8D/Y6i4ikAAUO3JbfZQeE=
 20260721000003_code_hardening.sql h1:8pbAqUpqcwOONUfac+qC51QjfC1JnObNCcXa1HC/dr0=
@@ -45,3 +45,5 @@ h1:M0+t3rT7Q5dzWM1FFVgP1Opdy1hjQ5MO1SDE/fWviPQ=
 20260929000040_user_contacts.sql h1:nMbUhmnaJBsyYBAVBCoR/RtH2FYvm4fXgWn72WEyMFk=
 20260930000041_group_channel_permission_state.sql h1:FLaLmfmUhWz3vbG1hPadEPUx0OZztrragpR69lXWeQo=
 20260930000042_validate_group_channel_permission_state.sql h1:FR+R9VUhS5L5FXsBOfMmrYmaLITVxxZB+yjOTCNhmHU=
+20260930000043_file_subtype_rights.sql h1:rt+HiOBaV4uBuQ3ai402164As5Y/sKZ/hydUJE8XxcM=
+20260930000044_validate_file_subtype_rights.sql h1:uAJreM2nTNqvRG1jSxJudjt292AujCEE3pEbL2OOcSE=

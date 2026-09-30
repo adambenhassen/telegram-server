@@ -137,14 +137,15 @@ type EncryptedEvent struct {
 }
 
 type File struct {
-	ID         int64
-	UploaderID int64
-	AccessHash int64
-	Size       int64
-	MimeType   string
-	FileName   string
-	Stored     bool
-	Date       pgtype.Timestamptz
+	ID            int64
+	UploaderID    int64
+	AccessHash    int64
+	Size          int64
+	MimeType      string
+	FileName      string
+	Stored        bool
+	Date          pgtype.Timestamptz
+	SubtypeRights []string
 }
 
 type Message struct {
