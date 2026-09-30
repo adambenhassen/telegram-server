@@ -19,6 +19,7 @@ import (
 	"github.com/gotd/td/telegram/updates/hook"
 	"github.com/gotd/td/tg"
 
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -41,6 +42,14 @@ func TestSmoke(t *testing.T) {
 	t.Run("channel", func(t *testing.T) {
 		t.Parallel()
 		testSmokeChannel(t)
+	})
+	t.Run("contacts-search", func(t *testing.T) {
+		t.Parallel()
+		testSmokeContactsSearch(t)
+	})
+	t.Run("username-registration", func(t *testing.T) {
+		t.Parallel()
+		testSmokeUsernameRegistration(t)
 	})
 }
 
@@ -445,6 +454,336 @@ func testSmokeChannel(t *testing.T) {
 	}
 }
 
+func testSmokeContactsSearch(t *testing.T) {
+	t.Helper()
+	f := newSmokeFixture(t)
+	const phoneA, phoneB = "+15551049001", "+15551049002"
+	seedPhoneUsers(t, f.ctx, f.store, phoneA, phoneB)
+
+	a := newSmokeClient(t, f, phoneA)
+	b := newSmokeClient(t, f, phoneB)
+	if err := f.store.ClaimUsername(f.ctx, a.id, "smokealpha"); err != nil {
+		t.Fatalf("claim A username: %v", err)
+	}
+	if err := f.store.ClaimUsername(f.ctx, b.id, "smokebravo"); err != nil {
+		t.Fatalf("claim B username: %v", err)
+	}
+
+	var search *tg.ContactsFound
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		search, err = api.ContactsSearch(ctx, &tg.ContactsSearchRequest{Q: "smokebravo", Limit: 10})
+		return err
+	}); err != nil {
+		t.Fatalf("exact username search: %v", err)
+	}
+	if search == nil {
+		t.Fatal("exact username search returned nil")
+	}
+	if len(search.Results) != 1 || len(search.Users) != 1 {
+		t.Fatalf("exact username search results/users = %d/%d, want one each", len(search.Results), len(search.Users))
+	}
+	peer, ok := search.Results[0].(*tg.PeerUser)
+	if !ok {
+		t.Fatalf("exact username search peer type = %T, want *tg.PeerUser", search.Results[0])
+	}
+	if peer.UserID != b.id {
+		t.Fatalf("exact username search peer id = %d, want user %d", peer.UserID, b.id)
+	}
+	searchUser, err := requireSmokeFullUser(search.Users, b.id, "contacts.search")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var users []tg.UserClass
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		users, err = api.UsersGetUsers(ctx, []tg.InputUserClass{
+			&tg.InputUser{UserID: searchUser.ID, AccessHash: searchUser.AccessHash},
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("getUsers for search result: %v", err)
+	}
+	resolvedUser, err := requireSmokeFullUser(users, b.id, "users.getUsers")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var added tg.UpdatesClass
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		added, err = api.ContactsAddContact(ctx, &tg.ContactsAddContactRequest{
+			ID:        &tg.InputUser{UserID: resolvedUser.ID, AccessHash: resolvedUser.AccessHash},
+			FirstName: "Smoke Bravo",
+			Phone:     "+15550000000",
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("add B as contact: %v", err)
+	}
+	if _, ok := added.(*tg.Updates); !ok {
+		t.Fatalf("add contact response = %T, want *tg.Updates", added)
+	}
+
+	var contactResult tg.ContactsContactsClass
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		contactResult, err = api.ContactsGetContacts(ctx, 0)
+		return err
+	}); err != nil {
+		t.Fatalf("A getContacts: %v", err)
+	}
+	contacts, ok := contactResult.(*tg.ContactsContacts)
+	if !ok {
+		t.Fatalf("A getContacts response = %T, want *tg.ContactsContacts", contactResult)
+	}
+	if contacts.SavedCount != 1 || len(contacts.Contacts) != 1 || contacts.Contacts[0].UserID != b.id {
+		t.Fatalf("A getContacts saved/users = %d/%d, want B %d", contacts.SavedCount, len(contacts.Contacts), b.id)
+	}
+	contactUser, err := requireSmokeFullUser(contacts.Users, b.id, "A contacts.getContacts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contactUser.Contact {
+		t.Fatalf("A getContacts B contact flag = false, want true")
+	}
+
+	var bContactsResult tg.ContactsContactsClass
+	if err := b.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		bContactsResult, err = api.ContactsGetContacts(ctx, 0)
+		return err
+	}); err != nil {
+		t.Fatalf("B getContacts: %v", err)
+	}
+	bContacts, ok := bContactsResult.(*tg.ContactsContacts)
+	if !ok || bContacts.SavedCount != 0 || len(bContacts.Contacts) != 0 || len(bContacts.Users) != 0 {
+		t.Fatalf("B sees A's one-sided contact edge: %T, want an empty contact list", bContactsResult)
+	}
+
+	const messageText = "contact-smoke"
+	peerForSend := &tg.InputPeerUser{UserID: resolvedUser.ID, AccessHash: resolvedUser.AccessHash}
+	var sendResult tg.UpdatesClass
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		sendResult, err = api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerForSend, Message: messageText, RandomID: 1049001,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("send to searched B peer: %v", err)
+	}
+	sent, _, ok := outgoingMessage(t, sendResult, messageText)
+	if !ok || countOutgoingMessages(sendResult, messageText) != 1 || sent.ID <= 0 || !sent.Out {
+		t.Fatalf("send result does not contain one outgoing %q message", messageText)
+	}
+	sentPeer, ok := sent.PeerID.(*tg.PeerUser)
+	if !ok || sentPeer.UserID != b.id {
+		t.Fatalf("send result peer type/id = %T/%d, want B %d", sent.PeerID, smokePeerUserID(sent.PeerID), b.id)
+	}
+
+	var historyResult any
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		historyResult, err = api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peerForSend, Limit: 10})
+		return err
+	}); err != nil {
+		t.Fatalf("A getHistory with searched B peer: %v", err)
+	}
+	history, ok := historyResult.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("A getHistory response = %T, want *tg.MessagesMessages", historyResult)
+	}
+	if len(history.Messages) != 1 {
+		t.Fatalf("A getHistory response = %T, want one message", historyResult)
+	}
+	historyMessage, ok := history.Messages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("A getHistory message = %T, want *tg.Message", history.Messages[0])
+	}
+	if historyMessage.Message != messageText || historyMessage.ID != sent.ID || !historyMessage.Out {
+		t.Fatalf("A getHistory text/id/out = %q/%d/%v, want %q/%d/true", historyMessage.Message, historyMessage.ID, historyMessage.Out, messageText, sent.ID)
+	}
+	historyPeer, ok := historyMessage.PeerID.(*tg.PeerUser)
+	if !ok || historyPeer.UserID != b.id {
+		t.Fatalf("A getHistory peer type/id = %T/%d, want B %d", historyMessage.PeerID, smokePeerUserID(historyMessage.PeerID), b.id)
+	}
+	if _, err := requireSmokeFullUser(history.Users, b.id, "A messages.getHistory"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func smokePeerUserID(peer tg.PeerClass) int64 {
+	if user, ok := peer.(*tg.PeerUser); ok {
+		return user.UserID
+	}
+	return 0
+}
+
+func testSmokeUsernameRegistration(t *testing.T) {
+	t.Helper()
+	f := newSmokeFixtureWithRegistration(t, config.RegistrationOpen)
+	const username, pendingPhone, password = "smokenewacct", "+15551049003", "smoke-password-1049"
+	pending, err := f.store.CreateUser(f.ctx, pendingPhone)
+	if err != nil {
+		t.Fatalf("create pending signup account: %v", err)
+	}
+
+	firstSession := &session.StorageMemory{}
+	firstClient := f.savedSessionClient(firstSession)
+	var accountID int64
+	if err := firstClient.Run(f.ctx, func(ctx context.Context) error {
+		api := firstClient.API()
+		codeHash, err := sendCodeUsername(ctx, api, username)
+		if err != nil {
+			return fmt.Errorf("sendCode for signup: %w", err)
+		}
+		code, err := f.codes.wait(ctx, username)
+		if err != nil {
+			return fmt.Errorf("wait for in-memory signup code: %w", err)
+		}
+		sessionData, err := (&session.Loader{Storage: firstSession}).Load(ctx)
+		if err != nil {
+			return fmt.Errorf("load signup session: %w", err)
+		}
+		if len(sessionData.AuthKeyID) != 8 {
+			return fmt.Errorf("signup auth key id length = %d, want 8", len(sessionData.AuthKeyID))
+		}
+		var authKeyID [8]byte
+		copy(authKeyID[:], sessionData.AuthKeyID)
+		if err := f.store.SetPendingUser(ctx, mtproto.AuthKeyIDInt64(authKeyID), pending.ID); err != nil {
+			return fmt.Errorf("stage test signup account: %w", err)
+		}
+
+		response, err := signInUsername(ctx, api, username, codeHash, code)
+		if err != nil {
+			if !isSignUpRequired(err) {
+				return fmt.Errorf("signIn before signup: %w", err)
+			}
+		} else if _, ok := response.(*tg.AuthAuthorizationSignUpRequired); !ok {
+			return fmt.Errorf("signIn before signup response = %T, want signup required", response)
+		}
+
+		response, err = signUpUsername(ctx, api, username, codeHash, "Smoke", "Account")
+		if err != nil {
+			return fmt.Errorf("signUp: %w", err)
+		}
+		authorization, ok := response.(*tg.AuthAuthorization)
+		if !ok || authorization.User == nil {
+			return fmt.Errorf("signUp response = %T, want authorization with a user", response)
+		}
+		signupUser, ok := authorization.User.(*tg.User)
+		if !ok || signupUser.ID <= 0 {
+			return fmt.Errorf("signUp user = %T, want a full user", authorization.User)
+		}
+		accountID = signupUser.ID
+		passwordState, err := api.AccountGetPassword(ctx)
+		if err != nil {
+			return fmt.Errorf("usable RPC after signUp: %w", err)
+		}
+		if passwordState.HasPassword {
+			return errors.New("new smoke account unexpectedly has a password")
+		}
+		verifier, salt1, salt2, err := testComputeSRPVerifier([]byte(password))
+		if err != nil {
+			return fmt.Errorf("prepare smoke password: %w", err)
+		}
+		_, err = api.AccountUpdatePasswordSettings(ctx, &tg.AccountUpdatePasswordSettingsRequest{
+			Password: &tg.InputCheckPasswordEmpty{},
+			NewSettings: tg.AccountPasswordInputSettings{
+				NewAlgo: &tg.PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow{
+					Salt1: salt1,
+					Salt2: salt2,
+				},
+				NewPasswordHash: verifier,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("set synthetic smoke password: %w", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("open username registration: %v", err)
+	}
+
+	secondSession := &session.StorageMemory{}
+	secondClient := f.savedSessionClient(secondSession)
+	if err := secondClient.Run(f.ctx, func(ctx context.Context) error {
+		api := secondClient.API()
+		codeHash, err := sendCodeUsername(ctx, api, username)
+		if err != nil {
+			return fmt.Errorf("sendCode for fresh sign-in: %w", err)
+		}
+		code, err := f.codes.wait(ctx, username)
+		if err != nil {
+			return fmt.Errorf("wait for in-memory sign-in code: %w", err)
+		}
+		response, err := signInUsername(ctx, api, username, codeHash, code)
+		if !isSessionPasswordNeeded(err) {
+			if err != nil {
+				return fmt.Errorf("fresh signIn expected password challenge: %w", err)
+			}
+			return fmt.Errorf("fresh signIn response = %T, want password challenge", response)
+		}
+		passwordState, err := api.AccountGetPassword(ctx)
+		if err != nil {
+			return fmt.Errorf("get fresh sign-in password challenge: %w", err)
+		}
+		if !passwordState.HasPassword {
+			return errors.New("fresh sign-in account has no password")
+		}
+		proof, err := auth.PasswordHash([]byte(password), passwordState.SRPID, passwordState.SRPB, passwordState.SecureRandom, passwordState.CurrentAlgo)
+		if err != nil {
+			return fmt.Errorf("compute fresh sign-in proof: %w", err)
+		}
+		response, err = api.AuthCheckPassword(ctx, proof)
+		if err != nil {
+			return fmt.Errorf("complete fresh signIn: %w", err)
+		}
+		authorization, ok := response.(*tg.AuthAuthorization)
+		if !ok || authorization.User == nil {
+			return fmt.Errorf("fresh signIn response = %T, want user %d", response, accountID)
+		}
+		signinUser, ok := authorization.User.(*tg.User)
+		if !ok || signinUser.ID != accountID {
+			return fmt.Errorf("fresh signIn user = %T, want user %d", authorization.User, accountID)
+		}
+		if _, err := api.AccountGetPassword(ctx); err != nil {
+			return fmt.Errorf("usable RPC after fresh signIn: %w", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("fresh username sign-in: %v", err)
+	}
+}
+
+func requireSmokeFullUser(users []tg.UserClass, userID int64, source string) (*tg.User, error) {
+	var found *tg.User
+	for _, candidate := range users {
+		switch user := candidate.(type) {
+		case *tg.User:
+			if user.ID == userID {
+				if found != nil {
+					return nil, fmt.Errorf("%s returned duplicate user %d", source, userID)
+				}
+				found = user
+			}
+		case *tg.UserEmpty:
+			if user.ID == userID {
+				return nil, fmt.Errorf("%s returned userEmpty for user %d", source, userID)
+			}
+		}
+	}
+	if found == nil {
+		return nil, fmt.Errorf("%s omitted user %d", source, userID)
+	}
+	if found.AccessHash == 0 {
+		return nil, fmt.Errorf("%s returned user %d without a usable peer identity", source, userID)
+	}
+	return found, nil
+}
+
 type smokeFixture struct {
 	ctx      context.Context
 	key      *rsa.PrivateKey
@@ -455,9 +794,15 @@ type smokeFixture struct {
 	port     int
 	registry *mtproto.SessionRegistry
 	stop     func()
+	regMode  config.RegistrationMode
 }
 
 func newSmokeFixture(t *testing.T) *smokeFixture {
+	t.Helper()
+	return newSmokeFixtureWithRegistration(t, config.RegistrationClosed)
+}
+
+func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMode) *smokeFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancel)
@@ -475,7 +820,7 @@ func newSmokeFixture(t *testing.T) *smokeFixture {
 			t.Errorf("store close: %v", err)
 		}
 	})
-	f := &smokeFixture{ctx: ctx, key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2}
+	f := &smokeFixture{ctx: ctx, key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode}
 	f.start(t, "127.0.0.1:0")
 	return f
 }
@@ -487,7 +832,7 @@ func (f *smokeFixture) start(t *testing.T, address string) {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
 	f.port = tcpPort(t, ln)
-	f.registry, f.stop = bootServerWithRegistry(t, f.ctx, f.key, f.dcID, f.store, f.dsn, f.codes.Logger(), ln)
+	f.registry, f.stop = bootServerWithRegistryAndRegistrationMode(t, f.ctx, f.key, f.dcID, f.store, f.dsn, f.codes.Logger(), ln, f.regMode)
 	stop := f.stop
 	t.Cleanup(stop)
 }
