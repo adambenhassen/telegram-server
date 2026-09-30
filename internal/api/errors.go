@@ -168,7 +168,7 @@ var (
 	// channel.
 	errChatAdminRequired = rpcErr(400, "CHAT_ADMIN_REQUIRED")
 	// errChatWriteForbidden rejects a message or invitation denied by stored
-	// basic-chat default restrictions.
+	// group or channel default restrictions.
 	errChatWriteForbidden = rpcErr(403, "CHAT_WRITE_FORBIDDEN")
 	// errUsernameInvalid rejects a username that fails validation: wrong length,
 	// invalid characters, digit/underscore leading, or a reserved handle.

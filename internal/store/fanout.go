@@ -223,7 +223,7 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, log *slog.Logger, f
 		}
 	}
 	if f.Action == ChatActionNone {
-		if err = checkChatMessageRestriction(chat.DefaultBannedRights, f.FromID == chat.CreatorID, f.FileID != 0, f.MediaRights); err != nil {
+		if err = checkDefaultMessageRestriction(chat.DefaultBannedRights, f.FromID == chat.CreatorID, f.FileID != 0, f.MediaRights); err != nil {
 			return Message{}, nil, false, err
 		}
 	}

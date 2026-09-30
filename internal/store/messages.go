@@ -1023,7 +1023,7 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 			}
 		}
 		if destPeerType == PeerTypeChat {
-			if err = checkChatMessageRestriction(chatDefaultBannedRights, fromID == chatCreatorID, src.FileID != 0, fileSubtypeRights[src.FileID]); err != nil {
+			if err = checkDefaultMessageRestriction(chatDefaultBannedRights, fromID == chatCreatorID, src.FileID != 0, fileSubtypeRights[src.FileID]); err != nil {
 				return nil, nil, err
 			}
 		}
