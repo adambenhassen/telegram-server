@@ -528,6 +528,157 @@ func TestChatsRealtime(t *testing.T) {
 	// Drain B's own copy of the sent message.
 	recvMsg(collB, "B", "hello from B", bUserID)
 
+	// Add two more group messages so every member has the same three content
+	// rows to page around. Their owner-local ids are already above 1 because the
+	// chat-create service row occupies the earlier position.
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID}, Message: "middle from A", RandomID: 100003,
+		})
+		return err
+	})
+	recvMsg(collA, "A", "middle from A", aUserID)
+	recvMsg(collB, "B", "middle from A", aUserID)
+	recvMsg(collC, "C", "middle from A", aUserID)
+	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID}, Message: "newest from C", RandomID: 100004,
+		})
+		return err
+	})
+	recvMsg(collA, "A", "newest from C", cUserID)
+	recvMsg(collB, "B", "newest from C", cUserID)
+	recvMsg(collC, "C", "newest from C", cUserID)
+
+	getHistory := func(cmds chan command, peer tg.InputPeerClass, offsetID, addOffset, limit int, who string) *tg.MessagesMessages {
+		t.Helper()
+		var history *tg.MessagesMessages
+		execChat(t, ctx, cmds, func(ctx context.Context, c *tg.Client) error {
+			res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+				Peer: peer, OffsetID: offsetID, AddOffset: addOffset, Limit: limit,
+			})
+			if err != nil {
+				return fmt.Errorf("%s getHistory: %w", who, err)
+			}
+			var ok bool
+			history, ok = res.(*tg.MessagesMessages)
+			if !ok {
+				return fmt.Errorf("%s getHistory result = %T, want *tg.MessagesMessages", who, res)
+			}
+			return nil
+		})
+		return history
+	}
+	messageTexts := func(history *tg.MessagesMessages) []string {
+		var texts []string
+		for _, msg := range history.Messages {
+			if m, ok := msg.(*tg.Message); ok && m.Message != "" {
+				texts = append(texts, m.Message)
+			}
+		}
+		return texts
+	}
+	assertTexts := func(who string, got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s history texts = %v, want %v", who, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s history texts = %v, want %v", who, got, want)
+			}
+		}
+	}
+	assertLocalIDsAboveOne := func(who string, history *tg.MessagesMessages) {
+		t.Helper()
+		for _, msg := range history.Messages {
+			if m, ok := msg.(*tg.Message); ok && m.Message != "" && m.ID <= 1 {
+				t.Errorf("%s history message %q has local id %d, want greater than 1", who, m.Message, m.ID)
+			}
+		}
+	}
+	wantGroupTexts := []string{"newest from C", "middle from A", "hello from B"}
+	for _, member := range []struct {
+		cmds chan command
+		who  string
+	}{{aCmds, "A"}, {bCmds, "B"}, {cCmds, "C"}} {
+		history := getHistory(member.cmds, &tg.InputPeerChat{ChatID: chatID}, 1, -25, 50, member.who)
+		assertTexts(member.who+" around-unread chat", messageTexts(history), wantGroupTexts)
+		assertLocalIDsAboveOne(member.who+" around-unread chat", history)
+	}
+
+	// Seed a separate user-peer history after each owner's group service rows so
+	// all three copies have owner-local ids above the around-unread boundary.
+	peerAB, peerBA := peerUser(aUserID, bUserID), peerUser(bUserID, aUserID)
+	for _, message := range []struct {
+		cmds     chan command
+		peer     tg.InputPeerClass
+		text     string
+		randomID int64
+		to       *updateCollector
+	}{
+		{aCmds, peerAB, "user oldest", 100101, collB},
+		{bCmds, peerBA, "user middle", 100102, collA},
+		{aCmds, peerAB, "user newest", 100103, collB},
+	} {
+		execChat(t, ctx, message.cmds, func(ctx context.Context, c *tg.Client) error {
+			_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+				Peer: message.peer, Message: message.text, RandomID: message.randomID,
+			})
+			return err
+		})
+		got := recvOrCtx(t, ctx, message.to.newMsg, message.text+" user-peer update")
+		if got.Message != message.text {
+			t.Fatalf("user-peer update = %q, want %q", got.Message, message.text)
+		}
+	}
+	wantUserTexts := []string{"user newest", "user middle", "user oldest"}
+	for _, userPeer := range []struct {
+		cmds chan command
+		peer tg.InputPeerClass
+		who  string
+	}{{aCmds, peerAB, "A"}, {bCmds, peerBA, "B"}} {
+		around := getHistory(userPeer.cmds, userPeer.peer, 1, -25, 50, userPeer.who)
+		assertTexts(userPeer.who+" around-unread user peer", messageTexts(around), wantUserTexts)
+		assertLocalIDsAboveOne(userPeer.who+" around-unread user peer", around)
+
+		newest := getHistory(userPeer.cmds, userPeer.peer, 0, 0, 50, userPeer.who+" newest")
+		assertTexts(userPeer.who+" offset zero", messageTexts(newest), wantUserTexts)
+		latestID := 0
+		for _, msg := range newest.Messages {
+			if m, ok := msg.(*tg.Message); ok && m.Message == "user newest" {
+				latestID = m.ID
+			}
+		}
+		if latestID <= 1 {
+			t.Fatalf("%s newest local id = %d, want greater than 1", userPeer.who, latestID)
+		}
+		older := getHistory(userPeer.cmds, userPeer.peer, latestID, 0, 50, userPeer.who+" older")
+		assertTexts(userPeer.who+" older than newest", messageTexts(older), []string{"user middle", "user oldest"})
+		positive := getHistory(userPeer.cmds, userPeer.peer, 0, 1, 50, userPeer.who+" positive")
+		assertTexts(userPeer.who+" positive add_offset", messageTexts(positive), []string{"user middle", "user oldest"})
+		limited := getHistory(userPeer.cmds, userPeer.peer, 0, 0, 1, userPeer.who+" limited")
+		assertTexts(userPeer.who+" requested limit", messageTexts(limited), []string{"user newest"})
+	}
+
+	// A self-delete hides only A's retained copy; B still reads the same fan-out
+	// message from B's own row.
+	var aMiddleID int
+	for _, msg := range getHistory(aCmds, &tg.InputPeerChat{ChatID: chatID}, 1, -25, 50, "A before self-delete").Messages {
+		if m, ok := msg.(*tg.Message); ok && m.Message == "middle from A" {
+			aMiddleID = m.ID
+		}
+	}
+	if aMiddleID <= 1 {
+		t.Fatalf("A middle message local id = %d, want greater than 1", aMiddleID)
+	}
+	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{ID: []int{aMiddleID}})
+		return err
+	})
+	assertTexts("A self-deleted chat copy", messageTexts(getHistory(aCmds, &tg.InputPeerChat{ChatID: chatID}, 1, -25, 50, "A deleted")), []string{"newest from C", "hello from B"})
+	assertTexts("B retained chat copy", messageTexts(getHistory(bCmds, &tg.InputPeerChat{ChatID: chatID}, 1, -25, 50, "B retained")), wantGroupTexts)
+
 	// 4. A edits title to "Team 2"; B and C receive editTitle.
 	execChat(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesEditChatTitle(ctx, &tg.MessagesEditChatTitleRequest{
@@ -642,6 +793,7 @@ func TestChatsRealtime(t *testing.T) {
 	})
 	recvMsg(collB, "B", "after C left", aUserID)
 	recvMsg(collD, "D", "after C left", aUserID)
+	recvMsg(collA, "A", "after C left", aUserID)
 	// The window is the assertion, so it hangs off Background: derived from ctx
 	// an already-exhausted parent would return immediately and pass vacuously.
 	noCtx, noCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -649,6 +801,15 @@ func TestChatsRealtime(t *testing.T) {
 		t.Errorf("C should not receive message after removal: %v", err)
 	}
 	noCancel()
+	execChat(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID}, Message: "later from B", RandomID: 100005,
+		})
+		return err
+	})
+	recvMsg(collA, "A", "later from B", bUserID)
+	recvMsg(collB, "B", "later from B", bUserID)
+	recvMsg(collD, "D", "later from B", bUserID)
 
 	// Pause full-info hydration after its membership read, then remove the
 	// viewer and add C. The response must stay on its original repeatable-read
@@ -714,8 +875,8 @@ func TestChatsRealtime(t *testing.T) {
 		t.Fatalf("concurrent membership mutation: %v", snapshotMutationErr)
 	}
 
-	// B invited D, then left during the snapshot hook. D still receives the raw
-	// inviter id, but B's profile is now outside D's entitlement set.
+	// B invited D before leaving. D retains the raw inviter id, but B's profile
+	// is now outside D's entitlement set.
 	execChat(t, ctx, dCmds, func(ctx context.Context, c *tg.Client) error {
 		res, err := c.MessagesGetFullChat(ctx, chatID)
 		if err != nil {
@@ -749,6 +910,44 @@ func TestChatsRealtime(t *testing.T) {
 		}
 		if !bEmpty {
 			return errors.New("departed inviter B is not represented by UserEmpty")
+		}
+		return nil
+	})
+	// D received B's message before B left. The retained message stays readable,
+	// while B's profile is now UserEmpty because D has no other live edge to B.
+	execChat(t, ctx, dCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID}, Limit: 100,
+		})
+		if err != nil {
+			return fmt.Errorf("D getHistory after B left: %w", err)
+		}
+		history, ok := res.(*tg.MessagesMessages)
+		if !ok {
+			return fmt.Errorf("D history = %T, want *tg.MessagesMessages", res)
+		}
+		var sawDepartedMessage, sawEmptyProfile bool
+		for _, message := range history.Messages {
+			if msg, ok := message.(*tg.Message); ok && msg.Message == "later from B" {
+				if from, ok := msg.FromID.(*tg.PeerUser); ok && from.UserID == bUserID {
+					sawDepartedMessage = true
+				}
+			}
+		}
+		for _, user := range history.Users {
+			switch u := user.(type) {
+			case *tg.UserEmpty:
+				if u.ID == bUserID {
+					sawEmptyProfile = true
+				}
+			case *tg.User:
+				if u.ID == bUserID {
+					return errors.New("departed author B profile is exposed in history")
+				}
+			}
+		}
+		if !sawDepartedMessage || !sawEmptyProfile {
+			return fmt.Errorf("departed history message=%t UserEmpty=%t, want both", sawDepartedMessage, sawEmptyProfile)
 		}
 		return nil
 	})
@@ -886,6 +1085,25 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 	if _, err = collC.waitService(ctx, &tg.MessageActionChatDeleteUser{}); err != nil {
 		t.Fatalf("C wait delete: %v", err)
 	}
+	retained, err := st.History(ctx, cUserID, store.PeerTypeChat, chatID, 0, 10)
+	if err != nil {
+		t.Fatalf("C retained history rows: %v", err)
+	}
+	retainedMessage := false
+	for _, message := range retained {
+		if message.Text == "C message" && !message.Deleted {
+			retainedMessage = true
+		}
+	}
+	if !retainedMessage {
+		t.Fatalf("C retained rows = %+v, want the undeleted owner copy", retained)
+	}
+	assertChannelRPCError(t, ctx, cCmds, "PEER_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID}, Limit: 10,
+		})
+		return err
+	})
 
 	// F1: C tries editMessage → MESSAGE_ID_INVALID; A does not receive edit.
 	var editErr error
@@ -1030,26 +1248,6 @@ func TestChatsRemovedMemberIsInert(t *testing.T) {
 		}
 	} else {
 		t.Fatalf("send error type = %T, want *tgerr.Error", sendErr)
-	}
-
-	// F3: C's getHistory → PEER_ID_INVALID.
-	var histErr error
-	execChat(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
-		_, err := c.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-			Peer: &tg.InputPeerChat{ChatID: chatID}, Limit: 10,
-		})
-		histErr = err
-		return nil
-	})
-	if histErr == nil {
-		t.Fatal("C getHistory should fail")
-	}
-	if errors.As(histErr, &tgErr) {
-		if tgErr.Message != "PEER_ID_INVALID" {
-			t.Fatalf("history error = %s, want PEER_ID_INVALID", tgErr.Message)
-		}
-	} else {
-		t.Fatalf("history error type = %T, want *tgerr.Error", histErr)
 	}
 
 	// F7: the removed member's loadUsers gate. A and C share no 1:1 dialog and

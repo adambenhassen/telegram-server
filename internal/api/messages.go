@@ -513,7 +513,8 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 	}, nil
 }
 
-// handleGetHistory serves messages.getHistory, paged newest-first by offset_id.
+// handleGetHistory serves messages.getHistory, selecting ordinal pages from
+// newest-first history with offset_id and add_offset.
 func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesGetHistoryRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -525,11 +526,6 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	peerType, toID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
 		return nil, err
-	}
-	if peerType == store.PeerTypeChat {
-		if err = h.requireMember(r.Ctx, toID, r.UserID); err != nil {
-			return nil, err
-		}
 	}
 
 	limit := req.Limit
@@ -549,14 +545,22 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 		}
 		return h.channelHistory(r, toID, &req, limit)
 	}
+	if peerType == store.PeerTypeChat {
+		snapshot, serr := h.store.ChatHistoryForMemberSnapshot(r.Ctx, r.UserID, toID, req.OffsetID, req.AddOffset, limit)
+		if errors.Is(serr, store.ErrNotMember) {
+			return nil, errPeerIDInvalid
+		}
+		if serr != nil {
+			h.log.Error("get chat history snapshot", "user_id", r.UserID, "chat_id", toID, "err", serr)
+			return nil, errInternal
+		}
+		return h.chatHistory(r, snapshot)
+	}
 
-	msgs, err := h.store.History(r.Ctx, r.UserID, peerType, toID, req.OffsetID, limit)
+	msgs, err := h.store.HistoryWithOffset(r.Ctx, r.UserID, peerType, toID, req.OffsetID, req.AddOffset, limit)
 	if err != nil {
 		h.log.Error("get history", "user_id", r.UserID, "err", err)
 		return nil, errInternal
-	}
-	if peerType == store.PeerTypeChat {
-		return h.chatHistory(r, toID, msgs)
 	}
 
 	files, err := h.loadFiles(r.Ctx, msgs)
@@ -593,25 +597,20 @@ func (h *handlers) handleGetHistory(r *mtproto.Request) (bin.Encoder, error) {
 	return &tg.MessagesMessages{Messages: tlMsgs, Users: users}, nil
 }
 
-// chatHistory renders one page of a chat's history for the caller, who
-// requireMember has already established is a member.
-func (h *handlers) chatHistory(r *mtproto.Request, chatID int64, msgs []store.Message) (bin.Encoder, error) {
+// chatHistory renders one page of a chat's history from the membership and
+// hydration snapshot that authorized the caller.
+func (h *handlers) chatHistory(r *mtproto.Request, snapshot store.ChatHistorySnapshot) (bin.Encoder, error) {
+	msgs := snapshot.Messages
 	// A page has as many authors as the chat has members, and a service row names
 	// further users in its action, so the user list is collected from the page
 	// itself; twoUsers is a 1:1 helper and would omit every author but the caller.
-	// createUsers is the chat's current member set, which the caller is entitled
-	// to see here — unlike getDifference, no removed viewer reaches this path.
+	// createUsers is the member set from the same snapshot as the history page.
 	var createUsers []int64
 	for _, m := range msgs {
 		if m.Action == store.ChatActionCreate {
-			parts, perr := h.store.Participants(r.Ctx, chatID)
-			if perr != nil {
-				h.log.Error("get history participants", "chat_id", chatID, "err", perr)
-				return nil, errInternal
-			}
-			createUsers = make([]int64, len(parts))
-			for i, p := range parts {
-				createUsers[i] = p.UserID
+			createUsers = make([]int64, len(snapshot.Participants))
+			for i, participant := range snapshot.Participants {
+				createUsers[i] = participant.UserID
 			}
 			break
 		}
@@ -619,7 +618,7 @@ func (h *handlers) chatHistory(r *mtproto.Request, chatID int64, msgs []store.Me
 
 	files, err := h.loadFiles(r.Ctx, msgs)
 	if err != nil {
-		h.log.Error("get history files", "user_id", r.UserID, "chat_id", chatID, "err", err)
+		h.log.Error("get history files", "user_id", r.UserID, "chat_id", snapshot.Chat.ID, "err", err)
 		return nil, errInternal
 	}
 	// Load reactions for each message.
@@ -635,31 +634,16 @@ func (h *handlers) chatHistory(r *mtproto.Request, chatID int64, msgs []store.Me
 		}
 	}
 	tlMsgs := make([]tg.MessageClass, len(msgs))
-	authors := map[int64]bool{r.UserID: true}
 	for i, m := range msgs {
 		tlMsgs[i] = messageToTL(m, createUsers, files, nil, reactionsByMsg[m.LocalID])
-		authors[m.FromID] = true
-		switch m.Action {
-		case store.ChatActionAddUser, store.ChatActionDeleteUser:
-			authors[m.ActionUserID] = true
-		case store.ChatActionCreate:
-			for _, id := range createUsers {
-				authors[id] = true
-			}
-		}
 	}
-
-	users, err := h.loadUsers(r.Ctx, authors, r.UserID)
+	users, err := h.renderUsers(r.Ctx, snapshot.Users, r.UserID, snapshot.EntitledUsers, nil)
 	if err != nil {
 		h.log.Error("get history users", "err", err)
 		return nil, errInternal
 	}
-	chats, err := h.loadChats(r.Ctx, map[int64]bool{chatID: true}, r.UserID, nil)
-	if err != nil {
-		h.log.Error("get history chats", "err", err)
-		return nil, errInternal
-	}
-	return &tg.MessagesMessages{Messages: tlMsgs, Users: users, Chats: chats}, nil
+	chat := chatToTL(snapshot.Chat, len(snapshot.Participants), r.UserID)
+	return &tg.MessagesMessages{Messages: tlMsgs, Users: users, Chats: []tg.ChatClass{chat}}, nil
 }
 
 // handleReadHistory serves messages.readHistory: advances read state on both

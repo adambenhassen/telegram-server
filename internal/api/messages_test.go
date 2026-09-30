@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -387,7 +388,7 @@ func TestHandleChatRPCsRejectNonMembers(t *testing.T) {
 	}
 
 	// A chat the caller is not in and a chat that does not exist are the same error.
-	for _, chatID := range []int64{chat.ID, chat.ID + 10_000} {
+	for _, chatID := range []int64{chat.ID, chat.ID + 10_000, -1} {
 		_, serr := api.SendMessageForTest(s, outsider.ID, &tg.MessagesSendMessageRequest{
 			Peer: &tg.InputPeerChat{ChatID: chatID}, Message: "probe", RandomID: 7,
 		})
@@ -458,6 +459,189 @@ func TestHandleGetHistoryOnChatListsEveryAuthor(t *testing.T) {
 	}
 	if len(res.Chats) != 1 {
 		t.Errorf("chats = %d, want 1", len(res.Chats))
+	}
+}
+
+func TestHandleGetHistoryCapsOrdinalPageAtServerMaximum(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	caller, err := s.CreateUser(ctx, "+15551292061")
+	if err != nil {
+		t.Fatalf("caller: %v", err)
+	}
+	peer, err := s.CreateUser(ctx, "+15551292062")
+	if err != nil {
+		t.Fatalf("peer: %v", err)
+	}
+	for i := range 105 {
+		if _, _, _, _, err := s.SendMessage(ctx, caller.ID, peer.ID, fmt.Sprintf("message-%03d", i), int64(1061+i), 0, 0); err != nil {
+			t.Fatalf("send message %d: %v", i, err)
+		}
+	}
+
+	enc, err := api.GetHistoryForTest(s, caller.ID, &tg.MessagesGetHistoryRequest{
+		Peer: api.InputPeerUser(caller.ID, peer.ID), OffsetID: 0, AddOffset: 1, Limit: 1000,
+	})
+	if err != nil {
+		t.Fatalf("getHistory: %v", err)
+	}
+	history, ok := enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("getHistory result = %T, want *tg.MessagesMessages", enc)
+	}
+	if len(history.Messages) != 100 {
+		t.Fatalf("history length = %d, want server maximum 100", len(history.Messages))
+	}
+	newest, ok := history.Messages[0].(*tg.Message)
+	if !ok || newest.Message != "message-103" {
+		t.Fatalf("first history message = %T/%v, want message-103 after positive add_offset", history.Messages[0], history.Messages[0])
+	}
+}
+
+func TestHandleGetHistoryKeepsMembershipAndHydrationInOneSnapshot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	users := make([]store.User, 3)
+	for i, phone := range []string{"+15551292051", "+15551292052", "+15551292053"} {
+		user, err := s.CreateUser(ctx, phone)
+		if err != nil {
+			t.Fatalf("user %s: %v", phone, err)
+		}
+		users[i] = user
+	}
+	created, err := api.CreateChatForTest(s, users[0].ID, &tg.MessagesCreateChatRequest{
+		Title: "Crew", Users: inputUsers(users[0].ID, users[1].ID, users[2].ID),
+	})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	invited, ok := created.(*tg.MessagesInvitedUsers)
+	if !ok {
+		t.Fatalf("create chat result = %T, want *tg.MessagesInvitedUsers", created)
+	}
+	updates, ok := invited.Updates.(*tg.Updates)
+	if !ok {
+		t.Fatalf("create chat updates = %T, want *tg.Updates", invited.Updates)
+	}
+	if len(updates.Chats) != 1 {
+		t.Fatalf("create chat updates have %d chats, want one", len(updates.Chats))
+	}
+	group, ok := updates.Chats[0].(*tg.Chat)
+	if !ok {
+		t.Fatalf("created chat = %T, want *tg.Chat", updates.Chats[0])
+	}
+	chatID := group.ID
+	newMember, err := s.CreateUser(ctx, "+15551292054")
+	if err != nil {
+		t.Fatalf("new member: %v", err)
+	}
+	if _, _, _, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: chatID, FromID: users[1].ID, Text: "history during snapshot", RandomID: 4052,
+	}); err != nil {
+		t.Fatalf("send history message: %v", err)
+	}
+
+	var mutationErr error
+	var mutationRan bool
+	store.SetChatHistorySnapshotHook(s, func() {
+		store.SetChatHistorySnapshotHook(s, nil)
+		removed, _, _, err := s.RemoveChatUser(ctx, chatID, users[1].ID, users[0].ID)
+		if err != nil {
+			mutationErr = err
+			return
+		}
+		if !removed {
+			mutationErr = errors.New("snapshot hook did not remove the existing member")
+			return
+		}
+		removed, _, _, err = s.RemoveChatUser(ctx, chatID, users[2].ID, users[0].ID)
+		if err != nil {
+			mutationErr = err
+			return
+		}
+		if !removed {
+			mutationErr = errors.New("snapshot hook did not remove the second existing member")
+			return
+		}
+		added, _, _, err := s.AddChatUser(ctx, chatID, newMember.ID, users[0].ID)
+		if err != nil {
+			mutationErr = err
+			return
+		}
+		if !added {
+			mutationErr = errors.New("snapshot hook did not add the new member")
+			return
+		}
+		mutationRan = true
+	})
+	t.Cleanup(func() { store.SetChatHistorySnapshotHook(s, nil) })
+
+	enc, err := api.GetHistoryForTest(s, users[1].ID, &tg.MessagesGetHistoryRequest{
+		Peer: &tg.InputPeerChat{ChatID: chatID}, Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("getHistory: %v", err)
+	}
+	if mutationErr != nil {
+		t.Fatalf("concurrent membership mutation: %v", mutationErr)
+	}
+	if !mutationRan {
+		t.Fatal("getHistory did not run the membership snapshot hook")
+	}
+	history, ok := enc.(*tg.MessagesMessages)
+	if !ok {
+		t.Fatalf("getHistory result = %T, want *tg.MessagesMessages", enc)
+	}
+
+	var sawHistoryMessage, sawCreate bool
+	for _, message := range history.Messages {
+		if msg, ok := message.(*tg.Message); ok && msg.Message == "history during snapshot" {
+			sawHistoryMessage = true
+		}
+		service, ok := message.(*tg.MessageService)
+		if !ok {
+			continue
+		}
+		create, ok := service.Action.(*tg.MessageActionChatCreate)
+		if !ok {
+			continue
+		}
+		sawCreate = true
+		participantIDs := make(map[int64]bool, len(create.Users))
+		for _, id := range create.Users {
+			participantIDs[id] = true
+		}
+		if !participantIDs[users[1].ID] || participantIDs[newMember.ID] {
+			t.Errorf("create action users = %v, want removed member %d and no new member %d", create.Users, users[1].ID, newMember.ID)
+		}
+	}
+	if !sawHistoryMessage || !sawCreate {
+		t.Fatalf("history has message=%t create=%t, want both", sawHistoryMessage, sawCreate)
+	}
+
+	var sawRemovedMemberProfile, sawNewMember bool
+	for _, user := range history.Users {
+		switch u := user.(type) {
+		case *tg.User:
+			if u.ID == users[2].ID {
+				sawRemovedMemberProfile = true
+			}
+			if u.ID == newMember.ID {
+				sawNewMember = true
+			}
+		case *tg.UserEmpty:
+			if u.ID == newMember.ID {
+				sawNewMember = true
+			}
+		}
+	}
+	if !sawRemovedMemberProfile {
+		t.Error("removed member profile is missing from the request's original entitlement snapshot")
+	}
+	if sawNewMember {
+		t.Error("new member appears in the request's original user snapshot")
 	}
 }
 

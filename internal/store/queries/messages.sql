@@ -27,10 +27,34 @@ ORDER BY owner_id;
 
 -- name: HistoryPage :many
 SELECT * FROM messages
-WHERE owner_id = sqlc.arg(owner_id) AND peer_type = sqlc.arg(peer_type) AND peer_id = sqlc.arg(peer_id)
+WHERE owner_id = sqlc.arg(owner_id)
+  AND peer_type = sqlc.arg(peer_type)
+  AND peer_id = sqlc.arg(peer_id)
   AND deleted = false
   AND (sqlc.arg(offset_id)::bigint = 0 OR local_id < sqlc.arg(offset_id)::bigint)
 ORDER BY local_id DESC
+OFFSET GREATEST(0::bigint, sqlc.arg(add_offset)::bigint)
+LIMIT sqlc.arg(lim)::int;
+
+-- HistoryPageAround handles negative add_offset by converting offset_id to its
+-- ordinal in the owner's filtered newest-first history before selecting a page.
+-- name: HistoryPageAround :many
+WITH page_offset AS (
+    SELECT GREATEST(0::bigint, COUNT(*) + sqlc.arg(add_offset)::bigint) AS skip
+    FROM messages AS offset_message
+    WHERE offset_message.owner_id = sqlc.arg(owner_id)
+      AND offset_message.peer_type = sqlc.arg(peer_type)
+      AND offset_message.peer_id = sqlc.arg(peer_id)
+      AND offset_message.deleted = false
+      AND offset_message.local_id >= sqlc.arg(offset_id)::bigint
+)
+SELECT page_message.* FROM messages AS page_message
+WHERE page_message.owner_id = sqlc.arg(owner_id)
+  AND page_message.peer_type = sqlc.arg(peer_type)
+  AND page_message.peer_id = sqlc.arg(peer_id)
+  AND page_message.deleted = false
+ORDER BY page_message.local_id DESC
+OFFSET (SELECT skip FROM page_offset)
 LIMIT sqlc.arg(lim)::int;
 
 -- name: SetEditedText :exec
