@@ -94,6 +94,30 @@ func participantID(p tg.ChannelParticipantClass) int64 {
 	return 0
 }
 
+func assertParticipantPageIDs(t *testing.T, page *tg.ChannelsChannelParticipants, wantIDs, excludedIDs []int64) {
+	t.Helper()
+	if page.Count != len(wantIDs) {
+		t.Errorf("participant count = %d, want %d", page.Count, len(wantIDs))
+	}
+	if len(page.Participants) != len(wantIDs) {
+		t.Errorf("participant rows = %d, want %d", len(page.Participants), len(wantIDs))
+	}
+	gotIDs := make(map[int64]bool, len(page.Participants))
+	for _, participant := range page.Participants {
+		gotIDs[participantID(participant)] = true
+	}
+	for _, id := range wantIDs {
+		if !gotIDs[id] {
+			t.Errorf("participant rows %v are missing matching user %d", gotIDs, id)
+		}
+	}
+	for _, id := range excludedIDs {
+		if gotIDs[id] {
+			t.Errorf("participant rows %v unexpectedly include excluded user %d", gotIDs, id)
+		}
+	}
+}
+
 func TestGetParticipantsEnforcesBroadcastVisibilityAndRendersStoredRoles(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -292,6 +316,62 @@ func TestGetParticipantsMegagroupFiltersExcludeBansAndRequireAdmin(t *testing.T)
 	if _, ok := row.Participant.(*tg.ChannelParticipantBanned); !ok {
 		t.Errorf("getParticipant banned row = %T, want banned participant", row.Participant)
 	}
+}
+
+func TestGetParticipantsAdminSearchAndContactsFiltersMatchRows(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator := mustUser(t, s, "+15551982401")
+	admin := mustUser(t, s, "+15551982402")
+	searchMatch := mustUser(t, s, "+15551982403")
+	contactMatch := mustUser(t, s, "+15551982404")
+	otherMember := mustUser(t, s, "+15551982405")
+	contactOutsideChannel := mustUser(t, s, "+15551982406")
+	group := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Megagroup: true, Title: "Filter matches"})
+	for _, user := range []store.User{admin, searchMatch, contactMatch, otherMember} {
+		joinChannel(t, ctx, dsn, group.ID, user.ID)
+	}
+	if err := s.SetChannelRole(ctx, group.ID, creator.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	for _, user := range []struct {
+		id        int64
+		firstName string
+	}{
+		{id: searchMatch.ID, firstName: "Needle Match"},
+		{id: contactMatch.ID, firstName: "Contact Match"},
+		{id: otherMember.ID, firstName: "Plain Member"},
+	} {
+		if err := api.SetUserFirstNameForTest(dsn, user.id, user.firstName); err != nil {
+			t.Fatalf("set user %d first name: %v", user.id, err)
+		}
+	}
+	for _, contactID := range []int64{contactMatch.ID, contactOutsideChannel.ID} {
+		if changed, err := s.AddContact(ctx, creator.ID, contactID); err != nil || !changed {
+			t.Fatalf("add creator contact %d: changed=%v err=%v", contactID, changed, err)
+		}
+	}
+	h := fullChannelDispatcher(s)
+	channel := api.InputChannel(creator.ID, group.ID)
+
+	admins, rpc := getParticipantsViaDispatcher(t, h, creator.ID, false, channel, &tg.ChannelParticipantsAdmins{}, 0, 20)
+	if rpc != nil {
+		t.Fatalf("admins filter: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	assertParticipantPageIDs(t, admins, []int64{creator.ID, admin.ID}, []int64{searchMatch.ID, contactMatch.ID, otherMember.ID})
+
+	search, rpc := getParticipantsViaDispatcher(t, h, creator.ID, false, channel, &tg.ChannelParticipantsSearch{Q: "Needle"}, 0, 20)
+	if rpc != nil {
+		t.Fatalf("search filter: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	assertParticipantPageIDs(t, search, []int64{searchMatch.ID}, []int64{creator.ID, admin.ID, contactMatch.ID, otherMember.ID})
+
+	contacts, rpc := getParticipantsViaDispatcher(t, h, creator.ID, false, channel, &tg.ChannelParticipantsContacts{}, 0, 20)
+	if rpc != nil {
+		t.Fatalf("contacts filter: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	assertParticipantPageIDs(t, contacts, []int64{contactMatch.ID}, []int64{creator.ID, admin.ID, searchMatch.ID, otherMember.ID, contactOutsideChannel.ID})
 }
 
 func TestGetParticipantsBoundsPageOffsetAndSearch(t *testing.T) {
