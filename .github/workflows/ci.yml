@@ -1211,7 +1211,7 @@ jobs:
           status=0
           output=$(go test -count=1 -timeout 2m -v ./test/e2e -run '^TestSmoke' 2>&1) || status=$?
           if [ "$status" -ne 0 ]; then
-            printf '%s\n' "$output"
+            echo "::error::TestSmoke failed with exit status $status; test output is suppressed to protect test data"
             exit "$status"
           fi
 
