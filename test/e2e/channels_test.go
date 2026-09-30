@@ -12,6 +12,7 @@ import (
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -463,8 +464,9 @@ func TestChannelsBroadcastWriteBoundary(t *testing.T) {
 	}
 }
 
-// TestChannelsMegagroup proves gate 3: in a megagroup a plain member (role 0)
-// may send without any admin promotion.
+// TestChannelsMegagroup proves gate 3: a plain member may send with unrestricted
+// defaults, but stored send_plain restrictions block that member while admins
+// and the creator remain able to post.
 func TestChannelsMegagroup(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -525,15 +527,87 @@ func TestChannelsMegagroup(t *testing.T) {
 	hash := exportChannelInvite(t, ctx, aUserID, aCmds, chID)
 	importChannelInvite(t, ctx, bCmds, hash)
 
-	// B (role 0) sends to megagroup → succeeds.
-	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+	postAndCheckReply := func(userID int64, cmds chan command, text string, randomID int64, wantPts int) {
+		t.Helper()
+		execChannel(t, ctx, cmds, func(ctx context.Context, c *tg.Client) error {
+			res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+				Peer: peerChannel(userID, chID), Message: text, RandomID: randomID,
+			})
+			if err != nil {
+				return err
+			}
+			updates, ok := res.(*tg.Updates)
+			if !ok {
+				return fmt.Errorf("sendMessage result = %T, want *tg.Updates", res)
+			}
+			for _, update := range updates.Updates {
+				post, ok := update.(*tg.UpdateNewChannelMessage)
+				if !ok {
+					continue
+				}
+				message, ok := post.Message.(*tg.Message)
+				if !ok {
+					return fmt.Errorf("post reply message = %T, want *tg.Message", post.Message)
+				}
+				if message.Message != text || post.Pts != wantPts {
+					return fmt.Errorf("post reply text=%q pts=%d, want %q/%d", message.Message, post.Pts, text, wantPts)
+				}
+				return nil
+			}
+			return errors.New("sendMessage result has no UpdateNewChannelMessage")
+		})
+	}
+
+	// B (role 0) posts with the unrestricted default and gets the post in the RPC reply.
+	postAndCheckReply(bUserID, bCmds, "megagroup post by plain member", 5002001, 1)
+
+	// Save has no channel RPC yet. Write the persisted state directly, as the
+	// subsequent Permissions Save path will, then prove the failed post changes
+	// neither channel state nor membership.
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	if _, err = conn.Exec(ctx, `UPDATE channels SET default_banned_rights = $2 WHERE id = $1`, chID, []string{"send_plain"}); err != nil {
+		t.Fatalf("set channel defaults: %v", err)
+	}
+	beforePts, err := st.ChannelState(ctx, chID)
+	if err != nil {
+		t.Fatalf("channel state before denied post: %v", err)
+	}
+	beforeEvents, err := st.ChannelEventsWindow(ctx, chID, 0, beforePts, 10)
+	if err != nil {
+		t.Fatalf("channel events before denied post: %v", err)
+	}
+	assertChannelRPCError(t, ctx, bCmds, "CHAT_WRITE_FORBIDDEN", func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     peerChannel(bUserID, chID),
-			Message:  "megagroup post by plain member",
-			RandomID: 5002001,
+			Peer: peerChannel(bUserID, chID), Message: "blocked member post", RandomID: 5002002,
 		})
 		return err
 	})
+	afterPts, err := st.ChannelState(ctx, chID)
+	if err != nil || afterPts != beforePts {
+		t.Fatalf("channel pts after denied post = %d, err %v; want %d", afterPts, err, beforePts)
+	}
+	afterEvents, err := st.ChannelEventsWindow(ctx, chID, 0, afterPts, 10)
+	if err != nil || len(afterEvents) != len(beforeEvents) {
+		t.Fatalf("channel events after denied post = %d, err %v; want %d", len(afterEvents), err, len(beforeEvents))
+	}
+	member, found, err := st.ChannelMemberOf(ctx, chID, bUserID)
+	if err != nil || !found || member.Role != 0 || member.BannedUntil != nil {
+		t.Fatalf("member after denied post = %+v, found=%v err=%v; want unchanged role 0", member, found, err)
+	}
+
+	if err = st.SetChannelRole(ctx, chID, aUserID, bUserID, 1); err != nil {
+		t.Fatalf("promote B: %v", err)
+	}
+	postAndCheckReply(bUserID, bCmds, "megagroup post by admin", 5002003, beforePts+1)
+	postAndCheckReply(aUserID, aCmds, "megagroup post by creator", 5002004, beforePts+2)
 
 	close(aCmds)
 	close(bCmds)

@@ -24,8 +24,8 @@ func hasChatRight(rights []string, right string) bool {
 	return slices.Contains(rights, right)
 }
 
-func checkChatMessageRestriction(rights []string, creator, media bool, mediaRights []string) error {
-	if creator {
+func checkDefaultMessageRestriction(rights []string, exempt, media bool, mediaRights []string) error {
+	if exempt {
 		return nil
 	}
 	if hasChatRight(rights, "send_messages") {
@@ -77,7 +77,7 @@ func (s *Store) CheckChatWritePermission(ctx context.Context, chatID, callerID, 
 			return false, fmt.Errorf("random_id lookup: %w", err)
 		}
 	}
-	if err = checkChatMessageRestriction(m.defaultBannedRights, callerID == m.creatorID, true, mediaRights); err != nil {
+	if err = checkDefaultMessageRestriction(m.defaultBannedRights, callerID == m.creatorID, true, mediaRights); err != nil {
 		return false, err
 	}
 	if err = m.tx.Commit(ctx); err != nil {

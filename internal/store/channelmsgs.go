@@ -199,7 +199,7 @@ func (s *Store) postChannelMessage(
 	// existence oracle the one-error rule closes. Same shape as the fan-out's
 	// pre-lock IsChatMember reject in fanout.go.
 	if checkRights {
-		if err = checkPostRights(ctx, qtx, channelID, fromID); err != nil {
+		if _, err = checkPostRights(ctx, qtx, channelID, fromID); err != nil {
 			return ChannelMessage{}, 0, false, err
 		}
 	}
@@ -215,8 +215,9 @@ func (s *Store) postChannelMessage(
 	// read and before any write, so a ban committing concurrently is seen. A
 	// caller with no right to post here must not be able to probe random_ids
 	// either.
+	var role int
 	if checkRights {
-		if err = checkPostRights(ctx, qtx, channelID, fromID); err != nil {
+		if role, err = checkPostRights(ctx, qtx, channelID, fromID); err != nil {
 			return ChannelMessage{}, 0, false, err
 		}
 	}
@@ -241,6 +242,20 @@ func (s *Store) postChannelMessage(
 			return channelMessageFromFields(channelMsgFields(existing)), pts, true, nil
 		case !errors.Is(e, pgx.ErrNoRows):
 			return ChannelMessage{}, 0, false, fmt.Errorf("random_id lookup: %w", e)
+		}
+	}
+	if checkRights {
+		channel, e := qtx.ChannelByID(ctx, channelID)
+		switch {
+		case errors.Is(e, pgx.ErrNoRows):
+			return ChannelMessage{}, 0, false, ErrNotMember
+		case e != nil:
+			return ChannelMessage{}, 0, false, fmt.Errorf("channel defaults by id: %w", e)
+		}
+		if channel.Megagroup {
+			if err = checkDefaultMessageRestriction(channel.DefaultBannedRights, role >= channelRoleAdmin, fileID != nil, nil); err != nil {
+				return ChannelMessage{}, 0, false, err
+			}
 		}
 	}
 
@@ -290,17 +305,17 @@ func (s *Store) postChannelMessage(
 	return channelMessageFromFields(channelMsgFields(stored)), int(b.Pts), false, nil
 }
 
-// checkPostRights answers whether fromID may post to channelID, reading both
-// rows on the caller's transaction so they are the state the insert lands in.
-// Every rejection is ErrNotMember; see PostChannelMessageAs for why they are not
-// distinguishable.
-func checkPostRights(ctx context.Context, qtx *db.Queries, channelID, fromID int64) error {
+// checkPostRights answers whether fromID is a current, unbanned channel poster.
+// Default message restrictions are checked after the dedup read so a committed
+// retry remains idempotent. Every rejection here is ErrNotMember; see
+// PostChannelMessageAs for why they are not distinguishable.
+func checkPostRights(ctx context.Context, qtx *db.Queries, channelID, fromID int64) (int, error) {
 	ch, err := qtx.ChannelByID(ctx, channelID)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		return ErrNotMember
+		return 0, ErrNotMember
 	case err != nil:
-		return fmt.Errorf("channel by id: %w", err)
+		return 0, fmt.Errorf("channel by id: %w", err)
 	}
 
 	row, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
@@ -308,20 +323,20 @@ func checkPostRights(ctx context.Context, qtx *db.Queries, channelID, fromID int
 	})
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		return ErrNotMember
+		return 0, ErrNotMember
 	case err != nil:
-		return fmt.Errorf("channel participant: %w", err)
+		return 0, fmt.Errorf("channel participant: %w", err)
 	}
 
 	member := channelMemberFromRow(row)
 	if member.Banned(time.Now()) {
-		return ErrNotMember
+		return 0, ErrNotMember
 	}
 	// Broadcast: posting is an admin right. Megagroup: any unbanned participant.
 	if !ch.Megagroup && member.Role < 1 {
-		return ErrNotMember
+		return 0, ErrNotMember
 	}
-	return nil
+	return member.Role, nil
 }
 
 // ChannelEventsWindow returns the channel's events in (fromPts, toPts] ordered

@@ -168,8 +168,8 @@ var (
 	// not a participant of the chat, and by an absent chat id — the two are
 	// deliberately indistinguishable.
 	ErrNotMember = errors.New("not a chat member")
-	// ErrChatWriteForbidden is returned when a basic-chat default restriction
-	// denies a member's message or invitation.
+	// ErrChatWriteForbidden is returned when a group or channel default
+	// restriction denies a member's message or invitation.
 	ErrChatWriteForbidden = errors.New("chat write forbidden by default restrictions")
 	// ErrChannelFull is returned when a join would take a channel past
 	// maxChannelParticipants.
