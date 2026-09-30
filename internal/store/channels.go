@@ -128,6 +128,7 @@ type ChannelMember struct {
 	Role        int // 0 member, 1 admin, 2 creator
 	BannedUntil *time.Time
 	JoinPts     int
+	Date        time.Time
 }
 
 // bannedForever stands in for a banned_until of 'infinity'. pgx decodes that
@@ -173,6 +174,7 @@ func channelMemberFromRow(r db.ChannelParticipant) ChannelMember {
 		UserID:  r.UserID,
 		Role:    int(r.Role),
 		JoinPts: int(r.JoinPts),
+		Date:    r.Date.Time,
 	}
 	if r.BannedUntil.Valid {
 		t := r.BannedUntil.Time

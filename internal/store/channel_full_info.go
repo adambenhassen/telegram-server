@@ -34,6 +34,12 @@ func SetChannelFullInfoSnapshotHook(s *Store, fn func()) {
 	s.channelFullInfoSnapshotHook = fn
 }
 
+// SetChannelParticipantsSnapshotHook installs the test-only synchronization
+// seam used by participant privacy race tests. Production callers leave it nil.
+func SetChannelParticipantsSnapshotHook(s *Store, fn func()) {
+	s.channelParticipantsSnapshotHook = fn
+}
+
 // ChannelFullInfoForViewer selects a channel and its full-info read set in one
 // repeatable-read transaction. A concurrent removal or ban may commit while
 // this read is being hydrated, but it cannot make the member decision come from
