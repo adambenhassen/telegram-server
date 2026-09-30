@@ -200,6 +200,9 @@ var (
 	errSearchQueryEmpty = rpcErr(400, "SEARCH_QUERY_EMPTY")
 	// errSearchQueryTooLong rejects a contacts.search query over 256 bytes.
 	errSearchQueryTooLong = rpcErr(400, "SEARCH_QUERY_TOO_LONG")
+	// errSearchQueryInvalid rejects search text that cannot be safely passed to
+	// PostgreSQL as a text value.
+	errSearchQueryInvalid = rpcErr(400, "SEARCH_QUERY_INVALID")
 	// errPasswordCannotBeRemoved rejects removing the verifier of a username-mode
 	// account: doing so is irreversible lockout with no recovery path.
 	errPasswordCannotBeRemoved = rpcErr(400, "PASSWORD_HASH_INVALID")

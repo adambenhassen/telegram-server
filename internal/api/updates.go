@@ -603,7 +603,15 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 // live-edge entitlement check; explicit user peers authorized by a validated
 // access hash use loadUsersForUserPeer instead.
 func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, viewerID int64) ([]tg.UserClass, error) {
-	return h.loadUsersWithExplicitUserPeers(ctx, ids, viewerID, nil)
+	return h.loadUsersWithAuthorizedIDs(ctx, ids, viewerID, nil)
+}
+
+// loadUsersForChannelParticipants hydrates ids admitted by the current
+// participant-list or participant-row authorization snapshot. The shared
+// renderer still derives each user's hash for viewerID and only includes the
+// phone on the viewer's own profile.
+func (h *handlers) loadUsersForChannelParticipants(ctx context.Context, ids map[int64]bool, viewerID int64) ([]tg.UserClass, error) {
+	return h.loadUsersWithAuthorizedIDs(ctx, ids, viewerID, ids)
 }
 
 // loadUsersForUserPeer hydrates the viewer and one user peer that was validated
@@ -611,13 +619,13 @@ func (h *handlers) loadUsers(ctx context.Context, ids map[int64]bool, viewerID i
 // permits its public profile even without a live dialog edge.
 func (h *handlers) loadUsersForUserPeer(ctx context.Context, viewerID, peerID int64) ([]tg.UserClass, error) {
 	ids := map[int64]bool{viewerID: true, peerID: true}
-	return h.loadUsersWithExplicitUserPeers(ctx, ids, viewerID, map[int64]bool{peerID: true})
+	return h.loadUsersWithAuthorizedIDs(ctx, ids, viewerID, map[int64]bool{peerID: true})
 }
 
-// loadUsersWithExplicitUserPeers keeps row-derived and server-derived ids
-// behind the live-edge gate. explicitUserPeers contains only user peers whose
-// per-viewer access hashes were validated in the current request.
-func (h *handlers) loadUsersWithExplicitUserPeers(ctx context.Context, ids map[int64]bool, viewerID int64, explicitUserPeers map[int64]bool) ([]tg.UserClass, error) {
+// loadUsersWithAuthorizedIDs keeps row-derived ids behind the live-edge gate.
+// authorizedIDs carries peers or participant rows admitted by a check made by
+// the current request, such as an access hash or channel role.
+func (h *handlers) loadUsersWithAuthorizedIDs(ctx context.Context, ids map[int64]bool, viewerID int64, authorizedIDs map[int64]bool) ([]tg.UserClass, error) {
 	if len(ids) == 0 {
 		return []tg.UserClass{}, nil
 	}
@@ -635,7 +643,7 @@ func (h *handlers) loadUsersWithExplicitUserPeers(ctx context.Context, ids map[i
 	}
 	visibleIDs := make([]int64, 0, len(users))
 	for id := range users {
-		if id == viewerID || entitled[id] || explicitUserPeers[id] {
+		if id == viewerID || entitled[id] || authorizedIDs[id] {
 			visibleIDs = append(visibleIDs, id)
 		}
 	}
@@ -645,7 +653,7 @@ func (h *handlers) loadUsersWithExplicitUserPeers(ctx context.Context, ids map[i
 	}
 	out := make([]tg.UserClass, 0, len(users))
 	for id, u := range users {
-		if id != viewerID && !entitled[id] && !explicitUserPeers[id] {
+		if id != viewerID && !entitled[id] && !authorizedIDs[id] {
 			out = append(out, &tg.UserEmpty{ID: id})
 			continue
 		}

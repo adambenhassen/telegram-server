@@ -403,6 +403,124 @@ func (q *Queries) ChannelParticipantsForViewer(ctx context.Context, arg ChannelP
 	return items, nil
 }
 
+const channelParticipantsPage = `-- name: ChannelParticipantsPage :many
+SELECT cp.channel_id, cp.user_id, cp.role, cp.banned_until, cp.join_pts, cp.date
+FROM channel_participants cp
+JOIN users u ON u.id = cp.user_id
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = cp.user_id
+WHERE cp.channel_id = $1::bigint
+  AND (
+      ($2::int = 0 AND (cp.banned_until IS NULL OR cp.banned_until <= now()))
+      OR ($2::int = 1 AND cp.role >= 1 AND (cp.banned_until IS NULL OR cp.banned_until <= now()))
+      OR ($2::int IN (2, 3) AND cp.banned_until > now())
+      OR ($2::int = 4 AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+          AND (u.name_tsv @@ plainto_tsquery('simple', $3::text)
+               OR strpos(lower(COALESCE(un.handle, '')), lower($3::text)) > 0))
+      OR ($2::int = 5 AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+          AND EXISTS (
+              SELECT 1 FROM user_contacts uc
+              WHERE uc.owner_id = $4::bigint
+                AND uc.contact_id = cp.user_id
+          ))
+  )
+  AND ($2::int NOT IN (2, 3) OR $3::text = ''
+       OR u.name_tsv @@ plainto_tsquery('simple', $3::text)
+       OR strpos(lower(COALESCE(un.handle, '')), lower($3::text)) > 0)
+ORDER BY cp.user_id
+LIMIT $6::int OFFSET $5::int
+`
+
+type ChannelParticipantsPageParams struct {
+	ChannelID  int64
+	Filter     int32
+	Query      string
+	ViewerID   int64
+	PageOffset int32
+	PageLimit  int32
+}
+
+func (q *Queries) ChannelParticipantsPage(ctx context.Context, arg ChannelParticipantsPageParams) ([]ChannelParticipant, error) {
+	rows, err := q.db.Query(ctx, channelParticipantsPage,
+		arg.ChannelID,
+		arg.Filter,
+		arg.Query,
+		arg.ViewerID,
+		arg.PageOffset,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChannelParticipant
+	for rows.Next() {
+		var i ChannelParticipant
+		if err := rows.Scan(
+			&i.ChannelID,
+			&i.UserID,
+			&i.Role,
+			&i.BannedUntil,
+			&i.JoinPts,
+			&i.Date,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const channelParticipantsPageCount = `-- name: ChannelParticipantsPageCount :one
+SELECT count(*)::bigint
+FROM channel_participants cp
+JOIN users u ON u.id = cp.user_id
+LEFT JOIN usernames un ON un.owner_type = 'user' AND un.owner_id = cp.user_id
+WHERE cp.channel_id = $1::bigint
+  AND (
+      ($2::int = 0 AND (cp.banned_until IS NULL OR cp.banned_until <= now()))
+      OR ($2::int = 1 AND cp.role >= 1 AND (cp.banned_until IS NULL OR cp.banned_until <= now()))
+      OR ($2::int IN (2, 3) AND cp.banned_until > now())
+      OR ($2::int = 4 AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+          AND (u.name_tsv @@ plainto_tsquery('simple', $3::text)
+               OR strpos(lower(COALESCE(un.handle, '')), lower($3::text)) > 0))
+      OR ($2::int = 5 AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+          AND EXISTS (
+              SELECT 1 FROM user_contacts uc
+              WHERE uc.owner_id = $4::bigint
+                AND uc.contact_id = cp.user_id
+          ))
+  )
+  AND ($2::int NOT IN (2, 3) OR $3::text = ''
+       OR u.name_tsv @@ plainto_tsquery('simple', $3::text)
+       OR strpos(lower(COALESCE(un.handle, '')), lower($3::text)) > 0)
+`
+
+type ChannelParticipantsPageCountParams struct {
+	ChannelID int64
+	Filter    int32
+	Query     string
+	ViewerID  int64
+}
+
+// Participant list reads run in one repeatable-read transaction with the
+// viewer's membership check. The handler chooses only filters it can serve;
+// both the count and page use the same filter so offsets cannot disclose rows
+// outside the selected set.
+func (q *Queries) ChannelParticipantsPageCount(ctx context.Context, arg ChannelParticipantsPageCountParams) (int64, error) {
+	row := q.db.QueryRow(ctx, channelParticipantsPageCount,
+		arg.ChannelID,
+		arg.Filter,
+		arg.Query,
+		arg.ViewerID,
+	)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const channelStateForUpdate = `-- name: ChannelStateForUpdate :one
 SELECT channel_id, pts, next_local_id, date FROM channel_state WHERE channel_id = $1 FOR UPDATE
 `

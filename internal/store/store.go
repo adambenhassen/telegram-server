@@ -93,6 +93,11 @@ type Store struct {
 	// the reply still uses one database snapshot.
 	channelFullInfoSnapshotHook func()
 
+	// channelParticipantsSnapshotHook is a test-only callback fired after the
+	// channel and viewer membership are selected and before participant rows are
+	// read. It lets tests commit a removal and concurrent add at that boundary.
+	channelParticipantsSnapshotHook func()
+
 	// eraseHook is a test-only callback fired in SweepMediaErasure between the
 	// scan that names a candidate and the transaction that erases it, carrying
 	// the file id. That gap is where every race this pass has to survive lands —
