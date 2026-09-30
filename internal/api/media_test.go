@@ -439,6 +439,204 @@ func TestSendMediaResendIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSendMediaSubtypeRightsFollowOriginalFileOnResend(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	a, err := s.CreateUser(ctx, "+15551296301")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551296302")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+	c, err := s.CreateUser(ctx, "+15551296303")
+	if err != nil {
+		t.Fatalf("user c: %v", err)
+	}
+
+	const clientFileID = 7788
+	const randomID = 7789
+	saveParts(t, s, a.ID, clientFileID, []byte("sticker bytes"))
+	sticker := uploadedDocument(clientFileID, 1, "sticker.tgs", "application/x-tgsticker")
+	sticker.Attributes = []tg.DocumentAttributeClass{
+		&tg.DocumentAttributeSticker{Alt: "⭐", Stickerset: &tg.InputStickerSetEmpty{}},
+	}
+	first, err := api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
+		Peer: api.InputPeerUser(a.ID, b.ID), Media: sticker, RandomID: randomID,
+	})
+	if err != nil {
+		t.Fatalf("send sticker: %v", err)
+	}
+	fileID := documentOf(t, first).ID
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	var rights []string
+	if err := conn.QueryRow(ctx, `SELECT subtype_rights FROM files WHERE id = $1`, fileID).Scan(&rights); err != nil {
+		t.Fatalf("read stored subtype rights: %v", err)
+	}
+	if len(rights) != 1 || rights[0] != "send_stickers" {
+		t.Fatalf("stored subtype rights = %v, want [send_stickers]", rights)
+	}
+	forward, err := api.ForwardMessagesForTest(s, a.ID, &tg.MessagesForwardMessagesRequest{
+		ToPeer: api.InputPeerUser(a.ID, c.ID), FromPeer: api.InputPeerUser(a.ID, b.ID),
+		ID: []int{messageOf(t, first).ID}, RandomID: []int64{randomID + 1},
+	})
+	if err != nil {
+		t.Fatalf("forward sticker: %v", err)
+	}
+	if got := documentOf(t, forward).ID; got != fileID {
+		t.Fatalf("forward file id = %d, want original %d", got, fileID)
+	}
+	if err := conn.QueryRow(ctx, `SELECT subtype_rights FROM files WHERE id = $1`, fileID).Scan(&rights); err != nil {
+		t.Fatalf("read subtype rights after forward: %v", err)
+	}
+	if len(rights) != 1 || rights[0] != "send_stickers" {
+		t.Fatalf("stored subtype rights after forward = %v, want [send_stickers]", rights)
+	}
+
+	// A retry with the same random ID keeps the original classification, even
+	// when it supplies no document attributes and no matching upload parts.
+	retry, err := api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
+		Peer:  api.InputPeerUser(a.ID, b.ID),
+		Media: uploadedDocument(clientFileID+1, 1, "retry.bin", "application/octet-stream"), RandomID: randomID,
+	})
+	if err != nil {
+		t.Fatalf("resend without attributes: %v", err)
+	}
+	if got := documentOf(t, retry).ID; got != fileID {
+		t.Fatalf("resend file id = %d, want original %d", got, fileID)
+	}
+	if err := conn.QueryRow(ctx, `SELECT subtype_rights FROM files WHERE id = $1`, fileID).Scan(&rights); err != nil {
+		t.Fatalf("read subtype rights after resend: %v", err)
+	}
+	if len(rights) != 1 || rights[0] != "send_stickers" {
+		t.Fatalf("stored subtype rights after resend = %v, want [send_stickers]", rights)
+	}
+	if n := countFiles(t, ctx, dsn); n != 1 {
+		t.Fatalf("files rows after forward and resend = %d, want 1", n)
+	}
+}
+
+func TestSendMediaClassifiesAcceptedDocumentAttributes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	a, err := s.CreateUser(ctx, "+15551296311")
+	if err != nil {
+		t.Fatalf("user a: %v", err)
+	}
+	b, err := s.CreateUser(ctx, "+15551296312")
+	if err != nil {
+		t.Fatalf("user b: %v", err)
+	}
+
+	sticker := &tg.DocumentAttributeSticker{Alt: "⭐", Stickerset: &tg.InputStickerSetEmpty{}}
+	customEmoji := &tg.DocumentAttributeCustomEmoji{Alt: "⭐", Stickerset: &tg.InputStickerSetEmpty{}}
+	tests := []struct {
+		name       string
+		fileName   string
+		mimeType   string
+		attributes []tg.DocumentAttributeClass
+		wantNull   bool
+		wantRights []string
+	}{
+		{name: "empty attributes", wantRights: []string{}},
+		{
+			name: "filename and image size are generic",
+			attributes: []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeFilename{FileName: "photo.png"},
+				&tg.DocumentAttributeImageSize{W: 2, H: 3},
+			},
+			wantRights: []string{},
+		},
+		{
+			name:       "filename and MIME do not infer subtype",
+			fileName:   "sticker.gif",
+			mimeType:   "video/mp4",
+			wantRights: []string{},
+		},
+		{name: "sticker", attributes: []tg.DocumentAttributeClass{sticker}, wantRights: []string{"send_stickers"}},
+		{name: "custom emoji", attributes: []tg.DocumentAttributeClass{customEmoji}, wantRights: []string{"send_stickers"}},
+		{name: "animated", attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeAnimated{}}, wantRights: []string{"send_gifs"}},
+		{name: "video", attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeVideo{}}, wantRights: []string{"send_videos"}},
+		{name: "round video", attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeVideo{RoundMessage: true}}, wantRights: []string{"send_roundvideos"}},
+		{name: "audio", attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeAudio{}}, wantRights: []string{"send_audios"}},
+		{name: "voice", attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeAudio{Voice: true}}, wantRights: []string{"send_voices"}},
+		{
+			name: "combined and duplicate subtypes are sorted and unique",
+			attributes: []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeAudio{Voice: true}, sticker, &tg.DocumentAttributeAnimated{}, sticker,
+				&tg.DocumentAttributeVideo{RoundMessage: true},
+			},
+			wantRights: []string{"send_gifs", "send_roundvideos", "send_stickers", "send_voices"},
+		},
+		{
+			name:       "unrecognized attribute stays unknown",
+			attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeHasStickers{}},
+			wantNull:   true,
+		},
+		{
+			name:       "unrecognized attribute makes combined set unknown",
+			attributes: []tg.DocumentAttributeClass{sticker, &tg.DocumentAttributeHasStickers{}},
+			wantNull:   true,
+		},
+	}
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientFileID := int64(7900 + i)
+			saveParts(t, s, a.ID, clientFileID, []byte("document"))
+			fileName := tt.fileName
+			if fileName == "" {
+				fileName = "document.bin"
+			}
+			mimeType := tt.mimeType
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
+			media := uploadedDocument(clientFileID, 1, fileName, mimeType)
+			media.Attributes = tt.attributes
+			result, err := api.SendMediaForTest(s, a.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
+				Peer: api.InputPeerUser(a.ID, b.ID), Media: media, RandomID: int64(7950 + i),
+			})
+			if err != nil {
+				t.Fatalf("send media: %v", err)
+			}
+
+			fileID := documentOf(t, result).ID
+			var isNull bool
+			var rights []string
+			if err := conn.QueryRow(ctx, `SELECT subtype_rights IS NULL, subtype_rights FROM files WHERE id = $1`, fileID).Scan(&isNull, &rights); err != nil {
+				t.Fatalf("read subtype rights: %v", err)
+			}
+			if isNull != tt.wantNull {
+				t.Fatalf("subtype rights null = %v, want %v (value %v)", isNull, tt.wantNull, rights)
+			}
+			if !tt.wantNull {
+				if len(rights) != len(tt.wantRights) {
+					t.Fatalf("subtype rights = %v, want %v", rights, tt.wantRights)
+				}
+				for i := range rights {
+					if rights[i] != tt.wantRights[i] {
+						t.Fatalf("subtype rights = %v, want %v", rights, tt.wantRights)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestSendMediaToChat(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)

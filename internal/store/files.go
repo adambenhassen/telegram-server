@@ -18,14 +18,15 @@ import (
 // it is deliberately not the peer access_hash placeholder (access_hash ==
 // user_id), which is satisfiable by construction.
 type File struct {
-	ID         int64
-	UploaderID int64
-	AccessHash int64
-	Size       int64
-	MimeType   string
-	FileName   string
-	Stored     bool
-	Date       time.Time
+	ID            int64
+	UploaderID    int64
+	AccessHash    int64
+	Size          int64
+	MimeType      string
+	FileName      string
+	SubtypeRights []string // nil means unknown; a non-nil empty slice means known generic.
+	Stored        bool
+	Date          time.Time
 }
 
 // ErrStorageQuota is returned when a new file would take an account past its
@@ -47,14 +48,15 @@ var ErrFileMissing = errors.New("referenced file is missing")
 
 func fileFromRow(r db.File) File {
 	return File{
-		ID:         r.ID,
-		UploaderID: r.UploaderID,
-		AccessHash: r.AccessHash,
-		Size:       r.Size,
-		MimeType:   r.MimeType,
-		FileName:   r.FileName,
-		Stored:     r.Stored,
-		Date:       r.Date.Time,
+		ID:            r.ID,
+		UploaderID:    r.UploaderID,
+		AccessHash:    r.AccessHash,
+		Size:          r.Size,
+		MimeType:      r.MimeType,
+		FileName:      r.FileName,
+		SubtypeRights: r.SubtypeRights,
+		Stored:        r.Stored,
+		Date:          r.Date.Time,
 	}
 }
 
@@ -98,7 +100,7 @@ func (s *Store) AllocateFile(ctx context.Context, uploaderID, size int64, mimeTy
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 
-	file, err := allocateFileTx(ctx, tx, s.q.WithTx(tx), uploaderID, size, mimeType, fileName, maxUserBytes)
+	file, err := allocateFileTx(ctx, tx, s.q.WithTx(tx), uploaderID, size, mimeType, fileName, maxUserBytes, nil)
 	if err != nil {
 		return File{}, err
 	}
@@ -116,6 +118,10 @@ func (s *Store) AllocateFile(ctx context.Context, uploaderID, size int64, mimeTy
 // loses the connection and therefore the claim, leaving the row reclaimable
 // without an expiry policy.
 //
+// subtypeRights is persisted with the inserted row. Nil means unknown, and a
+// non-nil empty slice means known generic; the classification is never updated
+// after insertion.
+//
 // Lock order. Allocation takes the uploader advisory lock first, then the
 // assembly claim, and commits before taking the files row's shared lock. A
 // reference writer takes its chat row and owner advisory locks before that
@@ -128,6 +134,7 @@ func (s *Store) AllocateAndCompleteFile(
 	uploaderID, size int64,
 	mimeType, fileName string,
 	maxUserBytes int64,
+	subtypeRights []string,
 	put func(File) error,
 ) (file File, err error) {
 	if size <= 0 {
@@ -183,7 +190,7 @@ func (s *Store) AllocateAndCompleteFile(
 		}
 		defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 
-		file, err = allocateFileTx(ctx, tx, s.q.WithTx(tx), uploaderID, size, mimeType, fileName, maxUserBytes)
+		file, err = allocateFileTx(ctx, tx, s.q.WithTx(tx), uploaderID, size, mimeType, fileName, maxUserBytes, subtypeRights)
 		if err != nil {
 			return err
 		}
@@ -240,6 +247,7 @@ func allocateFileTx(
 	uploaderID, size int64,
 	mimeType, fileName string,
 	maxUserBytes int64,
+	subtypeRights []string,
 ) (File, error) {
 	if err := lockOwners(ctx, tx, uploaderID); err != nil {
 		return File{}, err
@@ -262,11 +270,12 @@ func allocateFileTx(
 		return File{}, err
 	}
 	row, err := qtx.InsertFile(ctx, db.InsertFileParams{
-		UploaderID: uploaderID,
-		AccessHash: hash,
-		Size:       size,
-		MimeType:   mimeType,
-		FileName:   fileName,
+		UploaderID:    uploaderID,
+		AccessHash:    hash,
+		Size:          size,
+		MimeType:      mimeType,
+		FileName:      fileName,
+		SubtypeRights: subtypeRights,
 	})
 	if err != nil {
 		return File{}, fmt.Errorf("insert file: %w", err)

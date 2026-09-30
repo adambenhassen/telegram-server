@@ -169,7 +169,7 @@ func TestAllocateAndCompleteFileSurvivesEraserRowLockFirst(t *testing.T) {
 	}
 	done := make(chan assemblyResult, 1)
 	go func() {
-		file, err := s.AllocateAndCompleteFile(ctx, u.ID, int64(len(body)), "text/plain", "hello.txt", bigQuota, func(file store.File) error {
+		file, err := s.AllocateAndCompleteFile(ctx, u.ID, int64(len(body)), "text/plain", "hello.txt", bigQuota, nil, func(file store.File) error {
 			_, err := store.BlobsOf(s).Put(ctx, blob.Key(file.ID), bytes.NewReader([]byte(body)))
 			return err
 		})
@@ -241,7 +241,7 @@ func TestMediaErasureSkipsClaimedAssembly(t *testing.T) {
 	}
 	done := make(chan assemblyResult, 1)
 	go func() {
-		file, err := s.AllocateAndCompleteFile(ctx, u.ID, int64(len(body)), "text/plain", "hello.txt", bigQuota, func(file store.File) error {
+		file, err := s.AllocateAndCompleteFile(ctx, u.ID, int64(len(body)), "text/plain", "hello.txt", bigQuota, nil, func(file store.File) error {
 			_, err := store.BlobsOf(s).Put(ctx, blob.Key(file.ID), bytes.NewReader([]byte(body)))
 			return err
 		})
@@ -326,7 +326,7 @@ func TestStalledAssemblyClaimUnlockDoesNotStrandSlot(t *testing.T) {
 
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := s.AllocateAndCompleteFile(ctx, firstUser.ID, 1, "application/octet-stream", "first.bin", bigQuota, func(store.File) error {
+		_, err := s.AllocateAndCompleteFile(ctx, firstUser.ID, 1, "application/octet-stream", "first.bin", bigQuota, nil, func(store.File) error {
 			return nil
 		})
 		firstDone <- err
@@ -340,7 +340,7 @@ func TestStalledAssemblyClaimUnlockDoesNotStrandSlot(t *testing.T) {
 	secondReady := make(chan struct{})
 	secondDone := make(chan error, 1)
 	go func() {
-		_, err := s.AllocateAndCompleteFile(ctx, secondUser.ID, 1, "application/octet-stream", "second.bin", bigQuota, func(store.File) error {
+		_, err := s.AllocateAndCompleteFile(ctx, secondUser.ID, 1, "application/octet-stream", "second.bin", bigQuota, nil, func(store.File) error {
 			close(secondReady)
 			return nil
 		})
@@ -395,7 +395,7 @@ func TestAmbiguousAssemblyClaimDiscardsConnection(t *testing.T) {
 	})
 	defer store.SetAssemblyClaimScanHook(s, nil)
 
-	_, err := s.AllocateAndCompleteFile(ctx, u.ID, 1, "application/octet-stream", "ambiguous.bin", bigQuota, func(store.File) error {
+	_, err := s.AllocateAndCompleteFile(ctx, u.ID, 1, "application/octet-stream", "ambiguous.bin", bigQuota, nil, func(store.File) error {
 		return errors.New("assembly callback ran after ambiguous claim")
 	})
 	if !errors.Is(err, ambiguous) {

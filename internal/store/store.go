@@ -352,7 +352,7 @@ type queryRower interface {
 // silently degrades to a per-row Seq Scan of messages — so either state is
 // exactly the un-migrated state this is here to refuse.
 func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
-	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload, hasMessageFileIdx, hasPartBlobKeyIdx, hasBlockedUsers, hasRegistrationInvites, hasRegistrationInviteLiveIdx, hasServerAdministration bool
+	var hasParticipants, hasFanoutID, hasEvents, hasUserStatus, hasEncryptedEvents, hasFwdFromID, hasReactions, hasPinnedChat, hasPinnedChannel, hasNameTsv, hasRateLimits, hasSendCodeIP, hasSignInFail, hasLoginMode, hasAdminSessions, hasPartSize, hasPartBlobKey, hasPartPayload, hasMessageFileIdx, hasPartBlobKeyIdx, hasBlockedUsers, hasRegistrationInvites, hasRegistrationInviteLiveIdx, hasServerAdministration, hasFileSubtypeRights, hasValidatedFileSubtypeRights bool
 	err := q.QueryRow(ctx, `
 		SELECT to_regclass('public.chat_participants') IS NOT NULL,
 		       EXISTS(SELECT 1 FROM information_schema.columns
@@ -393,12 +393,18 @@ func (s *Store) checkSchema(ctx context.Context, q queryRower) error {
 		       EXISTS(SELECT 1 FROM pg_catalog.pg_index
 		              WHERE indexrelid = to_regclass('public.registration_invites_live_handle_idx')
 		                AND indisvalid),
-		       to_regclass('public.server_administration') IS NOT NULL`,
-	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload, &hasMessageFileIdx, &hasPartBlobKeyIdx, &hasBlockedUsers, &hasRegistrationInvites, &hasRegistrationInviteLiveIdx, &hasServerAdministration)
+	       to_regclass('public.server_administration') IS NOT NULL,
+	       EXISTS(SELECT 1 FROM information_schema.columns
+	              WHERE table_name = 'files' AND column_name = 'subtype_rights'),
+	       EXISTS(SELECT 1 FROM pg_catalog.pg_constraint
+	              WHERE conrelid = to_regclass('public.files')
+	                AND conname = 'files_subtype_rights_valid'
+	                AND convalidated)`,
+	).Scan(&hasParticipants, &hasFanoutID, &hasEvents, &hasUserStatus, &hasEncryptedEvents, &hasFwdFromID, &hasReactions, &hasPinnedChat, &hasPinnedChannel, &hasNameTsv, &hasRateLimits, &hasSendCodeIP, &hasSignInFail, &hasLoginMode, &hasAdminSessions, &hasPartSize, &hasPartBlobKey, &hasPartPayload, &hasMessageFileIdx, &hasPartBlobKeyIdx, &hasBlockedUsers, &hasRegistrationInvites, &hasRegistrationInviteLiveIdx, &hasServerAdministration, &hasFileSubtypeRights, &hasValidatedFileSubtypeRights)
 	if err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || hasPartPayload || !hasMessageFileIdx || !hasPartBlobKeyIdx || !hasBlockedUsers || !hasRegistrationInvites || !hasRegistrationInviteLiveIdx || !hasServerAdministration {
+	if !hasParticipants || !hasFanoutID || !hasEvents || !hasUserStatus || !hasEncryptedEvents || !hasFwdFromID || !hasReactions || !hasPinnedChat || !hasPinnedChannel || !hasNameTsv || !hasRateLimits || !hasSendCodeIP || !hasSignInFail || !hasLoginMode || !hasAdminSessions || !hasPartSize || !hasPartBlobKey || hasPartPayload || !hasMessageFileIdx || !hasPartBlobKeyIdx || !hasBlockedUsers || !hasRegistrationInvites || !hasRegistrationInviteLiveIdx || !hasServerAdministration || !hasFileSubtypeRights || !hasValidatedFileSubtypeRights {
 		return errors.New("database schema is not migrated; run: atlas migrate apply --env local")
 	}
 	return nil

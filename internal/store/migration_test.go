@@ -34,6 +34,23 @@ func TestOpenRejectsUnmigratedSchema(t *testing.T) {
 	requireOpenMigrationError(t, ctx, dsn)
 }
 
+func TestOpenRejectsMissingFileSubtypeRightsConstraint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `ALTER TABLE files DROP CONSTRAINT files_subtype_rights_valid`); err != nil {
+		t.Fatalf("drop subtype rights constraint: %v", err)
+	}
+
+	requireOpenMigrationError(t, ctx, dsn)
+}
+
 func TestServerAdministrationMigrationClosesNonEmptyDatabase(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
