@@ -82,6 +82,10 @@ type Store struct {
 	// commit membership changes between reads and verify snapshot consistency.
 	chatInfoSnapshotHook func()
 
+	// chatHistorySnapshotHook is a test-only callback fired after history
+	// membership selection and before message, participant, and profile reads.
+	chatHistorySnapshotHook func()
+
 	// chatListInfoSnapshotHook is a test-only callback fired after the member-chat
 	// selection read and before its bounded participant-count read. It lets tests
 	// commit membership changes between reads and verify snapshot consistency.

@@ -298,22 +298,50 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 // History returns owner's messages with peer, newest-first, excluding deleted.
 // offsetID > 0 pages strictly older than that local_id (0 = from newest).
 func (s *Store) History(ctx context.Context, ownerID int64, peerType PeerType, peerID int64, offsetID, limit int) ([]Message, error) {
-	rows, err := s.q.HistoryPage(ctx, db.HistoryPageParams{
-		OwnerID:  ownerID,
-		PeerType: int16(peerType),
-		PeerID:   peerID,
-		OffsetID: int64(offsetID),
-		Lim:      int32(limit), //nolint:gosec // limit is a small validated page size
+	return s.HistoryWithOffset(ctx, ownerID, peerType, peerID, offsetID, 0, limit)
+}
 
-	})
+// HistoryWithOffset returns an ordinal page from the owner's non-deleted
+// messages with peer. offsetID locates the inclusive anchor in the newest-first
+// result set, and addOffset shifts the start relative to that position.
+func (s *Store) HistoryWithOffset(ctx context.Context, ownerID int64, peerType PeerType, peerID int64, offsetID, addOffset, limit int) ([]Message, error) {
+	rows, err := historyPage(ctx, s.q, ownerID, peerType, peerID, offsetID, addOffset, limit)
 	if err != nil {
 		return nil, fmt.Errorf("history page: %w", err)
 	}
+	return messagesFromRows(rows), nil
+}
+
+func historyPage(ctx context.Context, q *db.Queries, ownerID int64, peerType PeerType, peerID int64, offsetID, addOffset, limit int) ([]db.Message, error) {
+	if offsetID < 0 {
+		return []db.Message{}, nil
+	}
+	if offsetID > 0 && addOffset < 0 {
+		return q.HistoryPageAround(ctx, db.HistoryPageAroundParams{
+			OwnerID:   ownerID,
+			PeerType:  int16(peerType),
+			PeerID:    peerID,
+			OffsetID:  int64(offsetID),
+			Lim:       int32(limit), //nolint:gosec // limit is a small validated page size
+			AddOffset: int64(addOffset),
+		})
+	}
+	return q.HistoryPage(ctx, db.HistoryPageParams{
+		OwnerID:   ownerID,
+		PeerType:  int16(peerType),
+		PeerID:    peerID,
+		OffsetID:  int64(offsetID),
+		Lim:       int32(limit), //nolint:gosec // limit is a small validated page size
+		AddOffset: int64(addOffset),
+	})
+}
+
+func messagesFromRows(rows []db.Message) []Message {
 	msgs := make([]Message, len(rows))
 	for i, r := range rows {
 		msgs[i] = messageFromRow(r)
 	}
-	return msgs, nil
+	return msgs
 }
 
 // SearchMessages returns the caller's messages in the named peer whose text

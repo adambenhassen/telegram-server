@@ -645,6 +645,10 @@ func (h *handlers) loadUsersWithAuthorizedIDs(ctx context.Context, ids map[int64
 	if err != nil {
 		return nil, err
 	}
+	return h.renderUsers(ctx, users, viewerID, entitled, authorizedIDs)
+}
+
+func (h *handlers) renderUsers(ctx context.Context, users map[int64]store.User, viewerID int64, entitled, authorizedIDs map[int64]bool) ([]tg.UserClass, error) {
 	visibleIDs := make([]int64, 0, len(users))
 	for id := range users {
 		if id == viewerID || entitled[id] || authorizedIDs[id] {
