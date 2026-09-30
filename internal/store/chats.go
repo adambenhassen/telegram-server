@@ -174,11 +174,12 @@ func (s *Store) IsMember(ctx context.Context, chatID, userID int64) (bool, error
 // row locked FOR UPDATE and the member set read under that lock. Its operation
 // acquires the needed advisory locks after checking operation-specific authority.
 type chatMutation struct {
-	tx        pgx.Tx
-	qtx       *db.Queries
-	creatorID int64
-	members   []int64        // ascending, as read under the chats row lock
-	seen      map[int64]bool // membership of members, for O(1) tests
+	tx                  pgx.Tx
+	qtx                 *db.Queries
+	creatorID           int64
+	defaultBannedRights []string
+	members             []int64        // ascending, as read under the chats row lock
+	seen                map[int64]bool // membership of members, for O(1) tests
 }
 
 // beginChatMutation opens the transaction AddChatUser, RemoveChatUser and
@@ -258,11 +259,12 @@ func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64) (
 		return nil, fmt.Errorf("chat participants: %w", err)
 	}
 	m := &chatMutation{
-		tx:        tx,
-		qtx:       qtx,
-		creatorID: chat.CreatorID,
-		members:   make([]int64, len(parts)),
-		seen:      make(map[int64]bool, len(parts)),
+		tx:                  tx,
+		qtx:                 qtx,
+		creatorID:           chat.CreatorID,
+		defaultBannedRights: chat.DefaultBannedRights,
+		members:             make([]int64, len(parts)),
+		seen:                make(map[int64]bool, len(parts)),
 	}
 	for i, p := range parts {
 		m.members[i] = p.UserID
@@ -331,6 +333,9 @@ func (s *Store) AddChatUser(ctx context.Context, chatID, target, callerID int64)
 		return false, Message{}, nil, err
 	}
 	defer func() { _ = m.tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	if !m.seen[target] && callerID != m.creatorID && hasChatRight(m.defaultBannedRights, "invite_users") {
+		return false, Message{}, nil, ErrChatWriteForbidden
+	}
 	// Blocking is an authority decision, so a refused add must return before
 	// taking any owner advisory lock. The authorized path below takes its full
 	// owner set once, in the existing sorted order.

@@ -918,13 +918,18 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 
 	// For chat destinations, we need the member set.
 	var chatMembers map[int64]bool
+	var chatDefaultBannedRights []string
+	var chatCreatorID int64
 	if destPeerType == PeerTypeChat {
 		// Lock the chat row first.
-		if _, err = qtx.ChatByIDForUpdate(ctx, destPeerID); errors.Is(err, pgx.ErrNoRows) {
+		chat, lockErr := qtx.ChatByIDForUpdate(ctx, destPeerID)
+		if errors.Is(lockErr, pgx.ErrNoRows) {
 			return nil, nil, ErrNotMember
-		} else if err != nil {
-			return nil, nil, fmt.Errorf("lock chat: %w", err)
+		} else if lockErr != nil {
+			return nil, nil, fmt.Errorf("lock chat: %w", lockErr)
 		}
+		chatDefaultBannedRights = chat.DefaultBannedRights
+		chatCreatorID = chat.CreatorID
 		// Check sender membership.
 		member, e := qtx.IsChatMember(ctx, db.IsChatMemberParams{ChatID: destPeerID, UserID: fromID})
 		if e != nil {
@@ -956,10 +961,22 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 	// on. A batch carrying no media takes no lock and issues no query.
 	fileIDs := make([]int64, 0, len(sources))
 	for _, src := range sources {
-		fileIDs = append(fileIDs, src.FileID)
+		if src.FileID != 0 {
+			fileIDs = append(fileIDs, src.FileID)
+		}
 	}
 	if err = lockFileRefs(ctx, qtx, fileIDs...); err != nil {
 		return nil, nil, err
+	}
+	fileSubtypeRights := make(map[int64][]string, len(fileIDs))
+	if destPeerType == PeerTypeChat && len(fileIDs) > 0 {
+		files, e := qtx.FilesByIDs(ctx, fileIDs)
+		if e != nil {
+			return nil, nil, fmt.Errorf("load forwarded file subtype rights: %w", e)
+		}
+		for _, file := range files {
+			fileSubtypeRights[file.ID] = file.SubtypeRights
+		}
 	}
 
 	// Ensure state for all affected owners.
@@ -1003,6 +1020,11 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 				continue
 			case !errors.Is(e, pgx.ErrNoRows):
 				return nil, nil, fmt.Errorf("random_id lookup: %w", e)
+			}
+		}
+		if destPeerType == PeerTypeChat {
+			if err = checkChatMessageRestriction(chatDefaultBannedRights, fromID == chatCreatorID, src.FileID != 0, fileSubtypeRights[src.FileID]); err != nil {
+				return nil, nil, err
 			}
 		}
 

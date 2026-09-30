@@ -572,6 +572,15 @@ func SendMessageForTest(s *store.Store, userID int64, req *tg.MessagesSendMessag
 	return testHandlers(s).handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// UpdatePinnedMessageForTest encodes req and invokes handleUpdatePinnedMessage.
+func UpdatePinnedMessageForTest(s *store.Store, userID int64, req *tg.MessagesUpdatePinnedMessageRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleUpdatePinnedMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
 // SendMessageForTestWithLimits encodes req and invokes handleSendMessage for the
 // caller with a custom message send rate limit config.
 func SendMessageForTestWithLimits(s *store.Store, userID int64, rateLimit store.RateLimitConfig, req *tg.MessagesSendMessageRequest) (bin.Encoder, error) {

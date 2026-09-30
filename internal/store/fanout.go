@@ -34,6 +34,9 @@ type FanOut struct {
 	RandomID     int64 // sender dedup token; 0 for service messages
 	// FileID attaches an uploaded file to every per-member copy. 0 = no media.
 	FileID int64
+	// MediaRights names the document subtype flags derived from the input
+	// document attributes. The handler only supplies values it recognizes.
+	MediaRights []string
 
 	// ReplyToMsgID is the message-local-id the message should quote in this chat.
 	// Non-zero to link; 0 means the message is not a reply.
@@ -143,10 +146,11 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, log *slog.Logger, f
 
 	// An absent chat and a chat the sender is not in report the same error: the
 	// pair is what keeps chat ids unprobeable over a dense id space.
-	if _, err = qtx.ChatByIDForUpdate(ctx, f.ChatID); errors.Is(err, pgx.ErrNoRows) {
+	chat, lockErr := qtx.ChatByIDForUpdate(ctx, f.ChatID)
+	if errors.Is(lockErr, pgx.ErrNoRows) {
 		return Message{}, nil, false, ErrNotMember
-	} else if err != nil {
-		return Message{}, nil, false, fmt.Errorf("lock chat: %w", err)
+	} else if lockErr != nil {
+		return Message{}, nil, false, fmt.Errorf("lock chat: %w", lockErr)
 	}
 
 	parts, err := qtx.ChatParticipants(ctx, f.ChatID)
@@ -216,6 +220,11 @@ func fanOut(ctx context.Context, tx pgx.Tx, qtx *db.Queries, log *slog.Logger, f
 			return messageFromRow(existing), pts, true, nil
 		case !errors.Is(e, pgx.ErrNoRows):
 			return Message{}, nil, false, fmt.Errorf("random_id lookup: %w", e)
+		}
+	}
+	if f.Action == ChatActionNone {
+		if err = checkChatMessageRestriction(chat.DefaultBannedRights, f.FromID == chat.CreatorID, f.FileID != 0, f.MediaRights); err != nil {
+			return Message{}, nil, false, err
 		}
 	}
 

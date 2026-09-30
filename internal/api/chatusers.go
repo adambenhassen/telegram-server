@@ -39,6 +39,8 @@ func (h *handlers) chatMemberErr(op string, userID int64, err error) error {
 	switch {
 	case errors.Is(err, store.ErrNotMember):
 		return errPeerIDInvalid
+	case errors.Is(err, store.ErrChatWriteForbidden):
+		return errChatWriteForbidden
 	case errors.Is(err, store.ErrChatFull):
 		return errUsersTooMuch
 	default:
