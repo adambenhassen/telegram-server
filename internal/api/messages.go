@@ -476,6 +476,9 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
 	}
+	if errors.Is(err, store.ErrChatWriteForbidden) {
+		return nil, errChatWriteForbidden
+	}
 	if err != nil {
 		h.log.Error("send chat message", "user_id", r.UserID, "chat_id", chatID, "err", err)
 		return nil, errInternal
@@ -1012,6 +1015,9 @@ func (h *handlers) handleForwardMessagesAfterReplyOnConn(c *mtproto.Conn, r *mtp
 		if errors.Is(err, store.ErrNotMember) {
 			return nil, nil, nil, errPeerIDInvalid
 		}
+		if errors.Is(err, store.ErrChatWriteForbidden) {
+			return nil, nil, nil, errChatWriteForbidden
+		}
 		if err != nil {
 			h.log.Error("forward messages", "user_id", r.UserID, "err", err)
 			return nil, nil, nil, errInternal
@@ -1072,6 +1078,12 @@ func (h *handlers) handleForwardMessagesAfterReplyOnConn(c *mtproto.Conn, r *mtp
 			h.clearSenderAndNotify(attempt, r)
 		}
 		return nil, nil, nil, errPeerIDInvalid
+	}
+	if errors.Is(err, store.ErrChatWriteForbidden) {
+		if attempt.conn != nil {
+			h.clearSenderAndNotify(attempt, r)
+		}
+		return nil, nil, nil, errChatWriteForbidden
 	}
 	if err != nil {
 		if attempt.conn != nil {

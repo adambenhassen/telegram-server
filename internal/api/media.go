@@ -277,28 +277,51 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 	if _, ok = media.GetThumb(); ok {
 		return nil, nil, nil, errMediaInvalid
 	}
-
-	// Rate limit before the expensive file assembly: new message, consume a
-	// token. The dedupe check above already caught retries.
-	if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
-		return nil, nil, nil, err
+	mediaRights := chatDocumentRestrictionRights(media)
+	duplicate := false
+	if peerType == store.PeerTypeChat {
+		duplicate, err = h.store.CheckChatWritePermission(r.Ctx, toID, r.UserID, req.RandomID, mediaRights)
+		if errors.Is(err, store.ErrNotMember) {
+			return nil, nil, nil, errPeerIDInvalid
+		}
+		if errors.Is(err, store.ErrChatWriteForbidden) {
+			return nil, nil, nil, errChatWriteForbidden
+		}
+		if err != nil {
+			h.log.Error("check chat media permission", "user_id", r.UserID, "chat_id", toID, "err", err)
+			return nil, nil, nil, errInternal
+		}
 	}
 
-	clientFileID, parts, name, err := inputFileParts(media.File)
-	if err != nil {
-		return nil, nil, nil, err
+	var clientFileID int64
+	var parts int
+	var name string
+	if !duplicate {
+		// Rate limit before the expensive file assembly: new message, consume a
+		// token. The dedupe checks above already caught committed retries.
+		if err := h.checkRateLimit(r, "message_send", h.rateLimitMessageSend); err != nil {
+			return nil, nil, nil, err
+		}
+		clientFileID, parts, name, err = inputFileParts(media.File)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 	}
 
 	// Assembly is the one step in this handler the send path's dedup cannot
 	// cover: it consumes the upload parts, so a resend that reached assembly
 	// would fail on an upload that is no longer there and report MEDIA_INVALID
-	// for a message that was in fact delivered. Reading the dedup token first
-	// makes a resend re-send the file the original message already names.
-	fileID, err := h.resendFileID(r.Ctx, r.UserID, req.RandomID)
+	// for a message that was in fact delivered. Check again after the permission
+	// lock, since a send with the same random_id may have committed while this
+	// request waited for that lock.
+	fileID, existing, err := h.resendFileID(r.Ctx, r.UserID, req.RandomID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if fileID == 0 {
+	if duplicate && !existing {
+		return nil, nil, nil, errMediaInvalid
+	}
+	if !existing {
 		file, aerr := h.assembleFile(r.Ctx, r.UserID, clientFileID, parts, name, media.MimeType)
 		if aerr != nil {
 			return nil, nil, nil, aerr
@@ -307,7 +330,7 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 	}
 
 	if peerType == store.PeerTypeChat {
-		res, err := h.sendChatMedia(r, toID, &req, fileID)
+		res, err := h.sendChatMedia(r, toID, &req, fileID, mediaRights)
 		return res, nil, nil, err
 	}
 
@@ -375,14 +398,18 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 // membership requireMember has already established, and returns the sender-side
 // Updates.
 func (h *handlers) sendChatMedia(
-	r *mtproto.Request, chatID int64, req *tg.MessagesSendMediaRequest, fileID int64,
+	r *mtproto.Request, chatID int64, req *tg.MessagesSendMediaRequest, fileID int64, mediaRights []string,
 ) (bin.Encoder, error) {
 	// Rate limit already checked in handleSendMedia before the peer split.
 	sender, perOwner, _, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
 		ChatID: chatID, FromID: r.UserID, Text: req.Message, RandomID: req.RandomID, FileID: fileID,
+		MediaRights: mediaRights,
 	})
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
+	}
+	if errors.Is(err, store.ErrChatWriteForbidden) {
+		return nil, errChatWriteForbidden
 	}
 	if errors.Is(err, store.ErrFileMissing) {
 		return nil, errMediaInvalid
@@ -425,25 +452,51 @@ func (h *handlers) sendChatMedia(
 	}, nil
 }
 
-// resendFileID reports the file the caller's existing message with this random
-// id already names. It is 0 both when this send is not a resend and when the
-// original message carried no media, and those two want the same handling: go
-// on to assemble, and let the send path's own dedup decide what the reply is.
-// The send paths dedup
-// on the same token inside their own transaction, so this read is an early exit
-// and not the boundary: a resend that races past it assembles a second file and
-// the send still returns the original row, which costs stored bytes but cannot
-// duplicate a message.
-func (h *handlers) resendFileID(ctx context.Context, userID, randomID int64) (int64, error) {
+func chatDocumentRestrictionRights(media *tg.InputMediaUploadedDocument) []string {
+	var rights []string
+	for _, attribute := range media.Attributes {
+		switch value := attribute.(type) {
+		case *tg.DocumentAttributeSticker:
+			rights = append(rights, "send_stickers")
+		case *tg.DocumentAttributeAnimated:
+			rights = append(rights, "send_gifs")
+		case *tg.DocumentAttributeVideo:
+			if value.RoundMessage {
+				rights = append(rights, "send_roundvideos")
+			} else {
+				rights = append(rights, "send_videos")
+			}
+		case *tg.DocumentAttributeAudio:
+			if value.Voice {
+				rights = append(rights, "send_voices")
+			} else {
+				rights = append(rights, "send_audios")
+			}
+		}
+	}
+	return rights
+}
+
+// resendFileID reports the stored file id and whether randomID already names a
+// message owned by userID. A retry of a message without media is still a retry:
+// the caller must skip file assembly and let the send transaction return its
+// original row.
+func (h *handlers) resendFileID(ctx context.Context, userID, randomID int64) (int64, bool, error) {
+	if randomID == 0 {
+		return 0, false, nil
+	}
 	existing, ok, err := h.store.MessageByRandomID(ctx, userID, randomID)
 	if err != nil {
 		h.log.Error("send media random id", "user_id", userID, "err", err)
-		return 0, errInternal
+		return 0, false, errInternal
 	}
 	if !ok {
-		return 0, nil
+		return 0, false, nil
 	}
-	return existing.FileID, nil
+	if existing.Deleted {
+		return 0, true, errMediaInvalid
+	}
+	return existing.FileID, true, nil
 }
 
 // inputFileParts reads the three fields assembly needs off an input file.
