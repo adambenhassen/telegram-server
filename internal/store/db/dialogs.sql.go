@@ -9,6 +9,46 @@ import (
 	"context"
 )
 
+const advanceChatReadInbox = `-- name: AdvanceChatReadInbox :one
+UPDATE dialogs SET
+  read_inbox_max_id = GREATEST(read_inbox_max_id, $1::bigint),
+  unread_count = (
+    SELECT count(*) FROM messages m
+    WHERE m.owner_id = dialogs.owner_id AND m.peer_type = dialogs.peer_type AND m.peer_id = dialogs.peer_id
+      AND m.out = false AND m.deleted = false
+      AND m.local_id > GREATEST(dialogs.read_inbox_max_id, $1::bigint)
+  )::int
+WHERE owner_id = $2::bigint AND peer_type = $3::smallint
+  AND peer_id = $4::bigint
+RETURNING read_inbox_max_id, unread_count
+`
+
+type AdvanceChatReadInboxParams struct {
+	MaxID    int64
+	OwnerID  int64
+	PeerType int16
+	PeerID   int64
+}
+
+type AdvanceChatReadInboxRow struct {
+	ReadInboxMaxID int64
+	UnreadCount    int32
+}
+
+// AdvanceChatReadInbox leaves the chat's outbox marker alone even when its id
+// numerically equals the reader's user id.
+func (q *Queries) AdvanceChatReadInbox(ctx context.Context, arg AdvanceChatReadInboxParams) (AdvanceChatReadInboxRow, error) {
+	row := q.db.QueryRow(ctx, advanceChatReadInbox,
+		arg.MaxID,
+		arg.OwnerID,
+		arg.PeerType,
+		arg.PeerID,
+	)
+	var i AdvanceChatReadInboxRow
+	err := row.Scan(&i.ReadInboxMaxID, &i.UnreadCount)
+	return i, err
+}
+
 const advanceReadInbox = `-- name: AdvanceReadInbox :one
 UPDATE dialogs SET
   read_inbox_max_id = GREATEST(read_inbox_max_id, $1::bigint),
@@ -80,6 +120,75 @@ func (q *Queries) AdvanceReadOutbox(ctx context.Context, arg AdvanceReadOutboxPa
 	return result.RowsAffected(), nil
 }
 
+const chatReadReceiptTargets = `-- name: ChatReadReceiptTargets :many
+WITH covered AS (
+    SELECT DISTINCT m.from_id, m.fanout_id
+    FROM messages AS m
+    WHERE m.owner_id = $3::bigint
+      AND m.peer_type = $1::smallint
+      AND m.peer_id = $2::bigint
+      AND m.out = false AND m.deleted = false AND m.fanout_id <> 0
+      AND m.local_id > $4::bigint
+      AND m.local_id <= $5::bigint
+      AND m.from_id = ANY($6::bigint[])
+)
+SELECT covered.from_id AS sender_id, MAX(sender.local_id)::bigint AS max_id
+FROM covered
+JOIN messages AS sender
+  ON sender.owner_id = covered.from_id
+ AND sender.fanout_id = covered.fanout_id
+ AND sender.fanout_id <> 0
+ AND sender.out = true
+ AND sender.peer_type = $1::smallint
+ AND sender.peer_id = $2::bigint
+GROUP BY covered.from_id
+ORDER BY covered.from_id
+`
+
+type ChatReadReceiptTargetsParams struct {
+	PeerType  int16
+	PeerID    int64
+	OwnerID   int64
+	AfterID   int64
+	MaxID     int64
+	MemberIds []int64
+}
+
+type ChatReadReceiptTargetsRow struct {
+	SenderID int64
+	MaxID    int64
+}
+
+// ChatReadReceiptTargets maps covered inbound chat copies to each current
+// sender's own outbound message-id space. The current participant list is
+// supplied only after its owners have been locked and rechecked.
+func (q *Queries) ChatReadReceiptTargets(ctx context.Context, arg ChatReadReceiptTargetsParams) ([]ChatReadReceiptTargetsRow, error) {
+	rows, err := q.db.Query(ctx, chatReadReceiptTargets,
+		arg.PeerType,
+		arg.PeerID,
+		arg.OwnerID,
+		arg.AfterID,
+		arg.MaxID,
+		arg.MemberIds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChatReadReceiptTargetsRow
+	for rows.Next() {
+		var i ChatReadReceiptTargetsRow
+		if err := rows.Scan(&i.SenderID, &i.MaxID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countDialogsForOwner = `-- name: CountDialogsForOwner :one
 SELECT count(*)::int FROM dialogs WHERE owner_id = $1
 `
@@ -134,6 +243,56 @@ func (q *Queries) DialogsForOwner(ctx context.Context, arg DialogsForOwnerParams
 		return nil, err
 	}
 	return items, nil
+}
+
+const maxChatReadMessageID = `-- name: MaxChatReadMessageID :one
+SELECT COALESCE(MAX(local_id), 0)::bigint AS max_id
+FROM messages
+WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3
+  AND deleted = false AND local_id <= $4
+`
+
+type MaxChatReadMessageIDParams struct {
+	OwnerID  int64
+	PeerType int16
+	PeerID   int64
+	LocalID  int64
+}
+
+func (q *Queries) MaxChatReadMessageID(ctx context.Context, arg MaxChatReadMessageIDParams) (int64, error) {
+	row := q.db.QueryRow(ctx, maxChatReadMessageID,
+		arg.OwnerID,
+		arg.PeerType,
+		arg.PeerID,
+		arg.LocalID,
+	)
+	var max_id int64
+	err := row.Scan(&max_id)
+	return max_id, err
+}
+
+const readMarkers = `-- name: ReadMarkers :one
+SELECT read_inbox_max_id, read_outbox_max_id FROM dialogs
+WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3
+`
+
+type ReadMarkersParams struct {
+	OwnerID  int64
+	PeerType int16
+	PeerID   int64
+}
+
+type ReadMarkersRow struct {
+	ReadInboxMaxID  int64
+	ReadOutboxMaxID int64
+}
+
+// ReadMarkers reads the current inbox and outbox boundaries for one dialog.
+func (q *Queries) ReadMarkers(ctx context.Context, arg ReadMarkersParams) (ReadMarkersRow, error) {
+	row := q.db.QueryRow(ctx, readMarkers, arg.OwnerID, arg.PeerType, arg.PeerID)
+	var i ReadMarkersRow
+	err := row.Scan(&i.ReadInboxMaxID, &i.ReadOutboxMaxID)
+	return i, err
 }
 
 const upsertDialog = `-- name: UpsertDialog :exec

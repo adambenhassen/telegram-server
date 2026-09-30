@@ -1052,20 +1052,15 @@ func TestHandleGetDialogsNonMemberOnCreateRowGetsNoParticipants(t *testing.T) {
 	}
 }
 
-// F7: readHistory and setTyping stay 1:1-only. Typing in particular resolves its
-// peer id as a user id on delivery, so accepting a chat peer would push
-// updateUserTyping to whichever account shares the chat's id.
-func TestReadHistoryAndSetTypingRejectChatPeers(t *testing.T) {
+// F7: typing remains 1:1-only. It resolves the peer id as a user id on
+// delivery, so accepting a chat peer would push updateUserTyping to whichever
+// account shares the chat's id.
+func TestSetTypingRejectsChatPeers(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
 	users, chat := chatWith(t, s, "+15551292061", "+15551292062")
 
-	_, err := api.ReadHistoryForTest(s, users[0].ID, &tg.MessagesReadHistoryRequest{
-		Peer: &tg.InputPeerChat{ChatID: chat.ID}, MaxID: 1,
-	})
-	rpcError(t, err, "PEER_ID_INVALID")
-
-	_, err = api.SetTypingForTest(s, users[0].ID, &tg.MessagesSetTypingRequest{
+	_, err := api.SetTypingForTest(s, users[0].ID, &tg.MessagesSetTypingRequest{
 		Peer: &tg.InputPeerChat{ChatID: chat.ID}, Action: &tg.SendMessageTypingAction{},
 	})
 	rpcError(t, err, "PEER_ID_INVALID")
