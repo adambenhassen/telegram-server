@@ -139,6 +139,9 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 	if r.UserID == 0 {
 		return nil, nil, nil, errAuthKeyUnreg
 	}
+	if err := rejectUnsupportedSendOptions(&req); err != nil {
+		return nil, nil, nil, err
+	}
 	// Validate before any expensive work.
 	if !validText(req.Message) {
 		return nil, nil, nil, errMessageEmpty
