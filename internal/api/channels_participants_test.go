@@ -502,3 +502,85 @@ func TestGetParticipantsSnapshotCannotAddAfterViewerRemoval(t *testing.T) {
 		t.Errorf("post-removal participant list error = %v, want PEER_ID_INVALID", rpc)
 	}
 }
+
+func TestGetParticipantSnapshotCannotAddAfterViewerRemoval(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator := mustUser(t, s, "+15551982311")
+	viewer := mustUser(t, s, "+15551982312")
+	added := mustUser(t, s, "+15551982313")
+	group := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Megagroup: true, Title: "Participant race"})
+	joinChannel(t, ctx, dsn, group.ID, viewer.ID)
+	h := fullChannelDispatcher(s)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	store.SetChannelParticipantsSnapshotHook(s, func() {
+		close(entered)
+		<-release
+	})
+	defer func() {
+		if !released {
+			close(release)
+		}
+		store.SetChannelParticipantsSnapshotHook(s, nil)
+	}()
+
+	type outcome struct {
+		response *tg.ChannelsChannelParticipant
+		rpc      *mt.RPCError
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		response, rpc := getParticipantViaDispatcher(
+			t,
+			h,
+			viewer.ID,
+			false,
+			api.InputChannel(viewer.ID, group.ID),
+			api.InputPeerUser(viewer.ID, added.ID),
+		)
+		done <- outcome{response: response, rpc: rpc}
+	}()
+	select {
+	case <-entered:
+	case result := <-done:
+		t.Fatalf("participant snapshot did not reach read barrier: response=%v rpc=%v", result.response, result.rpc)
+	case <-time.After(2 * time.Second):
+		t.Fatal("participant snapshot did not reach its read barrier")
+	}
+
+	left, err := s.LeaveChannel(ctx, group.ID, viewer.ID)
+	if err != nil || !left {
+		t.Fatalf("remove viewer during read: left=%v err=%v", left, err)
+	}
+	joinChannel(t, ctx, dsn, group.ID, added.ID)
+	close(release)
+	released = true
+
+	var result outcome
+	select {
+	case result = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("participant snapshot did not finish after membership change")
+	}
+	if result.rpc == nil || result.rpc.ErrorMessage != "PEER_ID_INVALID" {
+		if result.rpc != nil {
+			t.Fatalf("in-flight getParticipant error = %s, want PEER_ID_INVALID", result.rpc.ErrorMessage)
+		}
+		if result.response == nil {
+			t.Fatal("in-flight getParticipant returned neither a response nor an RPC error")
+		}
+		if participantID(result.response.Participant) == added.ID {
+			t.Errorf("request that began before removal returned the newly admitted participant")
+		}
+		for _, user := range result.response.Users {
+			if wire, ok := user.(*tg.User); ok && wire.ID == added.ID {
+				t.Error("request that began before removal returned the new participant's profile")
+			}
+		}
+		t.Fatalf("in-flight getParticipant unexpectedly succeeded for newly admitted user %d", added.ID)
+	}
+}
