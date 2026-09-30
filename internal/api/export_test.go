@@ -598,6 +598,46 @@ func SendMessageForTestWithLimitsAndMetrics(s *store.Store, metrics *store.Notif
 	return h.handleSendMessage(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
+// SendAfterReplyForTest encodes a registered send request and invokes its
+// dispatcher handler, returning whether it produced reply or success hooks and
+// how often the commit hook ran.
+func SendAfterReplyForTest(
+	s *store.Store,
+	userID int64,
+	req bin.Encoder,
+	blobs blob.Store,
+	rateLimit store.RateLimitConfig,
+) (bin.Encoder, bool, bool, int, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, false, false, 0, err
+	}
+	h := testHandlers(s)
+	if blobs != nil {
+		h.blobs = blobs
+	}
+	h.rateLimitMessageSend = rateLimit
+	commitCalls := 0
+	h.afterSenderCommit = func() { commitCalls++ }
+	r := &mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf}
+
+	var result bin.Encoder
+	var update *replyUpdate
+	var afterReply func()
+	var err error
+	switch req := req.(type) {
+	case *tg.MessagesSendMessageRequest:
+		result, update, afterReply, err = h.handleSendMessageAfterReply(r)
+	case *tg.MessagesSendMediaRequest:
+		result, update, afterReply, err = h.handleSendMediaAfterReply(r)
+	case *tg.MessagesForwardMessagesRequest:
+		result, update, afterReply, err = h.handleForwardMessagesAfterReplyOnConn(nil, r)
+	default:
+		return nil, false, false, 0, fmt.Errorf("unsupported send request type %T", req)
+	}
+	return result, update != nil, afterReply != nil, commitCalls, err
+}
+
 // SendMediaForTestWithLimits encodes req and invokes handleSendMedia with a
 // custom message send rate limit config.
 func SendMediaForTestWithLimits(

@@ -235,6 +235,32 @@ func validText(s string) bool {
 	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
 }
 
+type unsupportedSendOptions interface {
+	GetScheduleDate() (int, bool)
+	GetScheduleRepeatPeriod() (int, bool)
+	GetQuickReplyShortcut() (tg.InputQuickReplyShortcutClass, bool)
+	GetSuggestedPost() (tg.SuggestedPost, bool)
+}
+
+// rejectUnsupportedSendOptions checks TL field presence, including scalar
+// fields explicitly set to zero. Suggested posts are wholly unsupported, so
+// their nested schedule date is rejected with the outer field as well.
+func rejectUnsupportedSendOptions(req unsupportedSendOptions) error {
+	if _, ok := req.GetScheduleDate(); ok {
+		return errInputRequestInvalid
+	}
+	if _, ok := req.GetScheduleRepeatPeriod(); ok {
+		return errInputRequestInvalid
+	}
+	if _, ok := req.GetQuickReplyShortcut(); ok {
+		return errInputRequestInvalid
+	}
+	if _, ok := req.GetSuggestedPost(); ok {
+		return errInputRequestInvalid
+	}
+	return nil
+}
+
 // handleSendMessage is the direct handler entry used by tests and callers that
 // do not write an RPC result. The dispatcher uses handleSendMessageAfterReply
 // so the sender notification is published only after that result reaches the
@@ -259,6 +285,9 @@ func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 	}
 	if r.UserID == 0 {
 		return nil, nil, nil, errAuthKeyUnreg
+	}
+	if err := rejectUnsupportedSendOptions(&req); err != nil {
+		return nil, nil, nil, err
 	}
 	// Validate text and resolve peer before any write.
 	if !validText(req.Message) {
@@ -846,6 +875,9 @@ func (h *handlers) handleForwardMessagesAfterReplyOnConn(c *mtproto.Conn, r *mtp
 	}
 	if r.UserID == 0 {
 		return nil, nil, nil, errAuthKeyUnreg
+	}
+	if err := rejectUnsupportedSendOptions(&req); err != nil {
+		return nil, nil, nil, err
 	}
 	// Check the cap before retry lookup, peer resolution, or any other store
 	// call. An oversized request must report the same client error regardless of
