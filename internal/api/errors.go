@@ -61,7 +61,7 @@ var (
 	// errPeerIDInvalid rejects an unresolvable or unauthorized input peer.
 	errPeerIDInvalid = rpcErr(400, "PEER_ID_INVALID")
 	// errChatNotModified answers an authorized default-rights save whose value
-	// already matches the basic group's stored restriction set.
+	// already matches the group's stored restriction set.
 	errChatNotModified = rpcErr(400, "CHAT_NOT_MODIFIED")
 	// errChatTitleInvalid rejects an empty, whitespace-only or over-length chat
 	// title on createChat and editChatTitle.

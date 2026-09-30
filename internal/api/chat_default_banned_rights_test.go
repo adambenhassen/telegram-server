@@ -314,7 +314,7 @@ func TestEditChatDefaultBannedRightsRejectsInvalidRightsWithoutWrite(t *testing.
 	}
 }
 
-func TestEditChatDefaultBannedRightsRejectsNonChatPeers(t *testing.T) {
+func TestEditChatDefaultBannedRightsSupportsMegagroupPeers(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openStore(t)
@@ -328,11 +328,22 @@ func TestEditChatDefaultBannedRightsRejectsNonChatPeers(t *testing.T) {
 		Peer:         api.InputPeerChannel(creator.ID, channel.ID),
 		BannedRights: tg.ChatBannedRights{SendPolls: true},
 	})
-	var rpc mt.RPCError
-	if err := rpc.Decode(&bin.Buffer{Buf: body}); err != nil {
-		t.Fatalf("decode non-basic-chat result: %v", err)
+	var updates tg.Updates
+	if err := updates.Decode(&bin.Buffer{Buf: body}); err != nil {
+		t.Fatalf("decode megagroup rights result: %v", err)
 	}
-	if rpc.ErrorMessage != "PEER_ID_INVALID" {
-		t.Fatalf("non-basic-chat error = %s, want PEER_ID_INVALID", rpc.ErrorMessage)
+	if len(updates.Updates) != 1 {
+		t.Fatalf("megagroup rights updates = %d, want one committed channel update", len(updates.Updates))
+	}
+	changed, ok := updates.Updates[0].(*tg.UpdateChatDefaultBannedRights)
+	if !ok {
+		t.Fatalf("megagroup rights update = %T, want *tg.UpdateChatDefaultBannedRights", updates.Updates[0])
+	}
+	peer, ok := changed.Peer.(*tg.PeerChannel)
+	if !ok || peer.ChannelID != channel.ID {
+		t.Fatalf("megagroup rights update peer = %T/%v, want channel %d", changed.Peer, changed.Peer, channel.ID)
+	}
+	if !changed.DefaultBannedRights.SendPolls || changed.Version != channel.Version+1 {
+		t.Fatalf("megagroup rights/version = %+v/%d, want SendPolls/version %d", changed.DefaultBannedRights, changed.Version, channel.Version+1)
 	}
 }

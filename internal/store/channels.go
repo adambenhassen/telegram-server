@@ -26,10 +26,11 @@ import (
 // CreateChannel takes the account lock before inserting its new channel, which
 // has no existing channel_state row to lock.
 //
-// The rights mutations — SetChannelRole, SetChannelBan and LeaveChannel — take
-// the channels row lock (LockChannel), first and held to commit. AddChannelMembers
-// takes that row first to re-check the caller's role, then channel_state, then
-// sorted account advisory locks to serialize quota checks across targets. Posts
+// The rights mutations — SetChannelRole, SetChannelBan,
+// SetChannelDefaultBannedRights and LeaveChannel — take the channels row lock
+// (LockChannel), first and held to commit. AddChannelMembers takes that row
+// first to re-check the caller's role, then channel_state, then sorted account
+// advisory locks to serialize quota checks across targets. Posts
 // and joins can hold channel_state while their inserts request a KEY SHARE lock
 // on channels for the foreign key; LockChannel's NO KEY UPDATE mode is compatible
 // with that check, so the insert can finish and release channel_state. This
@@ -112,7 +113,8 @@ type Channel struct {
 	PinnedMessageID *int32
 	// Username is the normalized handle claimed in the usernames table.
 	// Nil when the channel has no username.
-	Username *string
+	Username            *string
+	DefaultBannedRights []string
 }
 
 // Participant roles, as recorded in the M7 migration.
@@ -157,15 +159,16 @@ func (m ChannelMember) Forever() bool {
 
 func channelFromRow(r db.Channel) Channel {
 	return Channel{
-		ID:              r.ID,
-		Title:           r.Title,
-		About:           r.About,
-		CreatorID:       r.CreatorID,
-		Megagroup:       r.Megagroup,
-		Version:         int(r.Version),
-		Date:            r.Date.Time,
-		PinnedMessageID: r.PinnedMessageID,
-		Username:        r.Username,
+		ID:                  r.ID,
+		Title:               r.Title,
+		About:               r.About,
+		CreatorID:           r.CreatorID,
+		Megagroup:           r.Megagroup,
+		Version:             int(r.Version),
+		Date:                r.Date.Time,
+		PinnedMessageID:     r.PinnedMessageID,
+		Username:            r.Username,
+		DefaultBannedRights: r.DefaultBannedRights,
 	}
 }
 
@@ -837,6 +840,71 @@ func (s *Store) SetChannelBan(
 	return nil
 }
 
+// SetChannelDefaultBannedRights replaces a megagroup's default restriction
+// set. Current admin authority and equality are checked under LockChannel, the
+// same row lock SetChannelRole uses for demotion, so a demoted admin cannot
+// return an unchanged result based on stale authority.
+func (s *Store) SetChannelDefaultBannedRights(
+	ctx context.Context, channelID, callerID int64, rights []string,
+) (channel Channel, changed bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Channel{}, false, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	// Filter outsiders before they take the row lock; the locked read below is
+	// still the authorization decision because membership can change after this.
+	member, err := qtx.IsChannelMember(ctx, db.IsChannelMemberParams{ChannelID: channelID, UserID: callerID})
+	if err != nil {
+		return Channel{}, false, fmt.Errorf("is channel member: %w", err)
+	}
+	if !member {
+		return Channel{}, false, ErrNotMember
+	}
+
+	locked, err := qtx.LockChannel(ctx, channelID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Channel{}, false, ErrNotMember
+		}
+		return Channel{}, false, fmt.Errorf("lock channel: %w", err)
+	}
+	participant, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID,
+		UserID:    callerID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Channel{}, false, ErrNotMember
+	case err != nil:
+		return Channel{}, false, fmt.Errorf("caller participant: %w", err)
+	}
+	caller := channelMemberFromRow(participant)
+	if !locked.Megagroup || caller.Role < channelRoleAdmin || caller.Banned(time.Now()) {
+		return Channel{}, false, ErrNotMember
+	}
+	if sameDefaultBannedRights(locked.DefaultBannedRights, rights) {
+		if err = tx.Commit(ctx); err != nil {
+			return Channel{}, false, fmt.Errorf("commit unchanged default rights: %w", err)
+		}
+		return channelFromRow(locked), false, nil
+	}
+
+	row, err := qtx.SetChannelDefaultBannedRights(ctx, db.SetChannelDefaultBannedRightsParams{
+		ID:                  channelID,
+		DefaultBannedRights: rights,
+	})
+	if err != nil {
+		return Channel{}, false, fmt.Errorf("set channel default banned rights: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return Channel{}, false, fmt.Errorf("commit channel default rights: %w", err)
+	}
+	return channelFromRow(row), true, nil
+}
+
 // LeaveChannel deletes userID's participant row; left=false means there was
 // none. The creator leaving is allowed here — whether the RPC permits it is the
 // handler's call, not this layer's.
@@ -1114,14 +1182,15 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 	out := make([]ChannelDialogRow, len(rows))
 	for i, r := range rows {
 		ch := Channel{
-			ID:        r.ChannelID,
-			Title:     r.Title,
-			About:     r.About,
-			CreatorID: r.CreatorID,
-			Megagroup: r.Megagroup,
-			Version:   int(r.Version),
-			Date:      r.ChannelDate.Time,
-			Username:  r.Username,
+			ID:                  r.ChannelID,
+			Title:               r.Title,
+			About:               r.About,
+			CreatorID:           r.CreatorID,
+			Megagroup:           r.Megagroup,
+			Version:             int(r.Version),
+			Date:                r.ChannelDate.Time,
+			Username:            r.Username,
+			DefaultBannedRights: r.DefaultBannedRights,
 		}
 		member := channelMemberFromRow(db.ChannelParticipant{
 			ChannelID:   r.ChannelID,

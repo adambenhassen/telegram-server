@@ -261,6 +261,9 @@ func (h *handlers) channelToTL(c store.Channel, m store.ChannelMember, member bo
 	if c.Username != nil {
 		ch.Username = *c.Username
 	}
+	if c.Megagroup && len(c.DefaultBannedRights) > 0 {
+		ch.SetDefaultBannedRights(chatDefaultBannedRightsToTL(c.DefaultBannedRights))
+	}
 	return ch
 }
 

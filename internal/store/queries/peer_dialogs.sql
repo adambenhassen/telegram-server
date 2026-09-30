@@ -40,6 +40,7 @@ SELECT
     c.date AS channel_date,
     c.pinned_message_id AS channel_pinned_message_id,
     c.username AS channel_username,
+    c.default_banned_rights AS channel_default_banned_rights,
     p.role AS member_role,
     p.banned_until AS member_banned_until,
     p.join_pts AS member_join_pts,

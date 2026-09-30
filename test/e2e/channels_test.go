@@ -12,7 +12,6 @@ import (
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -497,17 +496,20 @@ func TestChannelsMegagroup(t *testing.T) {
 	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
 	t.Cleanup(stop)
 
-	const phoneA, phoneB = "+15551295021", "+15551295022"
-	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
+	const phoneA, phoneB, phoneC = "+15551295021", "+15551295022", "+15551295023"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneC)
 
-	aCmds, bCmds := make(chan command), make(chan command)
-	aID, bID := make(chan int64, 1), make(chan int64, 1)
-	errA, errB := make(chan error, 1), make(chan error, 1)
+	aCmds, bCmds, cCmds := make(chan command), make(chan command), make(chan command)
+	aID, bID, cID := make(chan int64, 1), make(chan int64, 1), make(chan int64, 1)
+	errA, errB, errC := make(chan error, 1), make(chan error, 1), make(chan error, 1)
 	go func() {
 		errA <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneA, codes), aID, aCmds)
 	}()
 	go func() {
 		errB <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneB, codes), bID, bCmds)
+	}()
+	go func() {
+		errC <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneC, codes), cID, cCmds)
 	}()
 
 	login := func(ch chan int64, who string) int64 {
@@ -521,6 +523,7 @@ func TestChannelsMegagroup(t *testing.T) {
 	}
 	aUserID := login(aID, "A")
 	bUserID := login(bID, "B")
+	login(cID, "C")
 
 	// A creates megagroup, B joins.
 	chID := createMegagroup(t, ctx, aCmds, "Megagroup")
@@ -561,21 +564,123 @@ func TestChannelsMegagroup(t *testing.T) {
 	// B (role 0) posts with the unrestricted default and gets the post in the RPC reply.
 	postAndCheckReply(bUserID, bCmds, "megagroup post by plain member", 5002001, 1)
 
-	// Save has no channel RPC yet. Write the persisted state directly, as the
-	// subsequent Permissions Save path will, then prove the failed post changes
-	// neither channel state nor membership.
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
+	// B is promoted and saves SendPolls through the same method the Permissions
+	// screen uses. The reply names the channel whose default rights committed.
+	if err = st.SetChannelRole(ctx, chID, aUserID, bUserID, 1); err != nil {
+		t.Fatalf("promote B: %v", err)
 	}
-	defer func() {
-		if err := conn.Close(ctx); err != nil {
-			t.Errorf("close: %v", err)
+	channelBefore, ok, err := st.ChannelByID(ctx, chID)
+	if err != nil || !ok {
+		t.Fatalf("read channel before rights save: ok=%v err=%v", ok, err)
+	}
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		result, err := c.MessagesEditChatDefaultBannedRights(ctx, &tg.MessagesEditChatDefaultBannedRightsRequest{
+			Peer:         peerChannel(bUserID, chID),
+			BannedRights: tg.ChatBannedRights{SendPolls: true},
+		})
+		if err != nil {
+			return fmt.Errorf("admin save default rights: %w", err)
 		}
-	}()
-	if _, err = conn.Exec(ctx, `UPDATE channels SET default_banned_rights = $2 WHERE id = $1`, chID, []string{"send_plain"}); err != nil {
-		t.Fatalf("set channel defaults: %v", err)
+		updates, ok := result.(*tg.Updates)
+		if !ok || len(updates.Updates) != 1 {
+			return fmt.Errorf("default rights result = %T, want Updates with one entry", result)
+		}
+		updated, ok := updates.Updates[0].(*tg.UpdateChatDefaultBannedRights)
+		if !ok {
+			return fmt.Errorf("default rights update = %T, want *tg.UpdateChatDefaultBannedRights", updates.Updates[0])
+		}
+		peer, ok := updated.Peer.(*tg.PeerChannel)
+		if !ok || peer.ChannelID != chID {
+			return fmt.Errorf("updated peer = %T/%v, want channel %d", updated.Peer, updated.Peer, chID)
+		}
+		if !updated.DefaultBannedRights.SendPolls || updated.DefaultBannedRights.SendMessages || updated.Version != channelBefore.Version+1 {
+			return fmt.Errorf("updated rights/version = %+v/%d, want SendPolls only/version %d", updated.DefaultBannedRights, updated.Version, channelBefore.Version+1)
+		}
+		return nil
+	})
+
+	// A fresh member-only full-channel read is the Permissions reopen path.
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		full, err := c.ChannelsGetFullChannel(ctx, inputChannel(bUserID, chID))
+		if err != nil {
+			return fmt.Errorf("member getFullChannel: %w", err)
+		}
+		if len(full.Chats) != 1 {
+			return fmt.Errorf("member getFullChannel chats = %d, want 1", len(full.Chats))
+		}
+		channel, ok := full.Chats[0].(*tg.Channel)
+		if !ok {
+			return fmt.Errorf("member full-channel peer = %T, want *tg.Channel", full.Chats[0])
+		}
+		rights, ok := channel.GetDefaultBannedRights()
+		if !ok || !rights.SendPolls || rights.SendMessages {
+			return fmt.Errorf("member getFullChannel default rights = %+v present=%v, want SendPolls only", rights, ok)
+		}
+		return nil
+	})
+
+	// A public username preview is visible to C but carries no private defaults.
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.ChannelsUpdateUsername(ctx, &tg.ChannelsUpdateUsernameRequest{
+			Channel: inputChannel(aUserID, chID), Username: "megagroup_rights_preview",
+		})
+		return err
+	})
+	execChannel(t, ctx, cCmds, func(ctx context.Context, c *tg.Client) error {
+		preview, err := c.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: "megagroup_rights_preview"})
+		if err != nil {
+			return fmt.Errorf("outsider resolveUsername: %w", err)
+		}
+		if len(preview.Chats) != 1 {
+			return fmt.Errorf("outsider preview chats = %d, want 1", len(preview.Chats))
+		}
+		channel, ok := preview.Chats[0].(*tg.Channel)
+		if !ok || channel.ID != chID {
+			return fmt.Errorf("outsider preview peer = %T/%v, want channel %d", preview.Chats[0], preview.Chats[0], chID)
+		}
+		if rights, ok := channel.GetDefaultBannedRights(); ok {
+			return fmt.Errorf("outsider public preview disclosed default rights: %+v", rights)
+		}
+		return nil
+	})
+
+	// Demotion does not erase the committed rights, and a plain member still
+	// reads them on the next member-only channel response.
+	if err = st.SetChannelRole(ctx, chID, aUserID, bUserID, 0); err != nil {
+		t.Fatalf("demote B: %v", err)
 	}
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		channelsResult, err := c.ChannelsGetChannels(ctx, []tg.InputChannelClass{inputChannel(bUserID, chID)})
+		if err != nil {
+			return fmt.Errorf("member getChannels: %w", err)
+		}
+		channels, ok := channelsResult.(*tg.MessagesChats)
+		if !ok {
+			return fmt.Errorf("member getChannels result = %T, want *tg.MessagesChats", channelsResult)
+		}
+		if len(channels.Chats) != 1 {
+			return fmt.Errorf("member getChannels chats = %d, want 1", len(channels.Chats))
+		}
+		channel, ok := channels.Chats[0].(*tg.Channel)
+		if !ok {
+			return fmt.Errorf("member channel peer = %T, want *tg.Channel", channels.Chats[0])
+		}
+		rights, ok := channel.GetDefaultBannedRights()
+		if !ok || !rights.SendPolls || channel.ID != chID {
+			return fmt.Errorf("demoted member rights/id = %+v/%d present=%v, want SendPolls/channel %d", rights, channel.ID, ok, chID)
+		}
+		return nil
+	})
+
+	// Add a text restriction through Save, then prove a denied post changes
+	// neither channel state nor membership.
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesEditChatDefaultBannedRights(ctx, &tg.MessagesEditChatDefaultBannedRightsRequest{
+			Peer:         peerChannel(aUserID, chID),
+			BannedRights: tg.ChatBannedRights{SendPolls: true, SendPlain: true},
+		})
+		return err
+	})
 	beforePts, err := st.ChannelState(ctx, chID)
 	if err != nil {
 		t.Fatalf("channel state before denied post: %v", err)
@@ -611,7 +716,8 @@ func TestChannelsMegagroup(t *testing.T) {
 
 	close(aCmds)
 	close(bCmds)
-	for _, ch := range []chan error{errA, errB} {
+	close(cCmds)
+	for _, ch := range []chan error{errA, errB, errC} {
 		if err := <-ch; err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("client run: %v", err)
 		}

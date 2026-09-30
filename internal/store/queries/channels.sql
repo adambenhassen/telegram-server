@@ -221,6 +221,7 @@ SELECT
     c.megagroup,
     c.version,
     c.username,
+    c.default_banned_rights,
     c.date AS channel_date,
     p.role AS member_role,
     p.banned_until AS member_banned_until,
@@ -250,6 +251,14 @@ LEFT JOIN LATERAL (
 WHERE p.user_id = $1
   AND (p.banned_until IS NULL OR p.banned_until <= now())
 ORDER BY c.id;
+
+-- SetChannelDefaultBannedRights writes defaults after the caller's current
+-- membership, role, channel kind and equality have been checked under LockChannel.
+-- name: SetChannelDefaultBannedRights :one
+UPDATE channels
+SET default_banned_rights = $2, version = version + 1
+WHERE id = $1
+RETURNING *;
 
 -- SetChannelUsername writes the denormalized handle copy and, with it,
 -- recomputes publicly_discoverable from the usernames table.
