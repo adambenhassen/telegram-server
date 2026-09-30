@@ -38,6 +38,10 @@ func TestSmoke(t *testing.T) {
 		t.Parallel()
 		testSmokeBasicGroup(t)
 	})
+	t.Run("channel", func(t *testing.T) {
+		t.Parallel()
+		testSmokeChannel(t)
+	})
 }
 
 func testSmokeOneToOne(t *testing.T) {
@@ -276,6 +280,168 @@ func testSmokeBasicGroup(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("smoke group for member %d: %v", member.id, err)
 		}
+	}
+}
+
+func testSmokeChannel(t *testing.T) {
+	t.Helper()
+	f := newSmokeFixture(t)
+	const phoneCreator, phoneSubscriber = "+15551048001", "+15551048002"
+	seedPhoneUsers(t, f.ctx, f.store, phoneCreator, phoneSubscriber)
+	creator := newSmokeClient(t, f, phoneCreator)
+	subscriber := newSmokeClient(t, f, phoneSubscriber)
+
+	channelID := createBroadcastChannel(t, f.ctx, creator.cmds, "Smoke channel")
+	hash := exportChannelInvite(t, f.ctx, creator.id, creator.cmds, channelID)
+	if joinedID := importChannelInvite(t, f.ctx, subscriber.cmds, hash); joinedID != channelID {
+		t.Fatalf("subscriber joined channel %d, want %d", joinedID, channelID)
+	}
+
+	const post = "channel-smoke"
+	execChannel(t, f.ctx, creator.cmds, func(ctx context.Context, api *tg.Client) error {
+		_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:     peerChannel(creator.id, channelID),
+			Message:  post,
+			RandomID: 1048001,
+		})
+		return err
+	})
+
+	update := recvOrCtx(t, f.ctx, subscriber.seen.newChannelMsg, "subscriber channel update")
+	if update.Msg.Message != post || update.Msg.ID <= 0 {
+		t.Fatalf("subscriber channel message = {text:%q id:%d}, want {%q, positive id}", update.Msg.Message, update.Msg.ID, post)
+	}
+	peer, ok := update.Msg.PeerID.(*tg.PeerChannel)
+	if !ok || peer.ChannelID != channelID {
+		t.Fatalf("subscriber channel peer = %+v, want channel %d", update.Msg.PeerID, channelID)
+	}
+	from, ok := update.Msg.FromID.(*tg.PeerUser)
+	if !ok || from.UserID != creator.id {
+		t.Fatalf("subscriber channel sender = %+v, want creator %d", update.Msg.FromID, creator.id)
+	}
+	noDuplicate := time.NewTimer(50 * time.Millisecond)
+	defer noDuplicate.Stop()
+	select {
+	case duplicate := <-subscriber.seen.newChannelMsg:
+		t.Fatalf("subscriber received duplicate channel message: %+v", duplicate.Msg)
+	case <-noDuplicate.C:
+	case <-f.ctx.Done():
+		t.Fatalf("waiting for duplicate channel message check: %v", f.ctx.Err())
+	}
+
+	if err := subscriber.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		result, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:  peerChannel(subscriber.id, channelID),
+			Limit: 10,
+		})
+		if err != nil {
+			return err
+		}
+		history, ok := result.(*tg.MessagesChannelMessages)
+		if !ok {
+			return fmt.Errorf("channel history response = %T, want *tg.MessagesChannelMessages", result)
+		}
+		if len(history.Messages) != 1 {
+			return fmt.Errorf("channel history count = %d, want 1", len(history.Messages))
+		}
+		message, ok := history.Messages[0].(*tg.Message)
+		if !ok {
+			return fmt.Errorf("channel history message = %T, want *tg.Message", history.Messages[0])
+		}
+		if message.Message != post || message.ID != update.Msg.ID || message.Out {
+			return fmt.Errorf("channel history message = {text:%q id:%d out:%v}, want {%q id:%d out:false}", message.Message, message.ID, message.Out, post, update.Msg.ID)
+		}
+		peer, ok := message.PeerID.(*tg.PeerChannel)
+		if !ok || peer.ChannelID != channelID {
+			return fmt.Errorf("channel history peer = %+v, want channel %d", message.PeerID, channelID)
+		}
+		from, ok := message.FromID.(*tg.PeerUser)
+		if !ok || from.UserID != creator.id {
+			return fmt.Errorf("channel history sender = %+v, want creator %d", message.FromID, creator.id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("subscriber getHistory: %v", err)
+	}
+
+	if err := creator.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		fullResult, err := api.ChannelsGetFullChannel(ctx, inputChannel(creator.id, channelID))
+		if err != nil {
+			return err
+		}
+		full, ok := fullResult.FullChat.(*tg.ChannelFull)
+		if !ok {
+			return fmt.Errorf("creator getFullChannel = %T, want *tg.ChannelFull", fullResult.FullChat)
+		}
+		count, ok := full.GetParticipantsCount()
+		if full.ID != channelID || !ok || count != 2 || !full.GetCanViewParticipants() {
+			return fmt.Errorf("creator getFullChannel id/count/can_view = %d/%d/%v, want %d/2/true", full.ID, count, full.GetCanViewParticipants(), channelID)
+		}
+		if len(fullResult.Chats) != 1 {
+			return fmt.Errorf("creator getFullChannel chats = %d, want 1", len(fullResult.Chats))
+		}
+		channel, ok := fullResult.Chats[0].(*tg.Channel)
+		if !ok || channel.ID != channelID || !channel.Creator || channel.Left {
+			return fmt.Errorf("creator getFullChannel channel = %+v, want creator member %d", fullResult.Chats[0], channelID)
+		}
+
+		participantsResult, err := api.ChannelsGetParticipants(ctx, &tg.ChannelsGetParticipantsRequest{
+			Channel: inputChannel(creator.id, channelID),
+			Filter:  &tg.ChannelParticipantsRecent{},
+			Limit:   10,
+		})
+		if err != nil {
+			return err
+		}
+		participants, ok := participantsResult.(*tg.ChannelsChannelParticipants)
+		if !ok {
+			return fmt.Errorf("getParticipants response = %T, want *tg.ChannelsChannelParticipants", participantsResult)
+		}
+		if participants.Count != count || len(participants.Participants) != count {
+			return fmt.Errorf("getParticipants count/rows = %d/%d, want %d", participants.Count, len(participants.Participants), count)
+		}
+		roles := make(map[int64]string, len(participants.Participants))
+		for _, participant := range participants.Participants {
+			switch member := participant.(type) {
+			case *tg.ChannelParticipantCreator:
+				roles[member.UserID] = "creator"
+			case *tg.ChannelParticipant:
+				roles[member.UserID] = "member"
+			default:
+				return fmt.Errorf("getParticipants role = %T, want creator or member", participant)
+			}
+		}
+		if len(roles) != 2 || roles[creator.id] != "creator" || roles[subscriber.id] != "member" {
+			return fmt.Errorf("getParticipants roles = %v, want creator %d and subscriber %d", roles, creator.id, subscriber.id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("creator channel membership reads: %v", err)
+	}
+
+	if err := subscriber.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		result, err := api.ChannelsGetFullChannel(ctx, inputChannel(subscriber.id, channelID))
+		if err != nil {
+			return err
+		}
+		full, ok := result.FullChat.(*tg.ChannelFull)
+		if !ok {
+			return fmt.Errorf("subscriber getFullChannel = %T, want *tg.ChannelFull", result.FullChat)
+		}
+		count, ok := full.GetParticipantsCount()
+		if full.ID != channelID || !ok || count != 2 || full.GetCanViewParticipants() {
+			return fmt.Errorf("subscriber getFullChannel id/count/can_view = %d/%d/%v, want %d/2/false", full.ID, count, full.GetCanViewParticipants(), channelID)
+		}
+		if len(result.Chats) != 1 {
+			return fmt.Errorf("subscriber getFullChannel chats = %d, want 1", len(result.Chats))
+		}
+		channel, ok := result.Chats[0].(*tg.Channel)
+		if !ok || channel.ID != channelID || channel.Creator || channel.Left {
+			return fmt.Errorf("subscriber getFullChannel channel = %+v, want current member %d", result.Chats[0], channelID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("subscriber getFullChannel: %v", err)
 	}
 }
 
