@@ -250,10 +250,11 @@ func (h *handlers) handleEditChatTitle(r *mtproto.Request) (bin.Encoder, error) 
 	return ups, nil
 }
 
-// handleEditChatDefaultBannedRights saves basic-group default restrictions.
-// The store re-checks current membership and creator authority under the chat
-// row lock before it compares values or writes. Rights updates have no message
-// event or owner pts, so the reply carries Telegram's chat-version update alone.
+// handleEditChatDefaultBannedRights saves basic-group or megagroup default
+// restrictions. The store re-checks current membership and authority under the
+// peer row lock before it compares values or writes. Rights updates have no
+// message event or owner pts, so the reply carries Telegram's peer-version
+// update alone.
 func (h *handlers) handleEditChatDefaultBannedRights(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesEditChatDefaultBannedRightsRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -262,8 +263,22 @@ func (h *handlers) handleEditChatDefaultBannedRights(r *mtproto.Request) (bin.En
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	peer, ok := req.Peer.(*tg.InputPeerChat)
-	if !ok || peer.ChatID <= 0 {
+	var (
+		chatID      int64
+		channelPeer *tg.InputPeerChannel
+	)
+	switch peer := req.Peer.(type) {
+	case *tg.InputPeerChat:
+		if peer.ChatID <= 0 {
+			return nil, errPeerIDInvalid
+		}
+		chatID = peer.ChatID
+	case *tg.InputPeerChannel:
+		if peer.ChannelID <= 0 {
+			return nil, errPeerIDInvalid
+		}
+		channelPeer = peer
+	default:
 		return nil, errPeerIDInvalid
 	}
 	rights, err := chatDefaultBannedRightsFromTL(req.BannedRights)
@@ -271,12 +286,41 @@ func (h *handlers) handleEditChatDefaultBannedRights(r *mtproto.Request) (bin.En
 		return nil, err
 	}
 
-	chat, changed, err := h.store.SetChatDefaultBannedRights(r.Ctx, peer.ChatID, r.UserID, rights)
+	if channelPeer != nil {
+		peerType, channelID, err := h.inputPeer(channelPeer, r.UserID)
+		if err != nil {
+			return nil, err
+		}
+		if peerType != store.PeerTypeChannel {
+			return nil, errPeerIDInvalid
+		}
+		channel, changed, err := h.store.SetChannelDefaultBannedRights(r.Ctx, channelID, r.UserID, rights)
+		if errors.Is(err, store.ErrNotMember) {
+			return nil, errPeerIDInvalid
+		}
+		if err != nil {
+			h.log.Error("edit channel default banned rights", "channel_id", channelID, "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+		if !changed {
+			return nil, errChatNotModified
+		}
+		return &tg.Updates{
+			Updates: []tg.UpdateClass{&tg.UpdateChatDefaultBannedRights{
+				Peer:                &tg.PeerChannel{ChannelID: channel.ID},
+				DefaultBannedRights: chatDefaultBannedRightsToTL(channel.DefaultBannedRights),
+				Version:             channel.Version,
+			}},
+			Date: int(h.now().Unix()),
+		}, nil
+	}
+
+	chat, changed, err := h.store.SetChatDefaultBannedRights(r.Ctx, chatID, r.UserID, rights)
 	if errors.Is(err, store.ErrNotMember) {
 		return nil, errPeerIDInvalid
 	}
 	if err != nil {
-		h.log.Error("edit chat default banned rights", "chat_id", peer.ChatID, "user_id", r.UserID, "err", err)
+		h.log.Error("edit chat default banned rights", "chat_id", chatID, "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
 	if !changed {

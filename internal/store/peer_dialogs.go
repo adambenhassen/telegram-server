@@ -336,15 +336,16 @@ func peerDialogFileIDs(dialogs []PeerDialog) []int64 {
 
 func channelFromPeerDialogRow(row db.PeerChannelDialogsForOwnerRow) Channel {
 	return Channel{
-		ID:              row.ChannelID,
-		Title:           row.ChannelTitle,
-		About:           row.ChannelAbout,
-		CreatorID:       row.ChannelCreatorID,
-		Megagroup:       row.ChannelMegagroup,
-		Version:         int(row.ChannelVersion),
-		Date:            row.ChannelDate.Time,
-		PinnedMessageID: row.ChannelPinnedMessageID,
-		Username:        row.ChannelUsername,
+		ID:                  row.ChannelID,
+		Title:               row.ChannelTitle,
+		About:               row.ChannelAbout,
+		CreatorID:           row.ChannelCreatorID,
+		Megagroup:           row.ChannelMegagroup,
+		Version:             int(row.ChannelVersion),
+		Date:                row.ChannelDate.Time,
+		PinnedMessageID:     row.ChannelPinnedMessageID,
+		Username:            row.ChannelUsername,
+		DefaultBannedRights: row.ChannelDefaultBannedRights,
 	}
 }
 

@@ -140,6 +140,7 @@ SELECT
     c.date AS channel_date,
     c.pinned_message_id AS channel_pinned_message_id,
     c.username AS channel_username,
+    c.default_banned_rights AS channel_default_banned_rights,
     p.role AS member_role,
     p.banned_until AS member_banned_until,
     p.join_pts AS member_join_pts,
@@ -174,27 +175,28 @@ type PeerChannelDialogsForOwnerParams struct {
 }
 
 type PeerChannelDialogsForOwnerRow struct {
-	ChannelID              int64
-	ChannelTitle           string
-	ChannelAbout           string
-	ChannelCreatorID       int64
-	ChannelMegagroup       bool
-	ChannelVersion         int32
-	ChannelDate            pgtype.Timestamptz
-	ChannelPinnedMessageID *int32
-	ChannelUsername        *string
-	MemberRole             int16
-	MemberBannedUntil      pgtype.Timestamptz
-	MemberJoinPts          int64
-	ChannelPts             int64
-	TopLocalID             int64
-	TopFromID              int64
-	TopDate                pgtype.Timestamptz
-	TopMessage             string
-	TopEditDate            pgtype.Timestamptz
-	TopRandomID            int64
-	TopFileID              *int64
-	TopReplyToMsgID        *int32
+	ChannelID                  int64
+	ChannelTitle               string
+	ChannelAbout               string
+	ChannelCreatorID           int64
+	ChannelMegagroup           bool
+	ChannelVersion             int32
+	ChannelDate                pgtype.Timestamptz
+	ChannelPinnedMessageID     *int32
+	ChannelUsername            *string
+	ChannelDefaultBannedRights []string
+	MemberRole                 int16
+	MemberBannedUntil          pgtype.Timestamptz
+	MemberJoinPts              int64
+	ChannelPts                 int64
+	TopLocalID                 int64
+	TopFromID                  int64
+	TopDate                    pgtype.Timestamptz
+	TopMessage                 string
+	TopEditDate                pgtype.Timestamptz
+	TopRandomID                int64
+	TopFileID                  *int64
+	TopReplyToMsgID            *int32
 }
 
 // PeerChannelDialogsForOwner is the channel counterpart of
@@ -222,6 +224,7 @@ func (q *Queries) PeerChannelDialogsForOwner(ctx context.Context, arg PeerChanne
 			&i.ChannelDate,
 			&i.ChannelPinnedMessageID,
 			&i.ChannelUsername,
+			&i.ChannelDefaultBannedRights,
 			&i.MemberRole,
 			&i.MemberBannedUntil,
 			&i.MemberJoinPts,

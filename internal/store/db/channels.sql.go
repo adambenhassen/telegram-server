@@ -126,6 +126,7 @@ SELECT
     c.megagroup,
     c.version,
     c.username,
+    c.default_banned_rights,
     c.date AS channel_date,
     p.role AS member_role,
     p.banned_until AS member_banned_until,
@@ -158,29 +159,30 @@ ORDER BY c.id
 `
 
 type ChannelDialogsForUserRow struct {
-	ChannelID         int64
-	Title             string
-	About             string
-	CreatorID         int64
-	Megagroup         bool
-	Version           int32
-	Username          *string
-	ChannelDate       pgtype.Timestamptz
-	MemberRole        int16
-	MemberBannedUntil pgtype.Timestamptz
-	MemberJoinPts     int64
-	Pts               int64
-	NextLocalID       int64
-	StateDate         pgtype.Timestamptz
-	TopLocalID        int64
-	TopFromID         int64
-	TopDate           pgtype.Timestamptz
-	TopMessage        string
-	TopEditDate       pgtype.Timestamptz
-	TopDeleted        bool
-	TopRandomID       int64
-	TopFileID         *int64
-	TopReplyToMsgID   *int32
+	ChannelID           int64
+	Title               string
+	About               string
+	CreatorID           int64
+	Megagroup           bool
+	Version             int32
+	Username            *string
+	DefaultBannedRights []string
+	ChannelDate         pgtype.Timestamptz
+	MemberRole          int16
+	MemberBannedUntil   pgtype.Timestamptz
+	MemberJoinPts       int64
+	Pts                 int64
+	NextLocalID         int64
+	StateDate           pgtype.Timestamptz
+	TopLocalID          int64
+	TopFromID           int64
+	TopDate             pgtype.Timestamptz
+	TopMessage          string
+	TopEditDate         pgtype.Timestamptz
+	TopDeleted          bool
+	TopRandomID         int64
+	TopFileID           *int64
+	TopReplyToMsgID     *int32
 }
 
 // ChannelDialogsForUser returns every unbanned channel the user belongs to,
@@ -207,6 +209,7 @@ func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Ch
 			&i.Megagroup,
 			&i.Version,
 			&i.Username,
+			&i.DefaultBannedRights,
 			&i.ChannelDate,
 			&i.MemberRole,
 			&i.MemberBannedUntil,
@@ -1047,6 +1050,41 @@ func (q *Queries) SearchPublicChannels(ctx context.Context, arg SearchPublicChan
 		return nil, err
 	}
 	return items, nil
+}
+
+const setChannelDefaultBannedRights = `-- name: SetChannelDefaultBannedRights :one
+UPDATE channels
+SET default_banned_rights = $2, version = version + 1
+WHERE id = $1
+RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable, default_banned_rights, slowmode_seconds
+`
+
+type SetChannelDefaultBannedRightsParams struct {
+	ID                  int64
+	DefaultBannedRights []string
+}
+
+// SetChannelDefaultBannedRights writes defaults after the caller's current
+// membership, role, channel kind and equality have been checked under LockChannel.
+func (q *Queries) SetChannelDefaultBannedRights(ctx context.Context, arg SetChannelDefaultBannedRightsParams) (Channel, error) {
+	row := q.db.QueryRow(ctx, setChannelDefaultBannedRights, arg.ID, arg.DefaultBannedRights)
+	var i Channel
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.About,
+		&i.CreatorID,
+		&i.Megagroup,
+		&i.Version,
+		&i.Date,
+		&i.PinnedMessageID,
+		&i.Username,
+		&i.TitleTsv,
+		&i.PubliclyDiscoverable,
+		&i.DefaultBannedRights,
+		&i.SlowmodeSeconds,
+	)
+	return i, err
 }
 
 const setChannelPinnedMessage = `-- name: SetChannelPinnedMessage :one

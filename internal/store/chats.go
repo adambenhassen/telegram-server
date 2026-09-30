@@ -510,7 +510,7 @@ func (s *Store) SetChatDefaultBannedRights(ctx context.Context, chatID, callerID
 	if callerID != m.creatorID {
 		return Chat{}, false, ErrNotMember
 	}
-	if sameChatDefaultRights(m.defaultBannedRights, rights) {
+	if sameDefaultBannedRights(m.defaultBannedRights, rights) {
 		if err = m.tx.Commit(ctx); err != nil {
 			return Chat{}, false, fmt.Errorf("commit unchanged default rights: %w", err)
 		}
@@ -530,7 +530,7 @@ func (s *Store) SetChatDefaultBannedRights(ctx context.Context, chatID, callerID
 	return chatFromRow(row), true, nil
 }
 
-func sameChatDefaultRights(a, b []string) bool {
+func sameDefaultBannedRights(a, b []string) bool {
 	left := slices.Clone(a)
 	right := slices.Clone(b)
 	slices.Sort(left)
