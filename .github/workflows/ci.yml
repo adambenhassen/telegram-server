@@ -1183,3 +1183,62 @@ jobs:
         run: |
           docker compose -f docker-compose.yml -f docker-compose.rustfs.yml down -v
           docker compose down -v
+
+  # Keep the core behavioral signal independent from the broader CI suite.
+  # TestSmoke uses pgtest's disposable, per-test databases; the hosted runner
+  # and its Postgres container are discarded with this job.
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run uncached core smoke selector
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          output=""
+          status=0
+          output=$(go test -count=1 -timeout 2m -v ./test/e2e -run '^TestSmoke' 2>&1) || status=$?
+          if [ "$status" -ne 0 ]; then
+            printf '%s\n' "$output"
+            exit "$status"
+          fi
+
+          if ! grep -Fq -- '=== RUN   TestSmoke' <<<"$output"; then
+            echo "::error::TestSmoke did not run"
+            exit 1
+          fi
+
+          for scenario in one-to-one saved-messages basic-group channel contacts-search username-registration; do
+            if ! grep -Fq -- "=== RUN   TestSmoke/$scenario" <<<"$output"; then
+              echo "::error::TestSmoke/$scenario was not selected"
+              exit 1
+            fi
+            if ! grep -Fq -- "--- PASS: TestSmoke/$scenario" <<<"$output"; then
+              echo "::error::TestSmoke/$scenario did not pass"
+              exit 1
+            fi
+          done
+
+          if grep -Eq '^--- SKIP: TestSmoke(/|[[:space:]]|$)' <<<"$output"; then
+            echo "::error::TestSmoke or one of its scenarios was skipped"
+            exit 1
+          fi
+
+          summary=$(grep -E '^ok[[:space:]]+github.com/adambenhassen/telegram-server/test/e2e[[:space:]]+[0-9.]+s$' <<<"$output" | tail -n 1)
+          if [ -z "$summary" ]; then
+            echo "::error::TestSmoke did not report a completed package run"
+            exit 1
+          fi
+          printf '%s\n' "$summary"
