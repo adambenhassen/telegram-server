@@ -84,7 +84,10 @@ func (h *handlers) handleGetParticipants(r *mtproto.Request) (bin.Encoder, error
 	if err != nil {
 		return nil, err
 	}
-	limit := min(req.Limit, maxChannelParticipantsPage)
+	limit := int32(maxChannelParticipantsPage)
+	if req.Limit < maxChannelParticipantsPage {
+		limit = int32(req.Limit)
+	}
 	snapshot, found, err := h.store.ChannelParticipantsPageForViewer(
 		r.Ctx,
 		channelID,
@@ -92,7 +95,7 @@ func (h *handlers) handleGetParticipants(r *mtproto.Request) (bin.Encoder, error
 		filter.storeFilter,
 		filter.query,
 		int32(req.Offset),
-		int32(limit),
+		limit,
 	)
 	if err != nil {
 		h.log.Error("get channel participants", "channel_id", channelID, "user_id", r.UserID, "err", err)
