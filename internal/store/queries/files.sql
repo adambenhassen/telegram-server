@@ -1,6 +1,6 @@
 -- name: InsertFile :one
-INSERT INTO files (uploader_id, access_hash, size, mime_type, file_name)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO files (uploader_id, access_hash, size, mime_type, file_name, subtype_rights)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
 -- name: MarkFileStored :execrows

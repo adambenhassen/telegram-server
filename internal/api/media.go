@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/gotd/td/bin"
@@ -104,6 +105,68 @@ func sanitizeFileName(s string) string {
 		return ""
 	}
 	return s
+}
+
+// documentSubtypeRights classifies accepted document attributes for storage.
+// Nil means an attribute was unrecognized or malformed; an empty non-nil slice
+// means the document is known generic. Names and image dimensions do not imply
+// a restricted subtype.
+func documentSubtypeRights(attributes []tg.DocumentAttributeClass) []string {
+	rights := make(map[string]struct{})
+	for _, attribute := range attributes {
+		switch value := attribute.(type) {
+		case *tg.DocumentAttributeFilename:
+			if value == nil {
+				return nil
+			}
+		case *tg.DocumentAttributeImageSize:
+			if value == nil {
+				return nil
+			}
+		case *tg.DocumentAttributeSticker:
+			if value == nil {
+				return nil
+			}
+			rights["send_stickers"] = struct{}{}
+		case *tg.DocumentAttributeCustomEmoji:
+			if value == nil {
+				return nil
+			}
+			rights["send_stickers"] = struct{}{}
+		case *tg.DocumentAttributeAnimated:
+			if value == nil {
+				return nil
+			}
+			rights["send_gifs"] = struct{}{}
+		case *tg.DocumentAttributeVideo:
+			if value == nil {
+				return nil
+			}
+			if value.RoundMessage {
+				rights["send_roundvideos"] = struct{}{}
+			} else {
+				rights["send_videos"] = struct{}{}
+			}
+		case *tg.DocumentAttributeAudio:
+			if value == nil {
+				return nil
+			}
+			if value.Voice {
+				rights["send_voices"] = struct{}{}
+			} else {
+				rights["send_audios"] = struct{}{}
+			}
+		default:
+			return nil
+		}
+	}
+
+	classified := make([]string, 0, len(rights))
+	for right := range rights {
+		classified = append(classified, right)
+	}
+	sort.Strings(classified)
+	return classified
 }
 
 // handleSendMedia is the direct handler entry used by tests and callers that do
@@ -324,7 +387,7 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 		return nil, nil, nil, errMediaInvalid
 	}
 	if !existing {
-		file, aerr := h.assembleFile(r.Ctx, r.UserID, clientFileID, parts, name, media.MimeType)
+		file, aerr := h.assembleFile(r.Ctx, r.UserID, clientFileID, parts, name, media.MimeType, documentSubtypeRights(media.Attributes))
 		if aerr != nil {
 			return nil, nil, nil, aerr
 		}
@@ -528,7 +591,7 @@ func inputFileParts(f tg.InputFileClass) (id int64, parts int, name string, err 
 // through the stored transition's commit, so the eraser cannot reclaim a live
 // upload even with a small cutoff.
 func (h *handlers) assembleFile(
-	ctx context.Context, userID, clientFileID int64, parts int, name, mimeType string,
+	ctx context.Context, userID, clientFileID int64, parts int, name, mimeType string, subtypeRights []string,
 ) (store.File, error) {
 	n, maxIndex, total, err := h.store.UploadPartsSummary(ctx, userID, clientFileID)
 	if err != nil {
@@ -569,7 +632,7 @@ func (h *handlers) assembleFile(
 	}
 
 	var written int64
-	file, err := h.store.AllocateAndCompleteFile(ctx, userID, total, sanitizeMIME(mimeType), sanitizeFileName(name), h.maxUserStorageBytes, func(file store.File) error {
+	file, err := h.store.AllocateAndCompleteFile(ctx, userID, total, sanitizeMIME(mimeType), sanitizeFileName(name), h.maxUserStorageBytes, subtypeRights, func(file store.File) error {
 		var err error
 		written, err = h.blobs.Put(ctx, blob.Key(file.ID), &partsReader{
 			ctx: ctx, store: h.store, refs: refs, size: total,

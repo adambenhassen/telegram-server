@@ -62,7 +62,7 @@ func TestAssemblyConcurrencyLeavesPoolHeadroom(t *testing.T) {
 
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := s.AllocateAndCompleteFile(ctx, assemblyUser.ID, largeAssemblySize, "application/octet-stream", "large-1.bin", bigQuota, func(store.File) error {
+		_, err := s.AllocateAndCompleteFile(ctx, assemblyUser.ID, largeAssemblySize, "application/octet-stream", "large-1.bin", bigQuota, nil, func(store.File) error {
 			firstOnce.Do(func() { close(firstReady) })
 			<-firstRelease
 			return nil
@@ -79,7 +79,7 @@ func TestAssemblyConcurrencyLeavesPoolHeadroom(t *testing.T) {
 	secondCtx, cancelSecond := context.WithCancel(ctx)
 	defer cancelSecond()
 	go func() {
-		_, err := s.AllocateAndCompleteFile(secondCtx, secondAssemblyUser.ID, largeAssemblySize, "application/octet-stream", "large-2.bin", bigQuota, func(store.File) error {
+		_, err := s.AllocateAndCompleteFile(secondCtx, secondAssemblyUser.ID, largeAssemblySize, "application/octet-stream", "large-2.bin", bigQuota, nil, func(store.File) error {
 			secondOnce.Do(func() { close(secondReady) })
 			<-secondRelease
 			return nil
