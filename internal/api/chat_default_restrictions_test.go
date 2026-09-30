@@ -52,6 +52,56 @@ func assertChatWriteStats(t *testing.T, conn *pgx.Conn, chatID int64, want chatW
 	}
 }
 
+func createDirectMediaSource(
+	t *testing.T,
+	s *store.Store,
+	conn *pgx.Conn,
+	sender, recipient store.User,
+	clientFileID, randomID int64,
+	name, mime string,
+	attributes ...tg.DocumentAttributeClass,
+) (senderLocalID, recipientLocalID int, fileID int64) {
+	t.Helper()
+	ctx := context.Background()
+	saveParts(t, s, sender.ID, clientFileID, []byte("source document bytes"))
+	media := uploadedDocument(clientFileID, 1, name, mime)
+	media.Attributes = attributes
+	if _, err := api.SendMediaForTest(s, sender.ID, newBlobs(t), api.TestMaxUserStorageBytes, &tg.MessagesSendMediaRequest{
+		Peer: api.InputPeerUser(sender.ID, recipient.ID), Media: media, Message: "forward source", RandomID: randomID,
+	}); err != nil {
+		t.Fatalf("send direct media source: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `
+		SELECT local_id, file_id FROM messages
+		WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3 AND random_id = $4
+	`, sender.ID, int16(store.PeerTypeUser), recipient.ID, randomID).Scan(&senderLocalID, &fileID); err != nil {
+		t.Fatalf("read sender media source: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `
+		SELECT local_id FROM messages
+		WHERE owner_id = $1 AND peer_type = $2 AND peer_id = $3 AND file_id = $4
+	`, recipient.ID, int16(store.PeerTypeUser), sender.ID, fileID).Scan(&recipientLocalID); err != nil {
+		t.Fatalf("read recipient media source: %v", err)
+	}
+	return senderLocalID, recipientLocalID, fileID
+}
+
+func forwardUserMediaToChat(
+	s *store.Store,
+	user store.User,
+	sourcePeerID, chatID int64,
+	sourceLocalID int,
+	randomID int64,
+) error {
+	_, err := api.ForwardMessagesForTest(s, user.ID, &tg.MessagesForwardMessagesRequest{
+		FromPeer: api.InputPeerUser(user.ID, sourcePeerID),
+		ID:       []int{sourceLocalID},
+		ToPeer:   api.InputPeerChat(user.ID, chatID),
+		RandomID: []int64{randomID},
+	})
+	return err
+}
+
 func TestBasicChatTextDefaultsRestrictMembersButPreserveCreatorAndRetries(t *testing.T) {
 	t.Parallel()
 	for _, right := range []string{"send_messages", "send_plain"} {
@@ -312,6 +362,185 @@ func voiceAttribute() tg.DocumentAttributeClass {
 	attr := &tg.DocumentAttributeAudio{}
 	attr.SetVoice(true)
 	return attr
+}
+
+func TestBasicChatForwardedDocumentSubtypeRestrictions(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		right string
+		attr  tg.DocumentAttributeClass
+	}{
+		{right: "send_stickers", attr: &tg.DocumentAttributeSticker{Stickerset: &tg.InputStickerSetEmpty{}}},
+		{right: "send_gifs", attr: &tg.DocumentAttributeAnimated{}},
+		{right: "send_videos", attr: &tg.DocumentAttributeVideo{}},
+		{right: "send_roundvideos", attr: roundVideoAttribute()},
+		{right: "send_audios", attr: &tg.DocumentAttributeAudio{}},
+		{right: "send_voices", attr: voiceAttribute()},
+	}
+	for i, tc := range cases {
+		t.Run(tc.right, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			s, dsn := openStoreDSN(t)
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+			creator := chatUser(t, s, 7601+i*2)
+			member := chatUser(t, s, 7602+i*2)
+			chat, err := s.CreateChat(ctx, creator.ID, "Forwarded subtype restriction", []int64{member.ID})
+			if err != nil {
+				t.Fatalf("create chat: %v", err)
+			}
+			memberSourceID, creatorSourceID, fileID := createDirectMediaSource(
+				t, s, conn, member, creator, int64(76100+i), int64(76110+i),
+				"source.bin", "application/octet-stream", tc.attr,
+			)
+			files, err := s.FilesByIDs(ctx, []int64{fileID})
+			if err != nil {
+				t.Fatalf("load source file subtype: %v", err)
+			}
+			if got := files[fileID].SubtypeRights; len(got) != 1 || got[0] != tc.right {
+				t.Fatalf("stored subtype rights = %v, want [%s]", got, tc.right)
+			}
+
+			before := basicChatWriteStats(t, conn, chat.ID)
+			memberPts := apiPts(t, s, member.ID)
+			creatorPts := apiPts(t, s, creator.ID)
+			retryID := int64(76200 + i)
+			if tc.right == "send_stickers" {
+				if err = forwardUserMediaToChat(s, member, creator.ID, chat.ID, memberSourceID, retryID); err != nil {
+					t.Fatalf("initial unrestricted forward: %v", err)
+				}
+				before = basicChatWriteStats(t, conn, chat.ID)
+				memberPts = apiPts(t, s, member.ID)
+				creatorPts = apiPts(t, s, creator.ID)
+			}
+			setChatDefaultRights(t, conn, chat.ID, tc.right)
+			if tc.right == "send_stickers" {
+				if err = forwardUserMediaToChat(s, member, creator.ID, chat.ID, memberSourceID, retryID); err != nil {
+					t.Fatalf("committed forward retry after restriction: %v", err)
+				}
+				assertChatWriteStats(t, conn, chat.ID, before)
+				if got := apiPts(t, s, member.ID); got != memberPts {
+					t.Fatalf("member pts after committed retry = %d, want %d", got, memberPts)
+				}
+				if got := apiPts(t, s, creator.ID); got != creatorPts {
+					t.Fatalf("creator pts after committed retry = %d, want %d", got, creatorPts)
+				}
+			}
+
+			wantRPC(t, forwardUserMediaToChat(s, member, creator.ID, chat.ID, memberSourceID, int64(76300+i)), "CHAT_WRITE_FORBIDDEN")
+			assertChatWriteStats(t, conn, chat.ID, before)
+			if got := apiPts(t, s, member.ID); got != memberPts {
+				t.Fatalf("member pts after denied forward = %d, want %d", got, memberPts)
+			}
+			if got := apiPts(t, s, creator.ID); got != creatorPts {
+				t.Fatalf("creator pts after denied forward = %d, want %d", got, creatorPts)
+			}
+
+			// The creator remains exempt for every document subtype.
+			if err = forwardUserMediaToChat(s, creator, member.ID, chat.ID, creatorSourceID, int64(76400+i)); err != nil {
+				t.Fatalf("restricted creator forward: %v", err)
+			}
+			assertChatWriteStats(t, conn, chat.ID, chatWriteStats{
+				messages: before.messages + 2,
+				events:   before.events + 2,
+			})
+		})
+	}
+}
+
+func TestBasicChatGenericAndUnknownSubtypeForwardPolicy(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	creator := chatUser(t, s, 7801)
+	member := chatUser(t, s, 7802)
+	chat, err := s.CreateChat(ctx, creator.ID, "Unknown subtype forward policy", []int64{member.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+
+	genericSourceID, _, genericFileID := createDirectMediaSource(
+		t, s, conn, member, creator, 78101, 78111, "generic.bin", "application/octet-stream",
+	)
+	unknownSourceID, _, unknownFileID := createDirectMediaSource(
+		t, s, conn, member, creator, 78102, 78112, "sticker.webp", "image/webp", &tg.DocumentAttributeHasStickers{},
+	)
+	legacySourceID, _, legacyFileID := createDirectMediaSource(
+		t, s, conn, member, creator, 78103, 78113, "legacy.bin", "application/octet-stream",
+	)
+	if _, err = conn.Exec(ctx, `UPDATE files SET subtype_rights = NULL WHERE id = $1`, legacyFileID); err != nil {
+		t.Fatalf("mark legacy subtype unknown: %v", err)
+	}
+
+	files, err := s.FilesByIDs(ctx, []int64{genericFileID, unknownFileID, legacyFileID})
+	if err != nil {
+		t.Fatalf("load source file subtypes: %v", err)
+	}
+	if got := files[genericFileID].SubtypeRights; got == nil || len(got) != 0 {
+		t.Fatalf("generic subtype rights = %v, want known empty set", got)
+	}
+	if got := files[unknownFileID].SubtypeRights; got != nil {
+		t.Fatalf("ambiguous subtype rights = %v, want unknown", got)
+	}
+	if got := files[legacyFileID].SubtypeRights; got != nil {
+		t.Fatalf("legacy subtype rights = %v, want unknown", got)
+	}
+
+	setChatDefaultRights(t, conn, chat.ID, "send_stickers")
+	if err = forwardUserMediaToChat(s, member, creator.ID, chat.ID, genericSourceID, 78201); err != nil {
+		t.Fatalf("known generic forward under send_stickers restriction: %v", err)
+	}
+
+	assertUnknownDenied := func(sourceID int, randomID int64) {
+		t.Helper()
+		before := basicChatWriteStats(t, conn, chat.ID)
+		memberPts := apiPts(t, s, member.ID)
+		creatorPts := apiPts(t, s, creator.ID)
+		wantRPC(t, forwardUserMediaToChat(s, member, creator.ID, chat.ID, sourceID, randomID), "CHAT_WRITE_FORBIDDEN")
+		assertChatWriteStats(t, conn, chat.ID, before)
+		if got := apiPts(t, s, member.ID); got != memberPts {
+			t.Fatalf("member pts after denied unknown forward = %d, want %d", got, memberPts)
+		}
+		if got := apiPts(t, s, creator.ID); got != creatorPts {
+			t.Fatalf("creator pts after denied unknown forward = %d, want %d", got, creatorPts)
+		}
+	}
+
+	for i, right := range []string{"send_stickers", "send_gifs", "send_videos", "send_roundvideos", "send_audios", "send_voices"} {
+		setChatDefaultRights(t, conn, chat.ID, right)
+		assertUnknownDenied(unknownSourceID, int64(78300+i))
+	}
+
+	if _, err = conn.Exec(ctx, `UPDATE chats SET default_banned_rights = '{}' WHERE id = $1`, chat.ID); err != nil {
+		t.Fatalf("clear subtype restrictions: %v", err)
+	}
+	before := basicChatWriteStats(t, conn, chat.ID)
+	if err = forwardUserMediaToChat(s, member, creator.ID, chat.ID, unknownSourceID, 78401); err != nil {
+		t.Fatalf("ambiguous unknown forward without subtype restrictions: %v", err)
+	}
+	assertChatWriteStats(t, conn, chat.ID, chatWriteStats{messages: before.messages + 2, events: before.events + 2})
+
+	setChatDefaultRights(t, conn, chat.ID, "send_videos")
+	assertUnknownDenied(legacySourceID, 78402)
+	if _, err = conn.Exec(ctx, `UPDATE chats SET default_banned_rights = '{}' WHERE id = $1`, chat.ID); err != nil {
+		t.Fatalf("clear legacy subtype restriction: %v", err)
+	}
+	before = basicChatWriteStats(t, conn, chat.ID)
+	if err = forwardUserMediaToChat(s, member, creator.ID, chat.ID, legacySourceID, 78403); err != nil {
+		t.Fatalf("legacy unknown forward without subtype restrictions: %v", err)
+	}
+	assertChatWriteStats(t, conn, chat.ID, chatWriteStats{messages: before.messages + 2, events: before.events + 2})
 }
 
 func TestBasicChatUnavailableMediaRightsStayUnavailable(t *testing.T) {

@@ -11,6 +11,15 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
+var chatMediaSubtypeRights = [...]string{
+	"send_stickers",
+	"send_gifs",
+	"send_videos",
+	"send_roundvideos",
+	"send_audios",
+	"send_voices",
+}
+
 func hasChatRight(rights []string, right string) bool {
 	return slices.Contains(rights, right)
 }
@@ -25,6 +34,13 @@ func checkChatMessageRestriction(rights []string, creator, media bool, mediaRigh
 	if media {
 		if hasChatRight(rights, "send_media") || hasChatRight(rights, "send_docs") {
 			return ErrChatWriteForbidden
+		}
+		if mediaRights == nil {
+			for _, right := range chatMediaSubtypeRights {
+				if hasChatRight(rights, right) {
+					return ErrChatWriteForbidden
+				}
+			}
 		}
 		for _, right := range mediaRights {
 			if hasChatRight(rights, right) {

@@ -340,7 +340,7 @@ func (h *handlers) handleSendMediaAfterReplyOnConn(c *mtproto.Conn, r *mtproto.R
 	if _, ok = media.GetThumb(); ok {
 		return nil, nil, nil, errMediaInvalid
 	}
-	mediaRights := chatDocumentRestrictionRights(media)
+	mediaRights := documentSubtypeRights(media.Attributes)
 	// Committed retries returned above. Charge new sends before checking chat
 	// permissions, since that check takes the chat row lock. A concurrent
 	// duplicate may spend a token, but repeated denied sends are throttled before
@@ -515,31 +515,6 @@ func (h *handlers) sendChatMedia(
 		Chats: chats,
 		Date:  int(sender.Date.Unix()),
 	}, nil
-}
-
-func chatDocumentRestrictionRights(media *tg.InputMediaUploadedDocument) []string {
-	var rights []string
-	for _, attribute := range media.Attributes {
-		switch value := attribute.(type) {
-		case *tg.DocumentAttributeSticker:
-			rights = append(rights, "send_stickers")
-		case *tg.DocumentAttributeAnimated:
-			rights = append(rights, "send_gifs")
-		case *tg.DocumentAttributeVideo:
-			if value.RoundMessage {
-				rights = append(rights, "send_roundvideos")
-			} else {
-				rights = append(rights, "send_videos")
-			}
-		case *tg.DocumentAttributeAudio:
-			if value.Voice {
-				rights = append(rights, "send_voices")
-			} else {
-				rights = append(rights, "send_audios")
-			}
-		}
-	}
-	return rights
 }
 
 // resendFileID reports the stored file id and whether randomID already names a

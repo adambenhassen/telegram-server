@@ -961,10 +961,22 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 	// on. A batch carrying no media takes no lock and issues no query.
 	fileIDs := make([]int64, 0, len(sources))
 	for _, src := range sources {
-		fileIDs = append(fileIDs, src.FileID)
+		if src.FileID != 0 {
+			fileIDs = append(fileIDs, src.FileID)
+		}
 	}
 	if err = lockFileRefs(ctx, qtx, fileIDs...); err != nil {
 		return nil, nil, err
+	}
+	fileSubtypeRights := make(map[int64][]string, len(fileIDs))
+	if destPeerType == PeerTypeChat && len(fileIDs) > 0 {
+		files, e := qtx.FilesByIDs(ctx, fileIDs)
+		if e != nil {
+			return nil, nil, fmt.Errorf("load forwarded file subtype rights: %w", e)
+		}
+		for _, file := range files {
+			fileSubtypeRights[file.ID] = file.SubtypeRights
+		}
 	}
 
 	// Ensure state for all affected owners.
@@ -1011,7 +1023,7 @@ func (s *Store) ForwardMessages(ctx context.Context, fromID int64, destPeerType 
 			}
 		}
 		if destPeerType == PeerTypeChat {
-			if err = checkChatMessageRestriction(chatDefaultBannedRights, fromID == chatCreatorID, src.FileID != 0, nil); err != nil {
+			if err = checkChatMessageRestriction(chatDefaultBannedRights, fromID == chatCreatorID, src.FileID != 0, fileSubtypeRights[src.FileID]); err != nil {
 				return nil, nil, err
 			}
 		}
