@@ -4,17 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/mt"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -339,6 +344,96 @@ func TestUnsupportedSendOptionsPreserveUnboundAuthError(t *testing.T) {
 			assertRPC(t, err, 401, "AUTH_KEY_UNREGISTERED")
 		})
 	}
+}
+
+func TestProvisionalSendOptionsRejectThroughRegisteredDispatch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	sender, err := s.CreateUser(ctx, "+15551297011")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := s.CreateUser(ctx, "+15551297012")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := s.CreateUser(ctx, "+15551297013")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceMessage, senderPts, recipientPts, duplicate, err := s.SendMessage(ctx, sender.ID, source.ID, "forward source", 98010, 0, 0)
+	if err != nil {
+		t.Fatalf("seed forward source: %v", err)
+	}
+	if senderPts != 1 || recipientPts != 1 || duplicate {
+		t.Fatalf("forward source seed = sender pts %d, recipient pts %d, duplicate %v; want 1, 1, false", senderPts, recipientPts, duplicate)
+	}
+
+	const fileID = 98012
+	blobs := newBlobs(t)
+	if _, err := api.SaveFilePartBlobsForTest(s, blobs, sender.ID, &tg.UploadSaveFilePartRequest{
+		FileID: fileID, FilePart: 0, Bytes: []byte("payload"),
+	}); err != nil {
+		t.Fatalf("save upload part: %v", err)
+	}
+
+	rateLimits := config.DefaultRateLimits()
+	dispatcher := api.New(
+		s, 2, &tg.Config{}, slog.New(slog.DiscardHandler), false,
+		1<<20, blobs, api.TestMaxUserStorageBytes, pgtest.PeerDeriver(),
+		rateLimits, config.RegistrationInvite,
+	)
+	peer := api.InputPeerUser(sender.ID, target.ID)
+	owners := []int64{sender.ID, target.ID, source.ID}
+	before := snapshotSendSideEffects(t, ctx, s, dsn, sender.ID, owners...)
+	updates := listenForUpdates(t, ctx, dsn)
+
+	for i, form := range []sendForm{sendText, sendMedia, sendForward} {
+		randomID := int64(98020 + i)
+		req := makeSendRequest(
+			form, peer, sender.ID, source.ID, int(sourceMessage.LocalID), randomID, fileID,
+			scheduleZero, time.Now(),
+		)
+		response := dispatchRegisteredSend(t, dispatcher, sender.ID, true, req)
+		rpc := &mt.RPCError{}
+		if err := rpc.Decode(&bin.Buffer{Buf: response}); err != nil {
+			t.Fatalf("decode %s rejection: %v", form, err)
+		}
+		if rpc.ErrorCode != 401 || rpc.ErrorMessage != "AUTH_KEY_UNREGISTERED" {
+			t.Errorf("%s rejection = %d %q, want 401 AUTH_KEY_UNREGISTERED", form, rpc.ErrorCode, rpc.ErrorMessage)
+		}
+		if _, ok, err := s.MessageByRandomID(ctx, sender.ID, randomID); err != nil || ok {
+			t.Errorf("%s random_id reserved: found=%v err=%v", form, ok, err)
+		}
+	}
+
+	after := snapshotSendSideEffects(t, ctx, s, dsn, sender.ID, owners...)
+	assertSameSendSideEffects(t, before, after)
+	parts, _, _, err := s.UploadPartsSummary(ctx, sender.ID, fileID)
+	if err != nil || parts != 1 {
+		t.Errorf("upload parts after provisional rejections = %d, err=%v; want 1", parts, err)
+	}
+	assertNoUpdateNotification(t, updates)
+}
+
+func dispatchRegisteredSend(t *testing.T, handler mtproto.Handler, userID int64, provisional bool, req bin.Encoder) []byte {
+	t.Helper()
+	key := testKey()
+	transport := &settingsDispatcherTransport{}
+	conn := mtproto.NewTestConn(transport, key)
+	var body bin.Buffer
+	if err := req.Encode(&body); err != nil {
+		t.Fatalf("encode registered send request: %v", err)
+	}
+	const msgID = int64(1 << 32)
+	if err := handler.OnMessage(conn, &mtproto.Request{
+		AuthKeyID: key.ID, UserID: userID, Provisional: provisional,
+		MsgID: msgID, Buf: &body, Ctx: context.Background(),
+	}); err != nil {
+		t.Fatalf("dispatch registered send: %v", err)
+	}
+	return transport.result(t, key, msgID)
 }
 
 func TestUnsupportedSendDoesNotReserveIDOrSpendRateLimit(t *testing.T) {
