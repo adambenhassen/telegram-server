@@ -494,3 +494,25 @@ func (s *Store) SearchChannelPosts(ctx context.Context, channelID int64, query s
 	}
 	return msgs, nil
 }
+
+// SearchPinnedChannelPost returns the active pinned post for channelID while
+// ownerID still has an unbanned participant row. The channel membership join
+// and post lookup happen in one statement so a departed or newly banned viewer
+// cannot receive channel content through the pin filter.
+func (s *Store) SearchPinnedChannelPost(ctx context.Context, ownerID, channelID int64, query string, offsetID int64, limit int) ([]ChannelMessage, error) {
+	rows, err := s.q.SearchPinnedChannelPostForMember(ctx, db.SearchPinnedChannelPostForMemberParams{
+		OwnerID:   ownerID,
+		ChannelID: channelID,
+		Query:     query,
+		OffsetID:  offsetID,
+		Lim:       int32(limit), //nolint:gosec // limit is a small validated page size
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search pinned channel post: %w", err)
+	}
+	msgs := make([]ChannelMessage, len(rows))
+	for i, row := range rows {
+		msgs[i] = channelMessageFromFields(channelMsgFields(row))
+	}
+	return msgs, nil
+}

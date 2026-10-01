@@ -86,3 +86,25 @@ WHERE channel_id = sqlc.arg(channel_id) AND deleted = false
   AND (sqlc.arg(offset_id)::bigint = 0 OR local_id < sqlc.arg(offset_id)::bigint)
 ORDER BY local_id DESC
 LIMIT sqlc.arg(lim)::int;
+
+-- SearchPinnedChannelPostForMember returns the active pinned post only while
+-- the viewer still has an unbanned participant row for the channel. Posts are
+-- shared, so unlike chat pins the channel local_id is already the wire id.
+-- name: SearchPinnedChannelPostForMember :many
+SELECT post.channel_id, post.local_id, post.from_id, post.date, post.message,
+       post.edit_date, post.deleted, post.random_id, post.file_id, post.reply_to_msg_id
+FROM channels c
+JOIN channel_participants participant
+  ON participant.channel_id = c.id
+ AND participant.user_id = sqlc.arg(owner_id)::bigint
+ AND (participant.banned_until IS NULL OR participant.banned_until <= now())
+JOIN channel_messages post
+  ON post.channel_id = c.id
+ AND post.local_id = c.pinned_message_id
+ AND post.deleted = false
+WHERE c.id = sqlc.arg(channel_id)::bigint
+  AND c.pinned_message_id IS NOT NULL
+  AND (sqlc.arg(query)::text = '' OR post.message_tsv @@ plainto_tsquery('simple', sqlc.arg(query)))
+  AND (sqlc.arg(offset_id)::bigint = 0 OR post.local_id < sqlc.arg(offset_id)::bigint)
+ORDER BY post.local_id DESC
+LIMIT sqlc.arg(lim)::int;

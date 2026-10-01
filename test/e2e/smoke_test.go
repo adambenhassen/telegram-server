@@ -450,7 +450,24 @@ func testSmokeBasicGroup(t *testing.T) {
 	for _, member := range []*smokeClient{a, b, c} {
 		wantID := happyLocalIDs[member.id]
 		if err := member.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
-			return verifySmokeGroupPin(ctx, api, chatID, wantID, "group-pin-happy")
+			if err := verifySmokeGroupPin(ctx, api, chatID, wantID, "group-pin-happy"); err != nil {
+				return err
+			}
+			result, err := api.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+				Peer: &tg.InputPeerChat{ChatID: chatID}, Q: "", Filter: &tg.InputMessagesFilterPinned{}, Limit: 100,
+			})
+			if err != nil {
+				return fmt.Errorf("messages.search pinned group: %w", err)
+			}
+			pinned, ok := result.(*tg.MessagesMessages)
+			if !ok || len(pinned.Messages) != 1 {
+				return fmt.Errorf("pinned search result = %T, want one group message", result)
+			}
+			message, ok := pinned.Messages[0].(*tg.Message)
+			if !ok || message.ID != wantID || message.Message != "group-pin-happy" {
+				return fmt.Errorf("pinned search message = %T %+v, want id %d and text group-pin-happy", pinned.Messages[0], pinned.Messages[0], wantID)
+			}
+			return nil
 		}); err != nil {
 			t.Fatalf("reopen happy-path pinned group for member %d: %v", member.id, err)
 		}
@@ -467,9 +484,22 @@ func testSmokeBasicGroup(t *testing.T) {
 	}
 	assertSmokePinResult(t, happyUnpinResult, false, chatID, nil)
 	assertSmokePinnedUpdate(t, recvOrCtx(t, f.ctx, b.push.pinnedMsg, "B happy-path unpin push"), false, chatID, nil)
-	for _, member := range []*smokeClient{a, b} {
+	for _, member := range []*smokeClient{a, b, c} {
 		if err := member.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
-			return verifySmokeGroupUnpinned(ctx, api, chatID)
+			if err := verifySmokeGroupUnpinned(ctx, api, chatID); err != nil {
+				return err
+			}
+			result, err := api.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+				Peer: &tg.InputPeerChat{ChatID: chatID}, Q: "", Filter: &tg.InputMessagesFilterPinned{}, Limit: 100,
+			})
+			if err != nil {
+				return fmt.Errorf("messages.search after group unpin: %w", err)
+			}
+			pinned, ok := result.(*tg.MessagesMessages)
+			if !ok || len(pinned.Messages) != 0 {
+				return fmt.Errorf("pinned search after unpin = %T, want empty group messages", result)
+			}
+			return nil
 		}); err != nil {
 			t.Fatalf("reopen unpinned group for member %d: %v", member.id, err)
 		}

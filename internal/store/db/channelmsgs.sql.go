@@ -482,3 +482,84 @@ func (q *Queries) SearchChannelPostsPage(ctx context.Context, arg SearchChannelP
 	}
 	return items, nil
 }
+
+const searchPinnedChannelPostForMember = `-- name: SearchPinnedChannelPostForMember :many
+SELECT post.channel_id, post.local_id, post.from_id, post.date, post.message,
+       post.edit_date, post.deleted, post.random_id, post.file_id, post.reply_to_msg_id
+FROM channels c
+JOIN channel_participants participant
+  ON participant.channel_id = c.id
+ AND participant.user_id = $1::bigint
+ AND (participant.banned_until IS NULL OR participant.banned_until <= now())
+JOIN channel_messages post
+  ON post.channel_id = c.id
+ AND post.local_id = c.pinned_message_id
+ AND post.deleted = false
+WHERE c.id = $2::bigint
+  AND c.pinned_message_id IS NOT NULL
+  AND ($3::text = '' OR post.message_tsv @@ plainto_tsquery('simple', $3))
+  AND ($4::bigint = 0 OR post.local_id < $4::bigint)
+ORDER BY post.local_id DESC
+LIMIT $5::int
+`
+
+type SearchPinnedChannelPostForMemberParams struct {
+	OwnerID   int64
+	ChannelID int64
+	Query     string
+	OffsetID  int64
+	Lim       int32
+}
+
+type SearchPinnedChannelPostForMemberRow struct {
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	FileID       *int64
+	ReplyToMsgID *int32
+}
+
+// SearchPinnedChannelPostForMember returns the active pinned post only while
+// the viewer still has an unbanned participant row for the channel. Posts are
+// shared, so unlike chat pins the channel local_id is already the wire id.
+func (q *Queries) SearchPinnedChannelPostForMember(ctx context.Context, arg SearchPinnedChannelPostForMemberParams) ([]SearchPinnedChannelPostForMemberRow, error) {
+	rows, err := q.db.Query(ctx, searchPinnedChannelPostForMember,
+		arg.OwnerID,
+		arg.ChannelID,
+		arg.Query,
+		arg.OffsetID,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SearchPinnedChannelPostForMemberRow
+	for rows.Next() {
+		var i SearchPinnedChannelPostForMemberRow
+		if err := rows.Scan(
+			&i.ChannelID,
+			&i.LocalID,
+			&i.FromID,
+			&i.Date,
+			&i.Message,
+			&i.EditDate,
+			&i.Deleted,
+			&i.RandomID,
+			&i.FileID,
+			&i.ReplyToMsgID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
