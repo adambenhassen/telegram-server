@@ -214,9 +214,11 @@ func testSmokeSavedMessages(t *testing.T) {
 func testSmokeDialogFilters(t *testing.T) {
 	t.Helper()
 	f := newSmokeFixture(t)
-	const phone = "+15551049001"
-	seedPhoneUsers(t, f.ctx, f.store, phone)
+	const phone, otherPhone = "+15551049001", "+15551049002"
+	seedPhoneUsers(t, f.ctx, f.store, phone, otherPhone)
 	client := newSmokeClient(t, f, "A1", phone)
+	otherSession := newSmokeClient(t, f, "A2", phone)
+	otherOwner := newSmokeClient(t, f, "B1", otherPhone)
 
 	filter := &tg.DialogFilter{ID: 2, Title: tg.TextWithEntities{Text: "Groups"}, Groups: true}
 	filter.SetFlags()
@@ -246,6 +248,46 @@ func testSmokeDialogFilters(t *testing.T) {
 	if !ok || custom.ID != 2 || custom.Title.Text != "Groups" || !custom.Groups {
 		t.Fatalf("listed custom filter = %#v, want ID 2 Groups", listed.Filters[1])
 	}
+
+	edit := &tg.DialogFilter{ID: 2, Title: tg.TextWithEntities{Text: "Bots"}, Bots: true}
+	edit.SetFlags()
+	editRequest := &tg.MessagesUpdateDialogFilterRequest{ID: 2, Filter: edit}
+	editRequest.SetFlags()
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		ok, err := api.MessagesUpdateDialogFilter(ctx, editRequest)
+		if err == nil && !ok {
+			return errors.New("folder edit returned false")
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("edit dialog filter: %v", err)
+	}
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		listed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("list edited dialog filters: %v", err)
+	}
+	custom, ok = listed.Filters[1].(*tg.DialogFilter)
+	if !ok || custom.ID != 2 || custom.Title.Text != "Bots" || !custom.Bots || custom.Groups {
+		t.Fatalf("edited custom filter = %#v, want ID 2 Bots", listed.Filters[1])
+	}
+	var isolated *tg.MessagesDialogFilters
+	if err := otherOwner.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		isolated, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("other owner get dialog filters: %v", err)
+	}
+	if isolated.TagsEnabled || len(isolated.Filters) != 1 {
+		t.Fatalf("other owner saw %d folders with tags enabled=%v, want only All chats", len(isolated.Filters), isolated.TagsEnabled)
+	}
+	if _, ok := isolated.Filters[0].(*tg.DialogFilterDefault); !ok {
+		t.Fatalf("other owner's first folder = %T, want All chats", isolated.Filters[0])
+	}
+
 	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		ok, err := api.MessagesUpdateDialogFiltersOrder(ctx, []int{2, 0})
 		if err == nil && !ok {
@@ -265,9 +307,34 @@ func testSmokeDialogFilters(t *testing.T) {
 	if folder, ok := listed.Filters[0].(*tg.DialogFilter); !ok || folder.ID != 2 {
 		t.Fatalf("first reordered filter = %#v, want ID 2", listed.Filters[0])
 	}
+	f.restart(t)
+	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		listed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("other authorized session get edited dialog filters after restart: %v", err)
+	}
+	if len(listed.Filters) != 2 {
+		t.Fatalf("other session saw %d filters after restart, want two", len(listed.Filters))
+	}
+	persisted, ok := listed.Filters[0].(*tg.DialogFilter)
+	if !ok || persisted.ID != 2 || persisted.Title.Text != "Bots" || !persisted.Bots || persisted.Groups {
+		t.Fatalf("persisted edited filter = %#v, want ID 2 Bots", listed.Filters[0])
+	}
+	if err := otherOwner.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		isolated, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("other owner get dialog filters after restart: %v", err)
+	}
+	if len(isolated.Filters) != 1 {
+		t.Fatalf("other owner saw %d folders after restart, want only All chats", len(isolated.Filters))
+	}
 	deleteRequest := &tg.MessagesUpdateDialogFilterRequest{ID: 2}
 	deleteRequest.SetFlags()
-	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		ok, err := api.MessagesUpdateDialogFilter(ctx, deleteRequest)
 		if err == nil && !ok {
 			return errors.New("folder delete returned false")
@@ -276,7 +343,7 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("delete dialog filter: %v", err)
 	}
-	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		var err error
 		listed, err = api.MessagesGetDialogFilters(ctx)
 		return err
@@ -287,7 +354,7 @@ func testSmokeDialogFilters(t *testing.T) {
 		t.Fatalf("filters after delete = %d, want only All chats", len(listed.Filters))
 	}
 	var suggested []tg.DialogFilterSuggested
-	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		var err error
 		suggested, err = api.MessagesGetSuggestedDialogFilters(ctx)
 		return err

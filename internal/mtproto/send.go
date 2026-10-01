@@ -148,7 +148,8 @@ type Conn struct {
 	// dialogFilterRecovery is connection-local coverage state for content-free
 	// folder invalidations. Its immutable snapshots are replaced with CAS so a
 	// listener callback never waits behind a socket write.
-	dialogFilterRecovery atomic.Pointer[dialogFilterRecovery]
+	dialogFilterRecovery      atomic.Pointer[dialogFilterRecovery]
+	dialogFilterRecoveryClaim atomic.Uint64
 	// rpcOutcomes is a 64-entry dependency ring. Only the connection's serve
 	// goroutine reads or writes it; a session change clears the ring.
 	rpcOutcomes    [64]rpcOutcome
@@ -163,10 +164,12 @@ type dialogFilterRecovery struct {
 	covered         uint64
 	initialized     bool
 	firstDifference bool
+	pushEligible    bool
 	cycle           bool
 	attempts        int
 	nextAttempt     time.Time
 	inFlight        bool
+	claimID         uint64
 }
 
 type recoveryBinding struct {
@@ -772,7 +775,10 @@ func (c *Conn) AcknowledgeDialogFilterFetch(owner, session int64, captured, glob
 			next.cycle = false
 			next.attempts = 0
 			next.nextAttempt = time.Time{}
+			next.inFlight = false
+			next.claimID = 0
 		}
+		next.pushEligible = true
 		if c.dialogFilterRecovery.CompareAndSwap(state, &next) {
 			return true
 		}
@@ -792,6 +798,7 @@ func (c *Conn) AcknowledgeDialogFilterDifference(owner, session int64, consumeFi
 		}
 		next := *state
 		next.firstDifference = false
+		next.pushEligible = true
 		if c.dialogFilterRecovery.CompareAndSwap(state, &next) {
 			return true
 		}
@@ -801,22 +808,24 @@ func (c *Conn) AcknowledgeDialogFilterDifference(owner, session int64, consumeFi
 // ClaimDialogFilterRecoveryAttempt reserves one bounded push attempt. Attempts
 // start at 0, then wait about 20 and 40 additional seconds; the state remains
 // pending after the third write until a successful folder fetch covers it.
-func (c *Conn) ClaimDialogFilterRecoveryAttempt(owner, session int64, globalEpoch uint64, now time.Time) bool {
+func (c *Conn) ClaimDialogFilterRecoveryAttempt(owner, session int64, globalEpoch uint64, now time.Time) (uint64, bool) {
 	for {
 		state := c.dialogFilterRecovery.Load()
-		if state == nil || state.owner != owner || state.session != session || !state.initialized || state.firstDifference || state.inFlight {
-			return false
+		if state == nil || state.owner != owner || state.session != session || !state.initialized || !state.pushEligible || state.inFlight {
+			return 0, false
 		}
 		if max(state.generation, globalEpoch) <= state.covered || state.attempts >= 3 {
-			return false
+			return 0, false
 		}
 		if state.attempts > 0 && now.Before(state.nextAttempt) {
-			return false
+			return 0, false
 		}
 		next := *state
 		next.cycle = true
 		next.attempts++
 		next.inFlight = true
+		claimID := c.dialogFilterRecoveryClaim.Add(1)
+		next.claimID = claimID
 		switch next.attempts {
 		case 1:
 			next.nextAttempt = now.Add(20 * time.Second)
@@ -826,21 +835,22 @@ func (c *Conn) ClaimDialogFilterRecoveryAttempt(owner, session int64, globalEpoc
 			next.nextAttempt = time.Time{}
 		}
 		if c.dialogFilterRecovery.CompareAndSwap(state, &next) {
-			return true
+			return claimID, true
 		}
 	}
 }
 
 // FinishDialogFilterRecoveryAttempt releases this connection's one outstanding
 // push slot, without changing coverage or the retry budget.
-func (c *Conn) FinishDialogFilterRecoveryAttempt(owner, session int64) {
+func (c *Conn) FinishDialogFilterRecoveryAttempt(owner, session int64, claimID uint64) {
 	for {
 		state := c.dialogFilterRecovery.Load()
-		if state == nil || state.owner != owner || state.session != session || !state.inFlight {
+		if state == nil || state.owner != owner || state.session != session || !state.inFlight || state.claimID != claimID {
 			return
 		}
 		next := *state
 		next.inFlight = false
+		next.claimID = 0
 		if c.dialogFilterRecovery.CompareAndSwap(state, &next) {
 			return
 		}
@@ -945,6 +955,35 @@ func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int
 	}
 	if pts > 0 {
 		c.lastPushedPts.Store(int64(pts))
+	}
+	return true, nil
+}
+
+// PushDialogFilterRecovery writes a claimed recovery nudge only while the
+// connection still has the owner, session and claim that were captured before
+// the asynchronous write was scheduled. The binding check and write share
+// writeMu with session rebinding, so an old session's repair cannot reach a
+// newly bound session for the same owner.
+func (c *Conn) PushDialogFilterRecovery(ctx context.Context, owner, session int64, claimID uint64, enc bin.Encoder) (bool, error) {
+	var b bin.Buffer
+	if err := enc.Encode(&b); err != nil {
+		return false, fmt.Errorf("push encode [%T]: %w", enc, MarkPushEncodeError(err))
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, fmt.Errorf("push [%T] not attempted: %w", enc, &pushNotAttemptedError{err: err})
+	}
+	state := c.dialogFilterRecovery.Load()
+	if c.owner != owner || c.sessionID != session || state == nil || state.owner != owner || state.session != session || !state.initialized || !state.inFlight || state.claimID != claimID {
+		return false, nil
+	}
+	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
+		if closeErr := c.transport.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close failed push transport: %w", closeErr))
+		}
+		return false, fmt.Errorf("push [%T]: %w", enc, err)
 	}
 	return true, nil
 }

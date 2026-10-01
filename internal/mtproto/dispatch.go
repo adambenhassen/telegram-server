@@ -258,6 +258,16 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 				return c.SendErr(req, tgerr.New(400, "MSG_WAIT_TIMEOUT"))
 			}
 		}
+		refuseUnsupported := func(innerID uint32) error {
+			if isInvokeWrapper(innerID) {
+				var err error
+				innerID, err = enclosedInvokeMethodID(req.Buf, innerID)
+				if err != nil {
+					return err
+				}
+			}
+			return refuse(innerID, InvokeAfterMsgWaitTimeout, true)
+		}
 		for {
 			switch id {
 			case tg.InvokeWithLayerRequestTypeID:
@@ -283,7 +293,7 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 				}
 				id = obj.TypeID
 				if isInvokeWrapper(id) {
-					return refuse(id, InvokeAfterMsgWaitTimeout, true)
+					return refuseUnsupported(id)
 				}
 				if wrapper.MsgID <= 0 || wrapper.MsgID >= req.MsgID || c == nil {
 					return refuse(id, InvokeAfterMsgWaitTimeout, true)
@@ -303,7 +313,7 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 					return err
 				}
 				id = obj.TypeID
-				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				return refuseUnsupported(id)
 			case tg.InvokeWithTakeoutRequestTypeID:
 				var wrapper tg.InvokeWithTakeoutRequest
 				wrapper.Query = obj
@@ -311,7 +321,7 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 					return err
 				}
 				id = obj.TypeID
-				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				return refuseUnsupported(id)
 			case tg.InvokeWithGooglePlayIntegrityRequestTypeID:
 				var wrapper tg.InvokeWithGooglePlayIntegrityRequest
 				wrapper.Query = obj
@@ -319,7 +329,7 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 					return err
 				}
 				id = obj.TypeID
-				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				return refuseUnsupported(id)
 			case tg.InvokeWithBusinessConnectionRequestTypeID:
 				var wrapper tg.InvokeWithBusinessConnectionRequest
 				wrapper.Query = obj
@@ -327,7 +337,7 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 					return err
 				}
 				id = obj.TypeID
-				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				return refuseUnsupported(id)
 			case tg.InvokeWithReCaptchaRequestTypeID:
 				var wrapper tg.InvokeWithReCaptchaRequest
 				wrapper.Query = obj
@@ -335,7 +345,7 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 					return err
 				}
 				id = obj.TypeID
-				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				return refuseUnsupported(id)
 			case tg.InvokeWithApnsSecretRequestTypeID:
 				var wrapper tg.InvokeWithApnsSecretRequest
 				wrapper.Query = obj
@@ -343,7 +353,7 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 					return err
 				}
 				id = obj.TypeID
-				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				return refuseUnsupported(id)
 			case tg.InvokeWithMessagesRangeRequestTypeID:
 				var wrapper tg.InvokeWithMessagesRangeRequest
 				wrapper.Query = obj
@@ -351,12 +361,54 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 					return err
 				}
 				id = obj.TypeID
-				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				return refuseUnsupported(id)
 			default:
 				return next.OnMessage(c, req)
 			}
 		}
 	})
+}
+
+// enclosedInvokeMethodID walks supported wrapper bodies without dispatching
+// them, returning the leaf constructor for refusal accounting. In particular,
+// a nested folder mutation must still spend its attempt budget and repair only
+// its requester even though the wrapper form itself is unsupported.
+func enclosedInvokeMethodID(b *bin.Buffer, id uint32) (uint32, error) {
+	obj := &peekIDObject{}
+	for isInvokeWrapper(id) {
+		var r bin.Decoder
+		switch id {
+		case tg.InvokeAfterMsgRequestTypeID:
+			r = &tg.InvokeAfterMsgRequest{Query: obj}
+		case tg.InvokeAfterMsgsRequestTypeID:
+			r = &tg.InvokeAfterMsgsRequest{Query: obj}
+		case tg.InvokeWithLayerRequestTypeID:
+			r = &tg.InvokeWithLayerRequest{Query: obj}
+		case tg.InitConnectionRequestTypeID:
+			r = &tg.InitConnectionRequest{Query: obj}
+		case tg.InvokeWithoutUpdatesRequestTypeID:
+			r = &tg.InvokeWithoutUpdatesRequest{Query: obj}
+		case tg.InvokeWithTakeoutRequestTypeID:
+			r = &tg.InvokeWithTakeoutRequest{Query: obj}
+		case tg.InvokeWithGooglePlayIntegrityRequestTypeID:
+			r = &tg.InvokeWithGooglePlayIntegrityRequest{Query: obj}
+		case tg.InvokeWithBusinessConnectionRequestTypeID:
+			r = &tg.InvokeWithBusinessConnectionRequest{Query: obj}
+		case tg.InvokeWithReCaptchaRequestTypeID:
+			r = &tg.InvokeWithReCaptchaRequest{Query: obj}
+		case tg.InvokeWithApnsSecretRequestTypeID:
+			r = &tg.InvokeWithApnsSecretRequest{Query: obj}
+		case tg.InvokeWithMessagesRangeRequestTypeID:
+			r = &tg.InvokeWithMessagesRangeRequest{Query: obj}
+		default:
+			return id, nil
+		}
+		if err := r.Decode(b); err != nil {
+			return 0, err
+		}
+		id = obj.TypeID
+	}
+	return id, nil
 }
 
 func isInvokeWrapper(id uint32) bool {

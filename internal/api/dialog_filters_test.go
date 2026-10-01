@@ -522,6 +522,207 @@ func TestDialogFilterFetchCoverageWaitsForSuccessfulSameConnectionWrite(t *testi
 	}
 }
 
+func TestDialogFilterAcknowledgementsIgnoreResponsesWrittenAfterDeadline(t *testing.T) {
+	t.Parallel()
+	baseCtx := context.Background()
+	s, err := store.Open(baseCtx, pgtest.DSN(t), pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	owner, err := s.CreateUser(baseCtx, "+15551090024")
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		request    bin.Encoder
+		prepare    func(*api.DialogFilterSync, *mtproto.Conn, *mtproto.Request)
+		wantResult func(*testing.T, []byte)
+	}{
+		{
+			name:    "folder fetch",
+			request: &tg.MessagesGetDialogFiltersRequest{},
+			prepare: func(syncState *api.DialogFilterSync, conn *mtproto.Conn, req *mtproto.Request) {
+				syncState.RequesterRepair(conn, req)
+			},
+			wantResult: func(t *testing.T, response []byte) {
+				t.Helper()
+				var folders tg.MessagesDialogFilters
+				if err := folders.Decode(&bin.Buffer{Buf: response}); err != nil {
+					t.Fatalf("decode folder response: %v", err)
+				}
+			},
+		},
+		{
+			name:    "difference",
+			request: &tg.UpdatesGetDifferenceRequest{Pts: 0, Date: int(time.Now().Unix())},
+			prepare: func(syncState *api.DialogFilterSync, conn *mtproto.Conn, req *mtproto.Request) {
+				syncState.EnsureBinding(conn, req)
+			},
+			wantResult: func(t *testing.T, response []byte) {
+				t.Helper()
+				if got := getDialogFilterDifferenceUpdates(t, response); got != 1 {
+					t.Fatalf("difference refresh updates = %d, want one", got)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			syncState := api.NewDialogFilterSync()
+			transport := &settingsDispatcherTransport{
+				sendEntered: make(chan struct{}, 1),
+				sendRelease: make(chan struct{}),
+			}
+			client := newDialogFilterRPCWithSync(t, s, owner.ID, transport, syncState)
+			requestCtx, cancel := context.WithTimeout(baseCtx, 500*time.Millisecond)
+			defer cancel()
+			msgID := client.nextMsgID
+			client.nextMsgID += 4
+			var body bin.Buffer
+			if err := tc.request.Encode(&body); err != nil {
+				t.Fatalf("encode %s request: %v", tc.name, err)
+			}
+			req := &mtproto.Request{
+				AuthKeyID: client.key.ID,
+				UserID:    owner.ID,
+				SessionID: 123,
+				MsgID:     msgID,
+				Buf:       &body,
+				Ctx:       requestCtx,
+			}
+			tc.prepare(syncState, client.conn, req)
+
+			done := make(chan error, 1)
+			go func() { done <- client.handler.OnMessage(client.conn, req) }()
+			select {
+			case <-transport.sendEntered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("response write did not begin")
+			}
+			releaseWrite := func() {
+				select {
+				case <-transport.sendRelease:
+				default:
+					close(transport.sendRelease)
+				}
+			}
+			defer releaseWrite()
+			<-requestCtx.Done()
+			syncState.RequesterRepair(client.conn, req)
+			releaseWrite()
+			if err := <-done; err != nil {
+				t.Fatalf("successful response write after deadline: %v", err)
+			}
+			tc.wantResult(t, transport.result(t, client.key, msgID))
+
+			generation, covered, first, pending, ok := client.conn.DialogFilterRecoverySnapshot(owner.ID, 123, 0)
+			if !ok || generation != 2 && tc.name == "folder fetch" || generation != 1 && tc.name == "difference" || covered != 0 || !first || !pending {
+				t.Fatalf("expired response acknowledged recovery: generation %d covered %d first %v pending %v ok %v", generation, covered, first, pending, ok)
+			}
+		})
+	}
+}
+
+func TestNestedInvokeAfterFolderMutationRefusesAndAccountsRequester(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	owner, err := s.CreateUser(ctx, "+15551090023")
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	if err := s.SaveDialogFilter(ctx, owner.ID, store.DialogFilter{ID: 2, Title: "Before", Groups: true}); err != nil {
+		t.Fatalf("save existing folder: %v", err)
+	}
+	if _, err := s.UpdateDialogFilterOrder(ctx, owner.ID, []int{2, 0}); err != nil {
+		t.Fatalf("set existing order: %v", err)
+	}
+	before, err := s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("read initial folder state: %v", err)
+	}
+
+	syncState := api.NewDialogFilterSync()
+	client := newDialogFilterRPCWithSync(t, s, owner.ID, &settingsDispatcherTransport{}, syncState)
+	otherSession := newDialogFilterRPCWithSync(t, s, owner.ID, &settingsDispatcherTransport{}, syncState)
+	syncState.EnsureBinding(otherSession.conn, &mtproto.Request{UserID: owner.ID, SessionID: 123})
+
+	for range 58 {
+		result, err := s.CheckRateLimitCost(ctx, owner.ID, "dialog_filter_mutation", store.RateLimitConfig{Limit: 60, Window: time.Minute}, 1)
+		if err != nil || result != nil {
+			t.Fatalf("precharge folder mutation attempt: result %v, err %v", result, err)
+		}
+	}
+
+	filter := &tg.DialogFilter{ID: 2, Title: tg.TextWithEntities{Text: "After"}, Groups: false}
+	filter.SetFlags()
+	edit := &tg.MessagesUpdateDialogFilterRequest{ID: 2, Filter: filter}
+	edit.SetFlags()
+	nested := &tg.InvokeAfterMsgRequest{
+		MsgID: 1,
+		Query: &tg.InvokeAfterMsgRequest{MsgID: 2, Query: edit},
+	}
+	response, err := client.dispatch(t, nested)
+	if err != nil {
+		t.Fatalf("nested folder mutation refusal: %v", err)
+	}
+	requireDialogFilterRPCError(t, response, "MSG_WAIT_TIMEOUT")
+	if _, err := client.dispatch(t, &tg.MessagesGetDialogFiltersRequest{}); err != nil {
+		t.Fatalf("fetch after first refusal: %v", err)
+	}
+	orderRequest := &tg.MessagesUpdateDialogFiltersOrderRequest{Order: []int{0, 2}}
+	nestedOrder := &tg.InvokeAfterMsgsRequest{
+		MsgIDs: []int64{1},
+		Query:  &tg.InvokeWithLayerRequest{Layer: 1, Query: orderRequest},
+	}
+	response, err = client.dispatch(t, nestedOrder)
+	if err != nil {
+		t.Fatalf("nested order refusal: %v", err)
+	}
+	requireDialogFilterRPCError(t, response, "MSG_WAIT_TIMEOUT")
+
+	after, err := s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("read folder state after refusal: %v", err)
+	}
+	if len(after.Filters) != 1 || after.Filters[0].Title != "Before" || after.Filters[0].Groups != true {
+		t.Fatalf("nested folder mutation changed the definition: %+v", after.Filters)
+	}
+	if len(after.Order) != len(before.Order) || after.Order[0] != before.Order[0] || after.Order[1] != before.Order[1] {
+		t.Fatalf("nested folder mutation changed order from %v to %v", before.Order, after.Order)
+	}
+	if before.ChangedAt == nil || after.ChangedAt == nil || !before.ChangedAt.Equal(*after.ChangedAt) {
+		t.Fatalf("nested folder mutation changed committed marker from %v to %v", before.ChangedAt, after.ChangedAt)
+	}
+	requesterGeneration, requesterCovered, requesterFirstDifference, requesterPending, ok := client.conn.DialogFilterRecoverySnapshot(owner.ID, 123, 0)
+	if !ok || !requesterPending {
+		t.Fatalf("authorized requester has no repair pending: generation %d covered %d first difference %v pending %v ok %v", requesterGeneration, requesterCovered, requesterFirstDifference, requesterPending, ok)
+	}
+	otherGeneration, otherCovered, otherFirstDifference, otherPending, ok := otherSession.conn.DialogFilterRecoverySnapshot(owner.ID, 123, 0)
+	if !ok || otherPending {
+		t.Fatalf("refusal repair spread to another session: generation %d covered %d first difference %v pending %v ok %v", otherGeneration, otherCovered, otherFirstDifference, otherPending, ok)
+	}
+
+	if _, err := client.dispatch(t, edit); err != nil {
+		t.Fatalf("rate-limited folder mutation: %v", err)
+	}
+	requireDialogFilterRPCError(t, client.transport.result(t, client.key, client.nextMsgID-4), "FLOOD_WAIT_60")
+}
+
 func getDialogFilterDifferenceUpdates(t *testing.T, response []byte) int {
 	t.Helper()
 	var result tg.UpdatesDifferenceBox

@@ -2,11 +2,14 @@
 package mtproto
 
 import (
+	"context"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/clock"
+	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/tg"
 )
 
@@ -34,28 +37,34 @@ func TestDialogFilterRecoveryCoverageAndRetryBudget(t *testing.T) {
 		t.Fatalf("marked recovery = generation %d covered %d first %v pending %v ok %v", generation, covered, first, pending, ok)
 	}
 	now := time.Unix(1000, 0)
-	if conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now) {
+	_, claimed := conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now)
+	if claimed {
 		t.Fatal("recovery push started before the first authorized difference")
 	}
 	if !conn.AcknowledgeDialogFilterDifference(7, 123, true) {
 		t.Fatal("first difference was not acknowledged")
 	}
-	if !conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now) {
+	claimID, claimed := conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now)
+	if !claimed {
 		t.Fatal("first recovery attempt was not claimable")
 	}
-	conn.FinishDialogFilterRecoveryAttempt(7, 123)
-	if conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now.Add(19*time.Second)) {
+	conn.FinishDialogFilterRecoveryAttempt(7, 123, claimID)
+	_, claimed = conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now.Add(19*time.Second))
+	if claimed {
 		t.Fatal("second recovery attempt started before 20 seconds")
 	}
-	if !conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now.Add(20*time.Second)) {
+	claimID, claimed = conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now.Add(20*time.Second))
+	if !claimed {
 		t.Fatal("second recovery attempt was not claimable at 20 seconds")
 	}
-	conn.FinishDialogFilterRecoveryAttempt(7, 123)
-	if !conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now.Add(60*time.Second)) {
+	conn.FinishDialogFilterRecoveryAttempt(7, 123, claimID)
+	claimID, claimed = conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now.Add(60*time.Second))
+	if !claimed {
 		t.Fatal("third recovery attempt was not claimable at 60 seconds")
 	}
-	conn.FinishDialogFilterRecoveryAttempt(7, 123)
-	if conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now.Add(120*time.Second)) {
+	conn.FinishDialogFilterRecoveryAttempt(7, 123, claimID)
+	_, claimed = conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, now.Add(120*time.Second))
+	if claimed {
 		t.Fatal("recovery exceeded its three-attempt cap")
 	}
 	if _, _, first, pending, _ := conn.DialogFilterRecoverySnapshot(7, 123, 0); first || !pending {
@@ -100,6 +109,84 @@ func TestDialogFilterRecoveryFetchKeepsNewerInvalidationAndResetsBinding(t *test
 	oldGeneration, oldCovered, oldFirst, oldPending, oldOK := conn.DialogFilterRecoverySnapshot(7, 123, 0)
 	if oldOK {
 		t.Fatalf("previous owner's recovery state survived rebinding: generation %d covered %d first %v pending %v", oldGeneration, oldCovered, oldFirst, oldPending)
+	}
+}
+
+func TestDialogFilterRecoveryFetchEnablesPushBeforeFirstDifference(t *testing.T) {
+	conn := recoveryConn(7, 123)
+	conn.EnsureDialogFilterRecoveryBinding(7, 123, 0)
+	if !conn.AcknowledgeDialogFilterFetch(7, 123, 0, 0) {
+		t.Fatal("folder fetch was not acknowledged")
+	}
+	if !conn.MarkDialogFilterRecovery(7, 123, 1, 0) {
+		t.Fatal("later owner invalidation was not marked")
+	}
+
+	generation, covered, first, pending, ok := conn.DialogFilterRecoverySnapshot(7, 123, 0)
+	if !ok || generation != 1 || covered != 0 || !first || !pending {
+		t.Fatalf("post-fetch invalidation = generation %d covered %d first %v pending %v ok %v", generation, covered, first, pending, ok)
+	}
+	_, claimed := conn.ClaimDialogFilterRecoveryAttempt(7, 123, 0, time.Unix(1000, 0))
+	if !claimed {
+		t.Fatal("authorized folder fetch did not enable recovery before the first difference")
+	}
+	if _, _, first, _, _ := conn.DialogFilterRecoverySnapshot(7, 123, 0); !first {
+		t.Fatal("recovery push consumed the independent first-difference signal")
+	}
+}
+
+type recoveryPushTestTransport struct {
+	writes int
+}
+
+func (t *recoveryPushTestTransport) Send(context.Context, *bin.Buffer) error {
+	t.writes++
+	return nil
+}
+
+func (*recoveryPushTestTransport) Recv(context.Context, *bin.Buffer) error { return io.EOF }
+func (*recoveryPushTestTransport) Close() error                            { return nil }
+
+func TestDialogFilterRecoveryClaimCannotWriteAfterSameOwnerSessionRebind(t *testing.T) {
+	transport := &recoveryPushTestTransport{}
+	var raw crypto.Key
+	for i := range raw {
+		raw[i] = byte(i + 1)
+	}
+	conn := NewTestConn(transport, raw.WithID())
+	conn.setOwner(7)
+	conn.EnsureDialogFilterRecoveryBinding(7, 123, 0)
+	if !conn.MarkDialogFilterRecovery(7, 123, 1, 0) {
+		t.Fatal("owner invalidation was not marked")
+	}
+	if !conn.AcknowledgeDialogFilterDifference(7, 123, true) {
+		t.Fatal("first difference was not acknowledged")
+	}
+
+	claimer, ok := any(conn).(interface {
+		ClaimDialogFilterRecoveryAttempt(int64, int64, uint64, time.Time) (uint64, bool)
+	})
+	if !ok {
+		t.Fatal("recovery claim does not carry a write-fencing token")
+	}
+	claimID, claimed := claimer.ClaimDialogFilterRecoveryAttempt(7, 123, 0, time.Unix(1000, 0))
+	if !claimed {
+		t.Fatal("pending recovery was not claimed")
+	}
+
+	conn.setSession(124)
+	pusher, ok := any(conn).(interface {
+		PushDialogFilterRecovery(context.Context, int64, int64, uint64, bin.Encoder) (bool, error)
+	})
+	if !ok {
+		t.Fatal("recovery writes cannot verify the captured binding and claim")
+	}
+	pushed, err := pusher.PushDialogFilterRecovery(context.Background(), 7, 123, claimID, &tg.UpdateDialogFilters{})
+	if err != nil {
+		t.Fatalf("stale recovery write: %v", err)
+	}
+	if pushed || transport.writes != 0 {
+		t.Fatalf("stale session recovery reached the socket: pushed %v, writes %d", pushed, transport.writes)
 	}
 }
 

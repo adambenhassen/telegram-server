@@ -124,16 +124,17 @@ func (u *Updater) recoverDialogFilters(ctx context.Context, now time.Time) {
 		default:
 			return
 		}
-		if !conn.ClaimDialogFilterRecoveryAttempt(owner, session, epoch, now) {
+		claimID, ok := conn.ClaimDialogFilterRecoveryAttempt(owner, session, epoch, now)
+		if !ok {
 			<-u.recoverySlots
 			continue
 		}
 		started++
 		u.recoveryWG.Add(1)
-		go func(conn *mtproto.Conn, owner, session int64) {
+		go func(conn *mtproto.Conn, owner, session int64, claimID uint64) {
 			defer u.recoveryWG.Done()
 			defer func() { <-u.recoverySlots }()
-			defer conn.FinishDialogFilterRecoveryAttempt(owner, session)
+			defer conn.FinishDialogFilterRecoveryAttempt(owner, session, claimID)
 			pushCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			env := &tg.Updates{
@@ -141,10 +142,10 @@ func (u *Updater) recoverDialogFilters(ctx context.Context, now time.Time) {
 				Date:    int(time.Now().Unix()),
 				Seq:     0,
 			}
-			if _, err := conn.PushTo(pushCtx, owner, env, 0); err != nil {
+			if _, err := conn.PushDialogFilterRecovery(pushCtx, owner, session, claimID, env); err != nil {
 				u.log.Info("dialog filter recovery push", "user_id", owner, "err", err)
 			}
-		}(conn, owner, session)
+		}(conn, owner, session, claimID)
 	}
 }
 

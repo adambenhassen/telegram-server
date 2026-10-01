@@ -100,7 +100,7 @@ func (s *DialogFilterSync) Capture(conn *mtproto.Conn, req *mtproto.Request) Dia
 // AcknowledgeFetch covers only the generation captured before the database
 // read. Invalidations that arrived while it ran remain pending.
 func (s *DialogFilterSync) AcknowledgeFetch(conn *mtproto.Conn, req *mtproto.Request, captured DialogFilterCapture) {
-	if conn == nil || req == nil || captured.owner != req.UserID || captured.session != req.SessionID {
+	if conn == nil || req == nil || requestExpired(req) || captured.owner != req.UserID || captured.session != req.SessionID {
 		return
 	}
 	clock := s.current()
@@ -110,10 +110,14 @@ func (s *DialogFilterSync) AcknowledgeFetch(conn *mtproto.Conn, req *mtproto.Req
 // AcknowledgeDifference consumes the one-time first-difference signal only
 // after the response carrying it was written successfully.
 func (s *DialogFilterSync) AcknowledgeDifference(conn *mtproto.Conn, req *mtproto.Request, captured DialogFilterCapture, included bool) {
-	if conn == nil || req == nil || captured.owner != req.UserID || captured.session != req.SessionID {
+	if conn == nil || req == nil || requestExpired(req) || captured.owner != req.UserID || captured.session != req.SessionID {
 		return
 	}
 	conn.AcknowledgeDialogFilterDifference(req.UserID, req.SessionID, included && captured.firstDifference)
+}
+
+func requestExpired(req *mtproto.Request) bool {
+	return req.Ctx != nil && req.Ctx.Err() != nil
 }
 
 // RequesterRepair marks only the authenticated connection whose mutation
