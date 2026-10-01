@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -86,6 +87,94 @@ func TestBuildEnglishIsDeterministicAndPreservesPlurals(t *testing.T) {
 	}
 	if _, err := ParseArtifact(canonical); err != nil {
 		t.Fatalf("ParseArtifact(canonical): %v", err)
+	}
+}
+
+func TestBuildEnglishAcceptsUpstreamBlockHeader(t *testing.T) {
+	t.Parallel()
+	// Header and first entries from tdesktop revision 33261535a0e747f125e0ed25486f01e556330677.
+	raw, err := os.ReadFile("testdata/tdesktop_header.strings")
+	if err != nil {
+		t.Fatalf("read upstream header fixture: %v", err)
+	}
+	sum := sha256.Sum256(raw)
+	checksum := hex.EncodeToString(sum[:])
+	artifact, err := BuildEnglish(raw, Source{
+		URL: "https://example.test/tdesktop/lang.strings", Revision: "revision", SHA256: checksum,
+	})
+	if err != nil {
+		t.Fatalf("build unchanged source with upstream header: %v", err)
+	}
+	if artifact.Source.SHA256 != checksum || len(artifact.Entries) != 2 ||
+		artifact.Entries[0].Key != "lng_language_name" || artifact.Entries[0].Value != "English" ||
+		artifact.Entries[1].Key != "lng_switch_to_this" || artifact.Entries[1].Value != "Continue in English" {
+		t.Fatalf("artifact = %+v, want both English entries and original checksum", artifact)
+	}
+}
+
+func TestBuildEnglishBlockCommentsPreserveQuotedMarkers(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		raw  string
+		key  string
+		want string
+	}{
+		{name: "inline", raw: `/* before */"key"/* key */ = /* value */"value";/* after */`, want: "value"},
+		{name: "multiline", raw: "/* comment\n\"ignored\" = \"hidden\";\n*/\n\"key\" = \"value\";", want: "value"},
+		{name: "markers in value", raw: `"key" = "https://example.test/*literal*/ // literal"; // /* not a block`, want: "https://example.test/*literal*/ // literal"},
+		{name: "markers in key", raw: `"key/*literal*/ // literal" = "value";`, key: "key/*literal*/ // literal", want: "value"},
+		{name: "escaped quote", raw: `"key" = "Escaped \"quote\" /* literal */ // literal";`, want: `Escaped "quote" /* literal */ // literal`},
+		{name: "line comment inside block", raw: "/* // still a block */\n\"key\" = \"value\";", want: "value"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sum := sha256.Sum256([]byte(tc.raw))
+			artifact, err := BuildEnglish([]byte(tc.raw), Source{
+				URL: "https://example.test/tdesktop/lang.strings", Revision: "revision", SHA256: hex.EncodeToString(sum[:]),
+			})
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			key := tc.key
+			if key == "" {
+				key = "key"
+			}
+			if len(artifact.Entries) != 1 || artifact.Entries[0].Key != key || artifact.Entries[0].Value != tc.want {
+				t.Fatalf("entries = %+v, want key with value %q", artifact.Entries, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildEnglishPreservesEntryBoundariesAcrossBlockComments(t *testing.T) {
+	t.Parallel()
+	raw := []byte("\"first\" = \"one\";/* comment\ncomment */\"second\" = \"two\";")
+	sum := sha256.Sum256(raw)
+	artifact, err := BuildEnglish(raw, Source{
+		URL: "https://example.test/tdesktop/lang.strings", Revision: "revision", SHA256: hex.EncodeToString(sum[:]),
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if len(artifact.Entries) != 2 || artifact.Entries[0].Key != "first" || artifact.Entries[0].Value != "one" ||
+		artifact.Entries[1].Key != "second" || artifact.Entries[1].Value != "two" {
+		t.Fatalf("entries = %+v, want both entries separated by the block's newline", artifact.Entries)
+	}
+}
+
+func TestBuildEnglishRejectsUnterminatedBlockComment(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{"/* PRIVATE_TRANSLATION", "\"key\" = \"value\";\n/* PRIVATE_TRANSLATION"} {
+		sum := sha256.Sum256([]byte(raw))
+		_, err := BuildEnglish([]byte(raw), Source{
+			URL: "https://example.test/tdesktop/lang.strings", Revision: "revision", SHA256: hex.EncodeToString(sum[:]),
+		})
+		if !errors.Is(err, ErrMalformedEntry) {
+			t.Fatalf("error = %v, want malformed entry", err)
+		}
+		if strings.Contains(err.Error(), "PRIVATE_TRANSLATION") {
+			t.Fatalf("diagnostic contains source text: %v", err)
+		}
 	}
 }
 

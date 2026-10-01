@@ -307,9 +307,13 @@ type sourcePlural struct {
 }
 
 func parseSource(raw []byte) ([]Entry, error) {
+	source, err := stripSourceComments(string(raw))
+	if err != nil {
+		return nil, err
+	}
 	entries := make(map[string]*Entry)
 	plurals := make(map[string]*sourcePlural)
-	for line := range strings.SplitSeq(string(raw), "\n") {
+	for line := range strings.SplitSeq(source, "\n") {
 		line = strings.TrimSuffix(line, "\r")
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "//") {
@@ -382,6 +386,45 @@ func parseSource(raw []byte) ([]Entry, error) {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Key < result[j].Key })
 	return result, nil
+}
+
+func stripSourceComments(source string) (string, error) {
+	var result strings.Builder
+	for pos := 0; pos < len(source); {
+		switch {
+		case source[pos] == '"':
+			_, next, err := parseQuoted(source, pos)
+			if err != nil {
+				return "", err
+			}
+			result.WriteString(source[pos:next])
+			pos = next
+		case strings.HasPrefix(source[pos:], "//"):
+			next := strings.IndexByte(source[pos:], '\n')
+			if next < 0 {
+				return result.String(), nil
+			}
+			pos += next
+		case strings.HasPrefix(source[pos:], "/*"):
+			end := strings.Index(source[pos+2:], "*/")
+			if end < 0 {
+				return "", ErrMalformedEntry
+			}
+			end += pos + 4
+			result.WriteByte(' ')
+			// Keep line boundaries so separate entries cannot become one line.
+			for _, char := range source[pos:end] {
+				if char == '\n' {
+					result.WriteByte('\n')
+				}
+			}
+			pos = end
+		default:
+			result.WriteByte(source[pos])
+			pos++
+		}
+	}
+	return result.String(), nil
 }
 
 func isPluralCategory(value string) bool {

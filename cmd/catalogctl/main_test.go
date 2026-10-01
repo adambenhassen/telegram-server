@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +45,58 @@ func TestBuildCommandProducesCanonicalEnglishArtifactOffline(t *testing.T) {
 	}
 	if artifact.LanguageCode != catalog.LanguageEnglish || len(artifact.Entries) != 1 || stderr.Len() != 0 {
 		t.Fatalf("artifact = %+v, stderr = %q", artifact, stderr.String())
+	}
+}
+
+func TestBuildCommandAcceptsUpstreamBlockHeaderOffline(t *testing.T) {
+	t.Parallel()
+	sourcePath := filepath.Join("..", "..", "internal", "catalog", "testdata", "tdesktop_header.strings")
+	raw, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read header fixture: %v", err)
+	}
+	sum := sha256.Sum256(raw)
+	checksum := hex.EncodeToString(sum[:])
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{
+		"build", "--input", sourcePath, "--output", "-",
+		"--source-url", "https://example.test/tdesktop/lang.strings",
+		"--source-revision", "revision", "--source-sha256", checksum,
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("build unchanged source: %v", err)
+	}
+	artifact, err := catalog.ParseArtifact(stdout.Bytes())
+	if err != nil {
+		t.Fatalf("parse artifact: %v", err)
+	}
+	if stderr.Len() != 0 || artifact.Source.SHA256 != checksum || len(artifact.Entries) != 2 ||
+		artifact.Entries[0].Key != "lng_language_name" || artifact.Entries[0].Value != "English" ||
+		artifact.Entries[1].Key != "lng_switch_to_this" || artifact.Entries[1].Value != "Continue in English" {
+		t.Fatalf("artifact = %+v, stderr = %q", artifact, stderr.String())
+	}
+}
+
+func TestBuildCommandRejectsUnterminatedBlockWithoutWritingArtifact(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "lang.strings")
+	artifactPath := filepath.Join(dir, "artifact.json")
+	raw := []byte("\"key\" = \"value\";\n/* PRIVATE_TRANSLATION")
+	if err := os.WriteFile(sourcePath, raw, 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	sum := sha256.Sum256(raw)
+	var stdout, stderr bytes.Buffer
+	err := run([]string{
+		"build", "--input", sourcePath, "--output", artifactPath,
+		"--source-url", "https://example.test/tdesktop/lang.strings",
+		"--source-revision", "revision", "--source-sha256", hex.EncodeToString(sum[:]),
+	}, &stdout, &stderr)
+	if !errors.Is(err, catalog.ErrMalformedEntry) || strings.Contains(err.Error(), "PRIVATE_TRANSLATION") || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("build error = %v, stdout = %q, stderr = %q", err, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(artifactPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid source wrote an artifact: %v", err)
 	}
 }
 
