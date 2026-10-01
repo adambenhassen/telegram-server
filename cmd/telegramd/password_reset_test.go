@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -115,6 +116,33 @@ func TestRunCommandAdminSetPasswordResetsExistingUsernamePassword(t *testing.T) 
 			t.Fatalf("reset password metadata = {hint:%q email:%q recovery:%t}", got.Hint, got.RecoveryEmail, got.HasRecovery)
 		}
 		previousVerifier, previousSalt1, previousSalt2 = got.Verifier, got.Salt1, got.Salt2
+	}
+}
+
+func TestRunCommandAdminSetPasswordKeyFileLogsOnlyConfirmation(t *testing.T) {
+	ctx := context.Background()
+	dsn, key, st := openPasswordResetTestStore(t)
+	user := seedPasswordResetUsername(t, ctx, st, "tester1", "old-password", "old hint", nil, false)
+	keyPath := filepath.Join(t.TempDir(), "auth.key")
+	if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(key)), 0o600); err != nil {
+		t.Fatalf("write test master key: %v", err)
+	}
+	t.Setenv("TG_POSTGRES_DSN", dsn)
+	t.Setenv("TG_AUTHKEY_ENC_KEY", "")
+	t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", keyPath)
+
+	var stdout, stderr bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&stderr, nil))
+	err := runCommandWithStdinAndLogger(t, []string{"admin", "set-password", "--username", "tester1"}, "replacement-secret-marker\n", logger, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("set-password using key file: %v", err)
+	}
+	want := fmt.Sprintf("Password reset: tester1 (user id: %d)\n", user.ID)
+	if stdout.Len() != 0 || stderr.String() != want {
+		t.Fatalf("stdout/stderr = %q/%q, want empty stdout and %q", stdout.String(), stderr.String(), want)
+	}
+	if strings.Contains(stdout.String()+stderr.String(), "replacement-secret-marker") {
+		t.Fatal("success output contained the password")
 	}
 }
 
@@ -270,6 +298,41 @@ func TestRunCommandAdminSetPasswordRefusesInteractiveInput(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), "interactive") {
 		t.Fatalf("interactive input error = %v, want interactive-input refusal", err)
+	}
+}
+
+func TestRunCommandAdminSetPasswordDatabaseWriteFailureRollsBack(t *testing.T) {
+	ctx := context.Background()
+	dsn, _, st := openPasswordResetTestStore(t)
+	seedPasswordResetUsername(t, ctx, st, "tester1", "old-password", "old hint", nil, false)
+	before := passwordResetSnapshot(t, ctx, dsn)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect trigger fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close trigger fixture: %v", err)
+		}
+	})
+	if _, err := conn.Exec(ctx, `CREATE FUNCTION reject_password_reset_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected password reset write failure'; END $$`); err != nil {
+		t.Fatalf("create password reset failure trigger function: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE TRIGGER reject_password_reset_test BEFORE UPDATE ON user_passwords FOR EACH ROW EXECUTE FUNCTION reject_password_reset_test()`); err != nil {
+		t.Fatalf("create password reset failure trigger: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = runCommandWithStdin(t, []string{"admin", "set-password", "--username", "tester1"}, "replacement-secret-marker\n", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "write replacement password verifier") {
+		t.Fatalf("database write failure = %v, want password verifier write error", err)
+	}
+	if strings.Contains(errText(err, stdout.String(), stderr.String()), "replacement-secret-marker") {
+		t.Fatal("password appeared in database write failure diagnostics")
+	}
+	if after := passwordResetSnapshot(t, ctx, dsn); !reflect.DeepEqual(after, before) {
+		t.Fatalf("database write failure changed password rows: before=%+v after=%+v", before, after)
 	}
 }
 
@@ -503,6 +566,11 @@ func waitForPasswordResetActivity(ctx context.Context, conn *pgx.Conn, queryPatt
 
 func runCommandWithStdin(t *testing.T, args []string, input string, stdout, stderr io.Writer) error {
 	t.Helper()
+	return runCommandWithStdinAndLogger(t, args, input, slog.New(slog.DiscardHandler), stdout, stderr)
+}
+
+func runCommandWithStdinAndLogger(t *testing.T, args []string, input string, logger *slog.Logger, stdout, stderr io.Writer) error {
+	t.Helper()
 	read, write, err := os.Pipe()
 	if err != nil {
 		return err
@@ -521,7 +589,7 @@ func runCommandWithStdin(t *testing.T, args []string, input string, stdout, stde
 			t.Errorf("close test stdin: %v", err)
 		}
 	}()
-	return runCommand(args, slog.New(slog.DiscardHandler), stdout, stderr)
+	return runCommand(args, logger, stdout, stderr)
 }
 
 func runCommandWithUnreadableStdin(t *testing.T, args []string, stdout, stderr io.Writer) error {

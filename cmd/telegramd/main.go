@@ -85,7 +85,7 @@ func runCommand(args []string, log *slog.Logger, stdout, stderr io.Writer) error
 
 var adminUsernameRE = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{1,31}$`)
 
-func runAdminCommand(args []string, stdin io.Reader, log *slog.Logger, stderr io.Writer) (err error) {
+func runAdminCommand(args []string, stdin io.Reader, _ *slog.Logger, stderr io.Writer) (err error) {
 	if len(args) == 0 || args[0] != "set-password" {
 		return adminUsageError()
 	}
@@ -127,13 +127,16 @@ func runAdminCommand(args []string, stdin io.Reader, log *slog.Logger, stderr io
 		return errors.New("generate SRP verifier: invalid verifier")
 	}
 
-	cfg, err := config.Load(log)
+	// Config and store startup logs can add paths and other details to stderr;
+	// the operator command exposes only its explicit confirmation or error.
+	quietLog := slog.New(slog.DiscardHandler)
+	cfg, err := config.Load(quietLog)
 	if err != nil {
 		return err
 	}
 	ctx := context.Background()
 	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey,
-		store.WithLogger(log),
+		store.WithLogger(quietLog),
 		store.WithStatementTimeout(cfg.StatementTimeout),
 		store.WithoutBlobStore(),
 	)
