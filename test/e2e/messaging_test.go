@@ -212,7 +212,7 @@ func recvOrCtx[T any](t *testing.T, ctx context.Context, ch chan T, what string)
 	case v := <-ch:
 		return v
 	case <-ctx.Done():
-		t.Fatalf("timed out waiting for %s: %v", what, ctx.Err())
+		t.Fatalf("timed out waiting for %s: %s", what, contextFailureDescription(ctx))
 		var zero T
 		return zero
 	}
@@ -257,7 +257,7 @@ func bootServerWithLimitsAndRegistrationMode(
 	dsn string, log *slog.Logger, ln net.Listener, rateLimits config.RateLimitsConfig, regMode config.RegistrationMode,
 ) (*mtproto.SessionRegistry, func()) {
 	t.Helper()
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	// Sign-in here reads the code off the log, so the gated line must be on.
 	blobs := testBlobs(t)
 	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits, regMode)

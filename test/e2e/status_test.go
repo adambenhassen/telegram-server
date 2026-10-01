@@ -27,7 +27,7 @@ import (
 // emit a NOTIFY, enabling the full online/offline push path.
 func bootServerWithStatus(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, dsn string, log *slog.Logger, ln net.Listener) func() {
 	t.Helper()
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	blobs, err := blob.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("blob store: %v", err)

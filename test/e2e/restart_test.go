@@ -247,7 +247,7 @@ func mustListen(t *testing.T, ctx context.Context, addr string) net.Listener {
 // function that cancels it and waits for the serve loop to exit.
 func bootServer(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, log *slog.Logger, ln net.Listener) func() {
 	t.Helper()
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	// Sign-in here reads the code off the log, so the gated line must be on.
 	blobs := testBlobs(t)
 	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)

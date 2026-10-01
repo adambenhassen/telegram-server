@@ -73,7 +73,7 @@ func TestClientLoginUnderDefaultRateLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
 	}
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), cfg.RateLimits, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
 

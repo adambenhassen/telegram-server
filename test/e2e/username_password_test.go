@@ -39,7 +39,7 @@ import (
 // returns a stop function.
 func bootServerWithRegMode(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, log *slog.Logger, ln net.Listener, regMode config.RegistrationMode) func() {
 	t.Helper()
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	blobs, err := blob.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
@@ -68,7 +68,7 @@ func bootServerWithRegMode(t *testing.T, ctx context.Context, key *rsa.PrivateKe
 // and rate-limit config, and returns a stop function.
 func bootServerWithRegAndLimits(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, log *slog.Logger, ln net.Listener, regMode config.RegistrationMode, rateLimits config.RateLimitsConfig) func() {
 	t.Helper()
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	blobs, err := blob.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
