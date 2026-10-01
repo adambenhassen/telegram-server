@@ -12,8 +12,12 @@ import (
 )
 
 func searchPinned(s *store.Store, userID int64, peer tg.InputPeerClass, offsetID, limit int) (bin.Encoder, error) {
+	return searchPinnedQuery(s, userID, peer, "", offsetID, limit)
+}
+
+func searchPinnedQuery(s *store.Store, userID int64, peer tg.InputPeerClass, query string, offsetID, limit int) (bin.Encoder, error) {
 	return api.SearchForTest(s, userID, &tg.MessagesSearchRequest{
-		Peer: peer, Q: "", Filter: &tg.InputMessagesFilterPinned{}, OffsetID: offsetID, Limit: limit,
+		Peer: peer, Q: query, Filter: &tg.InputMessagesFilterPinned{}, OffsetID: offsetID, Limit: limit,
 	})
 }
 
@@ -55,6 +59,24 @@ func findMessageByText(t *testing.T, messages []tg.MessageClass, text string) *t
 	}
 	t.Fatalf("messages = %v, want %q", messages, text)
 	return nil
+}
+
+func assertPinnedSearchRejectsStaleMember(t *testing.T, enc bin.Encoder, err error) {
+	t.Helper()
+	if err == nil {
+		switch result := enc.(type) {
+		case *tg.MessagesMessages:
+			if len(result.Messages) > 0 {
+				t.Fatalf("stale member received pinned message(s): %v, want PEER_ID_INVALID", result.Messages)
+			}
+		case *tg.MessagesChannelMessages:
+			if len(result.Messages) > 0 {
+				t.Fatalf("stale member received pinned channel message(s): %v, want PEER_ID_INVALID", result.Messages)
+			}
+		}
+		t.Fatalf("stale member search returned %T without an error, want PEER_ID_INVALID", enc)
+	}
+	rpcError(t, err, "PEER_ID_INVALID")
 }
 
 func TestSearchPinnedOneToOnePeerReturnsEmptyAndValidatesViewerHash(t *testing.T) {
@@ -310,5 +332,209 @@ func TestSearchPinnedChannelReturnsPostAndRejectsUnauthorizedViewers(t *testing.
 	}
 	if got := pinnedChannelMessages(t, enc).Count; got != 0 {
 		t.Fatalf("search deleted channel pin count = %d, want 0", got)
+	}
+}
+
+func TestSearchPinnedGroupFiltersByKeyword(t *testing.T) {
+	t.Parallel()
+	s, _, _, member, chat, peer, memberPinID := newPinnedSearchGroupFixture(t, "+15551298031")
+
+	enc, err := searchPinnedQuery(s, member.ID, peer, "pinned", 0, 100)
+	if err != nil {
+		t.Fatalf("search matching pinned group query: %v", err)
+	}
+	result := pinnedDialogMessages(t, enc)
+	if len(result.Messages) != 1 {
+		t.Fatalf("matching group result has %d messages, want one", len(result.Messages))
+	}
+	message := findMessageByText(t, result.Messages, "pinned group text")
+	if int64(message.ID) != memberPinID {
+		t.Errorf("matching group message id = %d, want viewer id %d", message.ID, memberPinID)
+	}
+	if peer, ok := message.PeerID.(*tg.PeerChat); !ok || peer.ChatID != chat.ID {
+		t.Errorf("matching group peer = %T/%v, want chat %d", message.PeerID, message.PeerID, chat.ID)
+	}
+
+	enc, err = searchPinnedQuery(s, member.ID, peer, "unrelatedneedle", 0, 100)
+	if err != nil {
+		t.Fatalf("search nonmatching pinned group query: %v", err)
+	}
+	if got := len(pinnedDialogMessages(t, enc).Messages); got != 0 {
+		t.Errorf("nonmatching group query returned %d messages, want none", got)
+	}
+}
+
+func TestSearchPinnedChannelFiltersByKeyword(t *testing.T) {
+	t.Parallel()
+	fixture := newPinnedSearchChannelFixture(t, "+15551298032")
+
+	enc, err := searchPinnedQuery(fixture.store, fixture.member.ID, fixture.peer, "pinned", 0, 100)
+	if err != nil {
+		t.Fatalf("search matching pinned channel query: %v", err)
+	}
+	result := pinnedChannelMessages(t, enc)
+	if result.Count != 1 || len(result.Messages) != 1 {
+		t.Fatalf("matching channel result count=%d messages=%d, want one", result.Count, len(result.Messages))
+	}
+	message, ok := result.Messages[0].(*tg.Message)
+	if !ok || message.ID != int(fixture.pinID) || message.Message != "pinned channel text" {
+		t.Fatalf("matching channel message = %T %+v, want id %d and pinned channel text", result.Messages[0], result.Messages[0], fixture.pinID)
+	}
+
+	enc, err = searchPinnedQuery(fixture.store, fixture.member.ID, fixture.peer, "unrelatedneedle", 0, 100)
+	if err != nil {
+		t.Fatalf("search nonmatching pinned channel query: %v", err)
+	}
+	result = pinnedChannelMessages(t, enc)
+	if result.Count != 0 || len(result.Messages) != 0 {
+		t.Errorf("nonmatching channel result count=%d messages=%d, want 0", result.Count, len(result.Messages))
+	}
+}
+
+func TestSearchPinnedGroupRejectsRemovedMemberUsingOriginalPeer(t *testing.T) {
+	t.Parallel()
+	s, ctx, creator, member, chat, peer, memberPinID := newPinnedSearchGroupFixture(t, "+15551298033")
+
+	enc, err := searchPinned(s, member.ID, peer, 0, 100)
+	if err != nil {
+		t.Fatalf("authorized member pinned search: %v", err)
+	}
+	result := pinnedDialogMessages(t, enc)
+	if len(result.Messages) != 1 {
+		t.Fatalf("authorized group result has %d messages, want one", len(result.Messages))
+	}
+	message := findMessageByText(t, result.Messages, "pinned group text")
+	if int64(message.ID) != memberPinID {
+		t.Fatalf("authorized group message id = %d, want viewer id %d", message.ID, memberPinID)
+	}
+
+	if _, _, _, err = s.RemoveChatUser(ctx, chat.ID, member.ID, creator.ID); err != nil {
+		t.Fatalf("remove group member: %v", err)
+	}
+	enc, err = searchPinned(s, member.ID, peer, 0, 100)
+	assertPinnedSearchRejectsStaleMember(t, enc, err)
+}
+
+func TestSearchPinnedChannelRejectsDepartedMemberUsingOriginalPeer(t *testing.T) {
+	t.Parallel()
+	fixture := newPinnedSearchChannelFixture(t, "+15551298034")
+
+	enc, err := searchPinned(fixture.store, fixture.member.ID, fixture.peer, 0, 100)
+	if err != nil {
+		t.Fatalf("authorized channel member pinned search: %v", err)
+	}
+	assertPinnedChannelMatch(t, enc, fixture.pinID)
+
+	left, err := fixture.store.LeaveChannel(fixture.ctx, fixture.channel.ID, fixture.member.ID)
+	if err != nil || !left {
+		t.Fatalf("leave channel: left=%v err=%v", left, err)
+	}
+	enc, err = searchPinned(fixture.store, fixture.member.ID, fixture.peer, 0, 100)
+	assertPinnedSearchRejectsStaleMember(t, enc, err)
+}
+
+func TestSearchPinnedChannelRejectsBannedMemberUsingOriginalPeer(t *testing.T) {
+	t.Parallel()
+	fixture := newPinnedSearchChannelFixture(t, "+15551298035")
+
+	enc, err := searchPinned(fixture.store, fixture.member.ID, fixture.peer, 0, 100)
+	if err != nil {
+		t.Fatalf("authorized channel member pinned search: %v", err)
+	}
+	assertPinnedChannelMatch(t, enc, fixture.pinID)
+
+	if err := fixture.store.SetChannelBan(fixture.ctx, fixture.channel.ID, fixture.creator.ID, fixture.member.ID, nil, true); err != nil {
+		t.Fatalf("ban channel member: %v", err)
+	}
+	enc, err = searchPinned(fixture.store, fixture.member.ID, fixture.peer, 0, 100)
+	assertPinnedSearchRejectsStaleMember(t, enc, err)
+}
+
+func newPinnedSearchGroupFixture(t *testing.T, memberPhone string) (*store.Store, context.Context, store.User, store.User, store.Chat, tg.InputPeerClass, int64) {
+	t.Helper()
+	ctx := context.Background()
+	s := openStore(t)
+	users, chat := chatWith(t, s, "+15551298030", memberPhone)
+	creator, member := users[0], users[1]
+	if _, err := api.SendMessageForTest(s, creator.ID, &tg.MessagesSendMessageRequest{
+		Peer: &tg.InputPeerChat{ChatID: chat.ID}, Message: "pinned group text", RandomID: 98401,
+	}); err != nil {
+		t.Fatalf("send pinned group message: %v", err)
+	}
+
+	creatorHistory, err := s.History(ctx, creator.ID, store.PeerTypeChat, chat.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("creator group history: %v", err)
+	}
+	creatorPin := storedMessageByText(t, creatorHistory, "pinned group text")
+	memberHistory, err := s.History(ctx, member.ID, store.PeerTypeChat, chat.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("member group history: %v", err)
+	}
+	memberPin := storedMessageByText(t, memberHistory, "pinned group text")
+	if _, err = api.UpdatePinnedMessageForTest(s, creator.ID, &tg.MessagesUpdatePinnedMessageRequest{
+		Peer: &tg.InputPeerChat{ChatID: chat.ID}, ID: int(creatorPin.LocalID),
+	}); err != nil {
+		t.Fatalf("pin group message: %v", err)
+	}
+
+	return s, ctx, creator, member, chat, &tg.InputPeerChat{ChatID: chat.ID}, memberPin.LocalID
+}
+
+type pinnedSearchChannelFixture struct {
+	store   *store.Store
+	ctx     context.Context
+	creator store.User
+	member  store.User
+	channel store.Channel
+	peer    tg.InputPeerClass
+	pinID   int64
+}
+
+func newPinnedSearchChannelFixture(t *testing.T, memberPhone string) pinnedSearchChannelFixture {
+	t.Helper()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, err := s.CreateUser(ctx, "+15551298040")
+	if err != nil {
+		t.Fatalf("create channel creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, memberPhone)
+	if err != nil {
+		t.Fatalf("create channel member: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "Pinned Search", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	joinChannelByInvite(t, s, ch, member.ID)
+	if _, err = sendToChannel(t, s, creator.ID, ch.ID, "pinned channel text", 98402); err != nil {
+		t.Fatalf("send pinned channel post: %v", err)
+	}
+	posts, err := s.SearchChannelPosts(ctx, ch.ID, "pinned", 0, 10)
+	if err != nil || len(posts) != 1 {
+		t.Fatalf("find channel pin target: got %d posts, err %v", len(posts), err)
+	}
+	pinned := posts[0]
+	if _, err = api.UpdatePinnedMessageForTest(s, creator.ID, &tg.MessagesUpdatePinnedMessageRequest{
+		Peer: channelPeer(creator.ID, ch.ID), ID: int(pinned.LocalID),
+	}); err != nil {
+		t.Fatalf("pin channel post: %v", err)
+	}
+	return pinnedSearchChannelFixture{
+		store: s, ctx: ctx, creator: creator, member: member, channel: ch,
+		peer: channelPeer(member.ID, ch.ID), pinID: pinned.LocalID,
+	}
+}
+
+func assertPinnedChannelMatch(t *testing.T, enc bin.Encoder, pinID int64) {
+	t.Helper()
+	result := pinnedChannelMessages(t, enc)
+	if result.Count != 1 || len(result.Messages) != 1 {
+		t.Fatalf("channel result count=%d messages=%d, want one", result.Count, len(result.Messages))
+	}
+	message, ok := result.Messages[0].(*tg.Message)
+	if !ok || message.ID != int(pinID) || message.Message != "pinned channel text" {
+		t.Fatalf("channel message = %T %+v, want id %d and pinned channel text", result.Messages[0], result.Messages[0], pinID)
 	}
 }
