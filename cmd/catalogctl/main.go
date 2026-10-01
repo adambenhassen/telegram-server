@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/adambenhassen/telegram-server/internal/catalog"
@@ -89,12 +90,20 @@ func runPublish(args []string, stdout, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	artifactPath := flags.String("artifact", "", "path to a reviewed catalog artifact")
 	repo := flags.String("repo", ".", "reviewed repository worktree")
-	dsn := flags.String("dsn", os.Getenv("TG_POSTGRES_DSN"), "Postgres DSN, or TG_POSTGRES_DSN")
+	dsn := flags.String("dsn", "", "Postgres DSN, or TG_POSTGRES_DSN")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *artifactPath == "" || *dsn == "" {
+	dsnValue := *dsn
+	if dsnValue == "" {
+		dsnValue = os.Getenv("TG_POSTGRES_DSN")
+	}
+	if *artifactPath == "" || dsnValue == "" {
 		return errors.New("usage: catalogctl publish --artifact <artifact> [--repo <repo>] [--dsn <dsn>]")
+	}
+	resolvedArtifact, artifactRelativePath, err := resolveReviewedArtifact(*repo, *artifactPath)
+	if err != nil {
+		return err
 	}
 	if err := requireCleanRepo(*repo); err != nil {
 		return err
@@ -103,15 +112,18 @@ func runPublish(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(*artifactPath)
+	data, err := os.ReadFile(resolvedArtifact) // #nosec G304 -- path is canonicalized and constrained to a tracked file in the reviewed worktree.
 	if err != nil {
 		return errors.New("catalog: unable to read artifact")
+	}
+	if err := requireArtifactAtCommit(*repo, reviewedCommit, artifactRelativePath, data); err != nil {
+		return err
 	}
 	artifact, err := catalog.ParseArtifact(data)
 	if err != nil {
 		return err
 	}
-	result, err := catalogpublish.Publish(context.Background(), *dsn, artifact, reviewedCommit, catalogpublish.PublishOptions{})
+	result, err := catalogpublish.Publish(context.Background(), dsnValue, artifact, reviewedCommit, catalogpublish.PublishOptions{})
 	if err != nil {
 		return err
 	}
@@ -122,6 +134,65 @@ func runPublish(args []string, stdout, stderr io.Writer) error {
 	}
 	if err != nil {
 		return errors.New("catalog: unable to write result")
+	}
+	return nil
+}
+
+func resolveReviewedArtifact(repo, artifactPath string) (string, string, error) {
+	if filepath.IsAbs(artifactPath) || artifactPath == "" {
+		return "", "", errors.New("catalog: artifact must be a tracked repository-relative path")
+	}
+	repoRoot, err := filepath.Abs(repo)
+	if err != nil {
+		return "", "", errors.New("catalog: unable to resolve reviewed source tree")
+	}
+	repoRoot, err = filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return "", "", errors.New("catalog: unable to resolve reviewed source tree")
+	}
+	cleanPath := filepath.Clean(artifactPath)
+	artifactPathAbs := filepath.Join(repoRoot, cleanPath)
+	lexicalRelative, err := filepath.Rel(repoRoot, artifactPathAbs)
+	if err != nil || escapesDirectory(lexicalRelative) {
+		return "", "", errors.New("catalog: artifact is outside reviewed source tree")
+	}
+	resolvedArtifact, err := filepath.EvalSymlinks(artifactPathAbs)
+	if err != nil {
+		return "", "", errors.New("catalog: unable to resolve artifact")
+	}
+	resolvedRelative, err := filepath.Rel(repoRoot, resolvedArtifact)
+	if err != nil || escapesDirectory(resolvedRelative) || resolvedRelative == "." {
+		return "", "", errors.New("catalog: artifact is outside reviewed source tree")
+	}
+	info, err := os.Stat(resolvedArtifact)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", "", errors.New("catalog: artifact is not a regular file")
+	}
+	for _, relativePath := range []string{lexicalRelative, resolvedRelative} {
+		if err := requireTrackedArtifact(repoRoot, relativePath); err != nil {
+			return "", "", err
+		}
+	}
+	return resolvedArtifact, filepath.ToSlash(resolvedRelative), nil
+}
+
+func escapesDirectory(path string) bool {
+	return path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator))
+}
+
+func requireTrackedArtifact(repo, relativePath string) error {
+	cmd := exec.CommandContext(context.Background(), "git", "-C", repo, "--literal-pathspecs", "ls-files", "--error-unmatch", "--", relativePath) // #nosec G204,G703 -- repo and path are arguments, not shell input.
+	if err := cmd.Run(); err != nil {
+		return errors.New("catalog: artifact must be tracked in reviewed source tree")
+	}
+	return nil
+}
+
+func requireArtifactAtCommit(repo, commit, relativePath string, data []byte) error {
+	cmd := exec.CommandContext(context.Background(), "git", "-C", repo, "cat-file", "blob", commit+":"+relativePath) // #nosec G204,G703 -- repository and object path are arguments, not shell input.
+	committed, err := cmd.Output()
+	if err != nil || !bytes.Equal(committed, data) {
+		return errors.New("catalog: artifact does not match reviewed source commit")
 	}
 	return nil
 }

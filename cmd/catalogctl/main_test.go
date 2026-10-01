@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -66,5 +67,111 @@ func TestBuildCommandRejectsNonEnglishInputWithFixedDiagnostic(t *testing.T) {
 	}, &bytes.Buffer{}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), catalog.ErrEnglishOnly.Error()) {
 		t.Fatalf("error = %v, want fixed English-only diagnostic", err)
+	}
+}
+
+func TestPublishUsageDoesNotPrintDSNFromEnvironment(t *testing.T) {
+	const sentinel = "SENTINEL_PASSWORD"
+	t.Setenv("TG_POSTGRES_DSN", "dsn-"+sentinel)
+	for _, args := range [][]string{
+		{"publish", "-h"},
+		{"publish", "--unknown-flag"},
+	} {
+		name := strings.Join(args[1:], "-")
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			err := run(args, &stdout, &stderr)
+			if err == nil {
+				t.Fatal("publish unexpectedly succeeded")
+			}
+			if strings.Contains(stderr.String(), sentinel) || strings.Contains(err.Error(), sentinel) {
+				t.Fatalf("publish usage exposed the environment DSN: stderr=%q error=%q", stderr.String(), err)
+			}
+		})
+	}
+}
+
+func TestPublishRejectsUntrackedArtifact(t *testing.T) {
+	t.Parallel()
+	repo := initCatalogTestRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "catalog.json"), []byte("not an artifact"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	assertPublishRejectsArtifactPath(t, repo, "catalog.json")
+}
+
+func TestPublishRejectsArtifactOutsideRepository(t *testing.T) {
+	t.Parallel()
+	repo := initCatalogTestRepo(t)
+	outsideDir := t.TempDir()
+	outsideArtifact := filepath.Join(outsideDir, "catalog.json")
+	if err := os.WriteFile(outsideArtifact, []byte("not an artifact"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	assertPublishRejectsArtifactPath(t, repo, outsideArtifact)
+}
+
+func TestPublishRejectsArtifactSymlinkOutsideRepository(t *testing.T) {
+	t.Parallel()
+	repo := initCatalogTestRepo(t)
+	outsideDir := t.TempDir()
+	outsideArtifact := filepath.Join(outsideDir, "catalog.json")
+	if err := os.WriteFile(outsideArtifact, []byte("not an artifact"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	if err := os.Symlink(outsideArtifact, filepath.Join(repo, "catalog.json")); err != nil {
+		t.Fatalf("symlink artifact: %v", err)
+	}
+	assertPublishRejectsArtifactPath(t, repo, "catalog.json")
+}
+
+func TestResolveReviewedArtifactMatchesCommittedBytes(t *testing.T) {
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repository: %v", err)
+	}
+	artifactPath, relativePath, err := resolveReviewedArtifact(repo, "go.mod")
+	if err != nil {
+		t.Fatalf("resolve tracked artifact: %v", err)
+	}
+	data, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("read tracked artifact: %v", err)
+	}
+	commit, err := exec.CommandContext(t.Context(), "git", "-C", repo, "rev-parse", "HEAD").Output() // #nosec G204 -- repo is the current test repository.
+	if err != nil {
+		t.Fatalf("read HEAD: %v", err)
+	}
+	commitSHA := strings.TrimSpace(string(commit))
+	if err := requireArtifactAtCommit(repo, commitSHA, relativePath, data); err != nil {
+		t.Fatalf("validate committed artifact: %v", err)
+	}
+	modified := append(append([]byte(nil), data...), '\n')
+	if err := requireArtifactAtCommit(repo, commitSHA, relativePath, modified); err == nil {
+		t.Fatal("modified artifact matched reviewed commit bytes")
+	}
+}
+
+func initCatalogTestRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	cmd := exec.CommandContext(t.Context(), "git", "init", "--quiet", repo) // #nosec G204 -- repo is an isolated t.TempDir path.
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("initialize test repository: %v: %s", err, output)
+	}
+	return repo
+}
+
+func assertPublishRejectsArtifactPath(t *testing.T, repo, artifact string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	err := run([]string{
+		"publish",
+		"--artifact", artifact,
+		"--repo", repo,
+		"--dsn", "postgres://unused:unused@127.0.0.1:1/catalog",
+	}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "artifact") {
+		t.Fatalf("publish error = %v, want artifact path rejection", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
@@ -88,6 +89,30 @@ func TestBuildEnglishIsDeterministicAndPreservesPlurals(t *testing.T) {
 	}
 }
 
+func TestParseArtifactRejectsChangedSourceNoticeAndAttribution(t *testing.T) {
+	t.Parallel()
+	base := validTestArtifact(t)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Artifact)
+	}{
+		{name: "source notice", mutate: func(a *Artifact) { a.Source.Notice = "changed source notice" }},
+		{name: "attribution", mutate: func(a *Artifact) { a.Attribution = "changed attribution" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			artifact := base
+			tc.mutate(&artifact)
+			data, err := json.Marshal(artifact)
+			if err != nil {
+				t.Fatalf("marshal artifact: %v", err)
+			}
+			if _, err := ParseArtifact(data); err == nil {
+				t.Fatal("ParseArtifact accepted modified provenance")
+			}
+		})
+	}
+}
+
 func TestBuildEnglishRejectsInvalidInputsWithValueFreeDiagnostics(t *testing.T) {
 	t.Parallel()
 
@@ -125,23 +150,7 @@ func TestBuildEnglishRejectsInvalidInputsWithValueFreeDiagnostics(t *testing.T) 
 
 func TestArtifactValidationRejectsNonEnglishAndOversizedFields(t *testing.T) {
 	t.Parallel()
-
-	base := Artifact{
-		SchemaVersion: 1,
-		Pack:          PackTDesktop,
-		LanguageCode:  LanguageEnglish,
-		Name:          "English",
-		NativeName:    "English",
-		PluralCode:    "en",
-		Source: Source{
-			URL:      "https://example.test/tdesktop/lang.strings",
-			Revision: "revision",
-			SHA256:   strings.Repeat("a", sha256.Size*2),
-			Notice:   "Telegram Desktop GPL source notice",
-		},
-		Attribution: "Telegram Desktop",
-		Entries:     []Entry{{Key: "key", Value: "value"}},
-	}
+	base := validTestArtifact(t)
 	cases := []struct {
 		name   string
 		mutate func(*Artifact)
@@ -188,24 +197,24 @@ func TestArtifactRejectsEncodedPackAboveCeiling(t *testing.T) {
 
 func TestArtifactRejectsPluralSyntaxInCanonicalKeys(t *testing.T) {
 	t.Parallel()
-
-	artifact := Artifact{
-		SchemaVersion: ArtifactSchemaVersion,
-		Pack:          PackTDesktop,
-		LanguageCode:  LanguageEnglish,
-		Name:          "English",
-		NativeName:    "English",
-		PluralCode:    "en",
-		Source: Source{
-			URL:      "https://example.test/tdesktop/lang.strings",
-			Revision: "revision",
-			SHA256:   strings.Repeat("a", sha256.Size*2),
-			Notice:   "Telegram Desktop GPL source notice",
-		},
-		Attribution: "Telegram Desktop",
-		Entries:     []Entry{{Key: "key#one", Value: "value"}},
-	}
+	artifact := validTestArtifact(t)
+	artifact.Entries[0].Key = "key#one"
 	if err := artifact.Validate(); !errors.Is(err, ErrMalformedPlural) {
 		t.Fatalf("Validate = %v, want %v", err, ErrMalformedPlural)
 	}
+}
+
+func validTestArtifact(t *testing.T) Artifact {
+	t.Helper()
+	raw := []byte(`"key" = "value";`)
+	sum := sha256.Sum256(raw)
+	artifact, err := BuildEnglish(raw, Source{
+		URL:      "https://example.test/tdesktop/lang.strings",
+		Revision: "revision",
+		SHA256:   hex.EncodeToString(sum[:]),
+	})
+	if err != nil {
+		t.Fatalf("BuildEnglish: %v", err)
+	}
+	return artifact
 }

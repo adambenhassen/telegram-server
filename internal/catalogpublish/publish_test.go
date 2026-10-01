@@ -15,6 +15,7 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/catalog"
 	"github.com/adambenhassen/telegram-server/internal/catalogpublish"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 type Result = catalogpublish.Result
@@ -36,6 +37,7 @@ func TestPublishIsAtomicIdempotentAndRetainsHistory(t *testing.T) {
 	if !result.Changed || result.NewVersion != 1 {
 		t.Fatalf("first result = %+v, want changed version 1", result)
 	}
+	countsBeforeFailure := readCatalogHistoryCounts(t, ctx, pool)
 
 	second := testArtifact(t, map[string]string{"a": "two", "new": "added", "stable": "same"})
 	_, err = Publish(ctx, dsn, second, strings.Repeat("2", 40), PublishOptions{
@@ -49,6 +51,9 @@ func TestPublishIsAtomicIdempotentAndRetainsHistory(t *testing.T) {
 	}
 	assertCurrentVersion(t, ctx, pool, 1)
 	assertCurrentKeys(t, ctx, pool, map[string]string{"a": "one", "gone": "old", "stable": "same"})
+	if countsAfterFailure := readCatalogHistoryCounts(t, ctx, pool); countsAfterFailure != countsBeforeFailure {
+		t.Fatalf("injected failure changed history counts: before %v after %v", countsBeforeFailure, countsAfterFailure)
+	}
 
 	result, err = Publish(ctx, dsn, second, strings.Repeat("2", 40), PublishOptions{OSUser: "reviewer"})
 	if err != nil {
@@ -58,6 +63,9 @@ func TestPublishIsAtomicIdempotentAndRetainsHistory(t *testing.T) {
 		t.Fatalf("second result = %+v, want 1 -> 2", result)
 	}
 	assertCurrentVersion(t, ctx, pool, 2)
+	if counts := readCatalogHistoryCounts(t, ctx, pool); counts[0] != 2 {
+		t.Fatalf("retained version count = %d, want both versions", counts[0])
+	}
 	assertCurrentKeys(t, ctx, pool, map[string]string{"a": "two", "new": "added", "stable": "same"})
 	var stableVersion, editedVersion int64
 	if err := pool.QueryRow(ctx, `SELECT last_changed_version FROM language_catalog_current_strings WHERE lang_pack = 'tdesktop' AND lang_code = 'en' AND key = 'stable'`).Scan(&stableVersion); err != nil {
@@ -145,6 +153,27 @@ func TestConcurrentDistinctPublicationsReceiveMonotonicVersions(t *testing.T) {
 		t.Fatalf("concurrent results = %+v, want versions 1 and 2", results)
 	}
 	assertCurrentVersion(t, ctx, pool, 2)
+	winner := 0
+	if results[1].NewVersion == 2 {
+		winner = 1
+	}
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = st.Close() }() //nolint:errcheck // test cleanup
+	snapshot, err := st.LoadCatalogSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("load concurrent snapshot: %v", err)
+	}
+	pack := snapshot.Pack(catalog.PackTDesktop, catalog.LanguageEnglish)
+	if pack == nil || pack.Version != 2 || pack.OldestVersion != 1 || len(pack.Entries) != 1 ||
+		pack.Entries[0].Key != "key" || pack.Entries[0].Value != artifacts[winner].Entries[0].Value {
+		t.Fatalf("final snapshot = %+v, want complete version-2 publication %+v", pack, artifacts[winner].Entries)
+	}
+	if len(pack.Changes) != 1 || pack.Changes[0].Version != 2 || pack.Changes[0].Entry.Value != artifacts[winner].Entries[0].Value {
+		t.Fatalf("concurrent history = %+v, want latest complete version 2", pack.Changes)
+	}
 }
 
 func TestPublishRejectsInvalidArtifactBeforeOpeningDatabase(t *testing.T) {
@@ -226,6 +255,22 @@ func assertCurrentKeys(t *testing.T, ctx context.Context, pool *pgxpool.Pool, wa
 			t.Fatalf("current string %q = %q, want %q", key, got[key], value)
 		}
 	}
+}
+
+func readCatalogHistoryCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool) [4]int64 {
+	t.Helper()
+	var counts [4]int64
+	err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM language_catalog_versions),
+			(SELECT count(*) FROM language_catalog_changes),
+			(SELECT count(*) FROM language_catalog_tombstones),
+			(SELECT count(*) FROM language_catalog_publication_audit)
+	`).Scan(&counts[0], &counts[1], &counts[2], &counts[3])
+	if err != nil {
+		t.Fatalf("read catalog history counts: %v", err)
+	}
+	return counts
 }
 
 func testPool(t *testing.T, dsn string) *pgxpool.Pool {

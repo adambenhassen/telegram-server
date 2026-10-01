@@ -129,6 +129,136 @@ func TestCatalogRefreshFailureKeepsPreviousSnapshot(t *testing.T) {
 	}
 }
 
+func TestCatalogRefreshChecksumFailureKeepsPreviousSnapshot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	artifact := catalogFixture(t, map[string]string{"key": "value"})
+	if _, err := catalogpublish.Publish(ctx, dsn, artifact, "reviewed", catalogpublish.PublishOptions{OSUser: "tester"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = st.Close() }() //nolint:errcheck // test cleanup
+	if err := st.RefreshCatalogSnapshot(ctx); err != nil {
+		t.Fatalf("initial refresh: %v", err)
+	}
+	prior := st.CatalogSnapshot()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `
+		UPDATE language_catalog_packs
+		SET current_content_sha256 = set_byte(current_content_sha256, 0, (get_byte(current_content_sha256, 0) + 1) % 256)
+		WHERE lang_pack = 'tdesktop' AND lang_code = 'en'
+	`); err != nil {
+		_ = conn.Close(ctx) //nolint:errcheck // close after setup failure
+		t.Fatalf("corrupt checksum: %v", err)
+	}
+	if err := conn.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := st.RefreshCatalogSnapshot(ctx); err == nil {
+		t.Fatal("refresh succeeded with an invalid English checksum")
+	}
+	if got := st.CatalogSnapshot(); got != prior {
+		t.Fatalf("failed refresh replaced prior snapshot: got %p want %p", got, prior)
+	}
+}
+
+func TestCatalogRefreshLatestChangeMismatchKeepsPreviousSnapshot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	first := catalogFixture(t, map[string]string{"key": "first"})
+	if _, err := catalogpublish.Publish(ctx, dsn, first, "reviewed-one", catalogpublish.PublishOptions{OSUser: "tester"}); err != nil {
+		t.Fatalf("publish first: %v", err)
+	}
+	second := catalogFixture(t, map[string]string{"key": "second"})
+	if _, err := catalogpublish.Publish(ctx, dsn, second, "reviewed-two", catalogpublish.PublishOptions{OSUser: "tester"}); err != nil {
+		t.Fatalf("publish second: %v", err)
+	}
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = st.Close() }() //nolint:errcheck // test cleanup
+	if err := st.RefreshCatalogSnapshot(ctx); err != nil {
+		t.Fatalf("initial refresh: %v", err)
+	}
+	prior := st.CatalogSnapshot()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `
+		UPDATE language_catalog_changes
+		SET value = 'corrupt'
+		WHERE lang_pack = 'tdesktop' AND lang_code = 'en' AND version = 2 AND key = 'key'
+	`); err != nil {
+		_ = conn.Close(ctx) //nolint:errcheck // close after setup failure
+		t.Fatalf("corrupt latest change: %v", err)
+	}
+	if err := conn.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := st.RefreshCatalogSnapshot(ctx); err == nil {
+		t.Fatal("refresh succeeded with a latest change that disagrees with current strings")
+	}
+	if got := st.CatalogSnapshot(); got != prior {
+		t.Fatalf("failed refresh replaced prior snapshot: got %p want %p", got, prior)
+	}
+	if diff := prior.Pack(catalog.PackTDesktop, catalog.LanguageEnglish).Difference(1); len(diff.Entries) != 1 || diff.Entries[0].Value != "second" {
+		t.Fatalf("previous snapshot difference = %+v, want validated current value", diff)
+	}
+}
+
+func TestCatalogRefreshLatestTombstoneMismatchKeepsPreviousSnapshot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	first := catalogFixture(t, map[string]string{"removed": "value"})
+	if _, err := catalogpublish.Publish(ctx, dsn, first, "reviewed-one", catalogpublish.PublishOptions{OSUser: "tester"}); err != nil {
+		t.Fatalf("publish first: %v", err)
+	}
+	second := catalogFixture(t, map[string]string{})
+	if _, err := catalogpublish.Publish(ctx, dsn, second, "reviewed-two", catalogpublish.PublishOptions{OSUser: "tester"}); err != nil {
+		t.Fatalf("publish second: %v", err)
+	}
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = st.Close() }() //nolint:errcheck // test cleanup
+	if err := st.RefreshCatalogSnapshot(ctx); err != nil {
+		t.Fatalf("initial refresh: %v", err)
+	}
+	prior := st.CatalogSnapshot()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `
+		DELETE FROM language_catalog_tombstones
+		WHERE lang_pack = 'tdesktop' AND lang_code = 'en' AND version = 2 AND key = 'removed'
+	`); err != nil {
+		_ = conn.Close(ctx) //nolint:errcheck // close after setup failure
+		t.Fatalf("remove latest tombstone: %v", err)
+	}
+	if err := conn.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := st.RefreshCatalogSnapshot(ctx); err == nil {
+		t.Fatal("refresh succeeded without the current deletion tombstone")
+	}
+	if got := st.CatalogSnapshot(); got != prior {
+		t.Fatalf("failed refresh replaced prior snapshot: got %p want %p", got, prior)
+	}
+}
+
 func TestCatalogSnapshotRejectsCurrentRowsWithFutureChangeVersion(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -157,12 +287,8 @@ func TestCatalogSnapshotRejectsCurrentRowsWithFutureChangeVersion(t *testing.T) 
 		t.Fatalf("open store: %v", err)
 	}
 	defer func() { _ = st.Close() }() //nolint:errcheck // test cleanup
-	snapshot, err := st.LoadCatalogSnapshot(ctx)
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-	if snapshot.Pack(catalog.PackTDesktop, catalog.LanguageEnglish) != nil {
-		t.Fatal("corrupt current row was loaded")
+	if _, err := st.LoadCatalogSnapshot(ctx); err == nil {
+		t.Fatal("corrupt current row did not fail snapshot validation")
 	}
 }
 

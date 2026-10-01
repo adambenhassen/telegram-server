@@ -43,9 +43,8 @@ type catalogCurrentRow struct {
 	lastChangedVersion int64
 }
 
-// LoadCatalogSnapshot reads all catalog state in one repeatable-read,
-// read-only transaction. A corrupt pack is excluded without preventing a
-// separate valid English pack from loading.
+// LoadCatalogSnapshot reads a validated current snapshot and its latest
+// per-key history in one repeatable-read, read-only transaction.
 func (s *Store) LoadCatalogSnapshot(ctx context.Context) (*catalog.Snapshot, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -91,10 +90,25 @@ func (s *Store) LoadCatalogSnapshot(ctx context.Context) (*catalog.Snapshot, err
 		if !ok {
 			currentRows = []catalogCurrentRow{}
 		}
+		latestChanges := make(map[string]catalog.Change, len(changes[id]))
+		for _, change := range changes[id] {
+			latestChanges[change.Entry.Key] = change
+		}
+		latestTombstones := make(map[string]catalog.Change, len(tombstones[id]))
+		for _, tombstone := range tombstones[id] {
+			latestTombstones[tombstone.Entry.Key] = tombstone
+		}
 		entries := make([]catalog.Entry, 0, len(currentRows))
 		validCurrent := true
 		for _, currentRow := range currentRows {
-			if currentRow.lastChangedVersion <= 0 || currentRow.lastChangedVersion > row.version || !validCatalogEntry(currentRow.entry, currentRow.deleted) {
+			change, hasChange := latestChanges[currentRow.entry.Key]
+			tombstone, hasTombstone := latestTombstones[currentRow.entry.Key]
+			if currentRow.lastChangedVersion <= 0 || currentRow.lastChangedVersion > row.version ||
+				!validCatalogEntry(currentRow.entry, currentRow.deleted) ||
+				!hasChange || change.Version != currentRow.lastChangedVersion ||
+				change.Deleted != currentRow.deleted || !catalogEntriesEqual(change.Entry, currentRow.entry) ||
+				(currentRow.deleted && (!hasTombstone || tombstone.Version != currentRow.lastChangedVersion)) ||
+				(!currentRow.deleted && hasTombstone && tombstone.Version >= currentRow.lastChangedVersion) {
 				validCurrent = false
 				break
 			}
@@ -103,8 +117,7 @@ func (s *Store) LoadCatalogSnapshot(ctx context.Context) (*catalog.Snapshot, err
 			}
 		}
 		if !validCurrent {
-			s.log.Warn("catalog pack rejected", "reason", "current strings validation failed")
-			continue
+			return nil, fmt.Errorf("catalog snapshot %s/%s: current state and latest history disagree", id.pack, id.lang)
 		}
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
 		artifact := catalog.Artifact{
@@ -126,27 +139,12 @@ func (s *Store) LoadCatalogSnapshot(ctx context.Context) (*catalog.Snapshot, err
 		contentSHA, contentErr := artifact.ContentSHA256()
 		manifestSHA, manifestErr := artifact.ManifestSHA256()
 		if contentErr != nil || manifestErr != nil || artifact.Validate() != nil || !bytes.Equal(row.contentSHA, mustDecodeSHA(contentSHA)) || !bytes.Equal(row.manifestSHA, mustDecodeSHA(manifestSHA)) {
-			s.log.Warn("catalog pack rejected", "reason", "validation failed")
-			continue
+			return nil, fmt.Errorf("catalog snapshot %s/%s: checksum or artifact validation failed", id.pack, id.lang)
 		}
 		if len(row.contentSHA) != 32 || len(row.manifestSHA) != 32 || len(row.sourceSHA) != 32 {
-			s.log.Warn("catalog pack rejected", "reason", "checksum failed")
-			continue
+			return nil, fmt.Errorf("catalog snapshot %s/%s: checksum length invalid", id.pack, id.lang)
 		}
 		packChanges := append([]catalog.Change(nil), changes[id]...)
-		for _, tombstone := range tombstones[id] {
-			found := false
-			for _, change := range packChanges {
-				if change.Version == tombstone.Version && change.Entry.Key == tombstone.Entry.Key {
-					found = true
-					break
-				}
-			}
-			if !found {
-				packChanges = append(packChanges, tombstone)
-			}
-		}
-		packChanges = latestCatalogChanges(packChanges)
 		validHistory := true
 		for _, change := range packChanges {
 			if change.Version > row.version || change.Version <= 0 || !validCatalogEntry(change.Entry, change.Deleted) {
@@ -156,8 +154,7 @@ func (s *Store) LoadCatalogSnapshot(ctx context.Context) (*catalog.Snapshot, err
 		}
 		oldestVersion := oldest[id]
 		if !validHistory || oldestVersion <= 0 || oldestVersion > row.version {
-			s.log.Warn("catalog pack rejected", "reason", "history validation failed")
-			continue
+			return nil, fmt.Errorf("catalog snapshot %s/%s: history validation failed", id.pack, id.lang)
 		}
 		sort.Slice(packChanges, func(i, j int) bool {
 			if packChanges[i].Version != packChanges[j].Version {
@@ -184,21 +181,6 @@ func (s *Store) LoadCatalogSnapshot(ctx context.Context) (*catalog.Snapshot, err
 		return result.Packs[i].LanguageCode < result.Packs[j].LanguageCode
 	})
 	return result, nil
-}
-
-func latestCatalogChanges(changes []catalog.Change) []catalog.Change {
-	latest := make(map[string]catalog.Change, len(changes))
-	for _, change := range changes {
-		previous, ok := latest[change.Entry.Key]
-		if !ok || change.Version > previous.Version {
-			latest[change.Entry.Key] = change
-		}
-	}
-	result := make([]catalog.Change, 0, len(latest))
-	for _, change := range latest {
-		result = append(result, change)
-	}
-	return result
 }
 
 // RefreshCatalogSnapshot atomically replaces the previous valid snapshot only
@@ -249,10 +231,17 @@ func loadCatalogPackRows(ctx context.Context, tx pgx.Tx) ([]catalogPackRow, erro
 
 func loadCatalogOldestVersions(ctx context.Context, tx pgx.Tx) (map[catalogPackID]int64, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT lang_pack, lang_code, version
-		FROM language_catalog_versions
-		ORDER BY lang_pack, lang_code, version
-	`)
+		SELECT p.lang_pack, p.lang_code,
+		       COALESCE((
+		           SELECT v.version
+		           FROM language_catalog_versions v
+		           WHERE v.lang_pack = p.lang_pack AND v.lang_code = p.lang_code
+		           ORDER BY v.version
+	           LIMIT 1
+	       ), 0)
+		FROM language_catalog_packs p
+		WHERE p.lang_code = $1
+	`, catalog.LanguageEnglish)
 	if err != nil {
 		return nil, fmt.Errorf("catalog snapshot versions: %w", err)
 	}
@@ -264,9 +253,7 @@ func loadCatalogOldestVersions(ctx context.Context, tx pgx.Tx) (map[catalogPackI
 		if err := rows.Scan(&id.pack, &id.lang, &version); err != nil {
 			return nil, fmt.Errorf("catalog snapshot version row: %w", err)
 		}
-		if result[id] == 0 || version < result[id] {
-			result[id] = version
-		}
+		result[id] = version
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("catalog snapshot version rows: %w", err)
@@ -280,7 +267,8 @@ func loadCatalogCurrentStrings(ctx context.Context, tx pgx.Tx) (map[catalogPackI
 		       plural_two, plural_few, plural_many, plural_other, deleted,
 		       last_changed_version
 		FROM language_catalog_current_strings
-	`)
+		WHERE lang_code = $1
+	`, catalog.LanguageEnglish)
 	if err != nil {
 		return nil, fmt.Errorf("catalog snapshot current strings: %w", err)
 	}
@@ -304,10 +292,25 @@ func loadCatalogCurrentStrings(ctx context.Context, tx pgx.Tx) (map[catalogPackI
 
 func loadCatalogChanges(ctx context.Context, tx pgx.Tx) (map[catalogPackID][]catalog.Change, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT lang_pack, lang_code, version, key, kind, value, plural_zero,
-		       plural_one, plural_two, plural_few, plural_many, plural_other, deleted
-		FROM language_catalog_changes
-	`)
+		SELECT latest.lang_pack, latest.lang_code, latest.version, latest.key,
+		       latest.kind, latest.value, latest.plural_zero, latest.plural_one,
+		       latest.plural_two, latest.plural_few, latest.plural_many,
+		       latest.plural_other, latest.deleted
+		FROM language_catalog_current_strings current
+		JOIN LATERAL (
+		    SELECT change.lang_pack, change.lang_code, change.version, change.key,
+		           change.kind, change.value, change.plural_zero, change.plural_one,
+		           change.plural_two, change.plural_few, change.plural_many,
+		           change.plural_other, change.deleted
+		    FROM language_catalog_changes change
+		    WHERE change.lang_pack = current.lang_pack
+		      AND change.lang_code = current.lang_code
+		      AND change.key = current.key
+		    ORDER BY change.version DESC
+		    LIMIT 1
+		) latest ON true
+		WHERE current.lang_code = $1
+	`, catalog.LanguageEnglish)
 	if err != nil {
 		return nil, fmt.Errorf("catalog snapshot changes: %w", err)
 	}
@@ -331,9 +334,19 @@ func loadCatalogChanges(ctx context.Context, tx pgx.Tx) (map[catalogPackID][]cat
 
 func loadCatalogTombstones(ctx context.Context, tx pgx.Tx) (map[catalogPackID][]catalog.Change, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT lang_pack, lang_code, version, key
-		FROM language_catalog_tombstones
-	`)
+		SELECT latest.lang_pack, latest.lang_code, latest.version, latest.key
+		FROM language_catalog_current_strings current
+		JOIN LATERAL (
+		    SELECT tombstone.lang_pack, tombstone.lang_code, tombstone.version, tombstone.key
+		    FROM language_catalog_tombstones tombstone
+		    WHERE tombstone.lang_pack = current.lang_pack
+		      AND tombstone.lang_code = current.lang_code
+		      AND tombstone.key = current.key
+		    ORDER BY tombstone.version DESC
+		    LIMIT 1
+		) latest ON true
+		WHERE current.lang_code = $1
+	`, catalog.LanguageEnglish)
 	if err != nil {
 		return nil, fmt.Errorf("catalog snapshot tombstones: %w", err)
 	}
@@ -417,6 +430,28 @@ func catalogTextPointer(value pgtype.Text) *string {
 	}
 	result := value.String
 	return &result
+}
+
+func catalogEntriesEqual(left, right catalog.Entry) bool {
+	if left.Key != right.Key || left.Value != right.Value || (left.Plural == nil) != (right.Plural == nil) {
+		return false
+	}
+	if left.Plural == nil {
+		return true
+	}
+	return catalogStringPointersEqual(left.Plural.Zero, right.Plural.Zero) &&
+		catalogStringPointersEqual(left.Plural.One, right.Plural.One) &&
+		catalogStringPointersEqual(left.Plural.Two, right.Plural.Two) &&
+		catalogStringPointersEqual(left.Plural.Few, right.Plural.Few) &&
+		catalogStringPointersEqual(left.Plural.Many, right.Plural.Many) &&
+		left.Plural.Other == right.Plural.Other
+}
+
+func catalogStringPointersEqual(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func validCatalogEntry(entry catalog.Entry, deleted bool) bool {
