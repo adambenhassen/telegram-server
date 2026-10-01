@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,8 +26,12 @@ import (
 
 func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
+	deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancelDeadline)
+	deadlineCtx = withRegistrySnapshotState(deadlineCtx)
+	ctx, cancelFailure := context.WithCancelCause(deadlineCtx)
+	t.Cleanup(func() { cancelFailure(nil) })
+	failures := newClientFailureSignal(cancelFailure)
 
 	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
 	if err != nil {
@@ -95,53 +101,65 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	}
 
 	type runningClient struct {
-		cmds    chan command
-		err     chan error
-		ready   chan struct{}
-		idCh    chan int64
-		id      int64
-		manager *updates.Manager
+		cmds      chan command
+		ready     chan struct{}
+		idCh      chan int64
+		id        int64
+		manager   *updates.Manager
+		lifecycle *clientLifecycle
+		options   clientRunOptions
+		stop      sync.Once
 	}
-	launchClient := func(phone string, pushes *updateCollector, manager *updates.Manager, sess *session.StorageMemory, forget bool) *runningClient {
-		run := &runningClient{cmds: make(chan command), err: make(chan error, 1), ready: make(chan struct{}), idCh: make(chan int64, 1), manager: manager}
+	var stopClient func(*runningClient)
+	launchClient := func(label, phone string, pushes *updateCollector, manager *updates.Manager, sess *session.StorageMemory, forget bool, options ...clientRunOptions) *runningClient {
+		run := &runningClient{cmds: make(chan command), ready: make(chan struct{}, 1), idCh: make(chan int64, 1), manager: manager}
+		if len(options) > 0 {
+			run.options = options[0]
+		}
 		client := newClient(clientUpdates{manager: manager, pushes: pushes}, sess)
-		go func() {
-			run.err <- runManagedInteractive(ctx, client, flowFor(phone), run.idCh, run.ready, run.cmds, manager, forget)
-		}()
+		run.lifecycle = startClientLifecycle(ctx, label, failures, func(phase *clientPhaseState) error {
+			return runClientWithOptions(phase, run.options, func() error {
+				return runManagedInteractive(ctx, client, flowFor(phone), run.idCh, run.ready, run.cmds, manager, forget, phase)
+			})
+		})
+		t.Cleanup(func() { stopClient(run) })
 		return run
 	}
-	waitClient := func(phone string, run *runningClient) {
+	waitClient := func(run *runningClient) {
+		loginStarted := time.Now()
 		select {
 		case run.id = <-run.idCh:
 		case <-ctx.Done():
-			t.Fatalf("login %s timeout: %v", phone, ctx.Err())
+			t.Fatalf("%s", run.lifecycle.diagnostic("login", time.Since(loginStarted), contextFailureDescription(ctx)))
+		case <-run.lifecycle.result.done:
+			t.Fatalf("%s", run.lifecycle.diagnostic("login", time.Since(loginStarted), "cause="+safeErrorClass(run.lifecycle.result.error())))
 		}
+		managerStarted := time.Now()
 		select {
 		case <-run.ready:
 		case <-ctx.Done():
-			t.Fatalf("update manager %s startup timeout: %v", phone, ctx.Err())
+			t.Fatalf("%s", run.lifecycle.diagnostic("manager readiness", time.Since(managerStarted), contextFailureDescription(ctx)))
+		case <-run.lifecycle.result.done:
+			t.Fatalf("%s", run.lifecycle.diagnostic("manager readiness", time.Since(managerStarted), "cause="+safeErrorClass(run.lifecycle.result.error())))
 		}
 	}
 	exec := func(run *runningClient, fn func(context.Context, *tg.Client) error) error {
+		started := time.Now()
 		done := make(chan error, 1)
 		select {
 		case run.cmds <- command{fn: fn, done: done}:
 		case <-ctx.Done():
-			t.Fatalf("command enqueue timeout: %v", ctx.Err())
+			t.Fatalf("%s", run.lifecycle.diagnostic("command", time.Since(started), contextFailureDescription(ctx)))
+		case <-run.lifecycle.result.done:
+			return errors.New(run.lifecycle.diagnostic("command", time.Since(started), "cause="+safeErrorClass(run.lifecycle.result.error())))
 		}
-		select {
-		case err := <-done:
-			return err
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return waitForClientCommand(ctx, run.lifecycle, done, started)
 	}
-	stopClient := func(run *runningClient) {
-		close(run.cmds)
-		if err := <-run.err; err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("client run: %v", err)
-		}
-		run.manager.Reset()
+	stopClient = func(run *runningClient) {
+		run.stop.Do(func() {
+			stopClientLifecycle(t, run.lifecycle, func() { close(run.cmds) })
+			run.manager.Reset()
+		})
 	}
 
 	sessA1, sessA2, sessB1, sessB2 := &session.StorageMemory{}, &session.StorageMemory{}, &session.StorageMemory{}, &session.StorageMemory{}
@@ -151,20 +169,20 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	pushB1, pushB2 := newUpdateCollector(), newUpdateCollector()
 	managerA1, managerA2 := updates.New(updates.Config{Handler: collA1}), updates.New(updates.Config{Handler: collA2})
 	managerB1, managerB2 := updates.New(updates.Config{Handler: collB1}), updates.New(updates.Config{Handler: collB2})
-	a1 := launchClient(phoneA, pushA1, managerA1, sessA1, true)
-	waitClient("A1", a1)
-	a2 := launchClient(phoneA, pushA2, managerA2, sessA2, true)
-	waitClient("A2", a2)
-	b1 := launchClient(phoneB, pushB1, managerB1, sessB1, true)
-	waitClient("B1", b1)
-	b2 := launchClient(phoneB, pushB2, managerB2, sessB2, true)
-	waitClient("B2", b2)
+	a1 := launchClient("A1", phoneA, pushA1, managerA1, sessA1, true)
+	waitClient(a1)
+	a2 := launchClient("A2", phoneA, pushA2, managerA2, sessA2, true)
+	waitClient(a2)
+	b1 := launchClient("B1", phoneB, pushB1, managerB1, sessB1, true)
+	waitClient(b1)
+	b2 := launchClient("B2", phoneB, pushB2, managerB2, sessB2, true)
+	waitClient(b2)
 	collC, pushC := newUpdateCollector(), newUpdateCollector()
 	managerC := updates.New(updates.Config{Handler: collC})
-	c := launchClient(phoneC, pushC, managerC, &session.StorageMemory{}, true)
-	waitClient("C", c)
-	waitForDistinctAuthKeys(t, ctx, registry, b1.id, 2, "B")
-	waitForDistinctAuthKeys(t, ctx, registry, a1.id, 2, "A")
+	c := launchClient("C", phoneC, pushC, managerC, &session.StorageMemory{}, true)
+	waitClient(c)
+	waitForDistinctAuthKeys(t, ctx, registry, b1.id, 2, "B1", b1.lifecycle)
+	waitForDistinctAuthKeys(t, ctx, registry, a1.id, 2, "A1", a1.lifecycle)
 
 	var warmup tg.UpdatesClass
 	if err := exec(a1, func(ctx context.Context, api *tg.Client) error {
@@ -461,8 +479,8 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		t.Fatalf("A recovery pts = %d, want 7 after two reads", recoveryPts)
 	}
 	pushB1Reconnected := newUpdateCollector()
-	b1Reconnected := launchClient(phoneB, pushB1Reconnected, managerB1, sessB1, false)
-	waitClient(phoneB, b1Reconnected)
+	b1Reconnected := launchClient("B1", phoneB, pushB1Reconnected, managerB1, sessB1, false)
+	waitClient(b1Reconnected)
 	assertDifferenceMessage(t, ctx, collB1, "A to B offline recovery", 4, false, a1.id, "B1 Manager recovery difference")
 
 	var senderDifference tg.UpdatesDifferenceClass
@@ -640,31 +658,25 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	stopClient(c)
 }
 
-func waitForDistinctAuthKeys(t *testing.T, ctx context.Context, registry *mtproto.SessionRegistry, userID int64, want int, label string) []*mtproto.Conn {
+func waitForDistinctAuthKeys(t *testing.T, ctx context.Context, registry *mtproto.SessionRegistry, userID int64, want int, label string, lifecycle *clientLifecycle) {
 	t.Helper()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	started := time.Now()
+	var last registrySnapshot
+	lastValid := false
 	for {
-		conns := registry.Conns(userID)
-		if len(conns) == want {
-			keys := make(map[int64]struct{}, len(conns))
-			ready := true
-			for _, conn := range conns {
-				keyID := conn.AuthKeyID()
-				if keyID == 0 {
-					ready = false
-					break
-				}
-				keys[keyID] = struct{}{}
-			}
-			if ready && len(keys) == want {
-				return conns
+		if snapshot, ok := snapshotRegistry(ctx, registry, userID); ok {
+			last, lastValid = snapshot, true
+			lifecycle.rememberRegistrySnapshot(snapshot)
+			if snapshot.connections == want && snapshot.zeroKeys == 0 && snapshot.distinctKeys == want {
+				return
 			}
 		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			t.Fatalf("%s registry readiness: got %d connections with distinct keys after polling: %v", label, len(conns), ctx.Err())
+			t.Fatalf("%s registry readiness failed after %s (%s; %s)", label, time.Since(started).Round(time.Millisecond), registrySnapshotDescription(last, lastValid), contextFailureDescription(ctx))
 		}
 	}
 }
@@ -677,13 +689,13 @@ func drainPushBacklog(t *testing.T, ctx context.Context, coll *updateCollector) 
 			select {
 			case <-coll.points:
 			case <-ctx.Done():
-				t.Fatalf("draining push points: %v", ctx.Err())
+				t.Fatalf("draining push points: %s", contextFailureDescription(ctx))
 			}
 		case <-coll.readOutbox:
 			select {
 			case <-coll.readOutboxPts:
 			case <-ctx.Done():
-				t.Fatalf("draining push read marker pts: %v", ctx.Err())
+				t.Fatalf("draining push read marker pts: %s", contextFailureDescription(ctx))
 			}
 		default:
 			return
@@ -773,7 +785,7 @@ func assertNoMessageFor(t *testing.T, ctx context.Context, updates <-chan *tg.Me
 		t.Fatalf("%s received unexpected message during drain: %+v", label, message)
 	case <-timer.C:
 	case <-ctx.Done():
-		t.Fatalf("waiting for %s drain: %v", label, ctx.Err())
+		t.Fatalf("waiting for %s drain: %s", label, contextFailureDescription(ctx))
 	}
 }
 
@@ -819,11 +831,13 @@ func (h observedManagerHandler) Handle(ctx context.Context, upd tg.UpdatesClass)
 	return h.manager.Handle(ctx, upd)
 }
 
-func runManagedInteractive(ctx context.Context, client *telegram.Client, flow auth.Flow, selfOut chan<- int64, readyOut chan<- struct{}, cmds <-chan command, manager *updates.Manager, forget bool) error {
+func runManagedInteractive(ctx context.Context, client *telegram.Client, flow auth.Flow, selfOut chan<- int64, readyOut chan<- struct{}, cmds <-chan command, manager *updates.Manager, forget bool, phase *clientPhaseState) error {
 	return client.Run(ctx, func(ctx context.Context) error {
+		phase.set("login")
 		if err := client.Auth().IfNecessary(ctx, flow); err != nil {
 			return err
 		}
+		phase.set("self")
 		self, err := client.Self(ctx)
 		if err != nil {
 			return err
@@ -831,49 +845,54 @@ func runManagedInteractive(ctx context.Context, client *telegram.Client, flow au
 		selfOut <- self.ID
 
 		managerCtx, cancelManager := context.WithCancel(ctx)
-		defer cancelManager()
+		var managerStopping atomic.Bool
+		defer func() {
+			managerStopping.Store(true)
+			cancelManager()
+		}()
 		managerReady := make(chan struct{})
-		managerDone := make(chan error, 1)
+		managerResult := newTerminalResult()
+		var onStart sync.Once
 		go func() {
-			managerDone <- manager.Run(managerCtx, client.API(), self.ID, updates.AuthOptions{
+			managerErr := manager.Run(managerCtx, client.API(), self.ID, updates.AuthOptions{
 				Forget: forget,
 				OnStart: func(context.Context) {
-					close(managerReady)
+					onStart.Do(func() { close(managerReady) })
 				},
 			})
-		}()
-		select {
-		case <-managerReady:
-			readyOut <- struct{}{}
-		case err := <-managerDone:
-			if err == nil {
-				return errors.New("update manager stopped before startup")
+			if managerErr == nil && !managerStopping.Load() {
+				managerErr = errUnexpectedNilExit
 			}
-			return err
-		case <-ctx.Done():
+			managerResult.complete(managerErr)
+		}()
+		stopManager := func() error {
+			managerStopping.Store(true)
+			cancelManager()
+			managerErr := managerResult.error()
+			if managerErr != nil && !errors.Is(managerErr, context.Canceled) {
+				return managerErr
+			}
 			return nil
 		}
-
-		for {
+		phase.set("manager readiness")
+		select {
+		case <-managerReady:
 			select {
-			case <-ctx.Done():
-				cancelManager()
-				err := <-managerDone
-				if err != nil && !errors.Is(err, context.Canceled) {
-					return err
-				}
-				return nil
-			case c, ok := <-cmds:
-				if !ok {
-					cancelManager()
-					err := <-managerDone
-					if err != nil && !errors.Is(err, context.Canceled) {
-						return err
-					}
-					return nil
-				}
-				c.done <- c.fn(ctx, client.API())
+			case readyOut <- struct{}{}:
+			default:
 			}
+			phase.set("idle")
+		case <-managerResult.done:
+			phase.set("update manager")
+			return managerResult.error()
+		case <-ctx.Done():
+			if err := stopManager(); err != nil {
+				return err
+			}
+			return nil
 		}
+		return runManagedCommands(ctx, cmds, managerResult, phase, func(commandCtx context.Context, c command) error {
+			return c.fn(commandCtx, client.API())
+		}, stopManager)
 	})
 }

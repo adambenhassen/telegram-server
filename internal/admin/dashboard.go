@@ -659,6 +659,7 @@ func dashboardNotifications(m MetricsResponse, capabilities dashboardCapabilitie
 		{ID: "notify-tg_encrypted_msg", Label: "tg_encrypted_msg", Value: safeCount(m.NotifyChannels.EncryptedMsg)},
 		{ID: "notify-tg_reactions", Label: "tg_reactions", Value: safeCount(m.NotifyChannels.Reactions)},
 		{ID: "notify-tg_pinned", Label: "tg_pinned", Value: safeCount(m.NotifyChannels.Pinned)},
+		{ID: "notify-tg_dialog_filters", Label: "tg_dialog_filters", Value: safeCount(m.NotifyChannels.DialogFilters)},
 	}
 	if channelsUnavailable {
 		markUninstrumentedRows(data.Rows)
@@ -706,6 +707,7 @@ func dashboardDenials(m MetricsResponse, capabilities dashboardCapabilities) Das
 		{ID: "denial-password_proof", Label: "password_proof", Value: safeCount(m.RateLimitDenialsBySurface.PasswordProof)},
 		{ID: "denial-get_password", Label: "get_password", Value: safeCount(m.RateLimitDenialsBySurface.GetPassword)},
 		{ID: "denial-update_profile", Label: "update_profile", Value: safeCount(m.RateLimitDenialsBySurface.UpdateProfile)},
+		{ID: "denial-dialog_filter_mutation", Label: "dialog_filter_mutation", Value: safeCount(m.RateLimitDenialsBySurface.DialogFilterMutation)},
 	}
 	if capabilities.unavailable("rate_limit_denials_by_surface") {
 		markUninstrumentedRows(data.Rows)

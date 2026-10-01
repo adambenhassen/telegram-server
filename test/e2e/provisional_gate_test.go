@@ -51,7 +51,12 @@ func TestProvisionalGateProbe(t *testing.T) {
 
 	codes := newCodeSink()
 	const dcID = 2
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	blobs, err := blob.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
@@ -59,11 +64,6 @@ func TestProvisionalGateProbe(t *testing.T) {
 	handler := api.New(st, dcID, tgcfg, codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
 
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
 	addr, ok := ln.Addr().(*net.TCPAddr)
 	if !ok {
 		t.Fatalf("listener addr type = %T", ln.Addr())

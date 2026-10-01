@@ -437,6 +437,44 @@ verifier and a closed, unassigned administration singleton. A retry after a
 successful assignment is a no-op; account, username, and verifier data are
 never created or changed.
 
+### 5d. Reset an existing username password from the local CLI
+
+`telegramd admin set-password` is a local operator command. It has no RPC or
+admin-dashboard route. Run it inside the deployment container with a protected
+file on stdin; it refuses terminal input, password flags, empty input, and
+multi-line input. The command accepts one line and removes one trailing LF or
+CRLF. It does not validate registration policy or start server listeners, so it
+also works when `TG_REGISTRATION=open`.
+
+On the LXC, create a root-only directory and credential file, then pass the file
+to the container through stdin:
+
+```bash
+install -d -o root -g root -m 0700 /root/telegram-password-reset
+umask 077
+openssl rand -base64 24 > /root/telegram-password-reset/tester1.password
+chmod 0600 /root/telegram-password-reset/tester1.password
+docker compose exec -T telegramd telegramd admin set-password --username tester1 \
+  < /root/telegram-password-reset/tester1.password
+```
+
+The handle may be supplied with or without `@`, and matching is ASCII
+case-insensitive. Success writes only the canonical handle and user ID to
+stderr. The new password must not appear in argv, environment variables, shell
+history, logs, issue comments, or pull requests. Keep the credential file
+root-owned and private; hand it to the account owner over the deployment's
+approved private channel, wait for login confirmation, then remove it.
+
+Before a production reset, take a recoverable PostgreSQL backup containing the
+current `public.user_passwords` row and test the restore procedure in an
+isolated database. If the backup tool cannot filter individual rows, back up
+the whole table rather than relying on an unsupported row-filter option. Keep
+the backup root-only and the encryption master key under its separate secret
+handling policy. If login verification fails, restore only the affected row in
+a reviewed transaction, verify that its old verifier decrypts with the original
+master key, and confirm the prior login before removing the backup. Do not
+blindly replay a whole-table dump into a live database.
+
 ## 6. Telegram Desktop, patched
 
 Stock Telegram Desktop has no user-facing way to change either the DC address

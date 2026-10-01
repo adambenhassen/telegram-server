@@ -35,6 +35,10 @@ func TestSmoke(t *testing.T) {
 		t.Parallel()
 		testSmokeSavedMessages(t)
 	})
+	t.Run("dialog-filters", func(t *testing.T) {
+		t.Parallel()
+		testSmokeDialogFilters(t)
+	})
 	t.Run("basic-group", func(t *testing.T) {
 		t.Parallel()
 		testSmokeBasicGroup(t)
@@ -42,6 +46,10 @@ func TestSmoke(t *testing.T) {
 	t.Run("channel", func(t *testing.T) {
 		t.Parallel()
 		testSmokeChannel(t)
+	})
+	t.Run("megagroup-slow-mode", func(t *testing.T) {
+		t.Parallel()
+		testSmokeMegagroupSlowMode(t)
 	})
 	t.Run("contacts-search", func(t *testing.T) {
 		t.Parallel()
@@ -51,6 +59,10 @@ func TestSmoke(t *testing.T) {
 		t.Parallel()
 		testSmokeUsernameRegistration(t)
 	})
+	t.Run("username-password-reset", func(t *testing.T) {
+		t.Parallel()
+		testSmokeUsernamePasswordReset(t)
+	})
 }
 
 func testSmokeOneToOne(t *testing.T) {
@@ -59,12 +71,12 @@ func testSmokeOneToOne(t *testing.T) {
 	const phoneA, phoneB = "+15551046001", "+15551046002"
 	seedPhoneUsers(t, f.ctx, f.store, phoneA, phoneB)
 
-	a1 := newSmokeClient(t, f, phoneA)
-	a2 := newSmokeClient(t, f, phoneA)
-	b1 := newSmokeClient(t, f, phoneB)
-	b2 := newSmokeClient(t, f, phoneB)
-	waitForDistinctAuthKeys(t, f.ctx, f.registry, a1.id, 2, "A")
-	waitForDistinctAuthKeys(t, f.ctx, f.registry, b1.id, 2, "B")
+	a1 := newSmokeClient(t, f, "A1", phoneA)
+	a2 := newSmokeClient(t, f, "A2", phoneA)
+	b1 := newSmokeClient(t, f, "B1", phoneB)
+	b2 := newSmokeClient(t, f, "B2", phoneB)
+	waitForDistinctAuthKeys(t, f.ctx, f.registry, a1.id, 2, "A1", a1.lifecycle)
+	waitForDistinctAuthKeys(t, f.ctx, f.registry, b1.id, 2, "B1", b1.lifecycle)
 
 	// Seed A's local ID space through a real Saved Messages send, so the two
 	// accounts' IDs differ when they receive the same 1:1 message.
@@ -179,7 +191,7 @@ func testSmokeSavedMessages(t *testing.T) {
 	f := newSmokeFixture(t)
 	const phone = "+15551046003"
 	seedPhoneUsers(t, f.ctx, f.store, phone)
-	client := newSmokeClient(t, f, phone)
+	client := newSmokeClient(t, f, "A1", phone)
 
 	var result tg.UpdatesClass
 	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
@@ -203,12 +215,205 @@ func testSmokeSavedMessages(t *testing.T) {
 	assertNoMessageFor(t, f.ctx, client.seen.newMsg, "Saved Messages session")
 }
 
+func testSmokeDialogFilters(t *testing.T) {
+	t.Helper()
+	f := newSmokeFixture(t)
+	const phone, otherPhone = "+15551049001", "+15551049002"
+	seedPhoneUsers(t, f.ctx, f.store, phone, otherPhone)
+	client := newSmokeClient(t, f, "A1", phone)
+	otherSession := newSmokeClient(t, f, "A2", phone)
+	otherOwner := newSmokeClient(t, f, "B1", otherPhone)
+	var appConfig *tg.HelpAppConfig
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		result, err := api.HelpGetAppConfig(ctx, 0)
+		if err != nil {
+			return err
+		}
+		var ok bool
+		appConfig, ok = result.(*tg.HelpAppConfig)
+		if !ok {
+			return errors.New("help.getAppConfig returned no config")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("help.getAppConfig: %v", err)
+	}
+	config, ok := appConfig.Config.(*tg.JSONObject)
+	if !ok {
+		t.Fatalf("app config = %T, want *tg.JSONObject", appConfig.Config)
+	}
+	filtersEnabled := false
+	filtersEnabledFound := false
+	for _, value := range config.Value {
+		if value.Key != "dialog_filters_enabled" {
+			continue
+		}
+		if filtersEnabledFound {
+			t.Fatal("app config repeats dialog_filters_enabled")
+		}
+		enabled, ok := value.Value.(*tg.JSONBool)
+		if !ok {
+			t.Fatalf("dialog_filters_enabled = %T, want *tg.JSONBool", value.Value)
+		}
+		filtersEnabled = enabled.Value
+		filtersEnabledFound = true
+	}
+	if !filtersEnabledFound || !filtersEnabled {
+		t.Fatal("dialog_filters_enabled is missing or false")
+	}
+
+	filter := &tg.DialogFilter{ID: 2, Title: tg.TextWithEntities{Text: "Groups"}, Groups: true}
+	filter.SetFlags()
+	upsert := &tg.MessagesUpdateDialogFilterRequest{ID: 2, Filter: filter}
+	upsert.SetFlags()
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		ok, err := api.MessagesUpdateDialogFilter(ctx, upsert)
+		if err == nil && !ok {
+			return errors.New("folder create returned false")
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("create dialog filter: %v", err)
+	}
+	var listed *tg.MessagesDialogFilters
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		listed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("list dialog filters: %v", err)
+	}
+	if listed.TagsEnabled || len(listed.Filters) != 2 {
+		t.Fatalf("filters = %d, tags enabled = %v, want default plus ID 2 with tags disabled", len(listed.Filters), listed.TagsEnabled)
+	}
+	custom, ok := listed.Filters[1].(*tg.DialogFilter)
+	if !ok || custom.ID != 2 || custom.Title.Text != "Groups" || !custom.Groups {
+		t.Fatalf("listed custom filter = %#v, want ID 2 Groups", listed.Filters[1])
+	}
+
+	edit := &tg.DialogFilter{ID: 2, Title: tg.TextWithEntities{Text: "Bots"}, Bots: true}
+	edit.SetFlags()
+	editRequest := &tg.MessagesUpdateDialogFilterRequest{ID: 2, Filter: edit}
+	editRequest.SetFlags()
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		ok, err := api.MessagesUpdateDialogFilter(ctx, editRequest)
+		if err == nil && !ok {
+			return errors.New("folder edit returned false")
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("edit dialog filter: %v", err)
+	}
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		listed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("list edited dialog filters: %v", err)
+	}
+	custom, ok = listed.Filters[1].(*tg.DialogFilter)
+	if !ok || custom.ID != 2 || custom.Title.Text != "Bots" || !custom.Bots || custom.Groups {
+		t.Fatalf("edited custom filter = %#v, want ID 2 Bots", listed.Filters[1])
+	}
+	var isolated *tg.MessagesDialogFilters
+	if err := otherOwner.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		isolated, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("other owner get dialog filters: %v", err)
+	}
+	if isolated.TagsEnabled || len(isolated.Filters) != 1 {
+		t.Fatalf("other owner saw %d folders with tags enabled=%v, want only All chats", len(isolated.Filters), isolated.TagsEnabled)
+	}
+	if _, ok := isolated.Filters[0].(*tg.DialogFilterDefault); !ok {
+		t.Fatalf("other owner's first folder = %T, want All chats", isolated.Filters[0])
+	}
+
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		ok, err := api.MessagesUpdateDialogFiltersOrder(ctx, []int{2, 0})
+		if err == nil && !ok {
+			return errors.New("folder reorder returned false")
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("reorder dialog filters: %v", err)
+	}
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		listed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("list reordered dialog filters: %v", err)
+	}
+	if folder, ok := listed.Filters[0].(*tg.DialogFilter); !ok || folder.ID != 2 {
+		t.Fatalf("first reordered filter = %#v, want ID 2", listed.Filters[0])
+	}
+	f.restart(t)
+	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		listed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("other authorized session get edited dialog filters after restart: %v", err)
+	}
+	if len(listed.Filters) != 2 {
+		t.Fatalf("other session saw %d filters after restart, want two", len(listed.Filters))
+	}
+	persisted, ok := listed.Filters[0].(*tg.DialogFilter)
+	if !ok || persisted.ID != 2 || persisted.Title.Text != "Bots" || !persisted.Bots || persisted.Groups {
+		t.Fatalf("persisted edited filter = %#v, want ID 2 Bots", listed.Filters[0])
+	}
+	if err := otherOwner.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		isolated, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("other owner get dialog filters after restart: %v", err)
+	}
+	if len(isolated.Filters) != 1 {
+		t.Fatalf("other owner saw %d folders after restart, want only All chats", len(isolated.Filters))
+	}
+	deleteRequest := &tg.MessagesUpdateDialogFilterRequest{ID: 2}
+	deleteRequest.SetFlags()
+	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		ok, err := api.MessagesUpdateDialogFilter(ctx, deleteRequest)
+		if err == nil && !ok {
+			return errors.New("folder delete returned false")
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("delete dialog filter: %v", err)
+	}
+	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		listed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("list dialog filters after delete: %v", err)
+	}
+	if len(listed.Filters) != 1 {
+		t.Fatalf("filters after delete = %d, want only All chats", len(listed.Filters))
+	}
+	var suggested []tg.DialogFilterSuggested
+	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		suggested, err = api.MessagesGetSuggestedDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("get suggested dialog filters: %v", err)
+	}
+	if len(suggested) != 0 {
+		t.Fatalf("suggested filters = %d, want empty", len(suggested))
+	}
+}
+
 func testSmokeBasicGroup(t *testing.T) {
 	t.Helper()
 	f := newSmokeFixture(t)
 	const phoneA, phoneB, phoneC = "+15551047001", "+15551047002", "+15551047003"
 	seedPhoneUsers(t, f.ctx, f.store, phoneA, phoneB, phoneC)
-	a, b, c := newSmokeClient(t, f, phoneA), newSmokeClient(t, f, phoneB), newSmokeClient(t, f, phoneC)
+	a, b, c := newSmokeClient(t, f, "A1", phoneA), newSmokeClient(t, f, "B1", phoneB), newSmokeClient(t, f, "C", phoneC)
 
 	// Offset C's message IDs so the sender's read receipt must use C's local ID,
 	// not the reader's ID for the same group message.
@@ -578,8 +783,8 @@ func testSmokeChannel(t *testing.T) {
 	f := newSmokeFixture(t)
 	const phoneCreator, phoneSubscriber = "+15551048001", "+15551048002"
 	seedPhoneUsers(t, f.ctx, f.store, phoneCreator, phoneSubscriber)
-	creator := newSmokeClient(t, f, phoneCreator)
-	subscriber := newSmokeClient(t, f, phoneSubscriber)
+	creator := newSmokeClient(t, f, "A1", phoneCreator)
+	subscriber := newSmokeClient(t, f, "B1", phoneSubscriber)
 
 	channelID := createBroadcastChannel(t, f.ctx, creator.cmds, "Smoke channel")
 	hash := exportChannelInvite(t, f.ctx, creator.id, creator.cmds, channelID)
@@ -616,7 +821,7 @@ func testSmokeChannel(t *testing.T) {
 		t.Fatalf("subscriber received duplicate channel message: %+v", duplicate.Msg)
 	case <-noDuplicate.C:
 	case <-f.ctx.Done():
-		t.Fatalf("waiting for duplicate channel message check: %v", f.ctx.Err())
+		t.Fatalf("waiting for duplicate channel message check: %s", contextFailureDescription(f.ctx))
 	}
 
 	if err := subscriber.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
@@ -741,8 +946,8 @@ func testSmokeContactsSearch(t *testing.T) {
 	const phoneA, phoneB = "+15551049001", "+15551049002"
 	seedPhoneUsers(t, f.ctx, f.store, phoneA, phoneB)
 
-	a := newSmokeClient(t, f, phoneA)
-	b := newSmokeClient(t, f, phoneB)
+	a := newSmokeClient(t, f, "A1", phoneA)
+	b := newSmokeClient(t, f, "B1", phoneB)
 	if err := f.store.ClaimUsername(f.ctx, a.id, "smokealpha"); err != nil {
 		t.Fatalf("claim A username: %v", err)
 	}
@@ -1067,12 +1272,14 @@ func requireSmokeFullUser(users []tg.UserClass, userID int64, source string) (*t
 
 type smokeFixture struct {
 	ctx      context.Context
+	failures *clientFailureSignal
 	key      *rsa.PrivateKey
 	dsn      string
 	store    *store.Store
 	codes    *multiCodeSink
 	dcID     int
 	port     int
+	listener *acceptCountingListener
 	registry *mtproto.SessionRegistry
 	stop     func()
 	regMode  config.RegistrationMode
@@ -1085,8 +1292,11 @@ func newSmokeFixture(t *testing.T) *smokeFixture {
 
 func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMode) *smokeFixture {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	t.Cleanup(cancel)
+	deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), 90*time.Second)
+	t.Cleanup(cancelDeadline)
+	deadlineCtx = withRegistrySnapshotState(deadlineCtx)
+	ctx, cancelFailure := context.WithCancelCause(deadlineCtx)
+	t.Cleanup(func() { cancelFailure(nil) })
 	key, err := rsakey.LoadOrGenerate(filepath.Join(t.TempDir(), "key.pem"))
 	if err != nil {
 		t.Fatal(err)
@@ -1101,18 +1311,20 @@ func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMo
 			t.Errorf("store close: %v", err)
 		}
 	})
-	f := &smokeFixture{ctx: ctx, key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode}
+	f := &smokeFixture{ctx: ctx, failures: newClientFailureSignal(cancelFailure), key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode}
 	f.start(t, "127.0.0.1:0")
 	return f
 }
 
 func (f *smokeFixture) start(t *testing.T, address string) {
 	t.Helper()
-	ln := mustListen(t, f.ctx, address)
+	baseListener := mustListen(t, f.ctx, address)
+	ln := newAcceptCountingListener(baseListener)
 	if _, ok := ln.Addr().(*net.TCPAddr); !ok {
 		t.Fatalf("listener addr type = %T", ln.Addr())
 	}
 	f.port = tcpPort(t, ln)
+	f.listener = ln
 	f.registry, f.stop = bootServerWithRegistryAndRegistrationMode(t, f.ctx, f.key, f.dcID, f.store, f.dsn, f.codes.Logger(), ln, f.regMode)
 	stop := f.stop
 	t.Cleanup(stop)
@@ -1150,18 +1362,19 @@ func (f *smokeFixture) savedSessionClient(sess *session.StorageMemory) *telegram
 }
 
 type smokeClient struct {
-	client  *telegram.Client
-	session *session.StorageMemory
-	manager *updates.Manager
-	seen    *updateCollector
-	push    *updateCollector
-	cmds    chan command
-	err     chan error
-	id      int64
-	stop    sync.Once
+	client    *telegram.Client
+	session   *session.StorageMemory
+	manager   *updates.Manager
+	seen      *updateCollector
+	push      *updateCollector
+	cmds      chan command
+	lifecycle *clientLifecycle
+	label     string
+	id        int64
+	stop      sync.Once
 }
 
-func newSmokeClient(t *testing.T, f *smokeFixture, phone string) *smokeClient {
+func newSmokeClient(t *testing.T, f *smokeFixture, label, phone string) *smokeClient {
 	t.Helper()
 	sess := &session.StorageMemory{}
 	seen, push := newUpdateCollector(), newUpdateCollector()
@@ -1173,7 +1386,7 @@ func newSmokeClient(t *testing.T, f *smokeFixture, phone string) *smokeClient {
 		seen:    seen,
 		push:    push,
 		cmds:    make(chan command),
-		err:     make(chan error, 1),
+		label:   label,
 	}
 	flow := auth.NewFlow(
 		auth.Constant(phone, "", auth.CodeAuthenticatorFunc(func(ctx context.Context, _ *tg.AuthSentCode) (string, error) {
@@ -1182,45 +1395,53 @@ func newSmokeClient(t *testing.T, f *smokeFixture, phone string) *smokeClient {
 		auth.SendCodeOptions{},
 	)
 	ids, ready := make(chan int64, 1), make(chan struct{}, 1)
-	go func() {
-		client.err <- runManagedInteractive(f.ctx, client.client, flow, ids, ready, client.cmds, manager, true)
-	}()
+	client.lifecycle = startClientLifecycle(f.ctx, label, f.failures, func(phase *clientPhaseState) error {
+		return runManagedInteractive(f.ctx, client.client, flow, ids, ready, client.cmds, manager, true, phase)
+	})
 	t.Cleanup(func() { client.stopClient(t) })
+	loginStarted := time.Now()
 	select {
 	case client.id = <-ids:
 	case <-f.ctx.Done():
-		t.Fatalf("smoke client login timed out: %v", f.ctx.Err())
+		t.Fatalf("%s", client.lifecycle.diagnostic("login", time.Since(loginStarted), contextFailureDescription(f.ctx)))
+	case <-client.lifecycle.result.done:
+		t.Fatalf("%s", client.lifecycle.diagnostic("login", time.Since(loginStarted), "cause="+safeErrorClass(client.lifecycle.result.error())))
 	}
+	managerStarted := time.Now()
 	select {
 	case <-ready:
 	case <-f.ctx.Done():
-		t.Fatalf("smoke update manager startup timed out: %v", f.ctx.Err())
+		t.Fatalf("%s", client.lifecycle.diagnostic("manager readiness", time.Since(managerStarted), contextFailureDescription(f.ctx)))
+	case <-client.lifecycle.result.done:
+		t.Fatalf("%s", client.lifecycle.diagnostic("manager readiness", time.Since(managerStarted), "cause="+safeErrorClass(client.lifecycle.result.error())))
 	}
 	return client
 }
 
 func (c *smokeClient) call(ctx context.Context, fn func(context.Context, *tg.Client) error) error {
+	started := time.Now()
 	done := make(chan error, 1)
 	select {
 	case c.cmds <- command{fn: fn, done: done}:
+	case <-c.lifecycle.result.done:
+		return errors.New(c.lifecycle.diagnostic("command", time.Since(started), "cause="+safeErrorClass(c.lifecycle.result.error())))
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.New(c.lifecycle.diagnostic("command", time.Since(started), contextFailureDescription(ctx)))
 	}
 	select {
 	case err := <-done:
 		return err
+	case <-c.lifecycle.result.done:
+		return errors.New(c.lifecycle.diagnostic("command", time.Since(started), "cause="+safeErrorClass(c.lifecycle.result.error())))
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.New(c.lifecycle.diagnostic("command", time.Since(started), contextFailureDescription(ctx)))
 	}
 }
 
 func (c *smokeClient) stopClient(t *testing.T) {
 	t.Helper()
 	c.stop.Do(func() {
-		close(c.cmds)
-		if err := <-c.err; err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("smoke client run: %v", err)
-		}
+		stopClientLifecycle(t, c.lifecycle, func() { close(c.cmds) })
 		c.manager.Reset()
 	})
 }

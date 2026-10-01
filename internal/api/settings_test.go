@@ -31,6 +31,45 @@ type settingsHandler struct {
 	requiresAuthorization bool
 }
 
+func assertAppConfig(t *testing.T, got *tg.HelpAppConfig, mode config.RegistrationMode) {
+	t.Helper()
+	if got.Hash != 1 {
+		t.Fatalf("app config hash = %d, want 1", got.Hash)
+	}
+	object, ok := got.Config.(*tg.JSONObject)
+	if !ok {
+		t.Fatalf("app config = %T with %v, want JSON object", got.Config, got.Config)
+	}
+	values := make(map[string]any, len(object.Value))
+	for _, value := range object.Value {
+		if _, exists := values[value.Key]; exists {
+			t.Fatalf("duplicate app config key %q", value.Key)
+		}
+		values[value.Key] = value.Value
+	}
+	if len(values) != 6 {
+		t.Fatalf("app config has %d keys, want 6", len(values))
+	}
+	if value, ok := values["dialog_filters_enabled"].(*tg.JSONBool); !ok || !value.Value {
+		t.Fatalf("dialog_filters_enabled = %v, want true", values["dialog_filters_enabled"])
+	}
+	if value, ok := values["dialog_filters_limit_default"].(*tg.JSONNumber); !ok || value.Value != 10 {
+		t.Fatalf("dialog_filters_limit_default = %v, want 10", values["dialog_filters_limit_default"])
+	}
+	if value, ok := values["dialog_filters_chats_limit_default"].(*tg.JSONNumber); !ok || value.Value != 100 {
+		t.Fatalf("dialog_filters_chats_limit_default = %v, want 100", values["dialog_filters_chats_limit_default"])
+	}
+	if value, ok := values["dialog_filters_tooltip"].(*tg.JSONBool); !ok || value.Value {
+		t.Fatalf("dialog_filters_tooltip = %v, want false", values["dialog_filters_tooltip"])
+	}
+	if value, ok := values["dialogs_folder_pinned_limit_default"].(*tg.JSONNumber); !ok || value.Value != 100 {
+		t.Fatalf("dialogs_folder_pinned_limit_default = %v, want 100", values["dialogs_folder_pinned_limit_default"])
+	}
+	if value, ok := values["registration_mode"].(*tg.JSONString); !ok || value.Value != string(mode) {
+		t.Fatalf("registration_mode = %v, want %q", values["registration_mode"], mode)
+	}
+}
+
 func settingsHandlers() []settingsHandler {
 	return []settingsHandler{
 		{
@@ -97,17 +136,7 @@ func settingsHandlers() []settingsHandler {
 				if !ok {
 					t.Fatalf("response = %T, want *tg.HelpAppConfig", response)
 				}
-				jsonConfig, ok := got.Config.(*tg.JSONObject)
-				if !ok || len(jsonConfig.Value) != 1 {
-					t.Fatalf("app config = %T with %v, want registration mode", got.Config, got.Config)
-				}
-				if jsonConfig.Value[0].Key != "registration_mode" {
-					t.Fatalf("app config key = %q, want registration_mode", jsonConfig.Value[0].Key)
-				}
-				mode, ok := jsonConfig.Value[0].Value.(*tg.JSONString)
-				if !ok || mode.Value != string(config.RegistrationInvite) {
-					t.Fatalf("registration mode = %T %v, want %q", jsonConfig.Value[0].Value, jsonConfig.Value[0].Value, config.RegistrationInvite)
-				}
+				assertAppConfig(t, got, config.RegistrationInvite)
 			},
 		},
 	}
@@ -157,14 +186,7 @@ func TestSettingsHandlersReturnHonestDefaults(t *testing.T) {
 					t.Fatalf("themes = hash %d, %d themes; want empty", got.Hash, len(got.Themes))
 				}
 			case *tg.HelpAppConfig:
-				jsonConfig, ok := got.Config.(*tg.JSONObject)
-				if !ok || len(jsonConfig.Value) != 1 {
-					t.Fatalf("app config = %T with %v, want registration mode", got.Config, got.Config)
-				}
-				mode, ok := jsonConfig.Value[0].Value.(*tg.JSONString)
-				if jsonConfig.Value[0].Key != "registration_mode" || !ok || mode.Value != string(config.RegistrationInvite) {
-					t.Fatalf("registration mode = %v, want %q", jsonConfig.Value[0], config.RegistrationInvite)
-				}
+				assertAppConfig(t, got, config.RegistrationInvite)
 			default:
 				t.Fatalf("response = %T, want one of the settings success types", res)
 			}
@@ -173,13 +195,29 @@ func TestSettingsHandlersReturnHonestDefaults(t *testing.T) {
 }
 
 type settingsDispatcherTransport struct {
-	mu   sync.Mutex
-	sent [][]byte
+	mu          sync.Mutex
+	sent        [][]byte
+	sendErr     error
+	sendEntered chan struct{}
+	sendRelease chan struct{}
 }
 
-func (t *settingsDispatcherTransport) Send(_ context.Context, b *bin.Buffer) error {
+func (t *settingsDispatcherTransport) Send(ctx context.Context, b *bin.Buffer) error {
+	if t.sendEntered != nil {
+		t.sendEntered <- struct{}{}
+	}
+	if t.sendRelease != nil {
+		select {
+		case <-t.sendRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.sendErr != nil {
+		return t.sendErr
+	}
 	t.sent = append(t.sent, slices.Clone(b.Buf))
 	return nil
 }
@@ -296,7 +334,7 @@ func TestSettingsHandlersThroughDispatcher(t *testing.T) {
 	}
 }
 
-func TestAppConfigAdvertisesRegistrationModeWithoutAuthorization(t *testing.T) {
+func TestAppConfigAdvertisesFoldersAndRegistrationModeWithoutAuthorization(t *testing.T) {
 	t.Parallel()
 
 	for _, mode := range []config.RegistrationMode{
@@ -304,24 +342,24 @@ func TestAppConfigAdvertisesRegistrationModeWithoutAuthorization(t *testing.T) {
 		config.RegistrationOpen,
 	} {
 		t.Run(string(mode), func(t *testing.T) {
-			res, err := api.GetAppConfigForTestWithMode(0, mode)
-			if err != nil {
-				t.Fatalf("help.getAppConfig: %v", err)
-			}
-			appConfig, ok := res.(*tg.HelpAppConfig)
-			if !ok {
-				t.Fatalf("response = %T, want *tg.HelpAppConfig", res)
-			}
-			object, ok := appConfig.Config.(*tg.JSONObject)
-			if !ok || len(object.Value) != 1 {
-				t.Fatalf("config = %T with %v, want one registration_mode field", appConfig.Config, appConfig.Config)
-			}
-			if object.Value[0].Key != "registration_mode" {
-				t.Fatalf("config key = %q, want registration_mode", object.Value[0].Key)
-			}
-			value, ok := object.Value[0].Value.(*tg.JSONString)
-			if !ok || value.Value != string(mode) {
-				t.Fatalf("registration mode = %T %v, want %q", object.Value[0].Value, object.Value[0].Value, mode)
+			for _, request := range []struct {
+				name string
+				hash int
+			}{
+				{name: "uncached", hash: 0},
+				{name: "cached", hash: 1},
+			} {
+				t.Run(request.name, func(t *testing.T) {
+					res, err := api.GetAppConfigForTestWithModeAndHash(0, mode, request.hash)
+					if err != nil {
+						t.Fatalf("help.getAppConfig: %v", err)
+					}
+					appConfig, ok := res.(*tg.HelpAppConfig)
+					if !ok {
+						t.Fatalf("response = %T, want full *tg.HelpAppConfig", res)
+					}
+					assertAppConfig(t, appConfig, mode)
+				})
 			}
 		})
 	}

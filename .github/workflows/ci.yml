@@ -1231,7 +1231,7 @@ jobs:
             exit "$status"
           fi
 
-          for test in TestSmoke TestSmoke/one-to-one TestSmoke/saved-messages TestSmoke/basic-group TestSmoke/channel TestSmoke/contacts-search TestSmoke/username-registration; do
+          for test in TestSmoke TestSmoke/one-to-one TestSmoke/saved-messages TestSmoke/dialog-filters TestSmoke/basic-group TestSmoke/channel TestSmoke/contacts-search TestSmoke/username-registration; do
             if has_test_event skip "$test"; then
               echo "::error::$test was skipped (category: scenario-skipped; details redacted)"
               exit 1
@@ -1243,7 +1243,7 @@ jobs:
             exit 1
           fi
 
-          for scenario in one-to-one saved-messages basic-group channel contacts-search username-registration; do
+          for scenario in one-to-one saved-messages dialog-filters basic-group channel contacts-search username-registration; do
             if ! has_test_event run "TestSmoke/$scenario"; then
               echo "::error::TestSmoke/$scenario was not selected (category: selection-failure; details redacted)"
               exit 1

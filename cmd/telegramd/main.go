@@ -2,7 +2,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,6 +23,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	gotdsrp "github.com/gotd/td/crypto/srp"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/tdsync"
 
@@ -32,6 +36,7 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
+	tsrp "github.com/adambenhassen/telegram-server/internal/srp"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
@@ -63,6 +68,8 @@ func runCommand(args []string, log *slog.Logger, stdout, stderr io.Writer) error
 		return runInviteCommand(args[1:], log, stdout, stderr)
 	case args[0] == "maintenance":
 		return runMaintenanceCommand(args[1:], log, stdout, stderr)
+	case args[0] == "admin":
+		return runAdminCommand(args[1:], os.Stdin, log, stderr)
 	case args[0] == "client-config":
 		if len(args) == 2 && slices.Contains(args[1:], "--help") {
 			return writeClientConfigUsage(stdout)
@@ -74,6 +81,141 @@ func runCommand(args []string, log *slog.Logger, stdout, stderr io.Writer) error
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+var adminUsernameRE = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{1,31}$`)
+
+func runAdminCommand(args []string, stdin io.Reader, _ *slog.Logger, stderr io.Writer) (err error) {
+	if len(args) == 0 || args[0] != "set-password" {
+		return adminUsageError()
+	}
+	handle, err := parseAdminSetPasswordArgs(args[1:])
+	if err != nil {
+		return err
+	}
+	handle = strings.TrimPrefix(handle, "@")
+	if !adminUsernameRE.MatchString(handle) {
+		return errors.New("invalid username handle")
+	}
+	handle = strings.ToLower(handle)
+
+	password, err := readAdminPassword(stdin)
+	if err != nil {
+		return err
+	}
+	defer clear(password)
+
+	salt1 := make([]byte, 32)
+	if _, err := io.ReadFull(cryptorand.Reader, salt1); err != nil {
+		return fmt.Errorf("generate password salt: %w", err)
+	}
+	salt2 := make([]byte, 32)
+	if _, err := io.ReadFull(cryptorand.Reader, salt2); err != nil {
+		return fmt.Errorf("generate password salt: %w", err)
+	}
+	verifier, augmentedSalt1, err := gotdsrp.NewSRP(cryptorand.Reader).NewHash(password, gotdsrp.Input{
+		Salt1: salt1,
+		Salt2: salt2,
+		G:     tsrp.G,
+		P:     tsrp.PBytes(),
+	})
+	if err != nil {
+		return fmt.Errorf("generate SRP verifier: %w", err)
+	}
+	defer clear(verifier)
+	if len(verifier) != tsrp.PadLen || !tsrp.ValidVerifier(verifier) {
+		return errors.New("generate SRP verifier: invalid verifier")
+	}
+
+	// Config and store startup logs can add paths and other details to stderr;
+	// the operator command exposes only its explicit confirmation or error.
+	quietLog := slog.New(slog.DiscardHandler)
+	cfg, err := config.Load(quietLog)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, cfg.PostgresDSN, cfg.AuthKeyEncKey,
+		store.WithLogger(quietLog),
+		store.WithStatementTimeout(cfg.StatementTimeout),
+		store.WithoutBlobStore(),
+	)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer func() {
+		if closeErr := st.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close store: %w", closeErr))
+		}
+	}()
+
+	reset, err := st.ResetUsernamePassword(ctx, handle, augmentedSalt1, salt2, verifier)
+	if err != nil {
+		return fmt.Errorf("reset username password: %w", err)
+	}
+	if _, err := fmt.Fprintf(stderr, "Password reset: %s (user id: %d)\n", reset.Handle, reset.UserID); err != nil {
+		return fmt.Errorf("write password reset confirmation: %w", err)
+	}
+	return nil
+}
+
+func parseAdminSetPasswordArgs(args []string) (string, error) {
+	var flag, username string
+	for index, arg := range args {
+		switch index {
+		case 0:
+			flag = arg
+		case 1:
+			username = arg
+		default:
+			return "", adminUsageError()
+		}
+	}
+	switch len(args) {
+	case 2:
+		if flag == "--username" {
+			return username, nil
+		}
+	case 1:
+		if username, ok := strings.CutPrefix(flag, "--username="); ok {
+			return username, nil
+		}
+	}
+	return "", adminUsageError()
+}
+
+func adminUsageError() error {
+	return errors.New("usage: telegramd admin set-password --username <handle>")
+}
+
+func readAdminPassword(stdin io.Reader) ([]byte, error) {
+	if file, ok := stdin.(*os.File); ok {
+		info, err := file.Stat()
+		if err != nil {
+			return nil, errors.New("read password input from stdin")
+		}
+		if info.Mode()&os.ModeCharDevice != 0 {
+			return nil, errors.New("interactive password input is unsupported; provide protected stdin")
+		}
+	}
+	reader := bufio.NewReader(stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, errors.New("read password input from stdin")
+	}
+	if err == nil {
+		if _, err := reader.ReadByte(); err == nil || !errors.Is(err, io.EOF) {
+			return nil, errors.New("password input must contain exactly one line")
+		}
+	}
+	line, hasLF := strings.CutSuffix(line, "\n")
+	if hasLF {
+		line = strings.TrimSuffix(line, "\r")
+	}
+	if line == "" {
+		return nil, errors.New("password input must be nonempty")
+	}
+	return []byte(line), nil
 }
 
 func runMaintenanceCommand(args []string, log *slog.Logger, _ io.Writer, stderr io.Writer) (err error) {
@@ -326,6 +468,11 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if err := st.RefreshCatalogSnapshot(ctx); err != nil {
+		// Catalog data is optional for the built-in English behavior. A failed
+		// refresh must not prevent the core server from starting.
+		log.Warn("language catalog refresh failed", "err", err)
+	}
 	log.Info("file assembly concurrency bound",
 		"limit", st.AssemblyConcurrencyLimit(),
 		"reserved_pool_connections", st.AssemblyPoolHeadroom())
@@ -397,7 +544,8 @@ func run(log *slog.Logger) error {
 
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
 	notifyMetrics := store.NewNotificationMetrics()
-	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode, notifyMetrics)
+	dialogFilterSync := api.NewDialogFilterSync()
+	handler := api.NewWithDialogFilterSync(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode, dialogFilterSync, notifyMetrics)
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
 	}
@@ -440,8 +588,10 @@ func run(log *slog.Logger) error {
 	// Cross-replica real-time delivery: the listener wakes on NOTIFY and pushes
 	// each user's pending updates to their live conns in this process. Drained
 	// before the store pool closes (defer registered after st.Close, runs first).
-	updater := api.NewUpdater(st, server.Registry(), log, peers, notifyMetrics)
-	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, log, notifyMetrics)
+	updater := api.NewUpdaterWithDialogFilterSync(st, server.Registry(), log, peers, dialogFilterSync, notifyMetrics)
+	stopDialogFilterRecovery := updater.StartDialogFilterRecovery(ctx)
+	defer stopDialogFilterRecovery()
+	_, stopListener, err := store.StartListenerWithDialogFilters(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, updater.MarkDialogFilters, updater.DialogFilterListenerReconnected, log, notifyMetrics)
 	if err != nil {
 		return err
 	}

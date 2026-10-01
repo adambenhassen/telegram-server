@@ -12,7 +12,6 @@ import (
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -178,27 +177,10 @@ func assertChannelRPCErrorPrefix(t *testing.T, ctx context.Context, cmds chan co
 	}
 }
 
-func setSlowModeTestState(t *testing.T, ctx context.Context, dsn string, channelID int64, seconds int16) {
+// testSmokeMegagroupSlowMode exercises slow-mode writes through a real client
+// alongside the committed-post cooldown and retry contract.
+func testSmokeMegagroupSlowMode(t *testing.T) {
 	t.Helper()
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect slow-mode fixture: %v", err)
-	}
-	defer func() {
-		if err := conn.Close(ctx); err != nil {
-			t.Errorf("close slow-mode fixture: %v", err)
-		}
-	}()
-	if _, err := conn.Exec(ctx, `UPDATE channels SET slowmode_seconds = $2 WHERE id = $1`, channelID, seconds); err != nil {
-		t.Fatalf("set slow-mode test state: %v", err)
-	}
-}
-
-// TestSmokeMegagroupSlowMode keeps the real server smoke selector on the
-// first-post, refusal and random-ID retry contract. The interval is fixture
-// state because the slow-mode write RPC is deliberately a later feature.
-func TestSmokeMegagroupSlowMode(t *testing.T) {
-	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -252,7 +234,53 @@ func TestSmokeMegagroupSlowMode(t *testing.T) {
 	channelID := createMegagroup(t, ctx, aCmds, "Smoke slow mode")
 	hash := exportChannelInvite(t, ctx, aUserID, aCmds, channelID)
 	importChannelInvite(t, ctx, bCmds, hash)
-	setSlowModeTestState(t, ctx, dsn, channelID, 10)
+	toggleSlowMode := func(ctx context.Context, c *tg.Client, userID int64, seconds int) error {
+		result, err := c.ChannelsToggleSlowMode(ctx, &tg.ChannelsToggleSlowModeRequest{
+			Channel: inputChannel(userID, channelID),
+			Seconds: seconds,
+		})
+		if err != nil {
+			return err
+		}
+		updates, ok := result.(*tg.Updates)
+		if !ok {
+			return fmt.Errorf("toggleSlowMode result = %T, want *tg.Updates", result)
+		}
+		for _, update := range updates.Updates {
+			if channel, ok := update.(*tg.UpdateChannel); ok && channel.ChannelID == channelID {
+				return nil
+			}
+		}
+		return fmt.Errorf("toggleSlowMode updates omit channel %d", channelID)
+	}
+	assertSlowModeReadback := func(ctx context.Context, c *tg.Client, userID int64, want int) error {
+		result, err := c.ChannelsGetFullChannel(ctx, inputChannel(userID, channelID))
+		if err != nil {
+			return err
+		}
+		full, ok := result.FullChat.(*tg.ChannelFull)
+		if !ok {
+			return fmt.Errorf("getFullChannel response = %T, want *tg.ChannelFull", result.FullChat)
+		}
+		seconds, ok := full.GetSlowmodeSeconds()
+		if !ok || seconds != want {
+			return fmt.Errorf("slowmode_seconds = %d present=%v, want %d", seconds, ok, want)
+		}
+		return nil
+	}
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		return toggleSlowMode(ctx, c, aUserID, 10)
+	})
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		return assertSlowModeReadback(ctx, c, bUserID, 10)
+	})
+	assertChannelRPCErrorPrefix(t, ctx, aCmds, "CHAT_NOT_MODIFIED", func(ctx context.Context, c *tg.Client) error {
+		_, err := c.ChannelsToggleSlowMode(ctx, &tg.ChannelsToggleSlowModeRequest{
+			Channel: inputChannel(aUserID, channelID),
+			Seconds: 10,
+		})
+		return err
+	})
 
 	const firstRandomID = 5006101
 	var firstID, firstPts int
@@ -332,6 +360,12 @@ func TestSmokeMegagroupSlowMode(t *testing.T) {
 	if err != nil || len(history) != 1 || history[0].Message != "first slow-mode post" {
 		t.Fatalf("channel history after retry = %+v err=%v, want only the original post", history, err)
 	}
+	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
+		return toggleSlowMode(ctx, c, aUserID, 0)
+	})
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		return assertSlowModeReadback(ctx, c, bUserID, 0)
+	})
 
 	close(aCmds)
 	close(bCmds)

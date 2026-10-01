@@ -27,7 +27,7 @@ import (
 // has no existing channel_state row to lock.
 //
 // The rights mutations — SetChannelRole, SetChannelBan,
-// SetChannelDefaultBannedRights and LeaveChannel — take the channels row lock
+// SetChannelDefaultBannedRights, SetChannelSlowMode and LeaveChannel — take the channels row lock
 // (LockChannel), first and held to commit. AddChannelMembers takes that row
 // first to re-check the caller's role, then channel_state, then sorted account
 // advisory locks to serialize quota checks across targets. Posts
@@ -115,6 +115,7 @@ type Channel struct {
 	// Nil when the channel has no username.
 	Username            *string
 	DefaultBannedRights []string
+	SlowmodeSeconds     int16
 }
 
 // Participant roles, as recorded in the M7 migration.
@@ -169,6 +170,7 @@ func channelFromRow(r db.Channel) Channel {
 		PinnedMessageID:     r.PinnedMessageID,
 		Username:            r.Username,
 		DefaultBannedRights: r.DefaultBannedRights,
+		SlowmodeSeconds:     r.SlowmodeSeconds,
 	}
 }
 
@@ -901,6 +903,72 @@ func (s *Store) SetChannelDefaultBannedRights(
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return Channel{}, false, fmt.Errorf("commit channel default rights: %w", err)
+	}
+	return channelFromRow(row), true, nil
+}
+
+// SetChannelSlowMode replaces a megagroup's slow-mode interval. The caller's
+// membership, admin role, ban state, channel kind and unchanged-value decision
+// are checked under the same channels row lock used by role demotions.
+func (s *Store) SetChannelSlowMode(
+	ctx context.Context,
+	channelID, callerID int64,
+	seconds int16,
+) (channel Channel, changed bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Channel{}, false, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	// Filter outsiders before they take the row lock. The locked membership read
+	// below remains authoritative because removal or demotion can race this check.
+	member, err := qtx.IsChannelMember(ctx, db.IsChannelMemberParams{ChannelID: channelID, UserID: callerID})
+	if err != nil {
+		return Channel{}, false, fmt.Errorf("is channel member: %w", err)
+	}
+	if !member {
+		return Channel{}, false, ErrNotMember
+	}
+
+	locked, err := qtx.LockChannel(ctx, channelID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Channel{}, false, ErrNotMember
+		}
+		return Channel{}, false, fmt.Errorf("lock channel: %w", err)
+	}
+	participant, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID,
+		UserID:    callerID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Channel{}, false, ErrNotMember
+	case err != nil:
+		return Channel{}, false, fmt.Errorf("caller participant: %w", err)
+	}
+	caller := channelMemberFromRow(participant)
+	if !locked.Megagroup || caller.Role < channelRoleAdmin || caller.Banned(time.Now()) {
+		return Channel{}, false, ErrNotMember
+	}
+	if locked.SlowmodeSeconds == seconds {
+		if err = tx.Commit(ctx); err != nil {
+			return Channel{}, false, fmt.Errorf("commit unchanged slow mode: %w", err)
+		}
+		return channelFromRow(locked), false, nil
+	}
+
+	row, err := qtx.SetChannelSlowMode(ctx, db.SetChannelSlowModeParams{
+		ID:              channelID,
+		SlowmodeSeconds: seconds,
+	})
+	if err != nil {
+		return Channel{}, false, fmt.Errorf("set channel slow mode: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return Channel{}, false, fmt.Errorf("commit channel slow mode: %w", err)
 	}
 	return channelFromRow(row), true, nil
 }

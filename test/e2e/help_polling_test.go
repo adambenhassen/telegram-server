@@ -55,18 +55,18 @@ func newHelpPollingFixture(t *testing.T) *helpPollingFixture {
 
 	const dcID = 2
 	codes := newCodeSink()
-	blobs, err := blob.NewLocal(t.TempDir())
-	if err != nil {
-		t.Fatalf("blob store: %v", err)
-	}
-	handler := api.New(st, dcID, api.DefaultConfig(dcID, "127.0.0.1", 0), codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)
-	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
-
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	handler := api.New(st, dcID, fixtureConfigForListener(t, dcID, ln), codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)
+	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
+
 	addr, ok := ln.Addr().(*net.TCPAddr)
 	if !ok {
 		t.Fatalf("listener addr type = %T", ln.Addr())

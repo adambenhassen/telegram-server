@@ -154,6 +154,95 @@ type File struct {
 	SubtypeRights []string
 }
 
+type LanguageCatalogChange struct {
+	LangPack    string
+	LangCode    string
+	Version     int64
+	Key         string
+	Kind        int16
+	Value       string
+	PluralZero  *string
+	PluralOne   *string
+	PluralTwo   *string
+	PluralFew   *string
+	PluralMany  *string
+	PluralOther *string
+	Deleted     bool
+}
+
+type LanguageCatalogCurrentString struct {
+	LangPack           string
+	LangCode           string
+	Key                string
+	Kind               int16
+	Value              string
+	PluralZero         *string
+	PluralOne          *string
+	PluralTwo          *string
+	PluralFew          *string
+	PluralMany         *string
+	PluralOther        *string
+	Deleted            bool
+	LastChangedVersion int64
+}
+
+type LanguageCatalogPack struct {
+	LangPack              string
+	LangCode              string
+	CurrentVersion        int64
+	Name                  string
+	NativeName            string
+	PluralCode            string
+	CurrentContentSha256  []byte
+	CurrentManifestSha256 []byte
+	SourceUrl             string
+	SourceRevision        string
+	SourceSha256          []byte
+	SourceNotice          string
+	Attribution           string
+	UpdatedAt             pgtype.Timestamptz
+}
+
+type LanguageCatalogPublicationAudit struct {
+	ID              int64
+	LangPack        string
+	LangCode        string
+	OldVersion      *int64
+	NewVersion      int64
+	SourceCommitSha string
+	SourceRevision  string
+	SourceSha256    []byte
+	ContentSha256   []byte
+	ManifestSha256  []byte
+	ValidatorResult string
+	OsUser          string
+	CreatedAt       pgtype.Timestamptz
+}
+
+type LanguageCatalogTombstone struct {
+	LangPack string
+	LangCode string
+	Version  int64
+	Key      string
+}
+
+type LanguageCatalogVersion struct {
+	LangPack       string
+	LangCode       string
+	Version        int64
+	Name           string
+	NativeName     string
+	PluralCode     string
+	ContentSha256  []byte
+	ManifestSha256 []byte
+	SourceUrl      string
+	SourceRevision string
+	SourceSha256   []byte
+	SourceNotice   string
+	Attribution    string
+	PublishedAt    pgtype.Timestamptz
+}
+
 type Message struct {
 	OwnerID        int64
 	LocalID        int64
@@ -303,6 +392,47 @@ type User struct {
 type UserContact struct {
 	OwnerID   int64
 	ContactID int64
+}
+
+type UserDialogFilter struct {
+	OwnerID         int64
+	FilterID        int16
+	Title           string
+	Emoticon        string
+	Color           *int16
+	Contacts        bool
+	NonContacts     bool
+	Groups          bool
+	Broadcasts      bool
+	Bots            bool
+	ExcludeMuted    bool
+	ExcludeRead     bool
+	ExcludeArchived bool
+	TitleNoanimate  bool
+}
+
+type UserDialogFilterEntity struct {
+	OwnerID        int64
+	FilterID       int16
+	EntityPosition int16
+	EntityOffset   int32
+	Length         int32
+	DocumentID     int64
+}
+
+type UserDialogFilterPeer struct {
+	OwnerID      int64
+	FilterID     int16
+	ListType     int16
+	PeerType     int16
+	PeerID       int64
+	PeerPosition int16
+}
+
+type UserDialogFilterState struct {
+	OwnerID   int64
+	OrderIds  []int16
+	ChangedAt pgtype.Timestamptz
 }
 
 type UserPassword struct {

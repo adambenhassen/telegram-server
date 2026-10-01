@@ -39,8 +39,12 @@ func GetAppConfigForTest(userID int64) (bin.Encoder, error) {
 }
 
 func GetAppConfigForTestWithMode(userID int64, mode config.RegistrationMode) (bin.Encoder, error) {
+	return GetAppConfigForTestWithModeAndHash(userID, mode, 0)
+}
+
+func GetAppConfigForTestWithModeAndHash(userID int64, mode config.RegistrationMode, hash int) (bin.Encoder, error) {
 	var buf bin.Buffer
-	if err := (&tg.HelpGetAppConfigRequest{}).Encode(&buf); err != nil {
+	if err := (&tg.HelpGetAppConfigRequest{Hash: hash}).Encode(&buf); err != nil {
 		return nil, err
 	}
 	h := testHandlers(nil)
