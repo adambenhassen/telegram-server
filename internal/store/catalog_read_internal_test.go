@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -86,6 +87,83 @@ func TestCatalogHistoryLoadIsBoundedByCurrentKeys(t *testing.T) {
 	if len(difference.Entries) != 2 || difference.Entries[1].Key != "b" || difference.Entries[1].Value != "b-13" || difference.Entries[1].Deleted {
 		t.Fatalf("difference after deletion and restore = %+v, want b restored at version 13", difference)
 	}
+}
+
+func TestCatalogHistoryQueriesSeekPastRetainedVersions(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, pgtest.DSN(t))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // test cleanup
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO language_catalog_changes (lang_pack, lang_code, version, key, kind, value, deleted)
+		SELECT 'tdesktop', 'en', v, k, 0, '', true
+		FROM generate_series(1, 10000) v CROSS JOIN (VALUES ('a'), ('b')) keys(k);
+		INSERT INTO language_catalog_tombstones (lang_pack, lang_code, version, key)
+		SELECT 'tdesktop', 'en', v, 'b' FROM generate_series(1, 10000) v;
+		ANALYZE language_catalog_changes;
+		ANALYZE language_catalog_tombstones;
+	`); err != nil {
+		t.Fatalf("seed retained history: %v", err)
+	}
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatalf("begin snapshot: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // test cleanup
+	id := catalogPackID{pack: catalog.PackTDesktop, lang: catalog.LanguageEnglish}
+	changes, err := loadCatalogChanges(ctx, tx)
+	if err != nil {
+		t.Fatalf("load latest changes: %v", err)
+	}
+	if len(changes[id]) != 2 || changes[id][0].Version != 10000 || changes[id][1].Version != 10000 {
+		t.Fatalf("latest changes = %+v, want two keys at version 10000", changes[id])
+	}
+	tombstones, err := loadCatalogTombstones(ctx, tx)
+	if err != nil {
+		t.Fatalf("load latest tombstones: %v", err)
+	}
+	if len(tombstones[id]) != 1 || tombstones[id][0].Version != 10000 {
+		t.Fatalf("latest tombstones = %+v, want one key at version 10000", tombstones[id])
+	}
+	for _, query := range []string{catalogLatestChangesSQL, catalogLatestTombstonesSQL} {
+		var raw []byte
+		if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, FORMAT JSON) "+query, catalog.LanguageEnglish).Scan(&raw); err != nil {
+			t.Fatalf("explain history query: %v", err)
+		}
+		var plans []struct {
+			Plan catalogHistoryPlan `json:"Plan"`
+		}
+		if err := json.Unmarshal(raw, &plans); err != nil {
+			t.Fatalf("decode query plan: %v", err)
+		}
+		// A full scan or DISTINCT over retained versions visits thousands of
+		// rows. Index seeks should visit only the latest row for each key.
+		if visited := plans[0].Plan.historyRowsVisited(); visited > 32 {
+			t.Fatalf("history query visited %.0f rows for at most two keys: %s", visited, raw)
+		}
+	}
+}
+
+type catalogHistoryPlan struct {
+	Relation string               `json:"Relation Name"`
+	Rows     float64              `json:"Actual Rows"`
+	Loops    float64              `json:"Actual Loops"`
+	Removed  float64              `json:"Rows Removed by Filter"`
+	Plans    []catalogHistoryPlan `json:"Plans"`
+}
+
+func (p catalogHistoryPlan) historyRowsVisited() float64 {
+	var visited float64
+	if p.Relation == "language_catalog_changes" || p.Relation == "language_catalog_tombstones" {
+		visited = (p.Rows + p.Removed) * p.Loops
+	}
+	for _, child := range p.Plans {
+		visited += child.historyRowsVisited()
+	}
+	return visited
 }
 
 func catalogReadFixture(t *testing.T, values map[string]string) catalog.Artifact {

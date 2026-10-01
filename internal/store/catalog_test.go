@@ -292,6 +292,67 @@ func TestCatalogSnapshotRejectsCurrentRowsWithFutureChangeVersion(t *testing.T) 
 	}
 }
 
+func TestCatalogRefreshOrphanHistoryKeepsPreviousSnapshot(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		remove string
+	}{
+		{name: "change and tombstone"},
+		{name: "change only", remove: "DELETE FROM language_catalog_tombstones"},
+		{name: "tombstone only", remove: "DELETE FROM language_catalog_changes"},
+		{name: "missing pack metadata", remove: "DELETE FROM language_catalog_packs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			dsn := pgtest.DSN(t)
+			for i, values := range []map[string]string{{"removed": "value"}, {}} {
+				if _, err := catalogpublish.Publish(ctx, dsn, catalogFixture(t, values), "reviewed", catalogpublish.PublishOptions{OSUser: "tester"}); err != nil {
+					t.Fatalf("publish version %d: %v", i+1, err)
+				}
+			}
+			st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithoutBlobStore())
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			defer func() { _ = st.Close() }() //nolint:errcheck // test cleanup
+			if err := st.RefreshCatalogSnapshot(ctx); err != nil {
+				t.Fatalf("initial refresh: %v", err)
+			}
+			prior := st.CatalogSnapshot()
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // test cleanup
+			if _, err := conn.Exec(ctx, `DELETE FROM language_catalog_current_strings
+				WHERE lang_pack = 'tdesktop' AND lang_code = 'en' AND key = 'removed'`); err != nil {
+				t.Fatalf("remove current row: %v", err)
+			}
+			if tc.remove != "" {
+				if _, err := conn.Exec(ctx, tc.remove); err != nil {
+					t.Fatalf("isolate orphan history: %v", err)
+				}
+			}
+			if err := st.RefreshCatalogSnapshot(ctx); err == nil {
+				t.Fatal("refresh succeeded with history lacking a current row")
+			}
+			if got := st.CatalogSnapshot(); got != prior {
+				t.Fatalf("failed refresh replaced prior snapshot: got %p want %p", got, prior)
+			}
+			pack := prior.Pack(catalog.PackTDesktop, catalog.LanguageEnglish)
+			if pack == nil || pack.Version != 2 || len(pack.Entries) != 0 {
+				t.Fatalf("prior pack = %+v, want empty version 2", pack)
+			}
+			diff := pack.Difference(1)
+			if diff.FromVersion != 1 || diff.Version != 2 || len(diff.Entries) != 1 || diff.Entries[0].Key != "removed" || !diff.Entries[0].Deleted {
+				t.Fatalf("prior difference = %+v, want removed tombstone at version 2", diff)
+			}
+		})
+	}
+}
+
 func catalogFixture(t *testing.T, values map[string]string) catalog.Artifact {
 	t.Helper()
 	keys := make([]string, 0, len(values))

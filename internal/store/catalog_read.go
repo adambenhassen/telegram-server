@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -76,6 +77,18 @@ func (s *Store) LoadCatalogSnapshot(ctx context.Context) (*catalog.Snapshot, err
 		return nil, fmt.Errorf("catalog snapshot commit: %w", err)
 	}
 
+	packIDs := make(map[catalogPackID]bool, len(packRows))
+	for _, row := range packRows {
+		packIDs[row.id] = true
+	}
+	for _, rows := range []map[catalogPackID][]catalog.Change{changes, tombstones} {
+		for id := range rows {
+			if !packIDs[id] {
+				return nil, errors.New("catalog snapshot: history without pack metadata")
+			}
+		}
+	}
+
 	result := &catalog.Snapshot{Packs: make([]catalog.Pack, 0, len(packRows))}
 	for _, row := range packRows {
 		if row.id.lang != catalog.LanguageEnglish {
@@ -90,12 +103,22 @@ func (s *Store) LoadCatalogSnapshot(ctx context.Context) (*catalog.Snapshot, err
 		if !ok {
 			currentRows = []catalogCurrentRow{}
 		}
+		if len(changes[id]) != len(currentRows) {
+			return nil, fmt.Errorf("catalog snapshot %s/%s: current state and latest history disagree", id.pack, id.lang)
+		}
+		currentKeys := make(map[string]bool, len(currentRows))
+		for _, currentRow := range currentRows {
+			currentKeys[currentRow.entry.Key] = true
+		}
 		latestChanges := make(map[string]catalog.Change, len(changes[id]))
 		for _, change := range changes[id] {
 			latestChanges[change.Entry.Key] = change
 		}
 		latestTombstones := make(map[string]catalog.Change, len(tombstones[id]))
 		for _, tombstone := range tombstones[id] {
+			if !currentKeys[tombstone.Entry.Key] || tombstone.Version <= 0 || tombstone.Version > row.version || !validCatalogEntry(tombstone.Entry, true) {
+				return nil, fmt.Errorf("catalog snapshot %s/%s: tombstone without valid current state", id.pack, id.lang)
+			}
 			latestTombstones[tombstone.Entry.Key] = tombstone
 		}
 		entries := make([]catalog.Entry, 0, len(currentRows))
@@ -290,27 +313,54 @@ func loadCatalogCurrentStrings(ctx context.Context, tx pgx.Tx) (map[catalogPackI
 	return result, nil
 }
 
+// Seek past each key's entire version range using the key/version indexes.
+// Enumerating history independently of current rows detects missing current
+// rows without scanning every retained version of every key.
+const catalogLatestChangesSQL = `
+	WITH RECURSIVE latest AS (
+		(SELECT lang_pack, lang_code, version, key, kind, value, plural_zero, plural_one,
+		        plural_two, plural_few, plural_many, plural_other, deleted
+		 FROM language_catalog_changes
+		 WHERE lang_code = $1
+		 ORDER BY lang_pack, lang_code, key, version DESC LIMIT 1)
+		UNION ALL
+		SELECT next.lang_pack, next.lang_code, next.version, next.key,
+		       next.kind, next.value, next.plural_zero, next.plural_one, next.plural_two,
+		       next.plural_few, next.plural_many, next.plural_other, next.deleted
+		FROM latest prior
+		CROSS JOIN LATERAL (
+			SELECT lang_pack, lang_code, version, key, kind, value, plural_zero, plural_one,
+			       plural_two, plural_few, plural_many, plural_other, deleted
+			FROM language_catalog_changes
+			WHERE lang_code = $1
+			  AND (lang_pack, lang_code, key) > (prior.lang_pack, prior.lang_code, prior.key)
+			ORDER BY lang_pack, lang_code, key, version DESC LIMIT 1
+		) next
+	)
+	SELECT lang_pack, lang_code, version, key, kind, value, plural_zero,
+	       plural_one, plural_two, plural_few, plural_many, plural_other, deleted
+	FROM latest
+`
+
+const catalogLatestTombstonesSQL = `
+	WITH RECURSIVE latest AS (
+		(SELECT lang_pack, lang_code, version, key FROM language_catalog_tombstones
+		 WHERE lang_code = $1
+		 ORDER BY lang_pack, lang_code, key, version DESC LIMIT 1)
+		UNION ALL
+		SELECT next.lang_pack, next.lang_code, next.version, next.key FROM latest prior
+		CROSS JOIN LATERAL (
+			SELECT lang_pack, lang_code, version, key FROM language_catalog_tombstones
+			WHERE lang_code = $1
+			  AND (lang_pack, lang_code, key) > (prior.lang_pack, prior.lang_code, prior.key)
+			ORDER BY lang_pack, lang_code, key, version DESC LIMIT 1
+		) next
+	)
+	SELECT lang_pack, lang_code, version, key FROM latest
+`
+
 func loadCatalogChanges(ctx context.Context, tx pgx.Tx) (map[catalogPackID][]catalog.Change, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT latest.lang_pack, latest.lang_code, latest.version, latest.key,
-		       latest.kind, latest.value, latest.plural_zero, latest.plural_one,
-		       latest.plural_two, latest.plural_few, latest.plural_many,
-		       latest.plural_other, latest.deleted
-		FROM language_catalog_current_strings current
-		JOIN LATERAL (
-		    SELECT change.lang_pack, change.lang_code, change.version, change.key,
-		           change.kind, change.value, change.plural_zero, change.plural_one,
-		           change.plural_two, change.plural_few, change.plural_many,
-		           change.plural_other, change.deleted
-		    FROM language_catalog_changes change
-		    WHERE change.lang_pack = current.lang_pack
-		      AND change.lang_code = current.lang_code
-		      AND change.key = current.key
-		    ORDER BY change.version DESC
-		    LIMIT 1
-		) latest ON true
-		WHERE current.lang_code = $1
-	`, catalog.LanguageEnglish)
+	rows, err := tx.Query(ctx, catalogLatestChangesSQL, catalog.LanguageEnglish)
 	if err != nil {
 		return nil, fmt.Errorf("catalog snapshot changes: %w", err)
 	}
@@ -333,20 +383,7 @@ func loadCatalogChanges(ctx context.Context, tx pgx.Tx) (map[catalogPackID][]cat
 }
 
 func loadCatalogTombstones(ctx context.Context, tx pgx.Tx) (map[catalogPackID][]catalog.Change, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT latest.lang_pack, latest.lang_code, latest.version, latest.key
-		FROM language_catalog_current_strings current
-		JOIN LATERAL (
-		    SELECT tombstone.lang_pack, tombstone.lang_code, tombstone.version, tombstone.key
-		    FROM language_catalog_tombstones tombstone
-		    WHERE tombstone.lang_pack = current.lang_pack
-		      AND tombstone.lang_code = current.lang_code
-		      AND tombstone.key = current.key
-		    ORDER BY tombstone.version DESC
-		    LIMIT 1
-		) latest ON true
-		WHERE current.lang_code = $1
-	`, catalog.LanguageEnglish)
+	rows, err := tx.Query(ctx, catalogLatestTombstonesSQL, catalog.LanguageEnglish)
 	if err != nil {
 		return nil, fmt.Errorf("catalog snapshot tombstones: %w", err)
 	}
