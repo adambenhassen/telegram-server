@@ -173,13 +173,17 @@ func TestSettingsHandlersReturnHonestDefaults(t *testing.T) {
 }
 
 type settingsDispatcherTransport struct {
-	mu   sync.Mutex
-	sent [][]byte
+	mu      sync.Mutex
+	sent    [][]byte
+	sendErr error
 }
 
 func (t *settingsDispatcherTransport) Send(_ context.Context, b *bin.Buffer) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.sendErr != nil {
+		return t.sendErr
+	}
 	t.sent = append(t.sent, slices.Clone(b.Buf))
 	return nil
 }

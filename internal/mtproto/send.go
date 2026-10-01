@@ -89,6 +89,9 @@ type Conn struct {
 	// Delivery addresses every push to an owner, so a push built for the user
 	// who held the key a moment ago is dropped instead of written.
 	owner int64
+	// recoveryBinding is an immutable owner/session pair for listener callbacks.
+	// It avoids taking writeMu, which may be held while a slow socket write runs.
+	recoveryBinding atomic.Pointer[recoveryBinding]
 
 	// created is touched only by the connection's single serve goroutine.
 	created map[int64]struct{}
@@ -141,6 +144,40 @@ type Conn struct {
 	// timestamp lock-free while the deadline remains tied to the first marker
 	// transition rather than to a later client frame.
 	pendingLoginAt atomic.Int64
+
+	// dialogFilterRecovery is connection-local coverage state for content-free
+	// folder invalidations. Its immutable snapshots are replaced with CAS so a
+	// listener callback never waits behind a socket write.
+	dialogFilterRecovery atomic.Pointer[dialogFilterRecovery]
+	// rpcOutcomes is a 64-entry dependency ring. Only the connection's serve
+	// goroutine reads or writes it; a session change clears the ring.
+	rpcOutcomes    [64]rpcOutcome
+	rpcOutcomeNext int
+	rpcOutcomeSize int
+}
+
+type dialogFilterRecovery struct {
+	owner           int64
+	session         int64
+	generation      uint64
+	covered         uint64
+	initialized     bool
+	firstDifference bool
+	cycle           bool
+	attempts        int
+	nextAttempt     time.Time
+	inFlight        bool
+}
+
+type recoveryBinding struct {
+	Owner   int64
+	Session int64
+}
+
+type rpcOutcome struct {
+	msgID   int64
+	session int64
+	success bool
 }
 
 // RPCUpdateReservation identifies the sender-result barrier registered by one
@@ -557,6 +594,7 @@ func (c *Conn) setOwner(userID int64) {
 		return
 	}
 	c.owner = userID
+	c.recoveryBinding.Store(&recoveryBinding{Owner: userID, Session: c.sessionID})
 	c.lastPushedPts.Store(0)
 	c.pendingRPCOwner = 0
 	c.pendingRPCAuthKey = 0
@@ -565,6 +603,8 @@ func (c *Conn) setOwner(userID int64) {
 	c.pendingRPCReady = nil
 	c.pendingRPCOverflow = nil
 	c.pendingRPCOverflowSaturated = false
+	c.resetDialogFilterRecoveryLocked(userID, c.sessionID)
+	c.resetRPCOutcomesLocked()
 }
 
 func newConn(
@@ -575,7 +615,7 @@ func newConn(
 	writeTimeout time.Duration,
 	log *slog.Logger,
 ) *Conn {
-	return &Conn{
+	conn := &Conn{
 		transport:    tconn,
 		cipher:       cipher,
 		msgID:        msgID,
@@ -584,6 +624,9 @@ func newConn(
 		log:          log,
 		created:      map[int64]struct{}{},
 	}
+	conn.dialogFilterRecovery.Store(&dialogFilterRecovery{firstDifference: true})
+	conn.recoveryBinding.Store(&recoveryBinding{})
+	return conn
 }
 
 // setKey binds the connection to the auth key for the frame being handled.
@@ -600,6 +643,8 @@ func (c *Conn) setKey(key crypto.AuthKey) {
 		c.pendingRPCReady = nil
 		c.pendingRPCOverflow = nil
 		c.pendingRPCOverflowSaturated = false
+		c.resetDialogFilterRecoveryLocked(c.owner, c.sessionID)
+		c.resetRPCOutcomesLocked()
 	}
 	c.writeMu.Unlock()
 	c.authKeyID.Store(keyID)
@@ -608,8 +653,214 @@ func (c *Conn) setKey(key crypto.AuthKey) {
 // setSession records the client session id for subsequent server writes.
 func (c *Conn) setSession(id int64) {
 	c.writeMu.Lock()
+	changed := c.sessionID != id
 	c.sessionID = id
+	c.recoveryBinding.Store(&recoveryBinding{Owner: c.owner, Session: id})
+	if changed {
+		c.resetDialogFilterRecoveryLocked(c.owner, id)
+		c.resetRPCOutcomesLocked()
+	}
 	c.writeMu.Unlock()
+}
+
+func (c *Conn) resetDialogFilterRecoveryLocked(owner, session int64) {
+	c.dialogFilterRecovery.Store(&dialogFilterRecovery{
+		owner:           owner,
+		session:         session,
+		firstDifference: true,
+	})
+}
+
+func (c *Conn) resetRPCOutcomesLocked() {
+	c.rpcOutcomes = [64]rpcOutcome{}
+	c.rpcOutcomeNext = 0
+	c.rpcOutcomeSize = 0
+}
+
+// EnsureDialogFilterRecoveryBinding starts fresh recovery state when this
+// connection is first used by an owner/session binding. initialCoverage skips
+// historical replica epochs for a new binding; its first difference still
+// carries one unconditional refetch signal.
+func (c *Conn) EnsureDialogFilterRecoveryBinding(owner, session int64, initialCoverage uint64) {
+	for {
+		state := c.dialogFilterRecovery.Load()
+		if state == nil {
+			state = &dialogFilterRecovery{firstDifference: true}
+		}
+		if state.owner == owner && state.session == session && state.initialized {
+			return
+		}
+		next := &dialogFilterRecovery{
+			owner:           owner,
+			session:         session,
+			covered:         initialCoverage,
+			initialized:     true,
+			firstDifference: true,
+		}
+		if c.dialogFilterRecovery.CompareAndSwap(state, next) {
+			return
+		}
+	}
+}
+
+// MarkDialogFilterRecovery advances only this connection's pending coverage.
+func (c *Conn) MarkDialogFilterRecovery(owner, session int64, generation, globalEpoch uint64) bool {
+	for {
+		current := c.dialogFilterRecovery.Load()
+		if current == nil || current.owner != owner || current.session != session {
+			return false
+		}
+		next := *current
+		if !current.initialized {
+			next = dialogFilterRecovery{
+				owner:           owner,
+				session:         session,
+				covered:         max(generation-1, globalEpoch),
+				initialized:     true,
+				firstDifference: true,
+			}
+		}
+		before := max(next.generation, globalEpoch) > next.covered
+		if generation > next.generation {
+			next.generation = generation
+		}
+		after := max(next.generation, globalEpoch) > next.covered
+		if !before && after {
+			next.cycle = false
+			next.attempts = 0
+			next.nextAttempt = time.Time{}
+		}
+		if c.dialogFilterRecovery.CompareAndSwap(current, &next) {
+			return true
+		}
+	}
+}
+
+// DialogFilterRecoveryBinding is a lock-free snapshot used by listener
+// callbacks to route an owner invalidation to the connection's current session.
+func (c *Conn) DialogFilterRecoveryBinding() (owner, session int64) {
+	if binding := c.recoveryBinding.Load(); binding != nil {
+		return binding.Owner, binding.Session
+	}
+	return 0, 0
+}
+
+// DialogFilterRecoverySnapshot returns the connection's current generations
+// and whether it has not yet written its first authorized difference.
+func (c *Conn) DialogFilterRecoverySnapshot(owner, session int64, globalEpoch uint64) (generation, covered uint64, firstDifference, pending, ok bool) {
+	state := c.dialogFilterRecovery.Load()
+	if state == nil || state.owner != owner || state.session != session || !state.initialized {
+		return 0, 0, false, false, false
+	}
+	target := max(state.generation, globalEpoch)
+	return state.generation, state.covered, state.firstDifference, target > state.covered, true
+}
+
+// AcknowledgeDialogFilterFetch covers only invalidations captured before the
+// authoritative read. It deliberately leaves firstDifference untouched.
+func (c *Conn) AcknowledgeDialogFilterFetch(owner, session int64, captured, globalEpoch uint64) bool {
+	for {
+		state := c.dialogFilterRecovery.Load()
+		if state == nil || state.owner != owner || state.session != session || !state.initialized {
+			return false
+		}
+		next := *state
+		if captured > next.covered {
+			next.covered = captured
+		}
+		if max(next.generation, globalEpoch) <= next.covered {
+			next.cycle = false
+			next.attempts = 0
+			next.nextAttempt = time.Time{}
+		}
+		if c.dialogFilterRecovery.CompareAndSwap(state, &next) {
+			return true
+		}
+	}
+}
+
+// AcknowledgeDialogFilterDifference consumes only the one-time new-binding
+// signal after that difference was written. It never advances coverage.
+func (c *Conn) AcknowledgeDialogFilterDifference(owner, session int64, consumeFirst bool) bool {
+	if !consumeFirst {
+		return false
+	}
+	for {
+		state := c.dialogFilterRecovery.Load()
+		if state == nil || state.owner != owner || state.session != session || !state.initialized || !state.firstDifference {
+			return false
+		}
+		next := *state
+		next.firstDifference = false
+		if c.dialogFilterRecovery.CompareAndSwap(state, &next) {
+			return true
+		}
+	}
+}
+
+// ClaimDialogFilterRecoveryAttempt reserves one bounded push attempt. Attempts
+// start at 0, then wait about 20 and 40 additional seconds; the state remains
+// pending after the third write until a successful folder fetch covers it.
+func (c *Conn) ClaimDialogFilterRecoveryAttempt(owner, session int64, globalEpoch uint64, now time.Time) bool {
+	for {
+		state := c.dialogFilterRecovery.Load()
+		if state == nil || state.owner != owner || state.session != session || !state.initialized || state.firstDifference || state.inFlight {
+			return false
+		}
+		if max(state.generation, globalEpoch) <= state.covered || state.attempts >= 3 {
+			return false
+		}
+		if state.attempts > 0 && now.Before(state.nextAttempt) {
+			return false
+		}
+		next := *state
+		next.cycle = true
+		next.attempts++
+		next.inFlight = true
+		switch next.attempts {
+		case 1:
+			next.nextAttempt = now.Add(20 * time.Second)
+		case 2:
+			next.nextAttempt = now.Add(40 * time.Second)
+		default:
+			next.nextAttempt = time.Time{}
+		}
+		if c.dialogFilterRecovery.CompareAndSwap(state, &next) {
+			return true
+		}
+	}
+}
+
+// FinishDialogFilterRecoveryAttempt releases this connection's one outstanding
+// push slot, without changing coverage or the retry budget.
+func (c *Conn) FinishDialogFilterRecoveryAttempt(owner, session int64) {
+	for {
+		state := c.dialogFilterRecovery.Load()
+		if state == nil || state.owner != owner || state.session != session || !state.inFlight {
+			return
+		}
+		next := *state
+		next.inFlight = false
+		if c.dialogFilterRecovery.CompareAndSwap(state, &next) {
+			return
+		}
+	}
+}
+
+// RPCDependencyOutcome returns a recent result only when the dependency is an
+// earlier message in this same connection and session.
+func (c *Conn) RPCDependencyOutcome(session, dependency, current int64) (found, success bool) {
+	if dependency <= 0 || dependency >= current || session != c.sessionID {
+		return false, false
+	}
+	for i := range c.rpcOutcomeSize {
+		index := (c.rpcOutcomeNext - 1 - i + len(c.rpcOutcomes)) % len(c.rpcOutcomes)
+		outcome := c.rpcOutcomes[index]
+		if outcome.msgID == dependency && outcome.session == session {
+			return true, outcome.success
+		}
+	}
+	return false, false
 }
 
 // markCreated reports whether new_session_created was already sent for session,
@@ -830,6 +1081,7 @@ func (c *Conn) sendResult(req *Request, msg bin.Encoder, onSuccess func()) error
 		if req.rpcResult == "" {
 			req.rpcResult = RPCResultSuccess
 		}
+		c.recordRPCOutcome(req.MsgID, req.SessionID, req.rpcResult == RPCResultSuccess)
 		if onSuccess != nil {
 			onSuccess()
 		}
@@ -838,6 +1090,17 @@ func (c *Conn) sendResult(req *Request, msg bin.Encoder, onSuccess func()) error
 		return fmt.Errorf("send result [%T]: %w", msg, sendErr)
 	}
 	return nil
+}
+
+func (c *Conn) recordRPCOutcome(msgID, session int64, success bool) {
+	if msgID <= 0 || session != c.sessionID {
+		return
+	}
+	c.rpcOutcomes[c.rpcOutcomeNext] = rpcOutcome{msgID: msgID, session: session, success: success}
+	c.rpcOutcomeNext = (c.rpcOutcomeNext + 1) % len(c.rpcOutcomes)
+	if c.rpcOutcomeSize < len(c.rpcOutcomes) {
+		c.rpcOutcomeSize++
+	}
 }
 
 // SendErr sends e as the RPC error result for req.

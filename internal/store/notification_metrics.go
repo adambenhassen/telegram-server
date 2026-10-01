@@ -11,14 +11,14 @@ import (
 const (
 	notificationWindowSeconds   = int64((time.Hour / time.Second))
 	notificationBucketCount     = int(notificationWindowSeconds + 1)
-	notificationCounterCount    = 10 // nine fixed channels plus invalid input
+	notificationCounterCount    = 11 // ten fixed channels plus invalid input
 	notificationInvalidIndex    = notificationCounterCount - 1
 	notificationUnsetEpoch      = int64(-1 << 63)
 	notificationSnapshotTries   = 4
 	pushOutcomeCount            = 4
 	pushLatencyFiniteBuckets    = 15
 	pushLatencyBucketCount      = pushLatencyFiniteBuckets + 1
-	rateLimitDenialSurfaceCount = 20 // nineteen fixed surfaces plus dropped
+	rateLimitDenialSurfaceCount = 21 // twenty fixed surfaces plus dropped
 	rateLimitDenialDroppedIndex = rateLimitDenialSurfaceCount - 1
 )
 
@@ -63,15 +63,16 @@ func (c RecorderFailureCategory) String() string {
 // notifications. Its fields deliberately mirror the compiled Postgres
 // channel constants; no caller-supplied channel becomes a field or key.
 type NotificationChannelCounts struct {
-	Updates      int64
-	Typing       int64
-	Evict        int64
-	ChannelPost  int64
-	Encryption   int64
-	Status       int64
-	EncryptedMsg int64
-	Reactions    int64
-	Pinned       int64
+	Updates       int64
+	Typing        int64
+	Evict         int64
+	ChannelPost   int64
+	Encryption    int64
+	Status        int64
+	EncryptedMsg  int64
+	Reactions     int64
+	Pinned        int64
+	DialogFilters int64
 }
 
 // RateLimitDenialSurfaceCounts holds one count for every fixed client-visible
@@ -97,6 +98,7 @@ type RateLimitDenialSurfaceCounts struct {
 	PasswordProof             int64
 	GetPassword               int64
 	UpdateProfile             int64
+	DialogFilterMutation      int64
 }
 
 // PushOutcomeCounts holds one count for every possible result of an attempted
@@ -415,15 +417,16 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 		NotifyCount:   notifyCount,
 		RatePerSecond: rate,
 		Channels: NotificationChannelCounts{
-			Updates:      counts[0],
-			Typing:       counts[1],
-			Evict:        counts[2],
-			ChannelPost:  counts[3],
-			Encryption:   counts[4],
-			Status:       counts[5],
-			EncryptedMsg: counts[6],
-			Reactions:    counts[7],
-			Pinned:       counts[8],
+			Updates:       counts[0],
+			Typing:        counts[1],
+			Evict:         counts[2],
+			ChannelPost:   counts[3],
+			Encryption:    counts[4],
+			Status:        counts[5],
+			EncryptedMsg:  counts[6],
+			Reactions:     counts[7],
+			Pinned:        counts[8],
+			DialogFilters: counts[9],
 		},
 		Invalid: counts[notificationInvalidIndex],
 		RateLimitDenials: RateLimitDenialMetricsSnapshot{
@@ -450,6 +453,7 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 				PasswordProof:             rateLimitDenials[16],
 				GetPassword:               rateLimitDenials[17],
 				UpdateProfile:             rateLimitDenials[18],
+				DialogFilterMutation:      rateLimitDenials[19],
 			},
 			Dropped: rateLimitDenials[rateLimitDenialDroppedIndex],
 		},
@@ -586,6 +590,8 @@ func notificationChannelIndex(channel string) int {
 		return 7
 	case ChannelPinned:
 		return 8
+	case ChannelDialogFilters:
+		return 9
 	default:
 		return -1
 	}
@@ -631,6 +637,8 @@ func rateLimitDenialSurfaceIndex(surface string) int {
 		return 17
 	case "update_profile":
 		return 18
+	case "dialog_filter_mutation":
+		return 19
 	default:
 		return -1
 	}

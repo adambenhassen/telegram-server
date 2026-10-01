@@ -111,6 +111,9 @@ type handlers struct {
 	registrationMode config.RegistrationMode
 	// Sign-up rejection records are sampled independently by fixed reason class.
 	signUpRejectionLogs signUpRejectionSampler
+	// dialogFilterSync coordinates connection-local folder recovery with the
+	// replica's committed owner marker.
+	dialogFilterSync *DialogFilterSync
 	// rateLimitMetrics records only client-visible fixed-surface FLOOD_WAITs.
 	// It is process-local and optional so tests and embedders without admin
 	// telemetry retain the same enforcement behaviour.
@@ -180,8 +183,17 @@ func selfRevocation(r *mtproto.Request, keyID int64) bool {
 // is a programming error rather than a runtime condition, so it stops the server
 // at startup instead of surfacing as a nil dereference on the first peer emitted.
 func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver, rateLimits config.RateLimitsConfig, registrationMode config.RegistrationMode, rateLimitMetrics ...*store.NotificationMetrics) mtproto.Handler {
+	return NewWithDialogFilterSync(s, dcID, cfg, log, logLoginCodes, maxFileBytes, blobs, maxUserStorageBytes, peers, rateLimits, registrationMode, NewDialogFilterSync(), rateLimitMetrics...)
+}
+
+// NewWithDialogFilterSync builds an RPC handler using the same replica-local
+// recovery clock as the updater and its LISTEN connection.
+func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCodes bool, maxFileBytes int64, blobs blob.Store, maxUserStorageBytes int64, peers *peerhash.Deriver, rateLimits config.RateLimitsConfig, registrationMode config.RegistrationMode, dialogFilterSync *DialogFilterSync, rateLimitMetrics ...*store.NotificationMetrics) mtproto.Handler {
 	if peers == nil {
 		panic("api: nil peer hash deriver")
+	}
+	if dialogFilterSync == nil {
+		dialogFilterSync = NewDialogFilterSync()
 	}
 	var denialMetrics *store.NotificationMetrics
 	if len(rateLimitMetrics) > 0 {
@@ -221,6 +233,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 		rateLimitUpdateProfile:   rateLimits.UpdateProfile,
 		registrationMode:         registrationMode,
 		rateLimitMetrics:         denialMetrics,
+		dialogFilterSync:         dialogFilterSync,
 	}
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
@@ -244,12 +257,22 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.AccountUpdatePasswordSettingsRequestTypeID, h.handleUpdatePasswordSettings)
 	register(d, tg.AccountGetPasswordSettingsRequestTypeID, h.handleGetPasswordSettings)
 	register(d, tg.UpdatesGetStateRequestTypeID, h.handleGetState)
-	register(d, tg.UpdatesGetDifferenceRequestTypeID, h.handleGetDifference)
+	registerReplyAfterSuccess(d, tg.UpdatesGetDifferenceRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		result, afterReply, err := h.handleGetDifferenceForConn(c, req)
+		return result, nil, afterReply, err
+	})
 	register(d, tg.UpdatesGetChannelDifferenceRequestTypeID, h.handleGetChannelDifference)
 	registerReplyAfterSuccess(d, tg.MessagesSendMessageRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
 		return h.handleSendMessageAfterReplyOnConn(c, req)
 	})
 	register(d, tg.MessagesGetDialogsRequestTypeID, h.handleGetDialogs)
+	registerReplyAfterSuccess(d, tg.MessagesGetDialogFiltersRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, *replyUpdate, func(), error) {
+		res, afterReply, err := h.handleGetDialogFilters(c, req)
+		return res, nil, afterReply, err
+	})
+	h.registerDialogFilterMutation(d, tg.MessagesUpdateDialogFilterRequestTypeID, h.handleUpdateDialogFilter)
+	h.registerDialogFilterMutation(d, tg.MessagesUpdateDialogFiltersOrderRequestTypeID, h.handleUpdateDialogFiltersOrder)
+	register(d, tg.MessagesGetSuggestedDialogFiltersRequestTypeID, h.handleGetSuggestedDialogFilters)
 	register(d, tg.MessagesGetPeerDialogsRequestTypeID, h.handleGetPeerDialogs)
 	register(d, tg.MessagesGetHistoryRequestTypeID, h.handleGetHistory)
 	register(d, tg.MessagesReadHistoryRequestTypeID, h.handleReadHistory)
@@ -321,7 +344,7 @@ func New(s *store.Store, dcID int, cfg *tg.Config, log *slog.Logger, logLoginCod
 	register(d, tg.MessagesSearchGlobalRequestTypeID, h.handleSearchGlobal)
 	register(d, tg.CommunitiesGetJoinedCommunitiesRequestTypeID, h.handleGetJoinedCommunities)
 	d.Fallback(mtproto.HandlerFunc(h.handleUnknownGated))
-	return mtproto.UnpackInvoke(d)
+	return mtproto.UnpackInvokeWithAfterMsg(d, h.handleInvokeAfterMsgRefusal)
 }
 
 // checkRateLimit checks the per-account rate limit for the given surface.

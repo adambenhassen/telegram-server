@@ -20,32 +20,131 @@ import (
 // pending updates once (shared with getDifference) and writes them to each of
 // the user's live connections in this process.
 type Updater struct {
-	h           *handlers
-	registry    *mtproto.SessionRegistry
-	log         *slog.Logger
-	pushMetrics *store.NotificationMetrics
+	h                *handlers
+	registry         *mtproto.SessionRegistry
+	dialogFilterSync *DialogFilterSync
+	log              *slog.Logger
+	pushMetrics      *store.NotificationMetrics
 	// pushRecorder is a test-only failure injection seam. Production uses the
 	// fixed recorder method through pushMetrics.
 	pushRecorder func(store.PushOutcome, time.Time) error
 	// pinSnapshotHook lets tests deterministically commit a repin or unpin after
 	// resolution and before delivery. Production leaves it nil.
 	pinSnapshotHook func()
+	recoverySlots   chan struct{}
+	recoveryWG      sync.WaitGroup
 }
 
 // NewUpdater builds an Updater over the store and the server's session registry.
 func NewUpdater(s *store.Store, registry *mtproto.SessionRegistry, log *slog.Logger, peers *peerhash.Deriver, pushMetrics ...*store.NotificationMetrics) *Updater {
+	return NewUpdaterWithDialogFilterSync(s, registry, log, peers, NewDialogFilterSync(), pushMetrics...)
+}
+
+// NewUpdaterWithDialogFilterSync shares folder recovery state with the RPC
+// handlers on this replica.
+func NewUpdaterWithDialogFilterSync(s *store.Store, registry *mtproto.SessionRegistry, log *slog.Logger, peers *peerhash.Deriver, dialogFilterSync *DialogFilterSync, pushMetrics ...*store.NotificationMetrics) *Updater {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
+	}
+	if dialogFilterSync == nil {
+		dialogFilterSync = NewDialogFilterSync()
 	}
 	var metrics *store.NotificationMetrics
 	if len(pushMetrics) > 0 {
 		metrics = pushMetrics[0]
 	}
 	return &Updater{
-		h:           &handlers{store: s, log: log, peers: peers},
-		registry:    registry,
-		log:         log,
-		pushMetrics: metrics,
+		h:                &handlers{store: s, log: log, peers: peers, dialogFilterSync: dialogFilterSync},
+		registry:         registry,
+		dialogFilterSync: dialogFilterSync,
+		log:              log,
+		pushMetrics:      metrics,
+		recoverySlots:    make(chan struct{}, dialogFilterRecoveryConcurrent),
+	}
+}
+
+const (
+	dialogFilterRecoveryTick       = time.Second
+	dialogFilterRecoveryBatch      = 64
+	dialogFilterRecoveryConcurrent = 16
+)
+
+// StartDialogFilterRecovery runs the bounded best-effort invalidation sweeper.
+// The returned stop function cancels it and waits for its loop to exit.
+func (u *Updater) StartDialogFilterRecovery(ctx context.Context) func() {
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(dialogFilterRecoveryTick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-loopCtx.Done():
+				return
+			case now := <-ticker.C:
+				u.recoverDialogFilters(loopCtx, now)
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+		u.recoveryWG.Wait()
+	}
+}
+
+// MarkDialogFilters advances local recovery coverage after a committed
+// cross-replica folder notification.
+func (u *Updater) MarkDialogFilters(_ context.Context, ownerID int64) {
+	u.dialogFilterSync.OwnerInvalidation(u.registry, ownerID)
+}
+
+// DialogFilterListenerReconnected advances the replica-wide recovery epoch.
+func (u *Updater) DialogFilterListenerReconnected() {
+	u.dialogFilterSync.ListenerReconnected()
+}
+
+func (u *Updater) recoverDialogFilters(ctx context.Context, now time.Time) {
+	if u.registry == nil || u.dialogFilterSync == nil {
+		return
+	}
+	_, epoch := u.dialogFilterSync.Snapshot()
+	started := 0
+	for _, conn := range u.registry.DialogFilterRecoveryCandidates(dialogFilterRecoveryBatch) {
+		if started >= dialogFilterRecoveryBatch {
+			return
+		}
+		owner, session := conn.DialogFilterRecoveryBinding()
+		if owner <= 0 {
+			continue
+		}
+		select {
+		case u.recoverySlots <- struct{}{}:
+		default:
+			return
+		}
+		if !conn.ClaimDialogFilterRecoveryAttempt(owner, session, epoch, now) {
+			<-u.recoverySlots
+			continue
+		}
+		started++
+		u.recoveryWG.Add(1)
+		go func(conn *mtproto.Conn, owner, session int64) {
+			defer u.recoveryWG.Done()
+			defer func() { <-u.recoverySlots }()
+			defer conn.FinishDialogFilterRecoveryAttempt(owner, session)
+			pushCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			env := &tg.Updates{
+				Updates: []tg.UpdateClass{&tg.UpdateDialogFilters{}},
+				Date:    int(time.Now().Unix()),
+				Seq:     0,
+			}
+			if _, err := conn.PushTo(pushCtx, owner, env, 0); err != nil {
+				u.log.Info("dialog filter recovery push", "user_id", owner, "err", err)
+			}
+		}(conn, owner, session)
 	}
 }
 

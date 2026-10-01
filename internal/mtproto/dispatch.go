@@ -10,6 +10,7 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 // Request represents a decrypted MTProto RPC request handed to a Handler.
@@ -210,6 +211,171 @@ func UnpackInvoke(next Handler) Handler {
 			id = obj.TypeID
 		}
 	})
+}
+
+// InvokeAfterMsgRefusal identifies whether an invokeAfterMsg dependency was
+// unknown/invalid or completed with an RPC error.
+type InvokeAfterMsgRefusal int
+
+const (
+	InvokeAfterMsgWaitTimeout InvokeAfterMsgRefusal = iota + 1
+	InvokeAfterMsgWaitFailed
+)
+
+// UnpackInvokeWithAfterMsg unwraps the ordinary invocation envelopes and
+// implements invokeAfterMsg only when its dependency completed successfully on
+// this connection and session. onRefusal owns the refusal response and any
+// application-specific accounting; unknown dependencies have already consumed
+// the connection's unimplemented-method budget.
+func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint32, InvokeAfterMsgRefusal, UnimplementedVerdict) error) Handler {
+	return HandlerFunc(func(c *Conn, req *Request) error {
+		id, err := req.Buf.PeekID()
+		if err != nil {
+			return fmt.Errorf("peek id: %w", err)
+		}
+
+		obj := &peekIDObject{}
+		refuse := func(innerID uint32, reason InvokeAfterMsgRefusal, charge bool) error {
+			verdict := UnimplementedAnswer
+			if charge && c != nil {
+				verdict = c.ChargeUnimplemented()
+			}
+			if onRefusal != nil {
+				return onRefusal(c, req, innerID, reason, verdict)
+			}
+			if c == nil {
+				return errors.New("invokeAfterMsg refused without connection")
+			}
+			if reason == InvokeAfterMsgWaitFailed {
+				return c.SendErr(req, tgerr.New(400, "MSG_WAIT_FAILED"))
+			}
+			switch verdict {
+			case UnimplementedClose:
+				return errors.New("unimplemented-method ceiling")
+			case UnimplementedFloodWait:
+				return c.SendErr(req, tgerr.New(420, "FLOOD_WAIT_30"))
+			default:
+				return c.SendErr(req, tgerr.New(400, "MSG_WAIT_TIMEOUT"))
+			}
+		}
+		for {
+			switch id {
+			case tg.InvokeWithLayerRequestTypeID:
+				if err := (&tg.InvokeWithLayerRequest{Query: obj}).Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+			case tg.InitConnectionRequestTypeID:
+				if err := (&tg.InitConnectionRequest{Query: obj}).Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+			case tg.InvokeWithoutUpdatesRequestTypeID:
+				if err := (&tg.InvokeWithoutUpdatesRequest{Query: obj}).Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+			case tg.InvokeAfterMsgRequestTypeID:
+				var wrapper tg.InvokeAfterMsgRequest
+				wrapper.Query = obj
+				if err := wrapper.Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+				if isInvokeWrapper(id) {
+					return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				}
+				if wrapper.MsgID <= 0 || wrapper.MsgID >= req.MsgID || c == nil {
+					return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				}
+				found, success := c.RPCDependencyOutcome(req.SessionID, wrapper.MsgID, req.MsgID)
+				if !found {
+					return refuse(id, InvokeAfterMsgWaitTimeout, true)
+				}
+				if !success {
+					return refuse(id, InvokeAfterMsgWaitFailed, false)
+				}
+				continue
+			case tg.InvokeAfterMsgsRequestTypeID:
+				var wrapper tg.InvokeAfterMsgsRequest
+				wrapper.Query = obj
+				if err := wrapper.Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+			case tg.InvokeWithTakeoutRequestTypeID:
+				var wrapper tg.InvokeWithTakeoutRequest
+				wrapper.Query = obj
+				if err := wrapper.Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+			case tg.InvokeWithGooglePlayIntegrityRequestTypeID:
+				var wrapper tg.InvokeWithGooglePlayIntegrityRequest
+				wrapper.Query = obj
+				if err := wrapper.Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+			case tg.InvokeWithBusinessConnectionRequestTypeID:
+				var wrapper tg.InvokeWithBusinessConnectionRequest
+				wrapper.Query = obj
+				if err := wrapper.Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+			case tg.InvokeWithReCaptchaRequestTypeID:
+				var wrapper tg.InvokeWithReCaptchaRequest
+				wrapper.Query = obj
+				if err := wrapper.Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+			case tg.InvokeWithApnsSecretRequestTypeID:
+				var wrapper tg.InvokeWithApnsSecretRequest
+				wrapper.Query = obj
+				if err := wrapper.Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+			case tg.InvokeWithMessagesRangeRequestTypeID:
+				var wrapper tg.InvokeWithMessagesRangeRequest
+				wrapper.Query = obj
+				if err := wrapper.Decode(req.Buf); err != nil {
+					return err
+				}
+				id = obj.TypeID
+				return refuse(id, InvokeAfterMsgWaitTimeout, true)
+			default:
+				return next.OnMessage(c, req)
+			}
+		}
+	})
+}
+
+func isInvokeWrapper(id uint32) bool {
+	switch id {
+	case tg.InvokeAfterMsgRequestTypeID,
+		tg.InvokeAfterMsgsRequestTypeID,
+		tg.InvokeWithLayerRequestTypeID,
+		tg.InitConnectionRequestTypeID,
+		tg.InvokeWithoutUpdatesRequestTypeID,
+		tg.InvokeWithTakeoutRequestTypeID,
+		tg.InvokeWithGooglePlayIntegrityRequestTypeID,
+		tg.InvokeWithBusinessConnectionRequestTypeID,
+		tg.InvokeWithReCaptchaRequestTypeID,
+		tg.InvokeWithApnsSecretRequestTypeID,
+		tg.InvokeWithMessagesRangeRequestTypeID:
+		return true
+	default:
+		return false
+	}
 }
 
 // peekIDObject is a bin.Object that records the constructor ID of the value it
