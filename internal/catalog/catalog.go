@@ -203,7 +203,7 @@ func (a Artifact) Validate() error {
 	if a.Name == "" || a.NativeName == "" || a.PluralCode == "" || !validMetadata(a.Name) || !validMetadata(a.NativeName) || !validMetadata(a.PluralCode) {
 		return ErrInvalidMetadata
 	}
-	if a.Source.URL == "" || a.Source.Revision == "" || !validSourceURL(a.Source.URL) || a.Source.Notice == "" || a.Attribution == "" {
+	if a.Source.URL == "" || a.Source.Revision == "" || !validSourceURL(a.Source.URL) || a.Source.Notice != sourceNotice || a.Attribution != sourceAttribution {
 		return ErrInvalidMetadata
 	}
 	if !validSHA256(a.Source.SHA256) {
