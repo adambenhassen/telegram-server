@@ -646,8 +646,8 @@ func (h *handlers) chatHistory(r *mtproto.Request, snapshot store.ChatHistorySna
 	return &tg.MessagesMessages{Messages: tlMsgs, Users: users, Chats: []tg.ChatClass{chat}}, nil
 }
 
-// handleReadHistory serves messages.readHistory: advances read state on both
-// sides, nudges both users, and returns the caller's affected pts.
+// handleReadHistory serves messages.readHistory: advances read state, nudges
+// event owners, and returns the caller's affected pts.
 func (h *handlers) handleReadHistory(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.MessagesReadHistoryRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -655,6 +655,23 @@ func (h *handlers) handleReadHistory(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
+	}
+	if chat, ok := req.Peer.(*tg.InputPeerChat); ok {
+		if chat.ChatID == 0 {
+			return nil, errPeerIDInvalid
+		}
+		result, err := h.store.ReadChatHistory(r.Ctx, r.UserID, chat.ChatID, int64(req.MaxID))
+		if errors.Is(err, store.ErrNotMember) {
+			return nil, errPeerIDInvalid
+		}
+		if err != nil {
+			h.log.Error("read chat history", "user_id", r.UserID, "chat_id", chat.ChatID, "err", err)
+			return nil, errInternal
+		}
+		for _, userID := range result.NotifyUserIDs {
+			h.notify(r.Ctx, userID)
+		}
+		return &tg.MessagesAffectedMessages{Pts: result.Pts, PtsCount: result.PtsCount}, nil
 	}
 	toID, err := h.peerUserID(req.Peer, r.UserID)
 	if err != nil {

@@ -102,6 +102,7 @@ type updateCollector struct {
 	newMsg        chan *tg.Message
 	editMsg       chan *tg.Message
 	delMsg        chan []int
+	readInbox     chan *tg.UpdateReadHistoryInbox
 	readOutbox    chan int
 	readOutboxPts chan int
 	typing        chan int64
@@ -119,6 +120,7 @@ func newUpdateCollector() *updateCollector {
 		newMsg:        make(chan *tg.Message, 4),
 		editMsg:       make(chan *tg.Message, 4),
 		delMsg:        make(chan []int, 4),
+		readInbox:     make(chan *tg.UpdateReadHistoryInbox, 4),
 		readOutbox:    make(chan int, 4),
 		readOutboxPts: make(chan int, 4),
 		typing:        make(chan int64, 4),
@@ -160,6 +162,8 @@ func (u *updateCollector) dispatch(x tg.UpdateClass, chats []tg.ChatClass) {
 		}
 	case *tg.UpdateDeleteMessages:
 		send(u.delMsg, up.Messages)
+	case *tg.UpdateReadHistoryInbox:
+		send(u.readInbox, up)
 	case *tg.UpdateReadHistoryOutbox:
 		send(u.readOutbox, up.MaxID)
 		send(u.readOutboxPts, up.Pts)

@@ -202,6 +202,120 @@ func (u *updateCollector) waitNoNewMsg(ctx context.Context) error {
 
 // --- tests ---
 
+func TestChatReadHistoryPushesInboxToOtherSession(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := st.Close(); cerr != nil {
+			t.Errorf("store close: %v", cerr)
+		}
+	})
+
+	const dcID = 2
+	codes := newMultiCodeSink()
+	ln := mustListen(t, ctx, "127.0.0.1:0")
+	addrPort := tcpPort(t, ln)
+	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	t.Cleanup(stop)
+
+	const readerPhone, senderPhone = "+15551295001", "+15551295002"
+	seedPhoneUsers(t, ctx, st, readerPhone, senderPhone)
+	reader, ok, err := st.UserByPhone(ctx, readerPhone)
+	if err != nil || !ok {
+		t.Fatalf("reader user: found=%v err=%v", ok, err)
+	}
+	sender, ok, err := st.UserByPhone(ctx, senderPhone)
+	if err != nil || !ok {
+		t.Fatalf("sender user: found=%v err=%v", ok, err)
+	}
+	if _, _, _, _, err := st.SendMessage(ctx, reader.ID, reader.ID, "saved id seed", 95001, 0, 0); err != nil {
+		t.Fatalf("seed reader local id: %v", err)
+	}
+	chat, err := st.CreateChat(ctx, reader.ID, "Read receipts", []int64{sender.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	for randomID := int64(95002); randomID <= 95003; randomID++ {
+		_, _, duplicate, sendErr := st.SendChatMessage(ctx, store.FanOut{
+			ChatID: chat.ID, FromID: sender.ID, Text: "group message", RandomID: randomID,
+		})
+		if sendErr != nil || duplicate {
+			t.Fatalf("seed group message: duplicate=%v err=%v", duplicate, sendErr)
+		}
+	}
+	dialogs, err := st.Dialogs(ctx, reader.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("reader dialogs: %v", err)
+	}
+	var readerBoundary int64
+	for _, dialog := range dialogs {
+		if dialog.PeerType == store.PeerTypeChat && dialog.PeerID == chat.ID {
+			readerBoundary = dialog.TopMessage
+			break
+		}
+	}
+	if readerBoundary != 3 {
+		t.Fatalf("reader chat top_message = %d, want 3 after saved and two group copies", readerBoundary)
+	}
+
+	startSession := func(label string, collector *updateCollector) (chan command, int64) {
+		client := createClient(addrPort, key, dcID, collector, &session.StorageMemory{})
+		cmds := make(chan command)
+		done := make(chan error, 1)
+		self := make(chan int64, 1)
+		go func() { done <- runInteractive(ctx, client, flowFor(readerPhone, codes), self, cmds) }()
+		t.Cleanup(func() {
+			close(cmds)
+			if runErr := <-done; runErr != nil && !errors.Is(runErr, context.Canceled) {
+				t.Errorf("%s client run: %v", label, runErr)
+			}
+		})
+		return cmds, recvOrCtx(t, ctx, self, label+" login")
+	}
+	readerSession1 := newUpdateCollector()
+	readerSession2 := newUpdateCollector()
+	cmds1, userID1 := startSession("reader session 1", readerSession1)
+	_, userID2 := startSession("reader session 2", readerSession2)
+	if userID1 != reader.ID || userID2 != reader.ID || userID1 != userID2 {
+		t.Fatalf("session user ids = %d/%d, want reader %d", userID1, userID2, reader.ID)
+	}
+
+	var affected *tg.MessagesAffectedMessages
+	execChat(t, ctx, cmds1, func(ctx context.Context, client *tg.Client) error {
+		var readErr error
+		affected, readErr = client.MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{
+			Peer: &tg.InputPeerChat{ChatID: chat.ID}, MaxID: 99,
+		})
+		return readErr
+	})
+	if affected.PtsCount != 1 || affected.Pts == 0 {
+		t.Fatalf("readHistory affected pts = %d/%d, want positive pts and count 1", affected.Pts, affected.PtsCount)
+	}
+
+	inbox := recvOrCtx(t, ctx, readerSession2.readInbox, "second session updateReadHistoryInbox")
+	peer, ok := inbox.Peer.(*tg.PeerChat)
+	if !ok || peer.ChatID != chat.ID {
+		t.Fatalf("second session inbox peer = %#v, want chat %d", inbox.Peer, chat.ID)
+	}
+	if inbox.MaxID != int(readerBoundary) {
+		t.Fatalf("second session inbox max_id = %d, want reader-local boundary %d", inbox.MaxID, readerBoundary)
+	}
+	if inbox.Pts != affected.Pts || inbox.PtsCount != affected.PtsCount {
+		t.Fatalf("second session inbox pts = %d/%d, want RPC pts %d/%d", inbox.Pts, inbox.PtsCount, affected.Pts, affected.PtsCount)
+	}
+}
+
 // TestChatsRealtime exercises the full chat lifecycle against a real gotd
 // client: create, send, edit title, add member, remove member, and prove the
 // removed member no longer receives messages.
