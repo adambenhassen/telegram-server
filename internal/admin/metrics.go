@@ -190,15 +190,16 @@ type MetricsResponse struct {
 // NotifyChannels holds one count for each compiled Postgres notification
 // channel. The fixed field set prevents input from creating metric series.
 type NotifyChannels struct {
-	Updates      int64 `json:"tg_updates"`
-	Typing       int64 `json:"tg_typing"`
-	Evict        int64 `json:"tg_evict"`
-	ChannelPost  int64 `json:"tg_channel_post"`
-	Encryption   int64 `json:"tg_encryption"`
-	Status       int64 `json:"tg_status"`
-	EncryptedMsg int64 `json:"tg_encrypted_msg"`
-	Reactions    int64 `json:"tg_reactions"`
-	Pinned       int64 `json:"tg_pinned"`
+	Updates       int64 `json:"tg_updates"`
+	Typing        int64 `json:"tg_typing"`
+	Evict         int64 `json:"tg_evict"`
+	ChannelPost   int64 `json:"tg_channel_post"`
+	Encryption    int64 `json:"tg_encryption"`
+	Status        int64 `json:"tg_status"`
+	EncryptedMsg  int64 `json:"tg_encrypted_msg"`
+	Reactions     int64 `json:"tg_reactions"`
+	Pinned        int64 `json:"tg_pinned"`
+	DialogFilters int64 `json:"tg_dialog_filters"`
 }
 
 // PushOutcomes holds one count for every fixed persisted-update push result.
@@ -232,6 +233,7 @@ type RateLimitDenialsBySurface struct {
 	PasswordProof             int64 `json:"password_proof"`
 	GetPassword               int64 `json:"get_password"`
 	UpdateProfile             int64 `json:"update_profile"`
+	DialogFilterMutation      int64 `json:"dialog_filter_mutation"`
 }
 
 // StorageRows is approximate row counts across key database tables,
@@ -469,15 +471,16 @@ func removePushPercentileUninstrumented(fields []string) []string {
 
 func notificationChannels(channels store.NotificationChannelCounts) NotifyChannels {
 	return NotifyChannels{
-		Updates:      channels.Updates,
-		Typing:       channels.Typing,
-		Evict:        channels.Evict,
-		ChannelPost:  channels.ChannelPost,
-		Encryption:   channels.Encryption,
-		Status:       channels.Status,
-		EncryptedMsg: channels.EncryptedMsg,
-		Reactions:    channels.Reactions,
-		Pinned:       channels.Pinned,
+		Updates:       channels.Updates,
+		Typing:        channels.Typing,
+		Evict:         channels.Evict,
+		ChannelPost:   channels.ChannelPost,
+		Encryption:    channels.Encryption,
+		Status:        channels.Status,
+		EncryptedMsg:  channels.EncryptedMsg,
+		Reactions:     channels.Reactions,
+		Pinned:        channels.Pinned,
+		DialogFilters: channels.DialogFilters,
 	}
 }
 
@@ -511,6 +514,7 @@ func rateLimitDenialsBySurface(counts store.RateLimitDenialSurfaceCounts) RateLi
 		PasswordProof:             counts.PasswordProof,
 		GetPassword:               counts.GetPassword,
 		UpdateProfile:             counts.UpdateProfile,
+		DialogFilterMutation:      counts.DialogFilterMutation,
 	}
 }
 

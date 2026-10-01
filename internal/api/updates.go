@@ -892,17 +892,39 @@ func (h *handlers) handleGetState(r *mtproto.Request) (bin.Encoder, error) {
 // missed pts events and qts-gapped encrypted messages. When caught up it
 // returns differenceEmpty; a client ahead of the server is clamped to empty.
 func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) {
+	result, _, err := h.handleGetDifferenceForConn(nil, r)
+	return result, err
+}
+
+const dialogFilterMarkerGuard = 60 * time.Second
+
+func dialogFilterMarkerWithinGuard(markerAt time.Time, found bool, requestDate int, serverNow time.Time) bool {
+	if !found {
+		return false
+	}
+	cutoff := time.Unix(int64(requestDate), 0)
+	if serverNow.Before(cutoff) {
+		cutoff = serverNow
+	}
+	return !markerAt.Before(cutoff.Add(-dialogFilterMarkerGuard))
+}
+
+func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Request) (bin.Encoder, func(), error) {
 	var req tg.UpdatesGetDifferenceRequest
 	if err := req.Decode(r.Buf); err != nil {
-		return nil, errMethodNotImpl
+		return nil, nil, errMethodNotImpl
 	}
 	if r.UserID == 0 {
-		return nil, errAuthKeyUnreg
+		return nil, nil, errAuthKeyUnreg
+	}
+	var recovery DialogFilterCapture
+	if c != nil {
+		recovery = h.dialogFilterSync.Capture(c, r)
 	}
 	b, err := h.buildUpdates(r.Ctx, r.UserID, req.Pts)
 	if err != nil {
 		h.log.Error("get difference", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+		return nil, nil, errInternal
 	}
 
 	// Qts gap: fill encrypted messages the client has not yet seen.
@@ -915,7 +937,7 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 		evts, eerr := h.store.EncryptedEventsWindow(r.Ctx, r.UserID, req.Qts, b.state.Qts, maxDiffEvents+1)
 		if eerr != nil {
 			h.log.Error("get difference qts", "user_id", r.UserID, "err", eerr)
-			return nil, errInternal
+			return nil, nil, errInternal
 		}
 		if len(evts) > maxDiffEvents {
 			evts = evts[:maxDiffEvents]
@@ -940,11 +962,20 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 	secretChats, serr := h.store.SecretChatsAfterDate(r.Ctx, r.UserID, clientDate)
 	if serr != nil {
 		h.log.Error("get difference secret chats", "user_id", r.UserID, "err", serr)
-		return nil, errInternal
+		return nil, nil, errInternal
 	}
 
-	if !b.more && !encMore && len(b.ups) == 0 && len(encMsgs) == 0 && len(secretChats) == 0 {
-		return &tg.UpdatesDifferenceEmpty{Date: b.state.Date, Seq: b.state.Seq}, nil
+	filterRefresh := recovery.firstDifference || recovery.pending
+	markerAt, markerFound, markerErr := h.store.DialogFilterChangeAt(r.Ctx, r.UserID)
+	if markerErr != nil {
+		h.log.Error("get difference dialog filter marker", "user_id", r.UserID, "err", markerErr)
+		return nil, nil, errInternal
+	}
+	filterRefresh = filterRefresh || dialogFilterMarkerWithinGuard(markerAt, markerFound, req.Date, h.now())
+	includeFilterRefresh := filterRefresh && !b.more && !encMore
+
+	if !b.more && !encMore && len(b.ups) == 0 && len(encMsgs) == 0 && len(secretChats) == 0 && !includeFilterRefresh {
+		return &tg.UpdatesDifferenceEmpty{Date: b.state.Date, Seq: b.state.Seq}, nil, nil
 	}
 
 	var newMessages []tg.MessageClass
@@ -962,6 +993,9 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 			Date: int(sc.Date.Unix()),
 		})
 	}
+	if includeFilterRefresh {
+		other = append(other, &tg.UpdateDialogFilters{})
+	}
 
 	// The intermediate/final state advertises the qts of the last included
 	// encrypted event when truncated, or state.Qts when the gap is closed.
@@ -976,14 +1010,19 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 			Users:                b.users,
 			Chats:                b.chats,
 			IntermediateState:    *stateToTL(st),
-		}, nil
+		}, nil, nil
 	}
-	return &tg.UpdatesDifference{
+	result := &tg.UpdatesDifference{
 		NewMessages:          newMessages,
 		NewEncryptedMessages: encMsgs,
 		OtherUpdates:         other,
 		Users:                b.users,
 		Chats:                b.chats,
 		State:                *stateToTL(st),
-	}, nil
+	}
+	var afterReply func()
+	if c != nil && includeFilterRefresh {
+		afterReply = func() { h.dialogFilterSync.AcknowledgeDifference(c, r, recovery, true) }
+	}
+	return result, afterReply, nil
 }

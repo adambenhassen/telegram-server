@@ -86,6 +86,7 @@ func TestNotificationMetricsConcurrentExactCounting(t *testing.T) {
 		store.ChannelEncryptedMsg,
 		store.ChannelReactions,
 		store.ChannelPinned,
+		store.ChannelDialogFilters,
 	}
 
 	var wg sync.WaitGroup
@@ -117,15 +118,16 @@ func TestNotificationMetricsConcurrentExactCounting(t *testing.T) {
 		t.Errorf("invalid count = %d, want %d", got.Invalid, perChannel)
 	}
 	wantChannels := store.NotificationChannelCounts{
-		Updates:      perChannel,
-		Typing:       perChannel,
-		Evict:        perChannel,
-		ChannelPost:  perChannel,
-		Encryption:   perChannel,
-		Status:       perChannel,
-		EncryptedMsg: perChannel,
-		Reactions:    perChannel,
-		Pinned:       perChannel,
+		Updates:       perChannel,
+		Typing:        perChannel,
+		Evict:         perChannel,
+		ChannelPost:   perChannel,
+		Encryption:    perChannel,
+		Status:        perChannel,
+		EncryptedMsg:  perChannel,
+		Reactions:     perChannel,
+		Pinned:        perChannel,
+		DialogFilters: perChannel,
 	}
 	if got.Channels != wantChannels {
 		t.Errorf("fixed channel counts = %+v, want each channel %d", got.Channels, perChannel)
@@ -180,6 +182,7 @@ func TestNotificationMetricsRateLimitDenialsUseFixedSurfaces(t *testing.T) {
 		"password_proof",
 		"get_password",
 		"update_profile",
+		"dialog_filter_mutation",
 	}
 
 	initial := metrics.Snapshot().RateLimitDenials
@@ -221,6 +224,7 @@ func TestNotificationMetricsRateLimitDenialsUseFixedSurfaces(t *testing.T) {
 		PasswordProof:             1,
 		GetPassword:               1,
 		UpdateProfile:             1,
+		DialogFilterMutation:      1,
 	}
 	if got.BySurface != want {
 		t.Errorf("fixed denial surfaces = %+v, want %+v", got.BySurface, want)

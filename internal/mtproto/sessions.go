@@ -11,9 +11,11 @@ import (
 // update-delivery path can push server-initiated messages to a user's sockets. A
 // user may have several connections (multiple devices/sessions) at once.
 type SessionRegistry struct {
-	mu         sync.Mutex
-	m          map[int64][]*Conn
-	totalConns atomic.Int64
+	mu             sync.Mutex
+	m              map[int64][]*Conn
+	recoveryConns  []*Conn
+	recoveryCursor int
+	totalConns     atomic.Int64
 }
 
 // DeliveryLagSample is the aggregate result of sampling the live authenticated
@@ -67,6 +69,7 @@ func (r *SessionRegistry) Add(userID int64, c *Conn) bool {
 		return false
 	}
 	r.m[userID] = append(r.m[userID], c)
+	r.recoveryConns = append(r.recoveryConns, c)
 	r.totalConns.Add(1)
 	return true
 }
@@ -83,9 +86,44 @@ func (r *SessionRegistry) Remove(userID int64, c *Conn) {
 			break
 		}
 	}
+	for i, x := range r.recoveryConns {
+		if x == c {
+			r.recoveryConns = append(r.recoveryConns[:i], r.recoveryConns[i+1:]...)
+			if len(r.recoveryConns) == 0 {
+				r.recoveryCursor = 0
+			} else {
+				if i < r.recoveryCursor {
+					r.recoveryCursor--
+				}
+				r.recoveryCursor %= len(r.recoveryConns)
+			}
+			break
+		}
+	}
 	if len(r.m[userID]) == 0 {
 		delete(r.m, userID)
 	}
+}
+
+// DialogFilterRecoveryCandidates returns a bounded round-robin snapshot. The
+// cursor advances across ticks so a large registry cannot starve later conns.
+func (r *SessionRegistry) DialogFilterRecoveryCandidates(limit int) []*Conn {
+	if limit <= 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := min(limit, len(r.recoveryConns))
+	if count == 0 {
+		return nil
+	}
+	out := make([]*Conn, count)
+	start := r.recoveryCursor % len(r.recoveryConns)
+	for i := range count {
+		out[i] = r.recoveryConns[(start+i)%len(r.recoveryConns)]
+	}
+	r.recoveryCursor = (start + count) % len(r.recoveryConns)
+	return out
 }
 
 // Conns returns a snapshot copy of userID's live connections, so callers can

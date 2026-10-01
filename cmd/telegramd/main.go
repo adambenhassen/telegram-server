@@ -397,7 +397,8 @@ func run(log *slog.Logger) error {
 
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
 	notifyMetrics := store.NewNotificationMetrics()
-	handler := api.New(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode, notifyMetrics)
+	dialogFilterSync := api.NewDialogFilterSync()
+	handler := api.NewWithDialogFilterSync(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode, dialogFilterSync, notifyMetrics)
 	if cfg.LogLoginCodes {
 		log.Warn("TG_LOG_LOGIN_CODES is on: login codes are written to the log in cleartext")
 	}
@@ -440,8 +441,10 @@ func run(log *slog.Logger) error {
 	// Cross-replica real-time delivery: the listener wakes on NOTIFY and pushes
 	// each user's pending updates to their live conns in this process. Drained
 	// before the store pool closes (defer registered after st.Close, runs first).
-	updater := api.NewUpdater(st, server.Registry(), log, peers, notifyMetrics)
-	_, stopListener, err := store.StartListener(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, log, notifyMetrics)
+	updater := api.NewUpdaterWithDialogFilterSync(st, server.Registry(), log, peers, dialogFilterSync, notifyMetrics)
+	stopDialogFilterRecovery := updater.StartDialogFilterRecovery(ctx)
+	defer stopDialogFilterRecovery()
+	_, stopListener, err := store.StartListenerWithDialogFilters(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, updater.MarkDialogFilters, updater.DialogFilterListenerReconnected, log, notifyMetrics)
 	if err != nil {
 		return err
 	}
