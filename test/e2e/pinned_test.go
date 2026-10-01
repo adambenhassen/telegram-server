@@ -86,6 +86,18 @@ func TestPinnedChat(t *testing.T) {
 		return <-d
 	}
 
+	// Advance only B's account-local message ID space before the group copy is
+	// created, so the same logical group message has different IDs for A and B.
+	bSeed, bSeedPts, recipientPts, duplicate, err := st.SendMessage(ctx, bUserID, bUserID, "B pin ID seed", 700000, 0, 0)
+	if err != nil {
+		t.Fatalf("B Saved Messages ID seed: %v", err)
+	}
+	if bSeed.OwnerID != bUserID || bSeed.Text != "B pin ID seed" {
+		t.Fatalf("B ID seed = {owner:%d text:%q}, want {%d %q}", bSeed.OwnerID, bSeed.Text, bUserID, "B pin ID seed")
+	}
+	if bSeedPts <= 0 || recipientPts <= 0 || duplicate {
+		t.Fatalf("B ID seed pts = %d/%d duplicate=%t, want positive pts and no duplicate", bSeedPts, recipientPts, duplicate)
+	}
 	// 1. A creates a chat with B and C.
 	var chatID int64
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -115,6 +127,10 @@ func TestPinnedChat(t *testing.T) {
 	// Drain B and C service messages for create.
 	recvOrCtx(t, ctx, collB.serviceMsg, "B create service")
 	recvOrCtx(t, ctx, collC.serviceMsg, "C create service")
+	bSeedUpdate := recvOrCtx(t, ctx, collB.newMsg, "B Saved Messages ID seed update")
+	if bSeedUpdate.ID != int(bSeed.LocalID) || bSeedUpdate.Message != "B pin ID seed" {
+		t.Fatalf("B ID seed update = {id:%d text:%q}, want {%d %q}", bSeedUpdate.ID, bSeedUpdate.Message, bSeed.LocalID, "B pin ID seed")
+	}
 
 	// 2. A sends a message to the chat.
 	var msgID int
@@ -142,9 +158,15 @@ func TestPinnedChat(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A send to chat: %v", err)
 	}
-	// Drain B and C new messages.
-	recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
-	recvOrCtx(t, ctx, collC.newMsg, "C updateNewMessage")
+	// Capture each member's local copy of the same logical message.
+	bCopy := recvOrCtx(t, ctx, collB.newMsg, "B updateNewMessage")
+	cCopy := recvOrCtx(t, ctx, collC.newMsg, "C updateNewMessage")
+	if bCopy.Message != "pin me" || bCopy.ID == msgID {
+		t.Fatalf("B message copy = {id:%d text:%q}, want a distinct ID for exact text %q (creator ID %d)", bCopy.ID, bCopy.Message, "pin me", msgID)
+	}
+	if cCopy.Message != "pin me" {
+		t.Fatalf("C message copy text = %q, want %q", cCopy.Message, "pin me")
+	}
 
 	// 3. A pins the message.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -166,8 +188,8 @@ func TestPinnedChat(t *testing.T) {
 	if !ok || peerChat.ChatID != chatID {
 		t.Fatalf("B pin push peer = %T, want *tg.PeerChat with chatID %d", pinB.Peer, chatID)
 	}
-	if len(pinB.Messages) != 1 || pinB.Messages[0] != msgID {
-		t.Fatalf("B pin push Messages = %v, want %v", pinB.Messages, []int{msgID})
+	if len(pinB.Messages) != 1 || pinB.Messages[0] != bCopy.ID {
+		t.Fatalf("B pin push Messages = %v, want B's local copy %d", pinB.Messages, bCopy.ID)
 	}
 
 	// 3c. C receives updatePinnedMessages.
@@ -175,8 +197,53 @@ func TestPinnedChat(t *testing.T) {
 	if !pinC.Pinned {
 		t.Fatal("C pin push: Pinned = false, want true")
 	}
-	if len(pinC.Messages) != 1 || pinC.Messages[0] != msgID {
-		t.Fatalf("C pin push Messages = %v, want %v", pinC.Messages, []int{msgID})
+	if len(pinC.Messages) != 1 || pinC.Messages[0] != cCopy.ID {
+		t.Fatalf("C pin push Messages = %v, want C's local copy %d", pinC.Messages, cCopy.ID)
+	}
+	for _, check := range []struct {
+		who  string
+		cmds chan command
+		want int
+	}{{"A", aCmds, msgID}, {"B", bCmds, bCopy.ID}} {
+		var fullResult *tg.MessagesChatFull
+		if err := exec(check.cmds, func(ctx context.Context, c *tg.Client) error {
+			var err error
+			fullResult, err = c.MessagesGetFullChat(ctx, chatID)
+			return err
+		}); err != nil {
+			t.Fatalf("%s reopen pinned group: %v", check.who, err)
+		}
+		full, ok := fullResult.FullChat.(*tg.ChatFull)
+		if !ok {
+			t.Fatalf("%s full chat = %T, want *tg.ChatFull", check.who, fullResult.FullChat)
+		}
+		if got, present := full.GetPinnedMsgID(); !present || got != check.want {
+			t.Fatalf("%s full chat pinned id = %d/%t, want %d", check.who, got, present, check.want)
+		}
+	}
+	if bCopy.Message != "pin me" {
+		t.Fatalf("B pin notification resolved text = %q, want exact text %q", bCopy.Message, "pin me")
+	}
+
+	// A deleted owner copy has no display ID even while the creator's pin stays
+	// durable; never reuse another message that happens to share its local ID.
+	if _, err := st.DeleteMessages(ctx, bUserID, []int64{int64(bCopy.ID)}, false); err != nil {
+		t.Fatalf("delete B's local message copy: %v", err)
+	}
+	var deletedCopyFull *tg.MessagesChatFull
+	if err := exec(bCmds, func(ctx context.Context, c *tg.Client) error {
+		var err error
+		deletedCopyFull, err = c.MessagesGetFullChat(ctx, chatID)
+		return err
+	}); err != nil {
+		t.Fatalf("B reopen group after deleting local copy: %v", err)
+	}
+	deletedCopyChat, ok := deletedCopyFull.FullChat.(*tg.ChatFull)
+	if !ok {
+		t.Fatalf("B full chat after deleting local copy = %T, want *tg.ChatFull", deletedCopyFull.FullChat)
+	}
+	if got, present := deletedCopyChat.GetPinnedMsgID(); present && got != 0 {
+		t.Fatalf("B full chat pinned id = %d after local copy deletion, want none", got)
 	}
 
 	// 4. Pinning the same message again is idempotent (no extra push).
@@ -245,7 +312,8 @@ func TestPinnedChat(t *testing.T) {
 		t.Fatalf("C unpin push Messages = %v, want nil", unpinC.Messages)
 	}
 
-	// 6. A re-pins so we can test zero-ID unpin.
+	// 6. A re-pins after B's own copy was deleted. B sees the pin state but no
+	// fabricated message ID; C still sees its own copy.
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
 			Peer: &tg.InputPeerChat{ChatID: chatID},
@@ -255,7 +323,14 @@ func TestPinnedChat(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A pin (for zero-ID test): %v", err)
 	}
-	recvOrCtx(t, ctx, collB.pinnedMsg, "B re-pin")
+	repinB := recvOrCtx(t, ctx, collB.pinnedMsg, "B re-pin with missing local copy")
+	if !repinB.Pinned || len(repinB.Messages) != 0 {
+		t.Fatalf("B re-pin with missing copy = {pinned:%t messages:%v}, want true/empty", repinB.Pinned, repinB.Messages)
+	}
+	repinC := recvOrCtx(t, ctx, collC.pinnedMsg, "C re-pin")
+	if !repinC.Pinned || len(repinC.Messages) != 1 || repinC.Messages[0] != cCopy.ID {
+		t.Fatalf("C re-pin = {pinned:%t messages:%v}, want true/[C copy %d]", repinC.Pinned, repinC.Messages, cCopy.ID)
+	}
 
 	// 7. A unpins with ID=0 (without Unpin=true).
 	if err := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -270,6 +345,10 @@ func TestPinnedChat(t *testing.T) {
 	zeroUnpinB := recvOrCtx(t, ctx, collB.pinnedMsg, "B updatePinnedMessages (zero-ID unpin)")
 	if zeroUnpinB.Pinned {
 		t.Fatal("B zero-ID unpin push: Pinned = true, want false")
+	}
+	zeroUnpinC := recvOrCtx(t, ctx, collC.pinnedMsg, "C updatePinnedMessages (zero-ID unpin)")
+	if zeroUnpinC.Pinned || len(zeroUnpinC.Messages) != 0 {
+		t.Fatalf("C zero-ID unpin = {pinned:%t messages:%v}, want false/empty", zeroUnpinC.Pinned, zeroUnpinC.Messages)
 	}
 
 	// 8. Pinning a nonexistent message ID should fail with MESSAGE_ID_INVALID.

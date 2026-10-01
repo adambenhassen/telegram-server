@@ -12,6 +12,7 @@ import (
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/rsakey"
@@ -153,6 +154,191 @@ func assertChannelRPCError(t *testing.T, ctx context.Context, cmds chan command,
 	}
 	if tgErr.Message != want {
 		t.Fatalf("error = %s, want %s", tgErr.Message, want)
+	}
+}
+
+func assertChannelRPCErrorPrefix(t *testing.T, ctx context.Context, cmds chan command, prefix string, fn func(ctx context.Context, c *tg.Client) error) {
+	t.Helper()
+	done := make(chan error, 1)
+	select {
+	case cmds <- command{fn: fn, done: done}:
+	case <-ctx.Done():
+		t.Fatalf("command enqueue timeout: %v", ctx.Err())
+	}
+	err := <-done
+	if err == nil {
+		t.Fatalf("expected RPC error with prefix %q, got nil", prefix)
+	}
+	var tgErr *tgerr.Error
+	if !errors.As(err, &tgErr) {
+		t.Fatalf("error type = %T, want *tgerr.Error (%q)", err, prefix)
+	}
+	if !strings.HasPrefix(tgErr.Message, prefix) {
+		t.Fatalf("error = %s, want prefix %q", tgErr.Message, prefix)
+	}
+}
+
+func setSlowModeTestState(t *testing.T, ctx context.Context, dsn string, channelID int64, seconds int16) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect slow-mode fixture: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close slow-mode fixture: %v", err)
+		}
+	}()
+	if _, err := conn.Exec(ctx, `UPDATE channels SET slowmode_seconds = $2 WHERE id = $1`, channelID, seconds); err != nil {
+		t.Fatalf("set slow-mode test state: %v", err)
+	}
+}
+
+// TestSmokeMegagroupSlowMode keeps the real server smoke selector on the
+// first-post, refusal and random-ID retry contract. The interval is fixture
+// state because the slow-mode write RPC is deliberately a later feature.
+func TestSmokeMegagroupSlowMode(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	key, err := rsakey.LoadOrGenerate(t.TempDir() + "/key.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := st.Close(); cerr != nil {
+			t.Errorf("store close: %v", cerr)
+		}
+	})
+
+	const dcID = 2
+	codes := newMultiCodeSink()
+	ln := mustListen(t, ctx, "127.0.0.1:0")
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr type = %T", ln.Addr())
+	}
+	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
+	t.Cleanup(stop)
+
+	const phoneA, phoneB = "+15551295061", "+15551295062"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
+	aCmds, bCmds := make(chan command), make(chan command)
+	aID, bID := make(chan int64, 1), make(chan int64, 1)
+	errA, errB := make(chan error, 1), make(chan error, 1)
+	go func() {
+		errA <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneA, codes), aID, aCmds)
+	}()
+	go func() {
+		errB <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneB, codes), bID, bCmds)
+	}()
+
+	login := func(ch chan int64, who string) int64 {
+		select {
+		case id := <-ch:
+			return id
+		case <-ctx.Done():
+			t.Fatalf("%s login timeout", who)
+			return 0
+		}
+	}
+	aUserID, bUserID := login(aID, "A"), login(bID, "B")
+	channelID := createMegagroup(t, ctx, aCmds, "Smoke slow mode")
+	hash := exportChannelInvite(t, ctx, aUserID, aCmds, channelID)
+	importChannelInvite(t, ctx, bCmds, hash)
+	setSlowModeTestState(t, ctx, dsn, channelID, 10)
+
+	const firstRandomID = 5006101
+	var firstID, firstPts int
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerChannel(bUserID, channelID), Message: "first slow-mode post", RandomID: firstRandomID,
+		})
+		if err != nil {
+			return err
+		}
+		updates, ok := res.(*tg.Updates)
+		if !ok {
+			return fmt.Errorf("first send result = %T, want *tg.Updates", res)
+		}
+		for _, update := range updates.Updates {
+			post, ok := update.(*tg.UpdateNewChannelMessage)
+			if !ok {
+				continue
+			}
+			message, ok := post.Message.(*tg.Message)
+			if !ok {
+				return fmt.Errorf("first post message = %T, want *tg.Message", post.Message)
+			}
+			if message.Message != "first slow-mode post" || post.Pts != 1 {
+				return fmt.Errorf("first post text/pts = %q/%d, want %q/1", message.Message, post.Pts, "first slow-mode post")
+			}
+			firstID, firstPts = message.ID, post.Pts
+			return nil
+		}
+		return errors.New("first send result has no UpdateNewChannelMessage")
+	})
+	if firstID == 0 || firstPts != 1 {
+		t.Fatalf("first post identity/pts = %d/%d, want nonzero/1", firstID, firstPts)
+	}
+
+	assertChannelRPCErrorPrefix(t, ctx, bCmds, "SLOWMODE_WAIT_", func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerChannel(bUserID, channelID), Message: "distinct slow-mode post", RandomID: 5006102,
+		})
+		return err
+	})
+
+	execChannel(t, ctx, bCmds, func(ctx context.Context, c *tg.Client) error {
+		res, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerChannel(bUserID, channelID), Message: "first slow-mode post", RandomID: firstRandomID,
+		})
+		if err != nil {
+			return fmt.Errorf("retry committed random ID: %w", err)
+		}
+		updates, ok := res.(*tg.Updates)
+		if !ok {
+			return fmt.Errorf("retry result = %T, want *tg.Updates", res)
+		}
+		for _, update := range updates.Updates {
+			post, ok := update.(*tg.UpdateNewChannelMessage)
+			if !ok {
+				continue
+			}
+			message, ok := post.Message.(*tg.Message)
+			if !ok || message.ID != firstID || message.Message != "first slow-mode post" || post.Pts != firstPts {
+				return fmt.Errorf("retry post = %T/%v pts=%d, want original id/text/pts %d/%q/%d", post.Message, post.Message, post.Pts, firstID, "first slow-mode post", firstPts)
+			}
+			return nil
+		}
+		return errors.New("retry result has no UpdateNewChannelMessage")
+	})
+
+	pts, err := st.ChannelState(ctx, channelID)
+	if err != nil || pts != 1 {
+		t.Fatalf("channel pts after retry = %d err=%v, want 1", pts, err)
+	}
+	events, err := st.ChannelEventsWindow(ctx, channelID, 0, pts, 10)
+	if err != nil || len(events) != 1 || events[0].Pts != firstPts {
+		t.Fatalf("channel events after retry = %+v err=%v, want only the first event", events, err)
+	}
+	history, err := st.ChannelHistory(ctx, channelID, 0, 10)
+	if err != nil || len(history) != 1 || history[0].Message != "first slow-mode post" {
+		t.Fatalf("channel history after retry = %+v err=%v, want only the original post", history, err)
+	}
+
+	close(aCmds)
+	close(bCmds)
+	for _, ch := range []chan error{errA, errB} {
+		if err := <-ch; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("client run: %v", err)
+		}
 	}
 }
 
