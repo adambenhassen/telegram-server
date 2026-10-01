@@ -60,8 +60,10 @@ var (
 	errMessageIDInvalid = rpcErr(400, "MESSAGE_ID_INVALID")
 	// errPeerIDInvalid rejects an unresolvable or unauthorized input peer.
 	errPeerIDInvalid = rpcErr(400, "PEER_ID_INVALID")
-	// errChatNotModified answers an authorized default-rights save whose value
-	// already matches the group's stored restriction set.
+	// errSecondsInvalid rejects a slow-mode interval the channel schema cannot store.
+	errSecondsInvalid = rpcErr(400, "SECONDS_INVALID")
+	// errChatNotModified answers an authorized channel-setting save whose value
+	// already matches the stored setting.
 	errChatNotModified = rpcErr(400, "CHAT_NOT_MODIFIED")
 	// errChatTitleInvalid rejects an empty, whitespace-only or over-length chat
 	// title on createChat and editChatTitle.

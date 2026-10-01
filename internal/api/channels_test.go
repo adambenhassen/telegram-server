@@ -3587,3 +3587,315 @@ func TestJoinChannelDeliversNewPosts(t *testing.T) {
 		t.Errorf("message = %q, want %q", msg.Message, "after join")
 	}
 }
+
+func toggleSlowModeViaDispatcher(
+	t *testing.T,
+	h mtproto.Handler,
+	userID int64,
+	channel tg.InputChannelClass,
+	seconds int,
+) (*tg.Updates, *mt.RPCError) {
+	t.Helper()
+	method := settingsHandler{
+		name: "channels.toggleSlowMode",
+		request: func() bin.Encoder {
+			return &tg.ChannelsToggleSlowModeRequest{Channel: channel, Seconds: seconds}
+		},
+	}
+	body := dispatchSettings(t, h, method, userID, false)
+	var updates tg.Updates
+	if err := updates.Decode(&bin.Buffer{Buf: body}); err == nil {
+		return &updates, nil
+	}
+	var rpc mt.RPCError
+	if err := rpc.Decode(&bin.Buffer{Buf: body}); err != nil {
+		t.Fatalf("decode toggleSlowMode response: %v", err)
+	}
+	return nil, &rpc
+}
+
+func requireSlowModeChannelUpdate(t *testing.T, updates *tg.Updates, channelID int64) {
+	t.Helper()
+	if updates == nil {
+		t.Fatal("toggleSlowMode returned nil Updates")
+	}
+	count := 0
+	for _, update := range updates.Updates {
+		if channel, ok := update.(*tg.UpdateChannel); ok && channel.ChannelID == channelID {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("toggleSlowMode channel updates = %d, want one for %d", count, channelID)
+	}
+}
+
+func TestHandleToggleSlowModeRoundTripsMemberInterval(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, err := s.CreateUser(ctx, "+15551295201")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551295202")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	admin, err := s.CreateUser(ctx, "+15551295204")
+	if err != nil {
+		t.Fatalf("admin: %v", err)
+	}
+	outsider, err := s.CreateUser(ctx, "+15551295203")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
+	channel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{
+		Megagroup: true,
+		Title:     "Slow mode settings",
+	})
+	joinChannel(t, ctx, dsn, channel.ID, member.ID)
+	joinChannel(t, ctx, dsn, channel.ID, admin.ID)
+	if err := s.SetChannelRole(ctx, channel.ID, creator.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	if err := api.ClaimChannelUsernameForTest(s, channel.ID, "slowmodesettings"); err != nil {
+		t.Fatalf("claim public username: %v", err)
+	}
+	h := fullChannelDispatcher(s)
+
+	updates, rpc := toggleSlowModeViaDispatcher(t, h, creator.ID, api.InputChannel(creator.ID, channel.ID), 10)
+	if rpc != nil {
+		t.Fatalf("set slow mode: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	requireSlowModeChannelUpdate(t, updates, channel.ID)
+	response, rpc := getFullChannelViaDispatcher(t, h, member.ID, false, api.InputChannel(member.ID, channel.ID))
+	if rpc != nil {
+		t.Fatalf("member getFullChannel after save: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	if seconds, ok := fullChannelInfo(t, response).GetSlowmodeSeconds(); !ok || seconds != 10 {
+		t.Fatalf("member slowmode_seconds = %d present=%v, want 10", seconds, ok)
+	}
+	if _, rpc := toggleSlowModeViaDispatcher(t, h, admin.ID, api.InputChannel(admin.ID, channel.ID), 10); rpc == nil || rpc.ErrorMessage != "CHAT_NOT_MODIFIED" {
+		t.Fatalf("admin unchanged slow mode result = %v, want CHAT_NOT_MODIFIED", rpc)
+	}
+	for _, seconds := range []int{30, 60, 300, 900, 3600} {
+		updates, rpc = toggleSlowModeViaDispatcher(t, h, admin.ID, api.InputChannel(admin.ID, channel.ID), seconds)
+		if rpc != nil {
+			t.Fatalf("admin set slow mode to %d: %d %s", seconds, rpc.ErrorCode, rpc.ErrorMessage)
+		}
+		requireSlowModeChannelUpdate(t, updates, channel.ID)
+	}
+	response, rpc = getFullChannelViaDispatcher(t, h, member.ID, false, api.InputChannel(member.ID, channel.ID))
+	if rpc != nil {
+		t.Fatalf("member getFullChannel after supported intervals: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	if seconds, ok := fullChannelInfo(t, response).GetSlowmodeSeconds(); !ok || seconds != 3600 {
+		t.Fatalf("member slowmode_seconds after supported intervals = %d present=%v, want 3600", seconds, ok)
+	}
+	updates, rpc = toggleSlowModeViaDispatcher(t, h, admin.ID, api.InputChannel(admin.ID, channel.ID), 10)
+	if rpc != nil {
+		t.Fatalf("admin restore slow mode to 10: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	requireSlowModeChannelUpdate(t, updates, channel.ID)
+	if _, _, duplicate, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "first eligible post", 95201, nil, 0); err != nil || duplicate {
+		t.Fatalf("first member post duplicate=%v err=%v", duplicate, err)
+	}
+	left, err := s.LeaveChannel(ctx, channel.ID, member.ID)
+	if err != nil || !left {
+		t.Fatalf("member leave = %v err=%v", left, err)
+	}
+	for _, seconds := range []int{30, 0, 10} {
+		updates, rpc = toggleSlowModeViaDispatcher(t, h, creator.ID, api.InputChannel(creator.ID, channel.ID), seconds)
+		if rpc != nil {
+			t.Fatalf("set slow mode to %d: %d %s", seconds, rpc.ErrorCode, rpc.ErrorMessage)
+		}
+		requireSlowModeChannelUpdate(t, updates, channel.ID)
+	}
+	if _, _, err := s.JoinChannelByUsername(ctx, channel.ID, member.ID); err != nil {
+		t.Fatalf("member rejoin: %v", err)
+	}
+	_, _, duplicate, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "after rejoin", 95202, nil, 0)
+	waitErr, wait := errors.AsType[*store.SlowModeWaitError](err)
+	if !wait || waitErr == nil || duplicate {
+		t.Fatalf("member post after rejoin duplicate=%v err=%v, want slow-mode wait", duplicate, err)
+	}
+
+	preview, rpc := getFullChannelViaDispatcher(t, h, outsider.ID, false, api.InputChannel(outsider.ID, channel.ID))
+	if rpc != nil {
+		t.Fatalf("public getFullChannel: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	if seconds, ok := fullChannelInfo(t, preview).GetSlowmodeSeconds(); ok {
+		t.Fatalf("public preview exposed slowmode_seconds %d", seconds)
+	}
+
+	updates, rpc = toggleSlowModeViaDispatcher(t, h, creator.ID, api.InputChannel(creator.ID, channel.ID), 10)
+	if updates != nil || rpc == nil || rpc.ErrorMessage != "CHAT_NOT_MODIFIED" {
+		t.Fatalf("unchanged slow mode result = updates %v, rpc %v; want CHAT_NOT_MODIFIED", updates, rpc)
+	}
+
+	updates, rpc = toggleSlowModeViaDispatcher(t, h, creator.ID, api.InputChannel(creator.ID, channel.ID), 0)
+	if rpc != nil {
+		t.Fatalf("disable slow mode: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	requireSlowModeChannelUpdate(t, updates, channel.ID)
+	response, rpc = getFullChannelViaDispatcher(t, h, member.ID, false, api.InputChannel(member.ID, channel.ID))
+	if rpc != nil {
+		t.Fatalf("member getFullChannel after disable: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	if seconds, ok := fullChannelInfo(t, response).GetSlowmodeSeconds(); !ok || seconds != 0 {
+		t.Fatalf("member slowmode_seconds after disable = %d present=%v, want 0", seconds, ok)
+	}
+}
+
+func TestHandleToggleSlowModeRejectsUnauthorizedAndInvalidRequests(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, err := s.CreateUser(ctx, "+15551295211")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551295212")
+	if err != nil {
+		t.Fatalf("member: %v", err)
+	}
+	removed, err := s.CreateUser(ctx, "+15551295213")
+	if err != nil {
+		t.Fatalf("removed member: %v", err)
+	}
+	banned, err := s.CreateUser(ctx, "+15551295214")
+	if err != nil {
+		t.Fatalf("banned member: %v", err)
+	}
+	outsider, err := s.CreateUser(ctx, "+15551295215")
+	if err != nil {
+		t.Fatalf("outsider: %v", err)
+	}
+	channel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{
+		Megagroup: true,
+		Title:     "Slow mode authorization",
+	})
+	joinChannel(t, ctx, dsn, channel.ID, member.ID)
+	joinChannel(t, ctx, dsn, channel.ID, removed.ID)
+	joinChannel(t, ctx, dsn, channel.ID, banned.ID)
+	channelExec(t, ctx, dsn, `DELETE FROM channel_participants WHERE channel_id = $1 AND user_id = $2`, channel.ID, removed.ID)
+	channelExec(t, ctx, dsn, `UPDATE channel_participants SET banned_until = now() + interval '1 hour' WHERE channel_id = $1 AND user_id = $2`, channel.ID, banned.ID)
+	h := fullChannelDispatcher(s)
+	updates, rpc := toggleSlowModeViaDispatcher(t, h, creator.ID, api.InputChannel(creator.ID, channel.ID), 10)
+	if rpc != nil {
+		t.Fatalf("set initial slow mode: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	requireSlowModeChannelUpdate(t, updates, channel.ID)
+	if _, rpc := getFullChannelViaDispatcher(t, h, banned.ID, false, api.InputChannel(banned.ID, channel.ID)); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Fatalf("banned getFullChannel error = %v, want PEER_ID_INVALID", rpc)
+	}
+
+	wrongChannelHash := &tg.InputChannel{ChannelID: channel.ID, AccessHash: channel.ID}
+	missingChannelID := channel.ID + 1
+	cases := []struct {
+		name    string
+		userID  int64
+		channel tg.InputChannelClass
+		seconds int
+	}{
+		{name: "member", userID: member.ID, channel: api.InputChannel(member.ID, channel.ID), seconds: 10},
+		{name: "removed member", userID: removed.ID, channel: api.InputChannel(removed.ID, channel.ID), seconds: 10},
+		{name: "banned member", userID: banned.ID, channel: api.InputChannel(banned.ID, channel.ID), seconds: 10},
+		{name: "nonmember", userID: outsider.ID, channel: api.InputChannel(outsider.ID, channel.ID), seconds: 10},
+		{name: "wrong hash", userID: creator.ID, channel: wrongChannelHash, seconds: 10},
+		{name: "absent channel", userID: outsider.ID, channel: api.InputChannel(outsider.ID, missingChannelID), seconds: 10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, rpc := toggleSlowModeViaDispatcher(t, h, tc.userID, tc.channel, tc.seconds); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+				t.Fatalf("toggleSlowMode error = %v, want PEER_ID_INVALID", rpc)
+			}
+		})
+	}
+
+	broadcast := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{
+		Broadcast: true,
+		Title:     "Broadcast slow mode",
+	})
+	if _, rpc := toggleSlowModeViaDispatcher(t, h, creator.ID, api.InputChannel(creator.ID, broadcast.ID), 0); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Fatalf("broadcast toggleSlowMode error = %v, want PEER_ID_INVALID", rpc)
+	}
+	basicGroup, err := s.CreateChat(ctx, creator.ID, "Basic group slow mode", nil)
+	if err != nil {
+		t.Fatalf("create basic group: %v", err)
+	}
+	if _, rpc := toggleSlowModeViaDispatcher(t, h, creator.ID, api.InputChannel(creator.ID, basicGroup.ID), 0); rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Fatalf("basic-group toggleSlowMode error = %v, want PEER_ID_INVALID", rpc)
+	}
+	if _, found, err := s.ChatByID(ctx, basicGroup.ID); err != nil || !found {
+		t.Fatalf("basic group after toggle = found %v err %v, want unchanged", found, err)
+	}
+	if _, found, err := s.ChannelByID(ctx, basicGroup.ID); err != nil || found {
+		t.Fatalf("channel at basic-group id = found %v err %v, want no migration", found, err)
+	}
+	if _, rpc := toggleSlowModeViaDispatcher(t, h, creator.ID, &tg.InputChannel{}, 11); rpc == nil || rpc.ErrorMessage != "SECONDS_INVALID" {
+		t.Fatalf("unsupported interval error = %v, want SECONDS_INVALID before peer validation", rpc)
+	}
+	response, rpc := getFullChannelViaDispatcher(t, h, member.ID, false, api.InputChannel(member.ID, channel.ID))
+	if rpc != nil {
+		t.Fatalf("member getFullChannel after refused writes: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	if seconds, ok := fullChannelInfo(t, response).GetSlowmodeSeconds(); !ok || seconds != 10 {
+		t.Fatalf("slowmode_seconds after refused writes = %d present=%v, want 10", seconds, ok)
+	}
+}
+
+func TestHandleToggleSlowModeSerializesAgainstAdminDemotion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, err := s.CreateUser(ctx, "+15551295221")
+	if err != nil {
+		t.Fatalf("creator: %v", err)
+	}
+	admin, err := s.CreateUser(ctx, "+15551295222")
+	if err != nil {
+		t.Fatalf("admin: %v", err)
+	}
+	channel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{
+		Megagroup: true,
+		Title:     "Slow mode demotion",
+	})
+	joinChannel(t, ctx, dsn, channel.ID, admin.ID)
+	if err := s.SetChannelRole(ctx, channel.ID, creator.ID, admin.ID, 1); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	h := fullChannelDispatcher(s)
+	start := make(chan struct{})
+	demotionReady := make(chan struct{})
+	demotionDone := make(chan error, 1)
+	go func() {
+		close(demotionReady)
+		<-start
+		demotionDone <- s.SetChannelRole(ctx, channel.ID, creator.ID, admin.ID, 0)
+	}()
+	<-demotionReady
+	close(start)
+	updates, rpc := toggleSlowModeViaDispatcher(t, h, admin.ID, api.InputChannel(admin.ID, channel.ID), 30)
+	if err := <-demotionDone; err != nil {
+		t.Fatalf("demote admin: %v", err)
+	}
+	if rpc == nil {
+		requireSlowModeChannelUpdate(t, updates, channel.ID)
+	} else if rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Fatalf("concurrent toggleSlowMode error = %d %s, want success or PEER_ID_INVALID", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	response, rpc := getFullChannelViaDispatcher(t, h, creator.ID, false, api.InputChannel(creator.ID, channel.ID))
+	if rpc != nil {
+		t.Fatalf("creator getFullChannel after race: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+	}
+	seconds, ok := fullChannelInfo(t, response).GetSlowmodeSeconds()
+	want := 0
+	if rpc == nil {
+		want = 30
+	}
+	if !ok || seconds != want {
+		t.Fatalf("slowmode_seconds after demotion race = %d present=%v, want %d", seconds, ok, want)
+	}
+}

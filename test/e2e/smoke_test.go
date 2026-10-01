@@ -43,6 +43,10 @@ func TestSmoke(t *testing.T) {
 		t.Parallel()
 		testSmokeChannel(t)
 	})
+	t.Run("megagroup-slow-mode", func(t *testing.T) {
+		t.Parallel()
+		testSmokeMegagroupSlowMode(t)
+	})
 	t.Run("contacts-search", func(t *testing.T) {
 		t.Parallel()
 		testSmokeContactsSearch(t)
