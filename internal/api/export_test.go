@@ -76,6 +76,89 @@ func SignUpForTest(s *store.Store, authKeyID [8]byte, addr netip.Addr, rateLimit
 	return h.handleSignUp(&mtproto.Request{Ctx: context.Background(), AuthKeyID: authKeyID, ClientAddr: addr, Buf: &buf})
 }
 
+// SignUpTestRunner keeps one handler alive so rejection-sampling tests observe
+// the same per-class counters across requests.
+type SignUpTestRunner struct {
+	handler   *handlers
+	authKeyID [8]byte
+	addr      netip.Addr
+	now       time.Time
+}
+
+// NewSignUpTestRunner builds a sign-up handler with a captured logger and fixed
+// request identity for rejection tests.
+func NewSignUpTestRunner(
+	s *store.Store,
+	authKeyID [8]byte,
+	addr netip.Addr,
+	rateLimit store.RateLimitConfig,
+	registrationMode config.RegistrationMode,
+	log *slog.Logger,
+) *SignUpTestRunner {
+	h := testHandlers(s)
+	h.rateLimitSignUpIP = rateLimit
+	h.registrationMode = registrationMode
+	if log != nil {
+		h.log = log
+	}
+	runner := &SignUpTestRunner{
+		handler:   h,
+		authKeyID: authKeyID,
+		addr:      addr,
+		now:       time.Unix(1_700_000_000, 0),
+	}
+	h.now = func() time.Time { return runner.now }
+	return runner
+}
+
+// SetRegistrationModeForTest changes the configured mode between test calls.
+func (r *SignUpTestRunner) SetRegistrationModeForTest(mode config.RegistrationMode) {
+	r.handler.registrationMode = mode
+}
+
+// SetAuthKeyIDForTest changes the request key without resetting sampler state.
+func (r *SignUpTestRunner) SetAuthKeyIDForTest(authKeyID [8]byte) {
+	r.authKeyID = authKeyID
+}
+
+// AdvanceClockForTest moves the sampler clock without waiting in real time.
+func (r *SignUpTestRunner) AdvanceClockForTest(d time.Duration) {
+	r.now = r.now.Add(d)
+}
+
+// SignUp encodes and dispatches a typed sign-up request.
+func (r *SignUpTestRunner) SignUp(req *tg.AuthSignUpRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return r.SignUpBody(&buf)
+}
+
+// SignUpBody dispatches a raw request body with a background context.
+func (r *SignUpTestRunner) SignUpBody(body *bin.Buffer) (bin.Encoder, error) {
+	return r.SignUpBodyWithContext(context.Background(), body)
+}
+
+// SignUpWithContext dispatches a typed request using ctx.
+func (r *SignUpTestRunner) SignUpWithContext(ctx context.Context, req *tg.AuthSignUpRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return r.SignUpBodyWithContext(ctx, &buf)
+}
+
+// SignUpBodyWithContext dispatches a raw request body using ctx.
+func (r *SignUpTestRunner) SignUpBodyWithContext(ctx context.Context, body *bin.Buffer) (bin.Encoder, error) {
+	return r.handler.handleSignUp(&mtproto.Request{
+		Ctx:        ctx,
+		AuthKeyID:  r.authKeyID,
+		ClientAddr: r.addr,
+		Buf:        body,
+	})
+}
+
 // LogIssuedCodeForTest drives the gated login-code log line for the external
 // api_test package, without needing a store or a database.
 func LogIssuedCodeForTest(log *slog.Logger, logLoginCodes bool, phone, code string) {

@@ -96,6 +96,7 @@ func verifyToRPC(err error) *tgerr.Error {
 func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AuthSignUpRequest
 	if err := req.Decode(r.Buf); err != nil {
+		h.logSignUpRejection(signUpMalformedRequest)
 		return nil, errMethodNotImpl
 	}
 
@@ -104,36 +105,49 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 	switch h.registrationMode {
 	case config.RegistrationInvite, config.RegistrationOpen:
 	default:
+		h.logSignUpRejection(signUpRegistrationModeUnavailable)
 		return nil, errInputRequestInvalid
 	}
 	// Charge every active-mode attempt before any identifier, name, invite, or
 	// code-dependent decision. The budget is deliberately not refunded on a
 	// later rejection.
 	if err := h.checkAndChargeRateLimitIP(r, "sign_up_ip", h.rateLimitSignUpIP); err != nil {
+		class := signUpInternal
+		var rpcErr *tgerr.Error
+		if errors.As(err, &rpcErr) && rpcErr.Code == 420 {
+			class = signUpRateLimited
+		}
+		h.logSignUpRejection(class)
 		return nil, err
 	}
 	key, found, err := h.store.AuthKeyByID(r.Ctx, mtproto.AuthKeyIDInt64(r.AuthKeyID))
 	if err != nil {
 		h.log.Error("sign up: inspect auth key", "err", err)
+		h.logSignUpRejection(signUpInternal)
 		return nil, errInternal
 	}
 	// A pending password challenge still has no user binding and may be
 	// replaced by signup. AdmitUsername takes the authoritative row lock and
 	// repeats this condition before any account-side write.
 	if !found || key.UserID != 0 {
+		h.logSignUpRejection(signUpSessionStateInvalid)
 		return nil, errSessionStateInvalid
 	}
 	if !validateUsername(req.PhoneNumber) {
+		h.logSignUpRejection(signUpHandleInvalid)
 		return nil, errUsernameInvalid
 	}
 	username := strings.ToLower(req.PhoneNumber)
 	if isReservedUsername(username) {
+		h.logSignUpRejection(signUpHandleInvalid)
 		return nil, errUsernameInvalid
 	}
 	if !validateSignUpName(req.FirstName) {
+		h.logSignUpRejection(signUpFirstNameInvalid)
 		return nil, errFirstNameInvalid
 	}
 	if !validateSignUpName(req.LastName) {
+		h.logSignUpRejection(signUpLastNameInvalid)
 		return nil, errLastNameInvalid
 	}
 
@@ -151,15 +165,20 @@ func (h *handlers) handleSignUp(r *mtproto.Request) (bin.Encoder, error) {
 		case errors.Is(err, store.ErrCodeInvalid),
 			errors.Is(err, store.ErrCodeExpired),
 			errors.Is(err, store.ErrCodeExhausted):
+			h.logSignUpRejection(signUpCodeInvalid)
 			return nil, errCodeInvalid
 		case errors.Is(err, store.ErrInviteInvalid):
+			h.logSignUpRejection(signUpInviteInvalid)
 			return nil, errInviteHashInvalid
 		case errors.Is(err, store.ErrUsernameOccupied):
+			h.logSignUpRejection(signUpHandleOccupied)
 			return nil, errUsernameOccupied
 		case errors.Is(err, store.ErrAuthKeyNotFound):
+			h.logSignUpRejection(signUpSessionStateInvalid)
 			return nil, errSessionStateInvalid
 		default:
 			h.log.Error("sign up: admit username", "err", err)
+			h.logSignUpRejection(signUpInternal)
 			return nil, errInternal
 		}
 	}
