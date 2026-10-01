@@ -304,6 +304,14 @@ SET default_banned_rights = $2, version = version + 1
 WHERE id = $1
 RETURNING *;
 
+-- SetChannelSlowMode writes the megagroup interval after current admin authority
+-- and equality have been checked under LockChannel.
+-- name: SetChannelSlowMode :one
+UPDATE channels
+SET slowmode_seconds = $2
+WHERE id = $1
+RETURNING *;
+
 -- SetChannelUsername writes the denormalized handle copy and, with it,
 -- recomputes publicly_discoverable from the usernames table.
 --

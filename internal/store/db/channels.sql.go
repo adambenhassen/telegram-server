@@ -1189,6 +1189,41 @@ func (q *Queries) SetChannelPinnedMessage(ctx context.Context, arg SetChannelPin
 	return i, err
 }
 
+const setChannelSlowMode = `-- name: SetChannelSlowMode :one
+UPDATE channels
+SET slowmode_seconds = $2
+WHERE id = $1
+RETURNING id, title, about, creator_id, megagroup, version, date, pinned_message_id, username, title_tsv, publicly_discoverable, default_banned_rights, slowmode_seconds
+`
+
+type SetChannelSlowModeParams struct {
+	ID              int64
+	SlowmodeSeconds int16
+}
+
+// SetChannelSlowMode writes the megagroup interval after current admin authority
+// and equality have been checked under LockChannel.
+func (q *Queries) SetChannelSlowMode(ctx context.Context, arg SetChannelSlowModeParams) (Channel, error) {
+	row := q.db.QueryRow(ctx, setChannelSlowMode, arg.ID, arg.SlowmodeSeconds)
+	var i Channel
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.About,
+		&i.CreatorID,
+		&i.Megagroup,
+		&i.Version,
+		&i.Date,
+		&i.PinnedMessageID,
+		&i.Username,
+		&i.TitleTsv,
+		&i.PubliclyDiscoverable,
+		&i.DefaultBannedRights,
+		&i.SlowmodeSeconds,
+	)
+	return i, err
+}
+
 const setChannelUsername = `-- name: SetChannelUsername :execrows
 UPDATE channels c
 SET username = $1,

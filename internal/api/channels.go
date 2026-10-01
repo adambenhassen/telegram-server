@@ -31,6 +31,28 @@ const (
 	maxChannelInviteTargets = 100
 )
 
+// slowModeSecondsValue maps a client interval to the database representation.
+func slowModeSecondsValue(seconds int) (int16, bool) {
+	switch seconds {
+	case 0:
+		return 0, true
+	case 10:
+		return 10, true
+	case 30:
+		return 30, true
+	case 60:
+		return 60, true
+	case 300:
+		return 300, true
+	case 900:
+		return 900, true
+	case 3600:
+		return 3600, true
+	default:
+		return 0, false
+	}
+}
+
 // The coarse participant roles M7 stores, mirroring internal/store's own
 // unexported constants. There is no bitfield: a member either holds admin
 // rights or does not.
@@ -187,6 +209,7 @@ func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error)
 	full.SetCanViewParticipants(canViewParticipants)
 	if member {
 		full.Pts = snapshot.Pts
+		full.SetSlowmodeSeconds(int(snapshot.Channel.SlowmodeSeconds))
 	}
 
 	var users []tg.UserClass
@@ -223,6 +246,42 @@ func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error)
 		FullChat: full,
 		Chats:    []tg.ChatClass{chat},
 		Users:    users,
+	}, nil
+}
+
+// handleToggleSlowMode serves channels.toggleSlowMode. The store checks current
+// admin authority and writes the interval under LockChannel, serializing the save
+// with concurrent demotions without touching committed post markers.
+func (h *handlers) handleToggleSlowMode(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsToggleSlowModeRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	seconds, valid := slowModeSecondsValue(req.Seconds)
+	if !valid {
+		return nil, errSecondsInvalid
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	_, changed, err := h.store.SetChannelSlowMode(r.Ctx, channelID, r.UserID, seconds)
+	if errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	}
+	if err != nil {
+		h.log.Error("toggle channel slow mode", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	if !changed {
+		return nil, errChatNotModified
+	}
+	return &tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: channelID}},
+		Date:    int(time.Now().Unix()),
 	}, nil
 }
 
