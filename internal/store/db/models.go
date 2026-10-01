@@ -154,6 +154,95 @@ type File struct {
 	SubtypeRights []string
 }
 
+type LanguageCatalogChange struct {
+	LangPack    string
+	LangCode    string
+	Version     int64
+	Key         string
+	Kind        int16
+	Value       string
+	PluralZero  *string
+	PluralOne   *string
+	PluralTwo   *string
+	PluralFew   *string
+	PluralMany  *string
+	PluralOther *string
+	Deleted     bool
+}
+
+type LanguageCatalogCurrentString struct {
+	LangPack           string
+	LangCode           string
+	Key                string
+	Kind               int16
+	Value              string
+	PluralZero         *string
+	PluralOne          *string
+	PluralTwo          *string
+	PluralFew          *string
+	PluralMany         *string
+	PluralOther        *string
+	Deleted            bool
+	LastChangedVersion int64
+}
+
+type LanguageCatalogPack struct {
+	LangPack              string
+	LangCode              string
+	CurrentVersion        int64
+	Name                  string
+	NativeName            string
+	PluralCode            string
+	CurrentContentSha256  []byte
+	CurrentManifestSha256 []byte
+	SourceUrl             string
+	SourceRevision        string
+	SourceSha256          []byte
+	SourceNotice          string
+	Attribution           string
+	UpdatedAt             pgtype.Timestamptz
+}
+
+type LanguageCatalogPublicationAudit struct {
+	ID              int64
+	LangPack        string
+	LangCode        string
+	OldVersion      *int64
+	NewVersion      int64
+	SourceCommitSha string
+	SourceRevision  string
+	SourceSha256    []byte
+	ContentSha256   []byte
+	ManifestSha256  []byte
+	ValidatorResult string
+	OsUser          string
+	CreatedAt       pgtype.Timestamptz
+}
+
+type LanguageCatalogTombstone struct {
+	LangPack string
+	LangCode string
+	Version  int64
+	Key      string
+}
+
+type LanguageCatalogVersion struct {
+	LangPack       string
+	LangCode       string
+	Version        int64
+	Name           string
+	NativeName     string
+	PluralCode     string
+	ContentSha256  []byte
+	ManifestSha256 []byte
+	SourceUrl      string
+	SourceRevision string
+	SourceSha256   []byte
+	SourceNotice   string
+	Attribution    string
+	PublishedAt    pgtype.Timestamptz
+}
+
 type Message struct {
 	OwnerID        int64
 	LocalID        int64
