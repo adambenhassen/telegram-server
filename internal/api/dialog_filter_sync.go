@@ -164,7 +164,10 @@ func (s *DialogFilterSync) AcknowledgeFetch(conn *mtproto.Conn, req *mtproto.Req
 	}
 	clock := s.current()
 	if conn.AcknowledgeDialogFilterFetch(req.UserID, req.SessionID, captured.generation, clock.globalEpoch) {
-		s.enqueueRecovery(conn)
+		_, globalEpoch := s.Snapshot()
+		if conn.DialogFilterRecoveryAttemptPending(req.UserID, req.SessionID, globalEpoch) {
+			s.enqueueRecovery(conn)
+		}
 	}
 }
 
@@ -175,7 +178,10 @@ func (s *DialogFilterSync) AcknowledgeDifference(conn *mtproto.Conn, req *mtprot
 		return
 	}
 	if conn.AcknowledgeDialogFilterDifference(req.UserID, req.SessionID, included && captured.firstDifference) {
-		s.enqueueRecovery(conn)
+		_, globalEpoch := s.Snapshot()
+		if conn.DialogFilterRecoveryAttemptPending(req.UserID, req.SessionID, globalEpoch) {
+			s.enqueueRecovery(conn)
+		}
 	}
 }
 

@@ -40,6 +40,67 @@ func recoveryTestKey() crypto.AuthKey {
 	return raw.WithID()
 }
 
+func TestDialogFilterRecoveryAcknowledgementsDoNotQueueIdleBindings(t *testing.T) {
+	tests := []struct {
+		name            string
+		idleConnections int
+		acknowledge     func(*DialogFilterSync, *mtproto.Conn, *mtproto.Request, DialogFilterCapture)
+	}{
+		{
+			name:            "successful folder fetch with 641 connections",
+			idleConnections: 640,
+			acknowledge: func(syncState *DialogFilterSync, conn *mtproto.Conn, req *mtproto.Request, captured DialogFilterCapture) {
+				syncState.AcknowledgeFetch(conn, req, captured)
+			},
+		},
+		{
+			name:            "first difference with 6400 connections",
+			idleConnections: 6399,
+			acknowledge: func(syncState *DialogFilterSync, conn *mtproto.Conn, req *mtproto.Request, captured DialogFilterCapture) {
+				syncState.AcknowledgeDifference(conn, req, captured, true)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := mtproto.NewSessionRegistry()
+			syncState := NewDialogFilterSync()
+			register := func(ownerID int64, transport *recoveryRebindTransport) *mtproto.Conn {
+				conn := mtproto.NewTestConn(transport, recoveryTestKey())
+				conn.SetOwner(ownerID)
+				conn.SetSession(123)
+				if !registry.Add(ownerID, conn) {
+					t.Fatalf("registry rejected connection for owner %d", ownerID)
+				}
+				req := &mtproto.Request{UserID: ownerID, SessionID: 123}
+				captured := syncState.Capture(conn, req)
+				tt.acknowledge(syncState, conn, req, captured)
+				if _, _, _, pending, ok := conn.DialogFilterRecoverySnapshot(ownerID, 123, 0); !ok || pending {
+					t.Fatalf("owner %d acknowledgement left recovery pending: ok=%t pending=%t", ownerID, ok, pending)
+				}
+				return conn
+			}
+
+			for i := range tt.idleConnections {
+				register(int64(10_000+i), &recoveryRebindTransport{})
+			}
+			targetOwner := int64(10_000 + tt.idleConnections)
+			targetTransport := &recoveryRebindTransport{sent: make(chan struct{}, 1)}
+			register(targetOwner, targetTransport)
+			syncState.OwnerInvalidation(registry, targetOwner)
+
+			updater := NewUpdaterWithDialogFilterSync(nil, registry, slog.New(slog.DiscardHandler), nil, syncState)
+			t.Cleanup(func() { updater.recoveryWG.Wait() })
+			updater.recoverDialogFilters(context.Background(), time.Now())
+			select {
+			case <-targetTransport.sent:
+			case <-time.After(time.Second):
+				t.Fatalf("pending target waited behind %d successfully acknowledged idle connections", tt.idleConnections)
+			}
+		})
+	}
+}
+
 type recoveryBlockingTransport struct {
 	entered     chan struct{}
 	release     chan struct{}
