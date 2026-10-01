@@ -40,6 +40,8 @@ const (
 	// msgID is present on pin (nonzero), absent on unpin. The handler pushes
 	// updatePinnedMessages (transient, no pts, same model as reactions).
 	ChannelPinned = "tg_pinned"
+	// ChannelDialogFilters carries only a folder owner's user id.
+	ChannelDialogFilters = "tg_dialog_filters"
 )
 
 const channelMembershipPayloadPrefix = "channel_membership|"
@@ -206,6 +208,48 @@ func StartListener(
 	log *slog.Logger,
 	notifyMetrics ...*NotificationMetrics,
 ) (*Listener, func() error, error) {
+	return startListener(ctx, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, nil, nil, log, notifyMetrics...)
+}
+
+// StartListenerWithDialogFilters adds private-folder invalidation and listener
+// reconnect callbacks for the server process.
+func StartListenerWithDialogFilters(
+	ctx context.Context,
+	dsn string,
+	deliver func(ctx context.Context, userID int64),
+	typing func(ctx context.Context, peerID, fromID int64),
+	evict func(ctx context.Context, userID, authKeyID int64),
+	channelPost func(ctx context.Context, channelID int64),
+	encryption func(ctx context.Context, userID, chatID int64),
+	status func(ctx context.Context, userID int64, online bool),
+	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
+	reactions func(ctx context.Context, ownerID, localID, userID int64),
+	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
+	dialogFilters func(ctx context.Context, ownerID int64),
+	reconnected func(),
+	log *slog.Logger,
+	notifyMetrics ...*NotificationMetrics,
+) (*Listener, func() error, error) {
+	return startListener(ctx, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, dialogFilters, reconnected, log, notifyMetrics...)
+}
+
+func startListener(
+	ctx context.Context,
+	dsn string,
+	deliver func(ctx context.Context, userID int64),
+	typing func(ctx context.Context, peerID, fromID int64),
+	evict func(ctx context.Context, userID, authKeyID int64),
+	channelPost func(ctx context.Context, channelID int64),
+	encryption func(ctx context.Context, userID, chatID int64),
+	status func(ctx context.Context, userID int64, online bool),
+	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
+	reactions func(ctx context.Context, ownerID, localID, userID int64),
+	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
+	dialogFilters func(ctx context.Context, ownerID int64),
+	reconnected func(),
+	log *slog.Logger,
+	notifyMetrics ...*NotificationMetrics,
+) (*Listener, func() error, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -222,7 +266,7 @@ func StartListener(
 	l := &Listener{log: log, metrics: metrics, scheduler: newNotificationScheduler(loopCtx)}
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned)
+		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, dialogFilters, reconnected)
 	})
 
 	stop := func() error {
@@ -242,7 +286,7 @@ func connectAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listener connect: %w", err)
 	}
-	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost, ChannelEncryption, ChannelStatus, ChannelEncryptedMsg, ChannelReactions, ChannelPinned} {
+	for _, ch := range []string{ChannelUpdates, ChannelTyping, ChannelEvict, ChannelPost, ChannelEncryption, ChannelStatus, ChannelEncryptedMsg, ChannelReactions, ChannelPinned, ChannelDialogFilters} {
 		// ch is a constant channel identifier, never user input (no injection).
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			_ = conn.Close(ctx) //nolint:errcheck // best-effort close on setup failure
@@ -269,6 +313,8 @@ func (l *Listener) run(
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
 	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
+	dialogFilters func(ctx context.Context, ownerID int64),
+	reconnected func(),
 ) {
 	backoff := listenerBackoffMin
 	for {
@@ -286,11 +332,14 @@ func (l *Listener) run(
 				continue
 			}
 			l.log.Info("listener reconnected")
+			if reconnected != nil {
+				reconnected()
+			}
 			conn = c
 		}
 
 		up := time.Now()
-		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned)
+		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, dialogFilters)
 		closeErr := conn.Close(context.Background())
 		conn = nil
 		if ctx.Err() != nil {
@@ -316,6 +365,7 @@ func (l *Listener) dispatch(
 	encryptedMsg func(ctx context.Context, recipientID int64, qts int),
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
 	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
+	dialogFilters func(ctx context.Context, ownerID int64),
 ) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
@@ -516,6 +566,19 @@ func (l *Listener) dispatch(
 					pinned(ctx, peerType, peerID, pinnedMsgID)
 				},
 			})
+		case ChannelDialogFilters:
+			ownerID, perr := strconv.ParseInt(n.Payload, 10, 64)
+			if perr != nil || ownerID <= 0 {
+				l.recordInvalidNotification()
+				l.log.Warn("bad tg_dialog_filters payload")
+				continue
+			}
+			l.recordValidNotification(ChannelDialogFilters)
+			if dialogFilters != nil {
+				// The callback only advances in-memory recovery state and never
+				// waits for the worker pool or a socket write.
+				dialogFilters(ctx, ownerID)
+			}
 		default:
 			l.recordInvalidNotification()
 		}

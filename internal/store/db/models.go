@@ -394,6 +394,47 @@ type UserContact struct {
 	ContactID int64
 }
 
+type UserDialogFilter struct {
+	OwnerID         int64
+	FilterID        int16
+	Title           string
+	Emoticon        string
+	Color           *int16
+	Contacts        bool
+	NonContacts     bool
+	Groups          bool
+	Broadcasts      bool
+	Bots            bool
+	ExcludeMuted    bool
+	ExcludeRead     bool
+	ExcludeArchived bool
+	TitleNoanimate  bool
+}
+
+type UserDialogFilterEntity struct {
+	OwnerID        int64
+	FilterID       int16
+	EntityPosition int16
+	EntityOffset   int32
+	Length         int32
+	DocumentID     int64
+}
+
+type UserDialogFilterPeer struct {
+	OwnerID      int64
+	FilterID     int16
+	ListType     int16
+	PeerType     int16
+	PeerID       int64
+	PeerPosition int16
+}
+
+type UserDialogFilterState struct {
+	OwnerID   int64
+	OrderIds  []int16
+	ChangedAt pgtype.Timestamptz
+}
+
 type UserPassword struct {
 	UserID        int64
 	Salt1         []byte

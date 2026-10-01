@@ -7,13 +7,13 @@ source "$script_dir/smoke-diagnostics.sh"
 probe='diagnostic-probe-code-1234 object-content-private'
 package='github.com/adambenhassen/telegram-server/test/e2e'
 fixture=$(jq -nc --arg package "$package" --arg output "$probe" \
-  '{Package:$package,Action:"fail",Test:"TestSmoke/one-to-one",Output:$output}')
+  '{Package:$package,Action:"fail",Test:"TestSmoke/dialog-filters",Output:$output}')
 fixture+=$'\n'
 fixture+=$(jq -nc --arg package "$package" --arg output "$probe" \
   '{Package:$package,Action:"fail",Test:"TestSmoke",Output:$output}')
 
 diagnostics=$(report_smoke_failure_diagnostics <<<"$fixture")
-expected='::error::TestSmoke/one-to-one failed (category: scenario-failure; details redacted)'
+expected='::error::TestSmoke/dialog-filters failed (category: scenario-failure; details redacted)'
 if [ "$diagnostics" != "$expected" ]; then
   printf 'unexpected sanitized diagnostic\n' >&2
   exit 1

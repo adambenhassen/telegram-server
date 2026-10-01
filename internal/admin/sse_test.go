@@ -780,8 +780,9 @@ func TestSSE_rateLimitDenialTelemetryHasFixedJSONSchema(t *testing.T) {
 		RateLimitDenialsWindowSeconds: 10,
 		RateLimitDenialsRatePerSecond: 0.5,
 		RateLimitDenialsBySurface: admin.RateLimitDenialsBySurface{
-			MessageSend:   2,
-			UpdateProfile: 3,
+			MessageSend:          2,
+			UpdateProfile:        3,
+			DialogFilterMutation: 4,
 		},
 		RateLimitDenialsDropped: 4,
 	}
@@ -812,7 +813,7 @@ func TestSSE_rateLimitDenialTelemetryHasFixedJSONSchema(t *testing.T) {
 	}
 	wantSurface := []string{
 		"add_chat_user", "check_password", "check_password_ip", "contacts_search",
-		"create_channel", "create_chat", "get_password", "get_password_ip",
+		"create_channel", "create_chat", "dialog_filter_mutation", "get_password", "get_password_ip",
 		"message_send", "messages_search", "messages_search_global", "password_proof",
 		"save_file_part", "send_code_ip_calls", "send_code_ip_distinct_numbers",
 		"sign_in_fail_ip", "sign_up_ip", "update_profile", "upload_get_file",

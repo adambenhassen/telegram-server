@@ -59,11 +59,18 @@ var (
 	// errMessageIDInvalid rejects edit/delete of an absent or non-owned message.
 	errMessageIDInvalid = rpcErr(400, "MESSAGE_ID_INVALID")
 	// errPeerIDInvalid rejects an unresolvable or unauthorized input peer.
-	errPeerIDInvalid = rpcErr(400, "PEER_ID_INVALID")
+	errPeerIDInvalid       = rpcErr(400, "PEER_ID_INVALID")
+	errFilterIDInvalid     = rpcErr(400, "FILTER_ID_INVALID")
+	errFilterTitleEmpty    = rpcErr(400, "FILTER_TITLE_EMPTY")
+	errFilterIncludeEmpty  = rpcErr(400, "FILTER_INCLUDE_EMPTY")
+	errEntityBoundsInvalid = rpcErr(400, "ENTITY_BOUNDS_INVALID")
+	errEntitiesTooLong     = rpcErr(400, "ENTITIES_TOO_LONG")
+	errMsgWaitTimeout      = rpcErr(400, "MSG_WAIT_TIMEOUT")
+	errMsgWaitFailed       = rpcErr(400, "MSG_WAIT_FAILED")
 	// errSecondsInvalid rejects a slow-mode interval the channel schema cannot store.
 	errSecondsInvalid = rpcErr(400, "SECONDS_INVALID")
-	// errChatNotModified answers an authorized channel-setting save whose value
-	// already matches the stored setting.
+	// errChatNotModified answers an authorized setting save whose value already
+	// matches the stored setting.
 	errChatNotModified = rpcErr(400, "CHAT_NOT_MODIFIED")
 	// errChatTitleInvalid rejects an empty, whitespace-only or over-length chat
 	// title on createChat and editChatTitle.

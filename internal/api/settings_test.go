@@ -173,13 +173,29 @@ func TestSettingsHandlersReturnHonestDefaults(t *testing.T) {
 }
 
 type settingsDispatcherTransport struct {
-	mu   sync.Mutex
-	sent [][]byte
+	mu          sync.Mutex
+	sent        [][]byte
+	sendErr     error
+	sendEntered chan struct{}
+	sendRelease chan struct{}
 }
 
-func (t *settingsDispatcherTransport) Send(_ context.Context, b *bin.Buffer) error {
+func (t *settingsDispatcherTransport) Send(ctx context.Context, b *bin.Buffer) error {
+	if t.sendEntered != nil {
+		t.sendEntered <- struct{}{}
+	}
+	if t.sendRelease != nil {
+		select {
+		case <-t.sendRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.sendErr != nil {
+		return t.sendErr
+	}
 	t.sent = append(t.sent, slices.Clone(b.Buf))
 	return nil
 }

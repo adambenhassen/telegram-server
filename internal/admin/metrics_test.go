@@ -112,6 +112,7 @@ func TestMetricsHandler(t *testing.T) {
 		`"tg_encrypted_msg"`,
 		`"tg_reactions"`,
 		`"tg_pinned"`,
+		`"tg_dialog_filters"`,
 		`"notify_invalid"`,
 		`"push_latency_sample_count"`,
 		`"push_latency_p50_overflow"`,
@@ -171,6 +172,9 @@ func TestMetricsHandlerNotificationTelemetry(t *testing.T) {
 	if err := metrics.RecordValidNotification(store.ChannelTyping); err != nil {
 		t.Fatal(err)
 	}
+	if err := metrics.RecordValidNotification(store.ChannelDialogFilters); err != nil {
+		t.Fatal(err)
+	}
 	if err := metrics.RecordInvalidNotification(); err != nil {
 		t.Fatal(err)
 	}
@@ -180,17 +184,17 @@ func TestMetricsHandlerNotificationTelemetry(t *testing.T) {
 	now = time.Unix(1_700_000_010, 0)
 
 	resp := requestMetrics(t, ctx, admin.Handler(mtproto.NewSessionRegistry(), st, metrics))
-	if resp.NotifyCount != 2 {
-		t.Errorf("notify count = %d, want 2", resp.NotifyCount)
+	if resp.NotifyCount != 3 {
+		t.Errorf("notify count = %d, want 3", resp.NotifyCount)
 	}
 	if resp.NotifyWindowSeconds != 10 {
 		t.Errorf("notify window = %v, want 10", resp.NotifyWindowSeconds)
 	}
-	if resp.NotifyRatePerSecond != 0.2 {
-		t.Errorf("notify rate = %v, want 0.2", resp.NotifyRatePerSecond)
+	if resp.NotifyRatePerSecond != 0.3 {
+		t.Errorf("notify rate = %v, want 0.3", resp.NotifyRatePerSecond)
 	}
-	if resp.NotifyChannels.Updates != 1 || resp.NotifyChannels.Typing != 1 {
-		t.Errorf("notify channels = %+v, want updates=1 and typing=1", resp.NotifyChannels)
+	if resp.NotifyChannels.Updates != 1 || resp.NotifyChannels.Typing != 1 || resp.NotifyChannels.DialogFilters != 1 {
+		t.Errorf("notify channels = %+v, want updates=1, typing=1 and dialog filters=1", resp.NotifyChannels)
 	}
 	if resp.NotifyInvalid != 1 {
 		t.Errorf("notify invalid = %d, want 1", resp.NotifyInvalid)
