@@ -30,7 +30,7 @@ func NewHandler(logger *slog.Logger) http.Handler {
 
 		if r.Method != http.MethodHead {
 			if _, err := io.WriteString(w, body); err != nil {
-				logger.Info("landing response", "route_class", class, "status", status)
+				logger.Error("landing response write failed", "route_class", class, "status", status)
 				return
 			}
 		}

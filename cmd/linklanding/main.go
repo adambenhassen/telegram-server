@@ -46,11 +46,12 @@ func serve(port int, logger *slog.Logger) error {
 		return fmt.Errorf("listen on loopback port %d: %w", port, err)
 	}
 	server := &http.Server{
-		Addr:              address,
-		Handler:           linklanding.NewHandler(logger),
-		ReadHeaderTimeout: 5 * time.Second,
-		MaxHeaderBytes:    8192,
-		ErrorLog:          log.New(io.Discard, "", 0),
+		Addr:                         address,
+		Handler:                      linklanding.NewHandler(logger),
+		DisableGeneralOptionsHandler: true,
+		ReadHeaderTimeout:            5 * time.Second,
+		MaxHeaderBytes:               8192,
+		ErrorLog:                     log.New(io.Discard, "", 0),
 	}
 	return server.Serve(listener)
 }

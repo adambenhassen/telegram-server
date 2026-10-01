@@ -94,6 +94,26 @@ if [[ "$method_status" != 405 ]]; then
 	printf 'POST returned %s, want 405\n' "$method_status" >&2
 	exit 1
 fi
+options_status="$(curl --silent --output "$temp_dir/options-body" --dump-header "$temp_dir/options-headers" \
+	--write-out '%{http_code}' --request-target '*' --request OPTIONS \
+	--header 'Referer: https://referer-secret.example/path' --header 'X-Synthetic-Secret: options-secret' \
+	"$origin/")"
+if [[ "$options_status" != 405 ]]; then
+	printf 'OPTIONS * returned %s, want 405\n' "$options_status" >&2
+	exit 1
+fi
+if [[ "$(<"$temp_dir/options-body")" != "$(<"$temp_dir/method-body")" ]]; then
+	printf 'OPTIONS * returned a different generic method response\n' >&2
+	exit 1
+fi
+for header in 'Allow' 'Content-Type' 'Content-Length' 'Cache-Control' 'Referrer-Policy' 'X-Content-Type-Options' 'Content-Security-Policy'; do
+	options_value="$(awk -v want_name="$header" '{ line = $0; sub(/\r$/, "", line); separator = index(line, ":"); if (separator > 0 && tolower(substr(line, 1, separator - 1)) == tolower(want_name)) value = substr(line, separator + 2) } END { print value }' "$temp_dir/options-headers")"
+	method_value="$(awk -v want_name="$header" '{ line = $0; sub(/\r$/, "", line); separator = index(line, ":"); if (separator > 0 && tolower(substr(line, 1, separator - 1)) == tolower(want_name)) value = substr(line, separator + 2) } END { print value }' "$temp_dir/method-headers")"
+	if [[ "$options_value" != "$method_value" ]]; then
+		printf 'OPTIONS * %s = %q, POST = %q\n' "$header" "$options_value" "$method_value" >&2
+		exit 1
+	fi
+done
 admin_status="$(curl --silent --output "$temp_dir/admin-body" --dump-header "$temp_dir/admin-headers" \
 	--write-out '%{http_code}' --header 'Referer: https://referer-secret.example/path' \
 	"$origin/admin/private-route?secret=query-secret")"
@@ -103,13 +123,13 @@ if [[ "$admin_status" != 404 ]]; then
 fi
 
 logs="$(<"$temp_dir/log")"
-for expected in 'route_class=invite status=200' 'route_class=username status=405' 'route_class=admin status=404'; do
+for expected in 'route_class=invite status=200' 'route_class=username status=405' 'route_class=other status=405' 'route_class=admin status=404'; do
 	if [[ "$logs" != *"$expected"* ]]; then
 		printf 'missing privacy-safe log record: %s\n' "$expected" >&2
 		exit 1
 	fi
 done
-for marker in 'synthetic-live-capability' 'username-secret' 'private-route' 'query-secret' 'referer-secret'; do
+for marker in 'synthetic-live-capability' 'username-secret' 'private-route' 'query-secret' 'referer-secret' 'options-secret'; do
 	if [[ "$logs" == *"$marker"* ]]; then
 		printf 'request data leaked to logs\n' >&2
 		exit 1

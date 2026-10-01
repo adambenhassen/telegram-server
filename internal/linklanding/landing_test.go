@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -179,6 +180,72 @@ func TestHandlerLogsOnlyRouteClassAndStatus(t *testing.T) {
 			t.Errorf("logs contain request data %q: %s", marker, logs.String())
 		}
 	}
+}
+
+func TestHandlerLogsBodyWriteFailureAtErrorLevelWithoutSensitiveData(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	handler := linklanding.NewHandler(slog.New(slog.NewJSONHandler(&logs, nil)))
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/+synthetic-invite?secret=query-secret", nil)
+	request.Header.Set("Referer", "https://referer-secret.example/path")
+	response := &failingResponseWriter{header: make(http.Header)}
+
+	handler.ServeHTTP(response, request)
+	if response.status != http.StatusOK {
+		t.Errorf("response status = %d, want %d", response.status, http.StatusOK)
+	}
+	if response.writes != 1 {
+		t.Fatalf("body writes = %d, want one failing write", response.writes)
+	}
+
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("log lines = %d, want one error event: %q", len(lines), logs.String())
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("decode log event: %v", err)
+	}
+	if record["level"] != "ERROR" {
+		t.Errorf("log level = %v, want ERROR", record["level"])
+	}
+	if record["msg"] == "landing response" {
+		t.Errorf("body write failure was logged as a successful response: %v", record)
+	}
+	if record["route_class"] != "invite" {
+		t.Errorf("route_class = %v, want invite", record["route_class"])
+	}
+	if record["status"] != float64(http.StatusOK) {
+		t.Errorf("status = %v, want %d", record["status"], http.StatusOK)
+	}
+	if len(record) != 5 {
+		t.Errorf("error event fields = %v, want standard fields plus route_class and status", record)
+	}
+	for _, marker := range []string{"synthetic-invite", "query-secret", "referer-secret", "body-write-secret"} {
+		if strings.Contains(logs.String(), marker) {
+			t.Errorf("error event contains sensitive value %q: %s", marker, logs.String())
+		}
+	}
+}
+
+type failingResponseWriter struct {
+	header http.Header
+	status int
+	writes int
+}
+
+func (w *failingResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *failingResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *failingResponseWriter) Write([]byte) (int, error) {
+	w.writes++
+	return 0, errors.New("body-write-secret")
 }
 
 func assertSecurityHeaders(t *testing.T, response *httptest.ResponseRecorder) {
