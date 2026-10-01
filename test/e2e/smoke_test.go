@@ -210,6 +210,21 @@ func testSmokeBasicGroup(t *testing.T) {
 	seedPhoneUsers(t, f.ctx, f.store, phoneA, phoneB, phoneC)
 	a, b, c := newSmokeClient(t, f, phoneA), newSmokeClient(t, f, phoneB), newSmokeClient(t, f, phoneC)
 
+	// Offset C's message IDs so the sender's read receipt must use C's local ID,
+	// not the reader's ID for the same group message.
+	var seedResult tg.UpdatesClass
+	if err := c.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		seedResult, err = api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: &tg.InputPeerSelf{}, Message: "group-id-seed", RandomID: 1047000,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("send group ID seed: %v", err)
+	}
+	seed := assertSmokeSendResult(t, seedResult, "group-id-seed", 1, 1)
+	assertObservedMessage(t, f.ctx, c.seen, seed.Message, seed.ID, true, c.id, 1, "C group ID seed", true)
+
 	var chatID int64
 	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		created, err := api.MessagesCreateChat(ctx, &tg.MessagesCreateChatRequest{
@@ -244,6 +259,12 @@ func testSmokeBasicGroup(t *testing.T) {
 		"group-b": b.id,
 		"group-c": c.id,
 	}
+	memberLocalIDs := map[int64]map[string]int{
+		a.id: {},
+		b.id: {},
+		c.id: {},
+	}
+	senderLocalIDs := make(map[string]int, len(wantSenders))
 	for _, send := range []struct {
 		client   *smokeClient
 		text     string
@@ -266,6 +287,7 @@ func testSmokeBasicGroup(t *testing.T) {
 		if message.ID <= 0 || pts <= 0 || !message.Out {
 			t.Fatalf("%s outgoing id/pts/out = %d/%d/%t, want positive id and pts and outgoing", send.text, message.ID, pts, message.Out)
 		}
+		senderLocalIDs[send.text] = message.ID
 		peer, ok := message.PeerID.(*tg.PeerChat)
 		if !ok || peer.ChatID != chatID {
 			t.Fatalf("%s outgoing peer = %+v, want chat %d", send.text, message.PeerID, chatID)
@@ -273,6 +295,24 @@ func testSmokeBasicGroup(t *testing.T) {
 		from, ok := message.FromID.(*tg.PeerUser)
 		if !ok || from.UserID != send.client.id {
 			t.Fatalf("%s outgoing sender = %+v, want user %d", send.text, message.FromID, send.client.id)
+		}
+		for _, member := range []*smokeClient{a, b, c} {
+			got := recvOrCtx(t, f.ctx, member.seen.newMsg, send.text+" group update")
+			if got.Message != send.text || got.ID <= 0 || got.Out != (member.id == send.client.id) {
+				t.Fatalf("%s group update for %d = {text:%q id:%d out:%v}, want positive local id and out:%t", send.text, member.id, got.Message, got.ID, got.Out, member.id == send.client.id)
+			}
+			updatePeer, ok := got.PeerID.(*tg.PeerChat)
+			if !ok || updatePeer.ChatID != chatID {
+				t.Fatalf("%s group update for %d peer = %+v, want chat %d", send.text, member.id, got.PeerID, chatID)
+			}
+			updateFrom, ok := got.FromID.(*tg.PeerUser)
+			if !ok || updateFrom.UserID != send.client.id {
+				t.Fatalf("%s group update for %d sender = %+v, want user %d", send.text, member.id, got.FromID, send.client.id)
+			}
+			if member.id == send.client.id && got.ID != message.ID {
+				t.Fatalf("%s sender update id = %d, want sender-local id %d", send.text, got.ID, message.ID)
+			}
+			memberLocalIDs[member.id][send.text] = got.ID
 		}
 	}
 
@@ -288,6 +328,68 @@ func testSmokeBasicGroup(t *testing.T) {
 			return checkFullChat(t, full, chatID, a.id, member.id, b.id, c.id)
 		}); err != nil {
 			t.Fatalf("smoke group for member %d: %v", member.id, err)
+		}
+	}
+
+	readerMessageID := memberLocalIDs[a.id]["group-c"]
+	senderMessageID := senderLocalIDs["group-c"]
+	if readerMessageID <= memberLocalIDs[a.id]["group-b"] {
+		t.Fatalf("A's last received group id = %d, want greater than prior id %d", readerMessageID, memberLocalIDs[a.id]["group-b"])
+	}
+	if readerMessageID == senderMessageID {
+		t.Fatalf("group-c reader and sender local IDs both equal %d; fixture must distinguish owner ID spaces", readerMessageID)
+	}
+
+	var beforeRead *tg.Dialog
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		beforeRead, err = smokeGroupDialog(ctx, api, chatID)
+		return err
+	}); err != nil {
+		t.Fatalf("A getDialogs before reading group: %v", err)
+	}
+	if beforeRead.UnreadCount != 2 {
+		t.Fatalf("A group unread count before read = %d, want 2", beforeRead.UnreadCount)
+	}
+
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		result, err := api.MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{
+			Peer: &tg.InputPeerChat{ChatID: chatID}, MaxID: readerMessageID,
+		})
+		if err != nil {
+			return err
+		}
+		if result == nil {
+			return errors.New("readHistory response is nil")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("A read group history through local id %d: %v", readerMessageID, err)
+	}
+
+	assertSenderReceipt := func(collector *updateCollector, label string) {
+		t.Helper()
+		if got := recvOrCtx(t, f.ctx, collector.readOutbox, label+" updateReadHistoryOutbox max_id"); got != senderMessageID {
+			t.Fatalf("%s updateReadHistoryOutbox max_id = %d, want C-local id %d", label, got, senderMessageID)
+		}
+		if got := recvOrCtx(t, f.ctx, collector.readOutboxPts, label+" updateReadHistoryOutbox pts"); got <= 0 {
+			t.Fatalf("%s updateReadHistoryOutbox pts = %d, want positive pts", label, got)
+		}
+	}
+	assertSenderReceipt(c.seen, "C managed updates")
+	assertSenderReceipt(c.push, "C live push")
+
+	for i, wantInboxID := range []int{readerMessageID, readerMessageID} {
+		var dialog *tg.Dialog
+		if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+			var err error
+			dialog, err = smokeGroupDialog(ctx, api, chatID)
+			return err
+		}); err != nil {
+			t.Fatalf("A getDialogs after group read %d: %v", i+1, err)
+		}
+		if dialog.UnreadCount != 0 || dialog.ReadInboxMaxID != wantInboxID || dialog.ReadInboxMaxID <= beforeRead.ReadInboxMaxID {
+			t.Fatalf("A group dialog after read %d = {unread:%d inbox:%d}, want unread=0 and advanced inbox=%d (before %d)", i+1, dialog.UnreadCount, dialog.ReadInboxMaxID, wantInboxID, beforeRead.ReadInboxMaxID)
 		}
 	}
 }
@@ -1015,6 +1117,36 @@ func verifySmokeHistory(
 		}
 	}
 	return nil
+}
+
+func smokeGroupDialog(ctx context.Context, api *tg.Client, chatID int64) (*tg.Dialog, error) {
+	result, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+		OffsetPeer: &tg.InputPeerEmpty{},
+		Limit:      20,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var dialogs []tg.DialogClass
+	switch response := result.(type) {
+	case *tg.MessagesDialogs:
+		dialogs = response.Dialogs
+	case *tg.MessagesDialogsSlice:
+		dialogs = response.Dialogs
+	default:
+		return nil, fmt.Errorf("getDialogs response = %T, want MessagesDialogs or MessagesDialogsSlice", result)
+	}
+	for _, entry := range dialogs {
+		dialog, ok := entry.(*tg.Dialog)
+		if !ok {
+			continue
+		}
+		peer, ok := dialog.Peer.(*tg.PeerChat)
+		if ok && peer.ChatID == chatID {
+			return dialog, nil
+		}
+	}
+	return nil, fmt.Errorf("getDialogs omitted chat %d", chatID)
 }
 
 func verifySmokeGroupHistory(
