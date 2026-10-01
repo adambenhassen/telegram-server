@@ -563,6 +563,22 @@ func (s *Store) ChatPinnedMessage(ctx context.Context, chatID int64) (*int32, er
 	return id, nil
 }
 
+// ChatPinnedMessageForOwner resolves a chat's creator-owned pinned message to
+// the requested member's local copy. Missing or deleted copies report
+// found=false.
+func (s *Store) ChatPinnedMessageForOwner(ctx context.Context, chatID, ownerID int64) (int64, bool, error) {
+	id, err := s.q.ChatPinnedMessageForOwner(ctx, db.ChatPinnedMessageForOwnerParams{
+		ChatID: chatID, OwnerID: ownerID, PeerType: int16(PeerTypeChat),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("chat pinned message for owner: %w", err)
+	}
+	return id, true, nil
+}
+
 // SetChatPinnedMessage sets or clears the pinned message id on chatID.
 // pinnedID is the local_id of the message to pin (identical across members for
 // a given fanout). Passing nil clears the pin. The caller is responsible for

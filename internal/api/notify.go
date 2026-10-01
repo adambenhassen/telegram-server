@@ -1040,7 +1040,8 @@ func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, chats []tg.ChatClas
 func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, peerID int64, _ int32) {
 	var members []int64
 	var peer tg.PeerClass
-	var pinnedMsgID int32
+	var pinned bool
+	messageIDs := make(map[int64]int)
 
 	switch peerType {
 	case store.PeerTypeChat:
@@ -1060,7 +1061,17 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, pe
 			u.log.Error("deliver pinned chat reload", "peer_id", peerID, "err", err)
 			return
 		} else if id != nil {
-			pinnedMsgID = *id
+			pinned = true
+			for _, memberID := range members {
+				localID, found, err := u.h.store.ChatPinnedMessageForOwner(ctx, peerID, memberID)
+				if err != nil {
+					u.log.Error("deliver pinned chat resolve", "peer_id", peerID, "user_id", memberID, "err", err)
+					return
+				}
+				if found {
+					messageIDs[memberID] = int(localID)
+				}
+			}
 		}
 
 	case store.PeerTypeChannel:
@@ -1080,7 +1091,10 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, pe
 			u.log.Error("deliver pinned channel reload", "peer_id", peerID, "err", err)
 			return
 		} else if id != nil {
-			pinnedMsgID = *id
+			pinned = true
+			for _, memberID := range members {
+				messageIDs[memberID] = int(*id)
+			}
 		}
 
 	default:
@@ -1088,12 +1102,12 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, pe
 		return
 	}
 
-	u.deliverPinnedToUsers(ctx, peer, members, pinnedMsgID)
+	u.deliverPinnedToUsers(ctx, peer, members, pinned, messageIDs)
 }
 
 // deliverPinnedToUsers pushes the pinned update to each member with live conns.
-// pinnedMsgID is nonzero on pin, zero on unpin.
-func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64, pinnedMsgID int32) {
+// A pinned chat may have no live copy for a member if that member deleted it.
+func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, members []int64, pinned bool, messageIDs map[int64]int) {
 	var pushes []transientPush
 	for _, memberID := range members {
 		conns := u.registry.Conns(memberID)
@@ -1101,12 +1115,12 @@ func (u *Updater) deliverPinnedToUsers(ctx context.Context, peer tg.PeerClass, m
 			continue
 		}
 		var messages []int
-		if pinnedMsgID != 0 {
-			messages = []int{int(pinnedMsgID)}
+		if messageID, ok := messageIDs[memberID]; ok {
+			messages = []int{messageID}
 		}
 		update := &tg.UpdateShort{
 			Update: &tg.UpdatePinnedMessages{
-				Pinned:   pinnedMsgID != 0,
+				Pinned:   pinned,
 				Peer:     peer,
 				Messages: messages,
 			},

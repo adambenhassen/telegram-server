@@ -134,6 +134,44 @@ func (q *Queries) ChatParticipants(ctx context.Context, chatID int64) ([]ChatPar
 	return items, nil
 }
 
+const chatPinnedMessageForOwner = `-- name: ChatPinnedMessageForOwner :one
+SELECT viewer_copy.local_id
+FROM chats c
+JOIN chat_participants p ON p.chat_id = c.id AND p.user_id = $1::bigint
+JOIN messages creator_copy
+  ON creator_copy.owner_id = c.creator_id
+ AND creator_copy.local_id = c.pinned_message_id
+ AND creator_copy.peer_type = $2::smallint
+ AND creator_copy.peer_id = c.id
+ AND creator_copy.fanout_id <> 0
+ AND creator_copy.deleted = false
+JOIN messages viewer_copy
+  ON viewer_copy.owner_id = p.user_id
+ AND viewer_copy.fanout_id = creator_copy.fanout_id
+ AND viewer_copy.peer_type = $2::smallint
+ AND viewer_copy.peer_id = c.id
+ AND viewer_copy.deleted = false
+WHERE c.id = $3::bigint
+  AND c.pinned_message_id IS NOT NULL
+`
+
+type ChatPinnedMessageForOwnerParams struct {
+	OwnerID  int64
+	PeerType int16
+	ChatID   int64
+}
+
+// ChatPinnedMessageForOwner resolves the creator-owned pin to the requested
+// member's copy. fanout_id identifies one logical chat message across each
+// member-owned row; the returned local_id always belongs to owner_id.
+// Deleted or missing source/member copies intentionally produce no row.
+func (q *Queries) ChatPinnedMessageForOwner(ctx context.Context, arg ChatPinnedMessageForOwnerParams) (int64, error) {
+	row := q.db.QueryRow(ctx, chatPinnedMessageForOwner, arg.OwnerID, arg.PeerType, arg.ChatID)
+	var local_id int64
+	err := row.Scan(&local_id)
+	return local_id, err
+}
+
 const chatsByIDsForMember = `-- name: ChatsByIDsForMember :many
 SELECT c.id, c.title, c.creator_id, c.version, c.date, c.pinned_message_id, c.default_banned_rights FROM chats c
 JOIN chat_participants p ON p.chat_id = c.id
