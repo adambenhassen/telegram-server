@@ -7,6 +7,8 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
 
+const appConfigHash = 1
+
 func (h *handlers) handleGetContentSettings(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.AccountGetContentSettingsRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -48,7 +50,23 @@ func (h *handlers) handleGetAppConfig(r *mtproto.Request) (bin.Encoder, error) {
 	// help.appConfig carries an extensible JSON object, so the registration mode
 	// does not change the fixed TL response shape that stock clients decode.
 	return &tg.HelpAppConfig{
+		Hash: appConfigHash,
 		Config: &tg.JSONObject{Value: []tg.JSONObjectValue{{
+			Key:   "dialog_filters_chats_limit_default",
+			Value: &tg.JSONNumber{Value: 100},
+		}, {
+			Key:   "dialog_filters_enabled",
+			Value: &tg.JSONBool{Value: true},
+		}, {
+			Key:   "dialog_filters_limit_default",
+			Value: &tg.JSONNumber{Value: 10},
+		}, {
+			Key:   "dialog_filters_tooltip",
+			Value: &tg.JSONBool{Value: false},
+		}, {
+			Key:   "dialogs_folder_pinned_limit_default",
+			Value: &tg.JSONNumber{Value: 100},
+		}, {
 			Key:   "registration_mode",
 			Value: &tg.JSONString{Value: string(h.registrationMode)},
 		}}},

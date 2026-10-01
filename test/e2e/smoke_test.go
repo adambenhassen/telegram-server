@@ -219,6 +219,44 @@ func testSmokeDialogFilters(t *testing.T) {
 	client := newSmokeClient(t, f, "A1", phone)
 	otherSession := newSmokeClient(t, f, "A2", phone)
 	otherOwner := newSmokeClient(t, f, "B1", otherPhone)
+	var appConfig *tg.HelpAppConfig
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		result, err := api.HelpGetAppConfig(ctx, 0)
+		if err != nil {
+			return err
+		}
+		var ok bool
+		appConfig, ok = result.(*tg.HelpAppConfig)
+		if !ok {
+			return errors.New("help.getAppConfig returned no config")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("help.getAppConfig: %v", err)
+	}
+	config, ok := appConfig.Config.(*tg.JSONObject)
+	if !ok {
+		t.Fatalf("app config = %T, want *tg.JSONObject", appConfig.Config)
+	}
+	filtersEnabled := false
+	filtersEnabledFound := false
+	for _, value := range config.Value {
+		if value.Key != "dialog_filters_enabled" {
+			continue
+		}
+		if filtersEnabledFound {
+			t.Fatal("app config repeats dialog_filters_enabled")
+		}
+		enabled, ok := value.Value.(*tg.JSONBool)
+		if !ok {
+			t.Fatalf("dialog_filters_enabled = %T, want *tg.JSONBool", value.Value)
+		}
+		filtersEnabled = enabled.Value
+		filtersEnabledFound = true
+	}
+	if !filtersEnabledFound || !filtersEnabled {
+		t.Fatal("dialog_filters_enabled is missing or false")
+	}
 
 	filter := &tg.DialogFilter{ID: 2, Title: tg.TextWithEntities{Text: "Groups"}, Groups: true}
 	filter.SetFlags()
