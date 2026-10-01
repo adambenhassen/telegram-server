@@ -48,6 +48,21 @@ type Participant struct {
 	Date      time.Time
 }
 
+// ChatPinSnapshot contains one committed pin state and each member's copy as
+// observed by the same database statement.
+type ChatPinSnapshot struct {
+	Pinned     bool
+	Recipients []ChatPinRecipient
+}
+
+// ChatPinRecipient identifies a member and, when it exists, their local copy of
+// the selected pin.
+type ChatPinRecipient struct {
+	UserID  int64
+	LocalID int64
+	HasCopy bool
+}
+
 func chatFromRow(r db.Chat) Chat {
 	return Chat{
 		ID:                  r.ID,
@@ -577,6 +592,35 @@ func (s *Store) ChatPinnedMessageForOwner(ctx context.Context, chatID, ownerID i
 		return 0, false, fmt.Errorf("chat pinned message for owner: %w", err)
 	}
 	return id, true, nil
+}
+
+// ChatPinSnapshot returns the pin state and member-owned copies from one SQL
+// statement, so a concurrent repin or unpin cannot change one recipient's
+// notification midway through resolution.
+func (s *Store) ChatPinSnapshot(ctx context.Context, chatID int64) (ChatPinSnapshot, error) {
+	rows, err := s.q.ChatPinSnapshot(ctx, db.ChatPinSnapshotParams{
+		ChatID: chatID, PeerType: int16(PeerTypeChat),
+	})
+	if err != nil {
+		return ChatPinSnapshot{}, fmt.Errorf("chat pin snapshot: %w", err)
+	}
+	if len(rows) == 0 {
+		return ChatPinSnapshot{}, nil
+	}
+
+	snapshot := ChatPinSnapshot{
+		Pinned:     rows[0].PinnedMessageID != nil,
+		Recipients: make([]ChatPinRecipient, len(rows)),
+	}
+	for i, row := range rows {
+		recipient := ChatPinRecipient{UserID: row.UserID}
+		if row.LocalID != nil {
+			recipient.LocalID = *row.LocalID
+			recipient.HasCopy = true
+		}
+		snapshot.Recipients[i] = recipient
+	}
+	return snapshot, nil
 }
 
 // SetChatPinnedMessage sets or clears the pinned message id on chatID.

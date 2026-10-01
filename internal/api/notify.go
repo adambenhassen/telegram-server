@@ -27,6 +27,9 @@ type Updater struct {
 	// pushRecorder is a test-only failure injection seam. Production uses the
 	// fixed recorder method through pushMetrics.
 	pushRecorder func(store.PushOutcome, time.Time) error
+	// pinSnapshotHook lets tests deterministically commit a repin or unpin after
+	// resolution and before delivery. Production leaves it nil.
+	pinSnapshotHook func()
 }
 
 // NewUpdater builds an Updater over the store and the server's session registry.
@@ -1034,9 +1037,8 @@ func wrapUpdates(ups []tg.UpdateClass, users []tg.UserClass, chats []tg.ChatClas
 // reactions).
 //
 // The pinned state is reloaded from the store rather than trusted from the
-// payload: a concurrent pin/unpin between commit and Notify could leave the
-// payload carrying a stale message id. Reloading ensures the push reflects
-// the authoritative committed state.
+// payload. For chats, one statement resolves the committed pin and every
+// member's copy together, so a concurrent repin cannot split one fanout.
 func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, peerID int64, _ int32) {
 	var members []int64
 	var peer tg.PeerClass
@@ -1045,33 +1047,22 @@ func (u *Updater) DeliverPinned(ctx context.Context, peerType store.PeerType, pe
 
 	switch peerType {
 	case store.PeerTypeChat:
-		chatMembers, err := u.h.store.Participants(ctx, peerID)
+		snapshot, err := u.h.store.ChatPinSnapshot(ctx, peerID)
 		if err != nil {
-			u.log.Error("deliver pinned chat lookup", "peer_id", peerID, "err", err)
+			u.log.Error("deliver pinned chat snapshot", "peer_id", peerID, "err", err)
 			return
 		}
-		members = make([]int64, len(chatMembers))
-		for i, p := range chatMembers {
-			members[i] = p.UserID
+		members = make([]int64, len(snapshot.Recipients))
+		pinned = snapshot.Pinned
+		for i, recipient := range snapshot.Recipients {
+			members[i] = recipient.UserID
+			if recipient.HasCopy {
+				messageIDs[recipient.UserID] = int(recipient.LocalID)
+			}
 		}
 		peer = &tg.PeerChat{ChatID: peerID}
-
-		// Reload authoritative pinned state to avoid stale payload.
-		if id, err := u.h.store.ChatPinnedMessage(ctx, peerID); err != nil {
-			u.log.Error("deliver pinned chat reload", "peer_id", peerID, "err", err)
-			return
-		} else if id != nil {
-			pinned = true
-			for _, memberID := range members {
-				localID, found, err := u.h.store.ChatPinnedMessageForOwner(ctx, peerID, memberID)
-				if err != nil {
-					u.log.Error("deliver pinned chat resolve", "peer_id", peerID, "user_id", memberID, "err", err)
-					return
-				}
-				if found {
-					messageIDs[memberID] = int(localID)
-				}
-			}
+		if u.pinSnapshotHook != nil {
+			u.pinSnapshotHook()
 		}
 
 	case store.PeerTypeChannel:

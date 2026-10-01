@@ -134,6 +134,64 @@ func (q *Queries) ChatParticipants(ctx context.Context, chatID int64) ([]ChatPar
 	return items, nil
 }
 
+const chatPinSnapshot = `-- name: ChatPinSnapshot :many
+SELECT p.user_id,
+       c.pinned_message_id,
+       viewer_copy.local_id
+FROM chats c
+JOIN chat_participants p ON p.chat_id = c.id
+LEFT JOIN messages creator_copy
+  ON creator_copy.owner_id = c.creator_id
+ AND creator_copy.local_id = c.pinned_message_id
+ AND creator_copy.peer_type = $1::smallint
+ AND creator_copy.peer_id = c.id
+ AND creator_copy.fanout_id <> 0
+ AND creator_copy.deleted = false
+LEFT JOIN messages viewer_copy
+  ON viewer_copy.owner_id = p.user_id
+ AND viewer_copy.fanout_id = creator_copy.fanout_id
+ AND viewer_copy.peer_type = $1::smallint
+ AND viewer_copy.peer_id = c.id
+ AND viewer_copy.deleted = false
+WHERE c.id = $2::bigint
+ORDER BY p.user_id
+`
+
+type ChatPinSnapshotParams struct {
+	PeerType int16
+	ChatID   int64
+}
+
+type ChatPinSnapshotRow struct {
+	UserID          int64
+	PinnedMessageID *int32
+	LocalID         *int64
+}
+
+// ChatPinSnapshot reads the selected pin and each member's local copy from one
+// statement snapshot, so a concurrent repin cannot split one notification.
+// Missing or deleted copies remain NULL while the participant still receives
+// the pinned state.
+func (q *Queries) ChatPinSnapshot(ctx context.Context, arg ChatPinSnapshotParams) ([]ChatPinSnapshotRow, error) {
+	rows, err := q.db.Query(ctx, chatPinSnapshot, arg.PeerType, arg.ChatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChatPinSnapshotRow
+	for rows.Next() {
+		var i ChatPinSnapshotRow
+		if err := rows.Scan(&i.UserID, &i.PinnedMessageID, &i.LocalID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const chatPinnedMessageForOwner = `-- name: ChatPinnedMessageForOwner :one
 SELECT viewer_copy.local_id
 FROM chats c
