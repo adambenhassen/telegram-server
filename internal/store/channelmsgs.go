@@ -329,12 +329,12 @@ func (s *Store) postChannelMessage(
 		return ChannelMessage{}, 0, false, fmt.Errorf("insert channel event: %w", err)
 	}
 	if checkRights {
-		n, e := qtx.UpdateChannelParticipantLastPostAt(ctx, db.UpdateChannelParticipantLastPostAtParams{
+		n, e := qtx.UpdateChannelPostMarker(ctx, db.UpdateChannelPostMarkerParams{
 			ChannelID: channelID,
 			UserID:    fromID,
 		})
 		if e != nil {
-			return ChannelMessage{}, 0, false, fmt.Errorf("update channel last-post time: %w", e)
+			return ChannelMessage{}, 0, false, fmt.Errorf("update channel post marker: %w", e)
 		}
 		if n != 1 {
 			return ChannelMessage{}, 0, false, ErrNotMember

@@ -32,11 +32,17 @@ SELECT megagroup, default_banned_rights FROM channels WHERE id = $1;
 -- ChannelSlowModePostState is called only after membership, ban, post rights,
 -- deduplication and default restrictions are decided. clock_timestamp() is
 -- sampled after the caller took channel_state FOR UPDATE, so a transaction that
--- waited for another post cannot compare against a stale transaction start.
+-- waited for another post cannot compare against a stale transaction start. The
+-- durable marker survives leave/rejoin; the participant value remains as a
+-- fallback for rows written by older binaries during a rolling deploy.
 -- name: ChannelSlowModePostState :one
-SELECT c.slowmode_seconds, cp.last_post_at, clock_timestamp()::timestamptz AS checked_at
+SELECT c.slowmode_seconds,
+       GREATEST(cp.last_post_at, cpm.last_post_at)::timestamptz AS last_post_at,
+       clock_timestamp()::timestamptz AS checked_at
 FROM channels c
 JOIN channel_participants cp ON cp.channel_id = c.id
+LEFT JOIN channel_post_markers cpm
+    ON cpm.channel_id = c.id AND cpm.user_id = cp.user_id
 WHERE c.id = sqlc.arg(channel_id)::bigint
   AND cp.user_id = sqlc.arg(user_id)::bigint;
 
@@ -174,14 +180,20 @@ UPDATE channel_participants SET role = $3 WHERE channel_id = $1 AND user_id = $2
 -- name: UpdateChannelParticipantBan :execrows
 UPDATE channel_participants SET banned_until = $3 WHERE channel_id = $1 AND user_id = $2;
 
--- Posts already hold channel_state FOR UPDATE before touching this participant
--- row. Role, ban and leave mutations may hold channels before a participant row,
--- but do not acquire channel_state after it; admission paths take channel_state
--- before inserting participant rows. This preserves a one-way lock order.
--- name: UpdateChannelParticipantLastPostAt :execrows
-UPDATE channel_participants
-SET last_post_at = clock_timestamp()
-WHERE channel_id = $1 AND user_id = $2;
+-- Posts already hold channel_state FOR UPDATE. Update both the membership-scoped
+-- compatibility value and the durable marker from one database timestamp.
+-- name: UpdateChannelPostMarker :execrows
+WITH updated_participant AS (
+    UPDATE channel_participants AS participant
+    SET last_post_at = clock_timestamp()
+    WHERE participant.channel_id = $1 AND participant.user_id = $2
+    RETURNING participant.channel_id, participant.user_id, participant.last_post_at
+)
+INSERT INTO channel_post_markers (channel_id, user_id, last_post_at)
+SELECT updated_participant.channel_id, updated_participant.user_id, updated_participant.last_post_at
+FROM updated_participant
+ON CONFLICT (channel_id, user_id) DO UPDATE
+SET last_post_at = EXCLUDED.last_post_at;
 
 -- name: DeleteChannelParticipant :execrows
 DELETE FROM channel_participants WHERE channel_id = $1 AND user_id = $2;

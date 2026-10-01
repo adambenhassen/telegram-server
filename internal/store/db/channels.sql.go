@@ -559,9 +559,13 @@ func (q *Queries) ChannelPostDefaults(ctx context.Context, id int64) (ChannelPos
 }
 
 const channelSlowModePostState = `-- name: ChannelSlowModePostState :one
-SELECT c.slowmode_seconds, cp.last_post_at, clock_timestamp()::timestamptz AS checked_at
+SELECT c.slowmode_seconds,
+       GREATEST(cp.last_post_at, cpm.last_post_at)::timestamptz AS last_post_at,
+       clock_timestamp()::timestamptz AS checked_at
 FROM channels c
 JOIN channel_participants cp ON cp.channel_id = c.id
+LEFT JOIN channel_post_markers cpm
+    ON cpm.channel_id = c.id AND cpm.user_id = cp.user_id
 WHERE c.id = $1::bigint
   AND cp.user_id = $2::bigint
 `
@@ -580,7 +584,9 @@ type ChannelSlowModePostStateRow struct {
 // ChannelSlowModePostState is called only after membership, ban, post rights,
 // deduplication and default restrictions are decided. clock_timestamp() is
 // sampled after the caller took channel_state FOR UPDATE, so a transaction that
-// waited for another post cannot compare against a stale transaction start.
+// waited for another post cannot compare against a stale transaction start. The
+// durable marker survives leave/rejoin; the participant value remains as a
+// fallback for rows written by older binaries during a rolling deploy.
 func (q *Queries) ChannelSlowModePostState(ctx context.Context, arg ChannelSlowModePostStateParams) (ChannelSlowModePostStateRow, error) {
 	row := q.db.QueryRow(ctx, channelSlowModePostState, arg.ChannelID, arg.UserID)
 	var i ChannelSlowModePostStateRow
@@ -1244,29 +1250,6 @@ func (q *Queries) UpdateChannelParticipantBan(ctx context.Context, arg UpdateCha
 	return result.RowsAffected(), nil
 }
 
-const updateChannelParticipantLastPostAt = `-- name: UpdateChannelParticipantLastPostAt :execrows
-UPDATE channel_participants
-SET last_post_at = clock_timestamp()
-WHERE channel_id = $1 AND user_id = $2
-`
-
-type UpdateChannelParticipantLastPostAtParams struct {
-	ChannelID int64
-	UserID    int64
-}
-
-// Posts already hold channel_state FOR UPDATE before touching this participant
-// row. Role, ban and leave mutations may hold channels before a participant row,
-// but do not acquire channel_state after it; admission paths take channel_state
-// before inserting participant rows. This preserves a one-way lock order.
-func (q *Queries) UpdateChannelParticipantLastPostAt(ctx context.Context, arg UpdateChannelParticipantLastPostAtParams) (int64, error) {
-	result, err := q.db.Exec(ctx, updateChannelParticipantLastPostAt, arg.ChannelID, arg.UserID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const updateChannelParticipantRole = `-- name: UpdateChannelParticipantRole :execrows
 UPDATE channel_participants SET role = $3 WHERE channel_id = $1 AND user_id = $2
 `
@@ -1282,6 +1265,35 @@ type UpdateChannelParticipantRoleParams struct {
 // not a member and the caller rejects.
 func (q *Queries) UpdateChannelParticipantRole(ctx context.Context, arg UpdateChannelParticipantRoleParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateChannelParticipantRole, arg.ChannelID, arg.UserID, arg.Role)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateChannelPostMarker = `-- name: UpdateChannelPostMarker :execrows
+WITH updated_participant AS (
+    UPDATE channel_participants AS participant
+    SET last_post_at = clock_timestamp()
+    WHERE participant.channel_id = $1 AND participant.user_id = $2
+    RETURNING participant.channel_id, participant.user_id, participant.last_post_at
+)
+INSERT INTO channel_post_markers (channel_id, user_id, last_post_at)
+SELECT updated_participant.channel_id, updated_participant.user_id, updated_participant.last_post_at
+FROM updated_participant
+ON CONFLICT (channel_id, user_id) DO UPDATE
+SET last_post_at = EXCLUDED.last_post_at
+`
+
+type UpdateChannelPostMarkerParams struct {
+	ChannelID int64
+	UserID    int64
+}
+
+// Posts already hold channel_state FOR UPDATE. Update both the membership-scoped
+// compatibility value and the durable marker from one database timestamp.
+func (q *Queries) UpdateChannelPostMarker(ctx context.Context, arg UpdateChannelPostMarkerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateChannelPostMarker, arg.ChannelID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}

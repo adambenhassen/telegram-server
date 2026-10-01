@@ -41,11 +41,19 @@ func setSlowModeTestState(t *testing.T, ctx context.Context, conn *pgx.Conn, cha
 func setLastPostTestState(t *testing.T, ctx context.Context, conn *pgx.Conn, channelID, userID int64, age time.Duration) {
 	t.Helper()
 	if _, err := conn.Exec(ctx, `
-		UPDATE channel_participants
-		SET last_post_at = clock_timestamp() - $3::interval
-		WHERE channel_id = $1 AND user_id = $2
+		WITH updated_participant AS (
+			UPDATE channel_participants AS participant
+			SET last_post_at = clock_timestamp() - $3::interval
+			WHERE participant.channel_id = $1 AND participant.user_id = $2
+			RETURNING participant.channel_id, participant.user_id, participant.last_post_at
+		)
+		INSERT INTO channel_post_markers (channel_id, user_id, last_post_at)
+		SELECT updated_participant.channel_id, updated_participant.user_id, updated_participant.last_post_at
+		FROM updated_participant
+		ON CONFLICT (channel_id, user_id) DO UPDATE
+		SET last_post_at = EXCLUDED.last_post_at
 	`, channelID, userID, age.String()); err != nil {
-		t.Fatalf("set last-post state: %v", err)
+		t.Fatalf("set slow-mode post state: %v", err)
 	}
 }
 
@@ -116,6 +124,46 @@ func TestPostChannelMessageAsSlowModeWaitsAfterCommittedPostAndDedupsRetry(t *te
 	afterInterval, afterIntervalPts, dup, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "after interval", 69003, nil, 0)
 	if err != nil || dup || afterIntervalPts != 3 || afterInterval.Message != "after interval" {
 		t.Fatalf("post after interval = %+v pts=%d duplicate=%v err=%v", afterInterval, afterIntervalPts, dup, err)
+	}
+}
+
+func TestPostChannelMessageAsSlowModeSurvivesLeaveAndRejoin(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, conn := openSlowModeTestDB(t, ctx)
+	creator := mustUser(t, s, "+15551269041")
+	member := mustUser(t, s, "+15551269042")
+	channel := mustMegagroup(t, s, creator.ID, "slow mode rejoin")
+	if err := s.EditChannelUsername(ctx, channel.ID, creator.ID, "slowmoderejoin"); err != nil {
+		t.Fatalf("make channel public: %v", err)
+	}
+	if _, _, err := s.JoinChannelByUsername(ctx, channel.ID, member.ID); err != nil {
+		t.Fatalf("join channel: %v", err)
+	}
+	setSlowModeTestState(t, ctx, conn, channel.ID, 10)
+	first := postAs(t, s, channel.ID, member.ID, "first", 69501)
+
+	left, err := s.LeaveChannel(ctx, channel.ID, member.ID)
+	if err != nil || !left {
+		t.Fatalf("leave channel = %v, err=%v", left, err)
+	}
+	if _, _, err := s.JoinChannelByUsername(ctx, channel.ID, member.ID); err != nil {
+		t.Fatalf("rejoin channel: %v", err)
+	}
+	if marker := channelLastPostTestState(t, ctx, conn, channel.ID, member.ID); marker.Valid {
+		t.Fatalf("new participant row retained last_post_at %v after rejoin", marker)
+	}
+
+	_, _, duplicate, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "distinct", 69502, nil, 0)
+	if err == nil || duplicate || !strings.HasPrefix(err.Error(), "SLOWMODE_WAIT_") {
+		t.Fatalf("post after rejoin = duplicate %v, err=%v; want SLOWMODE_WAIT_<seconds>", duplicate, err)
+	}
+	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 1 {
+		t.Fatalf("state after refused post = %d, err=%v; want pts 1", pts, err)
+	}
+	events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 1, 10)
+	if err != nil || len(events) != 1 || events[0].LocalID != first.LocalID {
+		t.Fatalf("events after refused post = %+v, err=%v; want only the first post", events, err)
 	}
 }
 
