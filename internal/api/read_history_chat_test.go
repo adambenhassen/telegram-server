@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"testing"
@@ -457,6 +458,35 @@ func TestReadHistoryChatRejectsUnknownAndNonMembersUniformly(t *testing.T) {
 	assertNoReadHistoryNotification(t, listener)
 }
 
+func TestReadHistoryChatRollsBackAfterLaterEventInsertFailure(t *testing.T) {
+	t.Parallel()
+	s, dsn := openStoreDSN(t)
+	users, chat := chatWith(t, s, "+15551294601", "+15551294602", "+15551294603")
+	reader, firstSender, failingSender := users[0], users[1], users[2]
+	if firstSender.ID >= failingSender.ID {
+		t.Fatalf("fixture sender ids = %d/%d, want target order", firstSender.ID, failingSender.ID)
+	}
+	_ = sendChatForReadHistory(t, s, chat.ID, firstSender.ID, 71)
+	_ = sendChatForReadHistory(t, s, chat.ID, failingSender.ID, 72)
+	listener := notificationListener(t, dsn)
+	installReadEventFailure(t, dsn, failingSender.ID)
+
+	owners := []store.User{reader, firstSender, failingSender}
+	before := make(map[int64]readHistoryOwnerState, len(owners))
+	for _, owner := range owners {
+		before[owner.ID] = snapshotReadHistoryOwner(t, s, owner.ID)
+	}
+
+	_, err := api.ReadHistoryForTest(s, reader.ID, &tg.MessagesReadHistoryRequest{
+		Peer: &tg.InputPeerChat{ChatID: chat.ID}, MaxID: 99,
+	})
+	assertReadHistoryRPCError(t, err, 500, "INTERNAL")
+	for _, owner := range owners {
+		assertReadHistoryOwnerState(t, s, owner.ID, before[owner.ID])
+	}
+	assertNoReadHistoryNotification(t, listener)
+}
+
 func TestReadHistoryChatRechecksRemovedReaderAfterEarlyFilter(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -548,6 +578,48 @@ func sendChatForReadHistory(t *testing.T, s *store.Store, chatID, senderID, rand
 		t.Fatalf("send chat message: duplicate=%v err=%v", duplicate, err)
 	}
 	return m
+}
+
+func installReadEventFailure(t *testing.T, dsn string, ownerID int64) {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect event failure injector: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(cleanupCtx, `DROP TRIGGER IF EXISTS fail_group_read_event_for_sender ON message_events`); err != nil {
+			t.Errorf("drop event failure trigger: %v", err)
+		}
+		if _, err := conn.Exec(cleanupCtx, `DROP FUNCTION IF EXISTS fail_group_read_event_for_sender()`); err != nil {
+			t.Errorf("drop event failure function: %v", err)
+		}
+		if err := conn.Close(cleanupCtx); err != nil {
+			t.Errorf("close event failure injector: %v", err)
+		}
+	})
+
+	functionSQL := fmt.Sprintf(`
+CREATE FUNCTION fail_group_read_event_for_sender() RETURNS trigger
+LANGUAGE plpgsql AS $body$
+BEGIN
+  IF NEW.owner_id = %d AND NEW.type = %d THEN
+    RAISE EXCEPTION 'injected group receipt event failure';
+  END IF;
+  RETURN NEW;
+END;
+$body$;`, ownerID, int16(store.EventReadOut))
+	if _, err := conn.Exec(ctx, functionSQL); err != nil {
+		t.Fatalf("create event failure function: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `
+CREATE TRIGGER fail_group_read_event_for_sender
+BEFORE INSERT ON message_events
+FOR EACH ROW EXECUTE FUNCTION fail_group_read_event_for_sender()`); err != nil {
+		t.Fatalf("create event failure trigger: %v", err)
+	}
 }
 
 func apiDialog(t *testing.T, s *store.Store, ownerID int64, peerType store.PeerType, peerID int64) store.Dialog {
