@@ -158,6 +158,26 @@ func (l *clientLifecycle) diagnostic(phase string, elapsed time.Duration, cause 
 	return fmt.Sprintf("%s %s failed after %s (%s; %s)", l.label, phase, elapsed.Round(time.Millisecond), registrySnapshotDescription(snapshot, valid), cause)
 }
 
+func waitForClientCommand(ctx context.Context, lifecycle *clientLifecycle, done <-chan error, started time.Time) error {
+	commandFailure := func() error {
+		return errors.New(lifecycle.diagnostic("command", time.Since(started), "cause="+safeErrorClass(lifecycle.result.error())))
+	}
+	select {
+	case err := <-done:
+		if lifecycle.result.finished() {
+			return commandFailure()
+		}
+		return err
+	case <-ctx.Done():
+		if lifecycle.result.finished() {
+			return commandFailure()
+		}
+		return errors.New(lifecycle.diagnostic("command", time.Since(started), contextFailureDescription(ctx)))
+	case <-lifecycle.result.done:
+		return commandFailure()
+	}
+}
+
 type clientRunOptions struct {
 	probeClientExit func() error
 }
@@ -248,23 +268,62 @@ func contextRegistrySnapshot(ctx context.Context) (registrySnapshot, bool) {
 	return state.latest()
 }
 
-func runManagedCommands(ctx context.Context, cmds <-chan command, managerResult *terminalResult, phase *clientPhaseState, execute func(command), stopManager func() error) error {
+func runManagedCommands(ctx context.Context, cmds <-chan command, managerResult *terminalResult, phase *clientPhaseState, execute func(context.Context, command) error, stopManager func() error) error {
 	for {
+		select {
+		case <-managerResult.done:
+			phase.set("update manager")
+			if err := managerResult.error(); err != nil {
+				return err
+			}
+			return errUnexpectedNilExit
+		default:
+		}
+
 		select {
 		case <-ctx.Done():
 			return stopManager()
 		case <-managerResult.done:
 			phase.set("update manager")
-			err := managerResult.error()
-			if err == nil {
-				return errUnexpectedNilExit
+			if err := managerResult.error(); err != nil {
+				return err
 			}
-			return err
+			return errUnexpectedNilExit
 		case cmd, ok := <-cmds:
 			if !ok {
 				return stopManager()
 			}
-			execute(cmd)
+			phase.set("command")
+			commandCtx, cancelCommand := context.WithCancel(ctx)
+			commandResult := make(chan error, 1)
+			go func() { commandResult <- execute(commandCtx, cmd) }()
+			select {
+			case <-managerResult.done:
+				phase.set("update manager")
+				cancelCommand()
+				<-commandResult
+				if err := managerResult.error(); err != nil {
+					return err
+				}
+				return errUnexpectedNilExit
+			case <-ctx.Done():
+				cancelCommand()
+				<-commandResult
+				return stopManager()
+			case err := <-commandResult:
+				cancelCommand()
+				select {
+				case <-managerResult.done:
+					phase.set("update manager")
+					if managerErr := managerResult.error(); managerErr != nil {
+						return managerErr
+					}
+					return errUnexpectedNilExit
+				default:
+				}
+				cmd.done <- err
+				phase.set("idle")
+			}
 		}
 	}
 }

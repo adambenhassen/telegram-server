@@ -153,14 +153,7 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 		case <-run.lifecycle.result.done:
 			return errors.New(run.lifecycle.diagnostic("command", time.Since(started), "cause="+safeErrorClass(run.lifecycle.result.error())))
 		}
-		select {
-		case err := <-done:
-			return err
-		case <-ctx.Done():
-			return errors.New(run.lifecycle.diagnostic("command", time.Since(started), contextFailureDescription(ctx)))
-		case <-run.lifecycle.result.done:
-			return errors.New(run.lifecycle.diagnostic("command", time.Since(started), "cause="+safeErrorClass(run.lifecycle.result.error())))
-		}
+		return waitForClientCommand(ctx, run.lifecycle, done, started)
 	}
 	stopClient = func(run *runningClient) {
 		run.stop.Do(func() {
@@ -903,10 +896,8 @@ func runManagedInteractive(ctx context.Context, client *telegram.Client, flow au
 			}
 			return nil
 		}
-		return runManagedCommands(ctx, cmds, managerResult, phase, func(c command) {
-			phase.set("command")
-			c.done <- c.fn(ctx, client.API())
-			phase.set("idle")
+		return runManagedCommands(ctx, cmds, managerResult, phase, func(commandCtx context.Context, c command) error {
+			return c.fn(commandCtx, client.API())
 		}, stopManager)
 	})
 }

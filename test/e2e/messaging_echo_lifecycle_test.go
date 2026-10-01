@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
@@ -53,7 +54,7 @@ func TestEchoLifecycleDiagnostics(t *testing.T) {
 		commands := make(chan command)
 		client := startClientLifecycle(context.Background(), "B1", failures, func(phase *clientPhaseState) error {
 			phase.set("idle")
-			return runManagedCommands(context.Background(), commands, managerResult, phase, func(command) {}, func() error { return nil })
+			return runManagedCommands(context.Background(), commands, managerResult, phase, func(context.Context, command) error { return nil }, func() error { return nil })
 		})
 
 		managerResult.complete(managerErr)
@@ -76,6 +77,77 @@ func TestEchoLifecycleDiagnostics(t *testing.T) {
 		}
 	})
 
+	t.Run("manager exit interrupts an active command", func(t *testing.T) {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		defer cancel(nil)
+		failures := newClientFailureSignal(cancel)
+		managerResult := newTerminalResult()
+		managerErr := errors.New("unreviewed manager error payload")
+		commandStarted := make(chan struct{})
+		commandDone := make(chan error, 1)
+		commands := make(chan command, 1)
+		commands <- command{
+			fn: func(ctx context.Context, _ *tg.Client) error {
+				close(commandStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			done: commandDone,
+		}
+		client := startClientLifecycle(ctx, "D1", failures, func(phase *clientPhaseState) error {
+			phase.set("command")
+			return runManagedCommands(ctx, commands, managerResult, phase, func(commandCtx context.Context, c command) error {
+				return c.fn(commandCtx, nil)
+			}, func() error { return managerResult.error() })
+		})
+		select {
+		case <-commandStarted:
+		case <-time.After(time.Second):
+			t.Fatal("command did not start")
+		}
+
+		pendingCommand := make(chan error, 1)
+		go func() {
+			pendingCommand <- waitForClientCommand(ctx, client, commandDone, time.Now())
+		}()
+
+		started := time.Now()
+		managerResult.complete(managerErr)
+		var commandErr error
+		select {
+		case commandErr = <-pendingCommand:
+		case <-time.After(time.Second):
+			cancel(errors.New("test cleanup"))
+			select {
+			case <-client.result.done:
+			case <-time.After(time.Second):
+				t.Fatal("client shutdown did not finish after cleanup cancellation")
+			}
+			t.Fatal("manager exit did not interrupt the pending command promptly")
+		}
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			t.Fatalf("manager exit took %s to fail the pending command", elapsed)
+		}
+		if commandErr == nil || !strings.Contains(commandErr.Error(), "D1 command") || !strings.Contains(commandErr.Error(), "cause=other(") {
+			t.Fatalf("pending command error = %v, want synthetic label, command phase and safe manager cause", commandErr)
+		}
+		if strings.Contains(commandErr.Error(), managerErr.Error()) {
+			t.Fatal("raw manager error entered the pending command error")
+		}
+		if err := client.result.error(); !errors.Is(err, managerErr) {
+			t.Fatalf("client terminal result = %v, want retained manager exit", err)
+		}
+		if got := failures.message(); !strings.Contains(got, "D1 update manager") || !strings.Contains(got, "cause=other(") {
+			t.Fatalf("client failure = %q, want synthetic label, manager phase and safe cause", got)
+		}
+		if strings.Contains(failures.message(), managerErr.Error()) {
+			t.Fatal("raw manager error entered the client failure diagnostic")
+		}
+		if got := managerResult.error(); !errors.Is(got, managerErr) {
+			t.Fatalf("manager terminal result = %v, want retained manager exit", got)
+		}
+	})
+
 	t.Run("intentional shutdown is normal cleanup", func(t *testing.T) {
 		failures := newClientFailureSignal(nil)
 		managerResult := newTerminalResult()
@@ -93,7 +165,7 @@ func TestEchoLifecycleDiagnostics(t *testing.T) {
 		commands := make(chan command)
 		client := startClientLifecycle(context.Background(), "C", failures, func(phase *clientPhaseState) error {
 			phase.set("idle")
-			return runManagedCommands(context.Background(), commands, managerResult, phase, func(command) {}, func() error {
+			return runManagedCommands(context.Background(), commands, managerResult, phase, func(context.Context, command) error { return nil }, func() error {
 				managerStopping.Store(true)
 				cancelManager()
 				return nil
