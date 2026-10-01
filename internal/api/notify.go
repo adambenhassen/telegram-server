@@ -30,9 +30,13 @@ type Updater struct {
 	pushRecorder func(store.PushOutcome, time.Time) error
 	// pinSnapshotHook lets tests deterministically commit a repin or unpin after
 	// resolution and before delivery. Production leaves it nil.
-	pinSnapshotHook func()
-	recoverySlots   chan struct{}
-	recoveryWG      sync.WaitGroup
+	pinSnapshotHook       func()
+	recoverySlots         chan struct{}
+	recoveryWG            sync.WaitGroup
+	recoveryScanEpoch     uint64
+	recoveryScanRemaining int
+	// recoveryClaimHook pauses a claimed attempt in deterministic concurrency tests.
+	recoveryClaimHook func(*mtproto.Conn)
 }
 
 // NewUpdater builds an Updater over the store and the server's session registry.
@@ -110,11 +114,22 @@ func (u *Updater) recoverDialogFilters(ctx context.Context, now time.Time) {
 		return
 	}
 	_, epoch := u.dialogFilterSync.Snapshot()
-	started := 0
-	for _, conn := range u.registry.DialogFilterRecoveryCandidates(dialogFilterRecoveryBatch) {
-		if started >= dialogFilterRecoveryBatch {
-			return
+	if epoch != u.recoveryScanEpoch {
+		u.recoveryScanEpoch = epoch
+		u.recoveryScanRemaining = u.registry.TotalConns()
+	}
+	if u.recoveryScanRemaining > 0 {
+		limit := min(dialogFilterRecoveryBatch, u.recoveryScanRemaining)
+		candidates := u.registry.DialogFilterRecoveryCandidates(limit)
+		u.dialogFilterSync.enqueueRecoveryBatch(candidates)
+		if len(candidates) < limit {
+			u.recoveryScanRemaining = 0
+		} else {
+			u.recoveryScanRemaining -= len(candidates)
 		}
+	}
+	candidates := u.dialogFilterSync.takeRecoveryCandidates(dialogFilterRecoveryBatch)
+	for index, conn := range candidates {
 		owner, session := conn.DialogFilterRecoveryBinding()
 		if owner <= 0 {
 			continue
@@ -122,19 +137,31 @@ func (u *Updater) recoverDialogFilters(ctx context.Context, now time.Time) {
 		select {
 		case u.recoverySlots <- struct{}{}:
 		default:
+			u.dialogFilterSync.enqueueRecoveryBatch(candidates[index:])
 			return
 		}
 		claimID, ok := conn.ClaimDialogFilterRecoveryAttempt(owner, session, epoch, now)
 		if !ok {
 			<-u.recoverySlots
+			if conn.DialogFilterRecoveryAttemptPending(owner, session, epoch) {
+				u.dialogFilterSync.enqueueRecovery(conn)
+			}
 			continue
 		}
-		started++
+		if u.recoveryClaimHook != nil {
+			u.recoveryClaimHook(conn)
+		}
 		u.recoveryWG.Add(1)
 		go func(conn *mtproto.Conn, owner, session int64, claimID uint64) {
-			defer u.recoveryWG.Done()
-			defer func() { <-u.recoverySlots }()
-			defer conn.FinishDialogFilterRecoveryAttempt(owner, session, claimID)
+			defer func() {
+				conn.FinishDialogFilterRecoveryAttempt(owner, session, claimID)
+				_, currentEpoch := u.dialogFilterSync.Snapshot()
+				if conn.DialogFilterRecoveryAttemptPending(owner, session, currentEpoch) {
+					u.dialogFilterSync.enqueueRecovery(conn)
+				}
+				<-u.recoverySlots
+				u.recoveryWG.Done()
+			}()
 			pushCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			env := &tg.Updates{

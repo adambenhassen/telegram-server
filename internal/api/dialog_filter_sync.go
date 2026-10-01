@@ -1,6 +1,7 @@
 package api
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
@@ -16,6 +17,11 @@ type dialogFilterClock struct {
 // are shared with the listener and recovery sweeper.
 type DialogFilterSync struct {
 	clock atomic.Pointer[dialogFilterClock]
+
+	recoveryMu        sync.Mutex
+	recoveryQueue     []*mtproto.Conn
+	recoveryQueueHead int
+	recoveryQueued    map[*mtproto.Conn]struct{}
 }
 
 // DialogFilterCapture is the recovery state captured before an authoritative
@@ -32,7 +38,60 @@ type DialogFilterCapture struct {
 func NewDialogFilterSync() *DialogFilterSync {
 	s := &DialogFilterSync{}
 	s.clock.Store(&dialogFilterClock{})
+	s.recoveryQueued = make(map[*mtproto.Conn]struct{})
 	return s
+}
+
+func (s *DialogFilterSync) enqueueRecovery(conn *mtproto.Conn) {
+	if conn == nil {
+		return
+	}
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	if s.recoveryQueued == nil {
+		s.recoveryQueued = make(map[*mtproto.Conn]struct{})
+	}
+	if _, exists := s.recoveryQueued[conn]; exists {
+		return
+	}
+	s.recoveryQueued[conn] = struct{}{}
+	s.recoveryQueue = append(s.recoveryQueue, conn)
+}
+
+func (s *DialogFilterSync) enqueueRecoveryBatch(conns []*mtproto.Conn) {
+	for _, conn := range conns {
+		s.enqueueRecovery(conn)
+	}
+}
+
+func (s *DialogFilterSync) takeRecoveryCandidates(limit int) []*mtproto.Conn {
+	if limit <= 0 {
+		return nil
+	}
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	count := min(limit, len(s.recoveryQueue)-s.recoveryQueueHead)
+	if count == 0 {
+		return nil
+	}
+	out := make([]*mtproto.Conn, 0, count)
+	for range count {
+		conn := s.recoveryQueue[s.recoveryQueueHead]
+		s.recoveryQueue[s.recoveryQueueHead] = nil
+		s.recoveryQueueHead++
+		delete(s.recoveryQueued, conn)
+		if conn != nil {
+			out = append(out, conn)
+		}
+	}
+	if s.recoveryQueueHead == len(s.recoveryQueue) {
+		s.recoveryQueue = nil
+		s.recoveryQueueHead = 0
+	} else if s.recoveryQueueHead >= 256 && s.recoveryQueueHead*2 >= len(s.recoveryQueue) {
+		s.recoveryQueue = append([]*mtproto.Conn(nil), s.recoveryQueue[s.recoveryQueueHead:]...)
+		s.recoveryQueueHead = 0
+	}
+	return out
 }
 
 func (s *DialogFilterSync) current() *dialogFilterClock {
@@ -104,7 +163,9 @@ func (s *DialogFilterSync) AcknowledgeFetch(conn *mtproto.Conn, req *mtproto.Req
 		return
 	}
 	clock := s.current()
-	conn.AcknowledgeDialogFilterFetch(req.UserID, req.SessionID, captured.generation, clock.globalEpoch)
+	if conn.AcknowledgeDialogFilterFetch(req.UserID, req.SessionID, captured.generation, clock.globalEpoch) {
+		s.enqueueRecovery(conn)
+	}
 }
 
 // AcknowledgeDifference consumes the one-time first-difference signal only
@@ -113,7 +174,9 @@ func (s *DialogFilterSync) AcknowledgeDifference(conn *mtproto.Conn, req *mtprot
 	if conn == nil || req == nil || requestExpired(req) || captured.owner != req.UserID || captured.session != req.SessionID {
 		return
 	}
-	conn.AcknowledgeDialogFilterDifference(req.UserID, req.SessionID, included && captured.firstDifference)
+	if conn.AcknowledgeDialogFilterDifference(req.UserID, req.SessionID, included && captured.firstDifference) {
+		s.enqueueRecovery(conn)
+	}
 }
 
 func requestExpired(req *mtproto.Request) bool {
@@ -128,7 +191,9 @@ func (s *DialogFilterSync) RequesterRepair(conn *mtproto.Conn, req *mtproto.Requ
 	}
 	s.EnsureBinding(conn, req)
 	generation, epoch := s.next()
-	conn.MarkDialogFilterRecovery(req.UserID, req.SessionID, generation, epoch)
+	if conn.MarkDialogFilterRecovery(req.UserID, req.SessionID, generation, epoch) {
+		s.enqueueRecovery(conn)
+	}
 }
 
 // OwnerInvalidation marks the owner's current local connections after a
@@ -140,8 +205,8 @@ func (s *DialogFilterSync) OwnerInvalidation(registry *mtproto.SessionRegistry, 
 	generation, epoch := s.next()
 	for _, conn := range registry.Conns(owner) {
 		bindingOwner, session := conn.DialogFilterRecoveryBinding()
-		if bindingOwner == owner {
-			conn.MarkDialogFilterRecovery(owner, session, generation, epoch)
+		if bindingOwner == owner && conn.MarkDialogFilterRecovery(owner, session, generation, epoch) {
+			s.enqueueRecovery(conn)
 		}
 	}
 }

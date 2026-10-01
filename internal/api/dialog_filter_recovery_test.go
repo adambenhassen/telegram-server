@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -76,4 +77,47 @@ func TestDialogFilterRecoveryStalledSocketDoesNotBlockAnotherConnection(t *testi
 		t.Fatal("one stalled socket prevented another connection's recovery push")
 	}
 	stop()
+}
+
+func TestDialogFilterRecoveryQueuesPendingConnectionAheadOfIdleConnections(t *testing.T) {
+	for _, idleConnections := range []int{640, 6399} {
+		t.Run(fmt.Sprintf("%d idle connections", idleConnections), func(t *testing.T) {
+			registry := mtproto.NewSessionRegistry()
+			syncState := api.NewDialogFilterSync()
+			targetOwner := int64(10_000 + idleConnections)
+			targetTransport := &dialogFilterRecoveryTransport{sent: make(chan struct{}, 1)}
+			var target *mtproto.Conn
+
+			for i := range idleConnections + 1 {
+				ownerID := int64(10_000 + i)
+				transport := &dialogFilterRecoveryTransport{}
+				if ownerID == targetOwner {
+					transport = targetTransport
+				}
+				conn := mtproto.NewTestConn(transport, testKey())
+				conn.SetOwner(ownerID)
+				if !registry.Add(ownerID, conn) {
+					t.Fatalf("registry rejected connection for owner %d", ownerID)
+				}
+				syncState.EnsureBinding(conn, &mtproto.Request{UserID: ownerID, SessionID: 123})
+				if ownerID == targetOwner {
+					target = conn
+				}
+			}
+			if target == nil || !target.AcknowledgeDialogFilterDifference(targetOwner, 123, true) {
+				t.Fatal("target connection did not complete its initial difference")
+			}
+			syncState.OwnerInvalidation(registry, targetOwner)
+
+			updater := api.NewUpdaterWithDialogFilterSync(nil, registry, slog.New(slog.DiscardHandler), nil, syncState)
+			stop := updater.StartDialogFilterRecovery(context.Background())
+			t.Cleanup(stop)
+
+			select {
+			case <-targetTransport.sent:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("pending connection waited behind %d idle registry connections", idleConnections)
+			}
+		})
+	}
 }

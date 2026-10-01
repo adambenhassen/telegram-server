@@ -759,6 +759,14 @@ func (c *Conn) DialogFilterRecoverySnapshot(owner, session int64, globalEpoch ui
 	return state.generation, state.covered, state.firstDifference, target > state.covered, true
 }
 
+// DialogFilterRecoveryAttemptPending reports whether this binding can still
+// spend one of its bounded recovery attempts for an uncovered invalidation.
+func (c *Conn) DialogFilterRecoveryAttemptPending(owner, session int64, globalEpoch uint64) bool {
+	state := c.dialogFilterRecovery.Load()
+	return state != nil && state.owner == owner && state.session == session && state.initialized &&
+		state.pushEligible && state.attempts < 3 && max(state.generation, globalEpoch) > state.covered
+}
+
 // AcknowledgeDialogFilterFetch covers only invalidations captured before the
 // authoritative read. It deliberately leaves firstDifference untouched.
 func (c *Conn) AcknowledgeDialogFilterFetch(owner, session int64, captured, globalEpoch uint64) bool {
