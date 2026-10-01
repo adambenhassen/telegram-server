@@ -48,6 +48,21 @@ type Participant struct {
 	Date      time.Time
 }
 
+// ChatPinSnapshot contains one committed pin state and each member's copy as
+// observed by the same database statement.
+type ChatPinSnapshot struct {
+	Pinned     bool
+	Recipients []ChatPinRecipient
+}
+
+// ChatPinRecipient identifies a member and, when it exists, their local copy of
+// the selected pin.
+type ChatPinRecipient struct {
+	UserID  int64
+	LocalID int64
+	HasCopy bool
+}
+
 func chatFromRow(r db.Chat) Chat {
 	return Chat{
 		ID:                  r.ID,
@@ -563,10 +578,56 @@ func (s *Store) ChatPinnedMessage(ctx context.Context, chatID int64) (*int32, er
 	return id, nil
 }
 
+// ChatPinnedMessageForOwner resolves a chat's creator-owned pinned message to
+// the requested member's local copy. Missing or deleted copies report
+// found=false.
+func (s *Store) ChatPinnedMessageForOwner(ctx context.Context, chatID, ownerID int64) (int64, bool, error) {
+	id, err := s.q.ChatPinnedMessageForOwner(ctx, db.ChatPinnedMessageForOwnerParams{
+		ChatID: chatID, OwnerID: ownerID, PeerType: int16(PeerTypeChat),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("chat pinned message for owner: %w", err)
+	}
+	return id, true, nil
+}
+
+// ChatPinSnapshot returns the pin state and member-owned copies from one SQL
+// statement, so a concurrent repin or unpin cannot change one recipient's
+// notification midway through resolution.
+func (s *Store) ChatPinSnapshot(ctx context.Context, chatID int64) (ChatPinSnapshot, error) {
+	rows, err := s.q.ChatPinSnapshot(ctx, db.ChatPinSnapshotParams{
+		ChatID: chatID, PeerType: int16(PeerTypeChat),
+	})
+	if err != nil {
+		return ChatPinSnapshot{}, fmt.Errorf("chat pin snapshot: %w", err)
+	}
+	if len(rows) == 0 {
+		return ChatPinSnapshot{}, nil
+	}
+
+	snapshot := ChatPinSnapshot{
+		Pinned:     rows[0].PinnedMessageID != nil,
+		Recipients: make([]ChatPinRecipient, len(rows)),
+	}
+	for i, row := range rows {
+		recipient := ChatPinRecipient{UserID: row.UserID}
+		if row.LocalID != nil {
+			recipient.LocalID = *row.LocalID
+			recipient.HasCopy = true
+		}
+		snapshot.Recipients[i] = recipient
+	}
+	return snapshot, nil
+}
+
 // SetChatPinnedMessage sets or clears the pinned message id on chatID.
-// pinnedID is the local_id of the message to pin (identical across members for
-// a given fanout). Passing nil clears the pin. The caller is responsible for
-// having checked admin rights — this method does not authorise.
+// pinnedID stores the creator-owned copy's local_id; fanout_id resolves that
+// logical message to each member's local copy. Passing nil clears the pin.
+// The caller is responsible for having checked admin rights — this method
+// does not authorise.
 //
 // When pinnedID is non-nil the message is validated inside this transaction:
 // the caller's copy must exist, belong to chatID, and not be deleted. This
