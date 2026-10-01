@@ -3849,7 +3849,9 @@ func TestHandleToggleSlowModeRejectsUnauthorizedAndInvalidRequests(t *testing.T)
 func TestHandleToggleSlowModeSerializesAgainstAdminDemotion(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s, dsn := openStoreDSN(t)
+	dsn := pgtest.DSN(t)
+	s := openStoreWithApplicationName(t, dsn, "slow_mode_save_test")
+	demotionStore := openStoreWithApplicationName(t, dsn, "slow_mode_demotion_test")
 	creator, err := s.CreateUser(ctx, "+15551295221")
 	if err != nil {
 		t.Fatalf("creator: %v", err)
@@ -3896,42 +3898,70 @@ func TestHandleToggleSlowModeSerializesAgainstAdminDemotion(t *testing.T) {
 			if _, err := tx.Exec(ctx, `SELECT id FROM channels WHERE id = $1 FOR NO KEY UPDATE`, channel.ID); err != nil {
 				t.Fatalf("hold channel mutation lock: %v", err)
 			}
+			var barrierPID int
+			if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&barrierPID); err != nil {
+				t.Fatalf("read channel barrier backend pid: %v", err)
+			}
 
-			var save toggleResult
-			if tc.saveFirst {
-				saveDone := make(chan toggleResult, 1)
+			saveDone := make(chan toggleResult, 1)
+			demotionDone := make(chan error, 1)
+			startSave := func() {
 				go func() {
 					updates, rpc := toggleSlowModeViaDispatcher(t, h, admin.ID, api.InputChannel(admin.ID, channel.ID), 30)
 					saveDone <- toggleResult{updates: updates, rpc: rpc}
 				}()
-				waitForChannelLockWaiters(t, ctx, conn, 1)
-				if err := tx.Commit(ctx); err != nil {
-					t.Fatalf("commit lock-ordered save: %v", err)
-				}
-				save = <-saveDone
+			}
+			startDemotion := func() {
+				go func() {
+					demotionDone <- demotionStore.SetChannelRole(ctx, channel.ID, creator.ID, admin.ID, 0)
+				}()
+			}
+			if tc.saveFirst {
+				startSave()
+				savePID := waitForChannelLockWaiter(t, ctx, conn, "slow_mode_save_test", barrierPID, 0)
+				startDemotion()
+				waitForChannelLockWaiter(t, ctx, conn, "slow_mode_demotion_test", barrierPID, savePID)
+			} else {
+				startDemotion()
+				demotionPID := waitForChannelLockWaiter(t, ctx, conn, "slow_mode_demotion_test", barrierPID, 0)
+				startSave()
+				waitForChannelLockWaiter(t, ctx, conn, "slow_mode_save_test", barrierPID, demotionPID)
+			}
+			select {
+			case result := <-saveDone:
+				t.Fatalf("Save completed before the channel lock was released: updates:%v rpc:%v", result.updates, result.rpc)
+			default:
+			}
+			select {
+			case err := <-demotionDone:
+				t.Fatalf("demotion completed before the channel lock was released: %v", err)
+			default:
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatalf("release channel mutation barrier: %v", err)
+			}
+			var save toggleResult
+			var demotionErr error
+			select {
+			case save = <-saveDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("toggleSlowMode did not finish after releasing channel lock")
+			}
+			select {
+			case demotionErr = <-demotionDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("admin demotion did not finish after releasing channel lock")
+			}
+			if demotionErr != nil {
+				t.Fatalf("demote admin: %v", demotionErr)
+			}
+			if tc.saveFirst {
 				if save.rpc != nil {
 					t.Fatalf("save before demotion: %d %s", save.rpc.ErrorCode, save.rpc.ErrorMessage)
 				}
 				requireSlowModeChannelUpdate(t, save.updates, channel.ID)
-				if err := s.SetChannelRole(ctx, channel.ID, creator.ID, admin.ID, 0); err != nil {
-					t.Fatalf("demote admin after save: %v", err)
-				}
-			} else {
-				demotionDone := make(chan error, 1)
-				go func() {
-					demotionDone <- s.SetChannelRole(ctx, channel.ID, creator.ID, admin.ID, 0)
-				}()
-				waitForChannelLockWaiters(t, ctx, conn, 1)
-				if err := tx.Commit(ctx); err != nil {
-					t.Fatalf("commit lock-ordered demotion: %v", err)
-				}
-				if err := <-demotionDone; err != nil {
-					t.Fatalf("demote admin: %v", err)
-				}
-				save.updates, save.rpc = toggleSlowModeViaDispatcher(t, h, admin.ID, api.InputChannel(admin.ID, channel.ID), 30)
-				if save.updates != nil || save.rpc == nil || save.rpc.ErrorMessage != "PEER_ID_INVALID" {
-					t.Fatalf("demoted admin toggleSlowMode = updates:%v rpc:%v, want PEER_ID_INVALID", save.updates, save.rpc)
-				}
+			} else if save.updates != nil || save.rpc == nil || save.rpc.ErrorMessage != "PEER_ID_INVALID" {
+				t.Fatalf("already-started save after demotion = updates:%v rpc:%v, want PEER_ID_INVALID", save.updates, save.rpc)
 			}
 
 			response, rpc := getFullChannelViaDispatcher(t, h, creator.ID, false, api.InputChannel(creator.ID, channel.ID))
@@ -3940,12 +3970,221 @@ func TestHandleToggleSlowModeSerializesAgainstAdminDemotion(t *testing.T) {
 			}
 			seconds, ok := fullChannelInfo(t, response).GetSlowmodeSeconds()
 			want := 0
-			if save.rpc == nil {
+			if save.updates != nil && save.rpc == nil {
 				want = 30
 			}
 			if !ok || seconds != want {
 				t.Fatalf("slowmode_seconds after demotion race = %d present=%v, want %d", seconds, ok, want)
 			}
 		})
+	}
+}
+
+func openStoreWithApplicationName(t *testing.T, dsn, applicationName string) *store.Store {
+	t.Helper()
+	separator := "&"
+	if !strings.Contains(dsn, "?") {
+		separator = "?"
+	}
+	s, err := store.Open(context.Background(), dsn+separator+"application_name="+applicationName, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
+	if err != nil {
+		t.Fatalf("open store %q: %v", applicationName, err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store %q: %v", applicationName, err)
+		}
+	})
+	return s
+}
+
+func waitForChannelLockWaiter(t *testing.T, ctx context.Context, conn *pgx.Conn, applicationName string, blockerA, blockerB int) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var pid int
+		if err := conn.QueryRow(ctx, `
+			SELECT pid FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND application_name = $1
+			  AND wait_event_type = 'Lock'
+			  AND ($2 = ANY(pg_blocking_pids(pid)) OR $3 = ANY(pg_blocking_pids(pid)))
+			LIMIT 1
+		`, applicationName, blockerA, blockerB).Scan(&pid); err == nil {
+			return pid
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("inspect %s channel lock waiter: %v", applicationName, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	rows, err := conn.Query(ctx, `
+		SELECT pid, application_name, coalesce(wait_event_type, ''), coalesce(wait_event, ''), coalesce(left(query, 200), '')
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND pid <> pg_backend_pid()
+	`)
+	if err != nil {
+		t.Fatalf("%s did not wait on the channel mutation lock; inspect sessions: %v", applicationName, err)
+	}
+	defer rows.Close()
+	var sessions []string
+	for rows.Next() {
+		var pid int
+		var app, eventType, event, query string
+		if err := rows.Scan(&pid, &app, &eventType, &event, &query); err != nil {
+			t.Fatalf("%s did not wait on the channel mutation lock; scan sessions: %v", applicationName, err)
+		}
+		sessions = append(sessions, fmt.Sprintf("pid=%d app=%q %s/%s query=%q", pid, app, eventType, event, query))
+	}
+	t.Fatalf("%s did not wait on the channel mutation lock: %s", applicationName, strings.Join(sessions, "; "))
+	return 0
+}
+
+func TestHandleToggleSlowModeSaveFailuresPreservePostsAndCooldown(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		deferred bool
+	}{
+		{name: "update failure"},
+		{name: "deferred commit failure", deferred: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s, dsn := openStoreDSN(t)
+			creator, err := s.CreateUser(ctx, "+15551295231")
+			if err != nil {
+				t.Fatalf("creator: %v", err)
+			}
+			member, err := s.CreateUser(ctx, "+15551295232")
+			if err != nil {
+				t.Fatalf("member: %v", err)
+			}
+			channel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{
+				Megagroup: true,
+				Title:     "Slow mode save failure",
+			})
+			joinChannel(t, ctx, dsn, channel.ID, member.ID)
+			h := fullChannelDispatcher(s)
+			updates, rpc := toggleSlowModeViaDispatcher(t, h, creator.ID, api.InputChannel(creator.ID, channel.ID), 10)
+			if rpc != nil {
+				t.Fatalf("set initial slow mode: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+			}
+			requireSlowModeChannelUpdate(t, updates, channel.ID)
+
+			const randomID = int64(95231)
+			first, firstPts, duplicate, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "committed before failed save", randomID, nil, 0)
+			if err != nil || duplicate || firstPts != 1 {
+				t.Fatalf("first member post = %+v pts=%d duplicate=%v err=%v", first, firstPts, duplicate, err)
+			}
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatalf("connect to inspect committed post marker: %v", err)
+			}
+			defer func() {
+				if err := conn.Close(ctx); err != nil {
+					t.Errorf("close marker connection: %v", err)
+				}
+			}()
+			var markerBefore time.Time
+			if err := conn.QueryRow(ctx, `SELECT last_post_at FROM channel_participants WHERE channel_id = $1 AND user_id = $2`, channel.ID, member.ID).Scan(&markerBefore); err != nil {
+				t.Fatalf("read committed last-post marker: %v", err)
+			}
+
+			removeFailure := installSlowModeSaveFailure(t, dsn, channel.ID, tc.deferred)
+			updates, rpc = toggleSlowModeViaDispatcher(t, h, creator.ID, api.InputChannel(creator.ID, channel.ID), 30)
+			removeFailure()
+			if updates != nil || rpc == nil || rpc.ErrorMessage != "INTERNAL" {
+				t.Fatalf("failed slow-mode save = updates:%v rpc:%v, want INTERNAL without Updates", updates, rpc)
+			}
+
+			response, rpc := getFullChannelViaDispatcher(t, h, creator.ID, false, api.InputChannel(creator.ID, channel.ID))
+			if rpc != nil {
+				t.Fatalf("creator getFullChannel after failed save: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+			}
+			if seconds, ok := fullChannelInfo(t, response).GetSlowmodeSeconds(); !ok || seconds != 10 {
+				t.Fatalf("slowmode_seconds after failed save = %d present=%v, want 10", seconds, ok)
+			}
+			var markerAfter time.Time
+			if err := conn.QueryRow(ctx, `SELECT last_post_at FROM channel_participants WHERE channel_id = $1 AND user_id = $2`, channel.ID, member.ID).Scan(&markerAfter); err != nil {
+				t.Fatalf("read last-post marker after failed save: %v", err)
+			}
+			if !markerAfter.Equal(markerBefore) {
+				t.Fatalf("failed save changed committed last-post marker from %v to %v", markerBefore, markerAfter)
+			}
+			if _, _, duplicate, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "distinct post during cooldown", randomID+1, nil, 0); err == nil || duplicate || !strings.HasPrefix(err.Error(), "SLOWMODE_WAIT_") {
+				t.Fatalf("distinct post after failed save duplicate=%v err=%v, want slow-mode cooldown", duplicate, err)
+			}
+			retry, retryPts, duplicate, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "different retry payload", randomID, nil, 0)
+			if err != nil || !duplicate || retry.LocalID != first.LocalID || retry.Message != first.Message || retryPts != firstPts {
+				t.Fatalf("committed random-id retry = %+v pts=%d duplicate=%v err=%v, want original %+v pts=%d", retry, retryPts, duplicate, err, first, firstPts)
+			}
+			if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != firstPts {
+				t.Fatalf("channel state after failed save and retry = %d err=%v, want %d", pts, err, firstPts)
+			}
+			events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, firstPts, 10)
+			if err != nil || len(events) != 1 || events[0].Pts != firstPts || events[0].LocalID != first.LocalID || events[0].Type != store.EventNewMessage {
+				t.Fatalf("events after failed save and retry = %+v err=%v, want original post event only", events, err)
+			}
+		})
+	}
+}
+
+func installSlowModeSaveFailure(t *testing.T, dsn string, channelID int64, deferred bool) func() {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect failure injector: %v", err)
+	}
+	const triggerName = "test_slow_mode_save_failure"
+	const functionName = "test_slow_mode_save_failure"
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(cleanupCtx, `DROP TRIGGER IF EXISTS test_slow_mode_save_failure ON channels`); err != nil {
+			t.Errorf("drop slow-mode failure trigger: %v", err)
+		}
+		if _, err := conn.Exec(cleanupCtx, `DROP FUNCTION IF EXISTS test_slow_mode_save_failure()`); err != nil {
+			t.Errorf("drop slow-mode failure function: %v", err)
+		}
+		if err := conn.Close(cleanupCtx); err != nil {
+			t.Errorf("close failure injector: %v", err)
+		}
+	})
+	functionSQL := fmt.Sprintf(`
+CREATE FUNCTION %s() RETURNS trigger
+LANGUAGE plpgsql AS $body$
+BEGIN
+  IF OLD.id = %d AND NEW.slowmode_seconds IS DISTINCT FROM OLD.slowmode_seconds THEN
+    RAISE EXCEPTION 'injected slow-mode save failure';
+  END IF;
+  RETURN NEW;
+END;
+$body$;`, functionName, channelID)
+	if _, err := conn.Exec(ctx, functionSQL); err != nil {
+		t.Fatalf("create slow-mode failure function: %v", err)
+	}
+	triggerSQL := fmt.Sprintf(`
+CREATE TRIGGER %s
+BEFORE UPDATE OF slowmode_seconds ON channels
+FOR EACH ROW EXECUTE FUNCTION %s()`, triggerName, functionName)
+	if deferred {
+		triggerSQL = fmt.Sprintf(`
+CREATE CONSTRAINT TRIGGER %s
+AFTER UPDATE ON channels
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION %s()`, triggerName, functionName)
+	}
+	if _, err := conn.Exec(ctx, triggerSQL); err != nil {
+		t.Fatalf("create slow-mode failure trigger: %v", err)
+	}
+	return func() {
+		if _, err := conn.Exec(context.Background(), `DROP TRIGGER IF EXISTS test_slow_mode_save_failure ON channels`); err != nil {
+			t.Errorf("drop slow-mode failure trigger: %v", err)
+		}
+		if _, err := conn.Exec(context.Background(), `DROP FUNCTION IF EXISTS test_slow_mode_save_failure()`); err != nil {
+			t.Errorf("drop slow-mode failure function: %v", err)
+		}
 	}
 }
