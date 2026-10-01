@@ -182,7 +182,7 @@ func startObservabilityReplica(
 	metrics *store.NotificationMetrics,
 ) *observabilityReplica {
 	t.Helper()
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, testBlobs(t), 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed, metrics)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 

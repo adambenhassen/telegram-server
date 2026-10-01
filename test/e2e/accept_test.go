@@ -115,19 +115,19 @@ func bootAcceptServer(t *testing.T, ctx context.Context, handshake time.Duration
 
 	codes := newCodeSink()
 	const dcID = 2
+	ln := mustListen(t, ctx, "127.0.0.1:0")
 	blobs, err := blob.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
 	}
 	// The code sink scrapes the issued code out of the log, so the gated line
 	// needs to be on.
-	handler := api.New(st, dcID, api.DefaultConfig(dcID, "127.0.0.1", 0), codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)
+	handler := api.New(st, dcID, fixtureConfigForListener(t, dcID, ln), codes.Logger(), true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), config.RateLimitsConfig{}, config.RegistrationClosed)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, codes.Logger())
 	if handshake > 0 {
 		server.SetHandshakeTimeout(handshake)
 	}
 
-	ln := mustListen(t, ctx, "127.0.0.1:0")
 	addr, ok := ln.Addr().(*net.TCPAddr)
 	if !ok {
 		t.Fatalf("listener addr type = %T", ln.Addr())

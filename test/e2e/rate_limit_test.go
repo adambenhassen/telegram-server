@@ -56,7 +56,7 @@ func TestRateLimitE2E(t *testing.T) {
 	}
 
 	// Boot server with a small rate limit: 3 sends per 10s.
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	blobs, err := blob.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("blob store: %v", err)

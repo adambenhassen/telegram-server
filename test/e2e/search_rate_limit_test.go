@@ -313,7 +313,7 @@ func TestSearchRateLimitE2E(t *testing.T) {
 // rate limits for messages.search and contacts.search.
 func bootServerWithSearchLimits(t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store, dsn string, log *slog.Logger, ln net.Listener, searchMessages, searchContacts store.RateLimitConfig) func() {
 	t.Helper()
-	tgcfg := api.DefaultConfig(dcID, "127.0.0.1", 0)
+	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	blobs, err := blob.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("blob store: %v", err)
