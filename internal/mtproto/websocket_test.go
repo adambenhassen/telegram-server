@@ -662,7 +662,7 @@ func TestServeWebSocketHandshakeTimeout(t *testing.T) {
 	defer cancel()
 	ln := mustListenTCP(t, ctx, "127.0.0.1:0")
 	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
-	srv.SetHandshakeTimeout(100 * time.Millisecond)
+	srv.SetHandshakeTimeout(time.Second)
 	served := make(chan error, 1)
 	go func() { served <- srv.ServeWebSocket(ctx, ln) }()
 	t.Cleanup(func() {

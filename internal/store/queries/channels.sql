@@ -17,6 +17,35 @@ INSERT INTO channel_participants (channel_id, user_id, role, join_pts) VALUES ($
 -- name: ChannelByID :one
 SELECT * FROM channels WHERE id = $1;
 
+-- ChannelMegagroup reads only the channel kind needed for post authorization.
+-- In particular, this check must not fetch slow-mode state before membership
+-- and ban authorization has passed.
+-- name: ChannelMegagroup :one
+SELECT megagroup FROM channels WHERE id = $1;
+
+-- ChannelPostDefaults reads the stored restrictions after post authorization
+-- and random_id deduplication. Keep slowmode_seconds out of this projection so
+-- a default-rights refusal takes precedence without observing slow-mode state.
+-- name: ChannelPostDefaults :one
+SELECT megagroup, default_banned_rights FROM channels WHERE id = $1;
+
+-- ChannelSlowModePostState is called only after membership, ban, post rights,
+-- deduplication and default restrictions are decided. clock_timestamp() is
+-- sampled after the caller took channel_state FOR UPDATE, so a transaction that
+-- waited for another post cannot compare against a stale transaction start. The
+-- durable marker survives leave/rejoin; the participant value remains as a
+-- fallback for rows written by older binaries during a rolling deploy.
+-- name: ChannelSlowModePostState :one
+SELECT c.slowmode_seconds,
+       GREATEST(cp.last_post_at, cpm.last_post_at)::timestamptz AS last_post_at,
+       clock_timestamp()::timestamptz AS checked_at
+FROM channels c
+JOIN channel_participants cp ON cp.channel_id = c.id
+LEFT JOIN channel_post_markers cpm
+    ON cpm.channel_id = c.id AND cpm.user_id = cp.user_id
+WHERE c.id = sqlc.arg(channel_id)::bigint
+  AND cp.user_id = sqlc.arg(user_id)::bigint;
+
 -- ChannelStateForUpdate takes the channel_state row lock that serialises
 -- admission to one channel: the pts a joiner records and the participant count
 -- the caps are decided on are both read under it. See the lock-order comment at
@@ -150,6 +179,21 @@ UPDATE channel_participants SET role = $3 WHERE channel_id = $1 AND user_id = $2
 -- the parameter is a pgtype.Timestamptz — the same type the column decodes into.
 -- name: UpdateChannelParticipantBan :execrows
 UPDATE channel_participants SET banned_until = $3 WHERE channel_id = $1 AND user_id = $2;
+
+-- Posts already hold channel_state FOR UPDATE. Update both the membership-scoped
+-- compatibility value and the durable marker from one database timestamp.
+-- name: UpdateChannelPostMarker :execrows
+WITH updated_participant AS (
+    UPDATE channel_participants AS participant
+    SET last_post_at = clock_timestamp()
+    WHERE participant.channel_id = $1 AND participant.user_id = $2
+    RETURNING participant.channel_id, participant.user_id, participant.last_post_at
+)
+INSERT INTO channel_post_markers (channel_id, user_id, last_post_at)
+SELECT updated_participant.channel_id, updated_participant.user_id, updated_participant.last_post_at
+FROM updated_participant
+ON CONFLICT (channel_id, user_id) DO UPDATE
+SET last_post_at = EXCLUDED.last_post_at;
 
 -- name: DeleteChannelParticipant :execrows
 DELETE FROM channel_participants WHERE channel_id = $1 AND user_id = $2;

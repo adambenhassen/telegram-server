@@ -88,6 +88,12 @@ type ChannelParticipant struct {
 	LastPostAt  pgtype.Timestamptz
 }
 
+type ChannelPostMarker struct {
+	ChannelID  int64
+	UserID     int64
+	LastPostAt pgtype.Timestamptz
+}
+
 type ChannelState struct {
 	ChannelID   int64
 	Pts         int64
