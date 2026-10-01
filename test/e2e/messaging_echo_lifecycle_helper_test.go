@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/gotd/td/tgerr"
@@ -55,6 +56,7 @@ func (r *terminalResult) finished() bool {
 
 type clientFailureSignal struct {
 	once        sync.Once
+	reported    sync.Once
 	done        chan struct{}
 	diagnostic  string
 	cancelCause context.CancelCauseFunc
@@ -77,6 +79,15 @@ func (f *clientFailureSignal) report(diagnostic string) {
 func (f *clientFailureSignal) message() string {
 	<-f.done
 	return f.diagnostic
+}
+
+func (f *clientFailureSignal) reportAtTeardown(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.done:
+		f.reported.Do(func() { t.Errorf("%s", f.message()) })
+	default:
+	}
 }
 
 type safeDiagnosticError struct {
@@ -132,6 +143,7 @@ func (p *clientPhaseState) snapshot() (string, time.Time) {
 type clientLifecycle struct {
 	ctx             context.Context
 	label           string
+	failures        *clientFailureSignal
 	result          *terminalResult
 	phase           clientPhaseState
 	intentionalStop atomic.Bool
@@ -158,6 +170,18 @@ func (l *clientLifecycle) diagnostic(phase string, elapsed time.Duration, cause 
 	return fmt.Sprintf("%s %s failed after %s (%s; %s)", l.label, phase, elapsed.Round(time.Millisecond), registrySnapshotDescription(snapshot, valid), cause)
 }
 
+func stopClientLifecycle(t *testing.T, lifecycle *clientLifecycle, closeCommands func()) {
+	t.Helper()
+	lifecycle.intentionalStop.Store(true)
+	closeCommands()
+	if err := lifecycle.result.error(); err != nil && lifecycle.failures == nil && !isIntentionalClientCleanup(true, err) {
+		t.Errorf("%s teardown failed (cause=%s)", lifecycle.label, safeErrorClass(err))
+	}
+	if lifecycle.failures != nil {
+		lifecycle.failures.reportAtTeardown(t)
+	}
+}
+
 func waitForClientCommand(ctx context.Context, lifecycle *clientLifecycle, done <-chan error, started time.Time) error {
 	commandFailure := func() error {
 		return errors.New(lifecycle.diagnostic("command", time.Since(started), "cause="+safeErrorClass(lifecycle.result.error())))
@@ -170,6 +194,10 @@ func waitForClientCommand(ctx context.Context, lifecycle *clientLifecycle, done 
 		return err
 	case <-ctx.Done():
 		if lifecycle.result.finished() {
+			return commandFailure()
+		}
+		if diagnostic, ok := errors.AsType[safeDiagnosticError](context.Cause(ctx)); ok && diagnostic.message != "" {
+			<-lifecycle.result.done
 			return commandFailure()
 		}
 		return errors.New(lifecycle.diagnostic("command", time.Since(started), contextFailureDescription(ctx)))
@@ -191,7 +219,7 @@ func runClientWithOptions(phase *clientPhaseState, options clientRunOptions, run
 }
 
 func startClientLifecycle(ctx context.Context, label string, failures *clientFailureSignal, run func(*clientPhaseState) error) *clientLifecycle {
-	lifecycle := &clientLifecycle{ctx: ctx, label: label, result: newTerminalResult()}
+	lifecycle := &clientLifecycle{ctx: ctx, label: label, failures: failures, result: newTerminalResult()}
 	lifecycle.phase.set("login")
 	go func() {
 		err := run(&lifecycle.phase)
@@ -202,7 +230,6 @@ func startClientLifecycle(ctx context.Context, label string, failures *clientFai
 				err = errUnexpectedNilExit
 			}
 		}
-		lifecycle.result.complete(err)
 		if !isIntentionalClientCleanup(lifecycle.intentionalStop.Load(), err) && failures != nil {
 			phase, started := lifecycle.phase.snapshot()
 			if phase == "" {
@@ -210,6 +237,7 @@ func startClientLifecycle(ctx context.Context, label string, failures *clientFai
 			}
 			failures.report(lifecycle.diagnostic(phase, time.Since(started), "cause="+safeErrorClass(err)))
 		}
+		lifecycle.result.complete(err)
 	}()
 	return lifecycle
 }

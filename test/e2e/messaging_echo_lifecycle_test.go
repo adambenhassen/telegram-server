@@ -5,18 +5,61 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	osexec "os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
 
+const clientTeardownProbeEnv = "TELEGRAM_TEST_CLIENT_TEARDOWN_PROBE"
+
+func TestLifecycleTeardownFailureProbe(t *testing.T) {
+	if os.Getenv(clientTeardownProbeEnv) != "1" {
+		t.Skip("subprocess probe only")
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	failures := newClientFailureSignal(cancel)
+	lifecycle := startClientLifecycle(ctx, "PROBE", failures, func(phase *clientPhaseState) error {
+		phase.set("idle")
+		return errProbeClientExit
+	})
+	<-failures.done
+	<-lifecycle.result.done
+
+	client := &smokeClient{
+		lifecycle: lifecycle,
+		manager:   updates.New(updates.Config{Handler: newUpdateCollector()}),
+		cmds:      make(chan command),
+		label:     "PROBE",
+	}
+	client.stopClient(t)
+}
+
 func TestEchoLifecycleDiagnostics(t *testing.T) {
+	t.Run("unexpected idle exit fails shared client teardown", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := osexec.CommandContext(ctx, os.Args[0], "-test.run=^TestLifecycleTeardownFailureProbe$") // #nosec G204,G702 -- fixed test selector on this test binary verifies failure status.
+		cmd.Env = append(os.Environ(), clientTeardownProbeEnv+"=1")
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("idle client failure was retained but teardown passed: %s", output)
+		}
+		if !strings.Contains(string(output), "PROBE idle") || !strings.Contains(string(output), "cause=injected probe") {
+			t.Fatalf("teardown failed without the synthetic idle diagnostic: %s", output)
+		}
+	})
+
 	t.Run("probe client exit before readiness is prompt and labelled", func(t *testing.T) {
 		failures := newClientFailureSignal(nil)
 		started := time.Now()
@@ -172,13 +215,8 @@ func TestEchoLifecycleDiagnostics(t *testing.T) {
 			})
 		})
 
-		client.intentionalStop.Store(true)
-		close(commands)
-		select {
-		case <-client.result.done:
-		case <-time.After(time.Second):
-			t.Fatal("intentional shutdown waited on a consumed manager result")
-		}
+		run := &smokeClient{lifecycle: client, manager: updates.New(updates.Config{Handler: newUpdateCollector()}), cmds: commands, label: "C"}
+		run.stopClient(t)
 		if err := client.result.error(); err != nil {
 			t.Fatalf("intentional shutdown returned an error: %s", safeErrorClass(err))
 		}

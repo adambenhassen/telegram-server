@@ -157,12 +157,7 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 	}
 	stopClient = func(run *runningClient) {
 		run.stop.Do(func() {
-			alreadyFinished := run.lifecycle.result.finished()
-			run.lifecycle.intentionalStop.Store(true)
-			close(run.cmds)
-			if err := run.lifecycle.result.error(); run.lifecycle.ctx.Err() == nil && !alreadyFinished && !isIntentionalClientCleanup(true, err) {
-				t.Errorf("%s shutdown failed (cause=%s)", run.lifecycle.label, safeErrorClass(err))
-			}
+			stopClientLifecycle(t, run.lifecycle, func() { close(run.cmds) })
 			run.manager.Reset()
 		})
 	}

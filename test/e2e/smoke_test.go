@@ -1236,12 +1236,7 @@ func (c *smokeClient) call(ctx context.Context, fn func(context.Context, *tg.Cli
 func (c *smokeClient) stopClient(t *testing.T) {
 	t.Helper()
 	c.stop.Do(func() {
-		alreadyFinished := c.lifecycle.result.finished()
-		c.lifecycle.intentionalStop.Store(true)
-		close(c.cmds)
-		if err := c.lifecycle.result.error(); c.lifecycle.ctx.Err() == nil && !alreadyFinished && !isIntentionalClientCleanup(true, err) {
-			t.Errorf("%s smoke shutdown failed (cause=%s)", c.label, safeErrorClass(err))
-		}
+		stopClientLifecycle(t, c.lifecycle, func() { close(c.cmds) })
 		c.manager.Reset()
 	})
 }
