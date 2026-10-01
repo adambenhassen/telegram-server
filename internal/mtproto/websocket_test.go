@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -658,34 +659,193 @@ func TestServeWebSocketShutdownClosesHijackedConnection(t *testing.T) {
 func TestServeWebSocketHandshakeTimeout(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	ln := mustListenTCP(t, ctx, "127.0.0.1:0")
+	const (
+		handshakeBudget     = time.Second
+		observationBudget   = 8 * time.Second
+		parentBudget        = 30 * time.Second
+		cleanupBudget       = 2 * time.Second
+		earlyCloseTolerance = 75 * time.Millisecond
+	)
+
+	t.Run("stalled HTTP upgrade", func(t *testing.T) {
+		ln, ctx := startWebSocketHandshakeTimeoutServer(t, handshakeBudget, parentBudget, cleanupBudget)
+
+		dialStartedAt := time.Now()
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial stalled peer after %s (server budget %s, earliest close %s): %v",
+				time.Since(dialStartedAt), handshakeBudget, handshakeBudget-earlyCloseTolerance, err)
+		}
+		t.Cleanup(func() {
+			if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("close stalled peer: %v", err)
+			}
+		})
+
+		var acceptedAt time.Time
+		select {
+		case acceptedAt = <-ln.accepted:
+		case <-ctx.Done():
+			t.Fatalf("server did not accept stalled peer after %s (server budget %s): %v",
+				time.Since(dialStartedAt), handshakeBudget, ctx.Err())
+		}
+
+		request := rawWebSocketHandshake()
+		if _, err := conn.Write(request[:len(request)-2]); err != nil {
+			t.Fatalf("write incomplete HTTP upgrade after %s (server budget %s, earliest close %s): %v",
+				time.Since(acceptedAt), handshakeBudget, handshakeBudget-earlyCloseTolerance, err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(observationBudget)); err != nil {
+			t.Fatalf("set independent observation deadline after %s (server budget %s): %v",
+				time.Since(acceptedAt), handshakeBudget, err)
+		}
+
+		_, readErr := io.Copy(io.Discard, conn)
+		elapsed := time.Since(acceptedAt)
+		if isTimeout(readErr) || errors.Is(readErr, context.DeadlineExceeded) || errors.Is(readErr, context.Canceled) {
+			t.Fatalf("stalled HTTP upgrade remained open for %s until the independent observation deadline; server budget %s, earliest close %s: %v",
+				elapsed, handshakeBudget, handshakeBudget-earlyCloseTolerance, readErr)
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) && !errors.Is(readErr, syscall.ECONNRESET) {
+			t.Fatalf("stalled HTTP upgrade ended with unrelated read error after %s; server budget %s, earliest close %s: %v",
+				elapsed, handshakeBudget, handshakeBudget-earlyCloseTolerance, readErr)
+		}
+		assertWebSocketHandshakeCloseWasNotEarly(t, elapsed, handshakeBudget, earlyCloseTolerance)
+		var appliedDeadline time.Time
+		select {
+		case appliedDeadline = <-ln.deadlines:
+		default:
+			t.Fatalf("stalled HTTP peer closed after %s, but the server did not apply its deadline at accept; budget %s, earliest close %s",
+				elapsed, handshakeBudget, handshakeBudget-earlyCloseTolerance)
+		}
+		remaining := appliedDeadline.Sub(acceptedAt)
+		if remaining < handshakeBudget-earlyCloseTolerance || remaining > handshakeBudget+earlyCloseTolerance {
+			t.Fatalf("accept-time deadline leaves %s from accept; want budget %s within %s, peer closed after %s",
+				remaining, handshakeBudget, earlyCloseTolerance, elapsed)
+		}
+	})
+
+	t.Run("post-upgrade codec detection", func(t *testing.T) {
+		ln, ctx := startWebSocketHandshakeTimeoutServer(t, handshakeBudget, parentBudget, cleanupBudget)
+
+		dialCtx, stopDial := context.WithTimeout(ctx, observationBudget)
+		defer stopDial()
+		dialStartedAt := time.Now()
+		ws, dialErr := dialWebSocket(dialCtx, ln.Addr().String())
+		var acceptedAt time.Time
+		select {
+		case acceptedAt = <-ln.accepted:
+		case <-ctx.Done():
+			t.Fatalf("WebSocket dial ended without a recorded accept after %s (server budget %s, earliest close %s): %v",
+				time.Since(dialStartedAt), handshakeBudget, handshakeBudget-earlyCloseTolerance, ctx.Err())
+		}
+		if dialErr != nil {
+			t.Fatalf("WebSocket upgrade failed after %s from accept (%s from dial); a failed upgrade is not timeout proof, server budget %s, earliest close %s: %v",
+				time.Since(acceptedAt), time.Since(dialStartedAt), handshakeBudget, handshakeBudget-earlyCloseTolerance, dialErr)
+		}
+		t.Cleanup(func() { closeWebSocket(t, ws) })
+
+		if err := ws.Write(ctx, websocket.MessageBinary, []byte{0}); err != nil {
+			t.Fatalf("write incomplete binary transport framing after %s from accept; server budget %s, earliest close %s: %v",
+				time.Since(acceptedAt), handshakeBudget, handshakeBudget-earlyCloseTolerance, err)
+		}
+		readCtx, stopRead := context.WithTimeout(context.Background(), observationBudget)
+		defer stopRead()
+		_, _, readErr := ws.Read(readCtx)
+		elapsed := time.Since(acceptedAt)
+		if readErr == nil {
+			t.Fatalf("incomplete binary transport framing was not closed after %s; server budget %s, earliest close %s",
+				elapsed, handshakeBudget, handshakeBudget-earlyCloseTolerance)
+		}
+		if errors.Is(readErr, context.DeadlineExceeded) || errors.Is(readErr, context.Canceled) {
+			t.Fatalf("WebSocket read ended by client-side context after %s; client cancellation is not timeout proof, server budget %s, earliest close %s: %v",
+				elapsed, handshakeBudget, handshakeBudget-earlyCloseTolerance, readErr)
+		}
+		if !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) && !errors.Is(readErr, syscall.ECONNRESET) {
+			t.Fatalf("WebSocket read ended with unrelated error after %s; server budget %s, earliest close %s: %v",
+				elapsed, handshakeBudget, handshakeBudget-earlyCloseTolerance, readErr)
+		}
+		assertWebSocketHandshakeCloseWasNotEarly(t, elapsed, handshakeBudget, earlyCloseTolerance)
+	})
+}
+
+func startWebSocketHandshakeTimeoutServer(
+	t *testing.T,
+	handshakeBudget, parentBudget, cleanupBudget time.Duration,
+) (*webSocketHandshakeDeadlineListener, context.Context) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), parentBudget)
+	base, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		cancel()
+		t.Fatalf("listen for WebSocket handshake timeout: %v", err)
+	}
+	ln := &webSocketHandshakeDeadlineListener{
+		Listener:  base,
+		accepted:  make(chan time.Time, 1),
+		deadlines: make(chan time.Time, 4),
+	}
 	srv := mtproto.New(exchange.PrivateKey{}, 2, mtproto.NewMemoryAuthKeyStore(), nil, nil)
-	srv.SetHandshakeTimeout(time.Second)
+	srv.SetHandshakeTimeout(handshakeBudget)
 	served := make(chan error, 1)
 	go func() { served <- srv.ServeWebSocket(ctx, ln) }()
 	t.Cleanup(func() {
 		cancel()
-		if err := <-served; err != nil {
-			t.Errorf("serve websocket: %v", err)
+		select {
+		case err := <-served:
+			if err != nil {
+				t.Errorf("serve WebSocket returned an error: %v", err)
+			}
+		case <-time.After(cleanupBudget):
+			t.Errorf("ServeWebSocket did not stop within %s after cancellation", cleanupBudget)
 		}
 	})
+	return ln, ctx
+}
 
-	ws, err := dialWebSocket(ctx, ln.Addr().String())
+type webSocketHandshakeDeadlineListener struct {
+	net.Listener
+
+	accepted  chan time.Time
+	deadlines chan time.Time
+}
+
+func (l *webSocketHandshakeDeadlineListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
 	if err != nil {
-		t.Fatalf("dial websocket: %v", err)
+		return nil, err
 	}
-	t.Cleanup(func() { closeWebSocket(t, ws) })
-	if err := ws.Write(ctx, websocket.MessageBinary, []byte{0}); err != nil {
-		t.Fatalf("write partial framing: %v", err)
+	select {
+	case l.accepted <- time.Now():
+	default:
 	}
-	closeCtx, stop := context.WithTimeout(context.Background(), 2*time.Second)
-	defer stop()
-	if _, _, err := ws.Read(closeCtx); err == nil {
-		t.Fatal("partial transport framing was not closed at the handshake timeout")
-	} else if errors.Is(err, context.DeadlineExceeded) {
-		t.Fatal("partial transport framing stayed open past the handshake timeout")
+	return &webSocketHandshakeDeadlineConn{Conn: conn, deadlines: l.deadlines}, nil
+}
+
+type webSocketHandshakeDeadlineConn struct {
+	net.Conn
+
+	deadlines chan<- time.Time
+}
+
+func (c *webSocketHandshakeDeadlineConn) SetDeadline(deadline time.Time) error {
+	if err := c.Conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	select {
+	case c.deadlines <- deadline:
+	default:
+	}
+	return nil
+}
+
+func assertWebSocketHandshakeCloseWasNotEarly(t *testing.T, elapsed, handshakeBudget, tolerance time.Duration) {
+	t.Helper()
+	minimum := handshakeBudget - tolerance
+	if elapsed < minimum {
+		t.Fatalf("server closed after %s from accept, earlier than handshake budget %s minus %s (%s minimum)",
+			elapsed, handshakeBudget, tolerance, minimum)
 	}
 }
 
