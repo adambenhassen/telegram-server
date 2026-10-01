@@ -55,6 +55,10 @@ func TestSmoke(t *testing.T) {
 		t.Parallel()
 		testSmokeUsernameRegistration(t)
 	})
+	t.Run("username-password-reset", func(t *testing.T) {
+		t.Parallel()
+		testSmokeUsernamePasswordReset(t)
+	})
 }
 
 func testSmokeOneToOne(t *testing.T) {
