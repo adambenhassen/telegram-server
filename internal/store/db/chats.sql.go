@@ -454,8 +454,8 @@ type SetChatPinnedMessageParams struct {
 }
 
 // SetChatPinnedMessage sets or clears the pinned message id on a chat.
-// The pinned_message_id is the local_id of the pinned message (identical across
-// members for a given fanout). NULL clears the pin.
+// The pinned_message_id stores the creator-owned copy's local_id; fanout_id
+// resolves that logical message to each member's local copy. NULL clears the pin.
 func (q *Queries) SetChatPinnedMessage(ctx context.Context, arg SetChatPinnedMessageParams) (Chat, error) {
 	row := q.db.QueryRow(ctx, setChatPinnedMessage, arg.ID, arg.PinnedMessageID)
 	var i Chat

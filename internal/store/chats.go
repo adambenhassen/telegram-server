@@ -624,9 +624,10 @@ func (s *Store) ChatPinSnapshot(ctx context.Context, chatID int64) (ChatPinSnaps
 }
 
 // SetChatPinnedMessage sets or clears the pinned message id on chatID.
-// pinnedID is the local_id of the message to pin (identical across members for
-// a given fanout). Passing nil clears the pin. The caller is responsible for
-// having checked admin rights — this method does not authorise.
+// pinnedID stores the creator-owned copy's local_id; fanout_id resolves that
+// logical message to each member's local copy. Passing nil clears the pin.
+// The caller is responsible for having checked admin rights — this method
+// does not authorise.
 //
 // When pinnedID is non-nil the message is validated inside this transaction:
 // the caller's copy must exist, belong to chatID, and not be deleted. This

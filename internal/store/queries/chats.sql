@@ -70,8 +70,8 @@ GROUP BY chat_id
 ORDER BY chat_id;
 
 -- SetChatPinnedMessage sets or clears the pinned message id on a chat.
--- The pinned_message_id is the local_id of the pinned message (identical across
--- members for a given fanout). NULL clears the pin.
+-- The pinned_message_id stores the creator-owned copy's local_id; fanout_id
+-- resolves that logical message to each member's local copy. NULL clears the pin.
 -- name: SetChatPinnedMessage :one
 UPDATE chats SET pinned_message_id = $2, version = version + 1 WHERE id = $1 RETURNING *;
 
