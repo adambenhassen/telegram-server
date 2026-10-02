@@ -3,9 +3,15 @@ package mtproto
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/crypto"
+	"github.com/gotd/td/mt"
 )
 
 func TestPeerRPCStateChargesOneCancellationAcrossConnections(t *testing.T) {
@@ -283,5 +289,109 @@ func TestRPCCancelBudgetChargesPreLoginOnlyToGlobalBucket(t *testing.T) {
 	}
 	if got := len(budget.users); got != 0 {
 		t.Fatalf("pre-login cancellation allocated per-user state: %d entries", got)
+	}
+}
+
+type rpcPushFailureTransport struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (*rpcPushFailureTransport) Send(context.Context, *bin.Buffer) error { return io.ErrClosedPipe }
+
+func (c *rpcPushFailureTransport) Recv(ctx context.Context, _ *bin.Buffer) error {
+	select {
+	case <-c.closed:
+		return net.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *rpcPushFailureTransport) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestPushWriteFailureUsesPeerCancellationBudget(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{"ordinary", "watermark", "recovery"} {
+		for _, exhausted := range []bool{false, true} {
+			name := path + "/available"
+			if exhausted {
+				name = path + "/exhausted"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				now := time.Unix(1_800_000_600, 0)
+				budget := newRPCCancelBudget(func() time.Time { return now }, 8)
+				if exhausted {
+					reservation, ok := budget.reserve(7)
+					if !ok {
+						t.Fatal("could not consume initial user allowance")
+					}
+					reservation.commit()
+				}
+				state := newPeerRPCState(budget)
+				activeCtx, finish, started := state.begin(7, t.Context())
+				if !started {
+					t.Fatal("active RPC did not start")
+				}
+				defer finish()
+				transport := &rpcPushFailureTransport{closed: make(chan struct{})}
+				var raw crypto.Key
+				for i := range raw {
+					raw[i] = byte(i)
+				}
+				conn := NewTestConn(transport, raw.WithID())
+				conn.setOwner(7)
+				conn.setSession(42)
+				conn.peerRPC.Store(state)
+				reader := newRPCFrameReader(&Server{readTimeout: time.Hour}, t.Context(), peerReadTransport{Conn: transport}, state, nil)
+				defer func() {
+					reader.stop()
+					reader.join()
+				}()
+
+				var wrote bool
+				var err error
+				switch path {
+				case "ordinary":
+					wrote, err = conn.PushTo(t.Context(), 7, &mt.Pong{PingID: 1}, 1)
+				case "watermark":
+					wrote, _, err = conn.PushToAtWatermark(t.Context(), 7, 0, &mt.Pong{PingID: 1}, 1)
+				case "recovery":
+					conn.EnsureDialogFilterRecoveryBinding(7, 42, 0)
+					conn.MarkDialogFilterRecovery(7, 42, 1, 0)
+					conn.AcknowledgeDialogFilterDifference(7, 42, true)
+					claimID, claimed := conn.ClaimDialogFilterRecoveryAttempt(7, 42, 0, now)
+					if !claimed {
+						t.Fatal("recovery push was not claimable")
+					}
+					wrote, err = conn.PushDialogFilterRecovery(t.Context(), 7, 42, claimID, &mt.Pong{PingID: 1})
+				}
+				if wrote || !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("failed push = wrote %t, err %v", wrote, err)
+				}
+				if _, err, _ := reader.next(); !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("read after push failure = %v, want closed", err)
+				}
+				if state.isServerClosed() {
+					t.Fatal("failed peer push acquired server-close exemption")
+				}
+				if exhausted {
+					if activeCtx.Err() != nil {
+						t.Fatalf("exhausted peer allowance canceled active RPC: %v", context.Cause(activeCtx))
+					}
+				} else if !errors.Is(context.Cause(activeCtx), errPeerRPCDisconnected) {
+					t.Fatalf("push cancellation = %v, want peer cancellation", context.Cause(activeCtx))
+				}
+				if budget.tokens != 1 || len(budget.users) != 1 {
+					t.Fatalf("push budget = %.0f tokens, %d users; want one charge", budget.tokens, len(budget.users))
+				}
+			})
+		}
 	}
 }

@@ -1420,6 +1420,7 @@ type smokeFixture struct {
 	registry *mtproto.SessionRegistry
 	stop     func()
 	regMode  config.RegistrationMode
+	status   bool
 }
 
 func newSmokeFixture(t *testing.T) *smokeFixture {
@@ -1428,6 +1429,11 @@ func newSmokeFixture(t *testing.T) *smokeFixture {
 }
 
 func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMode) *smokeFixture {
+	t.Helper()
+	return newSmokeFixtureWithLifecycle(t, regMode, false)
+}
+
+func newSmokeFixtureWithLifecycle(t *testing.T, regMode config.RegistrationMode, withStatus bool) *smokeFixture {
 	t.Helper()
 	deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancelDeadline)
@@ -1448,7 +1454,7 @@ func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMo
 			t.Errorf("store close: %v", err)
 		}
 	})
-	f := &smokeFixture{ctx: ctx, failures: newClientFailureSignal(cancelFailure), key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode}
+	f := &smokeFixture{ctx: ctx, failures: newClientFailureSignal(cancelFailure), key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode, status: withStatus}
 	f.start(t, "127.0.0.1:0")
 	return f
 }
@@ -1462,7 +1468,7 @@ func (f *smokeFixture) start(t *testing.T, address string) {
 	}
 	f.port = tcpPort(t, ln)
 	f.listener = ln
-	f.registry, f.stop = bootServerWithRegistryAndRegistrationMode(t, f.ctx, f.key, f.dcID, f.store, f.dsn, f.codes.Logger(), ln, f.regMode)
+	f.registry, f.stop = bootServerWithLifecycle(t, f.ctx, f.key, f.dcID, f.store, f.dsn, f.codes.Logger(), ln, config.RateLimitsConfig{}, f.regMode, f.status)
 	stop := f.stop
 	t.Cleanup(stop)
 }

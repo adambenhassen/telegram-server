@@ -439,3 +439,20 @@ func TestPeerRPCIdleExpiryRacesAdmission(t *testing.T) {
 		}
 	}
 }
+
+func TestDisconnectedRPCPreservesHandlerFailure(t *testing.T) {
+	t.Parallel()
+
+	state := newPeerRPCState(nil)
+	state.peerDisconnected()
+	failure := errors.New("synthetic handler failure")
+	server := &Server{handler: HandlerFunc(func(*Conn, *Request) error { return failure })}
+	req := &Request{Ctx: t.Context(), peerRPC: state}
+	err := server.dispatchRPC(&Conn{}, req)
+	if !errors.Is(err, failure) {
+		t.Fatalf("disconnected handler failure = %v, want original failure", err)
+	}
+	if result := requestRPCResult(req, err); result != RPCResultInternal {
+		t.Fatalf("disconnected handler result = %s, want internal", result)
+	}
+}

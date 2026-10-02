@@ -202,7 +202,7 @@ func (s *Server) handle(c *Conn, req *Request) (err error) {
 
 func (s *Server) dispatchRPC(c *Conn, req *Request) error {
 	if err := s.handler.OnMessage(c, req); err != nil {
-		if errors.Is(err, errPeerRPCReplySkipped) || req.PeerDisconnected() {
+		if errors.Is(err, errPeerRPCReplySkipped) {
 			// The peer cannot receive a reply. Finish connection-owned lifecycle
 			// work under the frame context, then let connection teardown proceed;
 			// an unavailable transport must not short-circuit that cleanup.
@@ -226,6 +226,7 @@ func (s *Server) dispatchRPC(c *Conn, req *Request) error {
 			s.logServerFailure(serverFailureRequest)
 			return c.SendErr(req, errInternalRPC)
 		}
+		req.rpcResult = ClassifyRPCError(err)
 		return err
 	}
 	return nil

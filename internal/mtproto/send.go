@@ -970,7 +970,7 @@ func (c *Conn) PushTo(ctx context.Context, owner int64, enc bin.Encoder, pts int
 		return false, nil
 	}
 	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
-		if closeErr := c.Close(); closeErr != nil {
+		if closeErr := c.transport.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close failed push transport: %w", closeErr))
 		}
 		return false, fmt.Errorf("push [%T]: %w", enc, err)
@@ -1002,7 +1002,7 @@ func (c *Conn) PushDialogFilterRecovery(ctx context.Context, owner, session int6
 		return false, nil
 	}
 	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
-		if closeErr := c.Close(); closeErr != nil {
+		if closeErr := c.transport.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close failed push transport: %w", closeErr))
 		}
 		return false, fmt.Errorf("push [%T]: %w", enc, err)
@@ -1105,7 +1105,7 @@ func (c *Conn) PushToAtWatermark(ctx context.Context, owner int64, expectedPts i
 		return false, true, nil
 	}
 	if err := c.sendLocked(ctx, proto.MessageFromServer, &b); err != nil {
-		if closeErr := c.Close(); closeErr != nil {
+		if closeErr := c.transport.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close failed push transport: %w", closeErr))
 		}
 		return false, false, fmt.Errorf("push [%T]: %w", enc, err)

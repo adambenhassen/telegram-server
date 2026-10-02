@@ -8,12 +8,13 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 func testSmokePeerDisconnect(t *testing.T) {
 	t.Helper()
-	f := newSmokeFixture(t)
+	f := newSmokeFixtureWithLifecycle(t, config.RegistrationClosed, true)
 	const phoneA, phoneB = "+15551048001", "+15551048002"
 	seedPhoneUsers(t, f.ctx, f.store, phoneA, phoneB)
 	a1 := newSmokeClient(t, f, "A1", phoneA)

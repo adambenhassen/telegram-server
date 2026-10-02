@@ -38,6 +38,7 @@ func TestLifecycleTeardownFailureProbe(t *testing.T) {
 
 	client := &smokeClient{
 		lifecycle: lifecycle,
+		cancel:    func() { cancel(context.Canceled) },
 		manager:   updates.New(updates.Config{Handler: newUpdateCollector()}),
 		cmds:      make(chan command),
 		label:     "PROBE",
@@ -192,6 +193,8 @@ func TestEchoLifecycleDiagnostics(t *testing.T) {
 	})
 
 	t.Run("intentional shutdown is normal cleanup", func(t *testing.T) {
+		clientCtx, cancelClient := context.WithCancel(t.Context())
+		defer cancelClient()
 		failures := newClientFailureSignal(nil)
 		managerResult := newTerminalResult()
 		managerCtx, cancelManager := context.WithCancel(context.Background())
@@ -206,16 +209,16 @@ func TestEchoLifecycleDiagnostics(t *testing.T) {
 			managerResult.complete(errUnexpectedNilExit)
 		}()
 		commands := make(chan command)
-		client := startClientLifecycle(context.Background(), "C", failures, func(phase *clientPhaseState) error {
+		client := startClientLifecycle(clientCtx, "C", failures, func(phase *clientPhaseState) error {
 			phase.set("idle")
-			return runManagedCommands(context.Background(), commands, managerResult, phase, func(context.Context, command) error { return nil }, func() error {
+			return runManagedCommands(clientCtx, commands, managerResult, phase, func(context.Context, command) error { return nil }, func() error {
 				managerStopping.Store(true)
 				cancelManager()
 				return nil
 			})
 		})
 
-		run := &smokeClient{lifecycle: client, manager: updates.New(updates.Config{Handler: newUpdateCollector()}), cmds: commands, label: "C"}
+		run := &smokeClient{lifecycle: client, cancel: cancelClient, manager: updates.New(updates.Config{Handler: newUpdateCollector()}), cmds: commands, label: "C"}
 		run.stopClient(t)
 		if err := client.result.error(); err != nil {
 			t.Fatalf("intentional shutdown returned an error: %s", safeErrorClass(err))
