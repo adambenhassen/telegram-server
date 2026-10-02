@@ -12,6 +12,7 @@ import (
 	"github.com/gotd/td/tgerr"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/adambenhassen/telegram-server/internal/catalog"
 	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/peerhash"
@@ -202,10 +203,14 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	if len(rateLimitMetrics) > 0 {
 		denialMetrics = rateLimitMetrics[0]
 	}
+	var langpackSnapshot *catalog.Snapshot
+	if s != nil {
+		langpackSnapshot = s.CatalogSnapshot()
+	}
 	h := &handlers{
 		peers:                    peers,
 		store:                    s,
-		langpack:                 newLangpackService(s.CatalogSnapshot(), dcID),
+		langpack:                 newLangpackService(langpackSnapshot, dcID),
 		cfg:                      cfg,
 		dcID:                     dcID,
 		log:                      log,
