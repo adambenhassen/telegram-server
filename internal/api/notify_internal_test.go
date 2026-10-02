@@ -1669,6 +1669,176 @@ func TestDeliverChannelPostPushesViaRealStore(t *testing.T) {
 	}
 }
 
+func TestAccountUpdatePushSkipsUnreadAggregate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(blobs))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+
+	sender, err := s.CreateUser(ctx, "+15550000301")
+	if err != nil {
+		t.Fatalf("create sender: %v", err)
+	}
+	recipient, err := s.CreateUser(ctx, "+15550000302")
+	if err != nil {
+		t.Fatalf("create recipient: %v", err)
+	}
+	if _, _, _, _, err := s.SendMessage(ctx, sender.ID, recipient.ID, "push", 301, 0, 0); err != nil {
+		t.Fatalf("send message: %v", err)
+	}
+	state, err := s.State(ctx, recipient.ID)
+	if err != nil {
+		t.Fatalf("state before unread tripwire: %v", err)
+	}
+
+	// Seed 499 unrelated channel memberships and a 10,000-member channel. The
+	// recipient is therefore at the accepted 500-channel account cap while a
+	// live channel push can exercise the maximum participant fan-out.
+	dbConn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect for unread tripwire: %v", err)
+	}
+	t.Cleanup(func() { _ = dbConn.Close(context.Background()) }) //nolint:errcheck // teardown
+	_, err = dbConn.Exec(ctx, `
+		WITH new_channels AS (
+		    INSERT INTO channels (id, title, creator_id)
+		    SELECT 900000000000 + n, 'push-unread-probe-' || n::text, $1
+		    FROM generate_series(1, 499) AS seq(n)
+		    RETURNING id
+		), new_states AS (
+		    INSERT INTO channel_state (channel_id)
+		    SELECT id FROM new_channels
+		    RETURNING channel_id
+		)
+		INSERT INTO channel_participants (channel_id, user_id, role)
+		SELECT channel_id, $1, 2 FROM new_states`, recipient.ID)
+	if err != nil {
+		t.Fatalf("seed unrelated channel memberships: %v", err)
+	}
+	var fanoutMembers int
+	if err := dbConn.QueryRow(ctx, `
+		WITH extra_users AS (
+		    INSERT INTO users (phone)
+		    SELECT '+19990000' || lpad(n::text, 8, '0')
+		    FROM generate_series(1, 9999) AS seq(n)
+		    RETURNING id
+		), new_channel AS (
+		    INSERT INTO channels (id, title, creator_id)
+		    VALUES (900000000500, 'push unread maximum fanout', $1)
+		    RETURNING id
+		), new_state AS (
+		    INSERT INTO channel_state (channel_id)
+		    SELECT id FROM new_channel
+		    RETURNING channel_id
+		), new_members AS (
+		    INSERT INTO channel_participants (channel_id, user_id, role)
+		    SELECT channel_id, $1, 2 FROM new_state
+		    UNION ALL
+		    SELECT new_state.channel_id, extra_users.id, 0
+		    FROM new_state CROSS JOIN extra_users
+		    RETURNING user_id
+		)
+		SELECT count(*) FROM new_members`, recipient.ID).Scan(&fanoutMembers); err != nil {
+		t.Fatalf("seed maximum channel fan-out: %v", err)
+	}
+	if fanoutMembers != 10000 {
+		t.Fatalf("fan-out members = %d, want 10000", fanoutMembers)
+	}
+	var memberships int
+	if err := dbConn.QueryRow(ctx, `SELECT count(*) FROM channel_participants WHERE user_id = $1`, recipient.ID).Scan(&memberships); err != nil {
+		t.Fatalf("count channel memberships: %v", err)
+	}
+	if memberships != 500 {
+		t.Fatalf("channel memberships = %d, want 500", memberships)
+	}
+
+	// Replace the dialogs relation with a tripwire that fails on any aggregate
+	// read. This proves the live push path avoids the query; elapsed time would
+	// not distinguish a skipped probe from a fast one.
+	_, err = dbConn.Exec(ctx, `
+		CREATE FUNCTION unread_aggregate_probe() RETURNS integer
+		LANGUAGE plpgsql IMMUTABLE AS $$
+		BEGIN
+		    RAISE EXCEPTION 'account unread aggregate invoked';
+		END
+		$$;
+		ALTER TABLE dialogs RENAME TO dialogs_unread_probe_source;
+		CREATE VIEW dialogs AS
+		SELECT owner_id, peer_id, top_message,
+		       unread_aggregate_probe() AS unread_count,
+		       read_inbox_max_id, read_outbox_max_id, peer_type
+		FROM dialogs_unread_probe_source`)
+	if err != nil {
+		t.Fatalf("install unread aggregate tripwire: %v", err)
+	}
+	_, err = dbConn.Exec(ctx, `SELECT COALESCE(SUM(unread_count), 0) FROM dialogs WHERE owner_id = $1`, recipient.ID)
+	if err == nil || !strings.Contains(err.Error(), "account unread aggregate invoked") {
+		t.Fatalf("unread aggregate tripwire error = %v, want its explicit failure", err)
+	}
+
+	key := replyTestKey()
+	transport := &recordingNotifyTransport{}
+	conn := mtproto.NewTestConn(transport, key)
+	conn.SetOwner(recipient.ID)
+	registry := mtproto.NewSessionRegistry()
+	if !registry.Add(recipient.ID, conn) {
+		t.Fatal("register recipient connection")
+	}
+	t.Cleanup(func() { registry.Remove(recipient.ID, conn) })
+
+	updater := NewUpdater(s, registry, nil, pgtest.PeerDeriver())
+	updater.Deliver(ctx, recipient.ID)
+	frames := transport.framesFrom(0)
+	if len(frames) != 1 {
+		t.Fatalf("push frames = %d, want 1; the unread aggregate tripwire may have fired", len(frames))
+	}
+	decoded := decodeServerFrames(t, key, frames)
+	if len(decoded) != 1 || decoded[0].push == nil {
+		t.Fatalf("decoded frames = %+v, want one updates push", decoded)
+	}
+	push := decoded[0].push
+	if push.Date != state.Date || push.Seq != state.Seq {
+		t.Fatalf("push date/seq = %d/%d, want %d/%d", push.Date, push.Seq, state.Date, state.Seq)
+	}
+	if len(push.Updates) != 1 {
+		t.Fatalf("push updates = %d, want one DM update", len(push.Updates))
+	}
+	if _, ok := push.Updates[0].(*tg.UpdateNewMessage); !ok {
+		t.Fatalf("push update type = %T, want *tg.UpdateNewMessage", push.Updates[0])
+	}
+
+	if _, _, _, err := s.PostChannelMessage(ctx, 900000000500, recipient.ID, "channel", 302, nil, 0); err != nil {
+		t.Fatalf("post to maximum-fanout channel: %v", err)
+	}
+	updater.DeliverChannelPost(ctx, 900000000500)
+	frames = transport.framesFrom(0)
+	if len(frames) != 2 {
+		t.Fatalf("push frames after channel fan-out = %d, want DM and channel pushes", len(frames))
+	}
+	decoded = decodeServerFrames(t, key, frames)
+	if len(decoded) != 2 || decoded[1].push == nil {
+		t.Fatalf("decoded channel push frames = %+v, want two pushes", decoded)
+	}
+	if len(decoded[1].push.Updates) != 1 {
+		t.Fatalf("channel push updates = %d, want one", len(decoded[1].push.Updates))
+	}
+	if _, ok := decoded[1].push.Updates[0].(*tg.UpdateNewChannelMessage); !ok {
+		t.Fatalf("channel push update type = %T, want *tg.UpdateNewChannelMessage", decoded[1].push.Updates[0])
+	}
+}
+
 // TestBatchAbove pins the slicing rule itself: the suffix strictly above the
 // watermark, no duplicates, empty once caught up.
 func TestBatchAbove(t *testing.T) {

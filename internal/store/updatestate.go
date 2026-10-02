@@ -79,16 +79,32 @@ func (s *Store) EnsureUpdateState(ctx context.Context, userID int64) error {
 	return nil
 }
 
-// State returns the user's current pts/seq/date and total unread count. A user
-// with no update_state row yet (fresh account that never participated in a send)
-// reports the zero state (pts 0), so getState/getDifference work immediately.
-func (s *Store) State(ctx context.Context, userID int64) (State, error) {
+// StateWithoutUnread returns the user's current pts/seq/date without summing
+// the account's dialogs. Live update pushes do not serialize unread totals and
+// use this read to avoid account-wide aggregation during fan-out.
+func (s *Store) StateWithoutUnread(ctx context.Context, userID int64) (State, error) {
 	row, err := s.q.GetState(ctx, userID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return State{}, nil
 	}
 	if err != nil {
 		return State{}, fmt.Errorf("get state: %w", err)
+	}
+	return State{
+		Pts:  int(row.Pts),
+		Qts:  int(row.Qts),
+		Seq:  int(row.Seq),
+		Date: int(row.Date.Time.Unix()),
+	}, nil
+}
+
+// State returns the user's current pts/seq/date and total unread count. A user
+// with no update_state row yet reports the zero update state and still receives
+// the exact total from their dialogs.
+func (s *Store) State(ctx context.Context, userID int64) (State, error) {
+	state, err := s.StateWithoutUnread(ctx, userID)
+	if err != nil {
+		return State{}, err
 	}
 	var unread int
 	if err := s.pool.QueryRow(ctx,
@@ -97,13 +113,8 @@ func (s *Store) State(ctx context.Context, userID int64) (State, error) {
 	).Scan(&unread); err != nil {
 		return State{}, fmt.Errorf("sum unread: %w", err)
 	}
-	return State{
-		Pts:         int(row.Pts),
-		Qts:         int(row.Qts),
-		Seq:         int(row.Seq),
-		Date:        int(row.Date.Time.Unix()),
-		UnreadCount: unread,
-	}, nil
+	state.UnreadCount = unread
+	return state, nil
 }
 
 // EventsSince returns the user's events with pts strictly greater than fromPts,

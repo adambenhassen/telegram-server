@@ -214,7 +214,7 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 		}
 		acceptedAt, _ := store.NotificationAcceptedAt(ctx)
 		u.deliverAtSuppressed(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
-			return u.h.buildUpdates(ctx, userID, fromPts)
+			return u.h.buildUpdates(ctx, userID, fromPts, false)
 		}, acceptedAt, suppressed)
 	}
 	if channelID, ok := store.ChannelMembershipUpdateFromContext(ctx); ok {
