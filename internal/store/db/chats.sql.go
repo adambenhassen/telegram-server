@@ -417,6 +417,95 @@ func (q *Queries) IsChatMember(ctx context.Context, arg IsChatMemberParams) (boo
 	return exists, err
 }
 
+const searchPinnedChatMessageForOwner = `-- name: SearchPinnedChatMessageForOwner :many
+SELECT viewer_copy.owner_id, viewer_copy.local_id, viewer_copy.peer_id, viewer_copy.from_id, viewer_copy.date, viewer_copy.message, viewer_copy.out, viewer_copy.edit_date, viewer_copy.deleted, viewer_copy.random_id, viewer_copy.peer_local_id, viewer_copy.peer_type, viewer_copy.fanout_id, viewer_copy.action_type, viewer_copy.action_user_id, viewer_copy.file_id, viewer_copy.reply_to_msg_id, viewer_copy.fwd_from_id, viewer_copy.fwd_date, viewer_copy.fwd_channel_id, viewer_copy.fwd_channel_post, viewer_copy.message_tsv
+FROM chats c
+JOIN chat_participants p
+  ON p.chat_id = c.id AND p.user_id = $1::bigint
+JOIN messages creator_copy
+  ON creator_copy.owner_id = c.creator_id
+ AND creator_copy.local_id = c.pinned_message_id
+ AND creator_copy.peer_type = $2::smallint
+ AND creator_copy.peer_id = c.id
+ AND creator_copy.fanout_id <> 0
+ AND creator_copy.deleted = false
+JOIN messages viewer_copy
+  ON viewer_copy.owner_id = p.user_id
+ AND viewer_copy.fanout_id = creator_copy.fanout_id
+ AND viewer_copy.peer_type = $2::smallint
+ AND viewer_copy.peer_id = c.id
+ AND viewer_copy.deleted = false
+WHERE c.id = $3::bigint
+  AND c.pinned_message_id IS NOT NULL
+  AND ($4::text = '' OR viewer_copy.message_tsv @@ plainto_tsquery('simple', $4))
+  AND ($5::bigint = 0 OR viewer_copy.local_id < $5::bigint)
+ORDER BY viewer_copy.local_id DESC
+LIMIT $6::int
+`
+
+type SearchPinnedChatMessageForOwnerParams struct {
+	OwnerID  int64
+	PeerType int16
+	ChatID   int64
+	Query    string
+	OffsetID int64
+	Lim      int32
+}
+
+// SearchPinnedChatMessageForOwner returns the active viewer-owned copy of the
+// chat's current pin. The creator row identifies the logical fan-out, while
+// the participant join and viewer copy keep the result scoped to this member's
+// local id space. Search text and pagination narrow that single pinned row.
+func (q *Queries) SearchPinnedChatMessageForOwner(ctx context.Context, arg SearchPinnedChatMessageForOwnerParams) ([]Message, error) {
+	rows, err := q.db.Query(ctx, searchPinnedChatMessageForOwner,
+		arg.OwnerID,
+		arg.PeerType,
+		arg.ChatID,
+		arg.Query,
+		arg.OffsetID,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Message
+	for rows.Next() {
+		var i Message
+		if err := rows.Scan(
+			&i.OwnerID,
+			&i.LocalID,
+			&i.PeerID,
+			&i.FromID,
+			&i.Date,
+			&i.Message,
+			&i.Out,
+			&i.EditDate,
+			&i.Deleted,
+			&i.RandomID,
+			&i.PeerLocalID,
+			&i.PeerType,
+			&i.FanoutID,
+			&i.ActionType,
+			&i.ActionUserID,
+			&i.FileID,
+			&i.ReplyToMsgID,
+			&i.FwdFromID,
+			&i.FwdDate,
+			&i.FwdChannelID,
+			&i.FwdChannelPost,
+			&i.MessageTsv,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setChatDefaultBannedRights = `-- name: SetChatDefaultBannedRights :one
 UPDATE chats
 SET default_banned_rights = $2, version = version + 1

@@ -745,6 +745,18 @@ func (h *handlers) channelSearch(r *mtproto.Request, channelID int64, query stri
 	return h.channelMessages(r, channelID, msgs)
 }
 
+// channelPinnedSearch serves the active pinned post after the caller's channel
+// membership has been checked. The store query rechecks the participant row in
+// the same statement that reads the shared post.
+func (h *handlers) channelPinnedSearch(r *mtproto.Request, channelID int64, query string, offsetID int64, limit int) (bin.Encoder, error) {
+	msgs, err := h.store.SearchPinnedChannelPost(r.Ctx, r.UserID, channelID, query, offsetID, limit)
+	if err != nil {
+		h.log.Error("channel pinned search", "user_id", r.UserID, "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	return h.channelMessages(r, channelID, msgs)
+}
+
 // channelMessages renders a batch of one channel's posts into the wire reply
 // every channel read path returns. It is messages.channelMessages and not
 // messages.messagesSlice: a client needs the channel's pts to know where the

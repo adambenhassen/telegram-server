@@ -594,6 +594,25 @@ func (s *Store) ChatPinnedMessageForOwner(ctx context.Context, chatID, ownerID i
 	return id, true, nil
 }
 
+// SearchPinnedChatMessageForOwner returns the active pinned message copy owned
+// by ownerID, when that owner is still a chat participant. The creator's copy
+// identifies the logical fan-out, but the returned message and local ID belong
+// to ownerID. A non-empty query and offset narrow the pinned row as in search.
+func (s *Store) SearchPinnedChatMessageForOwner(ctx context.Context, chatID, ownerID int64, query string, offsetID int64, limit int) ([]Message, error) {
+	rows, err := s.q.SearchPinnedChatMessageForOwner(ctx, db.SearchPinnedChatMessageForOwnerParams{
+		OwnerID:  ownerID,
+		PeerType: int16(PeerTypeChat),
+		ChatID:   chatID,
+		Query:    query,
+		OffsetID: offsetID,
+		Lim:      int32(limit), //nolint:gosec // limit is a small validated page size
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search pinned chat message: %w", err)
+	}
+	return messagesFromRows(rows), nil
+}
+
 // ChatPinSnapshot returns the pin state and member-owned copies from one SQL
 // statement, so a concurrent repin or unpin cannot change one recipient's
 // notification midway through resolution.

@@ -1686,8 +1686,7 @@ func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, pe
 	}
 }
 
-// handleSearch serves messages.search: keyword search within a dialog.
-// Only InputMessagesFilterEmpty is accepted; other filters return INPUT_FILTER_INVALID.
+// handleSearch serves messages.search: keyword or pinned-message search within a dialog.
 // Results are the caller's messages (both directions) in the named peer, ordered
 // newest-first. A channel peer searches the channel's shared posts instead and
 // is gated on membership, not ownership.
@@ -1699,15 +1698,19 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	if req.Q == "" {
-		return nil, errSearchQueryEmpty
-	}
-	if utf8.RuneCountInString(req.Q) > maxSearchQueryLen {
+	if req.Q != "" && utf8.RuneCountInString(req.Q) > maxSearchQueryLen {
 		return nil, errMessageTooLong
 	}
-	// Only InputMessagesFilterEmpty is supported; everything else is not implemented.
-	if _, ok := req.Filter.(*tg.InputMessagesFilterEmpty); !ok {
+	filterPinned := false
+	switch req.Filter.(type) {
+	case *tg.InputMessagesFilterEmpty:
+	case *tg.InputMessagesFilterPinned:
+		filterPinned = true
+	default:
 		return nil, errInputFilterInvalid
+	}
+	if req.Q == "" && !filterPinned {
+		return nil, errSearchQueryEmpty
 	}
 	peerType, peerID, err := h.inputPeer(req.Peer, r.UserID)
 	if err != nil {
@@ -1746,13 +1749,27 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 		if _, err = h.requireChannelMember(r.Ctx, peerID, r.UserID); err != nil {
 			return nil, err
 		}
+		if filterPinned {
+			return h.channelPinnedSearch(r, peerID, req.Q, int64(req.OffsetID), limit)
+		}
 		return h.channelSearch(r, peerID, req.Q, int64(req.OffsetID), limit)
 	}
 
-	msgs, err := h.store.SearchMessages(r.Ctx, r.UserID, peerType, peerID, req.Q, req.OffsetID, limit)
-	if err != nil {
-		h.log.Error("search messages", "user_id", r.UserID, "err", err)
-		return nil, errInternal
+	var msgs []store.Message
+	if filterPinned {
+		if peerType == store.PeerTypeChat {
+			msgs, err = h.store.SearchPinnedChatMessageForOwner(r.Ctx, peerID, r.UserID, req.Q, int64(req.OffsetID), limit)
+			if err != nil {
+				h.log.Error("search pinned chat message", "user_id", r.UserID, "chat_id", peerID, "err", err)
+				return nil, errInternal
+			}
+		}
+	} else {
+		msgs, err = h.store.SearchMessages(r.Ctx, r.UserID, peerType, peerID, req.Q, req.OffsetID, limit)
+		if err != nil {
+			h.log.Error("search messages", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
 	}
 
 	files, err := h.loadFiles(r.Ctx, msgs)

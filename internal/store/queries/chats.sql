@@ -103,6 +103,35 @@ JOIN messages viewer_copy
 WHERE c.id = sqlc.arg(chat_id)::bigint
   AND c.pinned_message_id IS NOT NULL;
 
+-- SearchPinnedChatMessageForOwner returns the active viewer-owned copy of the
+-- chat's current pin. The creator row identifies the logical fan-out, while
+-- the participant join and viewer copy keep the result scoped to this member's
+-- local id space. Search text and pagination narrow that single pinned row.
+-- name: SearchPinnedChatMessageForOwner :many
+SELECT viewer_copy.*
+FROM chats c
+JOIN chat_participants p
+  ON p.chat_id = c.id AND p.user_id = sqlc.arg(owner_id)::bigint
+JOIN messages creator_copy
+  ON creator_copy.owner_id = c.creator_id
+ AND creator_copy.local_id = c.pinned_message_id
+ AND creator_copy.peer_type = sqlc.arg(peer_type)::smallint
+ AND creator_copy.peer_id = c.id
+ AND creator_copy.fanout_id <> 0
+ AND creator_copy.deleted = false
+JOIN messages viewer_copy
+  ON viewer_copy.owner_id = p.user_id
+ AND viewer_copy.fanout_id = creator_copy.fanout_id
+ AND viewer_copy.peer_type = sqlc.arg(peer_type)::smallint
+ AND viewer_copy.peer_id = c.id
+ AND viewer_copy.deleted = false
+WHERE c.id = sqlc.arg(chat_id)::bigint
+  AND c.pinned_message_id IS NOT NULL
+  AND (sqlc.arg(query)::text = '' OR viewer_copy.message_tsv @@ plainto_tsquery('simple', sqlc.arg(query)))
+  AND (sqlc.arg(offset_id)::bigint = 0 OR viewer_copy.local_id < sqlc.arg(offset_id)::bigint)
+ORDER BY viewer_copy.local_id DESC
+LIMIT sqlc.arg(lim)::int;
+
 -- ChatPinSnapshot reads the selected pin and each member's local copy from one
 -- statement snapshot, so a concurrent repin cannot split one notification.
 -- Missing or deleted copies remain NULL while the participant still receives
