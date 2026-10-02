@@ -22,12 +22,15 @@ func FloodWaitError(seconds int) *tgerr.Error {
 
 var (
 	// errInputRequestInvalid rejects a request that cannot be handled as sent.
-	errInputRequestInvalid = rpcErr(400, "INPUT_REQUEST_INVALID")
-	errPhoneInvalid        = rpcErr(400, "PHONE_NUMBER_INVALID")
-	errCodeInvalid         = rpcErr(400, "PHONE_CODE_INVALID")
-	errCodeExpired         = rpcErr(400, "PHONE_CODE_EXPIRED")
-	errInternal            = rpcErr(500, "INTERNAL")
-	errMethodNotImpl       = rpcErr(400, "INPUT_METHOD_INVALID")
+	errInputRequestInvalid  = rpcErr(400, "INPUT_REQUEST_INVALID")
+	errPhoneInvalid         = rpcErr(400, "PHONE_NUMBER_INVALID")
+	errCodeInvalid          = rpcErr(400, "PHONE_CODE_INVALID")
+	errCodeExpired          = rpcErr(400, "PHONE_CODE_EXPIRED")
+	errInternal             = rpcErr(500, "INTERNAL")
+	errMethodNotImpl        = rpcErr(400, "INPUT_METHOD_INVALID")
+	errLangPackInvalid      = rpcErr(400, "LANG_PACK_INVALID")
+	errLangCodeNotSupported = rpcErr(400, "LANG_CODE_NOT_SUPPORTED")
+	errLanguageInvalid      = rpcErr(400, "LANGUAGE_INVALID")
 	// errMethodNotImplFlood answers a call to an unimplemented method past what
 	// one connection may spend on them in a window. FLOOD_WAIT is the signal a
 	// client already backs off on, and it says what is true: the condition

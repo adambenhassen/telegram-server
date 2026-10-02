@@ -21,6 +21,9 @@ import (
 
 type handlers struct {
 	store *store.Store
+	// langpack is the precomputed, immutable RPC view of the latest validated
+	// catalog snapshot. Langpack handlers never query the store.
+	langpack *langpackService
 	// peers derives the per-viewer peer access_hash. Every emission and
 	// verification site in this package goes through it. Nothing constructs
 	// a peer access hash anywhere else.
@@ -202,6 +205,7 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	h := &handlers{
 		peers:                    peers,
 		store:                    s,
+		langpack:                 newLangpackService(s.CatalogSnapshot(), dcID),
 		cfg:                      cfg,
 		dcID:                     dcID,
 		log:                      log,
@@ -238,6 +242,11 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.HelpGetAppConfigRequestTypeID, h.handleGetAppConfig)
+	registerLangpack(d, tg.HelpGetNearestDCRequestTypeID, "help.getNearestDc", h.handleHelpGetNearestDC)
+	registerLangpack(d, tg.LangpackGetLanguagesRequestTypeID, "langpack.getLanguages", h.handleLangpackGetLanguages)
+	registerLangpack(d, tg.LangpackGetLangPackRequestTypeID, "langpack.getLangPack", h.handleLangpackGetLangPack)
+	registerLangpack(d, tg.LangpackGetStringsRequestTypeID, "langpack.getStrings", h.handleLangpackGetStrings)
+	registerLangpack(d, tg.LangpackGetDifferenceRequestTypeID, "langpack.getDifference", h.handleLangpackGetDifference)
 	h.registerHelpPolling(d)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	registerWithConn(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
@@ -462,6 +471,11 @@ func (h *handlers) recordRateLimitDenial(surface string) {
 var provisionalAllowList = map[uint32]bool{
 	tg.HelpGetConfigRequestTypeID:                 true,
 	tg.HelpGetAppConfigRequestTypeID:              true,
+	tg.HelpGetNearestDCRequestTypeID:              true,
+	tg.LangpackGetLanguagesRequestTypeID:          true,
+	tg.LangpackGetLangPackRequestTypeID:           true,
+	tg.LangpackGetStringsRequestTypeID:            true,
+	tg.LangpackGetDifferenceRequestTypeID:         true,
 	tg.AccountGetPasswordRequestTypeID:            true,
 	tg.AccountUpdatePasswordSettingsRequestTypeID: true,
 	tg.AuthLogOutRequestTypeID:                    true,

@@ -101,6 +101,10 @@ type Conn struct {
 	// by the same serve goroutine as created, which is the only one that
 	// dispatches this connection's frames.
 	unimplemented unimplementedBudget
+	// langpack counts calls to the catalog-backed Langpack RPC surface. It is
+	// separate from unimplemented so alternating the two cannot spend one
+	// shared allowance twice or allow one surface to starve the other.
+	langpack langpackBudget
 
 	// lastPushedPts is the highest owner pts delivered to this conn by a push or
 	// accounted for by its send RPC result, so a notification never re-delivers

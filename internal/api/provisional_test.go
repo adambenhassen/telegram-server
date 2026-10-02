@@ -16,13 +16,18 @@ import (
 
 func TestProvisionalAllowListContainsExpectedMethods(t *testing.T) {
 	t.Parallel()
-	// The allow-list must contain exactly the five methods that a provisional
-	// session is permitted to call. The help methods cover gotd's connection
-	// setup and this ticket's registration-mode discovery before the user
-	// finishes registration.
+	// The allow-list must contain exactly the methods that a provisional
+	// session is permitted to call. The help and langpack methods cover gotd's
+	// connection setup and language discovery before the user finishes
+	// registration.
 	want := map[uint32]bool{
 		tg.HelpGetConfigRequestTypeID:                 true,
 		tg.HelpGetAppConfigRequestTypeID:              true,
+		tg.HelpGetNearestDCRequestTypeID:              true,
+		tg.LangpackGetLanguagesRequestTypeID:          true,
+		tg.LangpackGetLangPackRequestTypeID:           true,
+		tg.LangpackGetStringsRequestTypeID:            true,
+		tg.LangpackGetDifferenceRequestTypeID:         true,
 		tg.AccountGetPasswordRequestTypeID:            true,
 		tg.AccountUpdatePasswordSettingsRequestTypeID: true,
 		tg.AuthLogOutRequestTypeID:                    true,
@@ -129,10 +134,15 @@ func TestProvisionalGateAllowsAllowListedMethods(t *testing.T) {
 		AuthKeyID:   [8]byte{2},
 	}
 
-	// All five allow-listed methods must not be blocked by the gate predicate.
+	// Every allow-listed method must not be blocked by the gate predicate.
 	allowed := []uint32{
 		uint32(tg.HelpGetConfigRequestTypeID),
 		uint32(tg.HelpGetAppConfigRequestTypeID),
+		uint32(tg.HelpGetNearestDCRequestTypeID),
+		uint32(tg.LangpackGetLanguagesRequestTypeID),
+		uint32(tg.LangpackGetLangPackRequestTypeID),
+		uint32(tg.LangpackGetStringsRequestTypeID),
+		uint32(tg.LangpackGetDifferenceRequestTypeID),
 		uint32(tg.AccountGetPasswordRequestTypeID),
 		uint32(tg.AccountUpdatePasswordSettingsRequestTypeID),
 		uint32(tg.AuthLogOutRequestTypeID),
@@ -566,13 +576,13 @@ func TestProvisionalGateBlocksUnimplementedMethod(t *testing.T) {
 	// returns true for any authenticated provisional session. Note that the
 	// predicate is called only by registerRevoke; the handleUnknownGated
 	// fallback uses its own inline check. Dispatch coverage for the fallback
-	// path is in test/e2e/provisional_gate_test.go (help.getNearestDc assertion).
+	// path is in test/e2e/provisional_gate_test.go (help.getSupport assertion).
 	req := &mtproto.Request{
 		Ctx:         context.Background(),
 		UserID:      1,
 		Provisional: true,
 	}
-	if !api.ProvisionalBlocked(tg.HelpGetNearestDCRequestTypeID, req) {
+	if !api.ProvisionalBlocked(tg.HelpGetSupportRequestTypeID, req) {
 		t.Fatal("gate did not block unimplemented method for provisional session")
 	}
 }

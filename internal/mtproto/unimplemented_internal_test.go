@@ -104,3 +104,30 @@ func TestUnimplementedBudgetStartsAtZero(t *testing.T) {
 		t.Errorf("fresh budget: verdict = %v, want %v", got, UnimplementedAnswer)
 	}
 }
+
+func TestLangpackBudgetUsesSameThresholdsAndItsOwnWindow(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	b := &langpackBudget{}
+	for i := 1; i <= unimplementedCloseAt; i++ {
+		want := UnimplementedAnswer
+		switch {
+		case i == unimplementedCloseAt:
+			want = UnimplementedClose
+		case i > unimplementedAnswerBudget:
+			want = UnimplementedFloodWait
+		}
+		if got := b.charge(now); got != want {
+			t.Fatalf("langpack call %d: verdict = %v, want %v", i, got, want)
+		}
+	}
+
+	// Spending the unimplemented-method budget does not spend the langpack
+	// budget, and each surface starts its own fixed 60-second window.
+	if got := (&langpackBudget{}).charge(now); got != UnimplementedAnswer {
+		t.Fatalf("fresh langpack budget: verdict = %v, want %v", got, UnimplementedAnswer)
+	}
+	if got := b.charge(now.Add(unimplementedWindow)); got != UnimplementedAnswer {
+		t.Fatalf("langpack window did not roll over: verdict = %v, want %v", got, UnimplementedAnswer)
+	}
+}
