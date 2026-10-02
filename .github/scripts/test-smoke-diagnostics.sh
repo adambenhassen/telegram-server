@@ -270,7 +270,8 @@ assert_case nested-scenario-id \
   "$(expected_unavailable)" "$canary"
 
 duplicate_source_case() {
-  printf '\n// duplicate metadata: %s\n' "$direct_id" >>"$fixture_root/test/e2e/smoke_test.go"
+  printf '\nfunc duplicateMetadata() { _ = "%s" }\n' "$direct_id" \
+    >>"$fixture_root/test/e2e/smoke_test.go"
   fixture_commit
   checked_out_commit=$(git -C "$fixture_root" rev-parse HEAD)
   assert_case duplicate-source-literal \
