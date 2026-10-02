@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -706,6 +707,56 @@ func (h *handlers) handleGetChannelMessages(r *mtproto.Request) (bin.Encoder, er
 		}
 	}
 	return h.channelMessages(r, channelID, msgs)
+}
+
+// handleExportMessageLink returns an address only for a message that the
+// caller can currently read through channels.getMessages. Channel membership,
+// the per-viewer access hash and bans remain the admission checks; the private
+// channel id in the resulting URL is only an address.
+func (h *handlers) handleExportMessageLink(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsExportMessageLinkRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := h.requireChannelMember(r.Ctx, channelID, r.UserID); err != nil {
+		return nil, err
+	}
+	if req.ID <= 0 {
+		return nil, errPeerIDInvalid
+	}
+
+	messages, err := h.store.ChannelMessages(r.Ctx, channelID, []int64{int64(req.ID)})
+	if err != nil {
+		h.log.Error("export channel message link", "user_id", r.UserID, "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	message, found := messages[int64(req.ID)]
+	if !found || message.Deleted {
+		return nil, errPeerIDInvalid
+	}
+
+	channel, found, err := h.store.ChannelByID(r.Ctx, channelID)
+	if err != nil {
+		h.log.Error("export channel message link channel", "user_id", r.UserID, "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	if !found {
+		return nil, errPeerIDInvalid
+	}
+
+	messageID := strconv.Itoa(req.ID)
+	address := "c/" + strconv.FormatInt(channelID, 10) + "/" + messageID
+	if channel.Username != nil && *channel.Username != "" {
+		address = *channel.Username + "/" + messageID
+	}
+	return &tg.ExportedMessageLink{Link: h.cfg.MeURLPrefix + address}, nil
 }
 
 // channelHistory renders one page of a channel's history for the caller, whom

@@ -309,6 +309,7 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	register(d, tg.MessagesAddChatUserRequestTypeID, h.handleAddChatUser)
 	register(d, tg.MessagesDeleteChatUserRequestTypeID, h.handleDeleteChatUser)
 	register(d, tg.ChannelsGetMessagesRequestTypeID, h.handleGetChannelMessages)
+	register(d, tg.ChannelsExportMessageLinkRequestTypeID, h.handleExportMessageLink)
 	register(d, tg.MessagesExportChatInviteRequestTypeID, h.handleExportChatInvite)
 	register(d, tg.MessagesCheckChatInviteRequestTypeID, h.handleCheckChatInvite)
 	register(d, tg.MessagesImportChatInviteRequestTypeID, h.handleImportChatInvite)

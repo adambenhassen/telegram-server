@@ -8,10 +8,10 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same ref supersedes the run already in flight.
+# PR updates supersede older checks; every other run attempt has its own group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ci:
@@ -1241,12 +1241,17 @@ jobs:
           }
 
           if [ "$status" -ne 0 ]; then
-            report_smoke_failure_diagnostics <<<"$output"
+            report_smoke_failure_diagnostics "$status" <<<"$output"
             exit "$status"
           fi
 
-          for test in TestSmoke TestSmoke/one-to-one TestSmoke/saved-messages TestSmoke/dialog-filters TestSmoke/basic-group TestSmoke/channel TestSmoke/contacts-search TestSmoke/username-registration TestSmoke/admin-proxy-login; do
-            if has_test_event skip "$test"; then
+          if has_test_event skip TestSmoke; then
+            echo "::error::TestSmoke was skipped (category: scenario-skipped; details redacted)"
+            exit 1
+          fi
+          for scenario in "${SMOKE_SCENARIOS[@]}"; do
+            if has_test_event skip "TestSmoke/$scenario"; then
+              test="TestSmoke/$scenario"
               echo "::error::$test was skipped (category: scenario-skipped; details redacted)"
               exit 1
             fi
@@ -1257,7 +1262,7 @@ jobs:
             exit 1
           fi
 
-          for scenario in one-to-one saved-messages dialog-filters basic-group channel contacts-search username-registration admin-proxy-login; do
+          for scenario in "${SMOKE_SCENARIOS[@]}"; do
             if ! has_test_event run "TestSmoke/$scenario"; then
               echo "::error::TestSmoke/$scenario was not selected (category: selection-failure; details redacted)"
               exit 1
