@@ -184,6 +184,63 @@ func TestLandingForwardingDropsRequestDataAndUsesCanonicalPath(t *testing.T) {
 	assertNoRedirectOrCookie(t, response)
 }
 
+func TestUsernameAndMessageLandingPathsAreRedacted(t *testing.T) {
+	var landingRequests, webRequests []observedRequest
+	landing := httptest.NewServer(recordingLanding(t, &landingRequests))
+	t.Cleanup(landing.Close)
+	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webRequests = append(webRequests, observeRequest(t, r))
+		writeTestResponse(t, w, webBody)
+	}))
+	t.Cleanup(web.Close)
+	handler := newSelector(t, web.URL, landing.URL, slog.New(slog.DiscardHandler))
+
+	for _, tc := range []struct {
+		target, wantLandingPath string
+	}{
+		{target: "/syntheticname", wantLandingPath: "/redacted"},
+		{target: "/syntheticname/12345", wantLandingPath: "/redacted/1"},
+		{target: "/c/12345/67", wantLandingPath: "/redacted/1"},
+	} {
+		landingRequestsBefore := len(landingRequests)
+		request := rawRequest(http.MethodGet, tc.target+"?secret=query-secret", "secret request body")
+		request.Header.Set("Referer", "https://referer.example/"+tc.target)
+		request.Header.Set("Cookie", "session=secret-cookie")
+		request.Header.Set("Authorization", "Bearer secret-token")
+		request.Header.Set("Tailscale-User-Login", "private-user@example.test")
+		request.Header.Set("Tailscale-User-Name", "Private User")
+		request.Header.Set("X-Other-Secret", "must-not-forward")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK || response.Body.String() != landingBody {
+			t.Errorf("GET %s = %d %q, want fixed landing response", tc.target, response.Code, response.Body.String())
+		}
+		if len(landingRequests) != landingRequestsBefore+1 {
+			t.Errorf("GET %s added %d landing requests, want one", tc.target, len(landingRequests)-landingRequestsBefore)
+			continue
+		}
+		got := landingRequests[landingRequestsBefore]
+		if got.method != http.MethodGet || got.requestURI != tc.wantLandingPath {
+			t.Errorf("landing received %s %q, want GET %q", got.method, got.requestURI, tc.wantLandingPath)
+		}
+		if got.body != "" {
+			t.Errorf("landing received request body %q", got.body)
+		}
+		for name, values := range got.header {
+			if name != "Content-Length" || !reflect.DeepEqual(values, []string{"0"}) {
+				t.Errorf("landing received application header %s=%q", name, values)
+			}
+		}
+	}
+	if len(landingRequests) != 3 {
+		t.Errorf("landing requests = %d, want 3", len(landingRequests))
+	}
+	if len(webRequests) != 0 {
+		t.Errorf("username/message links reached Web: %+v", webRequests)
+	}
+}
+
 func TestLandingMethodsAndAdminIsolation(t *testing.T) {
 	var landingRequests []observedRequest
 	var webRequests []observedRequest
