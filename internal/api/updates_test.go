@@ -141,7 +141,7 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 	}
 }
 
-func TestExplicitUnreadTotalsWhenUpdateStateIsAbsent(t *testing.T) {
+func TestGetStateWithoutUpdateStatePreservesBaseline(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, dsn := openStoreDSN(t)
@@ -186,8 +186,8 @@ func TestExplicitUnreadTotalsWhenUpdateStateIsAbsent(t *testing.T) {
 	if !ok {
 		t.Fatalf("get state result = %T, want *tg.UpdatesState", stateEnc)
 	}
-	if state.Pts != 0 || state.UnreadCount != 1 {
-		t.Fatalf("getState state = %+v, want pts=0 unread=1", state)
+	if state.Pts != 0 || state.UnreadCount != 0 {
+		t.Fatalf("getState state = %+v, want pts=0 unread=0", state)
 	}
 
 	peerEnc, err := api.GetPeerDialogsForTest(s, recipient.ID, &tg.MessagesGetPeerDialogsRequest{
