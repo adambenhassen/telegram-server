@@ -71,7 +71,11 @@ type Config struct {
 	// interface still has to name one address a client can reach it by.
 	AdvertiseHost string
 	AdvertisePort int
-	DCID          int
+	// PublicLinkPrefix is the HTTPS prefix returned by help.getConfig and used
+	// when rendering server-owned invite links. It is validated only for the
+	// MTProto server; administrative commands do not need it.
+	PublicLinkPrefix string
+	DCID             int
 	// LogLoginCodes opts into writing issued login codes to the log in
 	// cleartext. Off by default: the log is readable by anyone with the
 	// process output, and the code alone signs in any account that has no
@@ -444,6 +448,104 @@ func LoadClientConfig() (ClientConfig, error) {
 	}
 	cfg.AdvertiseHost = advertiseHost
 	cfg.AdvertisePort = advertisePort
+	return cfg, nil
+}
+
+// ValidatePublicLinkPrefix rejects values that could make the server advertise
+// or issue links on an ambiguous, official, or non-DNS origin.
+func ValidatePublicLinkPrefix(prefix string) error {
+	const name = "TG_PUBLIC_LINK_PREFIX"
+	invalid := func() error {
+		return fmt.Errorf("%s must be a lowercase ASCII HTTPS prefix with a DNS hostname and root path", name)
+	}
+	if prefix == "" {
+		return fmt.Errorf("%s is required", name)
+	}
+	if !strings.HasPrefix(prefix, "https://") || !strings.HasSuffix(prefix, "/") {
+		return invalid()
+	}
+
+	host := prefix[len("https://") : len(prefix)-1]
+	if host == "" || len(host) > 253 || strings.ContainsAny(host, "/:?#@\\%") || strings.HasSuffix(host, ".") {
+		return invalid()
+	}
+	for i := range len(prefix) {
+		if prefix[i] > 0x7f {
+			return invalid()
+		}
+	}
+
+	for label := range strings.SplitSeq(host, ".") {
+		if len(label) == 0 || len(label) > 63 || strings.HasPrefix(label, "xn--") || label[0] == '-' || label[len(label)-1] == '-' {
+			return invalid()
+		}
+		for i := range len(label) {
+			c := label[i]
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return invalid()
+			}
+		}
+	}
+	if isIPAddressLiteral(host) {
+		return invalid()
+	}
+	for _, official := range [...]string{"t" + ".me", "telegram.me", "telegram.dog", "telegram.org"} {
+		if host == official || strings.HasSuffix(host, "."+official) {
+			return invalid()
+		}
+	}
+	return nil
+}
+
+func isIPAddressLiteral(host string) bool {
+	if address, err := netip.ParseAddr(host); err == nil && address.Is4() {
+		return true
+	}
+	// Browsers also interpret abbreviated, octal, and hexadecimal numeric
+	// hosts as IPv4 addresses, so reject those forms as well.
+	parts := strings.Split(host, ".")
+	if len(parts) == 0 || len(parts) > 4 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		if strings.HasPrefix(part, "0x") {
+			part = part[2:]
+			if part == "" {
+				continue
+			}
+			for i := range len(part) {
+				c := part[i]
+				if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+					return false
+				}
+			}
+			continue
+		}
+		for i := range len(part) {
+			if part[i] < '0' || part[i] > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// LoadServerConfig requires the public link prefix before loading configuration
+// that may generate key material. Administrative commands use Load directly and
+// remain independent of this server-only setting.
+func LoadServerConfig(log *slog.Logger) (Config, error) {
+	prefix := os.Getenv("TG_PUBLIC_LINK_PREFIX")
+	if err := ValidatePublicLinkPrefix(prefix); err != nil {
+		return Config{}, err
+	}
+	cfg, err := Load(log)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PublicLinkPrefix = prefix
 	return cfg, nil
 }
 

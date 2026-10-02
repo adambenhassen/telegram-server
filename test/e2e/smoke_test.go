@@ -815,6 +815,16 @@ func testSmokeChannel(t *testing.T) {
 	seedPhoneUsers(t, f.ctx, f.store, phoneCreator, phoneSubscriber)
 	creator := newSmokeClient(t, f, "A1", phoneCreator)
 	subscriber := newSmokeClient(t, f, "B1", phoneSubscriber)
+	execChannel(t, f.ctx, creator.cmds, func(ctx context.Context, client *tg.Client) error {
+		cfg, err := client.HelpGetConfig(ctx)
+		if err != nil {
+			return err
+		}
+		if cfg.DCTxtDomainName != testPublicLinkPrefix {
+			return fmt.Errorf("help.getConfig public link prefix = %q, want %q", cfg.DCTxtDomainName, testPublicLinkPrefix)
+		}
+		return nil
+	})
 
 	channelID := createBroadcastChannel(t, f.ctx, creator.cmds, "Smoke channel")
 	hash := exportChannelInvite(t, f.ctx, creator.id, creator.cmds, channelID)

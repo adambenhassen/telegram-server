@@ -220,7 +220,7 @@ func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error)
 		full.SetBannedCount(int(snapshot.BannedCount))
 		if snapshot.HasInvite {
 			full.SetExportedInvite(&tg.ChatInviteExported{
-				Link:      inviteLinkPrefix + snapshot.InviteHash,
+				Link:      h.cfg.DCTxtDomainName + "+" + snapshot.InviteHash,
 				AdminID:   snapshot.InviteCreatorID,
 				Date:      int(snapshot.InviteDate.Unix()),
 				Permanent: true,
@@ -800,11 +800,9 @@ func (h *handlers) channelMessages(r *mtproto.Request, channelID int64, msgs []s
 	}, nil
 }
 
-// inviteLinkPrefix is what a hash is rendered behind. The link is the whole
-// credential, so nothing but the hash may appear after it — an id in the link
-// hands a real channel id to everyone the link travels through, and the hash
-// alone is what admits.
-const inviteLinkPrefix = "https://t.me/+"
+// legacyInviteLinkPrefix is accepted only when revoking links issued before
+// public links used the configured origin.
+const legacyInviteLinkPrefix = "https://t.me/+"
 
 // revokeExportedChatInviteTypeID is the constructor id of
 // messages.revokeExportedChatInvite (0x13db322c). gotd v0.161.0 does not
@@ -893,7 +891,7 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 		return nil, errInternal
 	}
 	return &tg.ChatInviteExported{
-		Link:      inviteLinkPrefix + hash,
+		Link:      h.cfg.DCTxtDomainName + "+" + hash,
 		AdminID:   r.UserID,
 		Date:      int(time.Now().Unix()),
 		Permanent: true,
@@ -930,8 +928,18 @@ func (h *handlers) handleRevokeExportedChatInvite(r *mtproto.Request) (bin.Encod
 		return nil, errPeerIDInvalid
 	}
 
-	// Strip link prefix if client sent full link instead of bare hash.
-	hash, _ := strings.CutPrefix(req.Hash, inviteLinkPrefix)
+	// Revoke accepts bare hashes, current configured links, and the exact legacy
+	// link form. Other origins remain part of the hash and cannot revoke an invite.
+	hash := req.Hash
+	if h.cfg.DCTxtDomainName != "" {
+		if configuredHash, ok := strings.CutPrefix(hash, h.cfg.DCTxtDomainName+"+"); ok {
+			hash = configuredHash
+		} else if legacyHash, ok := strings.CutPrefix(hash, legacyInviteLinkPrefix); ok {
+			hash = legacyHash
+		}
+	} else if legacyHash, ok := strings.CutPrefix(hash, legacyInviteLinkPrefix); ok {
+		hash = legacyHash
+	}
 
 	member, found, err := h.store.ChannelMemberOf(r.Ctx, channelID, r.UserID)
 	if err != nil {
@@ -943,7 +951,7 @@ func (h *handlers) handleRevokeExportedChatInvite(r *mtproto.Request) (bin.Encod
 	}
 
 	if err = h.store.RevokeChannelInvite(r.Ctx, hash, channelID); err != nil {
-		h.log.Error("revoke exported chat invite", "channel_id", channelID, "hash", hash, "err", err)
+		h.log.Error("revoke exported chat invite", "channel_id", channelID, "err", err)
 		return nil, errInternal
 	}
 
