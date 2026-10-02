@@ -319,7 +319,7 @@ func waitForSmokeOnline(t *testing.T, ctx context.Context, st *store.Store, user
 		select {
 		case <-ticker.C:
 		case <-waitCtx.Done():
-		t.Fatalf("[assert:%s/peer-disconnect.online-state-mismatch] user %d online=%t, want %t", callsiteID, userID, ok && user.IsOnline, want)
+			t.Fatalf("[assert:%s/peer-disconnect.online-state-mismatch] user %d online=%t, want %t", callsiteID, userID, ok && user.IsOnline, want)
 		}
 	}
 }
