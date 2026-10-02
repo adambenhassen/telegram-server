@@ -918,6 +918,19 @@ func testSmokeChannel(t *testing.T) {
 	seedPhoneUsers(t, f.ctx, f.store, phoneCreator, phoneSubscriber)
 	creator := newSmokeClient(t, f, "A1", phoneCreator)
 	subscriber := newSmokeClient(t, f, "B1", phoneSubscriber)
+	execChannel(t, f.ctx, creator.cmds, func(ctx context.Context, client *tg.Client) error {
+		cfg, err := client.HelpGetConfig(ctx)
+		if err != nil {
+			return err
+		}
+		if cfg.MeURLPrefix != testPublicLinkPrefix {
+			return fmt.Errorf("help.getConfig me_url_prefix = %q, want %q", cfg.MeURLPrefix, testPublicLinkPrefix)
+		}
+		if cfg.DCTxtDomainName != "" {
+			return fmt.Errorf("help.getConfig dc_txt_domain_name = %q, want empty", cfg.DCTxtDomainName)
+		}
+		return nil
+	})
 
 	channelID := createBroadcastChannel(t, f.ctx, creator.cmds, "Smoke channel")
 	hash := exportChannelInvite(t, f.ctx, creator.id, creator.cmds, channelID)

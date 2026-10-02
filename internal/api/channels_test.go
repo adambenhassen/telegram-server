@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/mt"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
@@ -92,11 +94,17 @@ func createChannel(t *testing.T, s *store.Store, userID int64, req *tg.ChannelsC
 	return ch
 }
 
-func fullChannelDispatcher(s *store.Store) mtproto.Handler {
+const testPublicLinkPrefix = "https://test.example/"
+
+func fullChannelDispatcher(s *store.Store, linkPrefixes ...string) mtproto.Handler {
+	linkPrefix := testPublicLinkPrefix
+	if len(linkPrefixes) > 0 {
+		linkPrefix = linkPrefixes[0]
+	}
 	return api.New(
 		s,
 		2,
-		&tg.Config{},
+		&tg.Config{MeURLPrefix: linkPrefix},
 		slog.New(slog.DiscardHandler),
 		false,
 		api.TestMaxFileBytes,
@@ -516,7 +524,7 @@ func TestHandleGetFullChannelKeepsAuthorizationAndMetadataInOneSnapshot(t *testi
 	}
 }
 
-func inviteLinkForTest(hash string) string { return "https://t.me/+" + hash }
+func inviteLinkForTest(hash string) string { return testPublicLinkPrefix + "+" + hash }
 
 func TestHandleCreateChannelBroadcast(t *testing.T) {
 	t.Parallel()
@@ -1566,7 +1574,7 @@ const unknownHash = "0000000000000000000000"
 // form a client ever sees it in.
 func inviteHash(t *testing.T, link string) string {
 	t.Helper()
-	hash, ok := strings.CutPrefix(link, "https://t.me/+")
+	hash, ok := strings.CutPrefix(link, testPublicLinkPrefix+"+")
 	if !ok {
 		t.Fatalf("link %q has no invite prefix", link)
 	}
@@ -1659,6 +1667,87 @@ func TestExportAndImportChannelInvite(t *testing.T) {
 	}
 }
 
+func TestConfiguredPublicLinkPrefixControlsConfigAndChannelInvites(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	creator, joiner, ch := channelWith(t, s, "+15551293021", "+15551293022")
+	const prefixA = "https://links.example.test/"
+	const prefixB = "https://community.example.test/"
+
+	var hashA, fullLinkA string
+	for _, prefix := range []string{prefixA, prefixB} {
+		getConfig := api.GetConfigSeqForTest(2, "127.0.0.1", 443, time.Now, prefix)
+		cfg, err := getConfig()
+		if err != nil {
+			t.Fatalf("help.getConfig for %q: %v", prefix, err)
+		}
+		if cfg.MeURLPrefix != prefix {
+			t.Errorf("help.getConfig me_url_prefix = %q, want %q", cfg.MeURLPrefix, prefix)
+		}
+		if cfg.DCTxtDomainName != "" {
+			t.Errorf("help.getConfig dc_txt_domain_name = %q, want empty", cfg.DCTxtDomainName)
+		}
+		exported, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{
+			Peer: api.InputPeerChannel(creator.ID, ch.ID),
+		}, prefix)
+		if err != nil {
+			t.Fatalf("export under %q: %v", prefix, err)
+		}
+		invite, ok := exported.(*tg.ChatInviteExported)
+		if !ok {
+			t.Fatalf("export under %q = %T, want *tg.ChatInviteExported", prefix, exported)
+		}
+		hash, ok := strings.CutPrefix(invite.Link, prefix+"+")
+		if !ok || !isInviteHash(hash) {
+			t.Fatalf("export under %q link = %q, want configured prefix plus a 22-character base64url hash", prefix, invite.Link)
+		}
+		if prefix == prefixA {
+			hashA = hash
+			fullLinkA = invite.Link
+		}
+
+		response, rpc := getFullChannelViaDispatcher(t, fullChannelDispatcher(s, prefix), creator.ID, false, api.InputChannel(creator.ID, ch.ID))
+		if rpc != nil {
+			t.Fatalf("getFullChannel under %q: %d %s", prefix, rpc.ErrorCode, rpc.ErrorMessage)
+		}
+		exportedInvite, ok := fullChannelInfo(t, response).GetExportedInvite()
+		if !ok {
+			t.Fatalf("getFullChannel under %q omitted the exported invite", prefix)
+		}
+		gotInvite, ok := exportedInvite.(*tg.ChatInviteExported)
+		if !ok {
+			t.Fatalf("getFullChannel under %q invite = %T, want *tg.ChatInviteExported", prefix, exportedInvite)
+		}
+		link := gotInvite.Link
+		if want := prefix + "+" + hash; link != want {
+			t.Errorf("getFullChannel under %q link = %q, want %q", prefix, link, want)
+		}
+	}
+
+	if _, err := api.CheckChatInviteForTest(s, joiner.ID, &tg.MessagesCheckChatInviteRequest{Hash: fullLinkA}, prefixB); rpcMessage(t, err) != "PEER_ID_INVALID" {
+		t.Errorf("check full link under origin B: got %v, want PEER_ID_INVALID", err)
+	}
+	if _, err := api.ImportChatInviteForTest(s, joiner.ID, &tg.MessagesImportChatInviteRequest{Hash: fullLinkA}, prefixB); rpcMessage(t, err) != "PEER_ID_INVALID" {
+		t.Errorf("import full link under origin B: got %v, want PEER_ID_INVALID", err)
+	}
+	if _, err := api.ImportChatInviteForTest(s, joiner.ID, &tg.MessagesImportChatInviteRequest{Hash: hashA}, prefixB); err != nil {
+		t.Fatalf("import hash minted under origin A while using origin B: %v", err)
+	}
+}
+
+func isInviteHash(hash string) bool {
+	if len(hash) != 22 {
+		return false
+	}
+	for i := range len(hash) {
+		c := hash[i]
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
 func TestExportChatInviteRejectsUnauthorized(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1668,6 +1757,13 @@ func TestExportChatInviteRejectsUnauthorized(t *testing.T) {
 	// A role-0 member: joined through the creator's invite, exactly as a real one
 	// arrives.
 	hash := exportInvite(t, s, creator.ID, ch)
+	if _, err := api.ExportChatInviteForTest(s, member.ID, &tg.MessagesExportChatInviteRequest{
+		Peer: api.InputPeerChannel(member.ID, ch.ID),
+	}); err == nil {
+		t.Error("non-member exported an invite")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Errorf("non-member export: got %s, want PEER_ID_INVALID", msg)
+	}
 	if _, err := api.ImportChatInviteForTest(s, member.ID, &tg.MessagesImportChatInviteRequest{Hash: hash}); err != nil {
 		t.Fatalf("import: %v", err)
 	}
@@ -3036,9 +3132,174 @@ func TestRevokeExportedChatInvite(t *testing.T) {
 	}
 }
 
-func TestRevokeExportedChatInviteRejectsNonAdmin(t *testing.T) {
+func TestRevokedAndUnknownInvitesReturnIdenticalErrors(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
+	creator, stranger, ch := channelWith(t, s, "+15551294421", "+15551294422")
+	revokedHash := exportInvite(t, s, creator.ID, ch)
+	if _, err := api.RevokeExportedChatInviteForTest(s, creator.ID, ch.ID, revokedHash); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	_, checkRevokedErr := api.CheckChatInviteForTest(s, stranger.ID, &tg.MessagesCheckChatInviteRequest{Hash: revokedHash})
+	_, checkUnknownErr := api.CheckChatInviteForTest(s, stranger.ID, &tg.MessagesCheckChatInviteRequest{Hash: unknownHash})
+	_, importRevokedErr := api.ImportChatInviteForTest(s, stranger.ID, &tg.MessagesImportChatInviteRequest{Hash: revokedHash})
+	_, importUnknownErr := api.ImportChatInviteForTest(s, stranger.ID, &tg.MessagesImportChatInviteRequest{Hash: unknownHash})
+	checks := []struct {
+		name string
+		err  error
+	}{
+		{name: "check revoked", err: checkRevokedErr},
+		{name: "check unknown", err: checkUnknownErr},
+		{name: "import revoked", err: importRevokedErr},
+		{name: "import unknown", err: importUnknownErr},
+	}
+	var want []byte
+	for _, check := range checks {
+		got := rpcErrorWireBytes(t, check.err)
+		if want == nil {
+			want = got
+			continue
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s RPC error bytes = %x, want %x", check.name, got, want)
+		}
+	}
+}
+
+func rpcErrorWireBytes(t *testing.T, err error) []byte {
+	t.Helper()
+	rpcErr, ok := tgerr.As(err)
+	if !ok {
+		t.Fatalf("error = %v, want an RPC error", err)
+	}
+	if rpcErr.Code != 400 || rpcErr.Message != "PEER_ID_INVALID" {
+		t.Fatalf("RPC error = %d %q, want 400 PEER_ID_INVALID", rpcErr.Code, rpcErr.Message)
+	}
+	var buf bin.Buffer
+	if err := (&mt.RPCError{ErrorCode: rpcErr.Code, ErrorMessage: rpcErr.Message}).Encode(&buf); err != nil {
+		t.Fatalf("encode RPC error: %v", err)
+	}
+	return append([]byte(nil), buf.Buf...)
+}
+
+func TestRevokeExportedChatInviteAcceptsOnlyConfiguredAndLegacyLinks(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator, joiner, ch := channelWith(t, s, "+15551294401", "+15551294402")
+	const prefixA = "https://links.example.test/"
+	const prefixB = "https://community.example.test/"
+
+	for _, tc := range []struct {
+		name   string
+		prefix string
+		form   string
+	}{
+		{name: "configured prefix", prefix: prefixA, form: prefixA + "+"},
+		{name: "other configured prefix", prefix: prefixB, form: prefixB + "+"},
+		{name: "legacy prefix", prefix: prefixA, form: "https://t.me/+"},
+		{name: "bare hash", prefix: prefixA, form: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exported, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{
+				Peer: api.InputPeerChannel(creator.ID, ch.ID),
+			}, tc.prefix)
+			if err != nil {
+				t.Fatalf("export: %v", err)
+			}
+			invite, ok := exported.(*tg.ChatInviteExported)
+			if !ok {
+				t.Fatalf("export response = %T, want *tg.ChatInviteExported", exported)
+			}
+			hash, ok := strings.CutPrefix(invite.Link, tc.prefix+"+")
+			if !ok || !isInviteHash(hash) {
+				t.Fatalf("exported link = %q, want configured prefix plus a valid hash", invite.Link)
+			}
+			revokeValue := hash
+			if tc.form != "" {
+				revokeValue = tc.form + hash
+			}
+			if _, err := api.RevokeExportedChatInviteForTest(s, creator.ID, ch.ID, revokeValue, tc.prefix); err != nil {
+				t.Fatalf("revoke %s: %v", tc.name, err)
+			}
+			if _, err := api.CheckChatInviteForTest(s, joiner.ID, &tg.MessagesCheckChatInviteRequest{Hash: hash}, tc.prefix); rpcMessage(t, err) != "PEER_ID_INVALID" {
+				t.Errorf("check revoked invite: got %v, want PEER_ID_INVALID", err)
+			}
+		})
+	}
+
+	exported, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{
+		Peer: api.InputPeerChannel(creator.ID, ch.ID),
+	}, prefixA)
+	if err != nil {
+		t.Fatalf("export for foreign-origin revoke: %v", err)
+	}
+	invite, ok := exported.(*tg.ChatInviteExported)
+	if !ok {
+		t.Fatalf("export response = %T, want *tg.ChatInviteExported", exported)
+	}
+	hash := strings.TrimPrefix(invite.Link, prefixA+"+")
+	if _, err := api.RevokeExportedChatInviteForTest(s, creator.ID, ch.ID, "https://evil.example/+"+hash, prefixA); err != nil {
+		t.Fatalf("revoke foreign-origin link: %v", err)
+	}
+	if _, err := api.ImportChatInviteForTest(s, joiner.ID, &tg.MessagesImportChatInviteRequest{Hash: hash}, prefixB); err != nil {
+		t.Fatalf("foreign-origin revoke retired invite: %v", err)
+	}
+	if member, found, err := s.ChannelMemberOf(ctx, ch.ID, joiner.ID); err != nil || !found || member.Role != 0 {
+		t.Fatalf("member after foreign-origin revoke: found=%v role=%d err=%v", found, member.Role, err)
+	}
+}
+
+func TestRevokeFailureLogOmitsInviteCredential(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, _, ch := channelWith(t, s, "+15551294411", "+15551294412")
+	exported, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{
+		Peer: api.InputPeerChannel(creator.ID, ch.ID),
+	}, testPublicLinkPrefix)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	invite, ok := exported.(*tg.ChatInviteExported)
+	if !ok {
+		t.Fatalf("export response = %T, want *tg.ChatInviteExported", exported)
+	}
+	link := invite.Link
+	hash := strings.TrimPrefix(link, testPublicLinkPrefix+"+")
+	if !isInviteHash(hash) {
+		t.Fatalf("exported link = %q, want a valid configured invite link", link)
+	}
+	channelExec(t, ctx, dsn, `
+		CREATE FUNCTION fail_channel_invite_revoke() RETURNS trigger AS $$
+		BEGIN
+			RAISE EXCEPTION 'controlled revoke failure';
+		END;
+		$$ LANGUAGE plpgsql
+	`)
+	channelExec(t, ctx, dsn, `
+		CREATE TRIGGER fail_channel_invite_revoke
+		BEFORE UPDATE ON channel_invites
+		FOR EACH STATEMENT EXECUTE FUNCTION fail_channel_invite_revoke()
+	`)
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	if _, err := api.RevokeExportedChatInviteWithLoggerForTest(s, creator.ID, ch.ID, link, logger, testPublicLinkPrefix); err == nil {
+		t.Fatal("revoke succeeded despite the injected database failure")
+	}
+	if !strings.Contains(logs.String(), "revoke exported chat invite") {
+		t.Fatalf("captured logs = %q, want revoke failure log", logs.String())
+	}
+	if strings.Contains(logs.String(), hash) || strings.Contains(logs.String(), link) {
+		t.Fatalf("revoke failure log contains invite credential: %q", logs.String())
+	}
+}
+
+func TestRevokeExportedChatInviteRejectsNonAdmin(t *testing.T) {
+	t.Parallel()
+	s, dsn := openStoreDSN(t)
 	creator, _, ch := channelWith(t, s, "+15551294101", "+15551294102")
 
 	// Add member as role 0.
@@ -3056,6 +3317,12 @@ func TestRevokeExportedChatInviteRejectsNonAdmin(t *testing.T) {
 	_, err = api.RevokeExportedChatInviteForTest(s, member.ID, ch.ID, hash)
 	if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
 		t.Fatalf("member revoke: got %s, want PEER_ID_INVALID", msg)
+	}
+	banChannelMember(t, context.Background(), dsn, ch.ID, creator.ID, time.Now().Add(time.Hour))
+	if _, err := api.RevokeExportedChatInviteForTest(s, creator.ID, ch.ID, hash); err == nil {
+		t.Fatal("banned admin revoked an invite")
+	} else if msg := rpcMessage(t, err); msg != "PEER_ID_INVALID" {
+		t.Fatalf("banned admin revoke: got %s, want PEER_ID_INVALID", msg)
 	}
 }
 

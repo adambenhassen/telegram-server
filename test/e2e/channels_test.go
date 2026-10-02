@@ -18,9 +18,24 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
+const testPublicLinkPrefix = "https://test.example/"
+
 // inviteHash strips the link prefix and returns the bare hash.
 func inviteHash(link string) string {
-	return strings.TrimPrefix(link, "https://t.me/+")
+	return strings.TrimPrefix(link, testPublicLinkPrefix+"+")
+}
+
+func validInviteHash(hash string) bool {
+	if len(hash) != 22 {
+		return false
+	}
+	for i := range len(hash) {
+		c := hash[i]
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // hasChannel reports whether chats contains a *tg.Channel with the given id.
@@ -97,7 +112,11 @@ func exportChannelInvite(t *testing.T, ctx context.Context, viewerID int64, cmds
 		if !ok {
 			return errors.New("exportChatInvite: unexpected response type")
 		}
-		hash = inviteHash(inv.Link)
+		var hasPrefix bool
+		hash, hasPrefix = strings.CutPrefix(inv.Link, testPublicLinkPrefix+"+")
+		if !hasPrefix || !validInviteHash(hash) {
+			return fmt.Errorf("exportChatInvite: link %q has no configured prefix or valid hash", inv.Link)
+		}
 		return nil
 	})
 	return hash

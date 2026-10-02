@@ -425,7 +425,7 @@ func writeInviteList(w io.Writer, invites []store.RegistrationInvite) error {
 }
 
 func run(log *slog.Logger) error {
-	cfg, err := config.Load(log)
+	cfg, err := config.LoadServerConfig(log)
 	if err != nil {
 		return err
 	}
@@ -543,6 +543,7 @@ func run(log *slog.Logger) error {
 	}
 
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
+	tgcfg.MeURLPrefix = cfg.PublicLinkPrefix
 	notifyMetrics := store.NewNotificationMetrics()
 	dialogFilterSync := api.NewDialogFilterSync()
 	handler := api.NewWithDialogFilterSync(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode, dialogFilterSync, notifyMetrics)
