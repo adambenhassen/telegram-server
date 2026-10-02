@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gotd/td/bin"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
@@ -1094,11 +1093,10 @@ func testSmokeChannel(t *testing.T) {
 	}
 
 	if err := subscriber.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
-		var exported smokeExportedMessageLink
-		err := api.Invoker().Invoke(ctx, smokeExportMessageLinkRequest{
+		exported, err := api.ChannelsExportMessageLink(ctx, &tg.ChannelsExportMessageLinkRequest{
 			Channel: inputChannel(subscriber.id, channelID),
 			ID:      update.Msg.ID,
-		}, &exported)
+		})
 		if err != nil {
 			return err
 		}
@@ -1190,42 +1188,6 @@ func testSmokeChannel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("subscriber getFullChannel: %v", err)
 	}
-}
-
-type smokeExportMessageLinkRequest struct {
-	Channel tg.InputChannelClass
-	ID      int
-}
-
-func (r smokeExportMessageLinkRequest) Encode(b *bin.Buffer) error {
-	b.PutID(0xe63fadeb)
-	b.PutInt(0)
-	if err := r.Channel.Encode(b); err != nil {
-		return err
-	}
-	b.PutInt(r.ID)
-	return nil
-}
-
-type smokeExportedMessageLink struct {
-	Link string
-	HTML string
-}
-
-func (r *smokeExportedMessageLink) Decode(b *bin.Buffer) error {
-	if err := b.ConsumeID(0x5dab1af4); err != nil {
-		return err
-	}
-	link, err := b.String()
-	if err != nil {
-		return err
-	}
-	html, err := b.String()
-	if err != nil {
-		return err
-	}
-	r.Link, r.HTML = link, html
-	return nil
 }
 
 func testSmokeContactsSearch(t *testing.T) {

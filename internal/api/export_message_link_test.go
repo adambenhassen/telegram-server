@@ -15,79 +15,20 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
 
-const (
-	exportMessageLinkMethodID    = 0xe63fadeb
-	exportedMessageLinkResultID  = 0x5dab1af4
-	exportMessageLinkGroupedFlag = 1 << 0
-	exportMessageLinkThreadFlag  = 1 << 1
-)
-
-type exportMessageLinkWireRequest struct {
-	channel tg.InputChannelClass
-	id      int
-	grouped bool
-	thread  bool
-}
-
-func (r exportMessageLinkWireRequest) Encode(b *bin.Buffer) error {
-	flags := 0
-	if r.grouped {
-		flags |= exportMessageLinkGroupedFlag
-	}
-	if r.thread {
-		flags |= exportMessageLinkThreadFlag
-	}
-	b.PutID(exportMessageLinkMethodID)
-	b.PutInt(flags)
-	if err := r.channel.Encode(b); err != nil {
-		return err
-	}
-	b.PutInt(r.id)
-	return nil
-}
-
-type exportedMessageLinkWireResponse struct {
-	Link string
-	HTML string
-}
-
-func (r *exportedMessageLinkWireResponse) Decode(b *bin.Buffer) error {
-	if err := b.ConsumeID(exportedMessageLinkResultID); err != nil {
-		return err
-	}
-	link, err := b.String()
-	if err != nil {
-		return err
-	}
-	html, err := b.String()
-	if err != nil {
-		return err
-	}
-	r.Link, r.HTML = link, html
-	return nil
-}
-
 func exportMessageLinkCall(
 	t *testing.T,
 	h mtproto.Handler,
 	userID int64,
-	channel tg.InputChannelClass,
-	messageID int,
-	grouped, thread bool,
+	req *tg.ChannelsExportMessageLinkRequest,
 ) (string, string, *mt.RPCError, []byte) {
 	t.Helper()
 	body := dispatchSettings(t, h, settingsHandler{
 		name: "channels.exportMessageLink",
 		request: func() bin.Encoder {
-			return exportMessageLinkWireRequest{
-				channel: channel,
-				id:      messageID,
-				grouped: grouped,
-				thread:  thread,
-			}
+			return req
 		},
 	}, userID, false)
-	var result exportedMessageLinkWireResponse
+	var result tg.ExportedMessageLink
 	if err := result.Decode(&bin.Buffer{Buf: body}); err == nil {
 		return result.Link, result.HTML, nil, body
 	}
@@ -100,7 +41,7 @@ func exportMessageLinkCall(
 
 func TestExportMessageLinkRequiresAuthentication(t *testing.T) {
 	link, html, rpc, wire := exportMessageLinkCall(
-		t, fullChannelDispatcher(nil), 0, api.InputChannel(7, 1), 1, false, false,
+		t, fullChannelDispatcher(nil), 0, &tg.ChannelsExportMessageLinkRequest{Channel: api.InputChannel(7, 1), ID: 1},
 	)
 	if rpc == nil || rpc.ErrorMessage != "AUTH_KEY_UNREGISTERED" {
 		t.Fatalf("unauthenticated error = %v, want AUTH_KEY_UNREGISTERED", rpc)
@@ -141,7 +82,12 @@ func TestExportMessageLinkReturnsCurrentPublicAndPrivateAddresses(t *testing.T) 
 	const prefix = "https://links.example/"
 	h := fullChannelDispatcher(s, prefix)
 	publicLink, publicHTML, rpc, _ := exportMessageLinkCall(
-		t, h, creator.ID, api.InputChannel(creator.ID, public.ID), 1, true, true,
+		t, h, creator.ID, &tg.ChannelsExportMessageLinkRequest{
+			Channel: api.InputChannel(creator.ID, public.ID),
+			ID:      1,
+			Grouped: true,
+			Thread:  true,
+		},
 	)
 	if rpc != nil {
 		t.Fatalf("export public link: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
@@ -152,12 +98,22 @@ func TestExportMessageLinkReturnsCurrentPublicAndPrivateAddresses(t *testing.T) 
 	if publicHTML != "" {
 		t.Errorf("public link html = %q, want empty", publicHTML)
 	}
+	generatedResult, err := api.ExportMessageLinkForTest(s, creator.ID, &tg.ChannelsExportMessageLinkRequest{
+		Channel: api.InputChannel(creator.ID, public.ID),
+		ID:      1,
+	})
+	if err != nil {
+		t.Fatalf("direct export: %v", err)
+	}
+	if _, ok := generatedResult.(*tg.ExportedMessageLink); !ok {
+		t.Fatalf("direct export result = %T, want *tg.ExportedMessageLink", generatedResult)
+	}
 
 	if err := s.EditChannelUsername(ctx, public.ID, creator.ID, "newscurrent"); err != nil {
 		t.Fatalf("change public username: %v", err)
 	}
 	updatedLink, _, rpc, _ := exportMessageLinkCall(
-		t, h, creator.ID, api.InputChannel(creator.ID, public.ID), 1, false, false,
+		t, h, creator.ID, &tg.ChannelsExportMessageLinkRequest{Channel: api.InputChannel(creator.ID, public.ID), ID: 1},
 	)
 	if rpc != nil {
 		t.Fatalf("export link after username change: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
@@ -167,7 +123,7 @@ func TestExportMessageLinkReturnsCurrentPublicAndPrivateAddresses(t *testing.T) 
 	}
 	otherOriginLink, _, rpc, _ := exportMessageLinkCall(
 		t, fullChannelDispatcher(s, "https://alternate.example/"), creator.ID,
-		api.InputChannel(creator.ID, public.ID), 1, false, false,
+		&tg.ChannelsExportMessageLinkRequest{Channel: api.InputChannel(creator.ID, public.ID), ID: 1},
 	)
 	if rpc != nil {
 		t.Fatalf("export link with alternate origin: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
@@ -177,7 +133,7 @@ func TestExportMessageLinkReturnsCurrentPublicAndPrivateAddresses(t *testing.T) 
 	}
 
 	privateLink, _, rpc, _ := exportMessageLinkCall(
-		t, h, creator.ID, api.InputChannel(creator.ID, private.ID), 1, false, false,
+		t, h, creator.ID, &tg.ChannelsExportMessageLinkRequest{Channel: api.InputChannel(creator.ID, private.ID), ID: 1},
 	)
 	if rpc != nil {
 		t.Fatalf("export private link: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
@@ -246,7 +202,7 @@ func TestExportMessageLinkDenialsAreByteIdentical(t *testing.T) {
 	var wantWire []byte
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, rpc, wire := exportMessageLinkCall(t, h, tc.userID, tc.channel, tc.id, false, false)
+			_, _, rpc, wire := exportMessageLinkCall(t, h, tc.userID, &tg.ChannelsExportMessageLinkRequest{Channel: tc.channel, ID: tc.id})
 			if rpc == nil {
 				t.Fatal("export succeeded, want PEER_ID_INVALID")
 			}

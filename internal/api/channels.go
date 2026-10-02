@@ -455,52 +455,6 @@ func (h *handlers) handleLeaveChannel(r *mtproto.Request) (bin.Encoder, error) {
 // a single call cannot ask the server to hydrate an unbounded batch.
 const maxChannelMessagesPerCall = 100
 
-const (
-	exportMessageLinkMethodTypeID = 0xe63fadeb
-	exportedMessageLinkTypeID     = 0x5dab1af4
-)
-
-// exportMessageLinkRequest is the channels.exportMessageLink request from the
-// layer newer than gotd's generated schema. The grouped and thread flags are
-// decoded for wire compatibility but do not change the address or visibility
-// of the requested message.
-type exportMessageLinkRequest struct {
-	Channel tg.InputChannelClass
-	ID      int
-}
-
-func (r *exportMessageLinkRequest) Decode(b *bin.Buffer) error {
-	if err := b.ConsumeID(exportMessageLinkMethodTypeID); err != nil {
-		return err
-	}
-	if _, err := b.Int(); err != nil { // flags: grouped and thread are ignored.
-		return err
-	}
-	channel, err := tg.DecodeInputChannel(b)
-	if err != nil {
-		return err
-	}
-	id, err := b.Int()
-	if err != nil {
-		return err
-	}
-	r.Channel = channel
-	r.ID = id
-	return nil
-}
-
-type exportedMessageLinkReply struct {
-	Link string
-	HTML string
-}
-
-func (r *exportedMessageLinkReply) Encode(b *bin.Buffer) error {
-	b.PutID(exportedMessageLinkTypeID)
-	b.PutString(r.Link)
-	b.PutString(r.HTML)
-	return nil
-}
-
 // requireChannelMember is the read gate for a client-supplied channel id: the
 // caller must hold a participant row that is not banned as of now. An unknown
 // channel, a channel the caller never joined and a banned member all report
@@ -760,7 +714,7 @@ func (h *handlers) handleGetChannelMessages(r *mtproto.Request) (bin.Encoder, er
 // the per-viewer access hash and bans remain the admission checks; the private
 // channel id in the resulting URL is only an address.
 func (h *handlers) handleExportMessageLink(r *mtproto.Request) (bin.Encoder, error) {
-	var req exportMessageLinkRequest
+	var req tg.ChannelsExportMessageLinkRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
@@ -802,7 +756,7 @@ func (h *handlers) handleExportMessageLink(r *mtproto.Request) (bin.Encoder, err
 	if channel.Username != nil && *channel.Username != "" {
 		address = *channel.Username + "/" + messageID
 	}
-	return &exportedMessageLinkReply{Link: h.cfg.MeURLPrefix + address}, nil
+	return &tg.ExportedMessageLink{Link: h.cfg.MeURLPrefix + address}, nil
 }
 
 // channelHistory renders one page of a channel's history for the caller, whom
