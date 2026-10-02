@@ -99,6 +99,63 @@ func TestNewBlobStoreDoesNotFallBackWhenS3IsUnreachable(t *testing.T) {
 	}
 }
 
+func TestRunValidatesPublicLinkPrefixBeforeLoadingServerConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		prefix     string
+		wantAccept bool
+	}{
+		{name: "selected deployment", prefix: "https://telegram-server.tailaa4918.ts.net/", wantAccept: true},
+		{name: "test origin", prefix: "https://links.example.test/", wantAccept: true},
+		{name: "missing", prefix: ""},
+		{name: "wrong scheme", prefix: "http://links.example.test/"},
+		{name: "uppercase scheme", prefix: "HTTPS://links.example.test/"},
+		{name: "uppercase host", prefix: "https://Links.example.test/"},
+		{name: "port", prefix: "https://links.example.test:443/"},
+		{name: "path", prefix: "https://links.example.test/path/"},
+		{name: "query", prefix: "https://links.example.test/?q=1"},
+		{name: "fragment", prefix: "https://links.example.test/#section"},
+		{name: "userinfo", prefix: "https://user@links.example.test/"},
+		{name: "ipv4 literal", prefix: "https://192.0.2.1/"},
+		{name: "ipv6 literal", prefix: "https://[2001:db8::1]/"},
+		{name: "trailing dot", prefix: "https://links.example.test./"},
+		{name: "punycode", prefix: "https://xn--links.example/"},
+		{name: "t.me", prefix: "https://t.me/"},
+		{name: "t.me subdomain", prefix: "https://links.t.me/"},
+		{name: "telegram.me", prefix: "https://telegram.me/"},
+		{name: "telegram.me subdomain", prefix: "https://links.telegram.me/"},
+		{name: "telegram.dog", prefix: "https://telegram.dog/"},
+		{name: "telegram.dog subdomain", prefix: "https://links.telegram.dog/"},
+		{name: "telegram.org", prefix: "https://telegram.org/"},
+		{name: "telegram.org subdomain", prefix: "https://links.telegram.org/"},
+		{name: "missing root slash", prefix: "https://links.example.test"},
+		{name: "empty host", prefix: "https:///"},
+		{name: "empty label", prefix: "https://links..example/"},
+		{name: "underscore", prefix: "https://links_test.example/"},
+		{name: "non-ascii", prefix: "https://línks.example/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TG_PUBLIC_LINK_PREFIX", tt.prefix)
+			t.Setenv("TG_POSTGRES_DSN", "")
+			t.Setenv("TG_AUTHKEY_ENC_KEY", strings.Repeat("00", 32))
+			t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", "")
+
+			err := run(slog.New(slog.DiscardHandler))
+			if tt.wantAccept {
+				if err == nil || err.Error() != "TG_POSTGRES_DSN is required" {
+					t.Fatalf("run error = %v, want config loading to continue to the missing Postgres DSN", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "TG_PUBLIC_LINK_PREFIX") {
+				t.Fatalf("run error = %v, want TG_PUBLIC_LINK_PREFIX validation error", err)
+			}
+		})
+	}
+}
+
 type commandRemoveProbe struct {
 	blob.Store
 

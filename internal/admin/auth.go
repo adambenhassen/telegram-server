@@ -344,8 +344,8 @@ func handleLoginPOST(cfg LoginHandlerConfig, rl *rateLimiter, w http.ResponseWri
 	cookie := SessionCookie(sessionIDHex)
 	http.SetCookie(w, cookie)
 
-	// Redirect to metrics dashboard.
-	http.Redirect(w, r, "/admin/metrics", http.StatusFound)
+	// Redirect to the admin dashboard.
+	http.Redirect(w, r, "/admin/dashboard", http.StatusFound)
 }
 
 // handleLogoutPOST processes logout requests.

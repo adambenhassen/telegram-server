@@ -663,6 +663,8 @@ jobs:
       # reach of a workflow that prints container logs.
       TG_POSTGRES_DSN: postgres://postgres:smoketest@localhost:5432/telegram?sslmode=disable
       TG_AUTHKEY_ENC_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      # Reserved test hostname, never an official or production origin.
+      TG_PUBLIC_LINK_PREFIX: https://links.example.test/
 
     steps:
       - uses: actions/checkout@v7.0.1
@@ -734,7 +736,7 @@ jobs:
           docker run -d --name telegramd \
             --network host \
             --read-only -v tg-key:/var/lib/telegramd -v tg-blobs:/var/lib/telegramd-blobs \
-            -e TG_POSTGRES_DSN -e TG_AUTHKEY_ENC_KEY \
+            -e TG_POSTGRES_DSN -e TG_AUTHKEY_ENC_KEY -e TG_PUBLIC_LINK_PREFIX \
             telegramd:ci
           for _ in $(seq 30); do
             if docker logs telegramd 2>&1 | grep -q 'msg=listening'; then
@@ -812,6 +814,7 @@ jobs:
           # untested in the only place compose ever runs.
           cat > .env <<'EOF'
           POSTGRES_PASSWORD=localdev
+          TG_PUBLIC_LINK_PREFIX=https://links.example.test/
           EOF
           # .gitignore ignores .env.*, so the template only survives because of
           # the negation below it. Dropping or misordering that line loses the

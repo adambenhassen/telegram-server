@@ -22,7 +22,9 @@ func fixtureConfigForListener(t *testing.T, dcID int, listener net.Listener) *tg
 	if addr.IP == nil || !addr.IP.IsLoopback() || addr.Port < 1 || addr.Port > 65535 {
 		t.Fatal("fixture listener must be bound to loopback with a non-zero port")
 	}
-	return api.DefaultConfig(dcID, addr.IP.String(), addr.Port)
+	cfg := api.DefaultConfig(dcID, addr.IP.String(), addr.Port)
+	cfg.MeURLPrefix = testPublicLinkPrefix
+	return cfg
 }
 
 func TestFixtureConfigForListenerUsesBoundEndpoint(t *testing.T) {
@@ -38,6 +40,12 @@ func TestFixtureConfigForListenerUsesBoundEndpoint(t *testing.T) {
 	}
 	const dcID = 7
 	cfg := fixtureConfigForListener(t, dcID, listener)
+	if cfg.MeURLPrefix != testPublicLinkPrefix {
+		t.Fatalf("fixture me_url_prefix = %q, want %q", cfg.MeURLPrefix, testPublicLinkPrefix)
+	}
+	if cfg.DCTxtDomainName != "" {
+		t.Fatalf("fixture dc_txt_domain_name = %q, want empty", cfg.DCTxtDomainName)
+	}
 	if cfg.ThisDC != dcID || len(cfg.DCOptions) != 1 {
 		t.Fatal("fixture config DC identity mismatch")
 	}

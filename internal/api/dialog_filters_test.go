@@ -11,6 +11,7 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/mt"
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/adambenhassen/telegram-server/internal/config"
@@ -21,12 +22,13 @@ import (
 )
 
 type dialogFilterRPC struct {
-	handler   mtproto.Handler
-	conn      *mtproto.Conn
-	transport *settingsDispatcherTransport
-	key       crypto.AuthKey
-	userID    int64
-	nextMsgID int64
+	handler     mtproto.Handler
+	conn        *mtproto.Conn
+	transport   *settingsDispatcherTransport
+	key         crypto.AuthKey
+	userID      int64
+	nextMsgID   int64
+	provisional bool
 }
 
 func newDialogFilterRPC(t *testing.T, s *store.Store, userID int64) *dialogFilterRPC {
@@ -72,12 +74,13 @@ func (c *dialogFilterRPC) dispatch(t *testing.T, request bin.Encoder) ([]byte, e
 	msgID := c.nextMsgID
 	c.nextMsgID += 4
 	if err := c.handler.OnMessage(c.conn, &mtproto.Request{
-		AuthKeyID: c.key.ID,
-		UserID:    c.userID,
-		SessionID: 123,
-		MsgID:     msgID,
-		Buf:       &body,
-		Ctx:       context.Background(),
+		AuthKeyID:   c.key.ID,
+		UserID:      c.userID,
+		SessionID:   123,
+		MsgID:       msgID,
+		Buf:         &body,
+		Provisional: c.provisional,
+		Ctx:         context.Background(),
 	}); err != nil {
 		return nil, err
 	}
@@ -171,8 +174,8 @@ func TestDialogFiltersRPCPersistsAndOrdersPrivateFolder(t *testing.T) {
 	if got.TagsEnabled {
 		t.Fatal("folder tags are enabled")
 	}
-	if len(got.Filters) != 2 {
-		t.Fatalf("folders = %d, want All chats and ID 2", len(got.Filters))
+	if len(got.Filters) != 5 {
+		t.Fatalf("folders = %d, want All chats, existing Groups, and three missing defaults", len(got.Filters))
 	}
 	if _, ok := got.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("first folder = %T, want All chats", got.Filters[0])
@@ -207,8 +210,8 @@ func TestDialogFiltersRPCPersistsAndOrdersPrivateFolder(t *testing.T) {
 	if err := otherSessionFilters.Decode(&bin.Buffer{Buf: otherSession.call(t, &tg.MessagesGetDialogFiltersRequest{})}); err != nil {
 		t.Fatalf("other session get dialog filters: %v", err)
 	}
-	if len(otherSessionFilters.Filters) != 2 {
-		t.Fatalf("other session saw %d folders, want the owner's persisted folder", len(otherSessionFilters.Filters))
+	if len(otherSessionFilters.Filters) != 5 {
+		t.Fatalf("other session saw %d folders, want All chats and four defaults", len(otherSessionFilters.Filters))
 	}
 	if otherCustom, ok := otherSessionFilters.Filters[1].(*tg.DialogFilter); !ok || otherCustom.Title.Text != "Groups" {
 		t.Fatalf("other session folder = %#v, want persisted Groups", otherSessionFilters.Filters[1])
@@ -220,8 +223,8 @@ func TestDialogFiltersRPCPersistsAndOrdersPrivateFolder(t *testing.T) {
 	if err := reordered.Decode(&bin.Buffer{Buf: client.call(t, &tg.MessagesGetDialogFiltersRequest{})}); err != nil {
 		t.Fatalf("decode reordered folders: %v", err)
 	}
-	if len(reordered.Filters) != 2 {
-		t.Fatalf("reordered folders = %d, want 2", len(reordered.Filters))
+	if len(reordered.Filters) != 5 {
+		t.Fatalf("reordered folders = %d, want five folders", len(reordered.Filters))
 	}
 	if folder, ok := reordered.Filters[0].(*tg.DialogFilter); !ok || folder.ID != 2 {
 		t.Fatalf("first reordered folder = %T, want ID 2", reordered.Filters[0])
@@ -237,8 +240,8 @@ func TestDialogFiltersRPCPersistsAndOrdersPrivateFolder(t *testing.T) {
 	if err := afterDelete.Decode(&bin.Buffer{Buf: client.call(t, &tg.MessagesGetDialogFiltersRequest{})}); err != nil {
 		t.Fatalf("decode folders after delete: %v", err)
 	}
-	if len(afterDelete.Filters) != 1 {
-		t.Fatalf("folders after delete = %d, want only All chats", len(afterDelete.Filters))
+	if len(afterDelete.Filters) != 4 {
+		t.Fatalf("folders after delete = %d, want All chats and three remaining defaults", len(afterDelete.Filters))
 	}
 }
 
@@ -296,8 +299,18 @@ func TestDialogFiltersAreOwnerScopedAndReadsPruneInaccessiblePeers(t *testing.T)
 	if err := otherFilters.Decode(&bin.Buffer{Buf: otherClient.call(t, &tg.MessagesGetDialogFiltersRequest{})}); err != nil {
 		t.Fatalf("other owner get dialog filters: %v", err)
 	}
-	if len(otherFilters.Filters) != 1 {
-		t.Fatalf("other owner saw %d filters, want only All chats", len(otherFilters.Filters))
+	if len(otherFilters.Filters) != 5 {
+		t.Fatalf("other owner saw %d filters, want All chats and four defaults", len(otherFilters.Filters))
+	}
+	if _, ok := otherFilters.Filters[0].(*tg.DialogFilterDefault); !ok {
+		t.Fatalf("other owner's first folder = %T, want All chats", otherFilters.Filters[0])
+	}
+	if personal, ok := otherFilters.Filters[1].(*tg.DialogFilter); !ok || personal.Title.Text != "Personal" {
+		t.Fatalf("other owner's second folder = %#v, want Personal", otherFilters.Filters[1])
+	}
+	baselineMarker, found, err := s.DialogFilterChangeAt(ctx, other.ID)
+	if err != nil || !found {
+		t.Fatalf("read other owner's seeded marker: found %v, err %v", found, err)
 	}
 
 	foreignFilter := &tg.DialogFilter{
@@ -318,8 +331,8 @@ func TestDialogFiltersAreOwnerScopedAndReadsPruneInaccessiblePeers(t *testing.T)
 	if !ok || ownerPending {
 		t.Fatalf("rejected mutation affected another owner's connection: generation %d covered %d first %v pending %v ok %v", generation, covered, first, ownerPending, ok)
 	}
-	if _, found, err := s.DialogFilterChangeAt(ctx, other.ID); err != nil || found {
-		t.Fatalf("rejected peer mutation changed the durable marker: found %v, err %v", found, err)
+	if marker, found, err := s.DialogFilterChangeAt(ctx, other.ID); err != nil || !found || !marker.Equal(baselineMarker) {
+		t.Fatalf("rejected peer mutation changed the durable marker from %s to %s (found %v, err %v)", baselineMarker, marker, found, err)
 	}
 
 	removed, _, _, err := s.RemoveChatUser(ctx, group.ID, owner.ID, creator.ID)
@@ -338,7 +351,7 @@ func TestDialogFiltersAreOwnerScopedAndReadsPruneInaccessiblePeers(t *testing.T)
 	if err != nil {
 		t.Fatalf("read persisted owner folders: %v", err)
 	}
-	if len(persisted.Filters) != 1 || len(persisted.Filters[0].IncludePeers) != 1 {
+	if len(persisted.Filters) != 5 || len(persisted.Filters[0].IncludePeers) != 1 {
 		t.Fatalf("pruning changed durable peer references: %#v", persisted.Filters)
 	}
 
@@ -352,6 +365,159 @@ func TestDialogFiltersAreOwnerScopedAndReadsPruneInaccessiblePeers(t *testing.T)
 	badHashMutation := &tg.MessagesUpdateDialogFilterRequest{ID: 4, Filter: badHashFilter}
 	badHashMutation.SetFlags()
 	requireDialogFilterRPCError(t, ownerClient.call(t, badHashMutation), "PEER_ID_INVALID")
+}
+
+func TestSuggestedDialogFiltersOfferOnlyMissingDefaultTitles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	owner, err := s.CreateUser(ctx, "+15551090099")
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	member, err := s.CreateUser(ctx, "+15551090098")
+	if err != nil {
+		t.Fatalf("create folder peer: %v", err)
+	}
+	if err := s.SaveDialogFilter(ctx, owner.ID, store.DialogFilter{
+		ID: 2, Title: "unread", IncludePeers: []store.DialogFilterPeer{{Type: store.PeerTypeUser, ID: member.ID}},
+	}); err != nil {
+		t.Fatalf("save existing Unread title with private peer: %v", err)
+	}
+	client := newDialogFilterRPC(t, s, owner.ID)
+	getSuggestions := func() []tg.DialogFilterSuggested {
+		t.Helper()
+		var got tg.DialogFilterSuggestedVector
+		if err := got.Decode(&bin.Buffer{Buf: client.call(t, &tg.MessagesGetSuggestedDialogFiltersRequest{})}); err != nil {
+			t.Fatalf("decode suggested folders: %v", err)
+		}
+		return got.Elems
+	}
+	assertSuggestion := func(got tg.DialogFilterSuggested, id int, title, description string) *tg.DialogFilter {
+		t.Helper()
+		filter, ok := got.Filter.(*tg.DialogFilter)
+		if !ok || filter.ID != id || filter.Title.Text != title || got.Description != description {
+			t.Fatalf("suggestion = %#v, want ID %d %s with description %q", got, id, title, description)
+		}
+		return filter
+	}
+
+	initial := getSuggestions()
+	if len(initial) != 3 {
+		t.Fatalf("initial suggestions = %d, want missing Personal, Groups and Channels", len(initial))
+	}
+	personal := assertSuggestion(initial[0], 3, "Personal", "Private chats")
+	if !personal.Contacts || !personal.NonContacts || !personal.Bots || personal.Groups || personal.Broadcasts || personal.ExcludeRead || len(personal.IncludePeers) != 0 || len(personal.PinnedPeers) != 0 || len(personal.ExcludePeers) != 0 {
+		t.Fatalf("Personal suggestion = %+v, want private contacts, non-contacts and bots with empty peers", personal)
+	}
+	groups := assertSuggestion(initial[1], 4, "Groups", "Group chats")
+	if !groups.Groups || groups.Contacts || groups.NonContacts || groups.Broadcasts || groups.Bots || groups.ExcludeRead || len(groups.IncludePeers) != 0 {
+		t.Fatalf("Groups suggestion = %+v, want basic groups and megagroups with empty peers", groups)
+	}
+	channels := assertSuggestion(initial[2], 5, "Channels", "Broadcast channels")
+	if !channels.Broadcasts || channels.Contacts || channels.NonContacts || channels.Groups || channels.Bots || channels.ExcludeRead || len(channels.IncludePeers) != 0 {
+		t.Fatalf("Channels suggestion = %+v, want broadcast channels with empty peers", channels)
+	}
+	seeded, err := s.DialogFilterDefaultsSeeded(ctx, owner.ID)
+	if err != nil || seeded {
+		t.Fatalf("suggestions initialized default state: seeded %v, err %v", seeded, err)
+	}
+
+	var folders tg.MessagesDialogFilters
+	if err := folders.Decode(&bin.Buffer{Buf: client.call(t, &tg.MessagesGetDialogFiltersRequest{})}); err != nil {
+		t.Fatalf("get dialog filters: %v", err)
+	}
+	if len(folders.Filters) != 5 {
+		t.Fatalf("first get dialog filters returned %d folders, want All chats, existing Unread, and three missing defaults", len(folders.Filters))
+	}
+	if seeded, ok := folders.Filters[1].(*tg.DialogFilter); !ok || seeded.Title.Text != "unread" {
+		t.Fatalf("existing folder was overwritten: %#v", folders.Filters[1])
+	}
+	remaining := getSuggestions()
+	if len(remaining) != 0 {
+		t.Fatalf("suggestions after seeding defaults = %d, want none", len(remaining))
+	}
+
+	deletePersonal := &tg.MessagesUpdateDialogFilterRequest{ID: 3}
+	deletePersonal.SetFlags()
+	requireDialogFilterBool(t, client.call(t, deletePersonal))
+	if got := getSuggestions(); len(got) != 1 || assertSuggestion(got[0], 3, "Personal", "Private chats").ID != 3 {
+		t.Fatalf("suggestions after deleting Personal = %#v, want only the empty Personal definition", got)
+	}
+}
+
+func TestDialogFilterReadsRejectUnauthenticatedAndProvisionalSessions(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	owner, err := s.CreateUser(ctx, "+15551090097")
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	unauthenticated := newDialogFilterRPC(t, s, 0)
+	for _, request := range []bin.Encoder{
+		&tg.MessagesGetDialogFiltersRequest{},
+		&tg.MessagesGetSuggestedDialogFiltersRequest{},
+	} {
+		response, err := unauthenticated.dispatch(t, request)
+		if err != nil {
+			t.Fatalf("dispatch unauthenticated %T: %v", request, err)
+		}
+		requireDialogFilterRPCError(t, response, "AUTH_KEY_UNREGISTERED")
+	}
+	provisional := newDialogFilterRPC(t, s, owner.ID)
+	provisional.provisional = true
+	for _, request := range []bin.Encoder{
+		&tg.MessagesGetDialogFiltersRequest{},
+		&tg.MessagesGetSuggestedDialogFiltersRequest{},
+	} {
+		response, err := provisional.dispatch(t, request)
+		if err != nil {
+			t.Fatalf("dispatch provisional %T: %v", request, err)
+		}
+		requireDialogFilterRPCError(t, response, "AUTH_KEY_UNREGISTERED")
+	}
+	seeded, err := s.DialogFilterDefaultsSeeded(ctx, owner.ID)
+	if err != nil || seeded {
+		t.Fatalf("denied reads initialized defaults: seeded %v, err %v", seeded, err)
+	}
+	definitions, err := s.DialogFilterDefinitions(ctx, owner.ID)
+	if err != nil || len(definitions) != 0 {
+		t.Fatalf("denied reads created folders: definitions %#v, err %v", definitions, err)
+	}
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect to check denied-read state: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Errorf("close denied-read state connection: %v", err)
+		}
+	})
+	var stateRows int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM user_dialog_filter_state WHERE owner_id = $1`, owner.ID).Scan(&stateRows); err != nil {
+		t.Fatalf("count state rows after denied reads: %v", err)
+	}
+	if stateRows != 0 {
+		t.Fatalf("denied reads created %d owner state rows, want none", stateRows)
+	}
 }
 
 func TestDialogFilterChannelPeersRequireOwnerHashAndActiveMembership(t *testing.T) {
@@ -651,6 +817,9 @@ func TestNestedInvokeAfterFolderMutationRefusesAndAccountsRequester(t *testing.T
 	if _, err := s.UpdateDialogFilterOrder(ctx, owner.ID, []int{2, 0}); err != nil {
 		t.Fatalf("set existing order: %v", err)
 	}
+	if _, err := s.SeedDefaultDialogFilters(ctx, owner.ID); err != nil {
+		t.Fatalf("initialize default folders: %v", err)
+	}
 	before, err := s.DialogFilters(ctx, owner.ID)
 	if err != nil {
 		t.Fatalf("read initial folder state: %v", err)
@@ -699,7 +868,7 @@ func TestNestedInvokeAfterFolderMutationRefusesAndAccountsRequester(t *testing.T
 	if err != nil {
 		t.Fatalf("read folder state after refusal: %v", err)
 	}
-	if len(after.Filters) != 1 || after.Filters[0].Title != "Before" || after.Filters[0].Groups != true {
+	if len(after.Filters) != 5 || after.Filters[0].Title != "Before" || after.Filters[0].Groups != true {
 		t.Fatalf("nested folder mutation changed the definition: %+v", after.Filters)
 	}
 	if len(after.Order) != len(before.Order) || after.Order[0] != before.Order[0] || after.Order[1] != before.Order[1] {

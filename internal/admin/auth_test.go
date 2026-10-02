@@ -56,6 +56,13 @@ func newTestRouterWithOrigin(t *testing.T, st *store.Store, tokenHash, origin st
 	}, registry)
 }
 
+func assertNoLocation(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Errorf("unexpected Location header on failure: %q", got)
+	}
+}
+
 // --- GET /admin/login tests ---
 
 func TestLoginGET_serves_form(t *testing.T) {
@@ -152,18 +159,19 @@ func TestLoginPOST_valid_token_creates_session(t *testing.T) {
 
 	// POST with valid token and CSRF.
 	form := strings.NewReader("csrf_token=" + csrfToken + "&token=correct-token")
-	req = httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/login", form)
+	req = httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/login?next=https%3A%2F%2Fattacker.example%2F", form)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Referer", "https://attacker.example/")
 	req.AddCookie(&http.Cookie{Name: "__Host-csrf-token", Value: csrfCookie}) //nolint:gosec // G124: test cookie
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
-	// Should redirect to /admin/metrics.
+	// A successful login always redirects to the fixed dashboard path.
 	if rec.Code != http.StatusFound {
 		t.Fatalf("expected 302, got %d", rec.Code)
 	}
-	if rec.Header().Get("Location") != "/admin/metrics" {
-		t.Errorf("Location = %q, want /admin/metrics", rec.Header().Get("Location"))
+	if rec.Header().Get("Location") != "/admin/dashboard" {
+		t.Errorf("Location = %q, want /admin/dashboard", rec.Header().Get("Location"))
 	}
 
 	// Check session cookie was set.
@@ -221,6 +229,7 @@ func TestLoginPOST_wrong_token_401(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rec.Code)
 	}
+	assertNoLocation(t, rec)
 	if rec.Body.Len() != 0 {
 		t.Errorf("body should be empty on 401, got %d bytes", rec.Body.Len())
 	}
@@ -243,6 +252,7 @@ func TestLoginPOST_missing_csrf_401(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rec.Code)
 	}
+	assertNoLocation(t, rec)
 }
 
 func TestLoginPOST_bad_csrf_401(t *testing.T) {
@@ -275,6 +285,43 @@ func TestLoginPOST_bad_csrf_401(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rec.Code)
 	}
+	assertNoLocation(t, rec)
+}
+
+func TestLoginPOST_store_failure_500_no_location(t *testing.T) {
+	t.Parallel()
+	st := newAuthTestStore(t)
+	tokenHash := sha256hex([]byte("correct-token"))
+	h := newTestRouter(t, st, tokenHash)
+
+	get := httptest.NewRequestWithContext(ctx, http.MethodGet, "/admin/login", nil)
+	getRec := httptest.NewRecorder()
+	h.ServeHTTP(getRec, get)
+	csrfToken := extractCSRFToken(t, getRec.Body.String())
+	var csrfCookie string
+	for _, cookie := range getRec.Result().Cookies() {
+		if cookie.Name == "__Host-csrf-token" {
+			csrfCookie = cookie.Value
+		}
+	}
+	if csrfCookie == "" {
+		t.Fatal("login page did not set a CSRF cookie")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	form := strings.NewReader("csrf_token=" + csrfToken + "&token=correct-token")
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/login", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: "__Host-csrf-token", Value: csrfCookie}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+	assertNoLocation(t, rec)
 }
 
 // --- POST /admin/logout tests ---
@@ -419,6 +466,7 @@ func TestLoginPOST_configuredOriginPolicy(t *testing.T) {
 			if rec.Code != http.StatusUnauthorized {
 				t.Errorf("login with Origin %q and Sec-Fetch-Site %q returned %d, want 401", tc.origin, tc.site, rec.Code)
 			}
+			assertNoLocation(t, rec)
 		})
 	}
 
@@ -639,6 +687,7 @@ func TestLogoutPOST_body_size_limit(t *testing.T) {
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413 for oversized body, got %d", rec.Code)
 	}
+	assertNoLocation(t, rec)
 }
 
 // TestLogoutPOST_body_size_limit_in_cap_body_still_authenticates verifies the

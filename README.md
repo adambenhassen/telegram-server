@@ -122,7 +122,8 @@ make run     # go run ./cmd/telegramd
 ```
 
 Configuration is environment variables, read in `internal/config/config.go`.
-The server refuses to start without a database and a master key:
+The server refuses to start without a database, a master key, and a public link
+prefix:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -132,6 +133,7 @@ The server refuses to start without a database and a master key:
 | `TG_WEBSOCKET_LISTEN_ADDR` | *(unset)* | Enables the WebSocket MTProto listener on this address; browser clients connect to `/apiws` |
 | `TG_WEBSOCKET_ALLOWED_ORIGINS` | *(unset)* | Comma-separated browser origins allowed to connect to `/apiws`; unset rejects every request carrying an `Origin` header |
 | `TG_ADVERTISE_ADDR` | *(derived from `TG_LISTEN_ADDR`)* | Public `host:port` written to the discovery document and advertised to clients |
+| `TG_PUBLIC_LINK_PREFIX` | *(required)* | Lowercase HTTPS origin for client and invite links, with a root path and no port (e.g. `https://links.example.test/`) |
 | `TG_RSA_KEY_PATH` | `server_key.pem` | Server RSA private key; generated on first start |
 | `TG_BLOB_DIR` | `blobs` | Where uploaded file bodies are written |
 | `TG_BLOB_S3_ENDPOINT` | *(unset)* | Enables the S3-compatible blob backend when non-empty; requires the other `TG_BLOB_S3_*` settings below |
@@ -214,6 +216,7 @@ normal registration flow:
 export TG_POSTGRES_DSN="postgres://user:pass@localhost:5432/telegram?sslmode=disable"
 make migrate
 TG_AUTHKEY_ENC_KEY="$(openssl rand -hex 32)" \
+TG_PUBLIC_LINK_PREFIX="https://links.example.test/" \
 TG_REGISTRATION=open \
   make run
 ```
