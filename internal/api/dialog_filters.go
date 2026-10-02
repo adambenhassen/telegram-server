@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"slices"
+	"strings"
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -237,7 +238,92 @@ func (h *handlers) handleGetSuggestedDialogFilters(r *mtproto.Request) (bin.Enco
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
-	return &tg.DialogFilterSuggestedVector{Elems: []tg.DialogFilterSuggested{}}, nil
+	existing, err := h.store.DialogFilterDefinitions(r.Ctx, r.UserID)
+	if err != nil {
+		h.log.Error("get dialog filter suggestions", "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return &tg.DialogFilterSuggestedVector{Elems: suggestedDialogFilters(existing)}, nil
+}
+
+func suggestedDialogFilters(existing []store.DialogFilter) []tg.DialogFilterSuggested {
+	candidates := []struct {
+		definition  store.DialogFilter
+		description string
+	}{
+		{
+			definition: store.DialogFilter{
+				Title: "Unread", Contacts: true, NonContacts: true, Groups: true,
+				Broadcasts: true, Bots: true, ExcludeRead: true,
+			},
+			description: "Chats with unread messages",
+		},
+		{
+			definition:  store.DialogFilter{Title: "Personal", Contacts: true, NonContacts: true},
+			description: "Private chats",
+		},
+	}
+	usedIDs := make(map[int]struct{}, len(existing))
+	for _, filter := range existing {
+		usedIDs[filter.ID] = struct{}{}
+	}
+
+	suggested := make([]tg.DialogFilterSuggested, 0, len(candidates))
+	for _, candidate := range candidates {
+		if hasSuggestedDialogFilter(existing, candidate.definition) {
+			continue
+		}
+		id := nextDialogFilterID(usedIDs)
+		if id == 0 {
+			break
+		}
+		usedIDs[id] = struct{}{}
+		filter := dialogFilterTemplateToTL(candidate.definition, id)
+		suggested = append(suggested, tg.DialogFilterSuggested{
+			Filter: filter, Description: candidate.description,
+		})
+	}
+	return suggested
+}
+
+func hasSuggestedDialogFilter(existing []store.DialogFilter, candidate store.DialogFilter) bool {
+	for _, filter := range existing {
+		if strings.EqualFold(strings.TrimSpace(filter.Title), candidate.Title) ||
+			(filter.Contacts == candidate.Contacts &&
+				filter.NonContacts == candidate.NonContacts &&
+				filter.Groups == candidate.Groups &&
+				filter.Broadcasts == candidate.Broadcasts &&
+				filter.Bots == candidate.Bots &&
+				filter.ExcludeMuted == candidate.ExcludeMuted &&
+				filter.ExcludeRead == candidate.ExcludeRead &&
+				filter.ExcludeArchived == candidate.ExcludeArchived &&
+				len(filter.PinnedPeers) == 0 && len(filter.IncludePeers) == 0 &&
+				len(filter.ExcludePeers) == 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func nextDialogFilterID(used map[int]struct{}) int {
+	for id := 2; id <= 255; id++ {
+		if _, exists := used[id]; !exists {
+			return id
+		}
+	}
+	return 0
+}
+
+func dialogFilterTemplateToTL(filter store.DialogFilter, id int) *tg.DialogFilter {
+	out := &tg.DialogFilter{
+		ID: id, Title: tg.TextWithEntities{Text: filter.Title},
+		Contacts: filter.Contacts, NonContacts: filter.NonContacts,
+		Groups: filter.Groups, Broadcasts: filter.Broadcasts, Bots: filter.Bots,
+		ExcludeMuted: filter.ExcludeMuted, ExcludeRead: filter.ExcludeRead,
+		ExcludeArchived: filter.ExcludeArchived, TitleNoanimate: filter.TitleNoanimate,
+	}
+	out.SetFlags()
+	return out
 }
 
 func (h *handlers) dialogFilterPeerLists(r *mtproto.Request, filter *tg.DialogFilter) ([]store.DialogFilterPeer, []store.DialogFilterPeer, []store.DialogFilterPeer, error) {

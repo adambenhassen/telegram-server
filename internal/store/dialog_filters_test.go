@@ -64,12 +64,82 @@ func TestDialogFilterQuotaSerializesConcurrentCreates(t *testing.T) {
 	}
 }
 
+func TestDialogFiltersSeedUnreadOnceAndKeepDeletion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openDialogFilterStore(t, pgtest.DSN(t))
+	owner := mustUser(t, s, "+15551091006")
+
+	snapshot, err := s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("first get dialog filters: %v", err)
+	}
+	if len(snapshot.Filters) != 1 {
+		t.Fatalf("first get returned %d folders, want Unread", len(snapshot.Filters))
+	}
+	unread := snapshot.Filters[0]
+	if unread.ID != 2 || unread.Title != "Unread" || !unread.Contacts || !unread.NonContacts || !unread.Groups || !unread.Broadcasts || !unread.Bots || !unread.ExcludeRead {
+		t.Fatalf("first folder = %+v, want the all-types Unread folder", unread)
+	}
+	if len(snapshot.Order) != 2 || snapshot.Order[0] != 0 || snapshot.Order[1] != 2 {
+		t.Fatalf("first folder order = %v, want All chats then Unread", snapshot.Order)
+	}
+
+	if _, err := s.DeleteDialogFilter(ctx, owner.ID, 2); err != nil {
+		t.Fatalf("delete Unread: %v", err)
+	}
+	snapshot, err = s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("get dialog filters after deleting Unread: %v", err)
+	}
+	if len(snapshot.Filters) != 0 || len(snapshot.Order) != 1 || snapshot.Order[0] != 0 {
+		t.Fatalf("folders after deleting Unread = %#v, order %v; want only All chats", snapshot.Filters, snapshot.Order)
+	}
+}
+
+func TestConcurrentFirstDialogFilterReadsSeedOneUnreadFolder(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openDialogFilterStore(t, pgtest.DSN(t))
+	owner := mustUser(t, s, "+15551091007")
+	const attempts = 8
+	snapshots := make([]store.DialogFilterSnapshot, attempts)
+	errList := make([]error, attempts)
+	var wg sync.WaitGroup
+	for i := range attempts {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			snapshots[i], errList[i] = s.DialogFilters(ctx, owner.ID)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errList {
+		if err != nil {
+			t.Fatalf("concurrent get %d: %v", i, err)
+		}
+		if len(snapshots[i].Filters) != 1 || snapshots[i].Filters[0].ID != 2 || snapshots[i].Filters[0].Title != "Unread" {
+			t.Fatalf("concurrent get %d returned %#v, want one Unread folder", i, snapshots[i].Filters)
+		}
+	}
+	final, err := s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("final get dialog filters: %v", err)
+	}
+	if len(final.Filters) != 1 || final.Filters[0].Title != "Unread" {
+		t.Fatalf("persisted folders = %#v, want exactly one Unread folder", final.Filters)
+	}
+}
+
 func TestDialogFilterMarkerSurvivesLastDeleteAndRestart(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dsn := pgtest.DSN(t)
 	s := openDialogFilterStore(t, dsn)
 	owner := mustUser(t, s, "+15551091002")
+	if _, err := s.DialogFilters(ctx, owner.ID); err != nil {
+		t.Fatalf("seed defaults before testing last-folder delete: %v", err)
+	}
 	if err := s.SaveDialogFilter(ctx, owner.ID, store.DialogFilter{ID: 2, Title: "Only", Groups: true}); err != nil {
 		t.Fatalf("save folder: %v", err)
 	}
@@ -163,8 +233,19 @@ func TestDialogFilterInvalidChildRollsBackDefinitionAndMarker(t *testing.T) {
 	ctx := context.Background()
 	s := openDialogFilterStore(t, pgtest.DSN(t))
 	owner := mustUser(t, s, "+15551091003")
-	err := s.SaveDialogFilter(ctx, owner.ID, store.DialogFilter{
-		ID:     2,
+	baseline, err := s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("seed defaults before invalid save: %v", err)
+	}
+	if len(baseline.Filters) != 1 || baseline.Filters[0].Title != "Unread" || baseline.ChangedAt == nil {
+		t.Fatalf("baseline folders = %#v, marker %v; want seeded Unread", baseline.Filters, baseline.ChangedAt)
+	}
+	marker, found, err := s.DialogFilterChangeAt(ctx, owner.ID)
+	if err != nil || !found || !marker.Equal(*baseline.ChangedAt) {
+		t.Fatalf("read baseline marker: %s, found %v, err %v", marker, found, err)
+	}
+	err = s.SaveDialogFilter(ctx, owner.ID, store.DialogFilter{
+		ID:     3,
 		Title:  "Rollback",
 		Groups: true,
 		Entities: []store.DialogFilterEntity{{
@@ -178,10 +259,10 @@ func TestDialogFilterInvalidChildRollsBackDefinitionAndMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read after failed save: %v", err)
 	}
-	if len(snapshot.Filters) != 0 || snapshot.ChangedAt != nil {
+	if len(snapshot.Filters) != 1 || snapshot.Filters[0].ID != 2 || snapshot.Filters[0].Title != "Unread" || snapshot.ChangedAt == nil || !snapshot.ChangedAt.Equal(marker) {
 		t.Fatalf("failed save left filters %#v and marker %v", snapshot.Filters, snapshot.ChangedAt)
 	}
-	if _, found, err := s.DialogFilterChangeAt(ctx, owner.ID); err != nil || found {
-		t.Fatalf("failed save published committed marker: found %v, err %v", found, err)
+	if after, found, err := s.DialogFilterChangeAt(ctx, owner.ID); err != nil || !found || !after.Equal(marker) {
+		t.Fatalf("failed save changed committed marker from %s to %s (found %v, err %v)", marker, after, found, err)
 	}
 }

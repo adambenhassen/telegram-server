@@ -208,11 +208,11 @@ func StartListener(
 	log *slog.Logger,
 	notifyMetrics ...*NotificationMetrics,
 ) (*Listener, func() error, error) {
-	return startListener(ctx, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, nil, nil, log, notifyMetrics...)
+	return startListener(ctx, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, nil, nil, nil, log, notifyMetrics...)
 }
 
-// StartListenerWithDialogFilters adds private-folder invalidation and listener
-// reconnect callbacks for the server process.
+// StartListenerWithDialogFilters adds private-folder invalidation, default
+// folder seed pushes, and listener reconnect callbacks for the server process.
 func StartListenerWithDialogFilters(
 	ctx context.Context,
 	dsn string,
@@ -226,11 +226,12 @@ func StartListenerWithDialogFilters(
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
 	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
 	dialogFilters func(ctx context.Context, ownerID int64),
+	dialogFilterSeed func(ctx context.Context, ownerID int64),
 	reconnected func(),
 	log *slog.Logger,
 	notifyMetrics ...*NotificationMetrics,
 ) (*Listener, func() error, error) {
-	return startListener(ctx, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, dialogFilters, reconnected, log, notifyMetrics...)
+	return startListener(ctx, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, dialogFilters, dialogFilterSeed, reconnected, log, notifyMetrics...)
 }
 
 func startListener(
@@ -246,6 +247,7 @@ func startListener(
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
 	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
 	dialogFilters func(ctx context.Context, ownerID int64),
+	dialogFilterSeed func(ctx context.Context, ownerID int64),
 	reconnected func(),
 	log *slog.Logger,
 	notifyMetrics ...*NotificationMetrics,
@@ -266,7 +268,7 @@ func startListener(
 	l := &Listener{log: log, metrics: metrics, scheduler: newNotificationScheduler(loopCtx)}
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, dialogFilters, reconnected)
+		l.run(loopCtx, conn, dsn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, dialogFilters, dialogFilterSeed, reconnected)
 	})
 
 	stop := func() error {
@@ -314,6 +316,7 @@ func (l *Listener) run(
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
 	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
 	dialogFilters func(ctx context.Context, ownerID int64),
+	dialogFilterSeed func(ctx context.Context, ownerID int64),
 	reconnected func(),
 ) {
 	backoff := listenerBackoffMin
@@ -339,7 +342,7 @@ func (l *Listener) run(
 		}
 
 		up := time.Now()
-		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, dialogFilters)
+		err := l.dispatch(ctx, conn, deliver, typing, evict, channelPost, encryption, status, encryptedMsg, reactions, pinned, dialogFilters, dialogFilterSeed)
 		closeErr := conn.Close(context.Background())
 		conn = nil
 		if ctx.Err() != nil {
@@ -366,6 +369,7 @@ func (l *Listener) dispatch(
 	reactions func(ctx context.Context, ownerID, localID, userID int64),
 	pinned func(ctx context.Context, peerType PeerType, peerID int64, pinnedMsgID int32),
 	dialogFilters func(ctx context.Context, ownerID int64),
+	dialogFilterSeed func(ctx context.Context, ownerID int64),
 ) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
@@ -567,6 +571,25 @@ func (l *Listener) dispatch(
 				},
 			})
 		case ChannelDialogFilters:
+			if ownerPayload, seeded := strings.CutPrefix(n.Payload, "seed|"); seeded {
+				ownerID, perr := strconv.ParseInt(ownerPayload, 10, 64)
+				if perr != nil || ownerID <= 0 {
+					l.recordInvalidNotification()
+					l.log.Warn("bad seeded tg_dialog_filters payload")
+					continue
+				}
+				l.recordValidNotification(ChannelDialogFilters)
+				if dialogFilterSeed != nil {
+					l.schedule("dialog-filter-seed:"+strconv.FormatInt(ownerID, 10), notificationTask{
+						ctx:      ctx,
+						coalesce: true,
+						run: func(ctx context.Context) {
+							dialogFilterSeed(ctx, ownerID)
+						},
+					})
+				}
+				continue
+			}
 			ownerID, perr := strconv.ParseInt(n.Payload, 10, 64)
 			if perr != nil || ownerID <= 0 {
 				l.recordInvalidNotification()

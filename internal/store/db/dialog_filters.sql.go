@@ -27,6 +27,22 @@ func (q *Queries) CommitDialogFilterMutation(ctx context.Context, arg CommitDial
 	return err
 }
 
+const commitUnreadDialogFilterSeed = `-- name: CommitUnreadDialogFilterSeed :exec
+UPDATE user_dialog_filter_state
+SET defaults_seeded = true, order_ids = $2, changed_at = clock_timestamp()
+WHERE owner_id = $1
+`
+
+type CommitUnreadDialogFilterSeedParams struct {
+	OwnerID  int64
+	OrderIds []int16
+}
+
+func (q *Queries) CommitUnreadDialogFilterSeed(ctx context.Context, arg CommitUnreadDialogFilterSeedParams) error {
+	_, err := q.db.Exec(ctx, commitUnreadDialogFilterSeed, arg.OwnerID, arg.OrderIds)
+	return err
+}
+
 const deleteDialogFilter = `-- name: DeleteDialogFilter :execrows
 DELETE FROM user_dialog_filters
 WHERE owner_id = $1 AND filter_id = $2
@@ -191,7 +207,7 @@ func (q *Queries) DialogFilterFolderCount(ctx context.Context, ownerID int64) (i
 }
 
 const dialogFilterState = `-- name: DialogFilterState :one
-SELECT owner_id, order_ids, changed_at
+SELECT owner_id, order_ids, changed_at, defaults_seeded
 FROM user_dialog_filter_state
 WHERE owner_id = $1
 `
@@ -199,12 +215,17 @@ WHERE owner_id = $1
 func (q *Queries) DialogFilterState(ctx context.Context, ownerID int64) (UserDialogFilterState, error) {
 	row := q.db.QueryRow(ctx, dialogFilterState, ownerID)
 	var i UserDialogFilterState
-	err := row.Scan(&i.OwnerID, &i.OrderIds, &i.ChangedAt)
+	err := row.Scan(
+		&i.OwnerID,
+		&i.OrderIds,
+		&i.ChangedAt,
+		&i.DefaultsSeeded,
+	)
 	return i, err
 }
 
 const dialogFilterStateForUpdate = `-- name: DialogFilterStateForUpdate :one
-SELECT owner_id, order_ids, changed_at
+SELECT owner_id, order_ids, changed_at, defaults_seeded
 FROM user_dialog_filter_state
 WHERE owner_id = $1
 FOR UPDATE
@@ -213,7 +234,12 @@ FOR UPDATE
 func (q *Queries) DialogFilterStateForUpdate(ctx context.Context, ownerID int64) (UserDialogFilterState, error) {
 	row := q.db.QueryRow(ctx, dialogFilterStateForUpdate, ownerID)
 	var i UserDialogFilterState
-	err := row.Scan(&i.OwnerID, &i.OrderIds, &i.ChangedAt)
+	err := row.Scan(
+		&i.OwnerID,
+		&i.OrderIds,
+		&i.ChangedAt,
+		&i.DefaultsSeeded,
+	)
 	return i, err
 }
 
@@ -408,12 +434,32 @@ func (q *Queries) LockUpdateState(ctx context.Context, userID int64) (int64, err
 	return user_id, err
 }
 
+const markDialogFilterDefaultsSeeded = `-- name: MarkDialogFilterDefaultsSeeded :exec
+UPDATE user_dialog_filter_state
+SET defaults_seeded = true
+WHERE owner_id = $1
+`
+
+func (q *Queries) MarkDialogFilterDefaultsSeeded(ctx context.Context, ownerID int64) error {
+	_, err := q.db.Exec(ctx, markDialogFilterDefaultsSeeded, ownerID)
+	return err
+}
+
 const notifyDialogFilterMutation = `-- name: NotifyDialogFilterMutation :exec
 SELECT pg_notify('tg_dialog_filters', $1)
 `
 
 func (q *Queries) NotifyDialogFilterMutation(ctx context.Context, pgNotify string) error {
 	_, err := q.db.Exec(ctx, notifyDialogFilterMutation, pgNotify)
+	return err
+}
+
+const notifyDialogFilterSeed = `-- name: NotifyDialogFilterSeed :exec
+SELECT pg_notify('tg_dialog_filters', 'seed|' || CAST($1 AS BIGINT)::TEXT)
+`
+
+func (q *Queries) NotifyDialogFilterSeed(ctx context.Context, ownerID int64) error {
+	_, err := q.db.Exec(ctx, notifyDialogFilterSeed, ownerID)
 	return err
 }
 

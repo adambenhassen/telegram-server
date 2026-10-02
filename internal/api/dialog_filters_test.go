@@ -296,8 +296,18 @@ func TestDialogFiltersAreOwnerScopedAndReadsPruneInaccessiblePeers(t *testing.T)
 	if err := otherFilters.Decode(&bin.Buffer{Buf: otherClient.call(t, &tg.MessagesGetDialogFiltersRequest{})}); err != nil {
 		t.Fatalf("other owner get dialog filters: %v", err)
 	}
-	if len(otherFilters.Filters) != 1 {
-		t.Fatalf("other owner saw %d filters, want only All chats", len(otherFilters.Filters))
+	if len(otherFilters.Filters) != 2 {
+		t.Fatalf("other owner saw %d filters, want All chats and Unread", len(otherFilters.Filters))
+	}
+	if _, ok := otherFilters.Filters[0].(*tg.DialogFilterDefault); !ok {
+		t.Fatalf("other owner's first folder = %T, want All chats", otherFilters.Filters[0])
+	}
+	if unread, ok := otherFilters.Filters[1].(*tg.DialogFilter); !ok || unread.Title.Text != "Unread" {
+		t.Fatalf("other owner's second folder = %#v, want Unread", otherFilters.Filters[1])
+	}
+	baselineMarker, found, err := s.DialogFilterChangeAt(ctx, other.ID)
+	if err != nil || !found {
+		t.Fatalf("read other owner's seeded marker: found %v, err %v", found, err)
 	}
 
 	foreignFilter := &tg.DialogFilter{
@@ -318,8 +328,8 @@ func TestDialogFiltersAreOwnerScopedAndReadsPruneInaccessiblePeers(t *testing.T)
 	if !ok || ownerPending {
 		t.Fatalf("rejected mutation affected another owner's connection: generation %d covered %d first %v pending %v ok %v", generation, covered, first, ownerPending, ok)
 	}
-	if _, found, err := s.DialogFilterChangeAt(ctx, other.ID); err != nil || found {
-		t.Fatalf("rejected peer mutation changed the durable marker: found %v, err %v", found, err)
+	if marker, found, err := s.DialogFilterChangeAt(ctx, other.ID); err != nil || !found || !marker.Equal(baselineMarker) {
+		t.Fatalf("rejected peer mutation changed the durable marker from %s to %s (found %v, err %v)", baselineMarker, marker, found, err)
 	}
 
 	removed, _, _, err := s.RemoveChatUser(ctx, group.ID, owner.ID, creator.ID)
@@ -352,6 +362,78 @@ func TestDialogFiltersAreOwnerScopedAndReadsPruneInaccessiblePeers(t *testing.T)
 	badHashMutation := &tg.MessagesUpdateDialogFilterRequest{ID: 4, Filter: badHashFilter}
 	badHashMutation.SetFlags()
 	requireDialogFilterRPCError(t, ownerClient.call(t, badHashMutation), "PEER_ID_INVALID")
+}
+
+func TestSuggestedDialogFiltersOfferOnlyMissingUnreadAndPersonal(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithoutBlobStore())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	owner, err := s.CreateUser(ctx, "+15551090099")
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	client := newDialogFilterRPC(t, s, owner.ID)
+	getSuggestions := func() []tg.DialogFilterSuggested {
+		t.Helper()
+		var got tg.DialogFilterSuggestedVector
+		if err := got.Decode(&bin.Buffer{Buf: client.call(t, &tg.MessagesGetSuggestedDialogFiltersRequest{})}); err != nil {
+			t.Fatalf("decode suggested folders: %v", err)
+		}
+		return got.Elems
+	}
+	assertSuggestion := func(got tg.DialogFilterSuggested, id int, title, description string) *tg.DialogFilter {
+		t.Helper()
+		filter, ok := got.Filter.(*tg.DialogFilter)
+		if !ok || filter.ID != id || filter.Title.Text != title || got.Description != description {
+			t.Fatalf("suggestion = %#v, want ID %d %s with description %q", got, id, title, description)
+		}
+		return filter
+	}
+
+	initial := getSuggestions()
+	if len(initial) != 2 {
+		t.Fatalf("initial suggestions = %d, want Unread and Personal", len(initial))
+	}
+	unread := assertSuggestion(initial[0], 2, "Unread", "Chats with unread messages")
+	if !unread.Contacts || !unread.NonContacts || !unread.Groups || !unread.Broadcasts || !unread.Bots || !unread.ExcludeRead {
+		t.Fatalf("Unread suggestion = %+v, want all chat types excluding read chats", unread)
+	}
+	personal := assertSuggestion(initial[1], 3, "Personal", "Private chats")
+	if !personal.Contacts || !personal.NonContacts || personal.Groups || personal.Broadcasts || personal.Bots || personal.ExcludeRead {
+		t.Fatalf("Personal suggestion = %+v, want private contacts and non-contacts only", personal)
+	}
+
+	var folders tg.MessagesDialogFilters
+	if err := folders.Decode(&bin.Buffer{Buf: client.call(t, &tg.MessagesGetDialogFiltersRequest{})}); err != nil {
+		t.Fatalf("get dialog filters: %v", err)
+	}
+	if len(folders.Filters) != 2 {
+		t.Fatalf("first get dialog filters returned %d folders, want All chats and Unread", len(folders.Filters))
+	}
+	if seeded, ok := folders.Filters[1].(*tg.DialogFilter); !ok || seeded.Title.Text != "Unread" {
+		t.Fatalf("first seeded folder = %#v, want Unread", folders.Filters[1])
+	}
+	remaining := getSuggestions()
+	if len(remaining) != 1 {
+		t.Fatalf("suggestions after seeding Unread = %d, want only Personal", len(remaining))
+	}
+	assertSuggestion(remaining[0], 3, "Personal", "Private chats")
+
+	personal.SetFlags()
+	upsert := &tg.MessagesUpdateDialogFilterRequest{ID: 3, Filter: personal}
+	upsert.SetFlags()
+	requireDialogFilterBool(t, client.call(t, upsert))
+	if got := getSuggestions(); len(got) != 0 {
+		t.Fatalf("suggestions after adding both folders = %d, want none", len(got))
+	}
 }
 
 func TestDialogFilterChannelPeersRequireOwnerHashAndActiveMembership(t *testing.T) {

@@ -37,6 +37,7 @@ func TestListenerRoutesOnlyOwnerFromDialogFilterNotification(t *testing.T) {
 		func(context.Context, int64, int64, int64) {},
 		func(context.Context, store.PeerType, int64, int32) {},
 		func(_ context.Context, id int64) { got <- id },
+		func(context.Context, int64) {},
 		func() {},
 		slog.New(slog.DiscardHandler),
 	)

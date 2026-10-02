@@ -4,15 +4,25 @@ VALUES ($1)
 ON CONFLICT (owner_id) DO NOTHING;
 
 -- name: DialogFilterState :one
-SELECT owner_id, order_ids, changed_at
+SELECT owner_id, order_ids, changed_at, defaults_seeded
 FROM user_dialog_filter_state
 WHERE owner_id = $1;
 
 -- name: DialogFilterStateForUpdate :one
-SELECT owner_id, order_ids, changed_at
+SELECT owner_id, order_ids, changed_at, defaults_seeded
 FROM user_dialog_filter_state
 WHERE owner_id = $1
 FOR UPDATE;
+
+-- name: MarkDialogFilterDefaultsSeeded :exec
+UPDATE user_dialog_filter_state
+SET defaults_seeded = true
+WHERE owner_id = $1;
+
+-- name: CommitUnreadDialogFilterSeed :exec
+UPDATE user_dialog_filter_state
+SET defaults_seeded = true, order_ids = $2, changed_at = clock_timestamp()
+WHERE owner_id = $1;
 
 -- name: LockUpdateState :one
 SELECT user_id
@@ -110,6 +120,9 @@ WHERE owner_id = $1;
 
 -- name: NotifyDialogFilterMutation :exec
 SELECT pg_notify('tg_dialog_filters', $1);
+
+-- name: NotifyDialogFilterSeed :exec
+SELECT pg_notify('tg_dialog_filters', 'seed|' || CAST(sqlc.arg(owner_id) AS BIGINT)::TEXT);
 
 -- name: DialogFilterChatMemberships :many
 SELECT chat_id

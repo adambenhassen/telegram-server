@@ -35,6 +35,10 @@ func TestSmoke(t *testing.T) {
 		t.Parallel()
 		testSmokeSavedMessages(t)
 	})
+	t.Run("default-dialog-filter", func(t *testing.T) {
+		t.Parallel()
+		testSmokeDefaultDialogFilter(t)
+	})
 	t.Run("dialog-filters", func(t *testing.T) {
 		t.Parallel()
 		testSmokeDialogFilters(t)
@@ -215,6 +219,45 @@ func testSmokeSavedMessages(t *testing.T) {
 	assertNoMessageFor(t, f.ctx, client.seen.newMsg, "Saved Messages session")
 }
 
+func testSmokeDefaultDialogFilter(t *testing.T) {
+	t.Helper()
+	f := newSmokeFixture(t)
+	const phone = "+15551049003"
+	seedPhoneUsers(t, f.ctx, f.store, phone)
+	client := newSmokeClient(t, f, "A1", phone)
+	otherSession := newSmokeClient(t, f, "A2", phone)
+
+	var listed *tg.MessagesDialogFilters
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		listed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("first get dialog filters: %v", err)
+	}
+	if listed.TagsEnabled || len(listed.Filters) != 2 {
+		t.Fatalf("first get returned %d folders with tags enabled=%v, want All chats and Unread", len(listed.Filters), listed.TagsEnabled)
+	}
+	if _, ok := listed.Filters[0].(*tg.DialogFilterDefault); !ok {
+		t.Fatalf("first folder = %T, want All chats", listed.Filters[0])
+	}
+	unread, ok := listed.Filters[1].(*tg.DialogFilter)
+	if !ok || unread.ID != 2 || unread.Title.Text != "Unread" || !unread.Contacts || !unread.NonContacts || !unread.Groups || !unread.Broadcasts || !unread.Bots || !unread.ExcludeRead {
+		t.Fatalf("second folder = %#v, want all-types Unread", listed.Filters[1])
+	}
+
+	select {
+	case update := <-otherSession.push.dialogFilter:
+		filter, ok := update.GetFilter()
+		folder, folderOK := filter.(*tg.DialogFilter)
+		if !ok || !folderOK || update.ID != 2 || folder.Title.Text != "Unread" || !folder.ExcludeRead {
+			t.Fatalf("other session update = %#v, want updateDialogFilter for Unread", update)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("other session did not receive updateDialogFilter for seeded Unread")
+	}
+}
+
 func testSmokeDialogFilters(t *testing.T) {
 	t.Helper()
 	f := newSmokeFixture(t)
@@ -323,11 +366,14 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("other owner get dialog filters: %v", err)
 	}
-	if isolated.TagsEnabled || len(isolated.Filters) != 1 {
-		t.Fatalf("other owner saw %d folders with tags enabled=%v, want only All chats", len(isolated.Filters), isolated.TagsEnabled)
+	if isolated.TagsEnabled || len(isolated.Filters) != 2 {
+		t.Fatalf("other owner saw %d folders with tags enabled=%v, want All chats and Unread", len(isolated.Filters), isolated.TagsEnabled)
 	}
 	if _, ok := isolated.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("other owner's first folder = %T, want All chats", isolated.Filters[0])
+	}
+	if unread, ok := isolated.Filters[1].(*tg.DialogFilter); !ok || unread.Title.Text != "Unread" {
+		t.Fatalf("other owner's second folder = %#v, want Unread", isolated.Filters[1])
 	}
 
 	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
@@ -371,8 +417,11 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("other owner get dialog filters after restart: %v", err)
 	}
-	if len(isolated.Filters) != 1 {
-		t.Fatalf("other owner saw %d folders after restart, want only All chats", len(isolated.Filters))
+	if len(isolated.Filters) != 2 {
+		t.Fatalf("other owner saw %d folders after restart, want All chats and Unread", len(isolated.Filters))
+	}
+	if unread, ok := isolated.Filters[1].(*tg.DialogFilter); !ok || unread.Title.Text != "Unread" {
+		t.Fatalf("other owner's persisted second folder = %#v, want Unread", isolated.Filters[1])
 	}
 	deleteRequest := &tg.MessagesUpdateDialogFilterRequest{ID: 2}
 	deleteRequest.SetFlags()
@@ -403,8 +452,14 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("get suggested dialog filters: %v", err)
 	}
-	if len(suggested) != 0 {
-		t.Fatalf("suggested filters = %d, want empty", len(suggested))
+	if len(suggested) != 2 {
+		t.Fatalf("suggested filters = %d, want Unread and Personal after deleting the custom folder", len(suggested))
+	}
+	for i, want := range []string{"Unread", "Personal"} {
+		filter, ok := suggested[i].Filter.(*tg.DialogFilter)
+		if !ok || filter.Title.Text != want || suggested[i].Description == "" {
+			t.Fatalf("suggested filter %d = %#v, want %s with a description", i, suggested[i], want)
+		}
 	}
 }
 

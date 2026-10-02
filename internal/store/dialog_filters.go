@@ -59,18 +59,121 @@ type DialogFilter struct {
 
 // DialogFilterSnapshot is a consistent read of one owner's folders and order.
 type DialogFilterSnapshot struct {
-	Filters   []DialogFilter
-	Order     []int
-	ChangedAt *time.Time
+	Filters        []DialogFilter
+	Order          []int
+	ChangedAt      *time.Time
+	defaultsSeeded bool
 }
 
 // ErrDialogFilterLimit reports that the owner already has the maximum number
 // of custom folders.
 var ErrDialogFilterLimit = errors.New("dialog filter limit reached")
 
-// DialogFilters returns a repeatable-read snapshot. A missing state row is the
-// default All chats order and has no committed-change marker.
+// DialogFilters lazily seeds the default Unread folder once, then returns a
+// repeatable-read snapshot of the owner's folders and order.
 func (s *Store) DialogFilters(ctx context.Context, ownerID int64) (DialogFilterSnapshot, error) {
+	snapshot, err := s.readDialogFilters(ctx, ownerID)
+	if err != nil {
+		return DialogFilterSnapshot{}, err
+	}
+	if snapshot.defaultsSeeded {
+		return snapshot, nil
+	}
+	if err := s.seedDefaultUnreadDialogFilter(ctx, ownerID); err != nil {
+		return DialogFilterSnapshot{}, err
+	}
+	return s.readDialogFilters(ctx, ownerID)
+}
+
+// DialogFilterDefinitions returns stored folders without seeding defaults.
+// Suggested folders use this read so asking for recommendations does not
+// initialize an account's folder state.
+func (s *Store) DialogFilterDefinitions(ctx context.Context, ownerID int64) ([]DialogFilter, error) {
+	snapshot, err := s.readDialogFilters(ctx, ownerID)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Filters, nil
+}
+
+func (s *Store) seedDefaultUnreadDialogFilter(ctx context.Context, ownerID int64) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin default dialog filter seed: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+	if err := qtx.EnsureDialogFilterState(ctx, ownerID); err != nil {
+		cause := fmt.Errorf("ensure default dialog filter state: %w", err)
+		return rollbackDialogFilterMutation(tx, cause)
+	}
+	state, err := qtx.DialogFilterStateForUpdate(ctx, ownerID)
+	if err != nil {
+		cause := fmt.Errorf("lock default dialog filter state: %w", err)
+		return rollbackDialogFilterMutation(tx, cause)
+	}
+	if state.DefaultsSeeded {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit default dialog filter seed check: %w", err)
+		}
+		return nil
+	}
+
+	rows, err := qtx.ListDialogFilters(ctx, ownerID)
+	if err != nil {
+		cause := fmt.Errorf("check existing folders before default seed: %w", err)
+		return rollbackDialogFilterMutation(tx, cause)
+	}
+	if len(rows) > 0 {
+		if err := qtx.MarkDialogFilterDefaultsSeeded(ctx, ownerID); err != nil {
+			cause := fmt.Errorf("mark existing folders as initialized: %w", err)
+			return rollbackDialogFilterMutation(tx, cause)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit existing dialog filter initialization: %w", err)
+		}
+		return nil
+	}
+
+	if err := qtx.UpsertDialogFilter(ctx, db.UpsertDialogFilterParams{
+		OwnerID:     ownerID,
+		FilterID:    2,
+		Title:       "Unread",
+		Contacts:    true,
+		NonContacts: true,
+		Groups:      true,
+		Broadcasts:  true,
+		Bots:        true,
+		ExcludeRead: true,
+	}); err != nil {
+		cause := fmt.Errorf("insert default Unread folder: %w", err)
+		return rollbackDialogFilterMutation(tx, cause)
+	}
+	order := NormalizeDialogFilterOrder(dialogFilterIDs(state.OrderIds), []int{2})
+	orderIDs, err := dialogFilterOrderIDs(order)
+	if err != nil {
+		cause := fmt.Errorf("encode default folder order: %w", err)
+		return rollbackDialogFilterMutation(tx, cause)
+	}
+	if err := qtx.CommitUnreadDialogFilterSeed(ctx, db.CommitUnreadDialogFilterSeedParams{
+		OwnerID: ownerID, OrderIds: orderIDs,
+	}); err != nil {
+		cause := fmt.Errorf("commit default dialog filter seed state: %w", err)
+		return rollbackDialogFilterMutation(tx, cause)
+	}
+	if err := qtx.NotifyDialogFilterSeed(ctx, ownerID); err != nil {
+		cause := fmt.Errorf("notify default dialog filter seed: %w", err)
+		return rollbackDialogFilterMutation(tx, cause)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit default dialog filter seed: %w", err)
+	}
+	return nil
+}
+
+// readDialogFilters returns a repeatable-read snapshot without changing the
+// owner's folder state.
+func (s *Store) readDialogFilters(ctx context.Context, ownerID int64) (DialogFilterSnapshot, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return DialogFilterSnapshot{}, fmt.Errorf("begin dialog filters read: %w", err)
@@ -86,6 +189,7 @@ func (s *Store) DialogFilters(ctx context.Context, ownerID int64) (DialogFilterS
 	case err != nil:
 		return DialogFilterSnapshot{}, fmt.Errorf("read dialog filter state: %w", err)
 	default:
+		snapshot.defaultsSeeded = state.DefaultsSeeded
 		snapshot.Order = dialogFilterIDs(state.OrderIds)
 		if state.ChangedAt.Valid {
 			changedAt := state.ChangedAt.Time
