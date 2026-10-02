@@ -80,7 +80,7 @@ func (s *Server) detectCodec(sock net.Conn) (transport.Conn, error) {
 	if err != nil {
 		return nil, errors.Join(errors.New("detect codec"), err)
 	}
-	return conn, nil
+	return peerReadTransport{Conn: conn, readConn: stream}, nil
 }
 
 // peerAddr parses the transport peer address of an accepted socket. An address

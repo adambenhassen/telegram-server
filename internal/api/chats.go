@@ -181,13 +181,15 @@ func (h *handlers) handleCreateChat(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("create chat", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	missing, err = h.addMissingCreatedChatInvitees(r.Ctx, chat.ID, members, missing)
+	completionCtx, cancelCompletion := chatCompletionContext(r.ServerContext(), r.Ctx)
+	defer cancelCompletion()
+	missing, err = h.addMissingCreatedChatInvitees(completionCtx, chat.ID, members, missing)
 	if err != nil {
 		h.log.Error("create chat: inspect participants", "chat_id", chat.ID, "err", err)
 		return nil, errInternal
 	}
 
-	sender, perOwner, _, err := h.store.SendChatMessage(r.Ctx, store.FanOut{
+	sender, perOwner, _, err := h.store.SendChatMessage(completionCtx, store.FanOut{
 		ChatID: chat.ID, FromID: r.UserID, Text: title, Action: store.ChatActionCreate,
 	})
 	if err != nil {
@@ -196,13 +198,35 @@ func (h *handlers) handleCreateChat(r *mtproto.Request) (bin.Encoder, error) {
 	}
 	h.notifyOwners(r.Ctx, perOwner, 0)
 
-	ups, err := h.chatUpdate(r.Ctx, r.UserID, chat, sender, perOwner, memberIDs(perOwner))
+	ups, err := h.chatUpdate(completionCtx, r.UserID, chat, sender, perOwner, memberIDs(perOwner))
 	if err != nil {
 		h.log.Error("create chat updates", "chat_id", chat.ID, "err", err)
 		return nil, errInternal
 	}
 	// TTLPeriod is accepted and ignored: M6 stores no per-chat message TTL.
 	return &tg.MessagesInvitedUsers{Updates: ups, MissingInvitees: missing}, nil
+}
+
+// chatCompletionContext carries the connection's server lifetime and the
+// original RPC deadline across the first committed CreateChat transaction.
+// Peer cancellation must not strand a chat without its announcement, while a
+// request deadline and server shutdown still bound the completion work.
+func chatCompletionContext(serverCtx, rpcCtx context.Context) (context.Context, context.CancelFunc) {
+	if serverCtx == nil {
+		serverCtx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(serverCtx)
+	if rpcCtx == nil {
+		return ctx, cancel
+	}
+	if deadline, ok := rpcCtx.Deadline(); ok {
+		deadlineCtx, cancelDeadline := context.WithDeadline(ctx, deadline)
+		return deadlineCtx, func() {
+			cancelDeadline()
+			cancel()
+		}
+	}
+	return ctx, cancel
 }
 
 // handleEditChatTitle serves messages.editChatTitle: one store call renames the

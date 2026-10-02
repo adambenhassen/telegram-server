@@ -86,6 +86,8 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID i
 		MsgID:       msg.MessageID,
 		Buf:         b,
 		Ctx:         ctx,
+		serverCtx:   ctx,
+		peerRPC:     c.peerRPC.Load(),
 	})
 }
 
@@ -93,6 +95,9 @@ func (s *Server) rpcHandle(ctx context.Context, c *Conn, b *bin.Buffer, userID i
 // directly, containers and gzip are unwrapped, and everything else is passed to
 // the RPC handler. Mirrors gotd tgtest/handle.go.
 func (s *Server) handle(c *Conn, req *Request) (err error) {
+	if req.peerRPC != nil && req.peerRPC.disconnected() {
+		return nil
+	}
 	in := req.Buf
 	id, err := in.PeekID()
 	if err != nil {
@@ -142,6 +147,9 @@ func (s *Server) handle(c *Conn, req *Request) (err error) {
 			return fmt.Errorf("container: %w", err)
 		}
 		for i := range container.Messages {
+			if req.peerRPC != nil && req.peerRPC.disconnected() {
+				return nil
+			}
 			m := container.Messages[i]
 			if err := s.handle(c, &Request{
 				AuthKeyID:   req.AuthKeyID,
@@ -152,6 +160,8 @@ func (s *Server) handle(c *Conn, req *Request) (err error) {
 				MsgID:       m.ID,
 				Buf:         &bin.Buffer{Buf: m.Body},
 				Ctx:         req.Ctx,
+				serverCtx:   req.serverCtx,
+				peerRPC:     req.peerRPC,
 			}); err != nil {
 				return err
 			}
@@ -171,6 +181,14 @@ func (s *Server) handle(c *Conn, req *Request) (err error) {
 		req.Ctx, cancel = context.WithTimeout(req.Ctx, s.rpcDeadline)
 		defer cancel()
 	}
+	if req.peerRPC != nil {
+		activeCtx, finish, started := req.peerRPC.begin(req.UserID, req.Ctx)
+		if !started {
+			return nil
+		}
+		req.Ctx = activeCtx
+		defer finish()
+	}
 
 	if s.rpcTracer == nil || !s.rpcTracer.Enabled() {
 		return s.dispatchRPC(c, req)
@@ -184,8 +202,18 @@ func (s *Server) handle(c *Conn, req *Request) (err error) {
 
 func (s *Server) dispatchRPC(c *Conn, req *Request) error {
 	if err := s.handler.OnMessage(c, req); err != nil {
+		if errors.Is(err, errPeerRPCReplySkipped) || req.PeerDisconnected() {
+			// The peer cannot receive a reply. Finish connection-owned lifecycle
+			// work under the frame context, then let connection teardown proceed;
+			// an unavailable transport must not short-circuit that cleanup.
+			return nil
+		}
 		if rpcErr, ok := errors.AsType[*tgerr.Error](err); ok {
-			return c.SendErr(req, rpcErr)
+			sendErr := c.SendErr(req, rpcErr)
+			if errors.Is(sendErr, errPeerRPCReplySkipped) {
+				return nil
+			}
+			return sendErr
 		}
 		// A handler still running when its request deadline fired is abandoned,
 		// not fatal to the connection: the client gets the same generic INTERNAL

@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -164,6 +165,8 @@ type Server struct {
 	pendingLoginLifetime   time.Duration
 	pendingLoginCapLog     logSampler
 	pendingLoginCeilingLog logSampler
+	// rpcCancelBudget is shared by every connection handled by this replica.
+	rpcCancelBudget *rpcCancelBudget
 
 	// onStatusChange fires when a user's connection count transitions between
 	// zero and non-zero. Called after the registry has been updated, so a
@@ -294,6 +297,7 @@ func New(key exchange.PrivateKey, dcID int, keys AuthKeyStore, handler Handler, 
 		unboundKeys:          newUnboundKeyLimiter(DefaultMaxConnsPerUnboundKey),
 		pendingLogins:        newPendingLoginLimiter(DefaultMaxPendingLoginConns),
 		pendingLoginLifetime: DefaultPendingLoginLifetime,
+		rpcCancelBudget:      newRPCCancelBudget(c.Now, maxRPCCancelUsers),
 		log:                  log,
 	}
 }
@@ -598,13 +602,21 @@ func isDisconnect(err error) bool {
 // frame that decrypts under a key this server issued. It is nil for a connection
 // that was never accepted through a listener.
 func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr netip.Addr, slot *preAuthSlot) (rErr error) {
+	conn := newConn(tconn, s.cipher, s.msgID, s.clock, s.writeTimeout, s.log)
+	peerRPC := newPeerRPCState(s.rpcCancelBudget)
+	conn.peerRPC.Store(peerRPC)
+	stopServerClose := context.AfterFunc(ctx, peerRPC.serverClosed)
+	var reader *rpcFrameReader
 	defer func() {
-		if err := tconn.Close(); err != nil && rErr == nil && !isDisconnect(err) {
+		stopServerClose()
+		if err := conn.Close(); err != nil && rErr == nil && !isDisconnect(err) {
 			rErr = err
 		}
+		if reader != nil {
+			reader.stop()
+			reader.join()
+		}
 	}()
-
-	conn := newConn(tconn, s.cipher, s.msgID, s.clock, s.writeTimeout, s.log)
 	// The not-implemented sampler holds its suppressed count open until a later
 	// line on this conn, and a conn that ends or goes quiet has no later line.
 	// The drop writes whatever it owes, before the socket closes and never
@@ -674,6 +686,21 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 	defer pending.release()
 	var pendingLoginObserved bool
 	var pendingLoginDeadline time.Time
+	var pendingLoginDeadlineNS atomic.Int64
+	readDeadline := func() time.Time {
+		if deadline := pendingLoginDeadlineNS.Load(); deadline != 0 {
+			return time.Unix(0, deadline)
+		}
+		// MarkPendingLogin publishes its timestamp before the marker, so the
+		// reader can enforce the absolute ceiling immediately after dispatch,
+		// before this serve loop has acquired the process-wide pending slot.
+		if conn.PendingLogin() {
+			if since := conn.pendingLoginSince(); !since.IsZero() {
+				return since.Add(s.pendingLoginLifetime)
+			}
+		}
+		return time.Time{}
+	}
 	var pendingLoginTimer *time.Timer
 	defer func() {
 		if pendingLoginTimer != nil {
@@ -681,7 +708,13 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		}
 	}()
 	for {
-		if err := s.read(ctx, tconn, b, pendingLoginDeadline); err != nil {
+		var err error
+		if reader == nil {
+			err = s.read(ctx, tconn, b, pendingLoginDeadline)
+		} else {
+			b, err, _ = reader.next()
+		}
+		if err != nil {
 			return err
 		}
 
@@ -702,10 +735,14 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 			// Before runExchange, not after: gotd applies its own 60s
 			// DefaultTimeout per handshake read, wider than the frame deadline.
 			bind(0)
-			if err := s.runExchange(ctx, tconn, b, clientAddr); err != nil {
-				unexpected, ok := errors.AsType[*exchange.UnexpectedEncryptedError](err)
+			exchangeErr := s.runExchange(ctx, tconn, b, clientAddr)
+			if reader != nil {
+				reader.resumeExchange()
+			}
+			if exchangeErr != nil {
+				unexpected, ok := errors.AsType[*exchange.UnexpectedEncryptedError](exchangeErr)
 				if !ok {
-					return err
+					return exchangeErr
 				}
 				b.ResetTo(unexpected.Frame)
 				authKeyID = unexpected.AuthKeyID
@@ -744,6 +781,11 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 		}
 
 		conn.setKey(key)
+		if reader == nil {
+			if _, ok := tconn.(peerReadTransport); ok {
+				reader = newRPCFrameReader(s, ctx, tconn, peerRPC, readDeadline)
+			}
+		}
 		// The slot is handed to rpcHandle, which clears it the instant the
 		// frame's MAC verifies, and not at the registry bind below: a client
 		// between key exchange and sign-in has no user to bind to and is waiting
@@ -794,6 +836,7 @@ func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr
 				pendingLoginSince = s.clock.Now()
 			}
 			pendingLoginDeadline = pendingLoginSince.Add(s.pendingLoginLifetime)
+			pendingLoginDeadlineNS.Store(pendingLoginDeadline.UnixNano())
 			pendingLoginDelay := max(0, time.Until(pendingLoginDeadline))
 			pendingLoginTimer = time.AfterFunc(pendingLoginDelay, func() {
 				if err := conn.Close(); err != nil && !isDisconnect(err) {
