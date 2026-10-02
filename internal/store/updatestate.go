@@ -23,7 +23,7 @@ const (
 )
 
 // State is a user's current update sequence, mirroring updates.State on the
-// wire. Date is unix seconds; UnreadCount is summed across the user's dialogs.
+// wire. Date is unix seconds; UnreadCount is summed across basic and channel dialogs.
 type State struct {
 	Pts         int
 	Qts         int
@@ -80,30 +80,26 @@ func (s *Store) EnsureUpdateState(ctx context.Context, userID int64) error {
 }
 
 // State returns the user's current pts/seq/date and total unread count. A user
-// with no update_state row yet (fresh account that never participated in a send)
-// reports the zero state (pts 0), so getState/getDifference work immediately.
+// with no update_state row yet reports the zero update state while retaining
+// the total unread count from basic and channel dialogs.
 func (s *Store) State(ctx context.Context, userID int64) (State, error) {
 	row, err := s.q.GetState(ctx, userID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return State{}, nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return State{}, fmt.Errorf("get state: %w", err)
 	}
-	var unread int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(SUM(unread_count), 0) FROM dialogs WHERE owner_id = $1`,
-		userID,
-	).Scan(&unread); err != nil {
+	hasState := err == nil
+	unread, err := s.q.UnreadCountForOwner(ctx, userID)
+	if err != nil {
 		return State{}, fmt.Errorf("sum unread: %w", err)
 	}
-	return State{
-		Pts:         int(row.Pts),
-		Qts:         int(row.Qts),
-		Seq:         int(row.Seq),
-		Date:        int(row.Date.Time.Unix()),
-		UnreadCount: unread,
-	}, nil
+	state := State{UnreadCount: int(unread)}
+	if hasState {
+		state.Pts = int(row.Pts)
+		state.Qts = int(row.Qts)
+		state.Seq = int(row.Seq)
+		state.Date = int(row.Date.Time.Unix())
+	}
+	return state, nil
 }
 
 // EventsSince returns the user's events with pts strictly greater than fromPts,

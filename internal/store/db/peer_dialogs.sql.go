@@ -316,9 +316,31 @@ func (q *Queries) PeerDialogsForOwner(ctx context.Context, arg PeerDialogsForOwn
 }
 
 const unreadCountForOwner = `-- name: UnreadCountForOwner :one
-SELECT COALESCE(SUM(unread_count), 0)::bigint
-FROM dialogs
-WHERE owner_id = $1::bigint
+SELECT ((
+    SELECT COALESCE(SUM(d.unread_count), 0)
+    FROM dialogs d
+    WHERE d.owner_id = $1::bigint
+) + (
+    SELECT COALESCE(SUM(unread.unread_count), 0)
+    FROM channel_participants p
+    LEFT JOIN channel_read_state read_state
+      ON read_state.channel_id = p.channel_id AND read_state.user_id = p.user_id
+    CROSS JOIN LATERAL (
+        SELECT LEAST(count(*), 1000)::bigint AS unread_count
+        FROM (
+            SELECT cm.local_id
+            FROM channel_messages cm
+            WHERE cm.channel_id = p.channel_id
+              AND cm.from_id <> p.user_id
+              AND cm.deleted = false
+              AND cm.local_id > COALESCE(read_state.read_max_id, 0)
+            ORDER BY cm.local_id
+            LIMIT 1001
+        ) unread_posts
+    ) unread
+    WHERE p.user_id = $1::bigint
+      AND (p.banned_until IS NULL OR p.banned_until <= now())
+))::bigint
 `
 
 func (q *Queries) UnreadCountForOwner(ctx context.Context, ownerID int64) (int64, error) {

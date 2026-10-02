@@ -29,6 +29,10 @@ func TestChannelsReadHistoryAdvancesMonotonicallyAndPersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create reader: %v", err)
 	}
+	basicSender, err := s.CreateUser(ctx, "+15551239903")
+	if err != nil {
+		t.Fatalf("create basic-message sender: %v", err)
+	}
 	channel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "Read state"})
 	invite, err := s.CreateChannelInvite(ctx, channel.ID, creator.ID)
 	if err != nil {
@@ -39,10 +43,24 @@ func TestChannelsReadHistoryAdvancesMonotonicallyAndPersists(t *testing.T) {
 	}
 	first := postReadHistoryChannelMessage(t, ctx, s, channel.ID, creator.ID, "first", 123901)
 	second := postReadHistoryChannelMessage(t, ctx, s, channel.ID, creator.ID, "second", 123902)
+	if _, _, _, _, err := s.SendMessage(ctx, basicSender.ID, reader.ID, "basic unread", 123903, 0, 0); err != nil {
+		t.Fatalf("send basic unread message: %v", err)
+	}
+	creatorState, err := s.State(ctx, creator.ID)
+	if err != nil {
+		t.Fatalf("creator update state before read: %v", err)
+	}
+	creatorEvents, err := s.EventsSince(ctx, creator.ID, 0)
+	if err != nil {
+		t.Fatalf("creator events before read: %v", err)
+	}
+	creatorReadMarker := readChannelMarker(t, ctx, dsn, channel.ID, creator.ID)
+	channelExec(t, ctx, dsn, `DELETE FROM update_state WHERE user_id = $1`, reader.ID)
 	h := fullChannelDispatcher(s)
 
 	requireChannelReadState(t, s, reader.ID, channel.ID, 0, 2)
 	requirePeerChannelReadState(t, s, reader.ID, channel.ID, 0, 2)
+	requireChannelOwnerUnreadTotal(t, s, reader.ID, channel.ID, 3)
 
 	readerState, err := s.State(ctx, reader.ID)
 	if err != nil {
@@ -66,12 +84,14 @@ func TestChannelsReadHistoryAdvancesMonotonicallyAndPersists(t *testing.T) {
 	}
 	requireChannelReadState(t, s, reader.ID, channel.ID, first.LocalID, 1)
 	requirePeerChannelReadState(t, s, reader.ID, channel.ID, first.LocalID, 1)
+	requireChannelOwnerUnreadTotal(t, s, reader.ID, channel.ID, 2)
 
 	if ok, rpc := channelsReadHistoryViaDispatcher(t, h, reader.ID, false, api.InputChannel(reader.ID, channel.ID), int(second.LocalID)); rpc != nil || !ok {
 		t.Fatalf("channels.readHistory through second post: ok=%v rpc=%v", ok, rpc)
 	}
 	requireChannelReadState(t, s, reader.ID, channel.ID, second.LocalID, 0)
 	requirePeerChannelReadState(t, s, reader.ID, channel.ID, second.LocalID, 0)
+	requireChannelOwnerUnreadTotal(t, s, reader.ID, channel.ID, 1)
 
 	fullResponse, rpc := getFullChannelViaDispatcher(t, h, reader.ID, false, api.InputChannel(reader.ID, channel.ID))
 	if rpc != nil {
@@ -103,14 +123,17 @@ func TestChannelsReadHistoryAdvancesMonotonicallyAndPersists(t *testing.T) {
 
 	third := postReadHistoryChannelMessage(t, ctx, s, channel.ID, creator.ID, "third", 123903)
 	requireChannelReadState(t, reopened, reader.ID, channel.ID, second.LocalID, 1)
+	requireChannelOwnerUnreadTotal(t, s, reader.ID, channel.ID, 2)
 	if ok, rpc := channelsReadHistoryViaDispatcher(t, h, reader.ID, false, api.InputChannel(reader.ID, channel.ID), int(second.LocalID)); rpc != nil || !ok {
 		t.Fatalf("read through second post after later post: ok=%v rpc=%v", ok, rpc)
 	}
 	requireChannelReadState(t, s, reader.ID, channel.ID, second.LocalID, 1)
+	requireChannelOwnerUnreadTotal(t, s, reader.ID, channel.ID, 2)
 	if ok, rpc := channelsReadHistoryViaDispatcher(t, h, reader.ID, false, api.InputChannel(reader.ID, channel.ID), int(third.LocalID+100)); rpc != nil || !ok {
 		t.Fatalf("clamped channels.readHistory: ok=%v rpc=%v", ok, rpc)
 	}
 	requireChannelReadState(t, s, reader.ID, channel.ID, third.LocalID, 0)
+	requireChannelOwnerUnreadTotal(t, s, reader.ID, channel.ID, 1)
 
 	readerStateAfter, err := s.State(ctx, reader.ID)
 	if err != nil {
@@ -126,6 +149,24 @@ func TestChannelsReadHistoryAdvancesMonotonicallyAndPersists(t *testing.T) {
 	if !reflect.DeepEqual(readerEventsAfter, readerEvents) {
 		t.Errorf("channel read changed reader events: before=%+v after=%+v", readerEvents, readerEventsAfter)
 	}
+	creatorStateAfter, err := s.State(ctx, creator.ID)
+	if err != nil {
+		t.Fatalf("creator update state after read: %v", err)
+	}
+	if !reflect.DeepEqual(creatorStateAfter, creatorState) {
+		t.Errorf("channel read changed author update state: before=%+v after=%+v", creatorState, creatorStateAfter)
+	}
+	creatorEventsAfter, err := s.EventsSince(ctx, creator.ID, 0)
+	if err != nil {
+		t.Fatalf("creator events after read: %v", err)
+	}
+	if !reflect.DeepEqual(creatorEventsAfter, creatorEvents) {
+		t.Errorf("channel read created author events: before=%+v after=%+v", creatorEvents, creatorEventsAfter)
+	}
+	if got := readChannelMarker(t, ctx, dsn, channel.ID, creator.ID); got != creatorReadMarker {
+		t.Errorf("channel read changed author marker from %d to %d", creatorReadMarker, got)
+	}
+	requireChannelReadState(t, s, creator.ID, channel.ID, creatorReadMarker, 0)
 	channelPtsAfter, err := s.ChannelState(ctx, channel.ID)
 	if err != nil {
 		t.Fatalf("channel state after read: %v", err)
@@ -143,6 +184,58 @@ func TestChannelsReadHistoryAdvancesMonotonicallyAndPersists(t *testing.T) {
 			t.Errorf("channel events after later post = %+v, want only the later post appended", channelEventsAfter)
 		}
 	}
+}
+
+func TestChannelsReadHistoryIsScopedToMemberAndChannel(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator := readHistoryUser(t, s, ctx, "+15551239931")
+	reader := readHistoryUser(t, s, ctx, "+15551239932")
+	otherReader := readHistoryUser(t, s, ctx, "+15551239933")
+	firstChannel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "First read scope"})
+	secondChannel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "Second read scope"})
+	for _, channelID := range []int64{firstChannel.ID, secondChannel.ID} {
+		invite, err := s.CreateChannelInvite(ctx, channelID, creator.ID)
+		if err != nil {
+			t.Fatalf("create invite for channel %d: %v", channelID, err)
+		}
+		for _, member := range []store.User{reader, otherReader} {
+			if _, _, err := s.JoinChannelByInvite(ctx, invite, member.ID); err != nil {
+				t.Fatalf("join user %d to channel %d: %v", member.ID, channelID, err)
+			}
+		}
+	}
+	firstPost := postReadHistoryChannelMessage(t, ctx, s, firstChannel.ID, creator.ID, "first channel one", 123931)
+	secondPost := postReadHistoryChannelMessage(t, ctx, s, firstChannel.ID, creator.ID, "second channel one", 123932)
+	otherChannelPost := postReadHistoryChannelMessage(t, ctx, s, secondChannel.ID, creator.ID, "channel two", 123933)
+	assertScopedReadStates := func(wantReaderFirstMarker int64, wantReaderFirstUnread int, wantReaderSecondMarker int64, wantReaderSecondUnread int) {
+		t.Helper()
+		requireChannelReadState(t, s, reader.ID, firstChannel.ID, wantReaderFirstMarker, wantReaderFirstUnread)
+		requireChannelReadState(t, s, otherReader.ID, firstChannel.ID, 0, 2)
+		requireChannelReadState(t, s, reader.ID, secondChannel.ID, wantReaderSecondMarker, wantReaderSecondUnread)
+		requireChannelReadState(t, s, otherReader.ID, secondChannel.ID, 0, 1)
+	}
+	assertScopedReadStates(0, 2, 0, 1)
+
+	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, firstChannel.ID), int(firstPost.LocalID)); rpc != nil || !ok {
+		t.Fatalf("partial first-channel read: ok=%v rpc=%v", ok, rpc)
+	}
+	assertScopedReadStates(firstPost.LocalID, 1, 0, 1)
+
+	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, firstChannel.ID), int(secondPost.LocalID)); rpc != nil || !ok {
+		t.Fatalf("full first-channel read: ok=%v rpc=%v", ok, rpc)
+	}
+	assertScopedReadStates(secondPost.LocalID, 0, 0, 1)
+	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, firstChannel.ID), int(firstPost.LocalID)); rpc != nil || !ok {
+		t.Fatalf("lower repeated first-channel read: ok=%v rpc=%v", ok, rpc)
+	}
+	assertScopedReadStates(secondPost.LocalID, 0, 0, 1)
+
+	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, secondChannel.ID), int(otherChannelPost.LocalID)); rpc != nil || !ok {
+		t.Fatalf("full second-channel read: ok=%v rpc=%v", ok, rpc)
+	}
+	assertScopedReadStates(secondPost.LocalID, 0, otherChannelPost.LocalID, 0)
 }
 
 func TestNewChannelMemberStartsAtCommittedTopAndOwnPostsAreNotUnread(t *testing.T) {
@@ -438,6 +531,41 @@ func requirePeerChannelReadState(t *testing.T, s *store.Store, viewerID, channel
 	}
 	if dialog.ReadInboxMaxID != int(wantMarker) || dialog.UnreadCount != wantUnread {
 		t.Fatalf("getPeerDialogs channel read state = marker %d unread %d, want %d/%d", dialog.ReadInboxMaxID, dialog.UnreadCount, wantMarker, wantUnread)
+	}
+}
+
+func requireChannelOwnerUnreadTotal(t *testing.T, s *store.Store, viewerID, channelID int64, want int) {
+	t.Helper()
+	result, err := api.GetPeerDialogsForTest(s, viewerID, &tg.MessagesGetPeerDialogsRequest{
+		Peers: []tg.InputDialogPeerClass{&tg.InputDialogPeer{Peer: api.InputPeerChannel(viewerID, channelID)}},
+	})
+	if err != nil {
+		t.Fatalf("getPeerDialogs for unread total: %v", err)
+	}
+	peerDialogs, ok := result.(*tg.MessagesPeerDialogs)
+	if !ok {
+		t.Fatalf("getPeerDialogs response = %T, want state", result)
+	}
+	if peerDialogs.State.UnreadCount != want {
+		t.Errorf("getPeerDialogs total unread = %d, want %d", peerDialogs.State.UnreadCount, want)
+	}
+	stateResponse, err := api.GetStateForTest(s, viewerID)
+	if err != nil {
+		t.Fatalf("updates.getState for unread total: %v", err)
+	}
+	state, ok := stateResponse.(*tg.UpdatesState)
+	if !ok || state == nil {
+		t.Fatalf("updates.getState response = %T, want *tg.UpdatesState", stateResponse)
+	}
+	if state.UnreadCount != want {
+		t.Errorf("updates.getState = %T unread %d, want %d", stateResponse, state.UnreadCount, want)
+	}
+	storedState, err := s.State(context.Background(), viewerID)
+	if err != nil {
+		t.Fatalf("store state for unread total: %v", err)
+	}
+	if storedState.UnreadCount != want {
+		t.Errorf("store total unread = %d, want %d", storedState.UnreadCount, want)
 	}
 }
 
