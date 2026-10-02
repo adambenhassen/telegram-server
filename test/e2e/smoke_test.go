@@ -31,6 +31,10 @@ func TestSmoke(t *testing.T) {
 		t.Parallel()
 		testSmokeOneToOne(t)
 	})
+	t.Run("shared-media-search", func(t *testing.T) {
+		t.Parallel()
+		testSmokeSharedMediaSearch(t)
+	})
 	t.Run("saved-messages", func(t *testing.T) {
 		t.Parallel()
 		testSmokeSavedMessages(t)
@@ -66,6 +70,9 @@ func TestSmoke(t *testing.T) {
 	t.Run("username-password-reset", func(t *testing.T) {
 		t.Parallel()
 		testSmokeUsernamePasswordReset(t)
+	})
+	t.Run("admin-proxy-login", func(t *testing.T) {
+		testSmokeAdminProxyLogin(t)
 	})
 }
 
@@ -281,6 +288,102 @@ func testSmokeDefaultDialogFilter(t *testing.T) {
 	case update := <-otherSession.push.dialogFilter:
 		t.Fatalf("other session received content-bearing updateDialogFilter: %#v", update)
 	default:
+	}
+}
+
+func testSmokeSharedMediaSearch(t *testing.T) {
+	t.Helper()
+	f := newSmokeFixture(t)
+	const phoneA, phoneB = "+15551046091", "+15551046092"
+	seedPhoneUsers(t, f.ctx, f.store, phoneA, phoneB)
+	a := newSmokeClient(t, f, "media sender", phoneA)
+	b := newSmokeClient(t, f, "media viewer", phoneB)
+
+	peerForA := peerUser(a.id, b.id)
+	if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		for _, text := range []string{
+			"shared-media-plain-smoke",
+			"shared-media-link-smoke https://example.test/shared-media",
+		} {
+			if _, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+				Peer: peerForA, Message: text, RandomID: int64(len(text)) + 1047090,
+			}); err != nil {
+				return fmt.Errorf("send %q: %w", text, err)
+			}
+		}
+		const fileID = 1047093
+		ok, err := api.UploadSaveFilePart(ctx, &tg.UploadSaveFilePartRequest{
+			FileID: fileID, FilePart: 0, Bytes: []byte("shared media smoke document"),
+		})
+		if err != nil {
+			return fmt.Errorf("upload document: %w", err)
+		}
+		if !ok {
+			return errors.New("upload document returned false")
+		}
+		_, err = api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+			Peer: peerForA,
+			Media: &tg.InputMediaUploadedDocument{
+				File: &tg.InputFile{ID: fileID, Parts: 1, Name: "shared-media-smoke.txt"}, MimeType: "text/plain",
+			},
+			Message: "shared-media-document-smoke", RandomID: 1047094,
+		})
+		if err != nil {
+			return fmt.Errorf("send document: %w", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed shared-media search messages: %v", err)
+	}
+
+	search := func(filter tg.MessagesFilterClass) (*tg.MessagesMessagesSlice, error) {
+		var result *tg.MessagesMessagesSlice
+		err := b.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+			res, err := api.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+				Peer: peerUser(b.id, a.id), Q: "", Filter: filter, Limit: 100,
+			})
+			if err != nil {
+				return err
+			}
+			var ok bool
+			result, ok = res.(*tg.MessagesMessagesSlice)
+			if !ok {
+				return fmt.Errorf("messages.search result = %T, want *tg.MessagesMessagesSlice", res)
+			}
+			return nil
+		})
+		return result, err
+	}
+
+	documents, err := search(&tg.InputMessagesFilterDocument{})
+	if err != nil {
+		t.Fatalf("search shared documents: %v", err)
+	}
+	if documents.Count != 1 || len(documents.Messages) != 1 {
+		t.Fatalf("document search count=%d messages=%d, want one", documents.Count, len(documents.Messages))
+	}
+	documentMessage, ok := documents.Messages[0].(*tg.Message)
+	if !ok || documentMessage.Message != "shared-media-document-smoke" {
+		t.Fatalf("document search message = %T %+v, want shared-media-document-smoke", documents.Messages[0], documents.Messages[0])
+	}
+	media, ok := documentMessage.Media.(*tg.MessageMediaDocument)
+	if !ok {
+		t.Fatalf("document search media = %T, want *tg.MessageMediaDocument", documentMessage.Media)
+	}
+	if doc, ok := media.Document.(*tg.Document); !ok || doc.ID <= 0 || doc.MimeType != "text/plain" {
+		t.Fatalf("document search payload = %T %+v, want a text/plain document", media.Document, media.Document)
+	}
+
+	links, err := search(&tg.InputMessagesFilterURL{})
+	if err != nil {
+		t.Fatalf("search shared links: %v", err)
+	}
+	if links.Count != 1 || len(links.Messages) != 1 {
+		t.Fatalf("URL search count=%d messages=%d, want one", links.Count, len(links.Messages))
+	}
+	linkMessage, ok := links.Messages[0].(*tg.Message)
+	if !ok || linkMessage.Message != "shared-media-link-smoke https://example.test/shared-media" {
+		t.Fatalf("URL search message = %T %+v, want the shared link", links.Messages[0], links.Messages[0])
 	}
 }
 
@@ -901,6 +1004,19 @@ func testSmokeChannel(t *testing.T) {
 	seedPhoneUsers(t, f.ctx, f.store, phoneCreator, phoneSubscriber)
 	creator := newSmokeClient(t, f, "A1", phoneCreator)
 	subscriber := newSmokeClient(t, f, "B1", phoneSubscriber)
+	execChannel(t, f.ctx, creator.cmds, func(ctx context.Context, client *tg.Client) error {
+		cfg, err := client.HelpGetConfig(ctx)
+		if err != nil {
+			return err
+		}
+		if cfg.MeURLPrefix != testPublicLinkPrefix {
+			return fmt.Errorf("help.getConfig me_url_prefix = %q, want %q", cfg.MeURLPrefix, testPublicLinkPrefix)
+		}
+		if cfg.DCTxtDomainName != "" {
+			return fmt.Errorf("help.getConfig dc_txt_domain_name = %q, want empty", cfg.DCTxtDomainName)
+		}
+		return nil
+	})
 
 	channelID := createBroadcastChannel(t, f.ctx, creator.cmds, "Smoke channel")
 	hash := exportChannelInvite(t, f.ctx, creator.id, creator.cmds, channelID)

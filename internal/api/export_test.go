@@ -202,6 +202,8 @@ func GatedUnhandledForTest(log *slog.Logger, c *mtproto.Conn, req *mtproto.Reque
 // production default, so MaxFileParts is the same 200 a real server enforces.
 const TestMaxFileBytes int64 = 100 << 20
 
+const testPublicLinkPrefix = "https://test.example/"
+
 // MaxFileParts exposes the derived part-index bound for the external api_test
 // package, for a handler built with TestMaxFileBytes.
 func MaxFileParts() int {
@@ -217,13 +219,18 @@ var testBlobsDir = os.TempDir() + "/tg-api-test-blobs"
 // the part objects the handlers wrote.
 func BlobsDirForTest() string { return testBlobsDir }
 
-func testHandlers(s *store.Store) *handlers {
+func testHandlers(s *store.Store, linkPrefixes ...string) *handlers {
 	blobs, err := blob.NewLocal(testBlobsDir)
 	if err != nil {
 		panic(err)
 	}
+	linkPrefix := testPublicLinkPrefix
+	if len(linkPrefixes) > 0 {
+		linkPrefix = linkPrefixes[0]
+	}
 	return &handlers{
 		store:                    s,
+		cfg:                      &tg.Config{MeURLPrefix: linkPrefix},
 		log:                      slog.New(slog.DiscardHandler),
 		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
 		maxFileBytes:             TestMaxFileBytes,
@@ -631,6 +638,18 @@ func LogOutForTest(s *store.Store, authKeyID [8]byte) (bin.Encoder, func(), erro
 	}
 	return testHandlers(s).handleLogOut(&mtproto.Request{
 		Ctx: context.Background(), AuthKeyID: authKeyID, Buf: &buf,
+	})
+}
+
+// LogOutWithContextForTest invokes handleLogOut with the caller context so a
+// test can cancel it after the committed delete and before the reply hook runs.
+func LogOutWithContextForTest(s *store.Store, ctx context.Context, authKeyID [8]byte) (bin.Encoder, func(), error) {
+	var buf bin.Buffer
+	if err := (&tg.AuthLogOutRequest{}).Encode(&buf); err != nil {
+		return nil, nil, err
+	}
+	return testHandlers(s).handleLogOut(&mtproto.Request{
+		Ctx: ctx, AuthKeyID: authKeyID, Buf: &buf,
 	})
 }
 
@@ -1341,9 +1360,14 @@ const ConfigTTL = configTTL
 // GetConfigSeqForTest returns a help.getConfig callable bound to ONE handlers
 // value reading the clock the test supplies, so successive calls can observe the
 // server's clock moving without sleeping through an expiry window.
-func GetConfigSeqForTest(dcID int, host string, port int, now func() time.Time) func() (*tg.Config, error) {
+func GetConfigSeqForTest(dcID int, host string, port int, now func() time.Time, linkPrefixes ...string) func() (*tg.Config, error) {
 	h := testHandlers(nil)
 	h.cfg = DefaultConfig(dcID, host, port)
+	if len(linkPrefixes) > 0 {
+		h.cfg.MeURLPrefix = linkPrefixes[0]
+	} else {
+		h.cfg.MeURLPrefix = testPublicLinkPrefix
+	}
 	h.dcID = dcID
 	h.now = now
 	return func() (*tg.Config, error) {

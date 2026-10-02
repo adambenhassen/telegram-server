@@ -153,7 +153,7 @@ func (s *Store) CheckRateLimitBudget(ctx context.Context, subjectID int64, surfa
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		// No row — budget not exhausted.
-		return nil, nil //nolint:nilnil
+		return nil, nil //nolint:nilnil // no row means the budget is not exhausted
 	case err != nil:
 		return nil, fmt.Errorf("check rate limit budget: %w", err)
 	}
@@ -163,7 +163,7 @@ func (s *Store) CheckRateLimitBudget(ctx context.Context, subjectID int64, surfa
 		return &RateLimitResult{Wait: waitUntil(s.now(), row.ExpiresAt.Time)}, nil
 	}
 	// Window expired or under limit — proceed.
-	return nil, nil //nolint:nilnil
+	return nil, nil //nolint:nilnil // expired or under-limit windows allow the request
 }
 
 // ChargeRateLimit charges a rate-limit counter after a failed attempt.

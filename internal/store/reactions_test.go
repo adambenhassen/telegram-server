@@ -36,7 +36,7 @@ func TestSendReactionBlockedByDeleteLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin tx: %v", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // deferred rollback cleans up this test-owned transaction
 
 	ids := []int64{a.ID, b.ID}
 	slices.Sort(ids)
@@ -118,7 +118,7 @@ func TestClearReactionBlockedByDeleteLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin tx: %v", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // deferred rollback cleans up this test-owned transaction
 
 	ids := []int64{a.ID, b.ID}
 	slices.Sort(ids)

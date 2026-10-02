@@ -11,6 +11,57 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countFilteredMessages = `-- name: CountFilteredMessages :one
+SELECT count(*)::bigint
+FROM messages m
+WHERE m.owner_id = $1::bigint
+  AND m.peer_type = $2::smallint
+  AND m.peer_id = $3::bigint
+  AND m.peer_type IN (1, 2)
+  AND m.deleted = false
+  AND (m.peer_type <> 2 OR EXISTS (
+      SELECT 1 FROM chat_participants cp
+      WHERE cp.chat_id = m.peer_id AND cp.user_id = m.owner_id
+  ))
+  AND CASE $4::smallint
+      WHEN 1 THEN m.file_id <> 0 AND EXISTS (
+          SELECT 1 FROM files f WHERE f.id = m.file_id AND f.stored = true
+      )
+      WHEN 2 THEN false
+      WHEN 3 THEN m.message ~* '(^|[^[:alnum:]_@])(([[:alpha:]][[:alnum:]+.-]*://|www[.])[^[:space:]]+|[[:alnum:]-]+[.][[:alpha:]]{2,}(:[0-9]{1,5})?(/[[:graph:]]*)?)'
+      ELSE false
+  END
+  AND ($5::text = '' OR m.message_tsv @@ plainto_tsquery('simple', $5))
+`
+
+type CountFilteredMessagesParams struct {
+	OwnerID  int64
+	PeerType int16
+	PeerID   int64
+	Filter   int16
+	Query    string
+}
+
+// Filtered shared-media searches count and page only the caller's owned rows.
+// Chat membership is repeated in the predicate so a removal between the
+// handler's admission check and this read cannot expose retained chat copies.
+// Filter values are 1=document, 2=photo (not currently representable), and
+// 3=URL. A file is a document only while its stored body can be rendered.
+// URL detection runs in Postgres over one authorized peer's rows; the app does
+// not load a dialog history to classify links.
+func (q *Queries) CountFilteredMessages(ctx context.Context, arg CountFilteredMessagesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countFilteredMessages,
+		arg.OwnerID,
+		arg.PeerType,
+		arg.PeerID,
+		arg.Filter,
+		arg.Query,
+	)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const historyPage = `-- name: HistoryPage :many
 SELECT owner_id, local_id, peer_id, from_id, date, message, out, edit_date, deleted, random_id, peer_local_id, peer_type, fanout_id, action_type, action_user_id, file_id, reply_to_msg_id, fwd_from_id, fwd_date, fwd_channel_id, fwd_channel_post, message_tsv FROM messages
 WHERE owner_id = $1
@@ -358,6 +409,93 @@ func (q *Queries) NextFanoutID(ctx context.Context) (int64, error) {
 	var fanout_id int64
 	err := row.Scan(&fanout_id)
 	return fanout_id, err
+}
+
+const searchFilteredMessagesPage = `-- name: SearchFilteredMessagesPage :many
+SELECT m.owner_id, m.local_id, m.peer_id, m.from_id, m.date, m.message, m.out, m.edit_date, m.deleted, m.random_id, m.peer_local_id, m.peer_type, m.fanout_id, m.action_type, m.action_user_id, m.file_id, m.reply_to_msg_id, m.fwd_from_id, m.fwd_date, m.fwd_channel_id, m.fwd_channel_post, m.message_tsv
+FROM messages m
+WHERE m.owner_id = $1::bigint
+  AND m.peer_type = $2::smallint
+  AND m.peer_id = $3::bigint
+  AND m.peer_type IN (1, 2)
+  AND m.deleted = false
+  AND (m.peer_type <> 2 OR EXISTS (
+      SELECT 1 FROM chat_participants cp
+      WHERE cp.chat_id = m.peer_id AND cp.user_id = m.owner_id
+  ))
+  AND CASE $4::smallint
+      WHEN 1 THEN m.file_id <> 0 AND EXISTS (
+          SELECT 1 FROM files f WHERE f.id = m.file_id AND f.stored = true
+      )
+      WHEN 2 THEN false
+      WHEN 3 THEN m.message ~* '(^|[^[:alnum:]_@])(([[:alpha:]][[:alnum:]+.-]*://|www[.])[^[:space:]]+|[[:alnum:]-]+[.][[:alpha:]]{2,}(:[0-9]{1,5})?(/[[:graph:]]*)?)'
+      ELSE false
+  END
+  AND ($5::text = '' OR m.message_tsv @@ plainto_tsquery('simple', $5))
+  AND ($6::bigint = 0 OR m.local_id < $6::bigint)
+ORDER BY m.local_id DESC
+LIMIT $7::int
+`
+
+type SearchFilteredMessagesPageParams struct {
+	OwnerID  int64
+	PeerType int16
+	PeerID   int64
+	Filter   int16
+	Query    string
+	OffsetID int64
+	Lim      int32
+}
+
+func (q *Queries) SearchFilteredMessagesPage(ctx context.Context, arg SearchFilteredMessagesPageParams) ([]Message, error) {
+	rows, err := q.db.Query(ctx, searchFilteredMessagesPage,
+		arg.OwnerID,
+		arg.PeerType,
+		arg.PeerID,
+		arg.Filter,
+		arg.Query,
+		arg.OffsetID,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Message
+	for rows.Next() {
+		var i Message
+		if err := rows.Scan(
+			&i.OwnerID,
+			&i.LocalID,
+			&i.PeerID,
+			&i.FromID,
+			&i.Date,
+			&i.Message,
+			&i.Out,
+			&i.EditDate,
+			&i.Deleted,
+			&i.RandomID,
+			&i.PeerLocalID,
+			&i.PeerType,
+			&i.FanoutID,
+			&i.ActionType,
+			&i.ActionUserID,
+			&i.FileID,
+			&i.ReplyToMsgID,
+			&i.FwdFromID,
+			&i.FwdDate,
+			&i.FwdChannelID,
+			&i.FwdChannelPost,
+			&i.MessageTsv,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const searchMessages = `-- name: SearchMessages :many

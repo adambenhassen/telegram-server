@@ -42,11 +42,17 @@ func sha256hex(b []byte) string {
 
 func newTestRouter(t *testing.T, st *store.Store, tokenHash string) http.Handler {
 	t.Helper()
+	return newTestRouterWithOrigin(t, st, tokenHash, "")
+}
+
+func newTestRouterWithOrigin(t *testing.T, st *store.Store, tokenHash, origin string) http.Handler {
+	t.Helper()
 	registry := mtproto.NewSessionRegistry()
 	return admin.AdminRouter(admin.LoginHandlerConfig{
-		Store:     st,
-		TokenHash: tokenHash,
-		Logger:    slog.Default(),
+		Store:       st,
+		TokenHash:   tokenHash,
+		Logger:      slog.Default(),
+		AdminOrigin: origin,
 	}, registry)
 }
 
@@ -365,6 +371,171 @@ func TestLogoutPOST_missing_csrf_401(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestLoginPOST_configuredOriginPolicy(t *testing.T) {
+	t.Parallel()
+	st := newAuthTestStore(t)
+	tokenHash := sha256hex([]byte("correct-token"))
+	const trustedOrigin = "https://telegram-server.tailaa4918.ts.net"
+	h := newTestRouterWithOrigin(t, st, tokenHash, trustedOrigin)
+
+	get := httptest.NewRequestWithContext(ctx, http.MethodGet, "/admin/login", nil)
+	getRec := httptest.NewRecorder()
+	h.ServeHTTP(getRec, get)
+	csrfToken := extractCSRFToken(t, getRec.Body.String())
+	csrfCookie := ""
+	for _, cookie := range getRec.Result().Cookies() {
+		if cookie.Name == "__Host-csrf-token" {
+			csrfCookie = cookie.Value
+		}
+	}
+	if csrfCookie == "" {
+		t.Fatal("login page did not set a CSRF cookie")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		origin string
+		site   string
+	}{
+		{name: "derived localhost origin", origin: "http://localhost:2445"},
+		{name: "foreign HTTPS origin", origin: "https://foreign.example.com"},
+		{name: "configured host over HTTP", origin: "http://telegram-server.tailaa4918.ts.net"},
+		{name: "cross-site fetch", origin: trustedOrigin, site: "cross-site"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			form := strings.NewReader("csrf_token=" + csrfToken + "&token=correct-token")
+			req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/login", form)
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Origin", tc.origin)
+			if tc.site != "" {
+				req.Header.Set("Sec-Fetch-Site", tc.site)
+			}
+			req.AddCookie(&http.Cookie{Name: "__Host-csrf-token", Value: csrfCookie}) //nolint:gosec // G124: test cookie
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("login with Origin %q and Sec-Fetch-Site %q returned %d, want 401", tc.origin, tc.site, rec.Code)
+			}
+		})
+	}
+
+	form := strings.NewReader("csrf_token=" + csrfToken + "&token=correct-token")
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/login", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", trustedOrigin)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Forwarded", "host=attacker.example;proto=http")
+	req.Header.Set("X-Forwarded-Host", "attacker.example")
+	req.Header.Set("X-Forwarded-Proto", "http")
+	req.Host = "attacker.example"
+	req.AddCookie(&http.Cookie{Name: "__Host-csrf-token", Value: csrfCookie}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("login with configured Origin and spoofed host headers returned %d, want 302", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Error("login reflected an Origin in Access-Control-Allow-Origin")
+	}
+
+	sessionCookie := ""
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == "__Host-admin-session" {
+			sessionCookie = cookie.Value
+		}
+	}
+	if sessionCookie == "" {
+		t.Fatal("successful login did not set an admin session")
+	}
+	dashboardReq := httptest.NewRequestWithContext(ctx, http.MethodGet, "/admin/dashboard", nil)
+	dashboardReq.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	dashboardRec := httptest.NewRecorder()
+	h.ServeHTTP(dashboardRec, dashboardReq)
+	if dashboardRec.Code != http.StatusOK {
+		t.Fatalf("dashboard after configured-origin login returned %d, want 200", dashboardRec.Code)
+	}
+}
+
+func TestLogoutPOST_configuredOriginPolicy(t *testing.T) {
+	t.Parallel()
+	st := newAuthTestStore(t)
+	tokenHash := sha256hex([]byte("correct-token"))
+	const trustedOrigin = "https://telegram-server.tailaa4918.ts.net"
+	h := newTestRouterWithOrigin(t, st, tokenHash, trustedOrigin)
+	sessionCookie := loginAndGetSession(t, h, "correct-token")
+	csrfToken, err := admin.SessionCSRFToken(tokenHash, sessionCookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		origin string
+		site   string
+	}{
+		{name: "derived localhost origin", origin: "http://localhost:2445"},
+		{name: "foreign HTTPS origin", origin: "https://foreign.example.com"},
+		{name: "configured host over HTTP", origin: "http://telegram-server.tailaa4918.ts.net"},
+		{name: "cross-site fetch", origin: trustedOrigin, site: "cross-site"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			form := strings.NewReader("csrf_token=" + csrfToken)
+			req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/logout", form)
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Origin", tc.origin)
+			if tc.site != "" {
+				req.Header.Set("Sec-Fetch-Site", tc.site)
+			}
+			req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("logout with Origin %q and Sec-Fetch-Site %q returned %d, want 401", tc.origin, tc.site, rec.Code)
+			}
+		})
+	}
+
+	form := strings.NewReader("csrf_token=" + csrfToken)
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/logout", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", trustedOrigin)
+	req.Header.Set("Forwarded", "host=attacker.example;proto=http")
+	req.Header.Set("X-Forwarded-Host", "attacker.example")
+	req.Header.Set("X-Forwarded-Proto", "http")
+	req.Host = "attacker.example"
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("logout with configured Origin and spoofed host headers returned %d, want 302", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Error("logout reflected an Origin in Access-Control-Allow-Origin")
+	}
+}
+
+func TestConfiguredOriginAllowsMissingOriginForLoginAndLogout(t *testing.T) {
+	t.Parallel()
+	st := newAuthTestStore(t)
+	tokenHash := sha256hex([]byte("correct-token"))
+	h := newTestRouterWithOrigin(t, st, tokenHash, "https://admin.example.com")
+	sessionCookie := loginAndGetSession(t, h, "correct-token")
+	csrfToken, err := admin.SessionCSRFToken(tokenHash, sessionCookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	form := strings.NewReader("csrf_token=" + csrfToken)
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/admin/logout", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: "__Host-admin-session", Value: sessionCookie}) //nolint:gosec // G124: test cookie
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("logout without Origin returned %d, want 302", rec.Code)
 	}
 }
 

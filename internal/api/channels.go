@@ -220,7 +220,7 @@ func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error)
 		full.SetBannedCount(int(snapshot.BannedCount))
 		if snapshot.HasInvite {
 			full.SetExportedInvite(&tg.ChatInviteExported{
-				Link:      inviteLinkPrefix + snapshot.InviteHash,
+				Link:      h.cfg.MeURLPrefix + "+" + snapshot.InviteHash,
 				AdminID:   snapshot.InviteCreatorID,
 				Date:      int(snapshot.InviteDate.Unix()),
 				Permanent: true,
@@ -369,9 +369,7 @@ func (h *handlers) handleInviteToChannel(r *mtproto.Request) (bin.Encoder, error
 		h.log.Error("invite channel members", "channel_id", channelID, "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	for _, targetID := range added {
-		h.notifyChannelMembership(r.Ctx, targetID, channelID)
-	}
+	h.notifyChannelMemberships(r.Ctx, channelID, added)
 
 	chats, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
 	if err != nil {
@@ -762,6 +760,15 @@ func (h *handlers) channelPinnedSearch(r *mtproto.Request, channelID int64, quer
 // messages.messagesSlice: a client needs the channel's pts to know where the
 // batch sits in that channel's own update stream.
 func (h *handlers) channelMessages(r *mtproto.Request, channelID int64, msgs []store.ChannelMessage) (bin.Encoder, error) {
+	return h.channelMessagesWithCount(r, channelID, msgs, len(msgs))
+}
+
+func (h *handlers) channelMessagesWithCount(
+	r *mtproto.Request,
+	channelID int64,
+	msgs []store.ChannelMessage,
+	count int,
+) (bin.Encoder, error) {
 	files, err := h.loadChannelFiles(r.Ctx, msgs)
 	if err != nil {
 		h.log.Error("channel messages files", "user_id", r.UserID, "channel_id", channelID, "err", err)
@@ -793,18 +800,16 @@ func (h *handlers) channelMessages(r *mtproto.Request, channelID int64, msgs []s
 	}
 	return &tg.MessagesChannelMessages{
 		Pts:      pts,
-		Count:    len(tlMsgs),
+		Count:    count,
 		Messages: tlMsgs,
 		Chats:    channels,
 		Users:    users,
 	}, nil
 }
 
-// inviteLinkPrefix is what a hash is rendered behind. The link is the whole
-// credential, so nothing but the hash may appear after it — an id in the link
-// hands a real channel id to everyone the link travels through, and the hash
-// alone is what admits.
-const inviteLinkPrefix = "https://t.me/+"
+// legacyInviteLinkPrefix is accepted only when revoking links issued before
+// public links used the configured origin.
+const legacyInviteLinkPrefix = "https://t.me/+"
 
 // revokeExportedChatInviteTypeID is the constructor id of
 // messages.revokeExportedChatInvite (0x13db322c). gotd v0.161.0 does not
@@ -893,7 +898,7 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 		return nil, errInternal
 	}
 	return &tg.ChatInviteExported{
-		Link:      inviteLinkPrefix + hash,
+		Link:      h.cfg.MeURLPrefix + "+" + hash,
 		AdminID:   r.UserID,
 		Date:      int(time.Now().Unix()),
 		Permanent: true,
@@ -904,10 +909,9 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 // gotd v0.161.0 does not generate this request type, so the handler decodes
 // it manually (peer, hash) and registers the constructor id directly.
 //
-// Every rejection returns errPeerIDInvalid: no channel row, no participant row,
-// role 0, a live ban, or a hash that the channel never minted. They are ONE
-// error deliberately — a distinguishable "hash not found" would let an account
-// walk the invite space.
+// Authorization failures return errPeerIDInvalid: no channel row, no participant
+// row, role 0, or a live ban. Unknown hashes and links with unrecognized origins
+// revoke nothing and still return success, so invite existence is not disclosed.
 //
 // Role 1 is the floor for the same reason export requires it: a role-0 member
 // able to revoke would be able to confirm which hashes belong to the channel.
@@ -930,8 +934,18 @@ func (h *handlers) handleRevokeExportedChatInvite(r *mtproto.Request) (bin.Encod
 		return nil, errPeerIDInvalid
 	}
 
-	// Strip link prefix if client sent full link instead of bare hash.
-	hash, _ := strings.CutPrefix(req.Hash, inviteLinkPrefix)
+	// Revoke accepts bare hashes, current configured links, and the exact legacy
+	// link form. Other origins remain part of the hash and cannot revoke an invite.
+	hash := req.Hash
+	if h.cfg.MeURLPrefix != "" {
+		if configuredHash, ok := strings.CutPrefix(hash, h.cfg.MeURLPrefix+"+"); ok {
+			hash = configuredHash
+		} else if legacyHash, ok := strings.CutPrefix(hash, legacyInviteLinkPrefix); ok {
+			hash = legacyHash
+		}
+	} else if legacyHash, ok := strings.CutPrefix(hash, legacyInviteLinkPrefix); ok {
+		hash = legacyHash
+	}
 
 	member, found, err := h.store.ChannelMemberOf(r.Ctx, channelID, r.UserID)
 	if err != nil {
@@ -943,7 +957,7 @@ func (h *handlers) handleRevokeExportedChatInvite(r *mtproto.Request) (bin.Encod
 	}
 
 	if err = h.store.RevokeChannelInvite(r.Ctx, hash, channelID); err != nil {
-		h.log.Error("revoke exported chat invite", "channel_id", channelID, "hash", hash, "err", err)
+		h.log.Error("revoke exported chat invite", "channel_id", channelID, "err", err)
 		return nil, errInternal
 	}
 

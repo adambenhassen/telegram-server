@@ -1211,7 +1211,7 @@ func TestChannelNotifyFiresOncePerPost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}
-	defer func() { _ = stop() }() //nolint:errcheck
+	defer func() { _ = stop() }() //nolint:errcheck // listener shutdown is deferred test cleanup
 
 	// waitForNotify polls until the counter reaches want or times out.
 	waitForNotify := func(want int64) {

@@ -105,7 +105,9 @@ func (h *handlers) handleUpdateStatus(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("update status", "user_id", r.UserID, "online", online, "err", err)
 		return nil, errInternal
 	}
-	if err := h.store.Notify(r.Ctx, store.ChannelStatus, store.StatusPayload(r.UserID, online)); err != nil {
+	notifyCtx, cancel := senderNotifyContext(r.Ctx)
+	defer cancel()
+	if err := h.store.Notify(notifyCtx, store.ChannelStatus, store.StatusPayload(r.UserID, online)); err != nil {
 		h.log.Error("notify status", "user_id", r.UserID, "err", err)
 	}
 	return &tg.BoolTrue{}, nil

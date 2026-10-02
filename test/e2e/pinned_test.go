@@ -566,7 +566,13 @@ func TestPinnedChannel(t *testing.T) {
 		if !ok {
 			return errors.New("exportChatInvite: unexpected response type")
 		}
-		inviteHash = strings.TrimPrefix(exp.Link, "https://t.me/+")
+		if !strings.HasPrefix(exp.Link, testPublicLinkPrefix+"+") {
+			return errors.New("exportChatInvite: link did not use the configured prefix")
+		}
+		inviteHash = strings.TrimPrefix(exp.Link, testPublicLinkPrefix+"+")
+		if !validInviteHash(inviteHash) {
+			return errors.New("exportChatInvite: link did not contain a valid hash")
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("export invite: %v", err)

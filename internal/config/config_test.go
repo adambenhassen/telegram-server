@@ -169,6 +169,22 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadServerConfigPreservesPublicLinkPrefix(t *testing.T) {
+	const prefix = "https://telegram-server.tailaa4918.ts.net/"
+	t.Setenv("TG_PUBLIC_LINK_PREFIX", prefix)
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", "")
+
+	cfg, err := config.LoadServerConfig(discardLog())
+	if err != nil {
+		t.Fatalf("LoadServerConfig: %v", err)
+	}
+	if cfg.PublicLinkPrefix != prefix {
+		t.Fatalf("PublicLinkPrefix = %q, want exact configured value %q", cfg.PublicLinkPrefix, prefix)
+	}
+}
+
 func TestLoadReplicaID(t *testing.T) {
 	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
 	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)

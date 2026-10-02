@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
@@ -59,30 +60,30 @@ func LeaveChannelForTest(s *store.Store, userID int64, req *tg.ChannelsLeaveChan
 }
 
 // ExportChatInviteForTest encodes req and invokes handleExportChatInvite for the caller.
-func ExportChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesExportChatInviteRequest) (bin.Encoder, error) {
+func ExportChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesExportChatInviteRequest, linkPrefixes ...string) (bin.Encoder, error) {
 	var buf bin.Buffer
 	if err := req.Encode(&buf); err != nil {
 		return nil, err
 	}
-	return testHandlers(s).handleExportChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+	return testHandlers(s, linkPrefixes...).handleExportChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // CheckChatInviteForTest encodes req and invokes handleCheckChatInvite for the caller.
-func CheckChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesCheckChatInviteRequest) (bin.Encoder, error) {
+func CheckChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesCheckChatInviteRequest, linkPrefixes ...string) (bin.Encoder, error) {
 	var buf bin.Buffer
 	if err := req.Encode(&buf); err != nil {
 		return nil, err
 	}
-	return testHandlers(s).handleCheckChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+	return testHandlers(s, linkPrefixes...).handleCheckChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // ImportChatInviteForTest encodes req and invokes handleImportChatInvite for the caller.
-func ImportChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesImportChatInviteRequest) (bin.Encoder, error) {
+func ImportChatInviteForTest(s *store.Store, userID int64, req *tg.MessagesImportChatInviteRequest, linkPrefixes ...string) (bin.Encoder, error) {
 	var buf bin.Buffer
 	if err := req.Encode(&buf); err != nil {
 		return nil, err
 	}
-	return testHandlers(s).handleImportChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+	return testHandlers(s, linkPrefixes...).handleImportChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // EditAdminForTest encodes req and invokes handleEditAdmin for the caller.
@@ -135,7 +136,19 @@ func GetChannelDifferenceForTest(s *store.Store, userID int64, req *tg.UpdatesGe
 }
 
 // RevokeExportedChatInviteForTest invokes handleRevokeExportedChatInvite for the caller.
-func RevokeExportedChatInviteForTest(s *store.Store, userID, channelID int64, hash string) (bin.Encoder, error) {
+func RevokeExportedChatInviteForTest(s *store.Store, userID, channelID int64, hash string, linkPrefixes ...string) (bin.Encoder, error) {
+	return revokeExportedChatInviteForTest(testHandlers(s, linkPrefixes...), userID, channelID, hash)
+}
+
+// RevokeExportedChatInviteWithLoggerForTest invokes the revoke handler with a
+// test logger so failures can be checked for credential disclosure.
+func RevokeExportedChatInviteWithLoggerForTest(s *store.Store, userID, channelID int64, hash string, logger *slog.Logger, linkPrefixes ...string) (bin.Encoder, error) {
+	h := testHandlers(s, linkPrefixes...)
+	h.log = logger
+	return revokeExportedChatInviteForTest(h, userID, channelID, hash)
+}
+
+func revokeExportedChatInviteForTest(h *handlers, userID, channelID int64, hash string) (bin.Encoder, error) {
 	var buf bin.Buffer
 	buf.PutID(revokeExportedChatInviteTypeID)
 	peer := &tg.InputPeerChannel{ChannelID: channelID, AccessHash: DeriveChannelHash(userID, channelID)}
@@ -143,7 +156,7 @@ func RevokeExportedChatInviteForTest(s *store.Store, userID, channelID int64, ha
 		return nil, err
 	}
 	buf.PutString(hash)
-	return testHandlers(s).handleRevokeExportedChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+	return h.handleRevokeExportedChatInvite(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // MaxGetChannels exposes the getChannels input cap to the api_test package.

@@ -289,18 +289,18 @@ func TestSearchMessages(t *testing.T) {
 		_, err := c.MessagesSearch(ctx, &tg.MessagesSearchRequest{
 			Peer:   peerB,
 			Q:      "hello",
-			Filter: &tg.InputMessagesFilterPhotos{},
+			Filter: &tg.InputMessagesFilterMusic{},
 		})
 		return err
 	})
 	if err == nil {
-		t.Fatal("A search photos filter: expected error, got nil")
+		t.Fatal("A search music filter: expected error, got nil")
 	}
 	if !errors.As(err, &rpcErr) {
-		t.Fatalf("A search photos filter: expected RPC error, got %T: %v", err, err)
+		t.Fatalf("A search music filter: expected RPC error, got %T: %v", err, err)
 	}
 	if rpcErr.Code != 400 || rpcErr.Message != "INPUT_FILTER_INVALID" {
-		t.Fatalf("A search photos filter: got %d %s, want 400 INPUT_FILTER_INVALID", rpcErr.Code, rpcErr.Message)
+		t.Fatalf("A search music filter: got %d %s, want 400 INPUT_FILTER_INVALID", rpcErr.Code, rpcErr.Message)
 	}
 
 	// 8. Search with oversized query returns MESSAGE_TOO_LONG.

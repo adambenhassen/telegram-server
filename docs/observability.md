@@ -16,6 +16,26 @@ authenticated TLS reverse proxy when remote access is required. Do not bind
 the admin listener to a public interface without an equivalent network access
 control.
 
+`TG_ADMIN_ORIGIN` optionally sets the one browser origin accepted by the admin
+login and logout forms. It is fixed at startup and replaces the origin derived
+from `TG_ADMIN_LISTEN_ADDR`; setting it requires `TG_ADMIN_LISTEN_ADDR`.
+When unset, empty, or whitespace-only, the server keeps deriving
+`http://<listen-host>:<port>`; a blank listen host becomes `localhost`. A
+configured origin must be canonical lowercase ASCII `scheme://host[:port]`:
+HTTPS is accepted for hosts, while HTTP is limited to
+`localhost`, `127.0.0.0/8`, and `::1`. Do not include user information, a path
+(including `/`), a query, a fragment, a wildcard, `null`, uppercase or
+non-ASCII host characters, a non-canonical port outside `1` through `65535`,
+or an explicit default port (`:443` for HTTPS or `:80` for HTTP).
+
+For a TLS reverse proxy such as Tailscale Serve, set `TG_ADMIN_ORIGIN` to the
+HTTPS origin shown in the operator's browser and forward `/admin` requests to
+the existing admin listener while preserving the `/admin` path. For example,
+with a proxy listener at `https://admin.example.ts.net` and the admin server on
+`127.0.0.1:2445`, configure `TG_ADMIN_ORIGIN=https://admin.example.ts.net`.
+The CSRF check compares the browser's `Origin` with that startup value; it does
+not derive trust from `Host`, `Forwarded`, or `X-Forwarded-*` headers.
+
 For a local shell, a token hash can be prepared without putting the raw token
 in the command line:
 
