@@ -287,6 +287,32 @@ func TestWebHTTPFailureReturnsFixed502WithoutUpstreamBody(t *testing.T) {
 	assertNoRedirectOrCookie(t, response)
 }
 
+func TestWebTruncatedContentLengthReturnsFixed502(t *testing.T) {
+	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.Header().Set("Content-Type", "text/javascript")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		writeTestResponse(t, w, "partial-web-response")
+	}))
+	t.Cleanup(web.Close)
+	landing := httptest.NewServer(recordingLanding(t, nil))
+	t.Cleanup(landing.Close)
+	handler := newSelector(t, web.URL, landing.URL, slog.New(slog.DiscardHandler))
+
+	response := serveTarget(handler, http.MethodGet, "/main.js", "")
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("truncated Web response status = %d, want fixed 502", response.Code)
+	}
+	if response.Body.String() != "<!doctype html><html lang=\"en\"><body><main>Temporarily unavailable</main></body></html>" {
+		t.Errorf("truncated Web response body = %q, want fixed unavailable page", response.Body.String())
+	}
+	if response.Header().Get("Content-Type") == "text/javascript" || response.Header().Get("Content-Length") == "100" {
+		t.Errorf("truncated Web headers were forwarded: %v", response.Header())
+	}
+	assertSelectorSecurityHeaders(t, response)
+	assertNoRedirectOrCookie(t, response)
+}
+
 func TestUpstreamFailuresAreFixedAndLogsContainOnlyClassAndStatus(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))

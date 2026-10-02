@@ -18,6 +18,7 @@ const (
 	upstreamTimeout       = 15 * time.Second
 	upstreamDialTimeout   = 5 * time.Second
 	maxLandingBodyBytes   = 4096
+	maxWebBodyBytes       = 32 << 20 // Bound the staged response size per request.
 	landingUnavailable    = `<!doctype html><html lang="en"><body><main>Temporarily unavailable</main></body></html>`
 	webErrorStatus        = http.StatusBadGateway
 	landingErrorStatus    = http.StatusServiceUnavailable
@@ -163,7 +164,7 @@ func (s *selector) serveLanding(w http.ResponseWriter, incoming *http.Request, p
 	return false
 }
 
-func (s *selector) serveWeb(w http.ResponseWriter, incoming *http.Request, target requestTarget) (failed bool) {
+func (s *selector) serveWeb(w http.ResponseWriter, incoming *http.Request, target requestTarget) bool {
 	upstreamURL := *s.webURL
 	upstreamURL.Path = target.path
 	upstreamURL.RawQuery = target.query
@@ -195,15 +196,19 @@ func (s *selector) serveWeb(w http.ResponseWriter, incoming *http.Request, targe
 		writeUnavailable(w, webErrorStatus)
 		return true
 	}
-	defer func() {
-		if err := response.Body.Close(); err != nil {
-			failed = true
-		}
-	}()
+	// Stage the complete response before committing upstream headers so a
+	// truncated body or timeout can still become the fixed failure response.
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, maxWebBodyBytes+1))
+	closeErr := response.Body.Close()
+	if readErr != nil || closeErr != nil || len(body) > maxWebBodyBytes {
+		writeUnavailable(w, webErrorStatus)
+		return true
+	}
+
 	copyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
 	if incoming.Method != http.MethodHead {
-		if _, err := io.Copy(w, response.Body); err != nil {
+		if _, err := w.Write(body); err != nil {
 			return true
 		}
 	}
