@@ -190,6 +190,13 @@ type smokeMessagesLock struct {
 	released bool
 }
 
+func reportSmokeMessagesLockError(t *testing.T, action string, err error) {
+	t.Helper()
+	if err != nil {
+		t.Errorf("%s: %v", action, err)
+	}
+}
+
 func lockSmokeMessages(t *testing.T, ctx context.Context, dsn string) *smokeMessagesLock {
 	t.Helper()
 	blocker, err := pgx.Connect(ctx, dsn)
@@ -198,27 +205,27 @@ func lockSmokeMessages(t *testing.T, ctx context.Context, dsn string) *smokeMess
 	}
 	tx, err := blocker.Begin(ctx)
 	if err != nil {
-		_ = blocker.Close(context.Background())
+		reportSmokeMessagesLockError(t, "close message lock connection", blocker.Close(context.Background()))
 		t.Fatalf("begin message lock: %v", err)
 	}
 	if _, err := tx.Exec(ctx, `LOCK TABLE messages IN ACCESS EXCLUSIVE MODE`); err != nil {
-		_ = tx.Rollback(context.Background())
-		_ = blocker.Close(context.Background())
+		reportSmokeMessagesLockError(t, "rollback message lock transaction", tx.Rollback(context.Background()))
+		reportSmokeMessagesLockError(t, "close message lock connection", blocker.Close(context.Background()))
 		t.Fatalf("lock messages table: %v", err)
 	}
 	observer, err := pgx.Connect(ctx, dsn)
 	if err != nil {
-		_ = tx.Rollback(context.Background())
-		_ = blocker.Close(context.Background())
+		reportSmokeMessagesLockError(t, "rollback message lock transaction", tx.Rollback(context.Background()))
+		reportSmokeMessagesLockError(t, "close message lock connection", blocker.Close(context.Background()))
 		t.Fatalf("connect message lock observer: %v", err)
 	}
 	lock := &smokeMessagesLock{blocker: blocker, tx: tx, observer: observer}
 	t.Cleanup(func() {
 		if !lock.released {
-			_ = lock.tx.Rollback(context.Background())
+			reportSmokeMessagesLockError(t, "rollback message lock transaction", lock.tx.Rollback(context.Background()))
 		}
-		_ = lock.blocker.Close(context.Background())
-		_ = lock.observer.Close(context.Background())
+		reportSmokeMessagesLockError(t, "close message lock connection", lock.blocker.Close(context.Background()))
+		reportSmokeMessagesLockError(t, "close message lock observer", lock.observer.Close(context.Background()))
 	})
 	return lock
 }

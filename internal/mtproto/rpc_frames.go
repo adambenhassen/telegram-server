@@ -18,6 +18,7 @@ import (
 // a time.
 type peerReadTransport struct {
 	transport.Conn
+
 	readConn net.Conn
 }
 
@@ -25,7 +26,11 @@ func (p peerReadTransport) interruptRead() {
 	if p.readConn != nil {
 		// gotd's transport.Conn applies context deadlines to the socket, but a
 		// context cancellation alone does not interrupt an active Recv.
-		_ = p.readConn.SetReadDeadline(time.Now())
+		if err := p.readConn.SetReadDeadline(time.Now()); err != nil {
+			// A concurrent peer close can reject the deadline update; Recv
+			// will report the transport's final state.
+			return
+		}
 	}
 }
 
@@ -81,7 +86,7 @@ func newRPCFrameReader(
 func (r *rpcFrameReader) run() {
 	defer close(r.done)
 	for {
-		b, err, deadline := r.readFrame()
+		b, deadline, err := r.readFrame()
 		if isPeerReadTimeout(err) && r.peer.hasActive() &&
 			(deadline.IsZero() || r.now().Before(deadline)) {
 			// The ordinary read timeout only ends an idle connection. While an
@@ -128,7 +133,7 @@ func (r *rpcFrameReader) run() {
 // readFrame resets an in-progress idle read when an RPC starts or finishes.
 // That keeps the transport timeout from counting time spent dispatching a
 // request, while still keeping exactly one Recv active at a time.
-func (r *rpcFrameReader) readFrame() (*bin.Buffer, error, time.Time) {
+func (r *rpcFrameReader) readFrame() (*bin.Buffer, time.Time, error) {
 	for {
 		var deadline time.Time
 		if r.deadline != nil {
@@ -155,7 +160,7 @@ func (r *rpcFrameReader) readFrame() (*bin.Buffer, error, time.Time) {
 				default:
 				}
 			}
-			return result.buf, result.err, deadline
+			return result.buf, deadline, result.err
 		case <-changed:
 			cancelRead()
 			if interrupt, ok := r.transport.(interface{ interruptRead() }); ok {
@@ -163,22 +168,22 @@ func (r *rpcFrameReader) readFrame() (*bin.Buffer, error, time.Time) {
 			}
 			result := <-readDone
 			if r.ctx.Err() != nil || result.err == nil {
-				return result.buf, result.err, deadline
+				return result.buf, deadline, result.err
 			}
 			if isPeerReadTimeout(result.err) {
 				if !deadline.IsZero() && !r.now().Before(deadline) {
-					return result.buf, result.err, deadline
+					return result.buf, deadline, result.err
 				}
 				continue
 			}
 			if !errors.Is(result.err, context.Canceled) {
-				return result.buf, result.err, deadline
+				return result.buf, deadline, result.err
 			}
 			continue
 		case <-r.ctx.Done():
 			cancelRead()
 			result := <-readDone
-			return result.buf, result.err, deadline
+			return result.buf, deadline, result.err
 		}
 	}
 }

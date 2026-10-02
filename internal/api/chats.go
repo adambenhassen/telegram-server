@@ -196,7 +196,7 @@ func (h *handlers) handleCreateChat(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("create chat announce", "chat_id", chat.ID, "err", err)
 		return nil, errInternal
 	}
-	h.notifyOwners(r.Ctx, perOwner, 0)
+	h.notifyOwners(completionCtx, perOwner, 0)
 
 	ups, err := h.chatUpdate(completionCtx, r.UserID, chat, sender, perOwner, memberIDs(perOwner))
 	if err != nil {

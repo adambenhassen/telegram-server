@@ -11,9 +11,12 @@ fixture=$(jq -nc --arg package "$package" --arg output "$probe" \
 fixture+=$'\n'
 fixture+=$(jq -nc --arg package "$package" --arg output "$probe" \
   '{Package:$package,Action:"fail",Test:"TestSmoke",Output:$output}')
+fixture+=$'\n'
+fixture+=$(jq -nc --arg package "$package" --arg output "$probe" \
+  '{Package:$package,Action:"fail",Test:"TestSmoke/peer-disconnect",Output:$output}')
 
 diagnostics=$(report_smoke_failure_diagnostics <<<"$fixture")
-expected='::error::TestSmoke/dialog-filters failed (category: scenario-failure; details redacted)'
+expected=$'::error::TestSmoke/dialog-filters failed (category: scenario-failure; details redacted)\n::error::TestSmoke/peer-disconnect failed (category: scenario-failure; details redacted)'
 if [ "$diagnostics" != "$expected" ]; then
   printf 'unexpected sanitized diagnostic\n' >&2
   exit 1

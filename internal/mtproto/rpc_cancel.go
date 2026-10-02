@@ -217,7 +217,7 @@ func (a *activeRPC) cancelForPeer() {
 		return
 	}
 	a.cancel(errPeerRPCDisconnected)
-	applied := context.Cause(a.ctx) == errPeerRPCDisconnected
+	applied := errors.Is(context.Cause(a.ctx), errPeerRPCDisconnected)
 	a.attempting = false
 	a.cancelled = applied
 	a.mu.Unlock()

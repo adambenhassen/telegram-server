@@ -12,7 +12,7 @@ func TestChatCompletionContextIgnoresPeerCancelAndKeepsDeadline(t *testing.T) {
 	deadline := time.Now().Add(250 * time.Millisecond)
 	rpcCtx, cancelRPC := context.WithDeadline(context.Background(), deadline)
 	defer cancelRPC()
-	serverCtx, cancelServer := context.WithCancel(context.Background())
+	serverCtx, cancelServer := context.WithCancel(t.Context())
 	defer cancelServer()
 	completionCtx, cancelCompletion := chatCompletionContext(serverCtx, rpcCtx)
 	defer cancelCompletion()
@@ -38,9 +38,9 @@ func TestChatCompletionContextIgnoresPeerCancelAndKeepsDeadline(t *testing.T) {
 func TestChatCompletionContextStopsOnServerShutdown(t *testing.T) {
 	t.Parallel()
 
-	rpcCtx, cancelRPC := context.WithCancel(context.Background())
+	rpcCtx, cancelRPC := context.WithCancel(t.Context())
 	defer cancelRPC()
-	serverCtx, cancelServer := context.WithCancel(context.Background())
+	serverCtx, cancelServer := context.WithCancel(t.Context())
 	completionCtx, cancelCompletion := chatCompletionContext(serverCtx, rpcCtx)
 	defer cancelCompletion()
 

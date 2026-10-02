@@ -48,7 +48,7 @@ func (c *rpcFrameTestConn) Recv(ctx context.Context, b *bin.Buffer) error {
 		<-ctx.Done()
 		c.readCancelled <- struct{}{}
 		<-c.firstTimeoutRelease
-		return rpcFrameTestTimeout{}
+		return rpcFrameTestTimeoutError{}
 	}
 	select {
 	case read := <-c.reads:
@@ -69,11 +69,11 @@ func (c *rpcFrameTestConn) Send(context.Context, *bin.Buffer) error {
 
 func (*rpcFrameTestConn) Close() error { return nil }
 
-type rpcFrameTestTimeout struct{}
+type rpcFrameTestTimeoutError struct{}
 
-func (rpcFrameTestTimeout) Error() string   { return "read timeout" }
-func (rpcFrameTestTimeout) Timeout() bool   { return true }
-func (rpcFrameTestTimeout) Temporary() bool { return true }
+func (rpcFrameTestTimeoutError) Error() string   { return "read timeout" }
+func (rpcFrameTestTimeoutError) Timeout() bool   { return true }
+func (rpcFrameTestTimeoutError) Temporary() bool { return true }
 
 func TestRPCFrameReaderCancelsActiveRPCOnPeerEOF(t *testing.T) {
 	t.Parallel()
@@ -99,7 +99,7 @@ func TestRPCFrameReaderCancelsActiveRPCOnPeerEOF(t *testing.T) {
 	if _, err, _ := reader.next(); !errors.Is(err, io.EOF) {
 		t.Fatalf("peer EOF = %v, want EOF", err)
 	}
-	if got := context.Cause(activeCtx); got != errPeerRPCDisconnected {
+	if got := context.Cause(activeCtx); !errors.Is(got, errPeerRPCDisconnected) {
 		t.Fatalf("active RPC cause = %v, want peer disconnect", got)
 	}
 }
@@ -129,7 +129,7 @@ func TestRPCFrameReaderTimeoutDoesNotCancelActiveRPC(t *testing.T) {
 			finish()
 		}
 	}()
-	conn.reads <- rpcFrameTestRead{err: rpcFrameTestTimeout{}}
+	conn.reads <- rpcFrameTestRead{err: rpcFrameTestTimeoutError{}}
 	waitForRPCFrameReads(t, conn, 3)
 	if got := context.Cause(activeCtx); got != nil {
 		t.Fatalf("read timeout canceled active RPC with %v", got)
@@ -218,8 +218,12 @@ func TestRPCFrameReaderInterruptsTransportReadOnRPCStateChange(t *testing.T) {
 	}, state, nil)
 	defer func() {
 		reader.stop()
-		_ = clientConn.Close()
-		_ = serverConn.Close()
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("close client test connection: %v", err)
+		}
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("close server test connection: %v", err)
+		}
 		reader.join()
 	}()
 	waitForRPCFrameReads(t, conn.rpcFrameTestConn, 1)
@@ -248,7 +252,7 @@ type rpcFrameNetTestConn struct {
 
 func (c *rpcFrameNetTestConn) Recv(ctx context.Context, b *bin.Buffer) error {
 	if deadline, ok := ctx.Deadline(); ok {
-		if err := c.Conn.SetReadDeadline(deadline); err != nil {
+		if err := c.SetReadDeadline(deadline); err != nil {
 			return err
 		}
 	}
@@ -258,7 +262,7 @@ func (c *rpcFrameNetTestConn) Recv(ctx context.Context, b *bin.Buffer) error {
 	default:
 	}
 	var frame [1]byte
-	if _, err := c.Conn.Read(frame[:]); err != nil {
+	if _, err := c.Read(frame[:]); err != nil {
 		return err
 	}
 	b.ResetTo(frame[:])
@@ -381,4 +385,4 @@ func waitForRPCFrameReads(t *testing.T, conn *rpcFrameTestConn, want int32) {
 	}
 }
 
-var _ net.Error = rpcFrameTestTimeout{}
+var _ net.Error = rpcFrameTestTimeoutError{}

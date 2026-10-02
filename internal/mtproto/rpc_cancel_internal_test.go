@@ -2,6 +2,7 @@ package mtproto
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -28,8 +29,8 @@ func TestPeerRPCStateChargesOneCancellationAcrossConnections(t *testing.T) {
 	finishFirst()
 	finishSecond()
 
-	firstCancelled := context.Cause(firstCtx) == errPeerRPCDisconnected
-	secondCancelled := context.Cause(secondCtx) == errPeerRPCDisconnected
+	firstCancelled := errors.Is(context.Cause(firstCtx), errPeerRPCDisconnected)
+	secondCancelled := errors.Is(context.Cause(secondCtx), errPeerRPCDisconnected)
 	if firstCancelled == secondCancelled {
 		t.Fatalf("same-user RPC cancellations = %t/%t, want exactly one allowance", firstCancelled, secondCancelled)
 	}
@@ -42,7 +43,8 @@ func TestPeerDisconnectWithoutBudgetStopsQueuedRPCButKeepsActiveRPC(t *testing.T
 	t.Parallel()
 
 	budget := newRPCCancelBudget(time.Now, 8)
-	for userID := int64(1); userID <= 2; userID++ {
+	for i := range 2 {
+		userID := int64(i + 1)
 		state := newPeerRPCState(budget)
 		_, finish, started := state.begin(userID, context.Background())
 		if !started {
@@ -80,7 +82,7 @@ func TestCompletedRPCDisconnectDoesNotConsumeBudget(t *testing.T) {
 	finish()
 	state.peerDisconnected()
 
-	if got := context.Cause(ctx); got != context.Canceled {
+	if got := context.Cause(ctx); !errors.Is(got, context.Canceled) {
 		t.Fatalf("completed RPC cause = %v, want completion cancellation", got)
 	}
 	if got := len(budget.users); got != 0 {
@@ -104,7 +106,7 @@ func TestServerCloseCancelsWithoutPeerBudget(t *testing.T) {
 	state.peerDisconnected()
 	finish()
 
-	if got := context.Cause(ctx); got != errServerRPCClosed {
+	if got := context.Cause(ctx); !errors.Is(got, errServerRPCClosed) {
 		t.Fatalf("server close cause = %v, want server-close sentinel", got)
 	}
 	if got := len(budget.users); got != 0 {
@@ -132,7 +134,7 @@ func TestConnCloseMarksServerProvenanceBeforeTransportClose(t *testing.T) {
 	if err := conn.Close(); err != nil {
 		t.Fatalf("close connection: %v", err)
 	}
-	if got := context.Cause(ctx); got != errServerRPCClosed {
+	if got := context.Cause(ctx); !errors.Is(got, errServerRPCClosed) {
 		t.Fatalf("close cause = %v, want server-close sentinel", got)
 	}
 	if got := len(budget.users); got != 0 {
@@ -145,6 +147,7 @@ func TestConnCloseMarksServerProvenanceBeforeTransportClose(t *testing.T) {
 
 type serverCloseProvenanceTransport struct {
 	*rpcFrameTestConn
+
 	state *peerRPCState
 }
 
@@ -156,7 +159,7 @@ func (c *serverCloseProvenanceTransport) Close() error {
 func TestPeerCancellationCompletionRaceRefundsUnappliedAllowance(t *testing.T) {
 	t.Parallel()
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		now := time.Unix(1_800_000_500, 0)
 		budget := newRPCCancelBudget(func() time.Time { return now }, 8)
 		state := newPeerRPCState(budget)
@@ -179,7 +182,7 @@ func TestPeerCancellationCompletionRaceRefundsUnappliedAllowance(t *testing.T) {
 		finish()
 		race.Wait()
 
-		if context.Cause(ctx) == errPeerRPCDisconnected {
+		if errors.Is(context.Cause(ctx), errPeerRPCDisconnected) {
 			if got := len(budget.users); got != 1 {
 				t.Fatalf("iteration %d applied peer cancellation with %d user entries", i, got)
 			}
