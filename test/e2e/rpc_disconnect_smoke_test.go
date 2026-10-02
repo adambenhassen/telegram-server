@@ -145,8 +145,9 @@ func testSmokePeerDisconnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("A did not receive the completed chat announcement: %v", err)
 	}
-	if service.svc.Message != chatTitle {
-		t.Fatalf("chat-create announcement title = %q, want %q", service.svc.Message, chatTitle)
+	action, ok := service.svc.Action.(*tg.MessageActionChatCreate)
+	if !ok || action.Title != chatTitle {
+		t.Fatalf("chat-create announcement action = %#v, want title %q", service.svc.Action, chatTitle)
 	}
 	if !hasChat(service.chats, chatID) {
 		t.Fatalf("chat-create update omitted chat %d", chatID)
