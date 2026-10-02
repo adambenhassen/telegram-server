@@ -252,17 +252,17 @@ func bootServerWithLimits(
 	return bootServerWithLimitsAndRegistrationMode(t, ctx, key, dcID, st, dsn, log, ln, rateLimits, config.RegistrationClosed)
 }
 
-func bootServerWithRegistryAndRegistrationMode(
-	t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store,
-	dsn string, log *slog.Logger, ln net.Listener, regMode config.RegistrationMode,
-) (*mtproto.SessionRegistry, func()) {
-	t.Helper()
-	return bootServerWithLimitsAndRegistrationMode(t, ctx, key, dcID, st, dsn, log, ln, config.RateLimitsConfig{}, regMode)
-}
-
 func bootServerWithLimitsAndRegistrationMode(
 	t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store,
 	dsn string, log *slog.Logger, ln net.Listener, rateLimits config.RateLimitsConfig, regMode config.RegistrationMode,
+) (*mtproto.SessionRegistry, func()) {
+	t.Helper()
+	return bootServerWithLifecycle(t, ctx, key, dcID, st, dsn, log, ln, rateLimits, regMode, false)
+}
+
+func bootServerWithLifecycle(
+	t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store,
+	dsn string, log *slog.Logger, ln net.Listener, rateLimits config.RateLimitsConfig, regMode config.RegistrationMode, withStatus bool,
 ) (*mtproto.SessionRegistry, func()) {
 	t.Helper()
 	tgcfg := fixtureConfigForListener(t, dcID, ln)
@@ -271,6 +271,18 @@ func bootServerWithLimitsAndRegistrationMode(
 	dialogFilterSync := api.NewDialogFilterSync()
 	handler := api.NewWithDialogFilterSync(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits, regMode, dialogFilterSync)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
+
+	if withStatus {
+		server.OnStatusChange(func(ctx context.Context, userID int64, online bool) {
+			if err := st.SetUserStatus(ctx, userID, online); err != nil {
+				log.Error("set user status", "user_id", userID, "online", online, "err", err)
+				return
+			}
+			if err := st.Notify(ctx, store.ChannelStatus, store.StatusPayload(userID, online)); err != nil {
+				log.Error("notify status", "user_id", userID, "err", err)
+			}
+		})
+	}
 
 	updater := api.NewUpdaterWithDialogFilterSync(st, server.Registry(), log, pgtest.PeerDeriver(), dialogFilterSync)
 	_, stopListener, err := store.StartListenerWithDialogFilters(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, updater.MarkDialogFilters, updater.DialogFilterListenerReconnected, log)

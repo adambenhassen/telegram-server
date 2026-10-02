@@ -22,6 +22,8 @@ import (
 	"github.com/gotd/td/transport"
 )
 
+var errPeerRPCReplySkipped = errors.New("skip RPC reply after connection close")
+
 // pushEncodeError marks an encoder failure so delivery telemetry can
 // distinguish it from a failure after encoding. It carries no additional
 // message, preserving the existing error text and unwrap chain.
@@ -133,6 +135,10 @@ type Conn struct {
 	// so reading it under writeMu would let one blackholed socket — a push
 	// parked in the write timeout — stall every user's delivery.
 	authKeyID atomic.Int64
+	// peerRPC carries only this connection's active request cancellation state.
+	// Server-initiated closes mark it before touching the transport so a read
+	// error caused by that close can never be charged as peer loss.
+	peerRPC atomic.Pointer[peerRPCState]
 
 	// pendingLogin is set when auth.signIn stages a user for the password
 	// challenge. It belongs to this connection rather than the shared auth-key
@@ -564,9 +570,14 @@ func (c *Conn) PendingLogin() bool {
 // MarkPendingLogin marks this connection as waiting for auth.checkPassword.
 // The marker is intentionally connection-local and idempotent.
 func (c *Conn) MarkPendingLogin() {
-	if c.pendingLogin.CompareAndSwap(false, true) {
-		c.pendingLoginAt.Store(c.clock.Now().UnixNano())
+	if c.pendingLogin.Load() {
+		return
 	}
+	// Publish the transition time before the marker. The concurrent transport
+	// reader can then apply the absolute pending-login deadline as soon as the
+	// handler finishes, without waiting for the serve loop's post-dispatch step.
+	c.pendingLoginAt.CompareAndSwap(0, c.clock.Now().UnixNano())
+	c.pendingLogin.CompareAndSwap(false, true)
 }
 
 func (c *Conn) pendingLoginSince() time.Time {
@@ -582,6 +593,9 @@ func (c *Conn) pendingLoginSince() time.Time {
 // take writeMu: a revoked session must not wait on a write already in flight.
 // A second close from the serve loop's own defer is a no-op the caller ignores.
 func (c *Conn) Close() error {
+	if state := c.peerRPC.Load(); state != nil {
+		state.serverClosed()
+	}
 	return c.transport.Close()
 }
 
@@ -1103,6 +1117,10 @@ func (c *Conn) PushToAtWatermark(ctx context.Context, owner int64, expectedPts i
 }
 
 func (c *Conn) sendResult(req *Request, msg bin.Encoder, onSuccess func()) error {
+	if req.PeerDisconnected() {
+		req.rpcResult = RPCResultTransportFailure
+		return errPeerRPCReplySkipped
+	}
 	var buf bin.Buffer
 	if err := msg.Encode(&buf); err != nil {
 		req.rpcResult = RPCResultInternal

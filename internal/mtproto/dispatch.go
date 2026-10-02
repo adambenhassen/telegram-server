@@ -40,12 +40,28 @@ type Request struct {
 	Buf *bin.Buffer
 	// Ctx is the request context.
 	Ctx context.Context
+	// serverCtx is the connection's server-lifetime context. It lets a handler
+	// detach committed completion work from peer loss without dropping shutdown.
+	serverCtx context.Context
+	// peerRPC connects one actual dispatch to its connection's peer-loss state.
+	peerRPC *peerRPCState
 
 	// rpcMethod and rpcResult are set by the dispatcher and reply path for the
 	// optional RPC tracing boundary. They stay inside this package so request
 	// data can never become trace data by accident.
 	rpcMethod string
 	rpcResult RPCResultClass
+}
+
+// ServerContext returns the serving connection's lifetime context, before any
+// per-RPC deadline or peer-disconnect cancellation is applied.
+func (r *Request) ServerContext() context.Context { return r.serverCtx }
+
+// PeerDisconnected reports whether the serving transport is known to have
+// closed, so reply hooks can finish committed delivery bookkeeping without a
+// write that can no longer reach the caller.
+func (r *Request) PeerDisconnected() bool {
+	return r.peerRPC != nil && r.peerRPC.disconnected()
 }
 
 // Handler processes decrypted MTProto requests.

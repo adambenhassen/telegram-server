@@ -10,7 +10,7 @@ report_smoke_failure_diagnostics() {
     failed_tests=""
   fi
 
-  for scenario in one-to-one saved-messages dialog-filters basic-group channel contacts-search username-registration; do
+  for scenario in one-to-one saved-messages dialog-filters basic-group channel contacts-search username-registration peer-disconnect; do
     if grep -Fqx -- "TestSmoke/$scenario" <<<"$failed_tests"; then
       echo "::error::TestSmoke/$scenario failed (category: scenario-failure; details redacted)"
       reported=1

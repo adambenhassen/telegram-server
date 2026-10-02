@@ -74,6 +74,10 @@ func TestSmoke(t *testing.T) {
 	t.Run("admin-proxy-login", func(t *testing.T) {
 		testSmokeAdminProxyLogin(t)
 	})
+	t.Run("peer-disconnect", func(t *testing.T) {
+		t.Parallel()
+		testSmokePeerDisconnect(t)
+	})
 }
 
 func testSmokeOneToOne(t *testing.T) {
@@ -1515,6 +1519,7 @@ type smokeFixture struct {
 	registry *mtproto.SessionRegistry
 	stop     func()
 	regMode  config.RegistrationMode
+	status   bool
 }
 
 func newSmokeFixture(t *testing.T) *smokeFixture {
@@ -1523,6 +1528,11 @@ func newSmokeFixture(t *testing.T) *smokeFixture {
 }
 
 func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMode) *smokeFixture {
+	t.Helper()
+	return newSmokeFixtureWithLifecycle(t, regMode, false)
+}
+
+func newSmokeFixtureWithLifecycle(t *testing.T, regMode config.RegistrationMode, withStatus bool) *smokeFixture {
 	t.Helper()
 	deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancelDeadline)
@@ -1543,7 +1553,7 @@ func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMo
 			t.Errorf("store close: %v", err)
 		}
 	})
-	f := &smokeFixture{ctx: ctx, failures: newClientFailureSignal(cancelFailure), key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode}
+	f := &smokeFixture{ctx: ctx, failures: newClientFailureSignal(cancelFailure), key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode, status: withStatus}
 	f.start(t, "127.0.0.1:0")
 	return f
 }
@@ -1557,7 +1567,7 @@ func (f *smokeFixture) start(t *testing.T, address string) {
 	}
 	f.port = tcpPort(t, ln)
 	f.listener = ln
-	f.registry, f.stop = bootServerWithRegistryAndRegistrationMode(t, f.ctx, f.key, f.dcID, f.store, f.dsn, f.codes.Logger(), ln, f.regMode)
+	f.registry, f.stop = bootServerWithLifecycle(t, f.ctx, f.key, f.dcID, f.store, f.dsn, f.codes.Logger(), ln, config.RateLimitsConfig{}, f.regMode, f.status)
 	stop := f.stop
 	t.Cleanup(stop)
 }
@@ -1595,6 +1605,7 @@ func (f *smokeFixture) savedSessionClient(sess *session.StorageMemory) *telegram
 
 type smokeClient struct {
 	client    *telegram.Client
+	cancel    context.CancelFunc
 	session   *session.StorageMemory
 	manager   *updates.Manager
 	seen      *updateCollector
@@ -1608,11 +1619,13 @@ type smokeClient struct {
 
 func newSmokeClient(t *testing.T, f *smokeFixture, label, phone string) *smokeClient {
 	t.Helper()
+	clientCtx, cancelClient := context.WithCancel(f.ctx)
 	sess := &session.StorageMemory{}
 	seen, push := newUpdateCollector(), newUpdateCollector()
 	manager := updates.New(updates.Config{Handler: seen})
 	client := &smokeClient{
 		client:  f.managedClient(sess, seen, push, manager),
+		cancel:  cancelClient,
 		session: sess,
 		manager: manager,
 		seen:    seen,
@@ -1627,8 +1640,8 @@ func newSmokeClient(t *testing.T, f *smokeFixture, label, phone string) *smokeCl
 		auth.SendCodeOptions{},
 	)
 	ids, ready := make(chan int64, 1), make(chan struct{}, 1)
-	client.lifecycle = startClientLifecycle(f.ctx, label, f.failures, func(phase *clientPhaseState) error {
-		return runManagedInteractive(f.ctx, client.client, flow, ids, ready, client.cmds, manager, true, phase)
+	client.lifecycle = startClientLifecycle(clientCtx, label, f.failures, func(phase *clientPhaseState) error {
+		return runManagedInteractive(clientCtx, client.client, flow, ids, ready, client.cmds, manager, true, phase)
 	})
 	t.Cleanup(func() { client.stopClient(t) })
 	loginStarted := time.Now()
@@ -1673,9 +1686,24 @@ func (c *smokeClient) call(ctx context.Context, fn func(context.Context, *tg.Cli
 func (c *smokeClient) stopClient(t *testing.T) {
 	t.Helper()
 	c.stop.Do(func() {
-		stopClientLifecycle(t, c.lifecycle, func() { close(c.cmds) })
+		stopClientLifecycle(t, c.lifecycle, func() {
+			close(c.cmds)
+			c.cancel()
+		})
 		c.manager.Reset()
 	})
+}
+
+func (c *smokeClient) disconnectClient(t *testing.T) {
+	t.Helper()
+	c.lifecycle.intentionalStop.Store(true)
+	c.cancel()
+	select {
+	case <-c.lifecycle.result.done:
+		c.manager.Reset()
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not stop after its transport context was canceled", c.label)
+	}
 }
 
 type smokeSend struct {
