@@ -4,15 +4,27 @@ VALUES ($1)
 ON CONFLICT (owner_id) DO NOTHING;
 
 -- name: DialogFilterState :one
-SELECT owner_id, order_ids, changed_at
+SELECT owner_id, order_ids, changed_at, defaults_seeded_at
 FROM user_dialog_filter_state
 WHERE owner_id = $1;
 
 -- name: DialogFilterStateForUpdate :one
-SELECT owner_id, order_ids, changed_at
+SELECT owner_id, order_ids, changed_at, defaults_seeded_at
 FROM user_dialog_filter_state
 WHERE owner_id = $1
 FOR UPDATE;
+
+-- name: DialogFilterDefaultsSeeded :one
+SELECT EXISTS (
+    SELECT 1
+    FROM user_dialog_filter_state
+    WHERE owner_id = $1 AND defaults_seeded_at IS NOT NULL
+);
+
+-- name: MarkDialogFilterDefaultsSeeded :exec
+UPDATE user_dialog_filter_state
+SET defaults_seeded_at = clock_timestamp()
+WHERE owner_id = $1 AND defaults_seeded_at IS NULL;
 
 -- name: LockUpdateState :one
 SELECT user_id
@@ -78,6 +90,18 @@ ON CONFLICT (owner_id, filter_id) DO UPDATE SET
     exclude_read = EXCLUDED.exclude_read,
     exclude_archived = EXCLUDED.exclude_archived,
     title_noanimate = EXCLUDED.title_noanimate;
+
+-- name: InsertDialogFilter :exec
+INSERT INTO user_dialog_filters (
+    owner_id, filter_id, title, emoticon, color, contacts, non_contacts,
+    groups, broadcasts, bots, exclude_muted, exclude_read, exclude_archived,
+    title_noanimate
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7,
+    $8, $9, $10, $11, $12, $13,
+    $14
+);
 
 -- name: DeleteDialogFilter :execrows
 DELETE FROM user_dialog_filters

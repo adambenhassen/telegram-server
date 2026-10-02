@@ -106,6 +106,9 @@ func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) 
 	if got := len(replicaA.registry.Conns(ownerA)); got != 1 {
 		t.Fatalf("replica A registered %d owner connections after login, want one", got)
 	}
+	if got := len(replicaB.registry.Conns(ownerA)); got != 1 {
+		t.Fatalf("replica B registered %d owner connections after login, want one", got)
+	}
 
 	exec := func(cmds chan command, name string, fn func(context.Context, *tg.Client) error) {
 		t.Helper()
@@ -125,22 +128,57 @@ func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) 
 		}
 	}
 
+	exec(cmdsB, "second same-owner session binds update recovery", func(ctx context.Context, client *tg.Client) error {
+		_, err := client.UpdatesGetDifference(ctx, &tg.UpdatesGetDifferenceRequest{Pts: 0, Date: 0, Qts: 0})
+		return err
+	})
+
 	var initial *tg.MessagesDialogFilters
 	exec(cmdsA, "initial authorized folder fetch", func(ctx context.Context, client *tg.Client) error {
 		var err error
 		initial, err = client.MessagesGetDialogFilters(ctx)
 		return err
 	})
-	if initial.TagsEnabled || len(initial.Filters) != 1 {
-		t.Fatalf("initial folder fetch = %d filters, tags enabled %v; want only All chats", len(initial.Filters), initial.TagsEnabled)
+	if initial.TagsEnabled || len(initial.Filters) != 5 {
+		t.Fatalf("initial folder fetch = %d filters, tags enabled %v; want All chats and four defaults", len(initial.Filters), initial.TagsEnabled)
 	}
 	if _, ok := initial.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("initial folder = %T, want All chats", initial.Filters[0])
 	}
-	select {
-	case unexpected := <-collectorA.dialogFilters:
-		t.Fatalf("unexpected folder invalidation before replica B's commit: %#v", unexpected)
-	default:
+	for i, title := range []string{"Personal", "Groups", "Channels", "Unread"} {
+		if folder, ok := initial.Filters[i+1].(*tg.DialogFilter); !ok || folder.ID != i+2 || folder.Title.Text != title {
+			t.Fatalf("initial default %d = %#v, want ID %d %s", i, initial.Filters[i+1], i+2, title)
+		}
+	}
+	seedInvalidation := recvOrCtx(t, ctx, collectorA.dialogFilters, "requester seed invalidation")
+	if seedInvalidation == nil {
+		t.Fatal("requester received no content-free seed invalidation")
+	}
+	exec(cmdsA, "authenticated refetch after seed invalidation", func(ctx context.Context, client *tg.Client) error {
+		_, err := client.MessagesGetDialogFilters(ctx)
+		return err
+	})
+	var replicaBDefaults *tg.MessagesDialogFilters
+	secondSessionInvalidation := recvOrCtx(t, ctx, collectorB.dialogFilters, "second same-owner session seed invalidation")
+	if secondSessionInvalidation == nil || *secondSessionInvalidation != (tg.UpdateDialogFilters{}) {
+		t.Fatalf("second same-owner session seed update = %#v, want empty UpdateDialogFilters", secondSessionInvalidation)
+	}
+	exec(cmdsB, "authenticated refetch after second-session seed invalidation", func(ctx context.Context, client *tg.Client) error {
+		var err error
+		replicaBDefaults, err = client.MessagesGetDialogFilters(ctx)
+		return err
+	})
+	if replicaBDefaults.TagsEnabled || len(replicaBDefaults.Filters) != 5 {
+		t.Fatalf("second session refetched %d folders, tags enabled %v; want All chats and four defaults", len(replicaBDefaults.Filters), replicaBDefaults.TagsEnabled)
+	}
+	if _, ok := replicaBDefaults.Filters[0].(*tg.DialogFilterDefault); !ok {
+		t.Fatalf("second session first folder = %T, want All chats", replicaBDefaults.Filters[0])
+	}
+	for i, title := range []string{"Personal", "Groups", "Channels", "Unread"} {
+		folder, ok := replicaBDefaults.Filters[i+1].(*tg.DialogFilter)
+		if !ok || folder.ID != i+2 || folder.Title.Text != title {
+			t.Fatalf("second session default %d = %#v, want ID %d %s", i, replicaBDefaults.Filters[i+1], i+2, title)
+		}
 	}
 
 	terminateListenBackends(t, dsn)
@@ -168,8 +206,8 @@ func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) 
 		recovered, err = client.MessagesGetDialogFilters(ctx)
 		return err
 	})
-	if recovered.TagsEnabled || len(recovered.Filters) != 2 {
-		t.Fatalf("recovered folder fetch = %d filters, tags enabled %v; want All chats and ID 2", len(recovered.Filters), recovered.TagsEnabled)
+	if recovered.TagsEnabled || len(recovered.Filters) != 5 {
+		t.Fatalf("recovered folder fetch = %d filters, tags enabled %v; want All chats and four defaults", len(recovered.Filters), recovered.TagsEnabled)
 	}
 	folder, ok := recovered.Filters[1].(*tg.DialogFilter)
 	if !ok || folder.ID != 2 || folder.Title.Text != "Recovered" || !folder.Groups {

@@ -112,6 +112,7 @@ type updateCollector struct {
 	userStatus    chan *tg.UpdateUserStatus
 	msgReactions  chan *tg.UpdateMessageReactions
 	pinnedMsg     chan *tg.UpdatePinnedMessages
+	dialogFilter  chan *tg.UpdateDialogFilter
 	dialogFilters chan *tg.UpdateDialogFilters
 	points        chan int
 }
@@ -131,6 +132,7 @@ func newUpdateCollector() *updateCollector {
 		userStatus:    make(chan *tg.UpdateUserStatus, 8),
 		msgReactions:  make(chan *tg.UpdateMessageReactions, 8),
 		pinnedMsg:     make(chan *tg.UpdatePinnedMessages, 8),
+		dialogFilter:  make(chan *tg.UpdateDialogFilter, 8),
 		dialogFilters: make(chan *tg.UpdateDialogFilters, 8),
 		points:        make(chan int, 8),
 	}
@@ -183,6 +185,8 @@ func (u *updateCollector) dispatch(x tg.UpdateClass, chats []tg.ChatClass) {
 		send(u.msgReactions, up)
 	case *tg.UpdatePinnedMessages:
 		send(u.pinnedMsg, up)
+	case *tg.UpdateDialogFilter:
+		send(u.dialogFilter, up)
 	case *tg.UpdateDialogFilters:
 		send(u.dialogFilters, up)
 	}
@@ -264,14 +268,16 @@ func bootServerWithLimitsAndRegistrationMode(
 	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	// Sign-in here reads the code off the log, so the gated line must be on.
 	blobs := testBlobs(t)
-	handler := api.New(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits, regMode)
+	dialogFilterSync := api.NewDialogFilterSync()
+	handler := api.NewWithDialogFilterSync(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits, regMode, dialogFilterSync)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
-	updater := api.NewUpdater(st, server.Registry(), log, pgtest.PeerDeriver())
-	_, stopListener, err := store.StartListener(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, log)
+	updater := api.NewUpdaterWithDialogFilterSync(st, server.Registry(), log, pgtest.PeerDeriver(), dialogFilterSync)
+	_, stopListener, err := store.StartListenerWithDialogFilters(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, updater.MarkDialogFilters, updater.DialogFilterListenerReconnected, log)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}
+	stopDialogFilterRecovery := updater.StartDialogFilterRecovery(ctx)
 
 	srvCtx, srvCancel := context.WithCancel(ctx)
 	serveErr := make(chan error, 1)
@@ -290,6 +296,7 @@ func bootServerWithLimitsAndRegistrationMode(
 		if lerr := stopListener(); lerr != nil {
 			t.Errorf("listener stop: %v", lerr)
 		}
+		stopDialogFilterRecovery()
 	}
 }
 
