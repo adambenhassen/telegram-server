@@ -252,14 +252,6 @@ func bootServerWithLimits(
 	return bootServerWithLimitsAndRegistrationMode(t, ctx, key, dcID, st, dsn, log, ln, rateLimits, config.RegistrationClosed)
 }
 
-func bootServerWithRegistryAndRegistrationMode(
-	t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store,
-	dsn string, log *slog.Logger, ln net.Listener, regMode config.RegistrationMode,
-) (*mtproto.SessionRegistry, func()) {
-	t.Helper()
-	return bootServerWithLimitsAndRegistrationMode(t, ctx, key, dcID, st, dsn, log, ln, config.RateLimitsConfig{}, regMode)
-}
-
 func bootServerWithLimitsAndRegistrationMode(
 	t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store,
 	dsn string, log *slog.Logger, ln net.Listener, rateLimits config.RateLimitsConfig, regMode config.RegistrationMode,
