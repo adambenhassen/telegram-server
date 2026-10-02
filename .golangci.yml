@@ -60,6 +60,9 @@ linters:
     - godoclint
     - testpackage
   settings:
+    nolintlint:
+      require-explanation: true
+      require-specific: true
     errcheck:
       check-blank: true
       check-type-assertions: true
