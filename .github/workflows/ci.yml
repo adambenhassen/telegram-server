@@ -1220,6 +1220,9 @@ jobs:
       - name: Run isolated link landing process smoke
         run: bash .github/scripts/smoke-linklanding.sh
 
+      - name: Run isolated Web selector smoke
+        run: go test -race ./internal/linkselector -run '^TestSelectorSmokeHappyPath$' -count=1
+
       - name: Check sanitized smoke failure diagnostics
         run: bash .github/scripts/test-smoke-diagnostics.sh
 

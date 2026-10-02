@@ -123,7 +123,7 @@ if [[ "$admin_status" != 404 ]]; then
 fi
 
 logs="$(<"$temp_dir/log")"
-for expected in 'route_class=invite status=200' 'route_class=username status=405' 'route_class=other status=405' 'route_class=admin status=404'; do
+for expected in 'route_class=invite status=200' 'route_class=username status=405' 'route_class=landing_other status=405' 'route_class=landing_other status=404'; do
 	if [[ "$logs" != *"$expected"* ]]; then
 		printf 'missing privacy-safe log record: %s\n' "$expected" >&2
 		exit 1
