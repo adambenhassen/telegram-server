@@ -79,7 +79,7 @@ func statusClientFrame(t *testing.T, key crypto.AuthKey, sessionID, msgID int64,
 	data := crypto.EncryptedMessageData{
 		SessionID:              sessionID,
 		MessageID:              msgID,
-		MessageDataLen:         int32(b.Len()), //nolint:gosec
+		MessageDataLen:         int32(b.Len()), //nolint:gosec // test frames contain one small PingRequest body
 		MessageDataWithPadding: b.Copy(),
 	}
 	if err := crypto.NewClientCipher(crypto.DefaultRand()).Encrypt(key, data, &b); err != nil {

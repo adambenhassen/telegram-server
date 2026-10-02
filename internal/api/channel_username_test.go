@@ -19,7 +19,7 @@ func execDB(t *testing.T, dsn, sql string, args ...any) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer conn.Close(ctx) //nolint:errcheck
+	defer conn.Close(ctx) //nolint:errcheck // deferred close is cleanup for this test-owned connection
 	if _, err := conn.Exec(ctx, sql, args...); err != nil {
 		t.Fatalf("exec: %v", err)
 	}
