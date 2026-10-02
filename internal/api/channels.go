@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -454,6 +455,52 @@ func (h *handlers) handleLeaveChannel(r *mtproto.Request) (bin.Encoder, error) {
 // a single call cannot ask the server to hydrate an unbounded batch.
 const maxChannelMessagesPerCall = 100
 
+const (
+	exportMessageLinkMethodTypeID = 0xe63fadeb
+	exportedMessageLinkTypeID     = 0x5dab1af4
+)
+
+// exportMessageLinkRequest is the channels.exportMessageLink request from the
+// layer newer than gotd's generated schema. The grouped and thread flags are
+// decoded for wire compatibility but do not change the address or visibility
+// of the requested message.
+type exportMessageLinkRequest struct {
+	Channel tg.InputChannelClass
+	ID      int
+}
+
+func (r *exportMessageLinkRequest) Decode(b *bin.Buffer) error {
+	if err := b.ConsumeID(exportMessageLinkMethodTypeID); err != nil {
+		return err
+	}
+	if _, err := b.Int(); err != nil { // flags: grouped and thread are ignored.
+		return err
+	}
+	channel, err := tg.DecodeInputChannel(b)
+	if err != nil {
+		return err
+	}
+	id, err := b.Int()
+	if err != nil {
+		return err
+	}
+	r.Channel = channel
+	r.ID = id
+	return nil
+}
+
+type exportedMessageLinkReply struct {
+	Link string
+	HTML string
+}
+
+func (r *exportedMessageLinkReply) Encode(b *bin.Buffer) error {
+	b.PutID(exportedMessageLinkTypeID)
+	b.PutString(r.Link)
+	b.PutString(r.HTML)
+	return nil
+}
+
 // requireChannelMember is the read gate for a client-supplied channel id: the
 // caller must hold a participant row that is not banned as of now. An unknown
 // channel, a channel the caller never joined and a banned member all report
@@ -706,6 +753,56 @@ func (h *handlers) handleGetChannelMessages(r *mtproto.Request) (bin.Encoder, er
 		}
 	}
 	return h.channelMessages(r, channelID, msgs)
+}
+
+// handleExportMessageLink returns an address only for a message that the
+// caller can currently read through channels.getMessages. Channel membership,
+// the per-viewer access hash and bans remain the admission checks; the private
+// channel id in the resulting URL is only an address.
+func (h *handlers) handleExportMessageLink(r *mtproto.Request) (bin.Encoder, error) {
+	var req exportMessageLinkRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := h.requireChannelMember(r.Ctx, channelID, r.UserID); err != nil {
+		return nil, err
+	}
+	if req.ID <= 0 {
+		return nil, errPeerIDInvalid
+	}
+
+	messages, err := h.store.ChannelMessages(r.Ctx, channelID, []int64{int64(req.ID)})
+	if err != nil {
+		h.log.Error("export channel message link", "user_id", r.UserID, "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	message, found := messages[int64(req.ID)]
+	if !found || message.Deleted {
+		return nil, errPeerIDInvalid
+	}
+
+	channel, found, err := h.store.ChannelByID(r.Ctx, channelID)
+	if err != nil {
+		h.log.Error("export channel message link channel", "user_id", r.UserID, "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	if !found {
+		return nil, errPeerIDInvalid
+	}
+
+	messageID := strconv.Itoa(req.ID)
+	address := "c/" + strconv.FormatInt(channelID, 10) + "/" + messageID
+	if channel.Username != nil && *channel.Username != "" {
+		address = *channel.Username + "/" + messageID
+	}
+	return &exportedMessageLinkReply{Link: h.cfg.MeURLPrefix + address}, nil
 }
 
 // channelHistory renders one page of a channel's history for the caller, whom
