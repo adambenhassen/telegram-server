@@ -103,12 +103,8 @@ func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) 
 	if ownerB != ownerA {
 		t.Fatalf("second authorized session owner = %d, want %d", ownerB, ownerA)
 	}
-	if got := len(replicaA.registry.Conns(ownerA)); got != 1 {
-		t.Fatalf("replica A registered %d owner connections after login, want one", got)
-	}
-	if got := len(replicaB.registry.Conns(ownerA)); got != 1 {
-		t.Fatalf("replica B registered %d owner connections after login, want one", got)
-	}
+	waitForOwnerConnections(t, ctx, replicaA.registry, ownerA, 1, "replica A")
+	waitForOwnerConnections(t, ctx, replicaB.registry, ownerA, 1, "replica B")
 
 	exec := func(cmds chan command, name string, fn func(context.Context, *tg.Client) error) {
 		t.Helper()
@@ -212,6 +208,30 @@ func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) 
 	folder, ok := recovered.Filters[1].(*tg.DialogFilter)
 	if !ok || folder.ID != 2 || folder.Title.Text != "Recovered" || !folder.Groups {
 		t.Fatalf("client fetched folder = %#v, want persisted ID 2 Recovered with Groups", recovered.Filters[1])
+	}
+}
+
+func waitForOwnerConnections(t *testing.T, ctx context.Context, registry *mtproto.SessionRegistry, ownerID int64, want int, replica string) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for {
+		got := len(registry.Conns(ownerID))
+		if got == want {
+			return
+		}
+		if got > want {
+			t.Fatalf("%s registered %d owner connections after login, want %d", replica, got, want)
+		}
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			t.Fatalf("%s registered %d owner connections after login, want %d", replica, got, want)
+		case <-ctx.Done():
+			t.Fatalf("%s owner connection wait: %v", replica, ctx.Err())
+		}
 	}
 }
 
