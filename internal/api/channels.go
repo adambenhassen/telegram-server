@@ -902,10 +902,9 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 // gotd v0.161.0 does not generate this request type, so the handler decodes
 // it manually (peer, hash) and registers the constructor id directly.
 //
-// Every rejection returns errPeerIDInvalid: no channel row, no participant row,
-// role 0, a live ban, or a hash that the channel never minted. They are ONE
-// error deliberately — a distinguishable "hash not found" would let an account
-// walk the invite space.
+// Authorization failures return errPeerIDInvalid: no channel row, no participant
+// row, role 0, or a live ban. Unknown hashes and links with unrecognized origins
+// revoke nothing and still return success, so invite existence is not disclosed.
 //
 // Role 1 is the floor for the same reason export requires it: a role-0 member
 // able to revoke would be able to confirm which hashes belong to the channel.

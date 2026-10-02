@@ -489,6 +489,8 @@ func ValidatePublicLinkPrefix(prefix string) error {
 	if isIPAddressLiteral(host) {
 		return invalid()
 	}
+	// Keep the first hostname split so source audits do not mistake a rejected
+	// origin for a generated link.
 	for _, official := range [...]string{"t" + ".me", "telegram.me", "telegram.dog", "telegram.org"} {
 		if host == official || strings.HasSuffix(host, "."+official) {
 			return invalid()
