@@ -8,9 +8,9 @@ on:
 permissions:
   contents: read
 
-# PR updates supersede older checks; main push runs must complete.
+# PR updates supersede older checks; every other run attempt has its own group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
