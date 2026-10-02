@@ -116,6 +116,8 @@ jobs:
             printf 'focused_process_elapsed_seconds=not_run\n'
             printf 'load_exit_code=%s\n' "$load_status"
             printf 'load_process_elapsed_seconds=%s\n' "$load_time"
+            printf 'focused_scenario_result=not_run\n'
+            printf 'load_suite_outcome=%s\n' "$load_status"
             printf 'diagnostic_runner_status=prepared\n'
           } > reconnect-diagnostics/diagnostics.txt
 
@@ -129,6 +131,7 @@ jobs:
           cache: false
 
       - name: Run bounded reconnect diagnostic
+        id: diagnostic
         timeout-minutes: 20
         env:
           SOURCE_SHA: ${{ steps.request.outputs.source_sha }}
@@ -145,10 +148,11 @@ jobs:
             --source-sha "$SOURCE_SHA" \
             --repetitions "$REPETITIONS" \
             --parallel-e2e "$PARALLEL_E2E" \
-            --output reconnect-diagnostics/diagnostics.txt
+            --output reconnect-diagnostics/diagnostics.txt \
+            --artifact-ready-output "$GITHUB_OUTPUT"
 
       - name: Upload allow-listed diagnostics
-        if: ${{ always() }}
+        if: ${{ always() && steps.diagnostic.outputs.artifact_ready == 'true' }}
         uses: actions/upload-artifact@v7.0.1
         with:
           name: reconnect-diagnostic-${{ steps.request.outputs.source_sha }}-${{ steps.request.outputs.load_mode }}
