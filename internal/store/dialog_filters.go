@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -59,29 +60,18 @@ type DialogFilter struct {
 
 // DialogFilterSnapshot is a consistent read of one owner's folders and order.
 type DialogFilterSnapshot struct {
-	Filters        []DialogFilter
-	Order          []int
-	ChangedAt      *time.Time
-	defaultsSeeded bool
+	Filters   []DialogFilter
+	Order     []int
+	ChangedAt *time.Time
 }
 
 // ErrDialogFilterLimit reports that the owner already has the maximum number
 // of custom folders.
 var ErrDialogFilterLimit = errors.New("dialog filter limit reached")
 
-// DialogFilters lazily seeds the default Unread folder once, then returns a
-// repeatable-read snapshot of the owner's folders and order.
+// DialogFilters returns a repeatable-read snapshot of the owner's folders and
+// order without changing folder state.
 func (s *Store) DialogFilters(ctx context.Context, ownerID int64) (DialogFilterSnapshot, error) {
-	snapshot, err := s.readDialogFilters(ctx, ownerID)
-	if err != nil {
-		return DialogFilterSnapshot{}, err
-	}
-	if snapshot.defaultsSeeded {
-		return snapshot, nil
-	}
-	if err := s.seedDefaultUnreadDialogFilter(ctx, ownerID); err != nil {
-		return DialogFilterSnapshot{}, err
-	}
 	return s.readDialogFilters(ctx, ownerID)
 }
 
@@ -96,79 +86,112 @@ func (s *Store) DialogFilterDefinitions(ctx context.Context, ownerID int64) ([]D
 	return snapshot.Filters, nil
 }
 
-func (s *Store) seedDefaultUnreadDialogFilter(ctx context.Context, ownerID int64) error {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+// DefaultDialogFilters returns the four private, peer-free folder definitions
+// created for accounts on their first authenticated folder read.
+func DefaultDialogFilters() []DialogFilter {
+	return []DialogFilter{
+		{Title: "Personal", Contacts: true, NonContacts: true, Bots: true},
+		{Title: "Groups", Groups: true},
+		{Title: "Channels", Broadcasts: true},
+		{Title: "Unread", Contacts: true, NonContacts: true, Groups: true, Broadcasts: true, Bots: true, ExcludeRead: true},
+	}
+}
+
+// DialogFilterDefaultsSeeded reports whether the owner has completed the
+// one-time default initialization. A missing state row is unseeded.
+func (s *Store) DialogFilterDefaultsSeeded(ctx context.Context, ownerID int64) (bool, error) {
+	seeded, err := s.q.DialogFilterDefaultsSeeded(ctx, ownerID)
 	if err != nil {
-		return fmt.Errorf("begin default dialog filter seed: %w", err)
+		return false, fmt.Errorf("read dialog filter defaults marker: %w", err)
+	}
+	return seeded, nil
+}
+
+// SeedDefaultDialogFilters atomically appends missing default titles once.
+// Folder reads call this only after authenticating the request.
+func (s *Store) SeedDefaultDialogFilters(ctx context.Context, ownerID int64) (bool, error) {
+	seeded, err := s.DialogFilterDefaultsSeeded(ctx, ownerID)
+	if err != nil {
+		return false, err
+	}
+	if seeded {
+		return false, nil
+	}
+
+	tx, qtx, state, err := s.beginDialogFilterMutation(ctx, ownerID)
+	if err != nil {
+		return false, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }() //nolint:errcheck // no-op after commit
-	qtx := s.q.WithTx(tx)
-	if err := qtx.EnsureDialogFilterState(ctx, ownerID); err != nil {
-		cause := fmt.Errorf("ensure default dialog filter state: %w", err)
-		return rollbackDialogFilterMutation(tx, cause)
-	}
-	state, err := qtx.DialogFilterStateForUpdate(ctx, ownerID)
-	if err != nil {
-		cause := fmt.Errorf("lock default dialog filter state: %w", err)
-		return rollbackDialogFilterMutation(tx, cause)
-	}
-	if state.DefaultsSeeded {
+	if state.DefaultsSeededAt.Valid {
 		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit default dialog filter seed check: %w", err)
+			return false, fmt.Errorf("commit default dialog filter seed check: %w", err)
 		}
-		return nil
+		return false, nil
 	}
 
 	rows, err := qtx.ListDialogFilters(ctx, ownerID)
 	if err != nil {
-		cause := fmt.Errorf("check existing folders before default seed: %w", err)
-		return rollbackDialogFilterMutation(tx, cause)
+		return false, fmt.Errorf("list existing folders before default seed: %w", err)
 	}
-	if len(rows) > 0 {
-		if err := qtx.MarkDialogFilterDefaultsSeeded(ctx, ownerID); err != nil {
-			cause := fmt.Errorf("mark existing folders as initialized: %w", err)
-			return rollbackDialogFilterMutation(tx, cause)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit existing dialog filter initialization: %w", err)
-		}
-		return nil
+	usedIDs := make(map[int]struct{}, len(rows))
+	existingTitles := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		usedIDs[int(row.FilterID)] = struct{}{}
+		existingTitles[dialogFilterTitleKey(row.Title)] = struct{}{}
 	}
+	order := NormalizeDialogFilterOrder(dialogFilterIDs(state.OrderIds), dialogFilterRowIDs(rows))
+	addedIDs := make([]int, 0, 4)
+	for _, definition := range DefaultDialogFilters() {
+		if len(rows)+len(addedIDs) >= 10 {
+			break
+		}
+		if _, exists := existingTitles[dialogFilterTitleKey(definition.Title)]; exists {
+			continue
+		}
+		id := nextAvailableDialogFilterID(usedIDs)
+		if id == 0 {
+			break
+		}
+		filterID, err := dialogFilterSmallint(id)
+		if err != nil {
+			return false, rollbackDialogFilterMutation(tx, fmt.Errorf("default dialog filter id %d: %w", id, err))
+		}
+		if err := qtx.InsertDialogFilter(ctx, db.InsertDialogFilterParams{
+			OwnerID: ownerID, FilterID: filterID, Title: definition.Title,
+			Contacts: definition.Contacts, NonContacts: definition.NonContacts,
+			Groups: definition.Groups, Broadcasts: definition.Broadcasts,
+			Bots: definition.Bots, ExcludeMuted: definition.ExcludeMuted,
+			ExcludeRead: definition.ExcludeRead, ExcludeArchived: definition.ExcludeArchived,
+			TitleNoanimate: definition.TitleNoanimate,
+		}); err != nil {
+			return false, rollbackDialogFilterMutation(tx, fmt.Errorf("insert default dialog filter %q: %w", definition.Title, err))
+		}
+		usedIDs[id] = struct{}{}
+		existingTitles[dialogFilterTitleKey(definition.Title)] = struct{}{}
+		addedIDs = append(addedIDs, id)
+	}
+	order = append(order, addedIDs...)
+	if err := qtx.MarkDialogFilterDefaultsSeeded(ctx, ownerID); err != nil {
+		return false, rollbackDialogFilterMutation(tx, fmt.Errorf("mark default dialog filters seeded: %w", err))
+	}
+	if err := commitDialogFilterMutation(ctx, tx, qtx, ownerID, order); err != nil {
+		return false, rollbackDialogFilterMutation(tx, err)
+	}
+	return true, nil
+}
 
-	if err := qtx.UpsertDialogFilter(ctx, db.UpsertDialogFilterParams{
-		OwnerID:     ownerID,
-		FilterID:    2,
-		Title:       "Unread",
-		Contacts:    true,
-		NonContacts: true,
-		Groups:      true,
-		Broadcasts:  true,
-		Bots:        true,
-		ExcludeRead: true,
-	}); err != nil {
-		cause := fmt.Errorf("insert default Unread folder: %w", err)
-		return rollbackDialogFilterMutation(tx, cause)
+func dialogFilterTitleKey(title string) string {
+	return strings.ToLower(strings.TrimSpace(title))
+}
+
+func nextAvailableDialogFilterID(used map[int]struct{}) int {
+	for id := 2; id <= 255; id++ {
+		if _, exists := used[id]; !exists {
+			return id
+		}
 	}
-	order := NormalizeDialogFilterOrder(dialogFilterIDs(state.OrderIds), []int{2})
-	orderIDs, err := dialogFilterOrderIDs(order)
-	if err != nil {
-		cause := fmt.Errorf("encode default folder order: %w", err)
-		return rollbackDialogFilterMutation(tx, cause)
-	}
-	if err := qtx.CommitUnreadDialogFilterSeed(ctx, db.CommitUnreadDialogFilterSeedParams{
-		OwnerID: ownerID, OrderIds: orderIDs,
-	}); err != nil {
-		cause := fmt.Errorf("commit default dialog filter seed state: %w", err)
-		return rollbackDialogFilterMutation(tx, cause)
-	}
-	if err := qtx.NotifyDialogFilterSeed(ctx, ownerID); err != nil {
-		cause := fmt.Errorf("notify default dialog filter seed: %w", err)
-		return rollbackDialogFilterMutation(tx, cause)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit default dialog filter seed: %w", err)
-	}
-	return nil
+	return 0
 }
 
 // readDialogFilters returns a repeatable-read snapshot without changing the
@@ -189,7 +212,6 @@ func (s *Store) readDialogFilters(ctx context.Context, ownerID int64) (DialogFil
 	case err != nil:
 		return DialogFilterSnapshot{}, fmt.Errorf("read dialog filter state: %w", err)
 	default:
-		snapshot.defaultsSeeded = state.DefaultsSeeded
 		snapshot.Order = dialogFilterIDs(state.OrderIds)
 		if state.ChangedAt.Valid {
 			changedAt := state.ChangedAt.Time

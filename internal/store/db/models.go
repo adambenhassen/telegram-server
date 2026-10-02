@@ -430,10 +430,10 @@ type UserDialogFilterPeer struct {
 }
 
 type UserDialogFilterState struct {
-	OwnerID        int64
-	OrderIds       []int16
-	ChangedAt      pgtype.Timestamptz
-	DefaultsSeeded bool
+	OwnerID          int64
+	OrderIds         []int16
+	ChangedAt        pgtype.Timestamptz
+	DefaultsSeededAt pgtype.Timestamptz
 }
 
 type UserPassword struct {

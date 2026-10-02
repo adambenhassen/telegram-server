@@ -131,24 +131,33 @@ func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) 
 		initial, err = client.MessagesGetDialogFilters(ctx)
 		return err
 	})
-	if initial.TagsEnabled || len(initial.Filters) != 2 {
-		t.Fatalf("initial folder fetch = %d filters, tags enabled %v; want All chats and Unread", len(initial.Filters), initial.TagsEnabled)
+	if initial.TagsEnabled || len(initial.Filters) != 5 {
+		t.Fatalf("initial folder fetch = %d filters, tags enabled %v; want All chats and four defaults", len(initial.Filters), initial.TagsEnabled)
 	}
 	if _, ok := initial.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("initial folder = %T, want All chats", initial.Filters[0])
 	}
-	if unread, ok := initial.Filters[1].(*tg.DialogFilter); !ok || unread.ID != 2 || unread.Title.Text != "Unread" {
-		t.Fatalf("initial second folder = %#v, want Unread", initial.Filters[1])
+	for i, title := range []string{"Personal", "Groups", "Channels", "Unread"} {
+		if folder, ok := initial.Filters[i+1].(*tg.DialogFilter); !ok || folder.ID != i+2 || folder.Title.Text != title {
+			t.Fatalf("initial default %d = %#v, want ID %d %s", i, initial.Filters[i+1], i+2, title)
+		}
 	}
-	seedUpdate := recvOrCtx(t, ctx, collectorB.dialogFilter, "replica B seeded folder update")
-	seedFilter, ok := seedUpdate.GetFilter()
-	if folder, folderOK := seedFilter.(*tg.DialogFilter); !ok || !folderOK || seedUpdate.ID != 2 || folder.Title.Text != "Unread" || !folder.ExcludeRead {
-		t.Fatalf("replica B seed update = %#v, want updateDialogFilter for Unread", seedUpdate)
+	seedInvalidation := recvOrCtx(t, ctx, collectorA.dialogFilters, "requester seed invalidation")
+	if seedInvalidation == nil {
+		t.Fatal("requester received no content-free seed invalidation")
 	}
-	select {
-	case unexpected := <-collectorA.dialogFilters:
-		t.Fatalf("unexpected folder invalidation before replica B's commit: %#v", unexpected)
-	default:
+	exec(cmdsA, "authenticated refetch after seed invalidation", func(ctx context.Context, client *tg.Client) error {
+		_, err := client.MessagesGetDialogFilters(ctx)
+		return err
+	})
+	var replicaBDefaults *tg.MessagesDialogFilters
+	exec(cmdsB, "replica B authorized default fetch", func(ctx context.Context, client *tg.Client) error {
+		var err error
+		replicaBDefaults, err = client.MessagesGetDialogFilters(ctx)
+		return err
+	})
+	if len(replicaBDefaults.Filters) != 5 {
+		t.Fatalf("replica B fetched %d folders, want All chats and four defaults", len(replicaBDefaults.Filters))
 	}
 
 	terminateListenBackends(t, dsn)
@@ -176,8 +185,8 @@ func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) 
 		recovered, err = client.MessagesGetDialogFilters(ctx)
 		return err
 	})
-	if recovered.TagsEnabled || len(recovered.Filters) != 2 {
-		t.Fatalf("recovered folder fetch = %d filters, tags enabled %v; want All chats and ID 2", len(recovered.Filters), recovered.TagsEnabled)
+	if recovered.TagsEnabled || len(recovered.Filters) != 5 {
+		t.Fatalf("recovered folder fetch = %d filters, tags enabled %v; want All chats and four defaults", len(recovered.Filters), recovered.TagsEnabled)
 	}
 	folder, ok := recovered.Filters[1].(*tg.DialogFilter)
 	if !ok || folder.ID != 2 || folder.Title.Text != "Recovered" || !folder.Groups {
@@ -224,7 +233,6 @@ func startDialogFilterReplica(
 		updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus,
 		updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned,
 		updater.MarkDialogFilters,
-		updater.DeliverSeededDialogFilter,
 		func() {
 			updater.DialogFilterListenerReconnected()
 			select {

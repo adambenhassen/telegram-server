@@ -1,4 +1,4 @@
--- Track the one-time Unread folder seed independently from the folder rows so
--- deleting the folder does not cause it to be recreated on the next read.
+-- Track one-time default folder initialization independently from folder rows
+-- so user deletions do not cause defaults to be recreated on later reads.
 ALTER TABLE user_dialog_filter_state
-    ADD COLUMN defaults_seeded BOOLEAN NOT NULL DEFAULT false;
+    ADD COLUMN defaults_seeded_at TIMESTAMPTZ;

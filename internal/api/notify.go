@@ -104,58 +104,6 @@ func (u *Updater) MarkDialogFilters(_ context.Context, ownerID int64) {
 	u.dialogFilterSync.OwnerInvalidation(u.registry, ownerID)
 }
 
-// DeliverSeededDialogFilter sends the current ID 2 folder to each live owner
-// session after the one-time seed transaction commits. It reads the current
-// value so an edit or delete racing the notification is reflected in the push.
-func (u *Updater) DeliverSeededDialogFilter(ctx context.Context, ownerID int64) {
-	if ownerID <= 0 || u.registry == nil || u.h.store == nil {
-		return
-	}
-	snapshot, err := u.h.store.DialogFilters(ctx, ownerID)
-	if err != nil {
-		u.log.Error("read seeded dialog filter for push", "user_id", ownerID, "err", err)
-		return
-	}
-	update := &tg.UpdateDialogFilter{ID: 2}
-	for _, definition := range snapshot.Filters {
-		if definition.ID != 2 {
-			continue
-		}
-		peers := make([]store.DialogFilterPeer, 0, len(definition.PinnedPeers)+len(definition.IncludePeers)+len(definition.ExcludePeers))
-		peers = append(peers, definition.PinnedPeers...)
-		peers = append(peers, definition.IncludePeers...)
-		peers = append(peers, definition.ExcludePeers...)
-		accessible, err := u.h.store.AccessibleDialogFilterPeers(ctx, ownerID, peers, time.Now())
-		if err != nil {
-			u.log.Error("authorize seeded dialog filter push", "user_id", ownerID, "err", err)
-			return
-		}
-		definition.PinnedPeers = accessibleDialogFilterPeers(definition.PinnedPeers, accessible)
-		definition.IncludePeers = accessibleDialogFilterPeers(definition.IncludePeers, accessible)
-		definition.ExcludePeers = accessibleDialogFilterPeers(definition.ExcludePeers, accessible)
-		update.SetFilter(u.h.dialogFilterToTL(definition, ownerID))
-		break
-	}
-	update.SetFlags()
-	envelope := &tg.Updates{
-		Updates: []tg.UpdateClass{update},
-		Date:    int(time.Now().Unix()),
-	}
-	connections := u.registry.Conns(ownerID)
-	pushes := make([]transientPush, len(connections))
-	for i, conn := range connections {
-		pushes[i] = transientPush{
-			owner: ownerID,
-			conn:  conn,
-			enc:   envelope,
-			onError: func(err error) {
-				u.log.Info("push seeded dialog filter", "user_id", ownerID, "err", err)
-			},
-		}
-	}
-	u.pushTransientFanout(ctx, pushes)
-}
-
 // DialogFilterListenerReconnected advances the replica-wide recovery epoch.
 func (u *Updater) DialogFilterListenerReconnected() {
 	u.dialogFilterSync.ListenerReconnected()

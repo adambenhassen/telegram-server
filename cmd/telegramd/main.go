@@ -591,7 +591,7 @@ func run(log *slog.Logger) error {
 	updater := api.NewUpdaterWithDialogFilterSync(st, server.Registry(), log, peers, dialogFilterSync, notifyMetrics)
 	stopDialogFilterRecovery := updater.StartDialogFilterRecovery(ctx)
 	defer stopDialogFilterRecovery()
-	_, stopListener, err := store.StartListenerWithDialogFilters(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, updater.MarkDialogFilters, updater.DeliverSeededDialogFilter, updater.DialogFilterListenerReconnected, log, notifyMetrics)
+	_, stopListener, err := store.StartListenerWithDialogFilters(ctx, cfg.PostgresDSN, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, updater.MarkDialogFilters, updater.DialogFilterListenerReconnected, log, notifyMetrics)
 	if err != nil {
 		return err
 	}

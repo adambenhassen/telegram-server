@@ -77,6 +77,10 @@ func (h *handlers) handleGetDialogFilters(c *mtproto.Conn, req *mtproto.Request)
 
 	h.dialogFilterSync.EnsureBinding(c, req)
 	captured := h.dialogFilterSync.Capture(c, req)
+	if _, err := h.store.SeedDefaultDialogFilters(req.Ctx, req.UserID); err != nil {
+		h.log.Error("seed default dialog filters", "user_id", req.UserID, "err", err)
+		return nil, nil, errInternal
+	}
 	snapshot, err := h.store.DialogFilters(req.Ctx, req.UserID)
 	if err != nil {
 		h.log.Error("get dialog filters", "user_id", req.UserID, "err", err)
@@ -235,7 +239,7 @@ func (h *handlers) handleGetSuggestedDialogFilters(r *mtproto.Request) (bin.Enco
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
 	}
-	if r.UserID == 0 {
+	if r.UserID == 0 || r.Provisional {
 		return nil, errAuthKeyUnreg
 	}
 	existing, err := h.store.DialogFilterDefinitions(r.Ctx, r.UserID)
@@ -247,30 +251,21 @@ func (h *handlers) handleGetSuggestedDialogFilters(r *mtproto.Request) (bin.Enco
 }
 
 func suggestedDialogFilters(existing []store.DialogFilter) []tg.DialogFilterSuggested {
-	candidates := []struct {
-		definition  store.DialogFilter
-		description string
-	}{
-		{
-			definition: store.DialogFilter{
-				Title: "Unread", Contacts: true, NonContacts: true, Groups: true,
-				Broadcasts: true, Bots: true, ExcludeRead: true,
-			},
-			description: "Chats with unread messages",
-		},
-		{
-			definition:  store.DialogFilter{Title: "Personal", Contacts: true, NonContacts: true},
-			description: "Private chats",
-		},
+	descriptions := map[string]string{
+		"Personal": "Private chats",
+		"Groups":   "Group chats",
+		"Channels": "Broadcast channels",
+		"Unread":   "Chats with unread messages",
 	}
+	candidates := store.DefaultDialogFilters()
 	usedIDs := make(map[int]struct{}, len(existing))
 	for _, filter := range existing {
 		usedIDs[filter.ID] = struct{}{}
 	}
 
 	suggested := make([]tg.DialogFilterSuggested, 0, len(candidates))
-	for _, candidate := range candidates {
-		if hasSuggestedDialogFilter(existing, candidate.definition) {
+	for _, definition := range candidates {
+		if hasSuggestedDialogFilterTitle(existing, definition.Title) {
 			continue
 		}
 		id := nextDialogFilterID(usedIDs)
@@ -278,27 +273,17 @@ func suggestedDialogFilters(existing []store.DialogFilter) []tg.DialogFilterSugg
 			break
 		}
 		usedIDs[id] = struct{}{}
-		filter := dialogFilterTemplateToTL(candidate.definition, id)
+		filter := dialogFilterTemplateToTL(definition, id)
 		suggested = append(suggested, tg.DialogFilterSuggested{
-			Filter: filter, Description: candidate.description,
+			Filter: filter, Description: descriptions[definition.Title],
 		})
 	}
 	return suggested
 }
 
-func hasSuggestedDialogFilter(existing []store.DialogFilter, candidate store.DialogFilter) bool {
+func hasSuggestedDialogFilterTitle(existing []store.DialogFilter, title string) bool {
 	for _, filter := range existing {
-		if strings.EqualFold(strings.TrimSpace(filter.Title), candidate.Title) ||
-			(filter.Contacts == candidate.Contacts &&
-				filter.NonContacts == candidate.NonContacts &&
-				filter.Groups == candidate.Groups &&
-				filter.Broadcasts == candidate.Broadcasts &&
-				filter.Bots == candidate.Bots &&
-				filter.ExcludeMuted == candidate.ExcludeMuted &&
-				filter.ExcludeRead == candidate.ExcludeRead &&
-				filter.ExcludeArchived == candidate.ExcludeArchived &&
-				len(filter.PinnedPeers) == 0 && len(filter.IncludePeers) == 0 &&
-				len(filter.ExcludePeers) == 0) {
+		if strings.EqualFold(strings.TrimSpace(filter.Title), title) {
 			return true
 		}
 	}

@@ -4,25 +4,27 @@ VALUES ($1)
 ON CONFLICT (owner_id) DO NOTHING;
 
 -- name: DialogFilterState :one
-SELECT owner_id, order_ids, changed_at, defaults_seeded
+SELECT owner_id, order_ids, changed_at, defaults_seeded_at
 FROM user_dialog_filter_state
 WHERE owner_id = $1;
 
 -- name: DialogFilterStateForUpdate :one
-SELECT owner_id, order_ids, changed_at, defaults_seeded
+SELECT owner_id, order_ids, changed_at, defaults_seeded_at
 FROM user_dialog_filter_state
 WHERE owner_id = $1
 FOR UPDATE;
 
+-- name: DialogFilterDefaultsSeeded :one
+SELECT EXISTS (
+    SELECT 1
+    FROM user_dialog_filter_state
+    WHERE owner_id = $1 AND defaults_seeded_at IS NOT NULL
+);
+
 -- name: MarkDialogFilterDefaultsSeeded :exec
 UPDATE user_dialog_filter_state
-SET defaults_seeded = true
-WHERE owner_id = $1;
-
--- name: CommitUnreadDialogFilterSeed :exec
-UPDATE user_dialog_filter_state
-SET defaults_seeded = true, order_ids = $2, changed_at = clock_timestamp()
-WHERE owner_id = $1;
+SET defaults_seeded_at = clock_timestamp()
+WHERE owner_id = $1 AND defaults_seeded_at IS NULL;
 
 -- name: LockUpdateState :one
 SELECT user_id
@@ -89,6 +91,18 @@ ON CONFLICT (owner_id, filter_id) DO UPDATE SET
     exclude_archived = EXCLUDED.exclude_archived,
     title_noanimate = EXCLUDED.title_noanimate;
 
+-- name: InsertDialogFilter :exec
+INSERT INTO user_dialog_filters (
+    owner_id, filter_id, title, emoticon, color, contacts, non_contacts,
+    groups, broadcasts, bots, exclude_muted, exclude_read, exclude_archived,
+    title_noanimate
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7,
+    $8, $9, $10, $11, $12, $13,
+    $14
+);
+
 -- name: DeleteDialogFilter :execrows
 DELETE FROM user_dialog_filters
 WHERE owner_id = $1 AND filter_id = $2;
@@ -120,9 +134,6 @@ WHERE owner_id = $1;
 
 -- name: NotifyDialogFilterMutation :exec
 SELECT pg_notify('tg_dialog_filters', $1);
-
--- name: NotifyDialogFilterSeed :exec
-SELECT pg_notify('tg_dialog_filters', 'seed|' || CAST(sqlc.arg(owner_id) AS BIGINT)::TEXT);
 
 -- name: DialogFilterChatMemberships :many
 SELECT chat_id

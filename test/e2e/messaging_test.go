@@ -273,7 +273,7 @@ func bootServerWithLimitsAndRegistrationMode(
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
 
 	updater := api.NewUpdaterWithDialogFilterSync(st, server.Registry(), log, pgtest.PeerDeriver(), dialogFilterSync)
-	_, stopListener, err := store.StartListenerWithDialogFilters(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, updater.MarkDialogFilters, updater.DeliverSeededDialogFilter, updater.DialogFilterListenerReconnected, log)
+	_, stopListener, err := store.StartListenerWithDialogFilters(ctx, dsn, updater.Deliver, updater.DeliverTyping, updater.Evict, updater.DeliverChannelPost, updater.DeliverEncryption, updater.DeliverStatus, updater.DeliverEncryptedMsg, updater.DeliverReactions, updater.DeliverPinned, updater.MarkDialogFilters, updater.DialogFilterListenerReconnected, log)
 	if err != nil {
 		t.Fatalf("start listener: %v", err)
 	}

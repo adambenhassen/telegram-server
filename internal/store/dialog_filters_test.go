@@ -4,8 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
 	"github.com/adambenhassen/telegram-server/internal/store"
@@ -64,70 +69,247 @@ func TestDialogFilterQuotaSerializesConcurrentCreates(t *testing.T) {
 	}
 }
 
-func TestDialogFiltersSeedUnreadOnceAndKeepDeletion(t *testing.T) {
+func TestDialogFiltersSeedDefaultsOnceAndKeepDeletion(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openDialogFilterStore(t, pgtest.DSN(t))
 	owner := mustUser(t, s, "+15551091006")
 
+	seeded, err := s.SeedDefaultDialogFilters(ctx, owner.ID)
+	if err != nil || !seeded {
+		t.Fatalf("seed default dialog filters: seeded %v, err %v", seeded, err)
+	}
 	snapshot, err := s.DialogFilters(ctx, owner.ID)
 	if err != nil {
-		t.Fatalf("first get dialog filters: %v", err)
+		t.Fatalf("read default dialog filters: %v", err)
 	}
-	if len(snapshot.Filters) != 1 {
-		t.Fatalf("first get returned %d folders, want Unread", len(snapshot.Filters))
+	if len(snapshot.Filters) != 4 {
+		t.Fatalf("seed returned %d folders, want Personal, Groups, Channels and Unread", len(snapshot.Filters))
 	}
-	unread := snapshot.Filters[0]
-	if unread.ID != 2 || unread.Title != "Unread" || !unread.Contacts || !unread.NonContacts || !unread.Groups || !unread.Broadcasts || !unread.Bots || !unread.ExcludeRead {
-		t.Fatalf("first folder = %+v, want the all-types Unread folder", unread)
+	wantTitles := []string{"Personal", "Groups", "Channels", "Unread"}
+	for i, want := range wantTitles {
+		if snapshot.Filters[i].ID != i+2 || snapshot.Filters[i].Title != want {
+			t.Fatalf("default %d = %+v, want ID %d %s", i, snapshot.Filters[i], i+2, want)
+		}
+		if len(snapshot.Filters[i].PinnedPeers)+len(snapshot.Filters[i].IncludePeers)+len(snapshot.Filters[i].ExcludePeers)+len(snapshot.Filters[i].Entities) != 0 {
+			t.Fatalf("default %s contains owner-specific data: %+v", want, snapshot.Filters[i])
+		}
 	}
-	if len(snapshot.Order) != 2 || snapshot.Order[0] != 0 || snapshot.Order[1] != 2 {
-		t.Fatalf("first folder order = %v, want All chats then Unread", snapshot.Order)
+	if len(snapshot.Order) != 5 || snapshot.Order[0] != 0 || snapshot.Order[1] != 2 || snapshot.Order[2] != 3 || snapshot.Order[3] != 4 || snapshot.Order[4] != 5 {
+		t.Fatalf("default folder order = %v, want All chats then Personal, Groups, Channels, Unread", snapshot.Order)
 	}
 
-	if _, err := s.DeleteDialogFilter(ctx, owner.ID, 2); err != nil {
+	if _, err := s.DeleteDialogFilter(ctx, owner.ID, 5); err != nil {
 		t.Fatalf("delete Unread: %v", err)
 	}
-	snapshot, err = s.DialogFilters(ctx, owner.ID)
+	beforeRepeat, err := s.DialogFilters(ctx, owner.ID)
 	if err != nil {
-		t.Fatalf("get dialog filters after deleting Unread: %v", err)
+		t.Fatalf("read after deleting Unread: %v", err)
 	}
-	if len(snapshot.Filters) != 0 || len(snapshot.Order) != 1 || snapshot.Order[0] != 0 {
-		t.Fatalf("folders after deleting Unread = %#v, order %v; want only All chats", snapshot.Filters, snapshot.Order)
+	seeded, err = s.SeedDefaultDialogFilters(ctx, owner.ID)
+	if err != nil || seeded {
+		t.Fatalf("repeat seed after deletion: seeded %v, err %v; want no re-seed", seeded, err)
+	}
+	afterRepeat, err := s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("read after repeat seed: %v", err)
+	}
+	if len(afterRepeat.Filters) != 3 || afterRepeat.ChangedAt == nil || beforeRepeat.ChangedAt == nil || !afterRepeat.ChangedAt.Equal(*beforeRepeat.ChangedAt) {
+		t.Fatalf("repeat seed changed deleted defaults or marker: filters=%#v before=%v after=%v", afterRepeat.Filters, beforeRepeat.ChangedAt, afterRepeat.ChangedAt)
 	}
 }
 
-func TestConcurrentFirstDialogFilterReadsSeedOneUnreadFolder(t *testing.T) {
+func TestConcurrentFirstDialogFilterReadsSeedDefaultsOnceAndNotifyOwner(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openDialogFilterStore(t, pgtest.DSN(t))
+	dsn := pgtest.DSN(t)
+	s := openDialogFilterStore(t, dsn)
 	owner := mustUser(t, s, "+15551091007")
+	listener, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect notification listener: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := listener.Close(context.Background()); err != nil {
+			t.Errorf("close notification listener: %v", err)
+		}
+	})
+	if _, err := listener.Exec(ctx, "LISTEN tg_dialog_filters"); err != nil {
+		t.Fatalf("listen for dialog filter notification: %v", err)
+	}
 	const attempts = 8
-	snapshots := make([]store.DialogFilterSnapshot, attempts)
+	seeded := make([]bool, attempts)
 	errList := make([]error, attempts)
 	var wg sync.WaitGroup
 	for i := range attempts {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			snapshots[i], errList[i] = s.DialogFilters(ctx, owner.ID)
+			seeded[i], errList[i] = s.SeedDefaultDialogFilters(ctx, owner.ID)
 		}(i)
 	}
 	wg.Wait()
+	initializations := 0
 	for i, err := range errList {
 		if err != nil {
-			t.Fatalf("concurrent get %d: %v", i, err)
+			t.Fatalf("concurrent seed %d: %v", i, err)
 		}
-		if len(snapshots[i].Filters) != 1 || snapshots[i].Filters[0].ID != 2 || snapshots[i].Filters[0].Title != "Unread" {
-			t.Fatalf("concurrent get %d returned %#v, want one Unread folder", i, snapshots[i].Filters)
+		if seeded[i] {
+			initializations++
 		}
+	}
+	if initializations != 1 {
+		t.Fatalf("concurrent seed initialized %d times, want once", initializations)
 	}
 	final, err := s.DialogFilters(ctx, owner.ID)
 	if err != nil {
 		t.Fatalf("final get dialog filters: %v", err)
 	}
-	if len(final.Filters) != 1 || final.Filters[0].Title != "Unread" {
-		t.Fatalf("persisted folders = %#v, want exactly one Unread folder", final.Filters)
+	if len(final.Filters) != 4 {
+		t.Fatalf("persisted folders = %#v, want exactly four defaults", final.Filters)
+	}
+	var notifications []*pgconn.Notification
+	notifyCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	for {
+		notification, err := listener.WaitForNotification(notifyCtx)
+		if errors.Is(err, context.DeadlineExceeded) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("wait for dialog filter notification: %v", err)
+		}
+		notifications = append(notifications, notification)
+	}
+	if len(notifications) != 1 || notifications[0].Payload != strconv.FormatInt(owner.ID, 10) {
+		t.Fatalf("seed notifications = %#v, want one owner-id-only notification for %d", notifications, owner.ID)
+	}
+}
+
+func TestDialogFilterSeedPreservesExistingFoldersAndCapacity(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openDialogFilterStore(t, pgtest.DSN(t))
+	owner := mustUser(t, s, "+15551091009")
+	member := mustUser(t, s, "+15551091010")
+	if err := s.SaveDialogFilter(ctx, owner.ID, store.DialogFilter{
+		ID: 2, Title: "Folder 1", Groups: true,
+		IncludePeers: []store.DialogFilterPeer{{Type: store.PeerTypeUser, ID: member.ID}},
+	}); err != nil {
+		t.Fatalf("save existing id 2 folder: %v", err)
+	}
+	if err := s.SaveDialogFilter(ctx, owner.ID, store.DialogFilter{ID: 5, Title: "unread", ExcludeMuted: true}); err != nil {
+		t.Fatalf("save existing duplicate-title folder: %v", err)
+	}
+	if _, err := s.UpdateDialogFilterOrder(ctx, owner.ID, []int{0, 5, 2}); err != nil {
+		t.Fatalf("set existing folder order: %v", err)
+	}
+	seeded, err := s.SeedDefaultDialogFilters(ctx, owner.ID)
+	if err != nil || !seeded {
+		t.Fatalf("seed beside existing folders: seeded %v, err %v", seeded, err)
+	}
+	snapshot, err := s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("read seeded folders: %v", err)
+	}
+	if len(snapshot.Filters) != 5 {
+		t.Fatalf("seeded %d folders, want 2 existing plus 3 missing defaults", len(snapshot.Filters))
+	}
+	if snapshot.Filters[0].ID != 2 || snapshot.Filters[0].Title != "Folder 1" || !snapshot.Filters[0].Groups || len(snapshot.Filters[0].IncludePeers) != 1 || snapshot.Filters[0].IncludePeers[0].ID != member.ID {
+		t.Fatalf("existing id 2 folder changed: %+v", snapshot.Filters[0])
+	}
+	if snapshot.Filters[1].ID != 3 || snapshot.Filters[1].Title != "Personal" || snapshot.Filters[2].ID != 4 || snapshot.Filters[2].Title != "Groups" || snapshot.Filters[3].ID != 5 || snapshot.Filters[3].Title != "unread" || !snapshot.Filters[3].ExcludeMuted || snapshot.Filters[4].ID != 6 || snapshot.Filters[4].Title != "Channels" {
+		t.Fatalf("seeded folders or ids = %+v, want missing defaults appended in canonical order without duplicate Unread", snapshot.Filters)
+	}
+	if len(snapshot.Order) != 6 || snapshot.Order[0] != 0 || snapshot.Order[1] != 5 || snapshot.Order[2] != 2 || snapshot.Order[3] != 3 || snapshot.Order[4] != 4 || snapshot.Order[5] != 6 {
+		t.Fatalf("order after seeding = %v, want existing order followed by missing defaults", snapshot.Order)
+	}
+
+	fullOwner := mustUser(t, s, "+15551091011")
+	for i := range 9 {
+		if err := s.SaveDialogFilter(ctx, fullOwner.ID, store.DialogFilter{ID: i + 2, Title: fmt.Sprintf("Folder %d", i), Groups: true}); err != nil {
+			t.Fatalf("save folder %d for nine-folder account: %v", i, err)
+		}
+	}
+	if seeded, err := s.SeedDefaultDialogFilters(ctx, fullOwner.ID); err != nil || !seeded {
+		t.Fatalf("seed nine-folder account: seeded %v, err %v", seeded, err)
+	}
+	partial, err := s.DialogFilters(ctx, fullOwner.ID)
+	if err != nil {
+		t.Fatalf("read nine-folder account: %v", err)
+	}
+	if len(partial.Filters) != 10 || partial.Filters[9].Title != "Personal" {
+		t.Fatalf("nine-folder account received %#v; want only Personal appended", partial.Filters)
+	}
+	if _, err := s.DeleteDialogFilter(ctx, fullOwner.ID, 2); err != nil {
+		t.Fatalf("delete a folder after initialization: %v", err)
+	}
+	if seeded, err := s.SeedDefaultDialogFilters(ctx, fullOwner.ID); err != nil || seeded {
+		t.Fatalf("repeat seed after making room: seeded %v, err %v; want marker to prevent backfill", seeded, err)
+	}
+	partial, err = s.DialogFilters(ctx, fullOwner.ID)
+	if err != nil || len(partial.Filters) != 9 {
+		t.Fatalf("folders after deletion and repeat seed = %d, err %v; want 9", len(partial.Filters), err)
+	}
+
+	capacityOwner := mustUser(t, s, "+15551091013")
+	for i := range 10 {
+		if err := s.SaveDialogFilter(ctx, capacityOwner.ID, store.DialogFilter{ID: i + 2, Title: fmt.Sprintf("Existing %d", i), Groups: true}); err != nil {
+			t.Fatalf("save folder %d for full account: %v", i, err)
+		}
+	}
+	if seeded, err := s.SeedDefaultDialogFilters(ctx, capacityOwner.ID); err != nil || !seeded {
+		t.Fatalf("seed full account: seeded %v, err %v", seeded, err)
+	}
+	full, err := s.DialogFilters(ctx, capacityOwner.ID)
+	if err != nil || len(full.Filters) != 10 {
+		t.Fatalf("full account folders = %d, err %v; want unchanged capacity of 10", len(full.Filters), err)
+	}
+	if seeded, err := s.DialogFilterDefaultsSeeded(ctx, capacityOwner.ID); err != nil || !seeded {
+		t.Fatalf("full account was not durably marked seeded: seeded %v, err %v", seeded, err)
+	}
+}
+
+func TestDialogFilterSeedRollbackLeavesNoState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDialogFilterStore(t, dsn)
+	owner := mustUser(t, s, "+15551091012")
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect for seed failure trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Errorf("close seed failure connection: %v", err)
+		}
+	})
+	_, err = conn.Exec(ctx, `
+CREATE FUNCTION fail_dialog_filter_seed() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'forced seed insert failure';
+END $$;`)
+	if err != nil {
+		t.Fatalf("install seed failure function: %v", err)
+	}
+	_, err = conn.Exec(ctx, `CREATE TRIGGER fail_dialog_filter_seed BEFORE INSERT ON user_dialog_filters
+FOR EACH ROW EXECUTE FUNCTION fail_dialog_filter_seed();`)
+	if err != nil {
+		t.Fatalf("install seed failure trigger: %v", err)
+	}
+	if seeded, err := s.SeedDefaultDialogFilters(ctx, owner.ID); err == nil || seeded {
+		t.Fatalf("seed with forced insert failure = seeded %v, err %v; want rollback", seeded, err)
+	}
+	var stateCount, folderCount int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM user_dialog_filter_state WHERE owner_id = $1`, owner.ID).Scan(&stateCount); err != nil {
+		t.Fatalf("read state rows after rollback: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM user_dialog_filters WHERE owner_id = $1`, owner.ID).Scan(&folderCount); err != nil {
+		t.Fatalf("read folders after rollback: %v", err)
+	}
+	if stateCount != 0 || folderCount != 0 {
+		t.Fatalf("failed seed left %d state rows and %d folders, want neither", stateCount, folderCount)
 	}
 }
 
@@ -137,14 +319,13 @@ func TestDialogFilterMarkerSurvivesLastDeleteAndRestart(t *testing.T) {
 	dsn := pgtest.DSN(t)
 	s := openDialogFilterStore(t, dsn)
 	owner := mustUser(t, s, "+15551091002")
-	if _, err := s.DialogFilters(ctx, owner.ID); err != nil {
+	if _, err := s.SeedDefaultDialogFilters(ctx, owner.ID); err != nil {
 		t.Fatalf("seed defaults before testing last-folder delete: %v", err)
 	}
-	if err := s.SaveDialogFilter(ctx, owner.ID, store.DialogFilter{ID: 2, Title: "Only", Groups: true}); err != nil {
-		t.Fatalf("save folder: %v", err)
-	}
-	if _, err := s.DeleteDialogFilter(ctx, owner.ID, 2); err != nil {
-		t.Fatalf("delete last folder: %v", err)
+	for id := 2; id <= 5; id++ {
+		if deleted, err := s.DeleteDialogFilter(ctx, owner.ID, id); err != nil || !deleted {
+			t.Fatalf("delete default folder %d: deleted %v, err %v", id, deleted, err)
+		}
 	}
 	marker, found, err := s.DialogFilterChangeAt(ctx, owner.ID)
 	if err != nil || !found {
@@ -175,6 +356,9 @@ func TestDialogFilterMarkerSurvivesLastDeleteAndRestart(t *testing.T) {
 	}
 	if len(got.Filters) != 0 || got.ChangedAt == nil || !got.ChangedAt.Equal(marker) {
 		t.Fatalf("restarted state = filters %#v, marker %v; want durable last-delete marker %s", got.Filters, got.ChangedAt, marker)
+	}
+	if seeded, err := reopened.SeedDefaultDialogFilters(ctx, owner.ID); err != nil || seeded {
+		t.Fatalf("restart re-seeded deleted defaults: seeded %v, err %v", seeded, err)
 	}
 }
 
@@ -233,12 +417,15 @@ func TestDialogFilterInvalidChildRollsBackDefinitionAndMarker(t *testing.T) {
 	ctx := context.Background()
 	s := openDialogFilterStore(t, pgtest.DSN(t))
 	owner := mustUser(t, s, "+15551091003")
-	baseline, err := s.DialogFilters(ctx, owner.ID)
-	if err != nil {
+	if _, err := s.SeedDefaultDialogFilters(ctx, owner.ID); err != nil {
 		t.Fatalf("seed defaults before invalid save: %v", err)
 	}
-	if len(baseline.Filters) != 1 || baseline.Filters[0].Title != "Unread" || baseline.ChangedAt == nil {
-		t.Fatalf("baseline folders = %#v, marker %v; want seeded Unread", baseline.Filters, baseline.ChangedAt)
+	baseline, err := s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("read seeded defaults before invalid save: %v", err)
+	}
+	if len(baseline.Filters) != 4 || baseline.Filters[0].Title != "Personal" || baseline.ChangedAt == nil {
+		t.Fatalf("baseline folders = %#v, marker %v; want four seeded defaults", baseline.Filters, baseline.ChangedAt)
 	}
 	marker, found, err := s.DialogFilterChangeAt(ctx, owner.ID)
 	if err != nil || !found || !marker.Equal(*baseline.ChangedAt) {
@@ -259,7 +446,7 @@ func TestDialogFilterInvalidChildRollsBackDefinitionAndMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read after failed save: %v", err)
 	}
-	if len(snapshot.Filters) != 1 || snapshot.Filters[0].ID != 2 || snapshot.Filters[0].Title != "Unread" || snapshot.ChangedAt == nil || !snapshot.ChangedAt.Equal(marker) {
+	if len(snapshot.Filters) != 4 || snapshot.Filters[0].ID != 2 || snapshot.Filters[0].Title != "Personal" || snapshot.ChangedAt == nil || !snapshot.ChangedAt.Equal(marker) {
 		t.Fatalf("failed save left filters %#v and marker %v", snapshot.Filters, snapshot.ChangedAt)
 	}
 	if after, found, err := s.DialogFilterChangeAt(ctx, owner.ID); err != nil || !found || !after.Equal(marker) {
