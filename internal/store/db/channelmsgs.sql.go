@@ -299,6 +299,51 @@ func (q *Queries) ChannelPostExistsActive(ctx context.Context, arg ChannelPostEx
 	return local_id, err
 }
 
+const countFilteredChannelPosts = `-- name: CountFilteredChannelPosts :one
+SELECT count(*)::bigint
+FROM channel_messages post
+WHERE post.channel_id = $1::bigint
+  AND post.deleted = false
+  AND EXISTS (
+      SELECT 1 FROM channel_participants cp
+      WHERE cp.channel_id = post.channel_id
+        AND cp.user_id = $2::bigint
+        AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+  )
+  AND CASE $3::smallint
+      WHEN 1 THEN post.file_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM files f WHERE f.id = post.file_id AND f.stored = true
+      )
+      WHEN 2 THEN false
+      WHEN 3 THEN post.message ~* '(^|[^[:alnum:]_@])(([[:alpha:]][[:alnum:]+.-]*://|www[.])[^[:space:]]+|[[:alnum:]-]+[.][[:alpha:]]{2,}(:[0-9]{1,5})?(/[[:graph:]]*)?)'
+      ELSE false
+  END
+  AND ($4::text = '' OR post.message_tsv @@ plainto_tsquery('simple', $4))
+`
+
+type CountFilteredChannelPostsParams struct {
+	ChannelID int64
+	OwnerID   int64
+	Filter    int16
+	Query     string
+}
+
+// Filtered shared-media channel searches keep admission in both the count and
+// page query. Channel posts are shared rows, so membership is the authorized
+// scope; an access hash alone never widens it. The app handles no photo format
+// today, while stored file rows are representable as documents.
+func (q *Queries) CountFilteredChannelPosts(ctx context.Context, arg CountFilteredChannelPostsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countFilteredChannelPosts,
+		arg.ChannelID,
+		arg.OwnerID,
+		arg.Filter,
+		arg.Query,
+	)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const ensureChannelState = `-- name: EnsureChannelState :exec
 INSERT INTO channel_state (channel_id) VALUES ($1) ON CONFLICT (channel_id) DO NOTHING
 `
@@ -461,6 +506,92 @@ func (q *Queries) SearchChannelPostsPage(ctx context.Context, arg SearchChannelP
 	var items []SearchChannelPostsPageRow
 	for rows.Next() {
 		var i SearchChannelPostsPageRow
+		if err := rows.Scan(
+			&i.ChannelID,
+			&i.LocalID,
+			&i.FromID,
+			&i.Date,
+			&i.Message,
+			&i.EditDate,
+			&i.Deleted,
+			&i.RandomID,
+			&i.FileID,
+			&i.ReplyToMsgID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const searchFilteredChannelPostsPage = `-- name: SearchFilteredChannelPostsPage :many
+SELECT post.channel_id, post.local_id, post.from_id, post.date, post.message,
+       post.edit_date, post.deleted, post.random_id, post.file_id, post.reply_to_msg_id
+FROM channel_messages post
+WHERE post.channel_id = $1::bigint
+  AND post.deleted = false
+  AND EXISTS (
+      SELECT 1 FROM channel_participants cp
+      WHERE cp.channel_id = post.channel_id
+        AND cp.user_id = $2::bigint
+        AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+  )
+  AND CASE $3::smallint
+      WHEN 1 THEN post.file_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM files f WHERE f.id = post.file_id AND f.stored = true
+      )
+      WHEN 2 THEN false
+      WHEN 3 THEN post.message ~* '(^|[^[:alnum:]_@])(([[:alpha:]][[:alnum:]+.-]*://|www[.])[^[:space:]]+|[[:alnum:]-]+[.][[:alpha:]]{2,}(:[0-9]{1,5})?(/[[:graph:]]*)?)'
+      ELSE false
+  END
+  AND ($4::text = '' OR post.message_tsv @@ plainto_tsquery('simple', $4))
+  AND ($5::bigint = 0 OR post.local_id < $5::bigint)
+ORDER BY post.local_id DESC
+LIMIT $6::int
+`
+
+type SearchFilteredChannelPostsPageParams struct {
+	ChannelID int64
+	OwnerID   int64
+	Filter    int16
+	Query     string
+	OffsetID  int64
+	Lim       int32
+}
+
+type SearchFilteredChannelPostsPageRow struct {
+	ChannelID    int64
+	LocalID      int64
+	FromID       int64
+	Date         pgtype.Timestamptz
+	Message      string
+	EditDate     pgtype.Timestamptz
+	Deleted      bool
+	RandomID     int64
+	FileID       *int64
+	ReplyToMsgID *int32
+}
+
+func (q *Queries) SearchFilteredChannelPostsPage(ctx context.Context, arg SearchFilteredChannelPostsPageParams) ([]SearchFilteredChannelPostsPageRow, error) {
+	rows, err := q.db.Query(ctx, searchFilteredChannelPostsPage,
+		arg.ChannelID,
+		arg.OwnerID,
+		arg.Filter,
+		arg.Query,
+		arg.OffsetID,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SearchFilteredChannelPostsPageRow
+	for rows.Next() {
+		var i SearchFilteredChannelPostsPageRow
 		if err := rows.Scan(
 			&i.ChannelID,
 			&i.LocalID,

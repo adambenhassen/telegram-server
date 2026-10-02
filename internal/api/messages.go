@@ -1686,7 +1686,8 @@ func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, pe
 	}
 }
 
-// handleSearch serves messages.search: keyword or pinned-message search within a dialog.
+// handleSearch serves messages.search: keyword, pinned, or supported shared-media
+// search within a dialog.
 // Results are the caller's messages (both directions) in the named peer, ordered
 // newest-first. A channel peer searches the channel's shared posts instead and
 // is gated on membership, not ownership.
@@ -1702,14 +1703,22 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errMessageTooLong
 	}
 	filterPinned := false
+	var mediaFilter store.MediaSearchFilter
 	switch req.Filter.(type) {
 	case *tg.InputMessagesFilterEmpty:
 	case *tg.InputMessagesFilterPinned:
 		filterPinned = true
+	case *tg.InputMessagesFilterDocument:
+		mediaFilter = store.MediaSearchFilterDocument
+	case *tg.InputMessagesFilterPhotos:
+		mediaFilter = store.MediaSearchFilterPhoto
+	case *tg.InputMessagesFilterURL:
+		mediaFilter = store.MediaSearchFilterURL
 	default:
 		return nil, errInputFilterInvalid
 	}
-	if req.Q == "" && !filterPinned {
+	mediaSearch := mediaFilter != 0
+	if req.Q == "" && !filterPinned && !mediaSearch {
 		return nil, errSearchQueryEmpty
 	}
 	peerType, peerID, err := h.inputPeer(req.Peer, r.UserID)
@@ -1734,7 +1743,11 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	limit := req.Limit
-	if limit <= 0 {
+	if mediaSearch {
+		if limit < 0 {
+			limit = defaultHistoryLimit
+		}
+	} else if limit <= 0 {
 		limit = defaultHistoryLimit
 	}
 	if limit > maxHistoryLimit {
@@ -1752,11 +1765,26 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 		if filterPinned {
 			return h.channelPinnedSearch(r, peerID, req.Q, int64(req.OffsetID), limit)
 		}
+		if mediaSearch {
+			msgs, count, searchErr := h.store.SearchFilteredChannelPosts(
+				r.Ctx, r.UserID, peerID, req.Q, mediaFilter, int64(req.OffsetID), limit,
+			)
+			if errors.Is(searchErr, store.ErrNotMember) {
+				return nil, errPeerIDInvalid
+			}
+			if searchErr != nil {
+				h.log.Error("search filtered channel posts", "user_id", r.UserID, "channel_id", peerID, "err", searchErr)
+				return nil, errInternal
+			}
+			return h.channelMessagesWithCount(r, peerID, msgs, count)
+		}
 		return h.channelSearch(r, peerID, req.Q, int64(req.OffsetID), limit)
 	}
 
 	var msgs []store.Message
-	if filterPinned {
+	count := 0
+	switch {
+	case filterPinned:
 		if peerType == store.PeerTypeChat {
 			msgs, err = h.store.SearchPinnedChatMessageForOwner(r.Ctx, peerID, r.UserID, req.Q, int64(req.OffsetID), limit)
 			if err != nil {
@@ -1764,12 +1792,26 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 				return nil, errInternal
 			}
 		}
-	} else {
+	case mediaSearch:
+		msgs, count, err = h.store.SearchFilteredMessages(
+			r.Ctx, r.UserID, peerType, peerID, req.Q, mediaFilter, int64(req.OffsetID), limit,
+		)
+		if errors.Is(err, store.ErrNotMember) {
+			return nil, errPeerIDInvalid
+		}
+		if err != nil {
+			h.log.Error("search filtered messages", "user_id", r.UserID, "err", err)
+			return nil, errInternal
+		}
+	default:
 		msgs, err = h.store.SearchMessages(r.Ctx, r.UserID, peerType, peerID, req.Q, req.OffsetID, limit)
 		if err != nil {
 			h.log.Error("search messages", "user_id", r.UserID, "err", err)
 			return nil, errInternal
 		}
+	}
+	if !mediaSearch {
+		count = len(msgs)
 	}
 
 	files, err := h.loadFiles(r.Ctx, msgs)
@@ -1779,7 +1821,7 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 	}
 
 	if peerType == store.PeerTypeChat {
-		return h.chatSearch(r, peerID, msgs, files)
+		return h.chatSearch(r, peerID, msgs, files, count, mediaSearch)
 	}
 
 	tlMsgs := make([]tg.MessageClass, len(msgs))
@@ -1793,12 +1835,22 @@ func (h *handlers) handleSearch(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 
+	if mediaSearch {
+		return &tg.MessagesMessagesSlice{Count: count, Messages: tlMsgs, Users: users}, nil
+	}
 	return &tg.MessagesMessages{Messages: tlMsgs, Users: users}, nil
 }
 
 // chatSearch renders search results for a chat peer. It collects all authors
 // from the result set (plus the caller) and loads the chat metadata.
-func (h *handlers) chatSearch(r *mtproto.Request, chatID int64, msgs []store.Message, files map[int64]*tg.Document) (bin.Encoder, error) {
+func (h *handlers) chatSearch(
+	r *mtproto.Request,
+	chatID int64,
+	msgs []store.Message,
+	files map[int64]*tg.Document,
+	count int,
+	mediaSearch bool,
+) (bin.Encoder, error) {
 	// Load createUsers for any create service rows, mirroring chatHistory.
 	var createUsers []int64
 	for _, m := range msgs {
@@ -1839,6 +1891,9 @@ func (h *handlers) chatSearch(r *mtproto.Request, chatID int64, msgs []store.Mes
 	if err != nil {
 		h.log.Error("search messages chats", "err", err)
 		return nil, errInternal
+	}
+	if mediaSearch {
+		return &tg.MessagesMessagesSlice{Count: count, Messages: tlMsgs, Users: users, Chats: chats}, nil
 	}
 	return &tg.MessagesMessages{Messages: tlMsgs, Users: users, Chats: chats}, nil
 }
