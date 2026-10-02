@@ -44,6 +44,8 @@ SELECT
     p.role AS member_role,
     p.banned_until AS member_banned_until,
     p.join_pts AS member_join_pts,
+    COALESCE(read_state.read_max_id, 0)::bigint AS read_inbox_max_id,
+    unread.unread_count,
     cs.pts AS channel_pts,
     top.local_id AS top_local_id,
     top.from_id AS top_from_id,
@@ -56,6 +58,21 @@ SELECT
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
+LEFT JOIN channel_read_state read_state
+  ON read_state.channel_id = c.id AND read_state.user_id = p.user_id
+LEFT JOIN LATERAL (
+    SELECT LEAST(count(*), 1000)::int AS unread_count
+    FROM (
+        SELECT cm.local_id
+        FROM channel_messages cm
+        WHERE cm.channel_id = c.id
+          AND cm.from_id <> p.user_id
+          AND cm.deleted = false
+          AND cm.local_id > COALESCE(read_state.read_max_id, 0)
+        ORDER BY cm.local_id
+        LIMIT 1001
+    ) unread_posts
+) unread ON true
 JOIN LATERAL (
     SELECT cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date,
            cm.random_id, cm.file_id, cm.reply_to_msg_id

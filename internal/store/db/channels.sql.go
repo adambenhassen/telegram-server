@@ -70,6 +70,29 @@ func (q *Queries) AdminedPublicChannels(ctx context.Context, userID int64) ([]Ad
 	return items, nil
 }
 
+const advanceChannelReadState = `-- name: AdvanceChannelReadState :exec
+INSERT INTO channel_read_state (channel_id, user_id, read_max_id)
+VALUES ($1::bigint, $2::bigint,
+        GREATEST($3::bigint, 0))
+ON CONFLICT (channel_id, user_id) DO UPDATE
+SET read_max_id = EXCLUDED.read_max_id
+WHERE channel_read_state.read_max_id < EXCLUDED.read_max_id
+`
+
+type AdvanceChannelReadStateParams struct {
+	ChannelID int64
+	UserID    int64
+	ReadMaxID int64
+}
+
+// AdvanceChannelReadState changes only a strictly higher marker. Lower and
+// repeated positions are no-ops, and the store clamps max_id under the same
+// channel_state lock used by post allocation.
+func (q *Queries) AdvanceChannelReadState(ctx context.Context, arg AdvanceChannelReadStateParams) error {
+	_, err := q.db.Exec(ctx, advanceChannelReadState, arg.ChannelID, arg.UserID, arg.ReadMaxID)
+	return err
+}
+
 const channelActiveInviteByChannel = `-- name: ChannelActiveInviteByChannel :one
 SELECT hash, channel_id, creator_id, date, revoked_at FROM channel_invites
 WHERE channel_id = $1 AND revoked_at IS NULL
@@ -131,6 +154,8 @@ SELECT
     p.role AS member_role,
     p.banned_until AS member_banned_until,
     p.join_pts AS member_join_pts,
+    COALESCE(read_state.read_max_id, 0)::bigint AS read_inbox_max_id,
+    unread.unread_count,
     cs.pts,
     cs.next_local_id,
     cs.date AS state_date,
@@ -146,6 +171,21 @@ SELECT
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
+LEFT JOIN channel_read_state read_state
+  ON read_state.channel_id = c.id AND read_state.user_id = p.user_id
+LEFT JOIN LATERAL (
+    SELECT LEAST(count(*), 1000)::int AS unread_count
+    FROM (
+        SELECT cm.local_id
+        FROM channel_messages cm
+        WHERE cm.channel_id = c.id
+          AND cm.from_id <> p.user_id
+          AND cm.deleted = false
+          AND cm.local_id > COALESCE(read_state.read_max_id, 0)
+        ORDER BY cm.local_id
+        LIMIT 1001
+    ) unread_posts
+) unread ON true
 LEFT JOIN LATERAL (
     SELECT cm.channel_id, cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date, cm.deleted, cm.random_id, cm.file_id, cm.reply_to_msg_id
     FROM channel_messages cm
@@ -171,6 +211,8 @@ type ChannelDialogsForUserRow struct {
 	MemberRole          int16
 	MemberBannedUntil   pgtype.Timestamptz
 	MemberJoinPts       int64
+	ReadInboxMaxID      int64
+	UnreadCount         int32
 	Pts                 int64
 	NextLocalID         int64
 	StateDate           pgtype.Timestamptz
@@ -214,6 +256,8 @@ func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Ch
 			&i.MemberRole,
 			&i.MemberBannedUntil,
 			&i.MemberJoinPts,
+			&i.ReadInboxMaxID,
+			&i.UnreadCount,
 			&i.Pts,
 			&i.NextLocalID,
 			&i.StateDate,
@@ -558,6 +602,49 @@ func (q *Queries) ChannelPostDefaults(ctx context.Context, id int64) (ChannelPos
 	return i, err
 }
 
+const channelReadStateForViewer = `-- name: ChannelReadStateForViewer :one
+SELECT COALESCE(read_state.read_max_id, 0)::bigint AS read_max_id,
+       (
+           SELECT LEAST(count(*), 1000)::int
+           FROM (
+               SELECT cm.local_id
+               FROM channel_messages cm
+               WHERE cm.channel_id = participant.channel_id
+                 AND cm.from_id <> participant.user_id
+                 AND cm.deleted = false
+                 AND cm.local_id > COALESCE(read_state.read_max_id, 0)
+               ORDER BY cm.local_id
+               LIMIT 1001
+           ) unread
+       ) AS unread_count
+FROM channel_participants participant
+LEFT JOIN channel_read_state read_state
+  ON read_state.channel_id = participant.channel_id
+ AND read_state.user_id = participant.user_id
+WHERE participant.channel_id = $1::bigint
+  AND participant.user_id = $2::bigint
+  AND (participant.banned_until IS NULL OR participant.banned_until <= now())
+`
+
+type ChannelReadStateForViewerParams struct {
+	ChannelID int64
+	UserID    int64
+}
+
+type ChannelReadStateForViewerRow struct {
+	ReadMaxID   int64
+	UnreadCount int32
+}
+
+// ChannelReadStateForViewer returns only the entitled member's read state and
+// unread live posts. The inner LIMIT bounds the rows counted before saturation.
+func (q *Queries) ChannelReadStateForViewer(ctx context.Context, arg ChannelReadStateForViewerParams) (ChannelReadStateForViewerRow, error) {
+	row := q.db.QueryRow(ctx, channelReadStateForViewer, arg.ChannelID, arg.UserID)
+	var i ChannelReadStateForViewerRow
+	err := row.Scan(&i.ReadMaxID, &i.UnreadCount)
+	return i, err
+}
+
 const channelSlowModePostState = `-- name: ChannelSlowModePostState :one
 SELECT c.slowmode_seconds,
        GREATEST(cp.last_post_at, cpm.last_post_at)::timestamptz AS last_post_at,
@@ -816,6 +903,27 @@ func (q *Queries) InsertChannelParticipantIfAbsent(ctx context.Context, arg Inse
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const insertChannelReadStateForNewMember = `-- name: InsertChannelReadStateForNewMember :exec
+INSERT INTO channel_read_state (channel_id, user_id, read_max_id)
+VALUES ($1::bigint, $2::bigint,
+        GREATEST($3::bigint, 0))
+ON CONFLICT (channel_id, user_id) DO NOTHING
+`
+
+type InsertChannelReadStateForNewMemberParams struct {
+	ChannelID int64
+	UserID    int64
+	TopID     int64
+}
+
+// InsertChannelReadStateForNewMember starts a membership at the committed
+// channel top captured while the caller holds channel_state FOR UPDATE. A
+// repeated admission never rewrites an existing marker.
+func (q *Queries) InsertChannelReadStateForNewMember(ctx context.Context, arg InsertChannelReadStateForNewMemberParams) error {
+	_, err := q.db.Exec(ctx, insertChannelReadStateForNewMember, arg.ChannelID, arg.UserID, arg.TopID)
+	return err
 }
 
 const insertChannelState = `-- name: InsertChannelState :exec

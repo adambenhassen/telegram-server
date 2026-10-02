@@ -78,10 +78,9 @@ func (h *handlers) channelDialogs(ctx context.Context, userID int64) ([]tg.ChatC
 	tops := make([]store.ChannelMessage, 0, len(rows))
 	for _, r := range rows {
 		d := &tg.Dialog{
-			Peer: &tg.PeerChannel{ChannelID: r.Channel.ID},
-			// Channels keep no per-member read state in M7, so there is no read
-			// marker and no honest unread count to report.
-			UnreadCount: 0,
+			Peer:           &tg.PeerChannel{ChannelID: r.Channel.ID},
+			ReadInboxMaxID: int(r.ReadInboxMaxID),
+			UnreadCount:    r.UnreadCount,
 		}
 		if r.Top != nil {
 			d.TopMessage = int(r.Top.LocalID)

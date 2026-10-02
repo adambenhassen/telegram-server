@@ -67,6 +67,51 @@ SELECT * FROM channel_participants WHERE channel_id = $1 ORDER BY user_id;
 -- name: ChannelParticipantByUser :one
 SELECT * FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
 
+-- InsertChannelReadStateForNewMember starts a membership at the committed
+-- channel top captured while the caller holds channel_state FOR UPDATE. A
+-- repeated admission never rewrites an existing marker.
+-- name: InsertChannelReadStateForNewMember :exec
+INSERT INTO channel_read_state (channel_id, user_id, read_max_id)
+VALUES (sqlc.arg(channel_id)::bigint, sqlc.arg(user_id)::bigint,
+        GREATEST(sqlc.arg(top_id)::bigint, 0))
+ON CONFLICT (channel_id, user_id) DO NOTHING;
+
+-- AdvanceChannelReadState changes only a strictly higher marker. Lower and
+-- repeated positions are no-ops, and the store clamps max_id under the same
+-- channel_state lock used by post allocation.
+-- name: AdvanceChannelReadState :exec
+INSERT INTO channel_read_state (channel_id, user_id, read_max_id)
+VALUES (sqlc.arg(channel_id)::bigint, sqlc.arg(user_id)::bigint,
+        GREATEST(sqlc.arg(read_max_id)::bigint, 0))
+ON CONFLICT (channel_id, user_id) DO UPDATE
+SET read_max_id = EXCLUDED.read_max_id
+WHERE channel_read_state.read_max_id < EXCLUDED.read_max_id;
+
+-- ChannelReadStateForViewer returns only the entitled member's read state and
+-- unread live posts. The inner LIMIT bounds the rows counted before saturation.
+-- name: ChannelReadStateForViewer :one
+SELECT COALESCE(read_state.read_max_id, 0)::bigint AS read_max_id,
+       (
+           SELECT LEAST(count(*), 1000)::int
+           FROM (
+               SELECT cm.local_id
+               FROM channel_messages cm
+               WHERE cm.channel_id = participant.channel_id
+                 AND cm.from_id <> participant.user_id
+                 AND cm.deleted = false
+                 AND cm.local_id > COALESCE(read_state.read_max_id, 0)
+               ORDER BY cm.local_id
+               LIMIT 1001
+           ) unread
+       ) AS unread_count
+FROM channel_participants participant
+LEFT JOIN channel_read_state read_state
+  ON read_state.channel_id = participant.channel_id
+ AND read_state.user_id = participant.user_id
+WHERE participant.channel_id = sqlc.arg(channel_id)::bigint
+  AND participant.user_id = sqlc.arg(user_id)::bigint
+  AND (participant.banned_until IS NULL OR participant.banned_until <= now());
+
 -- Participant list reads run in one repeatable-read transaction with the
 -- viewer's membership check. The handler chooses only filters it can serve;
 -- both the count and page use the same filter so offsets cannot disclose rows
@@ -270,6 +315,8 @@ SELECT
     p.role AS member_role,
     p.banned_until AS member_banned_until,
     p.join_pts AS member_join_pts,
+    COALESCE(read_state.read_max_id, 0)::bigint AS read_inbox_max_id,
+    unread.unread_count,
     cs.pts,
     cs.next_local_id,
     cs.date AS state_date,
@@ -285,6 +332,21 @@ SELECT
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
+LEFT JOIN channel_read_state read_state
+  ON read_state.channel_id = c.id AND read_state.user_id = p.user_id
+LEFT JOIN LATERAL (
+    SELECT LEAST(count(*), 1000)::int AS unread_count
+    FROM (
+        SELECT cm.local_id
+        FROM channel_messages cm
+        WHERE cm.channel_id = c.id
+          AND cm.from_id <> p.user_id
+          AND cm.deleted = false
+          AND cm.local_id > COALESCE(read_state.read_max_id, 0)
+        ORDER BY cm.local_id
+        LIMIT 1001
+    ) unread_posts
+) unread ON true
 LEFT JOIN LATERAL (
     SELECT cm.channel_id, cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date, cm.deleted, cm.random_id, cm.file_id, cm.reply_to_msg_id
     FROM channel_messages cm

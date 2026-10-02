@@ -309,6 +309,7 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	})
 	register(d, tg.ChannelsCreateChannelRequestTypeID, h.handleCreateChannel)
 	register(d, tg.ChannelsGetFullChannelRequestTypeID, h.handleGetFullChannel)
+	register(d, tg.ChannelsReadHistoryRequestTypeID, h.handleChannelReadHistory)
 	register(d, tg.ChannelsToggleSlowModeRequestTypeID, h.handleToggleSlowMode)
 	register(d, tg.ChannelsGetParticipantsRequestTypeID, h.handleGetParticipants)
 	register(d, tg.ChannelsGetParticipantRequestTypeID, h.handleGetParticipant)

@@ -21,6 +21,8 @@ type ChannelFullInfoSnapshot struct {
 	ParticipantsCount int64
 	AdminsCount       int64
 	BannedCount       int64
+	ReadInboxMaxID    int64
+	UnreadCount       int
 	Pts               int
 	InviteHash        string
 	InviteCreatorID   int64
@@ -102,6 +104,17 @@ func (s *Store) ChannelFullInfoForViewer(
 	snapshot.ParticipantsCount = stats.ParticipantsCount
 	snapshot.AdminsCount = stats.AdminsCount
 	snapshot.BannedCount = stats.BannedCount
+	if snapshot.HasMember {
+		readState, err := qtx.ChannelReadStateForViewer(ctx, db.ChannelReadStateForViewerParams{
+			ChannelID: channelID,
+			UserID:    viewerID,
+		})
+		if err != nil {
+			return ChannelFullInfoSnapshot{}, false, fmt.Errorf("select channel viewer read state: %w", err)
+		}
+		snapshot.ReadInboxMaxID = readState.ReadMaxID
+		snapshot.UnreadCount = int(readState.UnreadCount)
+	}
 
 	state, err := qtx.GetChannelState(ctx, channelID)
 	if err != nil {

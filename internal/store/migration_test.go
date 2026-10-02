@@ -34,6 +34,23 @@ func TestOpenRejectsUnmigratedSchema(t *testing.T) {
 	requireOpenMigrationError(t, ctx, dsn)
 }
 
+func TestOpenRejectsMissingChannelReadStateSchema(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+	if _, err := conn.Exec(ctx, `DROP TABLE channel_read_state`); err != nil {
+		t.Fatalf("drop channel read state: %v", err)
+	}
+
+	requireOpenMigrationError(t, ctx, dsn)
+}
+
 func TestOpenRejectsMissingFileSubtypeRightsConstraint(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -138,10 +138,12 @@ func (s *Store) PeerDialogsSnapshot(ctx context.Context, ownerID int64, peers []
 		member := channelMemberFromPeerDialogRow(row, ownerID)
 		post := channelMessageFromPeerDialogRow(row)
 		d := Dialog{
-			OwnerID:    ownerID,
-			PeerType:   PeerTypeChannel,
-			PeerID:     channel.ID,
-			TopMessage: post.LocalID,
+			OwnerID:        ownerID,
+			PeerType:       PeerTypeChannel,
+			PeerID:         channel.ID,
+			TopMessage:     post.LocalID,
+			ReadInboxMaxID: row.ReadInboxMaxID,
+			UnreadCount:    int(row.UnreadCount),
 		}
 		selected[PeerDialogKey{PeerType: PeerTypeChannel, PeerID: channel.ID}] = PeerDialog{
 			Dialog:         d,

@@ -209,6 +209,8 @@ func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error)
 	full.SetCanViewParticipants(canViewParticipants)
 	if member {
 		full.Pts = snapshot.Pts
+		full.ReadInboxMaxID = int(snapshot.ReadInboxMaxID)
+		full.UnreadCount = snapshot.UnreadCount
 		full.SetSlowmodeSeconds(int(snapshot.Channel.SlowmodeSeconds))
 	}
 
@@ -247,6 +249,34 @@ func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error)
 		Chats:    []tg.ChatClass{chat},
 		Users:    users,
 	}, nil
+}
+
+// handleChannelReadHistory serves channels.readHistory. Read state is scoped
+// to the authenticated member and does not emit an update or read receipt.
+func (h *handlers) handleChannelReadHistory(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsReadHistoryRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if req.MaxID < 0 {
+		return nil, errMessageIDInvalid
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.store.ReadChannelHistory(r.Ctx, channelID, r.UserID, int64(req.MaxID)); errors.Is(err, store.ErrNotMember) {
+		return nil, errPeerIDInvalid
+	} else if errors.Is(err, store.ErrMessageInvalid) {
+		return nil, errMessageIDInvalid
+	} else if err != nil {
+		h.log.Error("read channel history", "channel_id", channelID, "user_id", r.UserID, "err", err)
+		return nil, errInternal
+	}
+	return &tg.BoolTrue{}, nil
 }
 
 // handleToggleSlowMode serves channels.toggleSlowMode. The store checks current
