@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -1089,6 +1090,23 @@ func testSmokeChannel(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("subscriber getHistory: %v", err)
+	}
+
+	if err := subscriber.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		exported, err := api.ChannelsExportMessageLink(ctx, &tg.ChannelsExportMessageLinkRequest{
+			Channel: inputChannel(subscriber.id, channelID),
+			ID:      update.Msg.ID,
+		})
+		if err != nil {
+			return err
+		}
+		want := testPublicLinkPrefix + "c/" + strconv.FormatInt(channelID, 10) + "/" + strconv.Itoa(update.Msg.ID)
+		if exported.Link != want {
+			return fmt.Errorf("exported channel message link = %q, want %q", exported.Link, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("subscriber exportMessageLink: %v", err)
 	}
 
 	if err := creator.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
