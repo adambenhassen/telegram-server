@@ -263,8 +263,9 @@ jobs:
 
       # Read-only on purpose, unlike the ci job: that job's key is built to
       # always miss so it always saves, and two jobs writing a build cache in
-      # the same run would race for the same entry. This one just borrows
-      # whatever ci already published for this go.sum.
+      # the same run would race for the same entry. This job starts alongside
+      # ci, so it restores a cache from an earlier run. It cannot use the cache
+      # ci saves later in this run.
       - name: Restore Go build cache
         uses: actions/cache/restore@v6.1.0
         with:
