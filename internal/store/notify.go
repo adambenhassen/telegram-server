@@ -117,7 +117,12 @@ func NotificationAcceptedAt(ctx context.Context) (time.Time, bool) {
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
 // nudge that wakes each process's Listener after an event transaction commits.
 func (s *Store) Notify(ctx context.Context, channel, payload string) error {
-	if _, err := s.pool.Exec(ctx, `SELECT pg_notify($1, $2)`, channel, payload); err != nil {
+	// A committed mutation must still reach other replicas after the RPC client
+	// disconnects. Bound pool acquisition and NOTIFY execution independently of
+	// caller cancellation so each transient nudge has a finite budget.
+	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if _, err := s.pool.Exec(notifyCtx, `SELECT pg_notify($1, $2)`, channel, payload); err != nil {
 		return fmt.Errorf("notify %s: %w", channel, err)
 	}
 	return nil
