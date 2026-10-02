@@ -62,6 +62,90 @@ func TestNotifyReachesRawListener(t *testing.T) {
 	}
 }
 
+func TestChatRecipientNotificationsSurviveCallerCancellationAfterCommit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openDSN(t, dsn)
+	listener, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect listener: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close(context.Background()) }) //nolint:errcheck // teardown
+	if _, err := listener.Exec(ctx, "LISTEN "+store.ChannelUpdates); err != nil {
+		t.Fatalf("listen for updates: %v", err)
+	}
+
+	alice, err := s.CreateUser(ctx, "+15550000111")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := s.CreateUser(ctx, "+15550000112")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	chat, err := s.CreateChat(ctx, alice.ID, "notify after commit", []int64{bob.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	_, perOwner, dup, err := s.SendChatMessage(ctx, store.FanOut{
+		ChatID: chat.ID, FromID: alice.ID, Text: "committed chat content", RandomID: 700111,
+	})
+	if err != nil || dup {
+		t.Fatalf("send chat message: duplicate=%v err=%v", dup, err)
+	}
+
+	rpcCtx, cancelRPC := context.WithCancel(ctx)
+	cancelRPC()
+	for userID := range perOwner {
+		if err := s.Notify(rpcCtx, store.ChannelUpdates, strconv.FormatInt(userID, 10)); err != nil {
+			t.Fatalf("notify chat member %d after cancellation: %v", userID, err)
+		}
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelWait()
+	notified := make(map[int64]bool, len(perOwner))
+	for range perOwner {
+		n, err := listener.WaitForNotification(waitCtx)
+		if err != nil {
+			t.Fatalf("chat member notification: %v", err)
+		}
+		userID, err := strconv.ParseInt(n.Payload, 10, 64)
+		if err != nil {
+			t.Fatalf("notification payload = %q: %v", n.Payload, err)
+		}
+		notified[userID] = true
+	}
+	for userID := range perOwner {
+		if !notified[userID] {
+			t.Errorf("chat member %d received no update notification", userID)
+		}
+		state, err := s.State(ctx, userID)
+		if err != nil {
+			t.Fatalf("state for chat member %d: %v", userID, err)
+		}
+		events, err := s.EventsSince(ctx, userID, 0)
+		if err != nil {
+			t.Fatalf("events for chat member %d: %v", userID, err)
+		}
+		foundContent := false
+		for _, event := range events {
+			message, ok, err := s.MessageByOwnerLocal(ctx, userID, event.LocalID)
+			if err != nil {
+				t.Fatalf("message for chat member %d: %v", userID, err)
+			}
+			if ok && message.Text == "committed chat content" {
+				foundContent = true
+				break
+			}
+		}
+		if !foundContent || state.Pts != perOwner[userID] {
+			t.Errorf("chat member %d recovery state = %+v; message content present=%v, final pts=%d", userID, state, foundContent, perOwner[userID])
+		}
+	}
+}
+
 func TestStartListenerDispatches(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

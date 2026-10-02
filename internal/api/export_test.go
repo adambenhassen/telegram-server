@@ -634,6 +634,18 @@ func LogOutForTest(s *store.Store, authKeyID [8]byte) (bin.Encoder, func(), erro
 	})
 }
 
+// LogOutWithContextForTest invokes handleLogOut with the caller context so a
+// test can cancel it after the committed delete and before the reply hook runs.
+func LogOutWithContextForTest(s *store.Store, ctx context.Context, authKeyID [8]byte) (bin.Encoder, func(), error) {
+	var buf bin.Buffer
+	if err := (&tg.AuthLogOutRequest{}).Encode(&buf); err != nil {
+		return nil, nil, err
+	}
+	return testHandlers(s).handleLogOut(&mtproto.Request{
+		Ctx: ctx, AuthKeyID: authKeyID, Buf: &buf,
+	})
+}
+
 // ResetAuthorizationForTest invokes handleResetAuthorization for userID against
 // hash, on a request arriving on authKeyID, with the same unrun announcement.
 func ResetAuthorizationForTest(s *store.Store, userID int64, authKeyID [8]byte, hash int64) (bin.Encoder, func(), error) {
