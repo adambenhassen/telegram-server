@@ -495,6 +495,85 @@ func (s *Store) SearchChannelPosts(ctx context.Context, channelID int64, query s
 	return msgs, nil
 }
 
+// SearchFilteredChannelPosts returns one authorized channel member's matching
+// media page and the exact count from the same database snapshot. Membership is
+// checked here and included in both queries; limit zero requests only the count.
+func (s *Store) SearchFilteredChannelPosts(
+	ctx context.Context,
+	ownerID, channelID int64,
+	query string,
+	filter MediaSearchFilter,
+	offsetID int64,
+	limit int,
+) ([]ChannelMessage, int, error) {
+	if filter != MediaSearchFilterDocument && filter != MediaSearchFilterPhoto && filter != MediaSearchFilterURL {
+		return nil, 0, fmt.Errorf("unsupported channel media search filter %d", filter)
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin filtered channel search snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	participant, err := qtx.ChannelParticipantByUser(ctx, db.ChannelParticipantByUserParams{
+		ChannelID: channelID,
+		UserID:    ownerID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, 0, ErrNotMember
+	case err != nil:
+		return nil, 0, fmt.Errorf("check filtered channel search membership: %w", err)
+	}
+	if channelMemberFromRow(participant).Banned(time.Now()) {
+		return nil, 0, ErrNotMember
+	}
+
+	if filter == MediaSearchFilterPhoto {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, 0, fmt.Errorf("commit empty channel photo search: %w", err)
+		}
+		return []ChannelMessage{}, 0, nil
+	}
+
+	count, err := qtx.CountFilteredChannelPosts(ctx, db.CountFilteredChannelPostsParams{
+		ChannelID: channelID,
+		OwnerID:   ownerID,
+		Filter:    int16(filter),
+		Query:     query,
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("count filtered channel posts: %w", err)
+	}
+
+	var rows []db.SearchFilteredChannelPostsPageRow
+	if limit > 0 {
+		rows, err = qtx.SearchFilteredChannelPostsPage(ctx, db.SearchFilteredChannelPostsPageParams{
+			ChannelID: channelID,
+			OwnerID:   ownerID,
+			Filter:    int16(filter),
+			Query:     query,
+			OffsetID:  offsetID,
+			Lim:       int32(limit), //nolint:gosec // caller caps this to maxHistoryLimit
+		})
+		if err != nil {
+			return nil, 0, fmt.Errorf("page filtered channel posts: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, 0, fmt.Errorf("commit filtered channel search snapshot: %w", err)
+	}
+	msgs := make([]ChannelMessage, len(rows))
+	for i, row := range rows {
+		msgs[i] = channelMessageFromFields(channelMsgFields(row))
+	}
+	return msgs, int(count), nil
+}
+
 // SearchPinnedChannelPost returns the active pinned post for channelID while
 // ownerID still has an unbanned participant row. The channel membership join
 // and post lookup happen in one statement so a departed or newly banned viewer

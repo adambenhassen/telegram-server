@@ -762,6 +762,15 @@ func (h *handlers) channelPinnedSearch(r *mtproto.Request, channelID int64, quer
 // messages.messagesSlice: a client needs the channel's pts to know where the
 // batch sits in that channel's own update stream.
 func (h *handlers) channelMessages(r *mtproto.Request, channelID int64, msgs []store.ChannelMessage) (bin.Encoder, error) {
+	return h.channelMessagesWithCount(r, channelID, msgs, len(msgs))
+}
+
+func (h *handlers) channelMessagesWithCount(
+	r *mtproto.Request,
+	channelID int64,
+	msgs []store.ChannelMessage,
+	count int,
+) (bin.Encoder, error) {
 	files, err := h.loadChannelFiles(r.Ctx, msgs)
 	if err != nil {
 		h.log.Error("channel messages files", "user_id", r.UserID, "channel_id", channelID, "err", err)
@@ -793,7 +802,7 @@ func (h *handlers) channelMessages(r *mtproto.Request, channelID int64, msgs []s
 	}
 	return &tg.MessagesChannelMessages{
 		Pts:      pts,
-		Count:    len(tlMsgs),
+		Count:    count,
 		Messages: tlMsgs,
 		Chats:    channels,
 		Users:    users,

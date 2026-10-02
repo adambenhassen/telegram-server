@@ -29,6 +29,15 @@ const (
 	PeerTypeChannel PeerType = 3
 )
 
+// MediaSearchFilter selects representable messages in a shared-media view.
+type MediaSearchFilter int16
+
+const (
+	MediaSearchFilterDocument MediaSearchFilter = iota + 1
+	MediaSearchFilterPhoto
+	MediaSearchFilterURL
+)
+
 // Message is a persisted message row (one side of a two-sided pair).
 type Message struct {
 	OwnerID     int64
@@ -364,6 +373,83 @@ func (s *Store) SearchMessages(ctx context.Context, ownerID int64, peerType Peer
 		msgs[i] = messageFromRow(r)
 	}
 	return msgs, nil
+}
+
+// SearchFilteredMessages returns the caller-owned rows in one user or chat
+// peer that match a shared-media filter. Count and page share a repeatable-read
+// snapshot; limit zero is count-only. A chat's membership is checked in that
+// snapshot and repeated by both queries so retained copies do not outlive access.
+func (s *Store) SearchFilteredMessages(
+	ctx context.Context,
+	ownerID int64,
+	peerType PeerType,
+	peerID int64,
+	query string,
+	filter MediaSearchFilter,
+	offsetID int64,
+	limit int,
+) ([]Message, int, error) {
+	if filter != MediaSearchFilterDocument && filter != MediaSearchFilterPhoto && filter != MediaSearchFilterURL {
+		return nil, 0, fmt.Errorf("unsupported message media search filter %d", filter)
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin filtered message search snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+
+	if peerType == PeerTypeChat {
+		member, err := qtx.IsChatMember(ctx, db.IsChatMemberParams{ChatID: peerID, UserID: ownerID})
+		if err != nil {
+			return nil, 0, fmt.Errorf("check filtered chat search membership: %w", err)
+		}
+		if !member {
+			return nil, 0, ErrNotMember
+		}
+	}
+
+	if filter == MediaSearchFilterPhoto {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, 0, fmt.Errorf("commit empty photo search: %w", err)
+		}
+		return []Message{}, 0, nil
+	}
+
+	params := db.CountFilteredMessagesParams{
+		OwnerID:  ownerID,
+		PeerType: int16(peerType),
+		PeerID:   peerID,
+		Filter:   int16(filter),
+		Query:    query,
+	}
+	count, err := qtx.CountFilteredMessages(ctx, params)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count filtered messages: %w", err)
+	}
+
+	var rows []db.Message
+	if limit > 0 {
+		rows, err = qtx.SearchFilteredMessagesPage(ctx, db.SearchFilteredMessagesPageParams{
+			OwnerID:  ownerID,
+			PeerType: int16(peerType),
+			PeerID:   peerID,
+			Filter:   int16(filter),
+			Query:    query,
+			OffsetID: offsetID,
+			Lim:      int32(limit), //nolint:gosec // caller caps this to maxHistoryLimit
+		})
+		if err != nil {
+			return nil, 0, fmt.Errorf("page filtered messages: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, 0, fmt.Errorf("commit filtered message search snapshot: %w", err)
+	}
+	return messagesFromRows(rows), int(count), nil
 }
 
 // EditMessage edits the caller's own outgoing message and its mirror on the

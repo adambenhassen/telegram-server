@@ -87,6 +87,56 @@ WHERE channel_id = sqlc.arg(channel_id) AND deleted = false
 ORDER BY local_id DESC
 LIMIT sqlc.arg(lim)::int;
 
+-- Filtered shared-media channel searches keep admission in both the count and
+-- page query. Channel posts are shared rows, so membership is the authorized
+-- scope; an access hash alone never widens it. The app handles no photo format
+-- today, while stored file rows are representable as documents.
+-- name: CountFilteredChannelPosts :one
+SELECT count(*)::bigint
+FROM channel_messages post
+WHERE post.channel_id = sqlc.arg(channel_id)::bigint
+  AND post.deleted = false
+  AND EXISTS (
+      SELECT 1 FROM channel_participants cp
+      WHERE cp.channel_id = post.channel_id
+        AND cp.user_id = sqlc.arg(owner_id)::bigint
+        AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+  )
+  AND CASE sqlc.arg(filter)::smallint
+      WHEN 1 THEN post.file_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM files f WHERE f.id = post.file_id AND f.stored = true
+      )
+      WHEN 2 THEN false
+      WHEN 3 THEN post.message ~* '(^|[^[:alnum:]_@])(([[:alpha:]][[:alnum:]+.-]*://|www[.])[^[:space:]]+|[[:alnum:]-]+[.][[:alpha:]]{2,}(:[0-9]{1,5})?(/[[:graph:]]*)?)'
+      ELSE false
+  END
+  AND (sqlc.arg(query)::text = '' OR post.message_tsv @@ plainto_tsquery('simple', sqlc.arg(query)));
+
+-- name: SearchFilteredChannelPostsPage :many
+SELECT post.channel_id, post.local_id, post.from_id, post.date, post.message,
+       post.edit_date, post.deleted, post.random_id, post.file_id, post.reply_to_msg_id
+FROM channel_messages post
+WHERE post.channel_id = sqlc.arg(channel_id)::bigint
+  AND post.deleted = false
+  AND EXISTS (
+      SELECT 1 FROM channel_participants cp
+      WHERE cp.channel_id = post.channel_id
+        AND cp.user_id = sqlc.arg(owner_id)::bigint
+        AND (cp.banned_until IS NULL OR cp.banned_until <= now())
+  )
+  AND CASE sqlc.arg(filter)::smallint
+      WHEN 1 THEN post.file_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM files f WHERE f.id = post.file_id AND f.stored = true
+      )
+      WHEN 2 THEN false
+      WHEN 3 THEN post.message ~* '(^|[^[:alnum:]_@])(([[:alpha:]][[:alnum:]+.-]*://|www[.])[^[:space:]]+|[[:alnum:]-]+[.][[:alpha:]]{2,}(:[0-9]{1,5})?(/[[:graph:]]*)?)'
+      ELSE false
+  END
+  AND (sqlc.arg(query)::text = '' OR post.message_tsv @@ plainto_tsquery('simple', sqlc.arg(query)))
+  AND (sqlc.arg(offset_id)::bigint = 0 OR post.local_id < sqlc.arg(offset_id)::bigint)
+ORDER BY post.local_id DESC
+LIMIT sqlc.arg(lim)::int;
+
 -- SearchPinnedChannelPostForMember returns the active pinned post only while
 -- the viewer still has an unbanned participant row for the channel. Posts are
 -- shared, so unlike chat pins the channel local_id is already the wire id.

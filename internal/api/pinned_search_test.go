@@ -116,10 +116,16 @@ func TestSearchPinnedOneToOnePeerReturnsEmptyAndValidatesViewerHash(t *testing.T
 	})
 	rpcError(t, err, "SEARCH_QUERY_EMPTY")
 
-	_, err = api.SearchForTest(s, viewer.ID, &tg.MessagesSearchRequest{
+	enc, err = api.SearchForTest(s, viewer.ID, &tg.MessagesSearchRequest{
 		Peer: api.InputPeerUser(viewer.ID, peer.ID), Q: "", Filter: &tg.InputMessagesFilterPhotos{},
 	})
-	rpcError(t, err, "INPUT_FILTER_INVALID")
+	if err != nil {
+		t.Fatalf("search photos with no representable messages: %v", err)
+	}
+	photos, ok := enc.(*tg.MessagesMessagesSlice)
+	if !ok || photos.Count != 0 || len(photos.Messages) != 0 {
+		t.Fatalf("photo search result = %T, want an empty messages slice with count 0", enc)
+	}
 }
 
 func TestSearchPinnedBasicGroupUsesViewerCopyAndTracksCurrentPin(t *testing.T) {
