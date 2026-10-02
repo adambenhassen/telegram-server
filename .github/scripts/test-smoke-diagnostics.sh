@@ -66,9 +66,23 @@ EOF
 
 fixture_commit() {
   git -C "$fixture_root" add -- test/e2e/smoke_test.go
-  local tree commit
+  local tree commit identity_headers
   tree=$(git -C "$fixture_root" write-tree)
-  commit=$(printf 'tree %s\n\nfixture\n' "$tree" | git -C "$fixture_root" hash-object -w -t commit --stdin)
+  identity_headers=$(git -C "$source_root" cat-file commit "$source_commit" | awk '
+    /^author / { author++; print }
+    /^committer / { committer++; print }
+    END { if (author != 1 || committer != 1) exit 1 }
+  ') || {
+    printf 'diagnostic fixture source commit lacks valid identity headers\n' >&2
+    return 1
+  }
+  commit=$(
+    {
+      printf 'tree %s\n' "$tree"
+      printf '%s\n' "$identity_headers"
+      printf '\nfixture\n'
+    } | git -C "$fixture_root" hash-object -w -t commit --stdin
+  )
   printf '%s\n' "$commit" >"$fixture_root/.git/HEAD"
 }
 
