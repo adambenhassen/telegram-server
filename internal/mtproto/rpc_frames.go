@@ -18,20 +18,6 @@ import (
 // a time.
 type peerReadTransport struct {
 	transport.Conn
-
-	readConn net.Conn
-}
-
-func (p peerReadTransport) interruptRead() {
-	if p.readConn != nil {
-		// gotd's transport.Conn applies context deadlines to the socket, but a
-		// context cancellation alone does not interrupt an active Recv.
-		if err := p.readConn.SetReadDeadline(time.Now()); err != nil {
-			// A concurrent peer close can reject the deadline update; Recv
-			// will report the transport's final state.
-			return
-		}
-	}
 }
 
 type rpcFrameResult struct {
@@ -130,60 +116,68 @@ func (r *rpcFrameReader) run() {
 	}
 }
 
-// readFrame resets an in-progress idle read when an RPC starts or finishes.
-// That keeps the transport timeout from counting time spent dispatching a
-// request, while still keeping exactly one Recv active at a time.
+// readFrame keeps one Recv alive until the whole frame arrives. Restarting a
+// codec read loses partial framing; expiring a WebSocket read deadline closes
+// its stream permanently. RPC state changes only update the terminal timer.
 func (r *rpcFrameReader) readFrame() (*bin.Buffer, time.Time, error) {
-	for {
-		var deadline time.Time
+	readCtx, cancelRead := context.WithCancel(context.WithoutCancel(r.ctx))
+	defer cancelRead()
+	readDone := make(chan rpcFrameReadResult, 1)
+	go func() {
+		b := new(bin.Buffer)
+		err := r.transport.Recv(readCtx, b)
+		readDone <- rpcFrameReadResult{buf: b, err: err}
+	}()
+
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	var deadline time.Time
+	var generation uint64
+	resetTimer := func() {
+		timer.Stop()
+		deadline = time.Time{}
 		if r.deadline != nil {
 			deadline = r.deadline()
 		}
-		readCtx, cancelRead := context.WithCancel(r.ctx)
-		readDone := make(chan rpcFrameReadResult, 1)
-		go func() {
-			b := new(bin.Buffer)
-			err := r.server.read(readCtx, r.transport, b, deadline)
-			readDone <- rpcFrameReadResult{buf: b, err: err}
-		}()
-		changed := r.peer.changeSignal()
+		active, observedGeneration := r.peer.readState()
+		generation = observedGeneration
+		if !deadline.IsZero() {
+			timer.Reset(max(0, deadline.Sub(r.now())))
+		} else if !active {
+			timer.Reset(r.server.readTimeout)
+		}
+	}
+	resetTimer()
+	changed := r.peer.changeSignal()
 
+	closeRead := func(cause error) (*bin.Buffer, time.Time, error) {
+		// Publish server provenance before cancellation or transport close can
+		// make the reader observe a peer-shaped error.
+		r.peer.serverClosed()
+		cancelRead()
+		closeErr := r.transport.Close()
+		result := <-readDone
+		if closeErr != nil && !isDisconnect(closeErr) {
+			cause = errors.Join(cause, closeErr)
+		}
+		return result.buf, deadline, cause
+	}
+	for {
 		select {
 		case result := <-readDone:
-			cancelRead()
-			if isPeerReadTimeout(result.err) {
-				select {
-				case <-changed:
-					if r.ctx.Err() == nil {
-						continue
-					}
-				default:
-				}
-			}
 			return result.buf, deadline, result.err
 		case <-changed:
-			cancelRead()
-			if interrupt, ok := r.transport.(interface{ interruptRead() }); ok {
-				interrupt.interruptRead()
-			}
-			result := <-readDone
-			if r.ctx.Err() != nil || result.err == nil {
-				return result.buf, deadline, result.err
-			}
-			if isPeerReadTimeout(result.err) {
-				if !deadline.IsZero() && !r.now().Before(deadline) {
-					return result.buf, deadline, result.err
-				}
+			resetTimer()
+		case <-timer.C:
+			if deadline.IsZero() && !r.peer.closeIfIdle(generation) {
+				// An RPC start or completion raced the timer. Observe the new
+				// state and grant a fresh idle interval after completion.
+				resetTimer()
 				continue
 			}
-			if !errors.Is(result.err, context.Canceled) {
-				return result.buf, deadline, result.err
-			}
-			continue
+			return closeRead(context.DeadlineExceeded)
 		case <-r.ctx.Done():
-			cancelRead()
-			result := <-readDone
-			return result.buf, deadline, result.err
+			return closeRead(r.ctx.Err())
 		}
 	}
 }

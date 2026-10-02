@@ -19,13 +19,10 @@ type rpcFrameTestRead struct {
 }
 
 type rpcFrameTestConn struct {
-	reads               chan rpcFrameTestRead
-	returned            chan struct{}
-	calls               atomic.Int32
-	sends               atomic.Int32
-	deadline            atomic.Int64
-	firstTimeoutRelease chan struct{}
-	readCancelled       chan struct{}
+	reads    chan rpcFrameTestRead
+	returned chan struct{}
+	calls    atomic.Int32
+	sends    atomic.Int32
 }
 
 func newRPCFrameTestConn() *rpcFrameTestConn {
@@ -36,20 +33,12 @@ func newRPCFrameTestConn() *rpcFrameTestConn {
 }
 
 func (c *rpcFrameTestConn) Recv(ctx context.Context, b *bin.Buffer) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		c.deadline.Store(deadline.UnixNano())
-	}
-	call := c.calls.Add(1)
+	c.calls.Add(1)
 	select {
 	case c.returned <- struct{}{}:
 	default:
 	}
-	if call == 1 && c.firstTimeoutRelease != nil {
-		<-ctx.Done()
-		c.readCancelled <- struct{}{}
-		<-c.firstTimeoutRelease
-		return rpcFrameTestTimeoutError{}
-	}
+
 	select {
 	case read := <-c.reads:
 		if read.err != nil {
@@ -145,109 +134,125 @@ func TestRPCFrameReaderTimeoutDoesNotCancelActiveRPC(t *testing.T) {
 	}
 }
 
-func TestRPCFrameReaderRestartsIdleTimeoutAfterRPCCompletion(t *testing.T) {
-	t.Parallel()
-
-	const readTimeout = time.Second
-	conn := newRPCFrameTestConn()
-	conn.reads <- rpcFrameTestRead{frame: []byte{1, 0, 0, 0, 0, 0, 0, 0}}
-	state := newPeerRPCState(newRPCCancelBudget(time.Now, 8))
-	reader := newRPCFrameReader(&Server{readTimeout: readTimeout}, context.Background(), peerReadTransport{Conn: conn}, state, nil)
-	defer func() {
-		reader.stop()
-		reader.join()
-	}()
-	if _, err, _ := reader.next(); err != nil {
-		t.Fatalf("read first frame: %v", err)
-	}
-	waitForRPCFrameReads(t, conn, 2)
-	_, finish, started := state.begin(21, context.Background())
-	if !started {
-		t.Fatal("active RPC did not start")
-	}
-	waitForRPCFrameReads(t, conn, 3)
-	finishedAt := time.Now()
-	finish()
-	waitForRPCFrameReads(t, conn, 4)
-	deadline := time.Unix(0, conn.deadline.Load())
-	if deadline.Before(finishedAt.Add(readTimeout - 10*time.Millisecond)) {
-		t.Fatalf("idle read deadline = %s, want a fresh %s after RPC completion %s", deadline, readTimeout, finishedAt)
-	}
-}
-
-func TestRPCFrameReaderRestartsWhenTimeoutRacesRPCCompletion(t *testing.T) {
-	t.Parallel()
-
-	conn := newRPCFrameTestConn()
-	conn.firstTimeoutRelease = make(chan struct{})
-	conn.readCancelled = make(chan struct{}, 1)
-	state := newPeerRPCState(newRPCCancelBudget(time.Now, 8))
-	reader := newRPCFrameReader(&Server{readTimeout: time.Hour}, context.Background(), peerReadTransport{Conn: conn}, state, nil)
-	defer func() {
-		reader.stop()
-		reader.join()
-	}()
-	waitForRPCFrameReads(t, conn, 1)
-	_, finish, started := state.begin(22, context.Background())
-	if !started {
-		t.Fatal("active RPC did not start")
-	}
-	select {
-	case <-conn.readCancelled:
-	case <-time.After(time.Second):
-		t.Fatal("RPC start did not cancel the in-progress idle read")
-	}
-	finish()
-	close(conn.firstTimeoutRelease)
-	waitForRPCFrameReads(t, conn, 3)
-	conn.reads <- rpcFrameTestRead{err: io.EOF}
-	if _, err, _ := reader.next(); !errors.Is(err, io.EOF) {
-		t.Fatalf("peer EOF after raced timeout = %v, want EOF", err)
-	}
-}
-
-func TestRPCFrameReaderInterruptsTransportReadOnRPCStateChange(t *testing.T) {
+func TestRPCFrameReaderKeepsReadAcrossRPCCompletion(t *testing.T) {
 	t.Parallel()
 
 	serverConn, clientConn := net.Pipe()
 	conn := &rpcFrameNetTestConn{rpcFrameTestConn: newRPCFrameTestConn(), Conn: serverConn}
 	state := newPeerRPCState(newRPCCancelBudget(time.Now, 8))
-	reader := newRPCFrameReader(&Server{readTimeout: time.Hour}, context.Background(), peerReadTransport{
-		Conn:     conn,
-		readConn: serverConn,
-	}, state, nil)
+	_, finish, started := state.begin(21, t.Context())
+	if !started {
+		t.Fatal("active RPC did not start")
+	}
+	reader := newRPCFrameReader(&Server{readTimeout: 100 * time.Millisecond}, t.Context(), peerReadTransport{Conn: conn}, state, nil)
 	defer func() {
 		reader.stop()
 		if err := clientConn.Close(); err != nil {
-			t.Errorf("close client test connection: %v", err)
-		}
-		if err := serverConn.Close(); err != nil {
-			t.Errorf("close server test connection: %v", err)
+			t.Errorf("close client connection: %v", err)
 		}
 		reader.join()
 	}()
 	waitForRPCFrameReads(t, conn.rpcFrameTestConn, 1)
-	_, finish, started := state.begin(23, context.Background())
+	// An active request may outlive the ordinary transport idle timeout.
+	time.Sleep(200 * time.Millisecond)
+	if _, err := clientConn.Write([]byte{42}); err != nil {
+		t.Fatalf("write during long RPC: %v", err)
+	}
+	frame, err, _ := reader.next()
+	if err != nil || len(frame.Buf) != 1 || frame.Buf[0] != 42 {
+		t.Fatalf("frame during long RPC = %v, %v; want [42]", frame, err)
+	}
+	waitForRPCFrameReads(t, conn.rpcFrameTestConn, 2)
+	finishedAt := time.Now()
+	finish()
+	_, err, _ = reader.next()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("idle read = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(finishedAt); elapsed < 90*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("idle timeout after RPC completion = %s", elapsed)
+	}
+}
+
+func TestRPCFrameReaderPreservesPartialFrameOnRPCStateChange(t *testing.T) {
+	t.Parallel()
+
+	serverConn, clientConn := net.Pipe()
+	conn := &rpcFrameNetTestConn{rpcFrameTestConn: newRPCFrameTestConn(), Conn: serverConn, frameSize: 2}
+	state := newPeerRPCState(newRPCCancelBudget(time.Now, 8))
+	reader := newRPCFrameReader(&Server{readTimeout: time.Hour}, t.Context(), peerReadTransport{Conn: conn}, state, nil)
+	defer func() {
+		reader.stop()
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("close client connection: %v", err)
+		}
+		reader.join()
+	}()
+	waitForRPCFrameReads(t, conn.rpcFrameTestConn, 1)
+	if _, err := clientConn.Write([]byte{42}); err != nil {
+		t.Fatalf("write partial frame: %v", err)
+	}
+	_, finish, started := state.begin(23, t.Context())
 	if !started {
 		t.Fatal("active RPC did not start")
 	}
-	waitForRPCFrameReads(t, conn.rpcFrameTestConn, 2)
-	if _, err := clientConn.Write([]byte{42}); err != nil {
-		t.Fatalf("write test frame: %v", err)
-	}
-	frame, err, _ := reader.next()
-	if err != nil {
-		t.Fatalf("read frame after interrupting idle read: %v", err)
-	}
-	if len(frame.Buf) != 1 || frame.Buf[0] != 42 {
-		t.Fatalf("frame after interrupting idle read = %v, want [42]", frame.Buf)
-	}
 	finish()
+	// Give the state change a chance to interrupt the unfinished frame.
+	time.Sleep(20 * time.Millisecond)
+	if err := clientConn.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set write deadline: %v", err)
+	}
+	if _, err := clientConn.Write([]byte{43}); err != nil {
+		t.Fatalf("finish partial frame: %v", err)
+	}
+	result := make(chan rpcFrameResult, 1)
+	go func() {
+		frame, err, _ := reader.next()
+		result <- rpcFrameResult{buf: frame, err: err}
+	}()
+	select {
+	case got := <-result:
+		if got.err != nil || len(got.buf.Buf) != 2 || got.buf.Buf[0] != 42 || got.buf.Buf[1] != 43 {
+			t.Fatalf("partial frame after RPC state change = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RPC state change discarded the partial frame")
+	}
+}
+
+func TestRPCFrameReaderPendingCeilingClosesActiveRPC(t *testing.T) {
+	t.Parallel()
+
+	serverConn, clientConn := net.Pipe()
+	conn := &rpcFrameNetTestConn{rpcFrameTestConn: newRPCFrameTestConn(), Conn: serverConn}
+	state := newPeerRPCState(nil)
+	activeCtx, finish, started := state.begin(24, t.Context())
+	if !started {
+		t.Fatal("active RPC did not start")
+	}
+	defer finish()
+	ceiling := time.Now().Add(100 * time.Millisecond)
+	reader := newRPCFrameReader(&Server{readTimeout: time.Hour}, t.Context(), peerReadTransport{Conn: conn}, state, func() time.Time { return ceiling })
+	defer func() {
+		reader.stop()
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("close client connection: %v", err)
+		}
+		reader.join()
+	}()
+	if _, err, _ := reader.next(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pending ceiling = %v, want deadline exceeded", err)
+	}
+	if !errors.Is(context.Cause(activeCtx), errServerRPCClosed) {
+		t.Fatalf("pending ceiling cancellation = %v, want server close", context.Cause(activeCtx))
+	}
 }
 
 type rpcFrameNetTestConn struct {
 	*rpcFrameTestConn
 	net.Conn
+
+	frameSize int
 }
 
 func (c *rpcFrameNetTestConn) Recv(ctx context.Context, b *bin.Buffer) error {
@@ -261,11 +266,11 @@ func (c *rpcFrameNetTestConn) Recv(ctx context.Context, b *bin.Buffer) error {
 	case c.returned <- struct{}{}:
 	default:
 	}
-	var frame [1]byte
-	if _, err := c.Read(frame[:]); err != nil {
+	frame := make([]byte, max(1, c.frameSize))
+	if _, err := io.ReadFull(c, frame); err != nil {
 		return err
 	}
-	b.ResetTo(frame[:])
+	b.ResetTo(frame)
 	return nil
 }
 
@@ -386,3 +391,51 @@ func waitForRPCFrameReads(t *testing.T, conn *rpcFrameTestConn, want int32) {
 }
 
 var _ net.Error = rpcFrameTestTimeoutError{}
+
+func TestPeerRPCIdleExpiryDoesNotCloseNewlyCompletedRPC(t *testing.T) {
+	t.Parallel()
+
+	state := newPeerRPCState(nil)
+	_, generation := state.readState()
+	_, finish, started := state.begin(25, t.Context())
+	if !started {
+		t.Fatal("active RPC did not start")
+	}
+	finish()
+	if state.closeIfIdle(generation) {
+		t.Fatal("stale idle expiry closed a newly completed RPC's connection")
+	}
+	_, generation = state.readState()
+	if !state.closeIfIdle(generation) {
+		t.Fatal("current idle expiry did not close the idle connection")
+	}
+	if _, _, started := state.begin(25, t.Context()); started {
+		t.Fatal("RPC started after server idle close")
+	}
+}
+
+func TestPeerRPCIdleExpiryRacesAdmission(t *testing.T) {
+	t.Parallel()
+
+	for range 100 {
+		state := newPeerRPCState(nil)
+		_, generation := state.readState()
+		start := make(chan struct{})
+		closed := make(chan bool, 1)
+		go func() {
+			<-start
+			closed <- state.closeIfIdle(generation)
+		}()
+		close(start)
+		ctx, finish, started := state.begin(26, t.Context())
+		idleClosed := <-closed
+		if started {
+			if idleClosed || ctx.Err() != nil {
+				t.Error("idle expiry closed an admitted RPC")
+			}
+			finish()
+		} else if !idleClosed {
+			t.Fatal("idle expiry and RPC admission both failed")
+		}
+	}
+}

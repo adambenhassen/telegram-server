@@ -34,7 +34,15 @@ func testSmokePeerDisconnect(t *testing.T) {
 
 	const randomID int64 = 20951144001
 	const messageText = "peer-disconnect rollback probe"
-	messageLock := lockSmokeMessages(t, f.ctx, f.dsn)
+	messageLock := lockSmokeOwner(t, f.ctx, f.dsn, min(a1.id, b1.id))
+	// The blocker targets writes only. Other connections must retain their
+	// message reads while the sending transaction is held uncommitted.
+	readCtx, cancelRead := context.WithTimeout(f.ctx, time.Second)
+	_, err = f.store.History(readCtx, a2.id, store.PeerTypeUser, b1.id, 0, 10)
+	cancelRead()
+	if err != nil {
+		t.Fatalf("owner write blocker prevented unrelated message reads: %v", err)
+	}
 	messageResult := make(chan error, 1)
 	go func() {
 		messageResult <- a1.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
@@ -44,9 +52,9 @@ func testSmokePeerDisconnect(t *testing.T) {
 			return err
 		})
 	}()
-	waitForSmokeMessagesLock(t, f.ctx, messageLock.observer, true)
+	waitForSmokeOwnerLock(t, f.ctx, messageLock, true)
 	a1.disconnectClient(t)
-	waitForSmokeMessagesLock(t, f.ctx, messageLock.observer, false)
+	waitForSmokeOwnerLock(t, f.ctx, messageLock, false)
 	messageLock.release(t)
 	select {
 	case err := <-messageResult:
@@ -99,7 +107,7 @@ func testSmokePeerDisconnect(t *testing.T) {
 	waitForSmokeOnline(t, f.ctx, f.store, a1.id, true)
 
 	const chatTitle = "peer-disconnect chat completion"
-	chatLock := lockSmokeMessages(t, f.ctx, f.dsn)
+	chatLock := lockSmokeOwner(t, f.ctx, f.dsn, min(a1.id, b1.id))
 	chatResult := make(chan error, 1)
 	go func() {
 		chatResult <- b1.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
@@ -110,16 +118,16 @@ func testSmokePeerDisconnect(t *testing.T) {
 			return err
 		})
 	}()
-	waitForSmokeMessagesLock(t, f.ctx, chatLock.observer, true)
+	waitForSmokeOwnerLock(t, f.ctx, chatLock, true)
 	var chatID int64
 	if err := chatLock.tx.QueryRow(f.ctx, `SELECT id FROM chats WHERE title = $1`, chatTitle).Scan(&chatID); err != nil {
 		t.Fatalf("createChat first transaction did not commit before announcement: %v", err)
 	}
 	b1.disconnectClient(t)
-	if got := smokeMessagesLockCount(t, f.ctx, chatLock.observer); got == 0 {
+	if got := smokeOwnerLockCount(t, f.ctx, chatLock); got == 0 {
 		t.Fatal("peer disconnect canceled the committed chat announcement while it was blocked")
 	}
-	assertSmokeMessagesStayBlocked(t, f.ctx, chatLock.observer, 300*time.Millisecond)
+	assertSmokeOwnerStaysBlocked(t, f.ctx, chatLock, 300*time.Millisecond)
 	waitForSmokeOnline(t, f.ctx, f.store, a1.id, true)
 	waitForSmokeOnline(t, f.ctx, f.store, b1.id, true)
 	if err := b2.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
@@ -129,7 +137,7 @@ func testSmokePeerDisconnect(t *testing.T) {
 		t.Fatalf("remaining B session authorization check: %v", err)
 	}
 	chatLock.release(t)
-	waitForSmokeMessagesLock(t, f.ctx, chatLock.observer, false)
+	waitForSmokeOwnerLock(t, f.ctx, chatLock, false)
 	select {
 	case err := <-chatResult:
 		if err == nil {
@@ -183,103 +191,104 @@ func testSmokePeerDisconnect(t *testing.T) {
 	waitForSmokeOnline(t, f.ctx, f.store, b1.id, false)
 }
 
-type smokeMessagesLock struct {
+type smokeOwnerLock struct {
 	blocker  *pgx.Conn
 	tx       pgx.Tx
 	observer *pgx.Conn
 	released bool
 }
 
-func reportSmokeMessagesLockError(t *testing.T, action string, err error) {
+func reportSmokeOwnerLockError(t *testing.T, action string, err error) {
 	t.Helper()
 	if err != nil {
 		t.Errorf("%s: %v", action, err)
 	}
 }
 
-func lockSmokeMessages(t *testing.T, ctx context.Context, dsn string) *smokeMessagesLock {
+func lockSmokeOwner(t *testing.T, ctx context.Context, dsn string, ownerID int64) *smokeOwnerLock {
 	t.Helper()
 	blocker, err := pgx.Connect(ctx, dsn)
 	if err != nil {
-		t.Fatalf("connect message lock: %v", err)
+		t.Fatalf("connect owner lock: %v", err)
 	}
 	tx, err := blocker.Begin(ctx)
 	if err != nil {
-		reportSmokeMessagesLockError(t, "close message lock connection", blocker.Close(context.Background()))
-		t.Fatalf("begin message lock: %v", err)
+		reportSmokeOwnerLockError(t, "close owner lock connection", blocker.Close(context.Background()))
+		t.Fatalf("begin owner lock: %v", err)
 	}
-	if _, err := tx.Exec(ctx, `LOCK TABLE messages IN ACCESS EXCLUSIVE MODE`); err != nil {
-		reportSmokeMessagesLockError(t, "rollback message lock transaction", tx.Rollback(context.Background()))
-		reportSmokeMessagesLockError(t, "close message lock connection", blocker.Close(context.Background()))
-		t.Fatalf("lock messages table: %v", err)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, ownerID); err != nil {
+		reportSmokeOwnerLockError(t, "rollback owner lock transaction", tx.Rollback(context.Background()))
+		reportSmokeOwnerLockError(t, "close owner lock connection", blocker.Close(context.Background()))
+		t.Fatalf("lock owner writes: %v", err)
 	}
 	observer, err := pgx.Connect(ctx, dsn)
 	if err != nil {
-		reportSmokeMessagesLockError(t, "rollback message lock transaction", tx.Rollback(context.Background()))
-		reportSmokeMessagesLockError(t, "close message lock connection", blocker.Close(context.Background()))
-		t.Fatalf("connect message lock observer: %v", err)
+		reportSmokeOwnerLockError(t, "rollback owner lock transaction", tx.Rollback(context.Background()))
+		reportSmokeOwnerLockError(t, "close owner lock connection", blocker.Close(context.Background()))
+		t.Fatalf("connect owner lock observer: %v", err)
 	}
-	lock := &smokeMessagesLock{blocker: blocker, tx: tx, observer: observer}
+	lock := &smokeOwnerLock{blocker: blocker, tx: tx, observer: observer}
 	t.Cleanup(func() {
 		if !lock.released {
-			reportSmokeMessagesLockError(t, "rollback message lock transaction", lock.tx.Rollback(context.Background()))
+			reportSmokeOwnerLockError(t, "rollback owner lock transaction", lock.tx.Rollback(context.Background()))
 		}
-		reportSmokeMessagesLockError(t, "close message lock connection", lock.blocker.Close(context.Background()))
-		reportSmokeMessagesLockError(t, "close message lock observer", lock.observer.Close(context.Background()))
+		reportSmokeOwnerLockError(t, "close owner lock connection", lock.blocker.Close(context.Background()))
+		reportSmokeOwnerLockError(t, "close owner lock observer", lock.observer.Close(context.Background()))
 	})
 	return lock
 }
 
-func (l *smokeMessagesLock) release(t *testing.T) {
+func (l *smokeOwnerLock) release(t *testing.T) {
 	t.Helper()
 	if l.released {
 		return
 	}
 	if err := l.tx.Rollback(context.Background()); err != nil {
-		t.Fatalf("release messages table lock: %v", err)
+		t.Fatalf("release owner write lock: %v", err)
 	}
 	l.released = true
 }
 
-func waitForSmokeMessagesLock(t *testing.T, ctx context.Context, observer *pgx.Conn, wantBlocked bool) {
+func waitForSmokeOwnerLock(t *testing.T, ctx context.Context, lock *smokeOwnerLock, wantBlocked bool) {
 	t.Helper()
 	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		count := smokeMessagesLockCount(t, waitCtx, observer)
+		count := smokeOwnerLockCount(t, waitCtx, lock)
 		if (count > 0) == wantBlocked {
 			return
 		}
 		select {
 		case <-ticker.C:
 		case <-waitCtx.Done():
-			t.Fatalf("messages lock activity blocked=%t, want %t", count > 0, wantBlocked)
+			t.Fatalf("owner lock activity blocked=%t, want %t", count > 0, wantBlocked)
 		}
 	}
 }
 
-func smokeMessagesLockCount(t *testing.T, ctx context.Context, observer *pgx.Conn) int {
+func smokeOwnerLockCount(t *testing.T, ctx context.Context, lock *smokeOwnerLock) int {
 	t.Helper()
 	var count int
-	err := observer.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+	err := lock.observer.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
 		WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock'
-		AND query ILIKE '%messages%' AND pid <> pg_backend_pid()`).Scan(&count)
+		AND wait_event = 'advisory' AND $1::integer = ANY(pg_blocking_pids(pid))`,
+		lock.blocker.PgConn().PID()).Scan(&count)
 	if err != nil {
-		t.Fatalf("inspect blocked message operations: %v", err)
+		t.Fatalf("inspect blocked owner writes: %v", err)
 	}
 	return count
 }
 
-func assertSmokeMessagesStayBlocked(t *testing.T, ctx context.Context, observer *pgx.Conn, duration time.Duration) {
+func assertSmokeOwnerStaysBlocked(t *testing.T, ctx context.Context, lock *smokeOwnerLock, duration time.Duration) {
 	t.Helper()
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if got := smokeMessagesLockCount(t, ctx, observer); got == 0 {
+		if got := smokeOwnerLockCount(t, ctx, lock); got == 0 {
 			t.Fatal("committed chat announcement stopped waiting before the blocker released")
 		}
 		select {

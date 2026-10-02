@@ -55,6 +55,7 @@ type peerRPCState struct {
 
 	budget      *rpcCancelBudget
 	changed     chan struct{}
+	generation  uint64
 	peerGone    bool
 	serverClose bool
 	active      *activeRPC
@@ -171,6 +172,26 @@ func (p *peerRPCState) isServerClosed() bool {
 	return serverClosed
 }
 
+// closeIfIdle makes the idle timeout atomic with RPC admission. A request
+// admitted before expiry keeps its read watcher; one admitted after it cannot
+// start on a connection the server has already decided to close.
+func (p *peerRPCState) closeIfIdle(generation uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.active != nil || p.generation != generation {
+		return false
+	}
+	p.serverClose = true
+	p.peerGone = true
+	return true
+}
+
+func (p *peerRPCState) readState() (active bool, generation uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.active != nil, p.generation
+}
+
 func (p *peerRPCState) hasActive() bool {
 	p.mu.Lock()
 	active := p.active != nil
@@ -186,6 +207,7 @@ func (p *peerRPCState) changeSignal() <-chan struct{} {
 }
 
 func (p *peerRPCState) signalChangeLocked() {
+	p.generation++
 	select {
 	case p.changed <- struct{}{}:
 	default:
