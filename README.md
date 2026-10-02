@@ -152,6 +152,7 @@ The server refuses to start without a database and a master key:
 | `TG_LOG_LOGIN_CODES` | `false` | Write phone-mode login codes to the log; with it off, phone-number sign-in cannot complete (username/password sign-in is unaffected) |
 | `TG_ADMIN_LISTEN_ADDR` | *(unset)* | Enables the admin HTTP server; requires `TG_ADMIN_TOKEN_HASH` (SHA-256 hex of the operator token) |
 | `TG_ADMIN_TOKEN_HASH` | *(unset)* | Lowercase SHA-256 hex digest of the admin token; must be set with `TG_ADMIN_LISTEN_ADDR` and never contains the raw token |
+| `TG_ADMIN_ORIGIN` | *(unset)* | Fixed browser origin for admin login/logout; HTTPS for remote proxy origins, or HTTP for localhost and loopback IPs. Unset/blank derives it from the listener. See `docs/observability.md` |
 | `TG_REPLICA_ID` | *(unset)* | Optional stable operator-supplied identity shown on authenticated admin metrics; 1–64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-` |
 
 The authenticated admin metrics contract, reset semantics, fleet aggregation

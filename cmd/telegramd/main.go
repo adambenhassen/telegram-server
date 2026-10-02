@@ -604,18 +604,6 @@ func run(log *slog.Logger) error {
 	// Start the admin HTTP server on a separate listener with login, logout,
 	// CSRF protection, rate limiting, and security headers.
 	if cfg.AdminListenAddr != "" {
-		// Derive the admin origin from the listen address for CSRF checks.
-		// When AdminListenAddr is a bare :port (e.g. ":2444"), substitute
-		// localhost so the Origin header matches what a browser sends.
-		adminHost, adminPort, err := net.SplitHostPort(cfg.AdminListenAddr)
-		if err != nil {
-			return fmt.Errorf("admin listen address: %w", err)
-		}
-		if adminHost == "" {
-			adminHost = "localhost"
-		}
-		adminOrigin := "http://" + net.JoinHostPort(adminHost, adminPort)
-
 		// One shared sampler feeds every dashboard stream; it idles while
 		// nobody is connected. Delivery lag state is shared with JSON and the
 		// dashboard so all authenticated surfaces retain the same complete
@@ -636,7 +624,7 @@ func run(log *slog.Logger) error {
 			Store:         st,
 			TokenHash:     cfg.AdminTokenHash,
 			Logger:        log,
-			AdminOrigin:   adminOrigin,
+			AdminOrigin:   cfg.AdminOrigin,
 			Events:        events,
 			NotifyMetrics: notifyMetrics,
 			DeliveryLag:   deliveryLag,
