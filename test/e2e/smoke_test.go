@@ -8,6 +8,7 @@ import (
 	"net"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1357,10 +1358,69 @@ func smokePeerUserID(peer tg.PeerClass) int64 {
 	return 0
 }
 
+func testSmokeReservedUsernameSignUp(t *testing.T, f *smokeFixture, username, pendingPhone string) {
+	t.Helper()
+	pending, err := f.store.CreateUser(f.ctx, pendingPhone)
+	if err != nil {
+		t.Fatalf("create pending reserved signup account: %v", err)
+	}
+
+	sess := &session.StorageMemory{}
+	client := f.savedSessionClient(sess)
+	if err := client.Run(f.ctx, func(ctx context.Context) error {
+		api := client.API()
+		codeHash, err := sendCodeUsername(ctx, api, username)
+		if err != nil {
+			return fmt.Errorf("sendCode for reserved signup: %w", err)
+		}
+		code, err := f.codes.wait(ctx, strings.ToLower(username))
+		if err != nil {
+			return fmt.Errorf("wait for in-memory reserved signup code: %w", err)
+		}
+		sessionData, err := (&session.Loader{Storage: sess}).Load(ctx)
+		if err != nil {
+			return fmt.Errorf("load reserved signup session: %w", err)
+		}
+		if len(sessionData.AuthKeyID) != 8 {
+			return fmt.Errorf("reserved signup auth key id length = %d, want 8", len(sessionData.AuthKeyID))
+		}
+		var authKeyID [8]byte
+		copy(authKeyID[:], sessionData.AuthKeyID)
+		if err := f.store.SetPendingUser(ctx, mtproto.AuthKeyIDInt64(authKeyID), pending.ID); err != nil {
+			return fmt.Errorf("stage reserved test signup account: %w", err)
+		}
+
+		response, err := signInUsername(ctx, api, username, codeHash, code)
+		if err != nil {
+			if !isSignUpRequired(err) {
+				return fmt.Errorf("signIn before reserved signup: %w", err)
+			}
+		} else if _, ok := response.(*tg.AuthAuthorizationSignUpRequired); !ok {
+			return fmt.Errorf("signIn before reserved signup response = %T, want signup required", response)
+		}
+
+		if _, err := signUpUsername(ctx, api, username, codeHash, "Smoke", "Reserved"); !isRPCMessage(err, "USERNAME_INVALID") {
+			if err == nil {
+				return errors.New("reserved auth.signUp succeeded")
+			}
+			return fmt.Errorf("reserved auth.signUp: expected USERNAME_INVALID, got %w", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("reject reserved username registration: %v", err)
+	}
+	if _, found, err := f.store.UserByUsernameWithLoginMode(f.ctx, username); err != nil {
+		t.Fatalf("lookup reserved smoke username: %v", err)
+	} else if found {
+		t.Fatalf("reserved username %q was stored", username)
+	}
+}
+
 func testSmokeUsernameRegistration(t *testing.T) {
 	t.Helper()
 	f := newSmokeFixtureWithRegistration(t, config.RegistrationOpen)
 	const username, pendingPhone, password = "smokenewacct", "+15551049003", "smoke-password-1049"
+	testSmokeReservedUsernameSignUp(t, f, "PiNg", "+15551049004")
 	pending, err := f.store.CreateUser(f.ctx, pendingPhone)
 	if err != nil {
 		t.Fatalf("create pending signup account: %v", err)
@@ -1414,11 +1474,6 @@ func testSmokeUsernameRegistration(t *testing.T) {
 			return fmt.Errorf("signUp user = %T, want a full user", authorization.User)
 		}
 		accountID = signupUser.ID
-		if _, err := api.AccountUpdateUsername(ctx, "PiNg"); err == nil {
-			return errors.New("reserved account.updateUsername succeeded")
-		} else if !isRPCMessage(err, "USERNAME_INVALID") {
-			return fmt.Errorf("reserved account.updateUsername: expected USERNAME_INVALID, got %w", err)
-		}
 		passwordState, err := api.AccountGetPassword(ctx)
 		if err != nil {
 			return fmt.Errorf("usable RPC after signUp: %w", err)
@@ -1446,11 +1501,6 @@ func testSmokeUsernameRegistration(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("open username registration: %v", err)
-	}
-	if _, found, err := f.store.UserByUsernameWithLoginMode(f.ctx, "ping"); err != nil {
-		t.Fatalf("lookup reserved smoke username: %v", err)
-	} else if found {
-		t.Fatal("reserved smoke username was stored")
 	}
 
 	secondSession := &session.StorageMemory{}
