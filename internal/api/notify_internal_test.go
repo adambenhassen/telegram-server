@@ -990,6 +990,41 @@ func TestSenderNotifyContextOutlivesRPCContext(t *testing.T) {
 	}
 }
 
+func TestChannelMembershipFanoutSharesOneBudgetWhenNotifyBlocks(t *testing.T) {
+	t.Parallel()
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	targets := []int64{7, 8, 9}
+	var calls int
+	var firstDone <-chan struct{}
+	started := time.Now()
+	notifyChannelMembershipFanout(parent, 42, targets, func(ctx context.Context, userID, channelID int64) {
+		if wantUserID := targets[calls]; userID != wantUserID {
+			t.Errorf("target user = %d, want %d", userID, wantUserID)
+		}
+		if channelID != 42 {
+			t.Errorf("target channel = %d, want 42", channelID)
+		}
+		calls++
+		done := ctx.Done()
+		if firstDone == nil {
+			firstDone = done
+		} else if done != firstDone {
+			t.Error("channel membership fan-out used a fresh notification context")
+		}
+		if calls == 1 {
+			<-ctx.Done()
+		}
+	})
+	if calls != len(targets) {
+		t.Fatalf("notify calls = %d, want %d", calls, len(targets))
+	}
+	if elapsed := time.Since(started); elapsed > 6*time.Second {
+		t.Fatalf("three-target membership fan-out waited %s with one 5s budget, want it to finish within 6s", elapsed)
+	}
+}
+
 func TestRecipientMessageNotifySurvivesCancellationAfterCommit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -69,12 +69,30 @@ func (h *handlers) notifyOwners(ctx context.Context, perOwner map[int64]int, ski
 	}
 }
 
-// notifyChannelMembership asks every replica to push the invited user's own
+// notifyChannelMemberships asks every replica to push each invited user's own
 // view of a channel after the admission transaction commits.
-func (h *handlers) notifyChannelMembership(ctx context.Context, userID, channelID int64) {
+func (h *handlers) notifyChannelMemberships(ctx context.Context, channelID int64, userIDs []int64) {
+	notifyChannelMembershipFanout(ctx, channelID, userIDs, h.notifyChannelMembershipWithContext)
+}
+
+func notifyChannelMembershipFanout(
+	ctx context.Context,
+	channelID int64,
+	userIDs []int64,
+	notify func(context.Context, int64, int64),
+) {
+	if len(userIDs) == 0 {
+		return
+	}
 	notifyCtx, cancel := senderNotifyContext(ctx)
 	defer cancel()
-	if err := h.store.Notify(notifyCtx, store.ChannelUpdates, store.ChannelMembershipPayload(userID, channelID)); err != nil {
+	for _, userID := range userIDs {
+		notify(notifyCtx, userID, channelID)
+	}
+}
+
+func (h *handlers) notifyChannelMembershipWithContext(ctx context.Context, userID, channelID int64) {
+	if err := h.store.Notify(ctx, store.ChannelUpdates, store.ChannelMembershipPayload(userID, channelID)); err != nil {
 		h.log.Error("notify channel membership", "user_id", userID, "channel_id", channelID, "err", err)
 	}
 }

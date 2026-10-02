@@ -369,9 +369,7 @@ func (h *handlers) handleInviteToChannel(r *mtproto.Request) (bin.Encoder, error
 		h.log.Error("invite channel members", "channel_id", channelID, "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	for _, targetID := range added {
-		h.notifyChannelMembership(r.Ctx, targetID, channelID)
-	}
+	h.notifyChannelMemberships(r.Ctx, channelID, added)
 
 	chats, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
 	if err != nil {

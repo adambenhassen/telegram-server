@@ -92,8 +92,15 @@ func TestNotifyFanoutSharesOneBudgetWhenPoolIsSaturated(t *testing.T) {
 	notifyCtx, cancelNotify := context.WithTimeout(context.WithoutCancel(rpcCtx), 5*time.Second)
 	defer cancelNotify()
 
+	// Channel-invite notifications use this payload and share this context
+	// across the target loop.
+	payloads := []string{
+		ChannelMembershipPayload(7, 42),
+		ChannelMembershipPayload(8, 42),
+		ChannelMembershipPayload(9, 42),
+	}
 	started := time.Now()
-	for _, payload := range []string{"7", "8", "9"} {
+	for _, payload := range payloads {
 		if err := s.Notify(notifyCtx, ChannelUpdates, payload); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("notify %s error = %v, want the shared fan-out deadline", payload, err)
 		}
