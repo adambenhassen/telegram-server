@@ -247,11 +247,7 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	d := mtproto.NewDispatcher()
 	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
 	register(d, tg.HelpGetAppConfigRequestTypeID, h.handleGetAppConfig)
-	registerLangpack(d, tg.HelpGetNearestDCRequestTypeID, "help.getNearestDc", h.handleHelpGetNearestDC)
-	registerLangpack(d, tg.LangpackGetLanguagesRequestTypeID, "langpack.getLanguages", h.handleLangpackGetLanguages)
-	registerLangpack(d, tg.LangpackGetLangPackRequestTypeID, "langpack.getLangPack", h.handleLangpackGetLangPack)
-	registerLangpack(d, tg.LangpackGetStringsRequestTypeID, "langpack.getStrings", h.handleLangpackGetStrings)
-	registerLangpack(d, tg.LangpackGetDifferenceRequestTypeID, "langpack.getDifference", h.handleLangpackGetDifference)
+	registerLangpackMethods(d, h)
 	h.registerHelpPolling(d)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	registerWithConn(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
@@ -360,6 +356,14 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	register(d, tg.CommunitiesGetJoinedCommunitiesRequestTypeID, h.handleGetJoinedCommunities)
 	d.Fallback(mtproto.HandlerFunc(h.handleUnknownGated))
 	return mtproto.UnpackInvokeWithAfterMsg(d, h.handleInvokeAfterMsgRefusal)
+}
+
+func registerLangpackMethods(d *mtproto.Dispatcher, h *handlers) {
+	registerLangpack(d, tg.HelpGetNearestDCRequestTypeID, "help.getNearestDc", h.handleHelpGetNearestDC)
+	registerLangpack(d, tg.LangpackGetLanguagesRequestTypeID, "langpack.getLanguages", h.handleLangpackGetLanguages)
+	registerLangpack(d, tg.LangpackGetLangPackRequestTypeID, "langpack.getLangPack", h.handleLangpackGetLangPack)
+	registerLangpack(d, tg.LangpackGetStringsRequestTypeID, "langpack.getStrings", h.handleLangpackGetStrings)
+	registerLangpack(d, tg.LangpackGetDifferenceRequestTypeID, "langpack.getDifference", h.handleLangpackGetDifference)
 }
 
 // checkRateLimit checks the per-account rate limit for the given surface.
