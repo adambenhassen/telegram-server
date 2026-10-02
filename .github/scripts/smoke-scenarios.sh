@@ -8,6 +8,7 @@ SMOKE_SCENARIOS=(
   channel
   megagroup-slow-mode
   contacts-search
+  langpack
   username-registration
   username-password-reset
   admin-proxy-login
