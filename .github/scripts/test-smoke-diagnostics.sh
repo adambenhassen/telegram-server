@@ -102,6 +102,8 @@ direct_id='dialog-filters.direct-check'
 callsite_one='dialog-filters.helper-call-one'
 callsite_two='dialog-filters.helper-call-two'
 helper_check='dialog-filters.helper-check'
+short_callsite='dialog-filters.helper-call-on'
+short_helper_check='dialog-filters.helper-chec'
 
 json_event() {
   local action="$1" test_name="$2" body="${3:-}"
@@ -177,6 +179,16 @@ paired_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:9: [assert:${callsite_one}/${he
 assert_case paired-helper-identities \
   "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$paired_body")" \
   "$(expected_helper_assertion)" "$canary"
+
+short_callsite_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:9: [assert:${short_callsite}/${helper_check}] runtime state ${canary}"$'\n'
+assert_case shortened-paired-callsite-id \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$short_callsite_body")" \
+  "$(expected_unavailable)" "$canary"
+
+short_helper_check_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:9: [assert:${callsite_one}/${short_helper_check}] runtime state ${canary}"$'\n'
+assert_case shortened-paired-helper-id \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$short_helper_check_body")" \
+  "$(expected_unavailable)" "$canary"
 
 bare_callsite_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:9: [assert:${callsite_one}] runtime state ${canary}"$'\n'
 assert_case bare-callsite-is-helper-call \

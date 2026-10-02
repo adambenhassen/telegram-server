@@ -189,7 +189,7 @@ def source_tree_is_clean(root: str) -> bool:
 def resolve_literal(root: str, literal: str, paths: list[str]) -> SourceLocation | None:
     if not re.fullmatch(r"[a-z0-9.-]+", literal) or not paths:
         return None
-    matches: list[tuple[str, int]] = []
+    matches: list[SourceLocation] = []
     for path in paths:
         result = run_git(
             root,
@@ -215,26 +215,14 @@ def resolve_literal(root: str, literal: str, paths: list[str]) -> SourceLocation
                 return None
             if not parts[1].isdecimal() or int(parts[1]) < 1:
                 return None
-            matches.append((path, int(parts[1])))
+            location = source_line_at(root, path, int(parts[1]))
+            if location is None:
+                return None
+            if source_has_literal(location.source_line, literal):
+                matches.append(location)
     if len(matches) != 1:
         return None
-
-    path, line_number = matches[0]
-    source = run_git(root, "show", f"HEAD:{path}")
-    if source is None or source.returncode != 0:
-        return None
-    source_lines = source.stdout.splitlines()
-    if line_number > len(source_lines):
-        return None
-
-    function = ""
-    for line in source_lines[:line_number]:
-        declaration = FUNCTION_DECL.match(line)
-        if declaration is not None:
-            function = declaration.group("name")
-    if not function:
-        return None
-    return SourceLocation(path, line_number, function, source_lines[line_number - 1])
+    return matches[0]
 
 
 def source_line_at(root: str, path: str, line_number: int) -> SourceLocation | None:
@@ -257,7 +245,16 @@ def source_line_at(root: str, path: str, line_number: int) -> SourceLocation | N
 
 
 def source_has_literal(source_line: str, value: str) -> bool:
-    return any(value in (double or raw) for double, raw in GO_STRING_LITERAL.findall(source_line))
+    delimited_value = re.compile(
+        rf"(?<![A-Za-z0-9_.-]){re.escape(value)}(?![A-Za-z0-9_.-])"
+    )
+    return any(
+        delimited_value.search(
+            match.group(1) if match.group(1) is not None else match.group(2)
+        )
+        is not None
+        for match in GO_STRING_LITERAL.finditer(source_line)
+    )
 
 
 def source_has_assertion_tag(source_line: str, assertion_id: str) -> bool:
