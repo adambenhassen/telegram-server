@@ -415,7 +415,7 @@ func SaveBigFilePartForTest(s *store.Store, userID int64, req *tg.UploadSaveBigF
 
 // BuildUpdatesForTest exposes buildUpdates for the external api_test package.
 func BuildUpdatesForTest(s *store.Store, userID int64, fromPts int) ([]tg.UpdateClass, []tg.UserClass, store.State, error) {
-	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts)
+	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts, true)
 	return b.ups, b.users, b.state, err
 }
 
@@ -511,7 +511,7 @@ func DocumentToTL(dcID int, f store.File) *tg.Document {
 // BuildUpdatesChatsForTest exposes the user and chat lists a batch carries
 // alongside its updates, which BuildUpdatesForTest partly omits.
 func BuildUpdatesChatsForTest(s *store.Store, userID int64, fromPts int) ([]tg.UpdateClass, []tg.UserClass, []tg.ChatClass, error) {
-	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts)
+	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts, true)
 	return b.ups, b.users, b.chats, err
 }
 
