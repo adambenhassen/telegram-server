@@ -1414,6 +1414,11 @@ func testSmokeUsernameRegistration(t *testing.T) {
 			return fmt.Errorf("signUp user = %T, want a full user", authorization.User)
 		}
 		accountID = signupUser.ID
+		if _, err := api.AccountUpdateUsername(ctx, "PiNg"); err == nil {
+			return errors.New("reserved account.updateUsername succeeded")
+		} else if !isRPCMessage(err, "USERNAME_INVALID") {
+			return fmt.Errorf("reserved account.updateUsername: expected USERNAME_INVALID, got %w", err)
+		}
 		passwordState, err := api.AccountGetPassword(ctx)
 		if err != nil {
 			return fmt.Errorf("usable RPC after signUp: %w", err)
@@ -1441,6 +1446,11 @@ func testSmokeUsernameRegistration(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("open username registration: %v", err)
+	}
+	if _, found, err := f.store.UserByUsernameWithLoginMode(f.ctx, "ping"); err != nil {
+		t.Fatalf("lookup reserved smoke username: %v", err)
+	} else if found {
+		t.Fatal("reserved smoke username was stored")
 	}
 
 	secondSession := &session.StorageMemory{}
