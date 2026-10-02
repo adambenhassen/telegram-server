@@ -1,6 +1,6 @@
 module github.com/adambenhassen/telegram-server
 
-go 1.26.6
+go 1.27.1
 
 require (
 	github.com/Oudwins/tailwind-merge-go v0.2.3

@@ -1,6 +1,6 @@
 module github.com/adambenhassen/telegram-server/tools
 
-go 1.26.6
+go 1.27.1
 
 tool github.com/sqlc-dev/sqlc/cmd/sqlc
 

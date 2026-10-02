@@ -66,13 +66,13 @@ compiled to Go by [sqlc](https://sqlc.dev) into `internal/store/db`.
 
 ## Requirements
 
-- **Go 1.25+** (`go.mod`)
+- **Go 1.27+** (`go.mod`)
 - **Docker**: required for the tests (the Postgres harness starts a
   `postgres:16-alpine` container), for Atlas's dev database, and for the
   compose stack
 - **Atlas CLI**: migrations; CI and the compose stack pin `v1.2.0`
   ([install](https://atlasgo.io/getting-started))
-- **golangci-lint**: `make lint`; CI pins `v2.12.2`
+- **golangci-lint**: `make lint`; CI pins `v2.14.0`
 - **sqlc**: not installed separately; `make sqlc` builds the pinned binary
   from the `tools/` module into `./bin/sqlc`
 - **Node 22 + pnpm 10**: only for the Playwright admin-dashboard e2e suite
