@@ -171,10 +171,17 @@ func TestHelpTermsAndPromoPolling(t *testing.T) {
 				return fmt.Errorf("authorized help.getPromoData call %d: %w", i+1, err)
 			}
 		}
-		if _, err := raw.HelpGetNearestDC(ctx); err == nil {
-			return errors.New("help.getNearestDc succeeded after authorized polling, want INPUT_METHOD_INVALID")
-		} else if !tgerr.Is(err, "INPUT_METHOD_INVALID") {
+		nearest, err := raw.HelpGetNearestDC(ctx)
+		if err != nil {
 			return fmt.Errorf("help.getNearestDc after authorized polling: %w", err)
+		}
+		if nearest.ThisDC != 2 || nearest.NearestDC != 2 || nearest.Country != "" {
+			return fmt.Errorf("help.getNearestDc after authorized polling = %+v, want configured DC 2 only", nearest)
+		}
+		if _, err := raw.HelpGetSupport(ctx); err == nil {
+			return errors.New("help.getSupport succeeded after authorized polling, want INPUT_METHOD_INVALID")
+		} else if !tgerr.Is(err, "INPUT_METHOD_INVALID") {
+			return fmt.Errorf("help.getSupport after authorized polling: %w", err)
 		}
 
 		// Trailing request data is malformed for these argument-free methods

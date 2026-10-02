@@ -3,6 +3,8 @@ package e2e_test
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -20,7 +22,10 @@ import (
 	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/telegram/updates/hook"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
+	"github.com/adambenhassen/telegram-server/internal/catalog"
+	"github.com/adambenhassen/telegram-server/internal/catalogpublish"
 	"github.com/adambenhassen/telegram-server/internal/config"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/pgtest"
@@ -64,6 +69,10 @@ func TestSmoke(t *testing.T) {
 	t.Run("contacts-search", func(t *testing.T) {
 		t.Parallel()
 		testSmokeContactsSearch(t)
+	})
+	t.Run("langpack", func(t *testing.T) {
+		t.Parallel()
+		testSmokeLangpack(t)
 	})
 	t.Run("username-registration", func(t *testing.T) {
 		t.Parallel()
@@ -197,6 +206,144 @@ func testSmokeOneToOne(t *testing.T) {
 
 	assertSmokeReconnect(t, f, a1.session, a1.id, a1.id, b1.id, wantA)
 	assertSmokeReconnect(t, f, b1.session, b1.id, b1.id, a1.id, wantB)
+}
+
+func testSmokeLangpack(t *testing.T) {
+	t.Helper()
+	artifact := langpackSmokeArtifact(t)
+	f := newSmokeFixtureWithSetup(t, config.RegistrationClosed, func(f *smokeFixture) {
+		if _, err := catalogpublish.Publish(f.ctx, f.dsn, artifact, "smoke-source-revision", catalogpublish.PublishOptions{OSUser: "tester"}); err != nil {
+			t.Fatalf("publish language catalog: %v", err)
+		}
+		if err := f.store.RefreshCatalogSnapshot(f.ctx); err != nil {
+			t.Fatalf("refresh language catalog: %v", err)
+		}
+	})
+	storage := &session.StorageMemory{}
+	unboundClient := f.savedSessionClient(storage)
+	if err := unboundClient.Run(f.ctx, func(ctx context.Context) error {
+		raw := tg.NewClient(unboundClient)
+		assertLangpackSmokeCalls(t, ctx, raw, f.dcID, artifact)
+		if _, err := raw.AccountGetPassword(ctx); err == nil || !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
+			t.Errorf("account.getPassword error = %v, want AUTH_KEY_UNREGISTERED", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("unbound client run: %v", err)
+	}
+
+	data, err := (&session.Loader{Storage: storage}).Load(f.ctx)
+	if err != nil {
+		t.Fatalf("load anonymous client session: %v", err)
+	}
+	var authKeyID [8]byte
+	if len(data.AuthKeyID) != len(authKeyID) {
+		t.Fatalf("auth key id length = %d, want %d", len(data.AuthKeyID), len(authKeyID))
+	}
+	copy(authKeyID[:], data.AuthKeyID)
+	username := fmt.Sprintf("langpack%d", time.Now().UnixNano())
+	user, err := f.store.CreateUsernameUser(f.ctx, username, "Langpack", "Smoke")
+	if err != nil {
+		t.Fatalf("create provisional user: %v", err)
+	}
+	if err := f.store.ClaimUsername(f.ctx, user.ID, username); err != nil {
+		t.Fatalf("claim provisional username: %v", err)
+	}
+	if err := f.store.BindAuthKeyUser(f.ctx, mtproto.AuthKeyIDInt64(authKeyID), user.ID); err != nil {
+		t.Fatalf("bind auth key to provisional user: %v", err)
+	}
+
+	provisionalClient := f.savedSessionClient(storage)
+	if err := provisionalClient.Run(f.ctx, func(ctx context.Context) error {
+		assertLangpackSmokeCalls(t, ctx, tg.NewClient(provisionalClient), f.dcID, artifact)
+		return nil
+	}); err != nil {
+		t.Fatalf("provisional client run: %v", err)
+	}
+}
+
+func assertLangpackSmokeCalls(t *testing.T, ctx context.Context, raw *tg.Client, dcID int, artifact catalog.Artifact) {
+	t.Helper()
+	const langPack = catalog.PackTDesktop
+	const langCode = catalog.LanguageEnglish
+	wantCount := len(artifact.Entries)
+
+	languages, err := raw.LangpackGetLanguages(ctx, langPack)
+	if err != nil {
+		t.Fatalf("langpack.getLanguages: %v", err)
+	}
+	if len(languages) != 1 {
+		t.Fatalf("langpack.getLanguages returned %d languages, want only English", len(languages))
+	}
+	language := languages[0]
+	if language.Name != artifact.Name || language.NativeName != artifact.NativeName || language.LangCode != langCode || language.PluralCode != artifact.PluralCode ||
+		language.StringsCount != wantCount || language.TranslatedCount != wantCount || !language.Official || language.Rtl || language.Beta || language.BaseLangCode != "" || language.TranslationsURL != "" {
+		t.Fatalf("langpack.getLanguages English metadata = %+v", language)
+	}
+
+	full, err := raw.LangpackGetLangPack(ctx, &tg.LangpackGetLangPackRequest{LangPack: langPack, LangCode: langCode})
+	if err != nil {
+		t.Fatalf("langpack.getLangPack: %v", err)
+	}
+	assertLangpackSmokeDifference(t, full, 0, 1, artifact)
+
+	selected, err := raw.LangpackGetStrings(ctx, &tg.LangpackGetStringsRequest{
+		LangPack: langPack,
+		LangCode: langCode,
+		Keys:     []string{artifact.Entries[0].Key, artifact.Entries[0].Key},
+	})
+	if err != nil {
+		t.Fatalf("langpack.getStrings: %v", err)
+	}
+	if len(selected) != 1 {
+		t.Fatalf("langpack.getStrings returned %d copies, want one", len(selected))
+	}
+	selectedString, ok := selected[0].(*tg.LangPackString)
+	if !ok || selectedString.Key != artifact.Entries[0].Key || selectedString.Value != artifact.Entries[0].Value {
+		t.Fatalf("langpack.getStrings response = %#v", selected[0])
+	}
+
+	difference, err := raw.LangpackGetDifference(ctx, &tg.LangpackGetDifferenceRequest{LangPack: langPack, LangCode: langCode, FromVersion: 0})
+	if err != nil {
+		t.Fatalf("langpack.getDifference: %v", err)
+	}
+	assertLangpackSmokeDifference(t, difference, 0, 1, artifact)
+
+	nearest, err := raw.HelpGetNearestDC(ctx)
+	if err != nil {
+		t.Fatalf("help.getNearestDc: %v", err)
+	}
+	if nearest.ThisDC != dcID || nearest.NearestDC != dcID || nearest.Country != "" {
+		t.Fatalf("help.getNearestDc = %+v, want configured DC %d only", nearest, dcID)
+	}
+}
+
+func assertLangpackSmokeDifference(t *testing.T, difference *tg.LangPackDifference, fromVersion, version int, artifact catalog.Artifact) {
+	t.Helper()
+	if difference.LangCode != catalog.LanguageEnglish || difference.FromVersion != fromVersion || difference.Version != version || len(difference.Strings) != len(artifact.Entries) {
+		t.Fatalf("langpack difference metadata = %+v", difference)
+	}
+	for i, want := range artifact.Entries {
+		got, ok := difference.Strings[i].(*tg.LangPackString)
+		if !ok || got.Key != want.Key || got.Value != want.Value {
+			t.Fatalf("langpack string %d = %#v, want %q=%q", i, difference.Strings[i], want.Key, want.Value)
+		}
+	}
+}
+
+func langpackSmokeArtifact(t *testing.T) catalog.Artifact {
+	t.Helper()
+	raw := []byte("\"SMOKE_GOODBYE\" = \"Goodbye\";\n\"SMOKE_HELLO\" = \"Hello from the published English catalog\";\n")
+	sum := sha256.Sum256(raw)
+	artifact, err := catalog.BuildEnglish(raw, catalog.Source{
+		URL:      "https://example.test/telegramdesktop/lang.strings",
+		Revision: "smoke-revision",
+		SHA256:   hex.EncodeToString(sum[:]),
+	})
+	if err != nil {
+		t.Fatalf("build language catalog smoke artifact: %v", err)
+	}
+	return artifact
 }
 
 func testSmokeSavedMessages(t *testing.T) {
@@ -1602,6 +1749,11 @@ func newSmokeFixture(t *testing.T) *smokeFixture {
 
 func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMode) *smokeFixture {
 	t.Helper()
+	return newSmokeFixtureWithSetup(t, regMode, nil)
+}
+
+func newSmokeFixtureWithSetup(t *testing.T, regMode config.RegistrationMode, beforeStart func(*smokeFixture)) *smokeFixture {
+	t.Helper()
 	deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancelDeadline)
 	deadlineCtx = withRegistrySnapshotState(deadlineCtx)
@@ -1622,6 +1774,9 @@ func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMo
 		}
 	})
 	f := &smokeFixture{ctx: ctx, failures: newClientFailureSignal(cancelFailure), key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode}
+	if beforeStart != nil {
+		beforeStart(f)
+	}
 	f.start(t, "127.0.0.1:0")
 	return f
 }
