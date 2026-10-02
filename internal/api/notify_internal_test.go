@@ -1036,11 +1036,14 @@ func TestRecipientMessageNotifySurvivesCancellationAfterCommit(t *testing.T) {
 	}).Encode(&body); err != nil {
 		t.Fatalf("encode sendMessage: %v", err)
 	}
-	_, _, _, err = h.handleSendMessageAfterReplyOnConn(nil, &mtproto.Request{
+	result, _, _, err := h.handleSendMessageAfterReplyOnConn(nil, &mtproto.Request{
 		Ctx: rpcCtx, UserID: alice.ID, Buf: &body,
 	})
 	if err == nil {
 		t.Fatal("sendMessage succeeded after its RPC context was canceled")
+	}
+	if result != nil {
+		t.Fatalf("sendMessage result after cancellation = %v, want nil", result)
 	}
 
 	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
