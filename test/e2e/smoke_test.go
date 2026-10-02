@@ -820,8 +820,11 @@ func testSmokeChannel(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if cfg.DCTxtDomainName != testPublicLinkPrefix {
-			return fmt.Errorf("help.getConfig public link prefix = %q, want %q", cfg.DCTxtDomainName, testPublicLinkPrefix)
+		if cfg.MeURLPrefix != testPublicLinkPrefix {
+			return fmt.Errorf("help.getConfig me_url_prefix = %q, want %q", cfg.MeURLPrefix, testPublicLinkPrefix)
+		}
+		if cfg.DCTxtDomainName != "" {
+			return fmt.Errorf("help.getConfig dc_txt_domain_name = %q, want empty", cfg.DCTxtDomainName)
 		}
 		return nil
 	})

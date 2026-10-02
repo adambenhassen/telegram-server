@@ -104,7 +104,7 @@ func fullChannelDispatcher(s *store.Store, linkPrefixes ...string) mtproto.Handl
 	return api.New(
 		s,
 		2,
-		&tg.Config{DCTxtDomainName: linkPrefix},
+		&tg.Config{MeURLPrefix: linkPrefix},
 		slog.New(slog.DiscardHandler),
 		false,
 		api.TestMaxFileBytes,
@@ -1681,8 +1681,11 @@ func TestConfiguredPublicLinkPrefixControlsConfigAndChannelInvites(t *testing.T)
 		if err != nil {
 			t.Fatalf("help.getConfig for %q: %v", prefix, err)
 		}
-		if cfg.DCTxtDomainName != prefix {
-			t.Errorf("help.getConfig prefix = %q, want %q", cfg.DCTxtDomainName, prefix)
+		if cfg.MeURLPrefix != prefix {
+			t.Errorf("help.getConfig me_url_prefix = %q, want %q", cfg.MeURLPrefix, prefix)
+		}
+		if cfg.DCTxtDomainName != "" {
+			t.Errorf("help.getConfig dc_txt_domain_name = %q, want empty", cfg.DCTxtDomainName)
 		}
 		exported, err := api.ExportChatInviteForTest(s, creator.ID, &tg.MessagesExportChatInviteRequest{
 			Peer: api.InputPeerChannel(creator.ID, ch.ID),

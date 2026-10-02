@@ -543,7 +543,7 @@ func run(log *slog.Logger) error {
 	}
 
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
-	tgcfg.DCTxtDomainName = cfg.PublicLinkPrefix
+	tgcfg.MeURLPrefix = cfg.PublicLinkPrefix
 	notifyMetrics := store.NewNotificationMetrics()
 	dialogFilterSync := api.NewDialogFilterSync()
 	handler := api.NewWithDialogFilterSync(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode, dialogFilterSync, notifyMetrics)

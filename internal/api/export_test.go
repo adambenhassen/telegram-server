@@ -230,7 +230,7 @@ func testHandlers(s *store.Store, linkPrefixes ...string) *handlers {
 	}
 	return &handlers{
 		store:                    s,
-		cfg:                      &tg.Config{DCTxtDomainName: linkPrefix},
+		cfg:                      &tg.Config{MeURLPrefix: linkPrefix},
 		log:                      slog.New(slog.DiscardHandler),
 		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
 		maxFileBytes:             TestMaxFileBytes,
@@ -1352,9 +1352,9 @@ func GetConfigSeqForTest(dcID int, host string, port int, now func() time.Time, 
 	h := testHandlers(nil)
 	h.cfg = DefaultConfig(dcID, host, port)
 	if len(linkPrefixes) > 0 {
-		h.cfg.DCTxtDomainName = linkPrefixes[0]
+		h.cfg.MeURLPrefix = linkPrefixes[0]
 	} else {
-		h.cfg.DCTxtDomainName = testPublicLinkPrefix
+		h.cfg.MeURLPrefix = testPublicLinkPrefix
 	}
 	h.dcID = dcID
 	h.now = now

@@ -220,7 +220,7 @@ func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error)
 		full.SetBannedCount(int(snapshot.BannedCount))
 		if snapshot.HasInvite {
 			full.SetExportedInvite(&tg.ChatInviteExported{
-				Link:      h.cfg.DCTxtDomainName + "+" + snapshot.InviteHash,
+				Link:      h.cfg.MeURLPrefix + "+" + snapshot.InviteHash,
 				AdminID:   snapshot.InviteCreatorID,
 				Date:      int(snapshot.InviteDate.Unix()),
 				Permanent: true,
@@ -891,7 +891,7 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 		return nil, errInternal
 	}
 	return &tg.ChatInviteExported{
-		Link:      h.cfg.DCTxtDomainName + "+" + hash,
+		Link:      h.cfg.MeURLPrefix + "+" + hash,
 		AdminID:   r.UserID,
 		Date:      int(time.Now().Unix()),
 		Permanent: true,
@@ -931,8 +931,8 @@ func (h *handlers) handleRevokeExportedChatInvite(r *mtproto.Request) (bin.Encod
 	// Revoke accepts bare hashes, current configured links, and the exact legacy
 	// link form. Other origins remain part of the hash and cannot revoke an invite.
 	hash := req.Hash
-	if h.cfg.DCTxtDomainName != "" {
-		if configuredHash, ok := strings.CutPrefix(hash, h.cfg.DCTxtDomainName+"+"); ok {
+	if h.cfg.MeURLPrefix != "" {
+		if configuredHash, ok := strings.CutPrefix(hash, h.cfg.MeURLPrefix+"+"); ok {
 			hash = configuredHash
 		} else if legacyHash, ok := strings.CutPrefix(hash, legacyInviteLinkPrefix); ok {
 			hash = legacyHash
