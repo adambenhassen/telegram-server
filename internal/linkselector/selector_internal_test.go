@@ -1,11 +1,14 @@
 package linkselector
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -87,3 +90,104 @@ func (b *timeoutBody) Read([]byte) (int, error) {
 }
 
 func (*timeoutBody) Close() error { return nil }
+
+func TestWebStagedBodyBudgetRejectsWhenSlowReadersHoldCapacity(t *testing.T) {
+	handler, err := NewHandler("http://web.example", "http://landing.example", slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	var bodyReads atomic.Int32
+	selectorHandler, ok := handler.(*selector)
+	if !ok {
+		t.Fatalf("NewHandler returned %T, want *selector", handler)
+	}
+	selectorHandler.client.Transport = roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": {"text/javascript"}},
+			Body:          &countingBody{reader: bytes.NewReader([]byte("asset")), reads: &bodyReads},
+			ContentLength: maxWebBodyBytes,
+			Request:       request,
+		}, nil
+	})
+
+	writeStarted := make(chan struct{}, 2)
+	releaseWrites := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseWrites) }) }
+	defer release()
+	request := func() *http.Request {
+		return &http.Request{
+			Method:     http.MethodGet,
+			URL:        &url.URL{},
+			RequestURI: "/main.js",
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+		}
+	}
+	finished := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			handler.ServeHTTP(&gatedResponseWriter{
+				ResponseRecorder: httptest.NewRecorder(),
+				writeStarted:     writeStarted,
+				release:          releaseWrites,
+			}, request())
+			finished <- struct{}{}
+		}()
+	}
+	for range 2 {
+		select {
+		case <-writeStarted:
+		case <-time.After(time.Second):
+			t.Fatal("Web response did not reach its blocked downstream write")
+		}
+	}
+
+	readsBeforeExtraRequest := bodyReads.Load()
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request())
+	if response.Code != http.StatusBadGateway {
+		t.Errorf("request over staged-body budget status = %d, want fixed 502", response.Code)
+	}
+	if response.Body.String() != landingUnavailable {
+		t.Errorf("request over staged-body budget body = %q, want fixed unavailable page", response.Body.String())
+	}
+	if got := bodyReads.Load(); got != readsBeforeExtraRequest {
+		t.Errorf("upstream body reads for rejected request = %d, want no additional reads", got-readsBeforeExtraRequest)
+	}
+
+	release()
+	for range 2 {
+		select {
+		case <-finished:
+		case <-time.After(time.Second):
+			t.Fatal("slow-reader request did not finish after its write was released")
+		}
+	}
+}
+
+type countingBody struct {
+	reader *bytes.Reader
+	reads  *atomic.Int32
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	b.reads.Add(1)
+	return b.reader.Read(p)
+}
+
+func (*countingBody) Close() error { return nil }
+
+type gatedResponseWriter struct {
+	*httptest.ResponseRecorder
+
+	writeStarted chan<- struct{}
+	release      <-chan struct{}
+}
+
+func (w *gatedResponseWriter) Write(p []byte) (int, error) {
+	w.writeStarted <- struct{}{}
+	<-w.release
+	return w.ResponseRecorder.Write(p)
+}

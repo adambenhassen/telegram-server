@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/linklanding"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -19,6 +20,7 @@ const (
 	upstreamDialTimeout   = 5 * time.Second
 	maxLandingBodyBytes   = 4096
 	maxWebBodyBytes       = 32 << 20 // Bound the staged response size per request.
+	maxStagedWebBodyBytes = 64 << 20 // Bound bodies held for downstream Web clients.
 	landingUnavailable    = `<!doctype html><html lang="en"><body><main>Temporarily unavailable</main></body></html>`
 	webErrorStatus        = http.StatusBadGateway
 	landingErrorStatus    = http.StatusServiceUnavailable
@@ -39,10 +41,11 @@ var (
 )
 
 type selector struct {
-	webURL     *url.URL
-	landingURL *url.URL
-	client     *http.Client
-	logger     *slog.Logger
+	webURL          *url.URL
+	landingURL      *url.URL
+	client          *http.Client
+	logger          *slog.Logger
+	stagedWebBodies *semaphore.Weighted
 }
 
 // NewHandler builds a selector that forwards only allowlisted Web paths and
@@ -82,7 +85,13 @@ func NewHandler(webUpstream, landingUpstream string, logger *slog.Logger) (http.
 		},
 	}
 
-	return &selector{webURL: webURL, landingURL: landingURL, client: client, logger: logger}, nil
+	return &selector{
+		webURL:          webURL,
+		landingURL:      landingURL,
+		client:          client,
+		logger:          logger,
+		stagedWebBodies: semaphore.NewWeighted(maxStagedWebBodyBytes),
+	}, nil
 }
 
 func parseUpstream(raw string) (*url.URL, error) {
@@ -190,12 +199,37 @@ func (s *selector) serveWeb(w http.ResponseWriter, incoming *http.Request, targe
 		return true
 	}
 	if response.StatusCode >= http.StatusInternalServerError {
-		if err := response.Body.Close(); err != nil {
-			s.logger.Error("selector upstream response close failed", "route_class", unavailableRouteClass, "status", webErrorStatus)
-		}
+		s.closeWebResponse(response)
 		writeUnavailable(w, webErrorStatus)
 		return true
 	}
+	if incoming.Method == http.MethodHead {
+		if err := response.Body.Close(); err != nil {
+			s.logger.Error("selector upstream response close failed", "route_class", unavailableRouteClass, "status", webErrorStatus)
+			writeUnavailable(w, webErrorStatus)
+			return true
+		}
+		copyResponseHeaders(w.Header(), response.Header)
+		w.WriteHeader(response.StatusCode)
+		return false
+	}
+
+	reservation := int64(maxWebBodyBytes)
+	if response.ContentLength > maxWebBodyBytes {
+		s.closeWebResponse(response)
+		writeUnavailable(w, webErrorStatus)
+		return true
+	}
+	if response.ContentLength >= 0 {
+		reservation = response.ContentLength
+	}
+	if !s.stagedWebBodies.TryAcquire(reservation) {
+		s.closeWebResponse(response)
+		writeUnavailable(w, webErrorStatus)
+		return true
+	}
+	defer s.stagedWebBodies.Release(reservation)
+
 	// Stage the complete response before committing upstream headers so a
 	// truncated body or timeout can still become the fixed failure response.
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, maxWebBodyBytes+1))
@@ -213,6 +247,12 @@ func (s *selector) serveWeb(w http.ResponseWriter, incoming *http.Request, targe
 		}
 	}
 	return false
+}
+
+func (s *selector) closeWebResponse(response *http.Response) {
+	if err := response.Body.Close(); err != nil {
+		s.logger.Error("selector upstream response close failed", "route_class", unavailableRouteClass, "status", webErrorStatus)
+	}
 }
 
 func writeUnavailable(w http.ResponseWriter, status int) {

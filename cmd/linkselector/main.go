@@ -58,6 +58,7 @@ func main() {
 		Handler:                      handler,
 		DisableGeneralOptionsHandler: true,
 		ReadHeaderTimeout:            5 * time.Second,
+		WriteTimeout:                 10 * time.Minute,
 		MaxHeaderBytes:               8192,
 		IdleTimeout:                  30 * time.Second,
 		ErrorLog:                     log.New(io.Discard, "", 0),
