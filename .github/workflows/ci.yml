@@ -16,6 +16,9 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     # The suite finishes in ~4m; this only catches a hang (a stalled image
     # pull, a container that never reports ready) before it burns six hours.
     timeout-minutes: 20
@@ -110,8 +113,18 @@ jobs:
 
       # Quay no longer allows anonymous pulls of its MinIO image. Build the
       # test fixture from the pinned public source so fork PRs need no secrets.
+      - uses: docker/setup-buildx-action@v4.2.0
+
       - name: Build MinIO image for tests
-        run: docker build --pull --file Dockerfile.minio-test --tag quay.io/minio/minio:latest .
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: .
+          file: Dockerfile.minio-test
+          pull: true
+          tags: quay.io/minio/minio:latest
+          load: true
+          cache-from: type=gha,scope=minio-test
+          cache-to: type=gha,scope=minio-test,mode=max
 
       - name: Measure flat parts directory ceiling
         run: PARTS_DIR_CEILING_PROBE=1 go test -count=1 -timeout 30m ./internal/blob/ -run TestFlatPartsDirEntryCeiling -v
