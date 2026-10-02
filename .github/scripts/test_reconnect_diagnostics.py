@@ -33,6 +33,22 @@ def event(action, test=TARGET, **fields):
 
 
 class ReconnectDiagnosticsTest(unittest.TestCase):
+    def test_diagnostic_workflow_execs_runner_for_step_timeout_signal_delivery(self):
+        workflow_path = (
+            Path(__file__).resolve().parents[1]
+            / "workflows"
+            / "reconnect-diagnostic.yml"
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+        diagnostic_step = workflow.split(
+            "      - name: Run bounded reconnect diagnostic\n", maxsplit=1
+        )[1].split("\n      - name:", maxsplit=1)[0]
+
+        self.assertIn(
+            "          exec python3 harness/.github/scripts/reconnect_diagnostics.py run \\\n",
+            diagnostic_step,
+        )
+
     def test_keeps_only_target_events_and_allowlisted_a2_error_class(self):
         secret = "auth-key-bytes=do-not-retain phone=+15551046101"
         lines = [

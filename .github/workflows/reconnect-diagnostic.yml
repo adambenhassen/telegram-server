@@ -141,7 +141,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 harness/.github/scripts/reconnect_diagnostics.py run \
+          exec python3 harness/.github/scripts/reconnect_diagnostics.py run \
             --harness-dir harness \
             --source-dir source \
             --workflow-sha "$WORKFLOW_SHA" \
