@@ -97,8 +97,10 @@ func TestChatRecipientNotificationsSurviveCallerCancellationAfterCommit(t *testi
 
 	rpcCtx, cancelRPC := context.WithCancel(ctx)
 	cancelRPC()
+	notifyCtx, cancelNotify := store.NotificationContext(rpcCtx)
+	defer cancelNotify()
 	for userID := range perOwner {
-		if err := s.Notify(rpcCtx, store.ChannelUpdates, strconv.FormatInt(userID, 10)); err != nil {
+		if err := s.Notify(notifyCtx, store.ChannelUpdates, strconv.FormatInt(userID, 10)); err != nil {
 			t.Fatalf("notify chat member %d after cancellation: %v", userID, err)
 		}
 	}

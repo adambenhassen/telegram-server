@@ -18,7 +18,6 @@ import (
 const (
 	defaultHistoryLimit = 20
 	maxHistoryLimit     = 100
-	senderNotifyTimeout = 5 * time.Second
 
 	defaultDialogsLimit = 20
 	maxDialogsLimit     = 100
@@ -36,15 +35,46 @@ const (
 
 // notify emits the cross-replica update nudge for userID (best-effort).
 func (h *handlers) notify(ctx context.Context, userID int64) {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	h.notifyWithContext(notifyCtx, userID)
+}
+
+func (h *handlers) notifyWithContext(ctx context.Context, userID int64) {
 	if err := h.store.Notify(ctx, store.ChannelUpdates, strconv.FormatInt(userID, 10)); err != nil {
 		h.log.Error("notify updates", "user_id", userID, "err", err)
+	}
+}
+
+// notifyUsers shares one detached notification budget across a post-commit
+// fan-out.
+func (h *handlers) notifyUsers(ctx context.Context, userIDs []int64) {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	for _, userID := range userIDs {
+		h.notifyWithContext(notifyCtx, userID)
+	}
+}
+
+// notifyOwners notifies every owner in a post-commit fan-out. skipUserID is
+// zero when no owner should be skipped.
+func (h *handlers) notifyOwners(ctx context.Context, perOwner map[int64]int, skipUserID int64) {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	for userID := range perOwner {
+		if skipUserID != 0 && userID == skipUserID {
+			continue
+		}
+		h.notifyWithContext(notifyCtx, userID)
 	}
 }
 
 // notifyChannelMembership asks every replica to push the invited user's own
 // view of a channel after the admission transaction commits.
 func (h *handlers) notifyChannelMembership(ctx context.Context, userID, channelID int64) {
-	if err := h.store.Notify(ctx, store.ChannelUpdates, store.ChannelMembershipPayload(userID, channelID)); err != nil {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	if err := h.store.Notify(notifyCtx, store.ChannelUpdates, store.ChannelMembershipPayload(userID, channelID)); err != nil {
 		h.log.Error("notify channel membership", "user_id", userID, "channel_id", channelID, "err", err)
 	}
 }
@@ -53,7 +83,7 @@ func (h *handlers) notifyChannelMembership(ctx context.Context, userID, channelI
 // update in the sendMessage RPC result, so that key can skip only that live echo.
 func (h *handlers) notifySend(ctx context.Context, userID, authKeyID int64, pts int) {
 	if authKeyID == 0 || pts <= 0 {
-		h.notify(ctx, userID)
+		h.notifyWithContext(ctx, userID)
 		return
 	}
 	payload := strconv.FormatInt(userID, 10) + "|" + strconv.FormatInt(authKeyID, 10) + "|" + strconv.Itoa(pts)
@@ -63,10 +93,7 @@ func (h *handlers) notifySend(ctx context.Context, userID, authKeyID int64, pts 
 }
 
 func senderNotifyContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if parent == nil {
-		parent = context.Background()
-	}
-	return context.WithTimeout(context.WithoutCancel(parent), senderNotifyTimeout)
+	return store.NotificationContext(parent)
 }
 
 func (h *handlers) notifySendAfterReply(r *mtproto.Request, pts int) {
@@ -78,7 +105,7 @@ func (h *handlers) notifySendAfterReply(r *mtproto.Request, pts int) {
 func (h *handlers) notifySendAfterFailure(r *mtproto.Request) {
 	ctx, cancel := senderNotifyContext(r.Ctx)
 	defer cancel()
-	h.notify(ctx, r.UserID)
+	h.notifyWithContext(ctx, r.UserID)
 }
 
 type senderRPCAttempt struct {
@@ -151,14 +178,18 @@ func (h *handlers) notifyTyping(ctx context.Context, peerID, fromID int64) {
 // the same cached key, finds the row still there, re-registers, and the evict is
 // spent.
 func (h *handlers) notifyEvict(ctx context.Context, userID, authKeyID int64) {
-	if err := h.store.Notify(ctx, store.ChannelEvict, store.EvictPayload(userID, authKeyID)); err != nil {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	if err := h.store.Notify(notifyCtx, store.ChannelEvict, store.EvictPayload(userID, authKeyID)); err != nil {
 		h.log.Error("notify evict", "user_id", userID, "err", err)
 	}
 }
 
 // notifyChannelPost emits the cross-replica nudge for a new post in channelID.
 func (h *handlers) notifyChannelPost(ctx context.Context, channelID int64) {
-	if err := h.store.Notify(ctx, store.ChannelPost, store.ChannelPostPayload(channelID)); err != nil {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	if err := h.store.Notify(notifyCtx, store.ChannelPost, store.ChannelPostPayload(channelID)); err != nil {
 		h.log.Error("notify channel post", "channel_id", channelID, "err", err)
 	}
 }
@@ -166,7 +197,9 @@ func (h *handlers) notifyChannelPost(ctx context.Context, channelID int64) {
 // notifyEncryptedMsg emits the cross-replica nudge for a new encrypted message
 // for recipientID at qts. Emitted after commit.
 func (h *handlers) notifyEncryptedMsg(ctx context.Context, recipientID int64, qts int) {
-	if err := h.store.Notify(ctx, store.ChannelEncryptedMsg, store.EncryptedMsgPayload(recipientID, qts)); err != nil {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	if err := h.store.Notify(notifyCtx, store.ChannelEncryptedMsg, store.EncryptedMsgPayload(recipientID, qts)); err != nil {
 		h.log.Error("notify encrypted msg", "recipient_id", recipientID, "qts", qts, "err", err)
 	}
 }
@@ -483,9 +516,7 @@ func (h *handlers) sendChatMessage(r *mtproto.Request, chatID int64, req *tg.Mes
 		h.log.Error("send chat message", "user_id", r.UserID, "chat_id", chatID, "err", err)
 		return nil, errInternal
 	}
-	for uid := range perOwner {
-		h.notify(r.Ctx, uid)
-	}
+	h.notifyOwners(r.Ctx, perOwner, 0)
 
 	recipients := make(map[int64]bool, len(perOwner))
 	for uid := range perOwner {
@@ -668,9 +699,7 @@ func (h *handlers) handleReadHistory(r *mtproto.Request) (bin.Encoder, error) {
 			h.log.Error("read chat history", "user_id", r.UserID, "chat_id", chat.ChatID, "err", err)
 			return nil, errInternal
 		}
-		for _, userID := range result.NotifyUserIDs {
-			h.notify(r.Ctx, userID)
-		}
+		h.notifyUsers(r.Ctx, result.NotifyUserIDs)
 		return &tg.MessagesAffectedMessages{Pts: result.Pts, PtsCount: result.PtsCount}, nil
 	}
 	toID, err := h.peerUserID(req.Peer, r.UserID)
@@ -683,10 +712,11 @@ func (h *handlers) handleReadHistory(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("read history", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	h.notify(r.Ctx, r.UserID)
+	userIDs := []int64{r.UserID}
 	if toID != r.UserID {
-		h.notify(r.Ctx, toID)
+		userIDs = append(userIDs, toID)
 	}
+	h.notifyUsers(r.Ctx, userIDs)
 	return &tg.MessagesAffectedMessages{Pts: readerPts, PtsCount: 1}, nil
 }
 
@@ -751,10 +781,11 @@ func (h *handlers) handleEditMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 			h.notify(r.Ctx, peerID)
 		}
 	} else {
-		h.notify(r.Ctx, r.UserID)
+		userIDs := []int64{r.UserID}
 		if peerID != r.UserID {
-			h.notify(r.Ctx, peerID)
+			userIDs = append(userIDs, peerID)
 		}
+		h.notifyUsers(r.Ctx, userIDs)
 	}
 
 	edited, ok, err := h.store.MessageByOwnerLocal(r.Ctx, r.UserID, int64(req.ID))
@@ -837,9 +868,7 @@ func (h *handlers) handleDeleteMessages(r *mtproto.Request) (bin.Encoder, error)
 		h.log.Error("delete messages", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	for uid := range perOwner {
-		h.notify(r.Ctx, uid)
-	}
+	h.notifyOwners(r.Ctx, perOwner, 0)
 	return &tg.MessagesAffectedMessages{Pts: perOwner[r.UserID], PtsCount: len(req.ID)}, nil
 }
 
@@ -1126,12 +1155,11 @@ func (h *handlers) finishForwardReply(
 	attempt senderRPCAttempt,
 ) (bin.Encoder, *replyUpdate, func(), error) {
 	_, suppress := forwardSenderPts(r.UserID, destPeerType, srcPeerType, sentMsgs)
-	for uid := range perOwner {
-		if suppress && uid == r.UserID {
-			continue
-		}
-		h.notify(r.Ctx, uid)
+	skipUserID := int64(0)
+	if suppress {
+		skipUserID = r.UserID
 	}
+	h.notifyOwners(r.Ctx, perOwner, skipUserID)
 	res, err := h.forwardReply(r, destPeerType, destPeerID, perOwner, sentMsgs, randomIDs)
 	if err != nil {
 		if suppress {
@@ -1214,10 +1242,9 @@ func (h *handlers) handleSendReaction(r *mtproto.Request) (bin.Encoder, error) {
 		return nil, errInternal
 	}
 
-	// Notify all affected message copies (transient push, no pts).
-	for _, t := range affected {
-		h.notifyReaction(r.Ctx, t.OwnerID, t.LocalID)
-	}
+	// Notify all affected message copies (transient push, no pts) within one
+	// post-commit budget.
+	h.notifyReactionTargets(r.Ctx, affected)
 
 	// messages.sendReaction returns Updates per the Telegram schema.
 	return &tg.Updates{Date: int(time.Now().Unix())}, nil
@@ -1331,10 +1358,17 @@ func (h *handlers) handleGetMessagesReactions(r *mtproto.Request) (bin.Encoder, 
 	return &tg.Updates{Updates: updates, Date: int(time.Now().Unix())}, nil
 }
 
-// notifyReaction emits the cross-replica reaction nudge for userID (best-effort).
-// ownerID is the owner of the message copy being pushed to; localID is that copy's
-// local message id.
-func (h *handlers) notifyReaction(ctx context.Context, userID, localID int64) {
+// notifyReactionTargets emits the cross-replica reaction nudges for each
+// affected message copy within a shared post-commit budget.
+func (h *handlers) notifyReactionTargets(ctx context.Context, targets []store.ReactionTarget) {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	for _, target := range targets {
+		h.notifyReactionWithContext(notifyCtx, target.OwnerID, target.LocalID)
+	}
+}
+
+func (h *handlers) notifyReactionWithContext(ctx context.Context, userID, localID int64) {
 	if err := h.store.Notify(ctx, store.ChannelReactions, store.ReactionPayload(userID, localID, userID)); err != nil {
 		h.log.Error("notify reaction", "user_id", userID, "err", err)
 	}
@@ -1681,7 +1715,9 @@ func (h *handlers) pinChannelMessage(r *mtproto.Request, channelID int64, req *t
 // notifyPinned emits the cross-replica pinned nudge for peerID (best-effort).
 // pinnedMsgID is nonzero on pin, zero on unpin.
 func (h *handlers) notifyPinned(ctx context.Context, peerType store.PeerType, peerID int64, pinnedMsgID int32) {
-	if err := h.store.Notify(ctx, store.ChannelPinned, store.PinnedPayload(peerType, peerID, pinnedMsgID)); err != nil {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	if err := h.store.Notify(notifyCtx, store.ChannelPinned, store.PinnedPayload(peerType, peerID, pinnedMsgID)); err != nil {
 		h.log.Error("notify pinned", "peer_id", peerID, "err", err)
 	}
 }

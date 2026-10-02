@@ -153,7 +153,9 @@ func TestDeliverPinnedKeepsOneChatPinSnapshotAcrossMembers(t *testing.T) {
 			cancelRPC()
 			notifyPin := func(pinnedMsgID int32) {
 				t.Helper()
-				if err := s.Notify(rpcCtx, store.ChannelPinned, store.PinnedPayload(store.PeerTypeChat, chat.ID, pinnedMsgID)); err != nil {
+				notifyCtx, cancelNotify := store.NotificationContext(rpcCtx)
+				defer cancelNotify()
+				if err := s.Notify(notifyCtx, store.ChannelPinned, store.PinnedPayload(store.PeerTypeChat, chat.ID, pinnedMsgID)); err != nil {
 					t.Fatalf("notify pin after caller cancellation: %v", err)
 				}
 				select {

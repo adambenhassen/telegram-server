@@ -483,9 +483,7 @@ func (h *handlers) sendChatMedia(
 		h.log.Error("send chat media", "user_id", r.UserID, "chat_id", chatID, "err", err)
 		return nil, errInternal
 	}
-	for uid := range perOwner {
-		h.notify(r.Ctx, uid)
-	}
+	h.notifyOwners(r.Ctx, perOwner, 0)
 
 	recipients := make(map[int64]bool, len(perOwner))
 	for uid := range perOwner {

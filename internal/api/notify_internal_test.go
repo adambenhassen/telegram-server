@@ -983,9 +983,10 @@ func TestSenderNotifyContextOutlivesRPCContext(t *testing.T) {
 	if !ok {
 		t.Fatal("sender notify context has no deadline")
 	}
+	const notificationBudget = 5 * time.Second
 	remaining := time.Until(deadline)
-	if remaining <= 0 || remaining > senderNotifyTimeout {
-		t.Fatalf("sender notify deadline in %s, want (0, %s]", remaining, senderNotifyTimeout)
+	if remaining <= 0 || remaining > notificationBudget {
+		t.Fatalf("sender notify deadline in %s, want (0, %s]", remaining, notificationBudget)
 	}
 }
 

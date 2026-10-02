@@ -90,7 +90,9 @@ func TestDeliverStatusPushesToPartnersOnly(t *testing.T) {
 	// The status mutation committed before the caller disconnected.
 	rpcCtx, cancelRPC := context.WithCancel(ctx)
 	cancelRPC()
-	if err := s.Notify(rpcCtx, store.ChannelStatus, store.StatusPayload(alice.ID, false)); err != nil {
+	notifyCtx, cancelNotify := store.NotificationContext(rpcCtx)
+	defer cancelNotify()
+	if err := s.Notify(notifyCtx, store.ChannelStatus, store.StatusPayload(alice.ID, false)); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
 	select {

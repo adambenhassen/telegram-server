@@ -80,8 +80,10 @@ func TestDeliverReactionsSkipsDeletedCopy(t *testing.T) {
 	// The reaction is committed; the originating RPC closes before its nudges.
 	rpcCtx, cancelRPC := context.WithCancel(ctx)
 	cancelRPC()
+	notifyCtx, cancelNotify := store.NotificationContext(rpcCtx)
+	defer cancelNotify()
 	for _, target := range targets {
-		if err := s.Notify(rpcCtx, store.ChannelReactions, store.ReactionPayload(target.OwnerID, target.LocalID, target.OwnerID)); err != nil {
+		if err := s.Notify(notifyCtx, store.ChannelReactions, store.ReactionPayload(target.OwnerID, target.LocalID, target.OwnerID)); err != nil {
 			t.Fatalf("notify reaction after cancellation: %v", err)
 		}
 	}

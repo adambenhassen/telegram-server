@@ -129,7 +129,9 @@ func TestDeliverEncryptionRequested(t *testing.T) {
 	// The request closes after committing the chat row but before its notification.
 	rpcCtx, cancelRPC := context.WithCancel(ctx)
 	cancelRPC()
-	if err := s.Notify(rpcCtx, store.ChannelEncryption, store.EncryptionPayload(bob.ID, int64(chat.ID))); err != nil {
+	notifyCtx, cancelNotify := store.NotificationContext(rpcCtx)
+	defer cancelNotify()
+	if err := s.Notify(notifyCtx, store.ChannelEncryption, store.EncryptionPayload(bob.ID, int64(chat.ID))); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
 

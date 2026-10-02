@@ -117,15 +117,27 @@ func NotificationAcceptedAt(ctx context.Context) (time.Time, bool) {
 // Notify emits a Postgres NOTIFY on channel with payload. It is the cross-replica
 // nudge that wakes each process's Listener after an event transaction commits.
 func (s *Store) Notify(ctx context.Context, channel, payload string) error {
-	// A committed mutation must still reach other replicas after the RPC client
-	// disconnects. Bound pool acquisition and NOTIFY execution independently of
-	// caller cancellation so each transient nudge has a finite budget.
-	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	// Bound pool acquisition and NOTIFY execution for this attempt. Post-commit
+	// callers detach once around the whole fan-out, so every recipient shares the
+	// same deadline instead of extending it by five seconds per recipient.
+	notifyCtx, cancel := context.WithTimeout(ctx, notificationTimeout)
 	defer cancel()
 	if _, err := s.pool.Exec(notifyCtx, `SELECT pg_notify($1, $2)`, channel, payload); err != nil {
 		return fmt.Errorf("notify %s: %w", channel, err)
 	}
 	return nil
+}
+
+const notificationTimeout = 5 * time.Second
+
+// NotificationContext detaches a committed notification operation from its RPC
+// while bounding the entire operation, including any serial recipient fan-out,
+// to one shared five-second budget.
+func NotificationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), notificationTimeout)
 }
 
 // Reconnect pacing for the listener loop. A database that stays down, or one
