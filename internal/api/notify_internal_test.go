@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/adambenhassen/telegram-server/internal/blob"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
@@ -981,9 +983,132 @@ func TestSenderNotifyContextOutlivesRPCContext(t *testing.T) {
 	if !ok {
 		t.Fatal("sender notify context has no deadline")
 	}
+	const notificationBudget = 5 * time.Second
 	remaining := time.Until(deadline)
-	if remaining <= 0 || remaining > senderNotifyTimeout {
-		t.Fatalf("sender notify deadline in %s, want (0, %s]", remaining, senderNotifyTimeout)
+	if remaining <= 0 || remaining > notificationBudget {
+		t.Fatalf("sender notify deadline in %s, want (0, %s]", remaining, notificationBudget)
+	}
+}
+
+func TestChannelMembershipFanoutSharesOneBudgetWhenNotifyBlocks(t *testing.T) {
+	t.Parallel()
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	targets := []int64{7, 8, 9}
+	var calls int
+	var firstDone <-chan struct{}
+	started := time.Now()
+	notifyChannelMembershipFanout(parent, 42, targets, func(ctx context.Context, userID, channelID int64) {
+		if wantUserID := targets[calls]; userID != wantUserID {
+			t.Errorf("target user = %d, want %d", userID, wantUserID)
+		}
+		if channelID != 42 {
+			t.Errorf("target channel = %d, want 42", channelID)
+		}
+		calls++
+		done := ctx.Done()
+		if firstDone == nil {
+			firstDone = done
+		} else if done != firstDone {
+			t.Error("channel membership fan-out used a fresh notification context")
+		}
+		if calls == 1 {
+			<-ctx.Done()
+		}
+	})
+	if calls != len(targets) {
+		t.Fatalf("notify calls = %d, want %d", calls, len(targets))
+	}
+	if elapsed := time.Since(started); elapsed > 6*time.Second {
+		t.Fatalf("three-target membership fan-out waited %s with one 5s budget, want it to finish within 6s", elapsed)
+	}
+}
+
+func TestRecipientMessageNotifySurvivesCancellationAfterCommit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(blobs))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+
+	listener, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect listener: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close(context.Background()) }) //nolint:errcheck // teardown
+	if _, err := listener.Exec(ctx, "LISTEN "+store.ChannelUpdates); err != nil {
+		t.Fatalf("listen for updates: %v", err)
+	}
+
+	alice, err := s.CreateUser(ctx, "+15557000101")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := s.CreateUser(ctx, "+15557000102")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+
+	rpcCtx, cancelRPC := context.WithCancel(ctx)
+	h := testHandlers(s)
+	h.afterSenderCommit = cancelRPC
+	var body bin.Buffer
+	if err := (&tg.MessagesSendMessageRequest{
+		Peer:     InputPeerUser(alice.ID, bob.ID),
+		Message:  "committed before disconnect",
+		RandomID: 917101,
+	}).Encode(&body); err != nil {
+		t.Fatalf("encode sendMessage: %v", err)
+	}
+	result, _, _, err := h.handleSendMessageAfterReplyOnConn(nil, &mtproto.Request{
+		Ctx: rpcCtx, UserID: alice.ID, Buf: &body,
+	})
+	if err == nil {
+		t.Fatal("sendMessage succeeded after its RPC context was canceled")
+	}
+	if result != nil {
+		t.Fatalf("sendMessage result after cancellation = %v, want nil", result)
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelWait()
+	notification, err := listener.WaitForNotification(waitCtx)
+	if err != nil {
+		t.Fatalf("recipient update notification: %v", err)
+	}
+	if want := strconv.FormatInt(bob.ID, 10); notification.Payload != want {
+		t.Fatalf("update payload = %q, want recipient %q", notification.Payload, want)
+	}
+
+	state, err := s.State(ctx, bob.ID)
+	if err != nil {
+		t.Fatalf("recipient state: %v", err)
+	}
+	events, err := s.EventsSince(ctx, bob.ID, 0)
+	if err != nil {
+		t.Fatalf("recipient events: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != store.EventNewMessage || events[0].Pts != state.Pts {
+		t.Fatalf("recipient state/events = %+v / %+v, want one durable message event", state, events)
+	}
+	message, ok, err := s.MessageByOwnerLocal(ctx, bob.ID, events[0].LocalID)
+	if err != nil || !ok {
+		t.Fatalf("recipient message: found=%v err=%v", ok, err)
+	}
+	if message.Text != "committed before disconnect" {
+		t.Fatalf("recipient content = %q, want committed message text", message.Text)
 	}
 }
 

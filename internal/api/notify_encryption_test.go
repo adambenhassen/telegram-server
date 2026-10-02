@@ -126,8 +126,12 @@ func TestDeliverEncryptionRequested(t *testing.T) {
 		t.Fatalf("wait for listener: %v", err)
 	}
 
-	// Emit encryption NOTIFY.
-	if err := s.Notify(ctx, store.ChannelEncryption, store.EncryptionPayload(bob.ID, int64(chat.ID))); err != nil {
+	// The request closes after committing the chat row but before its notification.
+	rpcCtx, cancelRPC := context.WithCancel(ctx)
+	cancelRPC()
+	notifyCtx, cancelNotify := store.NotificationContext(rpcCtx)
+	defer cancelNotify()
+	if err := s.Notify(notifyCtx, store.ChannelEncryption, store.EncryptionPayload(bob.ID, int64(chat.ID))); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
 
