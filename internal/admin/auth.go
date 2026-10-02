@@ -194,7 +194,7 @@ type LoginHandlerConfig struct {
 	// Logger is used for structured logging (never logs raw tokens or session ids).
 	Logger *slog.Logger
 	// AdminOrigin is the expected Origin header for login/logout POST requests.
-	// Derived from the admin listen address at startup.
+	// It is fixed from configuration at startup.
 	AdminOrigin string
 	// Events is the shared metrics broadcaster backing GET /admin/events.
 	// A nil value registers the route but reports it unavailable, so the
