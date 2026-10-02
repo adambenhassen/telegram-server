@@ -274,13 +274,22 @@ func TestHandleEditChannelUsernameRejectsReserved(t *testing.T) {
 		t.Fatalf("create channel: %v", err)
 	}
 
-	for _, username := range []string{"admin", "support", "help", "me", "ME", "telegram", "bot"} {
+	routeReserved := routeConflictingUsernameVariants()
+	reserved := make([]string, 0, 7+len(routeReserved))
+	reserved = append(reserved, "admin", "support", "help", "me", "ME", "telegram", "bot")
+	reserved = append(reserved, routeReserved...)
+	for _, username := range reserved {
 		_, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 			Channel:  api.InputChannel(creator.ID, ch.ID),
 			Username: username,
 		})
 		if msg := rpcMessage(t, err); msg != "USERNAME_INVALID" {
 			t.Errorf("%q: got %s, want USERNAME_INVALID", username, msg)
+		}
+		if _, found, err := s.UsernameByHandle(ctx, username); err != nil {
+			t.Errorf("lookup reserved handle %q: %v", username, err)
+		} else if found {
+			t.Errorf("reserved handle %q was stored", username)
 		}
 	}
 }
