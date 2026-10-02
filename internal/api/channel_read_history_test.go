@@ -238,6 +238,62 @@ func TestChannelsReadHistoryIsScopedToMemberAndChannel(t *testing.T) {
 	assertScopedReadStates(secondPost.LocalID, 0, otherChannelPost.LocalID, 0)
 }
 
+func TestChannelUnreadCountsBoundScanBeforeFiltering(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator := readHistoryUser(t, s, ctx, "+15551239941")
+	reader := readHistoryUser(t, s, ctx, "+15551239942")
+	deletedChannel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "Bound deleted scan"})
+	selfPostChannel := createChannel(t, s, creator.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "Bound own-post scan"})
+	invite, err := s.CreateChannelInvite(ctx, deletedChannel.ID, creator.ID)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, invite, reader.ID); err != nil {
+		t.Fatalf("join reader: %v", err)
+	}
+	channelExec(t, ctx, dsn, `
+INSERT INTO channel_messages (channel_id, local_id, from_id, message, deleted)
+SELECT $1::bigint, local_id::bigint, $2::bigint, 'deleted history', true
+FROM generate_series(1, 1002) local_id`, deletedChannel.ID, creator.ID)
+	channelExec(t, ctx, dsn, `
+INSERT INTO channel_messages (channel_id, local_id, from_id, message)
+VALUES ($1, 1003, $2, 'live post beyond the bounded scan')`, deletedChannel.ID, creator.ID)
+	channelExec(t, ctx, dsn, `
+INSERT INTO channel_messages (channel_id, local_id, from_id, message)
+SELECT $1::bigint, local_id::bigint, $2::bigint, 'own history'
+FROM generate_series(1, 1002) local_id`, selfPostChannel.ID, creator.ID)
+	channelExec(t, ctx, dsn, `
+INSERT INTO channel_messages (channel_id, local_id, from_id, message)
+VALUES ($1, 1003, $2, 'live post beyond the bounded scan')`, selfPostChannel.ID, reader.ID)
+
+	for _, tc := range []struct {
+		name      string
+		channelID int64
+		viewerID  int64
+	}{
+		{name: "deleted posts", channelID: deletedChannel.ID, viewerID: reader.ID},
+		{name: "own posts", channelID: selfPostChannel.ID, viewerID: creator.ID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// More than 1001 non-counting rows consume the scan window before
+			// the live post. Unread filters must not scan farther into history.
+			requireChannelReadState(t, s, tc.viewerID, tc.channelID, 0, 0)
+			requirePeerChannelReadState(t, s, tc.viewerID, tc.channelID, 0, 0)
+			requireChannelOwnerUnreadTotal(t, s, tc.viewerID, tc.channelID, 0)
+			fullResponse, rpc := getFullChannelViaDispatcher(t, fullChannelDispatcher(s), tc.viewerID, false, api.InputChannel(tc.viewerID, tc.channelID))
+			if rpc != nil {
+				t.Fatalf("reader getFullChannel: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
+			}
+			full := fullChannelInfo(t, fullResponse)
+			if full.ReadInboxMaxID != 0 || full.UnreadCount != 0 {
+				t.Fatalf("full channel read state = marker %d unread %d, want 0/0 for bounded scan", full.ReadInboxMaxID, full.UnreadCount)
+			}
+		})
+	}
+}
+
 func TestNewChannelMemberStartsAtCommittedTopAndOwnPostsAreNotUnread(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

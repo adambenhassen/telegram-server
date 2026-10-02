@@ -88,21 +88,25 @@ SET read_max_id = EXCLUDED.read_max_id
 WHERE channel_read_state.read_max_id < EXCLUDED.read_max_id;
 
 -- ChannelReadStateForViewer returns only the entitled member's read state and
--- unread live posts. The inner LIMIT bounds the rows counted before saturation.
+-- unread live posts. The inner LIMIT bounds rows scanned before unread filters.
 -- name: ChannelReadStateForViewer :one
 SELECT COALESCE(read_state.read_max_id, 0)::bigint AS read_max_id,
        (
-           SELECT LEAST(count(*), 1000)::int
+           SELECT LEAST(
+               count(*) FILTER (
+                   WHERE unread_posts.from_id <> participant.user_id
+                     AND NOT unread_posts.deleted
+               ),
+               1000
+           )::int
            FROM (
-               SELECT cm.local_id
+               SELECT cm.local_id, cm.from_id, cm.deleted
                FROM channel_messages cm
                WHERE cm.channel_id = participant.channel_id
-                 AND cm.from_id <> participant.user_id
-                 AND cm.deleted = false
                  AND cm.local_id > COALESCE(read_state.read_max_id, 0)
                ORDER BY cm.local_id
                LIMIT 1001
-           ) unread
+           ) unread_posts
        ) AS unread_count
 FROM channel_participants participant
 LEFT JOIN channel_read_state read_state
@@ -335,13 +339,14 @@ JOIN channel_state cs ON cs.channel_id = c.id
 LEFT JOIN channel_read_state read_state
   ON read_state.channel_id = c.id AND read_state.user_id = p.user_id
 LEFT JOIN LATERAL (
-    SELECT LEAST(count(*), 1000)::int AS unread_count
+    SELECT LEAST(
+        count(*) FILTER (WHERE unread_posts.from_id <> p.user_id AND NOT unread_posts.deleted),
+        1000
+    )::int AS unread_count
     FROM (
-        SELECT cm.local_id
+        SELECT cm.local_id, cm.from_id, cm.deleted
         FROM channel_messages cm
         WHERE cm.channel_id = c.id
-          AND cm.from_id <> p.user_id
-          AND cm.deleted = false
           AND cm.local_id > COALESCE(read_state.read_max_id, 0)
         ORDER BY cm.local_id
         LIMIT 1001

@@ -161,13 +161,14 @@ JOIN channel_state cs ON cs.channel_id = c.id
 LEFT JOIN channel_read_state read_state
   ON read_state.channel_id = c.id AND read_state.user_id = p.user_id
 LEFT JOIN LATERAL (
-    SELECT LEAST(count(*), 1000)::int AS unread_count
+    SELECT LEAST(
+        count(*) FILTER (WHERE unread_posts.from_id <> p.user_id AND NOT unread_posts.deleted),
+        1000
+    )::int AS unread_count
     FROM (
-        SELECT cm.local_id
+        SELECT cm.local_id, cm.from_id, cm.deleted
         FROM channel_messages cm
         WHERE cm.channel_id = c.id
-          AND cm.from_id <> p.user_id
-          AND cm.deleted = false
           AND cm.local_id > COALESCE(read_state.read_max_id, 0)
         ORDER BY cm.local_id
         LIMIT 1001
@@ -326,13 +327,14 @@ SELECT ((
     LEFT JOIN channel_read_state read_state
       ON read_state.channel_id = p.channel_id AND read_state.user_id = p.user_id
     CROSS JOIN LATERAL (
-        SELECT LEAST(count(*), 1000)::bigint AS unread_count
+        SELECT LEAST(
+            count(*) FILTER (WHERE unread_posts.from_id <> p.user_id AND NOT unread_posts.deleted),
+            1000
+        )::bigint AS unread_count
         FROM (
-            SELECT cm.local_id
+            SELECT cm.local_id, cm.from_id, cm.deleted
             FROM channel_messages cm
             WHERE cm.channel_id = p.channel_id
-              AND cm.from_id <> p.user_id
-              AND cm.deleted = false
               AND cm.local_id > COALESCE(read_state.read_max_id, 0)
             ORDER BY cm.local_id
             LIMIT 1001
