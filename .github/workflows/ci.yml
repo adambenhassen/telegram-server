@@ -8,10 +8,10 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same ref supersedes the run already in flight.
+# PR updates supersede older checks; main push runs must complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ci:
