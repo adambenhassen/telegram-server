@@ -384,7 +384,7 @@ func editPtsOf(t *testing.T, up *tg.Updates) []int {
 func TestDeliverPendingSenderSuppressionLeavesOriginAtBarrier(t *testing.T) {
 	t.Parallel()
 
-	origin := &pendingRPCPushConn{fakePushConn: fakePushConn{pts: 1}, pendingPts: 2}
+	origin := &pendingRPCPushConn{pts: 1, pendingPts: 2}
 	sibling := &fakePushConn{}
 	testUpdater().deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
 		return batch(fromPts, 3, 3), nil
@@ -558,9 +558,9 @@ func TestDeliverPendingSenderSuppressionAccountsKeyedEventAfterPrefix(t *testing
 	t.Parallel()
 
 	origin := &pendingRPCBatchPushConn{
-		fakePushConn: fakePushConn{pts: 0},
-		authKeyID:    11,
-		pendingPts:   5,
+		pts:        0,
+		authKeyID:  11,
+		pendingPts: 5,
 	}
 	sibling := &fakePushConn{}
 	u := testUpdater()
@@ -607,9 +607,9 @@ func TestDeliverPendingSenderSuppressionAccountsMissingKeyedEvent(t *testing.T) 
 	t.Parallel()
 
 	origin := &pendingRPCBatchPushConn{
-		fakePushConn: fakePushConn{pts: 0},
-		authKeyID:    11,
-		pendingPts:   1201,
+		pts:        0,
+		authKeyID:  11,
+		pendingPts: 1201,
 	}
 	sibling := &fakePushConn{}
 	testUpdater().deliver(context.Background(), 7, []pushConn{origin, sibling}, func(fromPts int) (updateBatch, error) {
@@ -643,9 +643,9 @@ func TestDeliverPendingSenderSuppressionAdvancesAcrossCappedNotifications(t *tes
 	t.Parallel()
 
 	origin := &pendingRPCBatchPushConn{
-		fakePushConn: fakePushConn{pts: 0},
-		authKeyID:    11,
-		pendingPts:   1201,
+		pts:        0,
+		authKeyID:  11,
+		pendingPts: 1201,
 	}
 	sibling := &fakePushConn{}
 	u := testUpdater()
@@ -691,12 +691,10 @@ func TestDeliverPendingSenderSuppressionRetriesPrefixWrite(t *testing.T) {
 	t.Parallel()
 
 	origin := &flakyPendingRPCBatchPushConn{
-		pendingRPCBatchPushConn: pendingRPCBatchPushConn{
-			fakePushConn: fakePushConn{pts: 0},
-			authKeyID:    11,
-			pendingPts:   5,
-		},
-		failures: 1,
+		pts:        0,
+		authKeyID:  11,
+		pendingPts: 5,
+		failures:   1,
 	}
 	u := testUpdater()
 	u.deliverAtSuppressed(

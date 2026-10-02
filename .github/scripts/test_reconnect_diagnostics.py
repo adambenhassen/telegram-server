@@ -291,7 +291,7 @@ class ReconnectDiagnosticsTest(unittest.TestCase):
         ):
             env = _test_environment()
 
-        self.assertEqual(env["GOTOOLCHAIN"], "go1.26.6")
+        self.assertEqual(env["GOTOOLCHAIN"], "go1.27.1")
         self.assertEqual(env["TESTCONTAINERS_RYUK_DISABLED"], "true")
         self.assertNotIn("GITHUB_TOKEN", env)
         self.assertNotIn("TG_POSTGRES_DSN", env)

@@ -100,7 +100,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v9.3.0
         with:
-          version: v2.12.2
+          version: v2.14.0
 
       # The action's version input defaults to latest, which resolves to the
       # canary channel; pin the binary so the checksum gate cannot move on its own.
@@ -113,10 +113,10 @@ jobs:
 
       # Quay no longer allows anonymous pulls of its MinIO image. Build the
       # test fixture from the pinned public source so fork PRs need no secrets.
-      - uses: docker/setup-buildx-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.4.1
 
       - name: Build MinIO image for tests
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: Dockerfile.minio-test
@@ -288,7 +288,7 @@ jobs:
       # Before setup-node, whose pnpm cache mode shells out to pnpm to find the
       # store path. Version pinned here because package.json carries no
       # packageManager field; 10 is the major that writes lockfileVersion 9.0.
-      - uses: pnpm/action-setup@v6.0.10
+      - uses: pnpm/action-setup@v6.1.0
         with:
           version: 10
 
@@ -304,7 +304,7 @@ jobs:
 
       # The lockfile hash already changes when the Playwright version changes,
       # but only the version decides which browser build is correct, so it is in
-      # the key in its own right: a key that reads `playwright-Linux-1.62.1-...`
+      # the key in its own right: a key that reads `playwright-Linux-1.63.0-...`
       # cannot be satisfied by a browser downloaded for another version, whatever
       # else moved in the lockfile.
       # Captured into a variable and checked rather than substituted straight
@@ -669,14 +669,14 @@ jobs:
 
       # type=gha needs the docker-container driver; the default builder cannot
       # export to an external cache backend.
-      - uses: docker/setup-buildx-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.4.1
 
       # mode=max because the compiler and `go mod download` layers live in the
       # discarded build stage: mode=min would only cache the distroless result
       # and a source-only run would still redownload the module cache.
       # load: true puts the image in the daemon, which every step below inspects.
       - name: Build image
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           tags: telegramd:ci
@@ -788,10 +788,10 @@ jobs:
       # the image is built here instead and loaded into the daemon under the tag
       # the telegramd service names. `up` below finds it present and skips the
       # build — same image, same assertions, just not rebuilt from scratch.
-      - uses: docker/setup-buildx-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.4.1
 
       - name: Build image
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           tags: telegramd:local
