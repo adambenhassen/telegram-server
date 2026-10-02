@@ -1694,7 +1694,7 @@ func (c *smokeClient) stopClient(t *testing.T) {
 	})
 }
 
-func (c *smokeClient) disconnectClient(t *testing.T) {
+func (c *smokeClient) disconnectClient(t *testing.T, callsiteID ...string) {
 	t.Helper()
 	c.lifecycle.intentionalStop.Store(true)
 	c.cancel()
@@ -1702,6 +1702,9 @@ func (c *smokeClient) disconnectClient(t *testing.T) {
 	case <-c.lifecycle.result.done:
 		c.manager.Reset()
 	case <-time.After(5 * time.Second):
+		if len(callsiteID) > 0 {
+			t.Fatalf("[assert:%s/peer-disconnect.client-disconnect-timeout] %s did not stop after its transport context was canceled", callsiteID[0], c.label)
+		}
 		t.Fatalf("%s did not stop after its transport context was canceled", c.label)
 	}
 }

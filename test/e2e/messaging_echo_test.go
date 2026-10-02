@@ -660,6 +660,11 @@ func TestMessagingSenderSessionEchoSuppression(t *testing.T) {
 
 func waitForDistinctAuthKeys(t *testing.T, ctx context.Context, registry *mtproto.SessionRegistry, userID int64, want int, label string, lifecycle *clientLifecycle) {
 	t.Helper()
+	waitForDistinctAuthKeysWithCallsite(t, ctx, registry, userID, want, label, lifecycle, "")
+}
+
+func waitForDistinctAuthKeysWithCallsite(t *testing.T, ctx context.Context, registry *mtproto.SessionRegistry, userID int64, want int, label string, lifecycle *clientLifecycle, callsiteID string) {
+	t.Helper()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	started := time.Now()
@@ -676,6 +681,9 @@ func waitForDistinctAuthKeys(t *testing.T, ctx context.Context, registry *mtprot
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
+			if callsiteID != "" {
+				t.Fatalf("[assert:%s/peer-disconnect.distinct-auth-keys] %s registry readiness failed after %s (%s; %s)", callsiteID, label, time.Since(started).Round(time.Millisecond), registrySnapshotDescription(last, lastValid), contextFailureDescription(ctx))
+			}
 			t.Fatalf("%s registry readiness failed after %s (%s; %s)", label, time.Since(started).Round(time.Millisecond), registrySnapshotDescription(last, lastValid), contextFailureDescription(ctx))
 		}
 	}
@@ -778,13 +786,24 @@ func assertDifferenceMessage(t *testing.T, ctx context.Context, coll *updateColl
 
 func assertNoMessageFor(t *testing.T, ctx context.Context, updates <-chan *tg.Message, label string) {
 	t.Helper()
+	assertNoMessageForWithCallsite(t, ctx, updates, label, "")
+}
+
+func assertNoMessageForWithCallsite(t *testing.T, ctx context.Context, updates <-chan *tg.Message, label, callsiteID string) {
+	t.Helper()
 	timer := time.NewTimer(50 * time.Millisecond)
 	defer timer.Stop()
 	select {
 	case message := <-updates:
+		if callsiteID != "" {
+			t.Fatalf("[assert:%s/peer-disconnect.unexpected-message] %s received unexpected message during drain: %+v", callsiteID, label, message)
+		}
 		t.Fatalf("%s received unexpected message during drain: %+v", label, message)
 	case <-timer.C:
 	case <-ctx.Done():
+		if callsiteID != "" {
+			t.Fatalf("[assert:%s/peer-disconnect.message-drain-context] waiting for %s drain: %s", callsiteID, label, contextFailureDescription(ctx))
+		}
 		t.Fatalf("waiting for %s drain: %s", label, contextFailureDescription(ctx))
 	}
 }
