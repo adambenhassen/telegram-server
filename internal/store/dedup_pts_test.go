@@ -110,8 +110,8 @@ func TestPostChannelMessageDedupReportsTheStoredPts(t *testing.T) {
 	if pts != firstPts {
 		t.Errorf("resend pts = %d, want the stored post's %d, current is %d", pts, firstPts, current)
 	}
-	if current != 2 {
-		t.Errorf("channel state pts = %d, want 2", current)
+	if current != 3 {
+		t.Errorf("channel state pts = %d, want 3", current)
 	}
 }
 

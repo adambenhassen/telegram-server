@@ -76,6 +76,7 @@ type ChannelMessage struct {
 	FileID       *int64
 	MessageTsv   interface{}
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 type ChannelParticipant struct {
