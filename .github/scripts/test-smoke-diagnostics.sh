@@ -29,6 +29,16 @@ fixture_root=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/smoke-diagnostics-repo
 trap 'rm -rf -- "$fixture_root"' EXIT
 mkdir -p "$fixture_root/test/e2e"
 
+scenario_failure='peer-disconnect'
+canary='private-runtime-assertion-canary-9472'
+direct_id='peer-disconnect.initial-state'
+callsite_one='peer-disconnect.message-blocker-clear-confirm'
+callsite_two='peer-disconnect.chat-blocker-clear-confirm'
+owner_lock_state='peer-disconnect.owner-lock-state'
+owner_lock_inspection='peer-disconnect.owner-lock-inspection'
+short_callsite='peer-disconnect.message-blocker-clear-confirm-short'
+short_helper_check='peer-disconnect.owner-lock-state-short'
+
 write_fixture_source() {
   cat >"$fixture_root/test/e2e/smoke_test.go" <<'EOF'
 package e2e
@@ -36,36 +46,89 @@ package e2e
 import "testing"
 
 func TestSmoke(t *testing.T) {
-    t.Run("dialog-filters", func(t *testing.T) {
-        t.Errorf("[assert:dialog-filters.direct-check] fixture")
+EOF
+  for ((fixture_line = 1; fixture_line <= 71; fixture_line++)); do
+    printf '    // fixture filler\n' >>"$fixture_root/test/e2e/smoke_test.go"
+  done
+  cat >>"$fixture_root/test/e2e/smoke_test.go" <<'EOF'
+    t.Run("peer-disconnect", func(t *testing.T) {
+        t.Parallel()
+        testSmokePeerDisconnect(t)
     })
-    waitForSmokeOnline(t, "dialog-filters.helper-call-one")
-    waitForSmokeOnline(t, "dialog-filters.helper-call-two")
-    t.Errorf("legacy fixture")
+    t.Run("other-scenario", func(t *testing.T) {
+        testSmokeOther(t)
+    })
 }
+EOF
 
-func waitForSmokeOnline(t *testing.T, callsite string) {
+  cat >"$fixture_root/test/e2e/rpc_disconnect_smoke_test.go" <<'EOF'
+package e2e
+
+import "testing"
+
+func testSmokePeerDisconnect(t *testing.T) {
     t.Helper()
-    t.Errorf("[assert:dialog-filters.helper-check] fixture")
+    t.Fatalf("[assert:peer-disconnect.initial-state] initial state: %v", "fixture")
+    waitForSmokeOwnerLock(t, nil, nil, false, "peer-disconnect.message-blocker-clear-confirm")
+    waitForSmokeOwnerLock(t, nil, nil, false, "peer-disconnect.chat-blocker-clear-confirm")
+    lockSmokeOwner(t, "peer-disconnect.message-owner-lock")
+    holdSmokeOwnerLock(t)
+    waitForSmokeOnline(t, "peer-disconnect.online-caller")
+    legacySmokeCheck(t)
 }
 
-// legacy fixture line 18
-// legacy fixture line 19
-// legacy fixture line 20
-// legacy fixture line 21
-// legacy fixture line 22
-// legacy fixture line 23
-// legacy fixture line 24
-// legacy fixture line 25
-// legacy fixture line 26
-// legacy fixture line 27
-// legacy fixture line 28
-// legacy fixture line 29
+func waitForSmokeOwnerLock(t *testing.T, ctx any, lock any, wantBlocked bool, callsiteID string) {
+    t.Helper()
+    smokeOwnerLockCount(t, ctx, lock, callsiteID)
+    if false {
+        t.Fatalf("[assert:%s/peer-disconnect.owner-lock-state] owner lock state %t", callsiteID, wantBlocked)
+    }
+}
+
+func smokeOwnerLockCount(t *testing.T, ctx any, lock any, callsiteID string) int {
+    t.Helper()
+    t.Fatalf("[assert:%s/peer-disconnect.owner-lock-inspection] inspect owner lock", callsiteID)
+    _ = ctx
+    _ = lock
+    return 0
+}
+
+func holdSmokeOwnerLock(t *testing.T) {
+    t.Helper()
+    smokeOwnerLockCount(t, nil, nil, "peer-disconnect.inner-hold-probe")
+}
+
+func lockSmokeOwner(t *testing.T, callsiteID string) {
+    t.Helper()
+    t.Fatalf("[assert:%s/peer-disconnect.owner-lock-acquire] acquire owner lock", callsiteID)
+    smokeOwnerLockCount(t, nil, nil, "peer-disconnect.lockSmokeOwner-internal-callsite")
+    t.Cleanup(func() {
+        smokeOwnerLockCount(t, nil, nil, "peer-disconnect.cleanup-closure-callsite")
+    })
+}
+
+func waitForSmokeOnline(t *testing.T, callsiteID string) {
+    t.Helper()
+    t.Fatalf("[assert:%s/peer-disconnect.online-state-mismatch] online state", callsiteID)
+}
+
+func legacySmokeCheck(t *testing.T) {
+    t.Helper()
+    t.Fatalf("[assert:peer-disconnect.legacy-helper-check] legacy helper check")
+}
+
+func testSmokeOther(t *testing.T) {
+    t.Helper()
+}
+
+func TestOutside(t *testing.T) {
+    testSmokeOther(t)
+}
 EOF
 }
 
 fixture_commit() {
-  git -C "$fixture_root" add -- test/e2e/smoke_test.go
+  git -C "$fixture_root" add -- test/e2e
   local tree commit identity_headers
   tree=$(git -C "$fixture_root" write-tree)
   identity_headers=$(git -C "$source_root" cat-file commit "$source_commit" | awk '
@@ -86,24 +149,244 @@ fixture_commit() {
   printf '%s\n' "$commit" >"$fixture_root/.git/HEAD"
 }
 
+replace_fixture_text() {
+  python3 - "$1" "$2" "$3" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+old, new = sys.argv[2], sys.argv[3]
+if old not in source:
+    raise SystemExit(f"fixture replacement was not found in {path.name}")
+path.write_text(source.replace(old, new, 1), encoding="utf-8")
+PY
+}
+
+rpc_fixture="$fixture_root/test/e2e/rpc_disconnect_smoke_test.go"
+smoke_fixture="$fixture_root/test/e2e/smoke_test.go"
+
+apply_mutation() {
+  local mutation="$1"
+  case "$mutation" in
+    none) ;;
+    root-no-helper)
+      replace_fixture_text "$rpc_fixture" \
+        $'func testSmokePeerDisconnect(t *testing.T) {\n    t.Helper()' \
+        $'func testSmokePeerDisconnect(t *testing.T) {\n    _ = t'
+      ;;
+    helper-no-helper)
+      replace_fixture_text "$rpc_fixture" \
+        $'func waitForSmokeOwnerLock(t *testing.T, ctx any, lock any, wantBlocked bool, callsiteID string) {\n    t.Helper()' \
+        $'func waitForSmokeOwnerLock(t *testing.T, ctx any, lock any, wantBlocked bool, callsiteID string) {\n    _ = t'
+      ;;
+    check-helper-no-helper)
+      replace_fixture_text "$rpc_fixture" \
+        $'func smokeOwnerLockCount(t *testing.T, ctx any, lock any, callsiteID string) int {\n    t.Helper()' \
+        $'func smokeOwnerLockCount(t *testing.T, ctx any, lock any, callsiteID string) int {\n    _ = t'
+      ;;
+    root-missing)
+      replace_fixture_text "$rpc_fixture" \
+        'func testSmokePeerDisconnect(t *testing.T)' \
+        'func testSmokePeerDisconnectMissing(t *testing.T)'
+      ;;
+    root-duplicate)
+      cat >>"$rpc_fixture" <<'EOF'
+
+func testSmokePeerDisconnect(t *testing.T) {
+    t.Helper()
+}
+EOF
+      ;;
+    root-method-collision)
+      cat >>"$rpc_fixture" <<'EOF'
+
+type fixtureReceiver struct{}
+
+func (fixtureReceiver) testSmokePeerDisconnect(t *testing.T) {
+    t.Helper()
+}
+EOF
+      ;;
+    helper-missing)
+      replace_fixture_text "$rpc_fixture" \
+        'func waitForSmokeOwnerLock(t *testing.T, callsiteID string)' \
+        'func waitForSmokeOwnerLockMissing(t *testing.T, callsiteID string)'
+      ;;
+    helper-duplicate)
+      cat >>"$rpc_fixture" <<'EOF'
+
+func waitForSmokeOwnerLock(t *testing.T, ctx any, lock any, wantBlocked bool, callsiteID string) {
+    t.Helper()
+}
+EOF
+      ;;
+    helper-method-collision)
+      cat >>"$rpc_fixture" <<'EOF'
+
+type fixtureReceiver struct{}
+
+func (fixtureReceiver) waitForSmokeOwnerLock(t *testing.T, ctx any, lock any, wantBlocked bool, callsiteID string) {
+    t.Helper()
+}
+EOF
+      ;;
+    check-helper-missing)
+      replace_fixture_text "$rpc_fixture" \
+        'func smokeOwnerLockCount(t *testing.T, callsiteID string) int' \
+        'func smokeOwnerLockCountMissing(t *testing.T, callsiteID string) int'
+      ;;
+    check-helper-duplicate)
+      cat >>"$rpc_fixture" <<'EOF'
+
+func smokeOwnerLockCount(t *testing.T, ctx any, lock any, callsiteID string) int {
+    t.Helper()
+    return 0
+}
+EOF
+      ;;
+    check-helper-method-collision)
+      cat >>"$rpc_fixture" <<'EOF'
+
+type fixtureReceiver struct{}
+
+func (fixtureReceiver) smokeOwnerLockCount(t *testing.T, ctx any, lock any, callsiteID string) int {
+    t.Helper()
+    return 0
+}
+EOF
+      ;;
+    testsmoke-missing)
+      replace_fixture_text "$smoke_fixture" 'func TestSmoke(t *testing.T)' 'func TestSmokeMissing(t *testing.T)'
+      ;;
+    testsmoke-duplicate)
+      cat >>"$smoke_fixture" <<'EOF'
+
+func TestSmoke(t *testing.T) {
+    t.Helper()
+}
+EOF
+      ;;
+    closure-zero-call)
+      replace_fixture_text "$smoke_fixture" "        testSmokePeerDisconnect(t)" ""
+      ;;
+    closure-two-calls)
+      replace_fixture_text "$smoke_fixture" \
+        "        testSmokePeerDisconnect(t)" \
+        $'        testSmokePeerDisconnect(t)\n        testSmokePeerDisconnect(t)'
+      ;;
+    duplicate-scenario-run)
+      replace_fixture_text "$smoke_fixture" \
+        $'    })\n    t.Run("other-scenario"' \
+        $'    })\n    t.Run("peer-disconnect", func(t *testing.T) {\n        testSmokePeerDisconnect(t)\n    })\n    t.Run("other-scenario"'
+      ;;
+    scenario-pattern-mismatch)
+      replace_fixture_text "$smoke_fixture" \
+        't.Run("peer-disconnect", func(t *testing.T) {' \
+        't.Run(smokeScenarioName(), func(t *testing.T) {'
+      ;;
+    unsupported-callsite)
+      replace_fixture_text "$rpc_fixture" \
+        '    waitForSmokeOwnerLock(t, nil, nil, false, "peer-disconnect.message-blocker-clear-confirm")' \
+        $'    waitForSmokeOwnerLock(\n        t,\n        nil,\n        nil,\n        false,\n        "peer-disconnect.message-blocker-clear-confirm",\n    )'
+      ;;
+    root-signature-mismatch)
+      replace_fixture_text "$smoke_fixture" \
+        'func TestSmoke(t *testing.T)' 'func TestSmoke(t testing.TB)'
+      ;;
+    second-root-caller)
+      cat >>"$rpc_fixture" <<'EOF'
+
+func TestOtherRootCaller(t *testing.T) {
+    testSmokePeerDisconnect(t)
+}
+EOF
+      ;;
+    inner-literal-hop)
+      replace_fixture_text "$rpc_fixture" \
+        'smokeOwnerLockCount(t, ctx, lock, callsiteID)' \
+        'smokeOwnerLockCount(t, ctx, lock, "peer-disconnect.inner-forwarding-literal")'
+      ;;
+    inner-expression-hop)
+      replace_fixture_text "$rpc_fixture" \
+        'smokeOwnerLockCount(t, ctx, lock, callsiteID)' \
+        'smokeOwnerLockCount(t, ctx, lock, strings.Clone(callsiteID))'
+      ;;
+    two-hop-chain)
+      replace_fixture_text "$rpc_fixture" \
+        '    smokeOwnerLockCount(t, ctx, lock, callsiteID)' \
+        '    smokeOwnerLockMiddle(t, ctx, lock, callsiteID)'
+      cat >>"$rpc_fixture" <<'EOF'
+
+func smokeOwnerLockMiddle(t *testing.T, ctx any, lock any, callsiteID string) {
+    t.Helper()
+    smokeOwnerLockCount(t, ctx, lock, callsiteID)
+}
+EOF
+      ;;
+    duplicate-callsite-literal)
+      cat >>"$rpc_fixture" <<'EOF'
+
+func duplicateMetadata(t *testing.T) {
+    _ = "peer-disconnect.message-blocker-clear-confirm"
+}
+EOF
+      ;;
+    duplicate-check-literal)
+      cat >>"$rpc_fixture" <<'EOF'
+
+func duplicateMetadata(t *testing.T) {
+    _ = "peer-disconnect.owner-lock-state"
+}
+EOF
+      ;;
+    duplicate-direct-literal)
+      cat >>"$rpc_fixture" <<'EOF'
+
+func duplicateMetadata(t *testing.T) {
+    _ = "peer-disconnect.initial-state"
+}
+EOF
+      ;;
+    dirty-second-file)
+      printf '\n// dirty source tree\n' >>"$rpc_fixture"
+      ;;
+    *)
+      printf 'unknown fixture mutation: %s\n' "$mutation" >&2
+      exit 1
+      ;;
+  esac
+}
+
 git init --quiet "$fixture_root"
 write_fixture_source
 fixture_commit
-SMOKE_DIAGNOSTICS_ROOT="$fixture_root"
 checked_out_commit=$(git -C "$fixture_root" rev-parse HEAD)
 if [[ ! "$checked_out_commit" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'diagnostic fixture commit validation failed\n' >&2
   exit 1
 fi
 
-scenario_failure='dialog-filters'
-canary='private-runtime-assertion-canary-9472'
-direct_id='dialog-filters.direct-check'
-callsite_one='dialog-filters.helper-call-one'
-callsite_two='dialog-filters.helper-call-two'
-helper_check='dialog-filters.helper-check'
-short_callsite='dialog-filters.helper-call-on'
-short_helper_check='dialog-filters.helper-chec'
+SMOKE_SCENARIOS=(peer-disconnect)
+SMOKE_DIAGNOSTICS_ROOT="$fixture_root"
+
+wrapper_script_dir="$fixture_root/wrapper-scripts"
+mock_bin="$fixture_root/mock-bin"
+runner_temp="$fixture_root/runner-temp"
+mkdir -p "$wrapper_script_dir" "$mock_bin" "$runner_temp"
+cp "$script_dir/run-e2e-diagnostics.sh" "$script_dir/smoke-diagnostics.sh" \
+  "$script_dir/smoke-diagnostics.py" "$wrapper_script_dir/"
+printf 'SMOKE_SCENARIOS=(peer-disconnect)\n' >"$wrapper_script_dir/smoke-scenarios.sh"
+cat >"$mock_bin/go" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" >>"$MOCK_GO_ARGS"
+cat "$MOCK_GO_JSON"
+exit "$MOCK_GO_STATUS"
+EOF
+chmod +x "$mock_bin/go"
+mock_json="$fixture_root/mock-go.json"
+mock_args="$fixture_root/mock-go.args"
 
 json_event() {
   local action="$1" test_name="$2" body="${3:-}"
@@ -131,197 +414,362 @@ expected_unavailable() {
     "$scenario_failure" "$checked_out_commit"
 }
 
-expected_legacy_location() {
-  printf '::error file=test/e2e/smoke_test.go,line=29::TestSmoke/%s failed (category: scenario-failure; location: test/e2e/smoke_test.go:29; checked-out commit: %s; details redacted)' \
-    "$scenario_failure" "$checked_out_commit"
+expected_helper_assertion() {
+  local callsite="$1" callsite_line="$2" check="$3" check_line="$4"
+  printf '::error file=test/e2e/rpc_disconnect_smoke_test.go,line=%s::TestSmoke/%s failed (category: assertion; ID: %s/%s; location: test/e2e/rpc_disconnect_smoke_test.go:%s; helper-call: test/e2e/rpc_disconnect_smoke_test.go:%s; checked-out commit: %s; details redacted)' \
+    "$check_line" "$scenario_failure" "$callsite" "$check" \
+    "$check_line" "$callsite_line" "$checked_out_commit"
 }
 
 expected_direct_assertion() {
-  printf '::error file=test/e2e/smoke_test.go,line=7::TestSmoke/%s failed (category: assertion; ID: %s; location: test/e2e/smoke_test.go:7; checked-out commit: %s; details redacted)' \
-    "$scenario_failure" "$direct_id" "$checked_out_commit"
-}
-
-expected_helper_assertion() {
-  printf '::error file=test/e2e/smoke_test.go,line=16::TestSmoke/%s failed (category: assertion; ID: %s/%s; location: test/e2e/smoke_test.go:16; helper-call: test/e2e/smoke_test.go:9; checked-out commit: %s; details redacted)' \
-    "$scenario_failure" "$callsite_one" "$helper_check" "$checked_out_commit"
+  local assertion_line="$1"
+  printf '::error file=test/e2e/rpc_disconnect_smoke_test.go,line=%s::TestSmoke/%s failed (category: assertion; ID: %s; location: test/e2e/rpc_disconnect_smoke_test.go:%s; checked-out commit: %s; details redacted)' \
+    "$assertion_line" "$scenario_failure" "$direct_id" "$assertion_line" "$checked_out_commit"
 }
 
 expected_helper_call() {
-  local id="$1"
-  printf '::error file=test/e2e/smoke_test.go,line=9::TestSmoke/%s failed (category: helper-call; ID: %s; location: test/e2e/smoke_test.go:9; checked-out commit: %s; details redacted)' \
-    "$scenario_failure" "$id" "$checked_out_commit"
+  local identifier="$1" callsite_line="$2"
+  printf '::error file=test/e2e/rpc_disconnect_smoke_test.go,line=%s::TestSmoke/%s failed (category: helper-call; ID: %s; location: test/e2e/rpc_disconnect_smoke_test.go:%s; checked-out commit: %s; details redacted)' \
+    "$callsite_line" "$scenario_failure" "$identifier" "$callsite_line" "$checked_out_commit"
+}
+
+expected_legacy_helper_check() {
+  local caller_line="$1"
+  printf '::error file=test/e2e/rpc_disconnect_smoke_test.go,line=%s::TestSmoke/%s failed (category: helper-call; ID: peer-disconnect.legacy-helper-check; location: test/e2e/rpc_disconnect_smoke_test.go:%s; checked-out commit: %s; details redacted)' \
+    "$caller_line" "$scenario_failure" "$caller_line" "$checked_out_commit"
 }
 
 assert_case() {
-  local name="$1" fixture="$2" expected="$3" forbidden="$4" actual
-  actual=$(report_smoke_failure_diagnostics 1 <<<"$fixture")
+  local name="$1" fixture="$2" expected="$3" actual output result_status \
+    stop_line resume_line token_from_line post_resume wrapper_diagnostics
+  local canary_event
+  canary_event=$(json_event output "TestSmoke/$scenario_failure" "untrusted runtime detail ${canary}")
+  fixture="${canary_event}"$'\n'"${fixture}"
+  if [[ "$fixture" != *"$canary"* ]]; then
+    printf 'smoke verifier case omitted its redaction canary: %s\n' "$name" >&2
+    exit 1
+  fi
+
+  actual=$(report_smoke_failure_diagnostics 37 <<<"$fixture")
   if [[ "$actual" != "$expected" ]]; then
     printf 'unexpected smoke diagnostic for verifier case: %s\n' "$name" >&2
     exit 1
   fi
-  if [[ -n "$forbidden" && "$actual" == *"$forbidden"* ]]; then
+  if [[ "$actual" == *"$canary"* ]]; then
     printf 'smoke verifier case exposed fixture bytes: %s\n' "$name" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$fixture" >"$mock_json"
+  : >"$mock_args"
+  if output=$(PATH="$mock_bin:$PATH" RUNNER_TEMP="$runner_temp" \
+    SMOKE_DIAGNOSTICS_ROOT="$fixture_root" SMOKE_OUTPUT_INDENT="$SMOKE_OUTPUT_INDENT" \
+    MOCK_GO_ARGS="$mock_args" MOCK_GO_JSON="$mock_json" MOCK_GO_STATUS=37 \
+    bash "$wrapper_script_dir/run-e2e-diagnostics.sh" 2>&1); then
+    result_status=0
+  else
+    result_status=$?
+  fi
+  if [[ "$result_status" -ne 37 ]]; then
+    printf 'E2E wrapper changed go test exit status in verifier case: %s\n' "$name" >&2
+    exit 1
+  fi
+  expected_args=$'test\n-race\n-count=1\n-timeout\n15m\n-json\n'"$SMOKE_E2E_PACKAGE"
+  if [[ "$(cat "$mock_args")" != "$expected_args" ]]; then
+    printf 'E2E invocation flags or package selection changed: %s\n' "$name" >&2
+    exit 1
+  fi
+  stop_line=$(grep -E '^::stop-commands::[0-9a-f]{64}$' <<<"$output" || true)
+  resume_line=$(grep -E '^::[0-9a-f]{64}::$' <<<"$output" || true)
+  token_from_line="${stop_line#::stop-commands::}"
+  if [[ -z "$stop_line" || "$resume_line" != "::$token_from_line::" ]]; then
+    printf 'E2E raw output lost command suppression: %s\n' "$name" >&2
+    exit 1
+  fi
+  post_resume="${output#*"$resume_line"$'\n'}"
+  wrapper_diagnostics=$(grep '^::error' <<<"$post_resume" || true)
+  if [[ "$wrapper_diagnostics" != "$actual" || "$wrapper_diagnostics" == *"$canary"* ]]; then
+    printf 'E2E wrapper changed or exposed the diagnostic: %s\n' "$name" >&2
+    exit 1
+  fi
+  if find "$runner_temp" -maxdepth 1 -type f -name 'e2e-test-json.*' -print -quit | grep -q .; then
+    printf 'E2E JSON temporary file remained after verifier case: %s\n' "$name" >&2
     exit 1
   fi
 }
 
-direct_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:7: [assert:${direct_id}] runtime state ${canary}"$'\n'
-assert_case valid-fixed-assertion \
-  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$direct_body")" \
-  "$(expected_direct_assertion)" "$canary"
+line_for_text() {
+  local path="$1" text="$2" result
+  result=$(grep -nF -- "$text" "$path" | cut -d: -f1)
+  if [[ -z "$result" || "$result" == *$'\n'* ]]; then
+    printf 'fixture line was missing or ambiguous: %s\n' "$text" >&2
+    exit 1
+  fi
+  printf '%s' "$result"
+}
 
-multiline_direct_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:7: [assert:${direct_id}] runtime state ${canary}"$'\n'"continued state ${canary}"$'\n'
-assert_case multiline-runtime-body \
-  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$multiline_direct_body")" \
-  "$(expected_direct_assertion)" "$canary"
+commit_fixture() {
+  fixture_commit
+  checked_out_commit=$(git -C "$fixture_root" rev-parse HEAD)
+}
 
-paired_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:9: [assert:${callsite_one}/${helper_check}] runtime state ${canary}"$'\n'
-assert_case paired-helper-identities \
+assert_unavailable_case() {
+  local name="$1" token="$2" runtime_location="$3" mutation="${4:-none}"
+  write_fixture_source
+  apply_mutation "$mutation"
+  commit_fixture
+  local body fixture
+  body="${SMOKE_OUTPUT_INDENT}${runtime_location}: [assert:${token}] runtime state ${canary}"$'\n'
+  fixture=$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$body")
+  assert_case "$name" "$fixture" "$(expected_unavailable)"
+}
+
+callsite_one_line=$(line_for_text "$rpc_fixture" "\"$callsite_one\"")
+callsite_two_line=$(line_for_text "$rpc_fixture" "\"$callsite_two\"")
+owner_lock_state_line=$(line_for_text "$rpc_fixture" "[assert:%s/peer-disconnect.owner-lock-state]")
+owner_lock_inspection_line=$(line_for_text "$rpc_fixture" "[assert:%s/peer-disconnect.owner-lock-inspection]")
+direct_assertion_line=$(line_for_text "$rpc_fixture" "[assert:$direct_id]")
+other_scenario_root_line=$(line_for_text "$smoke_fixture" "testSmokeOther(t)")
+legacy_helper_call_line=$(line_for_text "$rpc_fixture" "legacySmokeCheck(t)")
+external_caller_line=$(line_for_text "$rpc_fixture" "testSmokeOther(t)")
+
+paired_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${callsite_one}/${owner_lock_state}] lock wait ${canary}"$'\n'
+assert_case valid-peer-disconnect-helper-assertion \
   "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$paired_body")" \
-  "$(expected_helper_assertion)" "$canary"
+  "$(expected_helper_assertion "$callsite_one" "$callsite_one_line" "$owner_lock_state" "$owner_lock_state_line")"
 
-short_callsite_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:9: [assert:${short_callsite}/${helper_check}] runtime state ${canary}"$'\n'
-assert_case shortened-paired-callsite-id \
-  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$short_callsite_body")" \
-  "$(expected_unavailable)" "$canary"
+second_call_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${callsite_two}/${owner_lock_state}] second lock wait ${canary}"$'\n'
+assert_case distinct-helper-callsite \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$second_call_body")" \
+  "$(expected_helper_assertion "$callsite_two" "$callsite_two_line" "$owner_lock_state" "$owner_lock_state_line")"
 
-short_helper_check_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:9: [assert:${callsite_one}/${short_helper_check}] runtime state ${canary}"$'\n'
-assert_case shortened-paired-helper-id \
-  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$short_helper_check_body")" \
-  "$(expected_unavailable)" "$canary"
+inspection_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${callsite_one}/${owner_lock_inspection}] inspect lock ${canary}"$'\n'
+assert_case one-hop-owner-lock-inspection \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$inspection_body")" \
+  "$(expected_helper_assertion "$callsite_one" "$callsite_one_line" "$owner_lock_inspection" "$owner_lock_inspection_line")"
 
-bare_callsite_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:9: [assert:${callsite_one}] runtime state ${canary}"$'\n'
-assert_case bare-callsite-is-helper-call \
+direct_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${direct_id}] initial state ${canary}"$'\n'
+assert_case direct-root-assertion \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$direct_body")" \
+  "$(expected_direct_assertion "$direct_assertion_line")"
+
+bare_callsite_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${callsite_one}] helper call ${canary}"$'\n'
+assert_case bare-root-callsite-remains-helper-call \
   "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$bare_callsite_body")" \
-  "$(expected_helper_call "$callsite_one")" "$canary"
+  "$(expected_helper_call "$callsite_one" "$callsite_one_line")"
 
-bare_check_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:9: [assert:${helper_check}] runtime state ${canary}"$'\n'
-assert_case bare-helper-check-is-helper-call \
-  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$bare_check_body")" \
-  "$(expected_helper_call "$helper_check")" "$canary"
+write_fixture_source
+apply_mutation root-no-helper
+commit_fixture
+no_helper_call_line=$(line_for_text "$rpc_fixture" "\"$callsite_one\"")
+no_helper_body="${SMOKE_OUTPUT_INDENT}rpc_disconnect_smoke_test.go:${no_helper_call_line}: [assert:${callsite_one}/${owner_lock_state}] lock wait ${canary}"$'\n'
+assert_case root-without-helper-predicts-callsite \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$no_helper_body")" \
+  "$(expected_helper_assertion "$callsite_one" "$no_helper_call_line" "$owner_lock_state" "$owner_lock_state_line")"
 
-legacy_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:29: legacy assertion value ${canary}"$'\n'
-assert_case legacy-location-fallback \
+legacy_body="${SMOKE_OUTPUT_INDENT}rpc_disconnect_smoke_test.go:${legacy_helper_call_line}: [assert:peer-disconnect.legacy-helper-check] legacy helper ${canary}"$'\n'
+assert_case bare-helper-check-remains-helper-call \
   "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$legacy_body")" \
-  "$(expected_legacy_location)" "$canary"
+  "$(expected_legacy_helper_check "$legacy_helper_call_line")"
 
-for invalid_path in 'untracked_secret.go:29' '../smoke_test.go:29' '/tmp/smoke_test.go:29'; do
-  body="${SMOKE_OUTPUT_INDENT}${invalid_path}: ${canary}"$'\n'
-  assert_case invalid-path "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$body")" \
-    "$(expected_unavailable)" "$canary"
-done
+assert_unavailable_case wrong-location-is-callsite-line \
+  "$callsite_one/$owner_lock_state" "rpc_disconnect_smoke_test.go:$callsite_one_line"
+assert_unavailable_case wrong-location-is-other-testsmoke-line \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:78'
+assert_unavailable_case wrong-location-is-another-scenario-root \
+  "$callsite_one/$owner_lock_state" "smoke_test.go:$other_scenario_root_line"
+assert_unavailable_case wrong-location-is-unrelated-outer-caller \
+  "$callsite_one/$owner_lock_state" "rpc_disconnect_smoke_test.go:$external_caller_line"
+assert_unavailable_case wrong-location-is-arbitrary-line \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:6'
+assert_unavailable_case root-helper-missing-helper-marker \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' helper-no-helper
+assert_unavailable_case check-helper-missing-helper-marker \
+  "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' check-helper-no-helper
 
-for invalid_line in 0 999999 1000000; do
-  body="${SMOKE_OUTPUT_INDENT}smoke_test.go:${invalid_line}: ${canary}"$'\n'
-  assert_case "invalid-line-${invalid_line}" "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$body")" \
-    "$(expected_unavailable)" "$canary"
-done
+assert_unavailable_case scenario-closure-has-no-root-call \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' closure-zero-call
+assert_unavailable_case scenario-closure-has-several-root-calls \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' closure-two-calls
+assert_unavailable_case duplicate-scenario-closure \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' duplicate-scenario-run
+assert_unavailable_case unsupported-scenario-closure-pattern \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' scenario-pattern-mismatch
+assert_unavailable_case testsmoke-signature-mismatch \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' root-signature-mismatch
+assert_unavailable_case testsmoke-root-missing \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' testsmoke-missing
+assert_unavailable_case testsmoke-root-duplicate \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' testsmoke-duplicate
+
+assert_unavailable_case scenario-root-function-missing \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' root-missing
+assert_unavailable_case scenario-root-function-duplicate \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' root-duplicate
+assert_unavailable_case scenario-root-method-function-collision \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' root-method-collision
+assert_unavailable_case second-caller-of-scenario-root \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' second-root-caller
+assert_unavailable_case callsite-helper-missing \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' helper-missing
+assert_unavailable_case callsite-helper-duplicate \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' helper-duplicate
+assert_unavailable_case callsite-helper-method-function-collision \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' helper-method-collision
+assert_unavailable_case check-helper-missing \
+  "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' check-helper-missing
+assert_unavailable_case check-helper-duplicate \
+  "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' check-helper-duplicate
+assert_unavailable_case check-helper-method-function-collision \
+  "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' check-helper-method-collision
+
+assert_unavailable_case inner-helper-callsite-outside-root \
+  'peer-disconnect.inner-hold-probe/peer-disconnect.owner-lock-inspection' 'smoke_test.go:79'
+assert_unavailable_case cleanup-closure-callsite-outside-root \
+  'peer-disconnect.cleanup-closure-callsite/peer-disconnect.owner-lock-inspection' 'smoke_test.go:79'
+assert_unavailable_case locksmokeowner-internal-callsite-outside-root \
+  'peer-disconnect.lockSmokeOwner-internal-callsite/peer-disconnect.owner-lock-inspection' 'smoke_test.go:79'
+assert_unavailable_case check-is-not-reachable-from-helper \
+  "$callsite_one/peer-disconnect.online-state-mismatch" 'smoke_test.go:79'
+assert_unavailable_case hop-passes-literal-instead-of-callsite-id \
+  "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' inner-literal-hop
+assert_unavailable_case hop-passes-expression-instead-of-callsite-id \
+  "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' inner-expression-hop
+assert_unavailable_case chain-requires-more-than-one-hop \
+  "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' two-hop-chain
+assert_unavailable_case callsite-literal-is-not-unique \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' duplicate-callsite-literal
+assert_unavailable_case check-literal-is-not-unique \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' duplicate-check-literal
+assert_unavailable_case direct-root-literal-is-not-unique \
+  "$direct_id" 'smoke_test.go:79' duplicate-direct-literal
+assert_unavailable_case unsupported-multiline-callsite \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' unsupported-callsite
+
+assert_unavailable_case unknown-callsite-id \
+  'peer-disconnect.unknown-callsite/peer-disconnect.owner-lock-state' 'smoke_test.go:79'
+assert_unavailable_case stale-callsite-id \
+  'peer-disconnect.stale-callsite/peer-disconnect.owner-lock-state' 'smoke_test.go:79'
+assert_unavailable_case unknown-check-id \
+  'peer-disconnect.message-blocker-clear-confirm/peer-disconnect.unknown-check' 'smoke_test.go:79'
+assert_unavailable_case stale-check-id \
+  'peer-disconnect.message-blocker-clear-confirm/peer-disconnect.stale-check' 'smoke_test.go:79'
+assert_unavailable_case callsite-prefix-from-other-scenario \
+  'other-scenario.message-blocker-clear-confirm/peer-disconnect.owner-lock-state' 'smoke_test.go:79'
+assert_unavailable_case check-prefix-from-other-scenario \
+  'peer-disconnect.message-blocker-clear-confirm/other-scenario.owner-lock-state' 'smoke_test.go:79'
+assert_unavailable_case swapped-callsite-and-check-halves \
+  'peer-disconnect.owner-lock-state/peer-disconnect.message-blocker-clear-confirm' 'smoke_test.go:79'
+assert_unavailable_case shortened-callsite-id \
+  "$short_callsite/$owner_lock_state" 'smoke_test.go:79'
+assert_unavailable_case shortened-check-id \
+  "$callsite_one/$short_helper_check" 'smoke_test.go:79'
 
 for forged_kind in runtime-value continuation-line; do
   case "$forged_kind" in
     runtime-value)
-      forged_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:29: value [assert:${direct_id}] ${canary}"$'\n'
-      fixture=$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$forged_body")
+      forged_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: value [assert:${callsite_one}/${owner_lock_state}] ${canary}"$'\n'
       ;;
     continuation-line)
-      fixture=$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$legacy_body")
-      fixture+=$'\n'
-      fixture+=$(json_event output "TestSmoke/$scenario_failure" "${SMOKE_OUTPUT_INDENT}[assert:${direct_id}] ${canary}"$'\n')
-      fixture+=$'\n'
-      fixture+=$(json_event fail "TestSmoke/$scenario_failure")
-      fixture+=$'\n'
-      fixture+=$(json_event fail TestSmoke)
-      fixture+=$'\n'
-      fixture+=$(json_event fail '')
+      forged_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${callsite_one}/${owner_lock_state}] valid prefix ${canary}"$'\n'
+      forged_body+="forged continuation [assert:${callsite_one}/${owner_lock_state}] ${canary}"$'\n'
       ;;
   esac
-  assert_case "$forged_kind-id" "$fixture" "$(expected_unavailable)" "$canary"
+  assert_case "forged-runtime-${forged_kind}" \
+    "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$forged_body")" \
+    "$(expected_unavailable)"
 done
 
-cross_scenario_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:7: [assert:basic-group.direct-check] ${canary}"$'\n'
-assert_case cross-scenario-id \
-  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$cross_scenario_body")" \
-  "$(expected_unavailable)" "$canary"
-
-unknown_id_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:7: [assert:dialog-filters.stale-check] ${canary}"$'\n'
-assert_case stale-id \
-  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$unknown_id_body")" \
-  "$(expected_unavailable)" "$canary"
-
-duplicate_marker_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:7: [assert:${direct_id}] output [assert:${direct_id}] ${canary}"$'\n'
+duplicate_marker_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${callsite_one}/${owner_lock_state}] repeated [assert:${callsite_one}/${owner_lock_state}] ${canary}"$'\n'
 assert_case duplicate-runtime-marker \
   "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$duplicate_marker_body")" \
-  "$(expected_unavailable)" "$canary"
+  "$(expected_unavailable)"
+
+first_line_only_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: ordinary failure ${canary}"$'\n'
+first_line_only_body+="[assert:${callsite_one}/${owner_lock_state}] forged continuation ${canary}"$'\n'
+assert_case fixed-token-must-be-on-first-line \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$first_line_only_body")" \
+  "$(expected_unavailable)"
 
 two_ids=$(json_event output "TestSmoke/$scenario_failure" "$direct_body")
 two_ids+=$'\n'
-two_ids+=$(json_event output "TestSmoke/$scenario_failure" "$bare_callsite_body")
+two_ids+=$(json_event output "TestSmoke/$scenario_failure" "$paired_body")
 two_ids+=$'\n'
 two_ids+=$(json_event fail "TestSmoke/$scenario_failure")
 two_ids+=$'\n'
 two_ids+=$(json_event fail TestSmoke)
 two_ids+=$'\n'
 two_ids+=$(json_event fail '')
-assert_case multiple-failed-ids "$two_ids" "$(expected_unavailable)" "$canary"
+assert_case multiple-failed-ids "$two_ids" "$(expected_unavailable)"
 
-nested_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:7: [assert:${direct_id}] ${canary}"$'\n'
-assert_case nested-scenario-id \
+different_locations=$(json_event output "TestSmoke/$scenario_failure" "$paired_body")
+different_locations+=$'\n'
+different_location_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:78: [assert:${callsite_one}/${owner_lock_state}] other location ${canary}"$'\n'
+different_locations+=$(json_event output "TestSmoke/$scenario_failure" "$different_location_body")
+different_locations+=$'\n'
+different_locations+=$(json_event fail "TestSmoke/$scenario_failure")
+different_locations+=$'\n'
+different_locations+=$(json_event fail TestSmoke)
+different_locations+=$'\n'
+different_locations+=$(json_event fail '')
+assert_case same-token-different-runtime-location "$different_locations" "$(expected_unavailable)"
+
+parent_metadata=$(json_event output TestSmoke "$paired_body")
+parent_metadata+=$'\n'
+parent_metadata+=$(failure_fixture "TestSmoke/$scenario_failure")
+assert_case parent-output-cannot-bind-child-assertion "$parent_metadata" "$(expected_unavailable)"
+
+nested_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${direct_id}] ${canary}"$'\n'
+assert_case nested-scenario-failure \
   "$(failure_fixture "TestSmoke/$scenario_failure/nested" "TestSmoke/$scenario_failure/nested" "$nested_body")" \
-  "$(expected_unavailable)" "$canary"
-
-duplicate_source_case() {
-  printf '\nfunc duplicateMetadata() { _ = "%s" }\n' "$direct_id" \
-    >>"$fixture_root/test/e2e/smoke_test.go"
-  fixture_commit
-  checked_out_commit=$(git -C "$fixture_root" rev-parse HEAD)
-  assert_case duplicate-source-literal \
-    "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$direct_body")" \
-    "$(expected_unavailable)" "$canary"
-  write_fixture_source
-  fixture_commit
-  checked_out_commit=$(git -C "$fixture_root" rev-parse HEAD)
-}
-duplicate_source_case
-
-printf '\n// dirty source tree\n' >>"$fixture_root/test/e2e/smoke_test.go"
-assert_case dirty-source-tree \
-  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$direct_body")" \
-  "$(expected_unavailable)" "$canary"
-git -C "$fixture_root" restore -- test/e2e/smoke_test.go
-
-printf 'package e2e\n' >"$fixture_root/test/e2e/untracked.go"
-assert_case untracked-source-tree \
-  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$direct_body")" \
-  "$(expected_unavailable)" "$canary"
-rm -- "$fixture_root/test/e2e/untracked.go"
-
-for unsafe_kind in escape workflow-marker percent-newline carriage-return embedded-newline; do
-  case "$unsafe_kind" in
-    escape) unsafe_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:29: ${canary}"$'\033[31m\n' ;;
-    workflow-marker) unsafe_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:29: ::error file=/tmp/forged.go,line=1::fake ${canary}"$'\n' ;;
-    percent-newline) unsafe_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:29: encoded%0Aworkflow-command ${canary}"$'\n' ;;
-    carriage-return) unsafe_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:29: ${canary}"$'\r\n' ;;
-    embedded-newline) unsafe_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:"$'\n'"29: ${canary}"$'\n' ;;
-  esac
-  assert_case "$unsafe_kind" "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$unsafe_body")" \
-    "$(expected_unavailable)" "$canary"
-done
+  "$(expected_unavailable)"
 
 unknown_scenario='runtime-secret-scenario-9472'
-unknown_fixture=$(json_event output "TestSmoke/$unknown_scenario" "$direct_body")
-unknown_fixture+=$'\n'
-unknown_fixture+=$(json_event fail "TestSmoke/$unknown_scenario")
-unknown_fixture+=$'\n'
-unknown_fixture+=$(json_event fail TestSmoke)
-unknown_fixture+=$'\n'
-unknown_fixture+=$(json_event fail '')
+unknown_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${direct_id}] ${canary}"$'\n'
+unknown_fixture=$(failure_fixture "TestSmoke/$unknown_scenario" "TestSmoke/$unknown_scenario" "$unknown_body")
 unknown_expected="::error::TestSmoke failed (category: suite-failure; checked-out commit: $checked_out_commit; details redacted)"
-assert_case unknown-scenario "$unknown_fixture" "$unknown_expected" "$unknown_scenario"
+assert_case unknown-scenario "$unknown_fixture" "$unknown_expected"
+
+legacy_body="${SMOKE_OUTPUT_INDENT}smoke_test.go:79: legacy assertion value ${canary}"$'\n'
+assert_case legacy-location-fallback \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$legacy_body")" \
+  "::error file=test/e2e/smoke_test.go,line=79::TestSmoke/$scenario_failure failed (category: scenario-failure; location: test/e2e/smoke_test.go:79; checked-out commit: $checked_out_commit; details redacted)"
+
+for invalid_path in 'untracked_secret.go:79' '../smoke_test.go:79' '/tmp/smoke_test.go:79'; do
+  body="${SMOKE_OUTPUT_INDENT}${invalid_path}: ${canary}"$'\n'
+  assert_case "invalid-path-$invalid_path" \
+    "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$body")" \
+    "$(expected_unavailable)"
+done
+
+for invalid_line in 0 999999 1000000; do
+  body="${SMOKE_OUTPUT_INDENT}smoke_test.go:${invalid_line}: ${canary}"$'\n'
+  assert_case "invalid-line-${invalid_line}" \
+    "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$body")" \
+    "$(expected_unavailable)"
+done
+
+write_fixture_source
+fixture_commit
+checked_out_commit=$(git -C "$fixture_root" rev-parse HEAD)
+apply_mutation dirty-second-file
+assert_case dirty-second-file-source-tree \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$paired_body")" \
+  "$(expected_unavailable)"
+
+write_fixture_source
+fixture_commit
+checked_out_commit=$(git -C "$fixture_root" rev-parse HEAD)
+printf 'package e2e\n' >"$fixture_root/test/e2e/untracked_second.go"
+assert_case untracked-second-source-file \
+  "$(failure_fixture "TestSmoke/$scenario_failure" "TestSmoke/$scenario_failure" "$paired_body")" \
+  "$(expected_unavailable)"
+rm -- "$fixture_root/test/e2e/untracked_second.go"
 
 for execution_failure in race timeout build-failure; do
   case "$execution_failure" in
     race)
-      failed_stream=$(json_event output "TestSmoke/$scenario_failure" 'WARNING: DATA RACE')
+      failed_stream=$(json_event output TestOther 'WARNING: DATA RACE')
       failed_stream+=$'\n'
       failed_stream+=$(json_event fail "TestSmoke/$scenario_failure")
       failed_stream+=$'\n'
@@ -330,7 +778,7 @@ for execution_failure in race timeout build-failure; do
       failed_stream+=$(json_event fail '')
       ;;
     timeout)
-      failed_stream=$(json_event output "TestSmoke/$scenario_failure" 'panic: test timed out after 15m')
+      failed_stream=$(json_event output TestOther 'panic: test timed out after 15m')
       failed_stream+=$'\n'
       failed_stream+=$(json_event fail "TestSmoke/$scenario_failure")
       failed_stream+=$'\n'
@@ -345,23 +793,22 @@ for execution_failure in race timeout build-failure; do
       ;;
   esac
   expected_execution_failure="::error::E2E suite failed (category: execution-failure; checked-out commit: $checked_out_commit; details redacted)"
-  assert_case "$execution_failure" "$failed_stream" "$expected_execution_failure" "$canary"
+  assert_case "$execution_failure" "$failed_stream" "$expected_execution_failure"
 done
 
 truncated_stream=$(json_event fail "TestSmoke/$scenario_failure")
 expected_execution_failure="::error::E2E suite failed (category: execution-failure; checked-out commit: $checked_out_commit; details redacted)"
-assert_case truncated-json "$truncated_stream" "$expected_execution_failure" "$canary"
+assert_case truncated-json "$truncated_stream" "$expected_execution_failure"
 
 outside_failure=$(json_event fail TestOther)
 outside_failure+=$'\n'
 outside_failure+=$(json_event fail '')
 expected_suite_failure="::error::E2E suite failed (category: suite-failure; checked-out commit: $checked_out_commit; details redacted)"
-assert_case failure-outside-smoke "$outside_failure" "$expected_suite_failure" "$canary"
+assert_case failure-outside-smoke "$outside_failure" "$expected_suite_failure"
 
-non_json_fixture="${canary} ${direct_body}"$'\n'
+non_json_fixture="${canary} ${paired_body}"$'\n'
 non_json_fixture+=$(failure_fixture "TestSmoke/$scenario_failure")
-expected_execution_failure="::error::E2E suite failed (category: execution-failure; checked-out commit: $checked_out_commit; details redacted)"
-assert_case non-json-input "$non_json_fixture" "$expected_execution_failure" "$canary"
+assert_case non-json-input "$non_json_fixture" "$expected_execution_failure"
 
 passing_fixture=$(json_event pass "TestSmoke/$scenario_failure" "$canary")
 passing_diagnostics=$(report_smoke_failure_diagnostics 0 <<<"$passing_fixture")
@@ -382,86 +829,6 @@ raw_passthrough=$(smoke_emit_raw_output "$raw_json" "$command_token")
 expected_raw_passthrough="::stop-commands::$command_token"$'\n'"$raw_text"$'\n'"::$command_token::"
 if [[ "$raw_passthrough" != "$expected_raw_passthrough" ]]; then
   printf 'raw output command suppression boundaries were incorrect\n' >&2
-  exit 1
-fi
-
-mock_bin="$fixture_root/mock-bin"
-runner_temp="$fixture_root/runner-temp"
-mkdir -p "$mock_bin" "$runner_temp"
-cat >"$mock_bin/go" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$@" >>"$MOCK_GO_ARGS"
-cat "$MOCK_GO_JSON"
-exit "$MOCK_GO_STATUS"
-EOF
-chmod +x "$mock_bin/go"
-
-mock_json="$fixture_root/mock-go.json"
-mock_args="$fixture_root/mock-go.args"
-mock_raw_body="::error file=/tmp/forged.go,line=1::${canary} ::stop-commands::attacker"$'\n'
-mock_failure=$(json_event output "TestSmoke/$scenario_failure" "$direct_body")
-mock_failure+=$'\n'
-mock_failure+=$(json_event output "TestSmoke/$scenario_failure" "$mock_raw_body")
-mock_failure+=$'\n'
-mock_failure+=$(json_event fail "TestSmoke/$scenario_failure")
-mock_failure+=$'\n'
-mock_failure+=$(json_event fail TestSmoke)
-mock_failure+=$'\n'
-mock_failure+=$(json_event fail '')
-printf '%s\n' "$mock_failure" >"$mock_json"
-: >"$mock_args"
-
-if output=$(PATH="$mock_bin:$PATH" RUNNER_TEMP="$runner_temp" \
-  SMOKE_DIAGNOSTICS_ROOT="$fixture_root" SMOKE_OUTPUT_INDENT="$SMOKE_OUTPUT_INDENT" \
-  MOCK_GO_ARGS="$mock_args" MOCK_GO_JSON="$mock_json" MOCK_GO_STATUS=37 \
-  bash "$script_dir/run-e2e-diagnostics.sh" 2>&1); then
-  result_status=0
-else
-  result_status=$?
-fi
-if [[ "$result_status" -ne 37 ]]; then
-  printf 'E2E wrapper changed go test exit status\n' >&2
-  exit 1
-fi
-expected_args=$'test\n-race\n-count=1\n-timeout\n15m\n-json\n'"$SMOKE_E2E_PACKAGE"
-if [[ "$(cat "$mock_args")" != "$expected_args" ]]; then
-  printf 'E2E invocation flags or package selection changed\n' >&2
-  exit 1
-fi
-stop_line=$(grep -E '^::stop-commands::[0-9a-f]{64}$' <<<"$output" || true)
-resume_line=$(grep -E '^::[0-9a-f]{64}::$' <<<"$output" || true)
-token_from_line="${stop_line#::stop-commands::}"
-if [[ -z "$stop_line" || "$resume_line" != "::$token_from_line::" || "$output" != *"$mock_raw_body"* ]]; then
-  printf 'E2E raw output was not enclosed by command suppression\n' >&2
-  exit 1
-fi
-post_resume="${output#*"$resume_line"$'\n'}"
-annotation=$(grep '^::error' <<<"$post_resume" || true)
-if [[ "$annotation" != "$(expected_direct_assertion)" || "$annotation" == *"$canary"* ]]; then
-  printf 'E2E annotation exposed runtime text or lost assertion mapping\n' >&2
-  exit 1
-fi
-if find "$runner_temp" -maxdepth 1 -type f -name 'e2e-test-json.*' -print -quit | grep -q .; then
-  printf 'E2E JSON temporary file remained after the step\n' >&2
-  exit 1
-fi
-
-outside_json=$(json_event fail TestOther)
-outside_json+=$'\n'
-outside_json+=$(json_event fail '')
-printf '%s\n' "$outside_json" >"$mock_json"
-: >"$mock_args"
-if output=$(PATH="$mock_bin:$PATH" RUNNER_TEMP="$runner_temp" \
-  SMOKE_DIAGNOSTICS_ROOT="$fixture_root" SMOKE_OUTPUT_INDENT="$SMOKE_OUTPUT_INDENT" \
-  MOCK_GO_ARGS="$mock_args" MOCK_GO_JSON="$mock_json" MOCK_GO_STATUS=23 \
-  bash "$script_dir/run-e2e-diagnostics.sh" 2>&1); then
-  result_status=0
-else
-  result_status=$?
-fi
-if [[ "$result_status" -ne 23 || "$output" != *"$expected_suite_failure"* || "$output" == *'::error file='* ]]; then
-  printf 'E2E wrapper lost a nonzero exit without a smoke location\n' >&2
   exit 1
 fi
 
