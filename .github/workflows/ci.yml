@@ -1306,7 +1306,7 @@ jobs:
           }
 
           if [ "$status" -ne 0 ]; then
-            report_smoke_failure_diagnostics "$status" <<<"$output"
+            report_smoke_failure_diagnostics "$status" smoke <<<"$output" || true
             exit "$status"
           fi
 

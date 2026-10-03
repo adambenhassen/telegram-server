@@ -74,7 +74,7 @@ SMOKE_E2E_PACKAGE="github.com/teagramhq/teagram-server/test/e2e"
 source "$script_dir/smoke-scenarios.sh"
 
 report_smoke_failure_diagnostics() {
-  local status="${1:-1}" input="${2:--}" indent="${SMOKE_OUTPUT_INDENT:-}"
+  local status="${1:-1}" profile="${2-}" input="${3:--}" indent="${SMOKE_OUTPUT_INDENT:-}"
   local scenario
   local -a args=(
     --status "$status"
@@ -85,6 +85,9 @@ report_smoke_failure_diagnostics() {
   if [[ ! "$indent" =~ ^\ +$ ]]; then
     indent=$(smoke_diagnostic_output_indent 2>/dev/null) || indent=""
     args[7]="$indent"
+  fi
+  if [[ $# -ge 2 && "$profile" != "--" ]]; then
+    args+=(--profile "$profile")
   fi
   for scenario in "${SMOKE_SCENARIOS[@]}"; do
     args+=(--scenario "$scenario")

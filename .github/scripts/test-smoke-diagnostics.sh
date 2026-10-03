@@ -16,6 +16,28 @@ if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'checked-out commit validation failed\n' >&2
   exit 1
 fi
+probe_go_version=$(sed -nE 's/^go ([0-9]+\.[0-9]+(\.[0-9]+)?)$/\1/p' "$source_root/go.mod")
+if [[ ! "$probe_go_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+  printf 'Go probe version could not be read from go.mod\n' >&2
+  exit 1
+fi
+
+require_literal() {
+  local path="$1" literal="$2"
+  if ! grep -Fq -- "$literal" "$path"; then
+    printf 'diagnostic profile command or caller drifted: %s\n' "$path" >&2
+    exit 1
+  fi
+}
+
+require_literal "$source_root/.github/workflows/ci.yml" \
+  "go test -json -count=1 -timeout 2m -v ./test/e2e -run '^TestSmoke' 2>&1"
+require_literal "$source_root/.github/workflows/ci.yml" \
+  'report_smoke_failure_diagnostics "$status" smoke <<<"$output" || true'
+require_literal "$script_dir/run-e2e-diagnostics.sh" \
+  'go test -race -count=1 -timeout 15m -json "$SMOKE_E2E_PACKAGE"'
+require_literal "$script_dir/run-e2e-diagnostics.sh" \
+  'report_smoke_failure_diagnostics "$status" full-suite "$json_file" || true'
 
 while IFS= read -r declared_scenario; do
   [[ -n "$declared_scenario" ]] || continue
@@ -28,6 +50,8 @@ done < <(sed -nE 's/^[[:space:]]*t\.Run\("([^\"]+)".*/\1/p' "$source_root/test/e
 fixture_root=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/smoke-diagnostics-repo.XXXXXX")
 trap 'rm -rf -- "$fixture_root"' EXIT
 mkdir -p "$fixture_root/test/e2e"
+probe_root="$fixture_root/probes"
+mkdir -p "$probe_root"
 
 scenario_failure='peer-disconnect'
 canary='private-runtime-assertion-canary-9472'
@@ -410,6 +434,22 @@ cat "$MOCK_GO_JSON"
 exit "$MOCK_GO_STATUS"
 EOF
 chmod +x "$mock_bin/go"
+cat >"$wrapper_script_dir/report-failure.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/smoke-diagnostics.sh"
+if [[ -n "${MOCK_SCENARIOS+x}" ]]; then
+  IFS=',' read -r -a SMOKE_SCENARIOS <<<"$MOCK_SCENARIOS"
+fi
+if [[ "${MOCK_OMIT_PROFILE:-false}" == true ]]; then
+  report_smoke_failure_diagnostics "$MOCK_GO_STATUS" -- "$MOCK_GO_JSON" || true
+else
+  report_smoke_failure_diagnostics "$MOCK_GO_STATUS" "$MOCK_PROFILE" "$MOCK_GO_JSON" || true
+fi
+exit "$MOCK_GO_STATUS"
+EOF
+chmod +x "$wrapper_script_dir/report-failure.sh"
 mock_json="$fixture_root/mock-go.json"
 mock_args="$fixture_root/mock-go.args"
 
@@ -465,17 +505,20 @@ expected_legacy_helper_check() {
 }
 
 assert_case() {
-  local name="$1" fixture="$2" expected="$3" actual output result_status \
-    stop_line resume_line token_from_line post_resume wrapper_diagnostics
+  local name="$1" fixture="$2" expected="$3" profile="${4:-smoke}" \
+    test_status="${5:-37}" actual output result_status \
+    stop_line resume_line token_from_line suppressed_output post_resume \
+    wrapper_diagnostics diagnostics status
   local canary_event
-  canary_event=$(json_event output "TestSmoke/$scenario_failure" "untrusted runtime detail ${canary}")
+  canary_event=$(json_event output "TestSmoke/$scenario_failure" \
+    "untrusted runtime detail ${canary} ::error file=/tmp/forged.go,line=1::forged ::stop-commands::attacker")
   fixture="${canary_event}"$'\n'"${fixture}"
   if [[ "$fixture" != *"$canary"* ]]; then
     printf 'smoke verifier case omitted its redaction canary: %s\n' "$name" >&2
     exit 1
   fi
 
-  actual=$(report_smoke_failure_diagnostics 37 <<<"$fixture")
+  actual=$(report_smoke_failure_diagnostics "$test_status" "$profile" <<<"$fixture")
   if [[ "$actual" != "$expected" ]]; then
     printf 'unexpected smoke diagnostic for verifier case: %s\n' "$name" >&2
     exit 1
@@ -489,13 +532,13 @@ assert_case() {
   : >"$mock_args"
   if output=$(PATH="$mock_bin:$PATH" RUNNER_TEMP="$runner_temp" \
     SMOKE_DIAGNOSTICS_ROOT="$fixture_root" SMOKE_OUTPUT_INDENT="$SMOKE_OUTPUT_INDENT" \
-    MOCK_GO_ARGS="$mock_args" MOCK_GO_JSON="$mock_json" MOCK_GO_STATUS=37 \
+    MOCK_GO_ARGS="$mock_args" MOCK_GO_JSON="$mock_json" MOCK_GO_STATUS="$test_status" \
     bash "$wrapper_script_dir/run-e2e-diagnostics.sh" 2>&1); then
     result_status=0
   else
     result_status=$?
   fi
-  if [[ "$result_status" -ne 37 ]]; then
+  if [[ "$result_status" -ne "$test_status" ]]; then
     printf 'E2E wrapper changed go test exit status in verifier case: %s\n' "$name" >&2
     exit 1
   fi
@@ -511,9 +554,16 @@ assert_case() {
     printf 'E2E raw output lost command suppression: %s\n' "$name" >&2
     exit 1
   fi
+  suppressed_output="${output#*"$stop_line"$'\n'}"
+  suppressed_output="${suppressed_output%%"$resume_line"*}"
+  if [[ "$suppressed_output" != *"$canary"* \
+    || "$suppressed_output" != *'::error file=/tmp/forged.go,line=1::forged ::stop-commands::attacker'* ]]; then
+    printf 'E2E raw output injection fixture escaped command suppression: %s\n' "$name" >&2
+    exit 1
+  fi
   post_resume="${output#*"$resume_line"$'\n'}"
   wrapper_diagnostics=$(grep '^::error' <<<"$post_resume" || true)
-  if [[ "$wrapper_diagnostics" != "$actual" || "$wrapper_diagnostics" == *"$canary"* ]]; then
+  if [[ "$wrapper_diagnostics" != "$actual" || "$post_resume" == *"$canary"* ]]; then
     printf 'E2E wrapper changed or exposed the diagnostic: %s\n' "$name" >&2
     exit 1
   fi
@@ -521,7 +571,241 @@ assert_case() {
     printf 'E2E JSON temporary file remained after verifier case: %s\n' "$name" >&2
     exit 1
   fi
+
+  for status in 1 2; do
+    if output=$(PATH="$mock_bin:$PATH" RUNNER_TEMP="$runner_temp" \
+      SMOKE_DIAGNOSTICS_ROOT="$fixture_root" SMOKE_OUTPUT_INDENT="$SMOKE_OUTPUT_INDENT" \
+      MOCK_GO_JSON="$mock_json" MOCK_GO_STATUS="$status" MOCK_PROFILE="$profile" \
+      bash "$wrapper_script_dir/report-failure.sh" 2>&1); then
+      result_status=0
+    else
+      result_status=$?
+    fi
+    if [[ "$result_status" -ne "$status" ]]; then
+      printf 'reporter fixture changed the injected test status: %s (status %s)\n' \
+        "$name" "$status" >&2
+      exit 1
+    fi
+    diagnostics=$(grep '^::error' <<<"$output" || true)
+    if [[ "$diagnostics" != "$expected" || "$output" == *"$canary"* ]]; then
+      printf 'reporter fixture wrapper changed or exposed output: %s (status %s)\n' \
+        "$name" "$status" >&2
+      exit 1
+    fi
+  done
 }
+
+expected_execution_failure() {
+  printf '::error::E2E suite failed (category: execution-failure; reason: %s; checked-out commit: %s; details redacted)' \
+    "$1" "$checked_out_commit"
+}
+
+assert_execution_input_case() {
+  local name="$1" profile="$2" reason="$3" input_path="$4" \
+    require_canary="${5:-yes}" expected status actual output result_status diagnostics
+  expected=$(expected_execution_failure "$reason")
+  if [[ "$require_canary" == yes ]] && ! grep -qF -- "$canary" "$input_path"; then
+    printf 'execution-failure fixture omitted its redaction canary: %s\n' "$name" >&2
+    exit 1
+  fi
+
+  actual=$(report_smoke_failure_diagnostics 37 "$profile" "$input_path")
+  if [[ "$actual" != "$expected" || "$actual" == *"$canary"* \
+    || "$actual" == *'file='* || "$actual" == *'line='* ]]; then
+    printf 'unexpected execution-failure diagnostic: %s\n' "$name" >&2
+    exit 1
+  fi
+
+  if [[ "$profile" == full-suite && -s "$input_path" ]]; then
+    local fixture
+    fixture=$(cat -- "$input_path")
+    assert_case "$name-full-suite-wrapper" "$fixture" "$expected" full-suite
+    return
+  fi
+
+  for status in 1 2; do
+    actual=$(report_smoke_failure_diagnostics "$status" "$profile" "$input_path")
+    if [[ "$actual" != "$expected" || "$actual" == *"$canary"* \
+      || "$actual" == *'file='* || "$actual" == *'line='* ]]; then
+      printf 'execution-failure status fixture changed its diagnostic: %s (status %s)\n' \
+        "$name" "$status" >&2
+      exit 1
+    fi
+
+    if output=$(PATH="$mock_bin:$PATH" RUNNER_TEMP="$runner_temp" \
+      SMOKE_DIAGNOSTICS_ROOT="$fixture_root" SMOKE_OUTPUT_INDENT="$SMOKE_OUTPUT_INDENT" \
+      MOCK_GO_JSON="$input_path" MOCK_GO_STATUS="$status" MOCK_PROFILE="$profile" \
+      bash "$wrapper_script_dir/report-failure.sh" 2>&1); then
+      result_status=0
+    else
+      result_status=$?
+    fi
+    if [[ "$result_status" -ne "$status" ]]; then
+      printf 'reporter changed the injected test status: %s (status %s)\n' \
+        "$name" "$status" >&2
+      exit 1
+    fi
+    diagnostics=$(grep '^::error' <<<"$output" || true)
+    if [[ "$diagnostics" != "$expected" || "$output" == *"$canary"* \
+      || "$diagnostics" == *'file='* || "$diagnostics" == *'line='* ]]; then
+      printf 'reporter wrapper changed or exposed the diagnostic: %s (status %s)\n' \
+        "$name" "$status" >&2
+      exit 1
+    fi
+  done
+}
+
+write_probe_module() {
+  local name="$1" module_path="$2"
+  mkdir -p "$probe_root/$name"
+  cat >"$probe_root/$name/go.mod" <<EOF
+module $module_path
+
+go $probe_go_version
+EOF
+}
+
+write_probe_module timeout example.com/smoke-timeout-probe
+cat >"$probe_root/timeout/timeout_test.go" <<'EOF'
+package fixture
+
+import (
+	"testing"
+	"time"
+)
+
+func TestSmoke(t *testing.T) {
+	time.Sleep(10 * time.Second)
+}
+EOF
+
+write_probe_module race example.com/smoke-race-probe
+cat >"$probe_root/race/race_test.go" <<'EOF'
+package fixture
+
+import (
+	"testing"
+)
+
+var raceValue int
+
+func TestRace(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		raceValue = 1
+		close(done)
+	}()
+	raceValue = 2
+	<-done
+}
+EOF
+
+write_probe_module build example.com/smoke-build-probe
+cat >"$probe_root/build/build_test.go" <<'EOF'
+package fixture
+
+import "testing"
+
+func TestBuildFailure(t *testing.T) {
+	missingDiagnosticProbeSymbol()
+}
+EOF
+
+run_probe() {
+  local name="$1" status=0
+  shift
+  if (cd -- "$probe_root/$name" && go test "$@" .) >"$probe_root/$name.json" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    printf 'Go diagnostic probe unexpectedly passed: %s\n' "$name" >&2
+    exit 1
+  fi
+}
+
+run_probe timeout -json -count=1 -timeout 1s -run '^TestSmoke$'
+run_probe race -race -json -count=1 -run '^TestRace$'
+run_probe build -json -count=1 -timeout 1m -run '^TestBuildFailure$'
+
+probe_attributions=$(python3 - "$probe_root/timeout.json" "$probe_root/race.json" "$probe_root/build.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def events(path):
+    result = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            result.append(json.loads(line))
+    if not result or any(not isinstance(event, dict) for event in result):
+        raise SystemExit("Go diagnostic probe emitted an unexpected event stream")
+    return result
+
+
+timeout_events = events(sys.argv[1])
+timeout_output = [
+    event
+    for event in timeout_events
+    if event.get("Action") == "output"
+    and "panic: test timed out after" in event.get("Output", "")
+]
+if (
+    len(timeout_output) != 1
+    or timeout_output[0].get("Test") != "TestSmoke"
+    or timeout_output[0].get("Output") != "panic: test timed out after 1s\n"
+):
+    raise SystemExit("Go timeout event shape drifted")
+
+race_events = events(sys.argv[2])
+race_output = [
+    event
+    for event in race_events
+    if event.get("Action") == "output" and event.get("Output") == "WARNING: DATA RACE\n"
+]
+if len(race_output) != 1 or race_output[0].get("Test") != "TestRace":
+    raise SystemExit("Go race event shape drifted")
+
+build_events = events(sys.argv[3])
+build_diagnostics = [
+    event for event in build_events if event.get("Action") in {"build-output", "build-fail"}
+]
+if not build_diagnostics or not any(event.get("Action") == "build-fail" for event in build_diagnostics):
+    raise SystemExit("Go build event shape drifted")
+if any(
+    not isinstance(event.get("ImportPath"), str)
+    or "Package" in event
+    or "Test" in event
+    or ("Output" in event and not isinstance(event["Output"], str))
+    for event in build_diagnostics
+):
+    raise SystemExit("Go build event shape drifted")
+terminal_failures = [
+    event
+    for event in build_events
+    if event.get("Action") == "fail"
+    and event.get("Package") == "example.com/smoke-build-probe"
+    and event.get("Test", "") == ""
+]
+if (
+    len(terminal_failures) != 1
+    or not isinstance(terminal_failures[0].get("FailedBuild"), str)
+    or not terminal_failures[0]["FailedBuild"]
+):
+    raise SystemExit("Go FailedBuild event shape drifted")
+
+print(timeout_output[0]["Test"])
+print(race_output[0]["Test"])
+PY
+)
+timeout_test="${probe_attributions%%$'\n'*}"
+race_test="${probe_attributions#*$'\n'}"
+if [[ "$timeout_test" != TestSmoke || "$race_test" != TestRace ]]; then
+  printf 'Go diagnostic probe attribution drifted\n' >&2
+  exit 1
+fi
 
 line_for_text() {
   local path="$1" text="$2" result
@@ -801,56 +1085,262 @@ assert_case untracked-second-source-file \
   "$(expected_unavailable)"
 rm -- "$fixture_root/test/e2e/untracked_second.go"
 
-for execution_failure in race timeout build-failure; do
-  case "$execution_failure" in
-    race)
-      failed_stream=$(json_event output TestOther 'WARNING: DATA RACE')
-      failed_stream+=$'\n'
-      failed_stream+=$(json_event fail "TestSmoke/$scenario_failure")
-      failed_stream+=$'\n'
-      failed_stream+=$(json_event fail TestSmoke)
-      failed_stream+=$'\n'
-      failed_stream+=$(json_event fail '')
-      ;;
-    timeout)
-      failed_stream=$(json_event output TestOther 'panic: test timed out after 15m')
-      failed_stream+=$'\n'
-      failed_stream+=$(json_event fail "TestSmoke/$scenario_failure")
-      failed_stream+=$'\n'
-      failed_stream+=$(json_event fail TestSmoke)
-      failed_stream+=$'\n'
-      failed_stream+=$(json_event fail '')
-      ;;
-    build-failure)
-      failed_stream=$(json_event output '' '# github.com/example/build-error')
-      failed_stream+=$'\n'
-      failed_stream+=$(json_event fail '')
-      ;;
-  esac
-  expected_execution_failure="::error::E2E suite failed (category: execution-failure; checked-out commit: $checked_out_commit; details redacted)"
-  assert_case "$execution_failure" "$failed_stream" "$expected_execution_failure"
+execution_canary_event=$(json_event output TestOther \
+  "untrusted runtime detail ${canary} ::error file=/tmp/forged.go,line=1::forged ::stop-commands::attacker")
+package_terminal_fail=$(json_event fail '')
+
+go_build_event() {
+  local action="$1" import_path="$2" body="$3"
+  jq -cn --arg action "$action" --arg import_path "$import_path" --arg output "$body" \
+    '{Action:$action,ImportPath:$import_path,Output:$output}'
+}
+
+failed_build_terminal() {
+  jq -cn --arg package "$SMOKE_E2E_PACKAGE" --arg failed_build "$1" \
+    '{Package:$package,Action:"fail",FailedBuild:$failed_build}'
+}
+
+write_execution_case() {
+  local name="$1" profile="$2" reason="$3" stream="$4" \
+    prepend_canary="${5:-yes}" require_canary="${6:-yes}" input_path
+  input_path="$fixture_root/$name.json"
+  if [[ "$prepend_canary" == yes ]]; then
+    stream="${execution_canary_event}"$'\n'"$stream"
+  fi
+  printf '%s\n' "$stream" >"$input_path"
+  assert_execution_input_case "$name" "$profile" "$reason" "$input_path" "$require_canary"
+}
+
+timeout_smoke=$(json_event output "$timeout_test" $'panic: test timed out after 2m0s\n')
+timeout_full=$(json_event output "$timeout_test" $'panic: test timed out after 15m0s\n')
+
+smoke_timeout_stream="$timeout_smoke"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+write_execution_case timeout-smoke smoke timeout-signature "$smoke_timeout_stream"
+full_timeout_stream="$timeout_full"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+write_execution_case timeout-full-suite full-suite timeout-signature "$full_timeout_stream"
+
+race_event=$(json_event output "$race_test" $'WARNING: DATA RACE\n')
+race_stream="$race_event"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+write_execution_case race-full-suite full-suite race-signature "$race_stream"
+
+build_stream=$(go_build_event build-output example.com/build-probe "compiler output ${canary}")
+build_stream+=$'\n'
+build_stream+=$(go_build_event build-fail example.com/build-probe "build details ${canary}")
+build_stream+=$'\n'
+build_stream+=$(failed_build_terminal "private build value ${canary}")
+write_execution_case build-failure full-suite build-failure-signature "$build_stream"
+
+# The concrete regression: an output event is followed by a line truncated in
+# the middle of a JSON object. Cutting the same input on the previous newline is
+# an incomplete stream instead.
+truncated_line='{"Package":"github.com/teagramhq/teagram-server/test/e2e","Action":"fail","Test":'
+write_execution_case mid-line-truncated-json smoke invalid-stream "$truncated_line"
+write_execution_case line-boundary-truncated-json smoke incomplete-stream ''
+
+missing_terminal_stream=$(json_event fail "TestSmoke/$scenario_failure")
+write_execution_case missing-package-terminal smoke incomplete-stream "$missing_terminal_stream"
+empty_input="$fixture_root/empty.json"
+: >"$empty_input"
+assert_execution_input_case empty-stream smoke incomplete-stream "$empty_input" no
+
+timeout_incomplete_stream="$timeout_full"$'\n'"$(json_event fail "TestSmoke/$scenario_failure")"
+write_execution_case incomplete-before-signature full-suite incomplete-stream "$timeout_incomplete_stream"
+
+non_json_input="$fixture_root/non-json-first-line.json"
+printf '::error file=/tmp/forged.go,line=1::%s ::stop-commands::attacker\n%s\n%s\n' \
+  "$canary" "$execution_canary_event" "$package_terminal_fail" >"$non_json_input"
+assert_execution_input_case non-json-command-injection smoke invalid-stream "$non_json_input"
+
+wrong_package=$(jq -cn --arg output "private runtime ${canary}" \
+  '{Package:"example.com/wrong-package",Action:"output",Test:"TestOther",Output:$output}')
+write_execution_case wrong-package smoke invalid-stream "$wrong_package"
+
+unknown_action=$(json_event mystery TestOther "private runtime ${canary}")
+write_execution_case unknown-action smoke invalid-stream "$unknown_action"
+
+non_string_test=$(jq -cn --arg package "$SMOKE_E2E_PACKAGE" --arg output "$canary" \
+  '{Package:$package,Action:"output",Test:7,Output:$output}')
+write_execution_case non-string-test smoke invalid-stream "$non_string_test"
+
+non_string_output=$(jq -cn --arg package "$SMOKE_E2E_PACKAGE" \
+  '{Package:$package,Action:"output",Test:"TestOther",Output:7}')
+write_execution_case non-string-output smoke invalid-stream "$non_string_output"
+
+non_string_failed_build=$(jq -cn --arg package "$SMOKE_E2E_PACKAGE" \
+  '{Package:$package,Action:"fail",FailedBuild:7}')
+write_execution_case non-string-failed-build smoke invalid-stream "$non_string_failed_build"
+
+json_array='[]'
+write_execution_case json-array smoke invalid-stream "$json_array"
+
+bad_build_event=$(jq -cn '{Action:"build-fail",Package:"example.com/build-probe",ImportPath:"example.com/build-probe"}')
+write_execution_case build-event-with-package smoke invalid-stream "$bad_build_event"
+bad_build_event=$(jq -cn '{Action:"build-output",Test:"TestBuild",ImportPath:"example.com/build-probe",Output:"secret"}')
+write_execution_case build-event-with-test smoke invalid-stream "$bad_build_event"
+bad_build_event=$(jq -cn '{Action:"build-fail",Output:"missing import path"}')
+write_execution_case build-event-without-import-path smoke invalid-stream "$bad_build_event"
+
+invalid_utf8_input="$fixture_root/invalid-utf8.json"
+printf '%s\n' "$execution_canary_event" >"$invalid_utf8_input"
+printf '{"Package":"github.com/teagramhq/teagram-server/test/e2e","Action":"output","Test":"TestOther","Output":"\377"}\n' >>"$invalid_utf8_input"
+printf '%s\n%s\n%s\n' "$timeout_full" "$(json_event fail "TestSmoke/$scenario_failure")" "$package_terminal_fail" >>"$invalid_utf8_input"
+assert_execution_input_case invalid-utf8 smoke invalid-stream "$invalid_utf8_input"
+
+forged_timeout_cases=(
+  "noise panic: test timed out after 15m0s"
+  "panic: test timed out after 15m0s with trailing text"
+  "panic: test timed out after 2m0s"
+  $'panic: test timed out after 15m0s\ncontinuation'
+)
+for index in "${!forged_timeout_cases[@]}"; do
+  forged_event=$(json_event output "$timeout_test" "${forged_timeout_cases[$index]}")
+  forged_stream="$forged_event"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+  write_execution_case "forged-timeout-$index" full-suite unknown "$forged_stream"
 done
 
-truncated_stream=$(json_event fail "TestSmoke/$scenario_failure")
-expected_execution_failure="::error::E2E suite failed (category: execution-failure; checked-out commit: $checked_out_commit; details redacted)"
-assert_case truncated-json "$truncated_stream" "$expected_execution_failure"
+repeated_timeout_stream="$timeout_full"$'\n'"$timeout_full"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+write_execution_case repeated-timeout full-suite unknown "$repeated_timeout_stream"
+
+split_timeout_stream=$(json_event output "$timeout_test" 'panic: test timed out after')
+split_timeout_stream+=$'\n'
+split_timeout_stream+=$(json_event output "$timeout_test" '15m0s')
+split_timeout_stream+=$'\n'
+split_timeout_stream+=$(failure_fixture "TestSmoke/$scenario_failure")
+write_execution_case split-timeout-continuation full-suite unknown "$split_timeout_stream"
+
+race_smoke_stream="$race_event"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+write_execution_case race-in-smoke smoke unknown "$race_smoke_stream"
+
+midline_race=$(json_event output "$race_test" 'text before WARNING: DATA RACE\n')
+midline_race+=$'\n'
+midline_race+=$(failure_fixture "TestSmoke/$scenario_failure")
+write_execution_case midline-race full-suite unknown "$midline_race"
+
+race_timeout_stream="$race_event"$'\n'"$timeout_full"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+write_execution_case overlapping-race-timeout full-suite unknown "$race_timeout_stream"
+
+build_timeout_stream="$build_stream"$'\n'"$timeout_full"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+write_execution_case overlapping-build-timeout full-suite unknown "$build_timeout_stream"
+
+valid_assertion_event=$(json_event output "TestSmoke/$scenario_failure" \
+  "${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${direct_id}] assertion ${canary}"$'\n')
+forged_assertion_stream="$valid_assertion_event"$'\n'"$(json_event output "$timeout_test" 'panic: test timed out after 15m0s in test output')"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+write_execution_case forged-signature-with-assertion full-suite unknown "$forged_assertion_stream"
+
+invalid_timeout_stream='not-json'
+invalid_timeout_stream+=$'\n'
+invalid_timeout_stream+="$timeout_full"
+invalid_timeout_stream+=$'\n'
+invalid_timeout_stream+=$(failure_fixture "TestSmoke/$scenario_failure")
+write_execution_case invalid-before-signature smoke invalid-stream "$invalid_timeout_stream"
+
+terminal_build=$(failed_build_terminal "private build value ${canary}")
+build_failure_event=$(go_build_event build-fail example.com/build-probe "${canary}")
+build_signature_stream="$build_failure_event"$'\n'"$terminal_build"
+write_execution_case build-failure-signature full-suite build-failure-signature "$build_signature_stream"
+
+timeout_status_pass="$timeout_full"$'\n'"$(json_event pass TestSmoke)"$'\n'"$(json_event pass '')"
+write_execution_case status-without-failure-event full-suite status-without-failure-event "$timeout_status_pass"
+
+stream_unavailable="$fixture_root/no-such-directory/input.json"
+assert_execution_input_case unavailable-input smoke stream-unavailable "$stream_unavailable" no
+assert_execution_input_case reporter-read-exception smoke unknown "$fixture_root" no
+
+configuration_input="$fixture_root/configuration-canary.json"
+printf '%s\n%s\n' "$execution_canary_event" "$(json_event pass '')" >"$configuration_input"
+configuration_bad_input="$fixture_root/configuration-invalid.json"
+printf '%s\n' 'not-json' >"$configuration_bad_input"
+
+assert_configuration_case() {
+  local name="$1" scenario_csv="$2" profile="$3" omit_profile="$4" \
+    input_path="$5" alternate_input="${6:-}" expected actual alternate \
+    status output result_status diagnostics scenario_value
+  expected=$(expected_execution_failure invalid-configuration)
+
+  if [[ -n "$scenario_csv" ]]; then
+    IFS=',' read -r -a SMOKE_SCENARIOS <<<"$scenario_csv"
+  else
+    SMOKE_SCENARIOS=()
+  fi
+  if [[ "$omit_profile" == true ]]; then
+    actual=$(report_smoke_failure_diagnostics 1 -- "$input_path")
+  else
+    actual=$(report_smoke_failure_diagnostics 1 "$profile" "$input_path")
+  fi
+  if [[ "$actual" != "$expected" || "$actual" == *"$canary"* \
+    || "$actual" == *'file='* || "$actual" == *'line='* ]]; then
+    printf 'invalid configuration did not fail closed: %s\n' "$name" >&2
+    exit 1
+  fi
+  if [[ -n "$alternate_input" ]]; then
+    if [[ "$omit_profile" == true ]]; then
+      alternate=$(report_smoke_failure_diagnostics 1 -- "$alternate_input")
+    else
+      alternate=$(report_smoke_failure_diagnostics 1 "$profile" "$alternate_input")
+    fi
+    if [[ "$alternate" != "$actual" ]]; then
+      printf 'invalid configuration read its input stream: %s\n' "$name" >&2
+      exit 1
+    fi
+  fi
+
+  for status in 1 2; do
+    if [[ "${SMOKE_SCENARIOS[*]}" == *' '* ]]; then
+      scenario_value=$(IFS=,; printf '%s' "${SMOKE_SCENARIOS[*]}")
+    else
+      scenario_value="$scenario_csv"
+    fi
+    if output=$(PATH="$mock_bin:$PATH" RUNNER_TEMP="$runner_temp" \
+      SMOKE_DIAGNOSTICS_ROOT="$fixture_root" SMOKE_OUTPUT_INDENT="$SMOKE_OUTPUT_INDENT" \
+      MOCK_GO_JSON="$input_path" MOCK_GO_STATUS="$status" MOCK_PROFILE="$profile" \
+      MOCK_SCENARIOS="$scenario_value" MOCK_OMIT_PROFILE="$omit_profile" \
+      bash "$wrapper_script_dir/report-failure.sh" 2>&1); then
+      result_status=0
+    else
+      result_status=$?
+    fi
+    if [[ "$result_status" -ne "$status" ]]; then
+      printf 'invalid reporter configuration changed test status: %s\n' "$name" >&2
+      exit 1
+    fi
+    diagnostics=$(grep '^::error' <<<"$output" || true)
+    if [[ "$diagnostics" != "$expected" || "$output" == *"$canary"* \
+      || "$diagnostics" == *'file='* || "$diagnostics" == *'line='* ]]; then
+      printf 'invalid configuration wrapper exposed input or changed output: %s\n' "$name" >&2
+      exit 1
+    fi
+  done
+  SMOKE_SCENARIOS=(peer-disconnect)
+}
+
+assert_configuration_case duplicate-scenarios 'peer-disconnect,peer-disconnect' smoke false \
+  "$configuration_input" "$configuration_bad_input"
+assert_configuration_case invalid-scenario-grammar 'peer_disconnect' smoke false \
+  "$configuration_input" "$configuration_bad_input"
+assert_configuration_case unknown-profile peer-disconnect unknown false \
+  "$configuration_input" "$configuration_bad_input"
+assert_configuration_case missing-profile peer-disconnect '' true \
+  "$configuration_input" "$fixture_root/no-such-directory/missing.json"
+
+invalid_config_missing_scenarios="$fixture_root/missing-scenarios.json"
+printf '%s\n' "$execution_canary_event" >"$invalid_config_missing_scenarios"
+assert_configuration_case missing-scenarios '' smoke false \
+  "$invalid_config_missing_scenarios" "$configuration_bad_input"
+
+passing_fixture="$execution_canary_event"$'\n'"$(json_event pass "TestSmoke/$scenario_failure")"$'\n'"$(json_event pass TestSmoke)"$'\n'"$(json_event pass '')"
+passing_path="$fixture_root/passing.json"
+printf '%s\n' "$passing_fixture" >"$passing_path"
+passing_diagnostics=$(report_smoke_failure_diagnostics 0 smoke "$passing_path")
+if [[ -n "$passing_diagnostics" ]]; then
+  printf 'passing smoke fixture produced diagnostics\n' >&2
+  exit 1
+fi
 
 outside_failure=$(json_event fail TestOther)
 outside_failure+=$'\n'
 outside_failure+=$(json_event fail '')
 expected_suite_failure="::error::E2E suite failed (category: suite-failure; checked-out commit: $checked_out_commit; details redacted)"
 assert_case failure-outside-smoke "$outside_failure" "$expected_suite_failure"
-
-non_json_fixture="${canary} ${paired_body}"$'\n'
-non_json_fixture+=$(failure_fixture "TestSmoke/$scenario_failure")
-assert_case non-json-input "$non_json_fixture" "$expected_execution_failure"
-
-passing_fixture=$(json_event pass "TestSmoke/$scenario_failure" "$canary")
-passing_diagnostics=$(report_smoke_failure_diagnostics 0 <<<"$passing_fixture")
-if [[ -n "$passing_diagnostics" ]]; then
-  printf 'passing smoke fixture produced diagnostics\n' >&2
-  exit 1
-fi
 
 raw_text="::error file=/tmp/forged.go,line=1::${canary} ::stop-commands::attacker"$'\n'
 raw_json="$fixture_root/raw-output.json"

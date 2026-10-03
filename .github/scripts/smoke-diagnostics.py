@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
@@ -29,8 +30,24 @@ FUNCTION_DECL = re.compile(
 )
 ASSERTION_MARKER = "[assert:"
 RACE_OUTPUT = re.compile(r"(?i)(?:WARNING: DATA RACE|race detected during execution)")
-TIMEOUT_OUTPUT = re.compile(r"panic: test timed out after")
-JSON_ACTIONS = {"start", "run", "pause", "cont", "output", "pass", "bench", "fail", "skip"}
+TIMEOUT_OUTPUT = re.compile(r"(?i)panic: test timed out after")
+JSON_ACTIONS = {
+    "start",
+    "run",
+    "pause",
+    "cont",
+    "output",
+    "pass",
+    "bench",
+    "fail",
+    "skip",
+}
+BUILD_ACTIONS = {"build-output", "build-fail"}
+REPORT_PROFILES = {
+    "smoke": {"race": False, "timeout": "2m0s"},
+    "full-suite": {"race": True, "timeout": "15m0s"},
+}
+TIMEOUT_TEST = "TestSmoke"
 
 
 @dataclass(frozen=True)
@@ -85,6 +102,15 @@ class OutputRecord:
     safe_legacy_location: tuple[str, int] | None
 
 
+@dataclass(frozen=True)
+class EventStream:
+    output_records: dict[str, list[OutputRecord]]
+    failed_tests: set[str]
+    output_events: tuple[tuple[str, str], ...]
+    terminal_event: dict[str, object] | None
+    issue: str | None
+
+
 def run_git(root: str, *args: str) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(
@@ -100,55 +126,79 @@ def run_git(root: str, *args: str) -> subprocess.CompletedProcess[str] | None:
 
 
 def checked_out_commit(root: str) -> str:
-    result = run_git(root, "rev-parse", "--verify", "HEAD^{commit}")
-    if result is None or result.returncode != 0:
+    try:
+        result = run_git(root, "rev-parse", "--verify", "HEAD^{commit}")
+        if result is None or result.returncode != 0:
+            return "unavailable"
+        commit = result.stdout.strip()
+        return commit if re.fullmatch(r"[0-9a-f]{40}", commit) else "unavailable"
+    except Exception:
         return "unavailable"
-    commit = result.stdout.strip()
-    return commit if re.fullmatch(r"[0-9a-f]{40}", commit) else "unavailable"
 
 
 def read_event_stream(
     source: TextIO, package: str, indent: str
-) -> tuple[dict[str, list[OutputRecord]], set[str], bool, bool]:
+) -> EventStream:
     records: dict[str, list[OutputRecord]] = {}
     failed_tests: set[str] = set()
-    race_or_timeout = False
-    has_events = False
-    last_action = ""
-    last_test = ""
-    for raw_line in source:
-        if not raw_line.strip():
-            continue
-        try:
-            event = json.loads(raw_line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}, set(), False, False
-        if (
-            not isinstance(event, dict)
-            or event.get("Package") != package
-            or not isinstance(event.get("Action"), str)
-            or event["Action"] not in JSON_ACTIONS
-        ):
-            return {}, set(), False, False
-        if "Test" in event and event["Test"] is not None and not isinstance(event["Test"], str):
-            return {}, set(), False, False
-        if "Output" in event and not isinstance(event["Output"], str):
-            return {}, set(), False, False
-        has_events = True
-        last_action = event["Action"]
-        last_test = event.get("Test") or ""
-        if last_action == "fail":
-            failed_tests.add(last_test)
-        if last_action == "output":
-            test = event.get("Test") or ""
-            output = event.get("Output", "")
-            if RACE_OUTPUT.search(output) or TIMEOUT_OUTPUT.search(output):
-                race_or_timeout = True
-            if test.startswith("TestSmoke"):
-                records.setdefault(test, []).append(output_record(test, output, indent))
+    output_events: list[tuple[str, str]] = []
+    last_event: dict[str, object] | None = None
 
-    complete = has_events and last_test == "" and last_action in {"pass", "fail"}
-    return records, failed_tests, complete, race_or_timeout
+    try:
+        for raw_line in source:
+            if not raw_line.strip():
+                continue
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                return EventStream({}, set(), (), None, "invalid-stream")
+            if (
+                not isinstance(event, dict)
+                or not isinstance(event.get("Action"), str)
+                or event["Action"] not in (JSON_ACTIONS | BUILD_ACTIONS)
+            ):
+                return EventStream({}, set(), (), None, "invalid-stream")
+
+            action = event["Action"]
+            if action in BUILD_ACTIONS:
+                if (
+                    "Package" in event
+                    or "Test" in event
+                    or not isinstance(event.get("ImportPath"), str)
+                ):
+                    return EventStream({}, set(), (), None, "invalid-stream")
+            elif event.get("Package") != package:
+                return EventStream({}, set(), (), None, "invalid-stream")
+
+            if any(
+                field in event and not isinstance(event[field], str)
+                for field in ("Test", "Output", "FailedBuild")
+            ):
+                return EventStream({}, set(), (), None, "invalid-stream")
+
+            last_event = event
+            if action == "fail":
+                failed_tests.add(event.get("Test", ""))
+            if action == "output":
+                test = event.get("Test", "")
+                output = event.get("Output", "")
+                output_events.append((test, output))
+                if test.startswith("TestSmoke"):
+                    records.setdefault(test, []).append(output_record(test, output, indent))
+    except UnicodeDecodeError:
+        return EventStream({}, set(), (), None, "invalid-stream")
+
+    if (
+        last_event is None
+        or last_event.get("Action") not in {"pass", "fail"}
+        or last_event.get("Package") != package
+        or last_event.get("Test", "") != ""
+    ):
+        return EventStream(
+            records, failed_tests, tuple(output_events), None, "incomplete-stream"
+        )
+
+    return EventStream(records, failed_tests, tuple(output_events), last_event, None)
 
 
 def output_record(test: str, output: str, indent: str) -> OutputRecord:
@@ -1129,37 +1179,37 @@ def report_failure(
     root: str,
     indent: str,
     scenarios: list[str],
+    profile: str,
     source: TextIO,
+    output: TextIO,
 ) -> int:
     if status == 0:
         return 0
 
     sha = checked_out_commit(root)
-    if len(set(scenarios)) != len(scenarios) or any(
-        re.fullmatch(r"[a-z0-9-]+", scenario) is None for scenario in scenarios
-    ):
+    stream = read_event_stream(source, package, indent)
+    if stream.issue is not None:
+        print(execution_failure_annotation(sha, stream.issue), file=output)
+        return 0
+
+    terminal = stream.terminal_event
+    if terminal is None:
+        print(execution_failure_annotation(sha, "incomplete-stream"), file=output)
+        return 0
+    if terminal["Action"] == "pass":
         print(
-            f"::error::E2E suite failed (category: execution-failure; "
-            f"checked-out commit: {sha}; details redacted)"
+            execution_failure_annotation(sha, "status-without-failure-event"),
+            file=output,
         )
         return 0
 
-    output_records, failed_tests, complete, race_or_timeout = read_event_stream(
-        source, package, indent
-    )
-    if not complete:
-        print(
-            f"::error::E2E suite failed (category: execution-failure; "
-            f"checked-out commit: {sha}; details redacted)"
-        )
+    reason = signature_reason(stream, profile)
+    if reason is not None:
+        print(execution_failure_annotation(sha, reason), file=output)
         return 0
 
-    if race_or_timeout:
-        print(
-            f"::error::E2E suite failed (category: execution-failure; "
-            f"checked-out commit: {sha}; details redacted)"
-        )
-        return 0
+    output_records = stream.output_records
+    failed_tests = stream.failed_tests
 
     failed_scenarios: set[str] = set()
     unknown_smoke_failure = False
@@ -1184,24 +1234,21 @@ def report_failure(
         if parent_failed or unknown_smoke_failure:
             print(
                 f"::error::TestSmoke failed (category: suite-failure; "
-                f"checked-out commit: {sha}; details redacted)"
+                f"checked-out commit: {sha}; details redacted)", file=output
             )
         elif has_non_smoke_failure:
             print(
                 f"::error::E2E suite failed (category: suite-failure; "
-                f"checked-out commit: {sha}; details redacted)"
+                f"checked-out commit: {sha}; details redacted)", file=output
             )
         else:
-            print(
-                f"::error::E2E suite failed (category: execution-failure; "
-                f"checked-out commit: {sha}; details redacted)"
-            )
+            print(execution_failure_annotation(sha, "unknown"), file=output)
         return 0
 
     if unknown_smoke_failure:
         print(
             f"::error::TestSmoke failed (category: suite-failure; "
-            f"checked-out commit: {sha}; details redacted)"
+            f"checked-out commit: {sha}; details redacted)", file=output
         )
 
     parent_records = output_records.get("TestSmoke", [])
@@ -1249,17 +1296,17 @@ def report_failure(
                     sha,
                 )
                 if annotation is not None:
-                    print(annotation)
+                    print(annotation, file=output)
                     continue
-            print(format_unavailable(scenario, sha))
+            print(format_unavailable(scenario, sha), file=output)
             continue
 
         if scenario in nested_failures:
-            print(format_unavailable(scenario, sha))
+            print(format_unavailable(scenario, sha), file=output)
             continue
 
         if sha == "unavailable" or not indent:
-            print(format_unavailable(scenario, sha))
+            print(format_unavailable(scenario, sha), file=output)
             continue
         legacy: tuple[str, int] | None = None
         for record in exact_records:
@@ -1268,26 +1315,78 @@ def report_failure(
                 if legacy is not None:
                     break
         if legacy is None:
-            print(format_unavailable(scenario, sha))
+            print(format_unavailable(scenario, sha), file=output)
             continue
         path, line = legacy
         print(
             f"::error file={path},line={line}::TestSmoke/{scenario} failed "
             f"(category: scenario-failure; location: {path}:{line}; "
-            f"checked-out commit: {sha}; details redacted)"
+            f"checked-out commit: {sha}; details redacted)", file=output
         )
 
     if has_non_smoke_failure:
         print(
             f"::error::E2E suite failed (category: suite-failure; "
-            f"checked-out commit: {sha}; details redacted)"
+            f"checked-out commit: {sha}; details redacted)", file=output
         )
     if parent_failed and not failed_scenarios:
         print(
             f"::error::TestSmoke failed (category: suite-failure; "
-            f"checked-out commit: {sha}; details redacted)"
+            f"checked-out commit: {sha}; details redacted)", file=output
         )
     return 0
+
+
+def execution_failure_annotation(sha: str, reason: str) -> str:
+    return (
+        f"::error::E2E suite failed (category: execution-failure; reason: {reason}; "
+        f"checked-out commit: {sha}; details redacted)"
+    )
+
+
+def signature_reason(stream: EventStream, profile: str) -> str | None:
+    terminal = stream.terminal_event
+    if terminal is None or terminal.get("Action") != "fail":
+        return None
+
+    settings = REPORT_PROFILES[profile]
+    signatures: set[str] = set()
+    failed_build = terminal.get("FailedBuild", "")
+    if failed_build:
+        signatures.add("build-failure-signature")
+
+    timeout_events = [
+        (test, text)
+        for test, text in stream.output_events
+        if TIMEOUT_OUTPUT.search(text)
+    ]
+    if timeout_events:
+        exact_timeout = [
+            (test, text)
+            for test, text in timeout_events
+            if test == TIMEOUT_TEST
+            and text == f"panic: test timed out after {settings['timeout']}\n"
+        ]
+        if len(timeout_events) != 1 or len(exact_timeout) != 1:
+            return "unknown"
+        signatures.add("timeout-signature")
+
+    race_events = [
+        (test, text)
+        for test, text in stream.output_events
+        if RACE_OUTPUT.search(text)
+    ]
+    if race_events:
+        exact_race = [
+            text for _test, text in race_events if text == "WARNING: DATA RACE\n"
+        ]
+        if not settings["race"] or len(exact_race) != len(race_events):
+            return "unknown"
+        signatures.add("race-signature")
+
+    if len(signatures) > 1:
+        return "unknown"
+    return next(iter(signatures), None)
 
 
 def parent_records_with_markers(records: list[OutputRecord]) -> bool:
@@ -1299,8 +1398,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--status", type=int, required=True)
     parser.add_argument("--package", required=True)
     parser.add_argument("--root", required=True)
+    parser.add_argument("--profile")
     parser.add_argument("--indent", default="")
-    parser.add_argument("--scenario", action="append", required=True)
+    parser.add_argument("--scenario", action="append", default=[])
     parser.add_argument("input", nargs="?", default="-")
     return parser.parse_args()
 
@@ -1308,27 +1408,57 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     root = os.path.realpath(args.root)
-    try:
-        source = sys.stdin if args.input == "-" else open(args.input, "r", encoding="utf-8")
-    except OSError:
-        if args.status != 0:
-            print(
-                f"::error::E2E suite failed (category: execution-failure; "
-                f"checked-out commit: {checked_out_commit(root)}; details redacted)"
-            )
+    sha = checked_out_commit(root)
+    invalid_configuration = (
+        args.profile not in REPORT_PROFILES
+        or not args.scenario
+        or len(set(args.scenario)) != len(args.scenario)
+        or any(
+            re.fullmatch(r"[a-z0-9-]+", scenario) is None
+            for scenario in args.scenario
+        )
+    )
+    if invalid_configuration:
+        print(execution_failure_annotation(sha, "invalid-configuration"))
         return 0
+    if args.status == 0:
+        return 0
+
     try:
-        return report_failure(
+        source = (
+            sys.stdin
+            if args.input == "-"
+            else open(args.input, "r", encoding="utf-8")
+        )
+    except OSError:
+        print(execution_failure_annotation(sha, "stream-unavailable"))
+        return 0
+    except Exception:
+        print(execution_failure_annotation(sha, "unknown"))
+        return 0
+
+    report_output = io.StringIO()
+    try:
+        result = report_failure(
             args.status,
             args.package,
             root,
             args.indent,
             args.scenario,
+            args.profile,
             source,
+            report_output,
         )
-    finally:
         if source is not sys.stdin:
             source.close()
+    except Exception:
+        report_output.close()
+        print(execution_failure_annotation(sha, "unknown"))
+        return 0
+
+    sys.stdout.write(report_output.getvalue())
+    report_output.close()
+    return result
 
 
 if __name__ == "__main__":

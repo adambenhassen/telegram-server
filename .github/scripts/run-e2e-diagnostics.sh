@@ -17,7 +17,7 @@ if [[ "$command_token" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 
 if [[ "$status" -ne 0 ]]; then
-  report_smoke_failure_diagnostics "$status" "$json_file" || true
+  report_smoke_failure_diagnostics "$status" full-suite "$json_file" || true
   exit "$status"
 fi
 
