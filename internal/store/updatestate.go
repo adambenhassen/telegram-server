@@ -15,12 +15,11 @@ import (
 type EventType int
 
 const (
-	EventNewMessage           EventType = 1
-	EventEdit                 EventType = 2
-	EventDelete               EventType = 3
-	EventReadIn               EventType = 4
-	EventReadOut              EventType = 5
-	EventChatParticipantAdmin EventType = 6
+	EventNewMessage EventType = 1
+	EventEdit       EventType = 2
+	EventDelete     EventType = 3
+	EventReadIn     EventType = 4
+	EventReadOut    EventType = 5
 )
 
 // State is a user's current update sequence, mirroring updates.State on the

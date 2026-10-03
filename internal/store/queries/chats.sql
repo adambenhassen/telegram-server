@@ -42,6 +42,48 @@ INSERT INTO chat_admin_events (chat_id, user_id, is_admin, version)
 VALUES ($1, $2, $3, $4)
 RETURNING *;
 
+-- InsertChatAdminEventRecipients persists the membership snapshot from the
+-- same chat mutation transaction as the role and version change.
+-- name: InsertChatAdminEventRecipients :exec
+INSERT INTO chat_admin_event_recipients (event_id, owner_id)
+SELECT sqlc.arg(event_id)::bigint, recipient.owner_id
+FROM unnest(sqlc.arg(owner_ids)::bigint[]) AS recipient(owner_id)
+ON CONFLICT (event_id, owner_id) DO NOTHING;
+
+-- ChatAdminEventRecipientsByEvent returns only recipients who remain members;
+-- a delayed live push must not disclose an admin event after a member leaves.
+-- name: ChatAdminEventRecipientsByEvent :many
+SELECT recipient.owner_id
+FROM chat_admin_event_recipients AS recipient
+JOIN chat_admin_events AS event ON event.id = recipient.event_id
+JOIN chat_participants AS participant
+  ON participant.chat_id = event.chat_id
+ AND participant.user_id = recipient.owner_id
+WHERE recipient.event_id = $1
+ORDER BY recipient.owner_id;
+
+-- ChatAdminSnapshotsForMember replays the latest current role for every target
+-- whose admin state this member was entitled to observe. It is a durable pull
+-- path independent of pts and request date, so a missed transient notification
+-- cannot strand the client at the old role.
+-- name: ChatAdminSnapshotsForMember :many
+SELECT DISTINCT ON (event.chat_id, event.user_id)
+       event.chat_id,
+       event.user_id,
+       target.is_admin,
+       chat.version
+FROM chat_admin_event_recipients AS recipient
+JOIN chat_admin_events AS event ON event.id = recipient.event_id
+JOIN chat_participants AS viewer
+  ON viewer.chat_id = event.chat_id
+ AND viewer.user_id = recipient.owner_id
+JOIN chats AS chat ON chat.id = event.chat_id
+JOIN chat_participants AS target
+  ON target.chat_id = event.chat_id
+ AND target.user_id = event.user_id
+WHERE recipient.owner_id = $1
+ORDER BY event.chat_id, event.user_id, event.id DESC;
+
 -- name: ChatAdminEventsByIDs :many
 SELECT * FROM chat_admin_events
 WHERE id = ANY(sqlc.arg(event_ids)::bigint[])

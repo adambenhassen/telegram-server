@@ -28,6 +28,39 @@ func (q *Queries) BumpChatVersion(ctx context.Context, id int64) (Chat, error) {
 	return i, err
 }
 
+const chatAdminEventRecipientsByEvent = `-- name: ChatAdminEventRecipientsByEvent :many
+SELECT recipient.owner_id
+FROM chat_admin_event_recipients AS recipient
+JOIN chat_admin_events AS event ON event.id = recipient.event_id
+JOIN chat_participants AS participant
+  ON participant.chat_id = event.chat_id
+ AND participant.user_id = recipient.owner_id
+WHERE recipient.event_id = $1
+ORDER BY recipient.owner_id
+`
+
+// ChatAdminEventRecipientsByEvent returns only recipients who remain members;
+// a delayed live push must not disclose an admin event after a member leaves.
+func (q *Queries) ChatAdminEventRecipientsByEvent(ctx context.Context, eventID int64) ([]int64, error) {
+	rows, err := q.db.Query(ctx, chatAdminEventRecipientsByEvent, eventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var owner_id int64
+		if err := rows.Scan(&owner_id); err != nil {
+			return nil, err
+		}
+		items = append(items, owner_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const chatAdminEventsByIDs = `-- name: ChatAdminEventsByIDs :many
 SELECT id, chat_id, user_id, is_admin, version FROM chat_admin_events
 WHERE id = ANY($1::bigint[])
@@ -45,6 +78,61 @@ func (q *Queries) ChatAdminEventsByIDs(ctx context.Context, eventIds []int64) ([
 		var i ChatAdminEvent
 		if err := rows.Scan(
 			&i.ID,
+			&i.ChatID,
+			&i.UserID,
+			&i.IsAdmin,
+			&i.Version,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const chatAdminSnapshotsForMember = `-- name: ChatAdminSnapshotsForMember :many
+SELECT DISTINCT ON (event.chat_id, event.user_id)
+       event.chat_id,
+       event.user_id,
+       target.is_admin,
+       chat.version
+FROM chat_admin_event_recipients AS recipient
+JOIN chat_admin_events AS event ON event.id = recipient.event_id
+JOIN chat_participants AS viewer
+  ON viewer.chat_id = event.chat_id
+ AND viewer.user_id = recipient.owner_id
+JOIN chats AS chat ON chat.id = event.chat_id
+JOIN chat_participants AS target
+  ON target.chat_id = event.chat_id
+ AND target.user_id = event.user_id
+WHERE recipient.owner_id = $1
+ORDER BY event.chat_id, event.user_id, event.id DESC
+`
+
+type ChatAdminSnapshotsForMemberRow struct {
+	ChatID  int64
+	UserID  int64
+	IsAdmin bool
+	Version int32
+}
+
+// ChatAdminSnapshotsForMember replays the latest current role for every target
+// whose admin state this member was entitled to observe. It is a durable pull
+// path independent of pts and request date, so a missed transient notification
+// cannot strand the client at the old role.
+func (q *Queries) ChatAdminSnapshotsForMember(ctx context.Context, ownerID int64) ([]ChatAdminSnapshotsForMemberRow, error) {
+	rows, err := q.db.Query(ctx, chatAdminSnapshotsForMember, ownerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChatAdminSnapshotsForMemberRow
+	for rows.Next() {
+		var i ChatAdminSnapshotsForMemberRow
+		if err := rows.Scan(
 			&i.ChatID,
 			&i.UserID,
 			&i.IsAdmin,
@@ -427,6 +515,25 @@ func (q *Queries) InsertChatAdminEvent(ctx context.Context, arg InsertChatAdminE
 		&i.Version,
 	)
 	return i, err
+}
+
+const insertChatAdminEventRecipients = `-- name: InsertChatAdminEventRecipients :exec
+INSERT INTO chat_admin_event_recipients (event_id, owner_id)
+SELECT $1::bigint, recipient.owner_id
+FROM unnest($2::bigint[]) AS recipient(owner_id)
+ON CONFLICT (event_id, owner_id) DO NOTHING
+`
+
+type InsertChatAdminEventRecipientsParams struct {
+	EventID  int64
+	OwnerIds []int64
+}
+
+// InsertChatAdminEventRecipients persists the membership snapshot from the
+// same chat mutation transaction as the role and version change.
+func (q *Queries) InsertChatAdminEventRecipients(ctx context.Context, arg InsertChatAdminEventRecipientsParams) error {
+	_, err := q.db.Exec(ctx, insertChatAdminEventRecipients, arg.EventID, arg.OwnerIds)
+	return err
 }
 
 const insertChatParticipant = `-- name: InsertChatParticipant :exec

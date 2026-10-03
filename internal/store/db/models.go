@@ -125,6 +125,11 @@ type ChatAdminEvent struct {
 	Version int32
 }
 
+type ChatAdminEventRecipient struct {
+	EventID int64
+	OwnerID int64
+}
+
 type ChatParticipant struct {
 	ChatID    int64
 	UserID    int64

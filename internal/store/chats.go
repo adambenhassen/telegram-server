@@ -340,6 +340,12 @@ func (s *Store) SetChatAdmin(ctx context.Context, chatID, targetID, callerID int
 	if err != nil {
 		return false, 0, fmt.Errorf("insert chat admin event: %w", err)
 	}
+	if err := m.qtx.InsertChatAdminEventRecipients(ctx, db.InsertChatAdminEventRecipientsParams{
+		EventID:  event.ID,
+		OwnerIds: m.members,
+	}); err != nil {
+		return false, 0, fmt.Errorf("insert chat admin event recipients: %w", err)
+	}
 	if err := m.tx.Commit(ctx); err != nil {
 		return false, 0, fmt.Errorf("commit: %w", err)
 	}

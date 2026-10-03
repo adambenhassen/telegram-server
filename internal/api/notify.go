@@ -226,9 +226,9 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	}
 }
 
-// DeliverChatAdmin pushes one persisted chat-admin event to the chat's current
-// members as a transient update. The chat version and full-chat participant
-// snapshot repair clients that miss this best-effort notification.
+// DeliverChatAdmin pushes one persisted chat-admin event to its original
+// recipients who remain members. The durable recipient markers are also read
+// by getDifference, so this transient notification is only a low-latency path.
 func (u *Updater) DeliverChatAdmin(ctx context.Context, chatID, eventID int64) {
 	events, err := u.h.store.ChatAdminEventsByIDs(ctx, []int64{eventID})
 	if err != nil {
@@ -244,9 +244,9 @@ func (u *Updater) DeliverChatAdmin(ctx context.Context, chatID, eventID int64) {
 		u.log.Warn("deliver mismatched chat admin event", "event_id", eventID, "chat_id", chatID)
 		return
 	}
-	participants, err := u.h.store.Participants(ctx, event.ChatID)
+	recipients, err := u.h.store.ChatAdminEventRecipientsByEvent(ctx, eventID)
 	if err != nil {
-		u.log.Error("deliver chat admin participants", "event_id", eventID, "chat_id", event.ChatID, "err", err)
+		u.log.Error("deliver chat admin recipients", "event_id", eventID, "chat_id", event.ChatID, "err", err)
 		return
 	}
 	update := &tg.Updates{
@@ -260,9 +260,8 @@ func (u *Updater) DeliverChatAdmin(ctx context.Context, chatID, eventID int64) {
 		Seq:  0,
 	}
 	var pushes []transientPush
-	for _, participant := range participants {
-		for _, conn := range u.registry.Conns(participant.UserID) {
-			owner := participant.UserID
+	for _, owner := range recipients {
+		for _, conn := range u.registry.Conns(owner) {
 			pushes = append(pushes, transientPush{
 				owner: owner,
 				conn:  conn,

@@ -52,15 +52,27 @@ func getFullChat(t *testing.T, h mtproto.Handler, userID, chatID int64) *tg.Mess
 	return &result
 }
 
-func assertEmptyAdminDifference(t *testing.T, s *store.Store, userID int64, fromPts int) {
+func assertChatAdminDifference(t *testing.T, s *store.Store, userID int64, fromPts int, chatID, targetID int64, version int, wantAdmin bool) {
 	t.Helper()
 	result, err := api.GetDifferenceForTest(s, userID, &tg.UpdatesGetDifferenceRequest{Pts: fromPts})
 	if err != nil {
 		t.Fatalf("getDifference for user %d: %v", userID, err)
 	}
-	if _, ok := result.(*tg.UpdatesDifferenceEmpty); !ok {
-		t.Fatalf("getDifference result for user %d = %T, want empty because admin updates do not consume pts", userID, result)
+	difference, ok := result.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("getDifference result for user %d = %T, want difference with durable admin state", userID, result)
 	}
+	for _, update := range difference.OtherUpdates {
+		admin, ok := update.(*tg.UpdateChatParticipantAdmin)
+		if !ok || admin.ChatID != chatID || admin.UserID != targetID {
+			continue
+		}
+		if admin.Version != version || admin.IsAdmin != wantAdmin {
+			t.Fatalf("getDifference admin state = chat %d user %d admin %t version %d, want chat %d user %d admin %t version %d", admin.ChatID, admin.UserID, admin.IsAdmin, admin.Version, chatID, targetID, wantAdmin, version)
+		}
+		return
+	}
+	t.Fatalf("getDifference for user %d omitted durable admin state for chat %d user %d", userID, chatID, targetID)
 }
 
 func assertFullChatAdmin(t *testing.T, full *tg.MessagesChatFull, targetID int64, wantAdmin bool) {
@@ -108,23 +120,78 @@ func TestCreatorPromotesAndDemotesBasicGroupAdmin(t *testing.T) {
 	if result == nil || rpc != nil {
 		t.Fatalf("promote admin result = %v, rpc = %v", result, rpc)
 	}
+	promoted, ok, err := s.ChatByID(ctx, chat.ID)
+	if err != nil || !ok {
+		t.Fatalf("chat after promotion: ok=%v err=%v", ok, err)
+	}
 	for _, userID := range users {
 		if got := apiPts(t, s, userID); got != fromPts[userID] {
 			t.Errorf("owner %d pts after promotion = %d, want unchanged %d", userID, got, fromPts[userID])
 		}
-		assertEmptyAdminDifference(t, s, userID, fromPts[userID])
+		assertChatAdminDifference(t, s, userID, fromPts[userID], chat.ID, target.ID, promoted.Version, true)
 		assertFullChatAdmin(t, getFullChat(t, h, userID, chat.ID), target.ID, true)
+	}
+
+	// The live admin notification has no pts. The next real message must still
+	// occupy the very next pts slot, and getDifference must replay it gap-free.
+	message, err := api.SendMessageForTest(s, target.ID, &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerChat(target.ID, chat.ID), Message: "after promotion", RandomID: 1175001,
+	})
+	if err != nil {
+		t.Fatalf("send message after promotion: %v", err)
+	}
+	updates, ok := message.(*tg.Updates)
+	if !ok {
+		t.Fatalf("send result after promotion = %T, want *tg.Updates", message)
+	}
+	foundNextPts := false
+	for _, update := range updates.Updates {
+		if created, ok := update.(*tg.UpdateNewMessage); ok && created.Pts == fromPts[target.ID]+1 && created.PtsCount == 1 {
+			foundNextPts = true
+		}
+	}
+	if !foundNextPts {
+		t.Fatalf("message after promotion did not use pts %d with count 1: %+v", fromPts[target.ID]+1, updates.Updates)
+	}
+	afterMessageState, err := s.State(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("state after message following promotion: %v", err)
+	}
+	difference, err := api.GetDifferenceForTest(s, target.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts:  fromPts[target.ID],
+		Date: afterMessageState.Date,
+	})
+	if err != nil {
+		t.Fatalf("getDifference after message following promotion: %v", err)
+	}
+	diff, ok := difference.(*tg.UpdatesDifference)
+	if !ok || diff.State.Pts != fromPts[target.ID]+1 || len(diff.NewMessages) != 1 {
+		t.Fatalf("getDifference after message following promotion = %#v, want one message and pts %d", difference, fromPts[target.ID]+1)
+	}
+	foundRoleSnapshot := false
+	for _, update := range diff.OtherUpdates {
+		if admin, ok := update.(*tg.UpdateChatParticipantAdmin); ok && admin.ChatID == chat.ID && admin.UserID == target.ID && admin.IsAdmin {
+			foundRoleSnapshot = true
+		}
+	}
+	if !foundRoleSnapshot {
+		t.Fatal("getDifference omitted durable admin state after the member date advanced past the missed push")
 	}
 
 	result, rpc = editChatAdmin(t, h, creator.ID, target.ID, chat.ID, false)
 	if result == nil || rpc != nil {
 		t.Fatalf("demote admin result = %v, rpc = %v", result, rpc)
 	}
+	demoted, ok, err := s.ChatByID(ctx, chat.ID)
+	if err != nil || !ok {
+		t.Fatalf("chat after demotion: ok=%v err=%v", ok, err)
+	}
 	for _, userID := range users {
-		if got := apiPts(t, s, userID); got != fromPts[userID] {
-			t.Errorf("owner %d pts after demotion = %d, want unchanged %d", userID, got, fromPts[userID])
+		wantPts := fromPts[userID] + 1
+		if got := apiPts(t, s, userID); got != wantPts {
+			t.Errorf("owner %d pts after demotion = %d, want %d", userID, got, wantPts)
 		}
-		assertEmptyAdminDifference(t, s, userID, fromPts[userID])
+		assertChatAdminDifference(t, s, userID, fromPts[userID], chat.ID, target.ID, demoted.Version, false)
 		assertFullChatAdmin(t, getFullChat(t, h, userID, chat.ID), target.ID, false)
 	}
 }
@@ -213,7 +280,7 @@ func TestEditChatAdminNoOpKeepsVersionAndUpdatesStable(t *testing.T) {
 		if got := apiPts(t, s, userID); got != pts[userID] {
 			t.Errorf("owner %d pts after no-op = %d, want unchanged %d", userID, got, pts[userID])
 		}
-		assertEmptyAdminDifference(t, s, userID, 0)
+		assertChatAdminDifference(t, s, userID, 0, chat.ID, target.ID, versioned.Version, true)
 	}
 }
 
@@ -226,7 +293,7 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := conn.Exec(ctx, `DROP TRIGGER IF EXISTS fail_chat_admin_delivery ON chat_admin_events`); err != nil {
+		if _, err := conn.Exec(ctx, `DROP TRIGGER IF EXISTS fail_chat_admin_delivery ON chat_admin_event_recipients`); err != nil {
 			t.Errorf("drop event failure trigger: %v", err)
 		}
 		if _, err := conn.Exec(ctx, `DROP FUNCTION IF EXISTS fail_chat_admin_delivery()`); err != nil {
@@ -261,9 +328,9 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 	}
 	if _, err = conn.Exec(ctx, `
 		CREATE TRIGGER fail_chat_admin_delivery
-		BEFORE INSERT ON chat_admin_events
+		BEFORE INSERT ON chat_admin_event_recipients
 		FOR EACH ROW EXECUTE FUNCTION fail_chat_admin_delivery()`); err != nil {
-		t.Fatalf("create event failure trigger: %v", err)
+		t.Fatalf("create recipient failure trigger: %v", err)
 	}
 	if result, rpc := editChatAdmin(t, fullChannelDispatcher(s), creator.ID, target.ID, chat.ID, true); result != nil || rpc == nil || rpc.ErrorMessage != "INTERNAL" {
 		t.Fatalf("promotion with failed delivery = result:%v rpc:%v, want INTERNAL", result, rpc)
@@ -282,15 +349,15 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 			t.Fatal("role change persisted after update delivery failed")
 		}
 	}
-	var adminEvents, deliveryEvents int
+	var adminEvents, recipientMarkers int
 	if err = conn.QueryRow(ctx, `SELECT count(*) FROM chat_admin_events WHERE chat_id = $1`, chat.ID).Scan(&adminEvents); err != nil {
 		t.Fatalf("count admin events: %v", err)
 	}
-	if err = conn.QueryRow(ctx, `SELECT count(*) FROM message_events WHERE type = $1`, int16(store.EventChatParticipantAdmin)).Scan(&deliveryEvents); err != nil {
-		t.Fatalf("count delivery events: %v", err)
+	if err = conn.QueryRow(ctx, `SELECT count(*) FROM chat_admin_event_recipients WHERE event_id IN (SELECT id FROM chat_admin_events WHERE chat_id = $1)`, chat.ID).Scan(&recipientMarkers); err != nil {
+		t.Fatalf("count recipient markers: %v", err)
 	}
-	if adminEvents != 0 || deliveryEvents != 0 {
-		t.Fatalf("persisted events after failed delivery = admin:%d delivery:%d, want none", adminEvents, deliveryEvents)
+	if adminEvents != 0 || recipientMarkers != 0 {
+		t.Fatalf("persisted state after failed recipient marker = admin events:%d recipient markers:%d, want none", adminEvents, recipientMarkers)
 	}
 	for userID, wantPts := range pts {
 		if got := apiPts(t, s, userID); got != wantPts {
