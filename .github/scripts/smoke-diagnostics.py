@@ -557,12 +557,14 @@ def has_helper_first(tree: SourceTree, function: SourceFunction) -> bool:
 
 
 def parameter_index(tree: SourceTree, function: SourceFunction, parameter: str) -> int | None:
-    match = re.fullmatch(
-        rf"func\s+{re.escape(function.name)}\s*\((.*)\)", function.header
-    )
-    if match is None:
+    declaration = FUNCTION_DECL.match(function.header)
+    if declaration is None or declaration.group("name") != function.name:
         return None
-    arguments = split_go_arguments(match.group(1))
+    opening = declaration.end() - 1
+    closing = matching_delimiter(function.header, opening, "(", ")")
+    if closing is None:
+        return None
+    arguments = split_go_arguments(function.header[opening + 1 : closing])
     if arguments is None:
         return None
     indices = [
