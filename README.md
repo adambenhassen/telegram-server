@@ -307,3 +307,9 @@ make sqlc        # regenerate internal/store/db (alias: make generate)
 - `docs/testing.md`: how the Postgres tests get a database, running inside
   containers
 - `ROADMAP.md`: where the project has been and where it is going
+
+## License
+
+telegram-server is source-available under the PolyForm Noncommercial License 1.0.0. Commercial use requires permission from the author. See LICENSE.md.
+
+This license applies to every version of telegram-server, including all commits made before LICENSE.md was added.
