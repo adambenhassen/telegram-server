@@ -934,14 +934,11 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	if r.UserID == 0 {
 		return nil, nil, errAuthKeyUnreg
 	}
-	if err := h.checkChannelUnreadCountRateLimit(r); err != nil {
-		return nil, nil, err
-	}
 	var recovery DialogFilterCapture
 	if c != nil {
 		recovery = h.dialogFilterSync.Capture(c, r)
 	}
-	b, err := h.buildUpdates(r.Ctx, r.UserID, req.Pts, true)
+	b, err := h.buildUpdates(r.Ctx, r.UserID, req.Pts, false)
 	if err != nil {
 		h.log.Error("get difference", "user_id", r.UserID, "err", err)
 		return nil, nil, errInternal
