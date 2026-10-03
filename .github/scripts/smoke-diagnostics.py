@@ -1425,11 +1425,11 @@ def main() -> int:
         return 0
 
     try:
-        source = (
-            sys.stdin
-            if args.input == "-"
-            else open(args.input, "r", encoding="utf-8")
-        )
+        if args.input == "-":
+            sys.stdin.reconfigure(encoding="utf-8", errors="strict")
+            source = sys.stdin
+        else:
+            source = open(args.input, "r", encoding="utf-8", errors="strict")
     except OSError:
         print(execution_failure_annotation(sha, "stream-unavailable"))
         return 0

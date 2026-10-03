@@ -442,7 +442,9 @@ source "$script_dir/smoke-diagnostics.sh"
 if [[ -n "${MOCK_SCENARIOS+x}" ]]; then
   IFS=',' read -r -a SMOKE_SCENARIOS <<<"$MOCK_SCENARIOS"
 fi
-if [[ "${MOCK_OMIT_PROFILE:-false}" == true ]]; then
+if [[ "${MOCK_STDIN:-false}" == true ]]; then
+  report_smoke_failure_diagnostics "$MOCK_GO_STATUS" "$MOCK_PROFILE" || true
+elif [[ "${MOCK_OMIT_PROFILE:-false}" == true ]]; then
   report_smoke_failure_diagnostics "$MOCK_GO_STATUS" -- "$MOCK_GO_JSON" || true
 else
   report_smoke_failure_diagnostics "$MOCK_GO_STATUS" "$MOCK_PROFILE" "$MOCK_GO_JSON" || true
@@ -649,6 +651,47 @@ assert_execution_input_case() {
     if [[ "$diagnostics" != "$expected" || "$output" == *"$canary"* \
       || "$diagnostics" == *'file='* || "$diagnostics" == *'line='* ]]; then
       printf 'reporter wrapper changed or exposed the diagnostic: %s (status %s)\n' \
+        "$name" "$status" >&2
+      exit 1
+    fi
+  done
+}
+
+assert_execution_stdin_case() {
+  local name="$1" profile="$2" reason="$3" input_path="$4" \
+    expected status actual output result_status diagnostics
+  expected=$(expected_execution_failure "$reason")
+  if ! grep -qF -- "$canary" "$input_path"; then
+    printf 'execution-failure stdin fixture omitted its redaction canary: %s\n' "$name" >&2
+    exit 1
+  fi
+
+  for status in 1 2; do
+    actual=$(PYTHONUTF8=1 report_smoke_failure_diagnostics "$status" "$profile" <"$input_path")
+    if [[ "$actual" != "$expected" || "$actual" == *"$canary"* \
+      || "$actual" == *'file='* || "$actual" == *'line='* ]]; then
+      printf 'unexpected execution-failure stdin diagnostic: %s (status %s)\n' \
+        "$name" "$status" >&2
+      exit 1
+    fi
+
+    if output=$(PYTHONUTF8=1 PATH="$mock_bin:$PATH" RUNNER_TEMP="$runner_temp" \
+      SMOKE_DIAGNOSTICS_ROOT="$fixture_root" SMOKE_OUTPUT_INDENT="$SMOKE_OUTPUT_INDENT" \
+      MOCK_GO_JSON="$input_path" MOCK_GO_STATUS="$status" MOCK_PROFILE="$profile" \
+      MOCK_STDIN=true bash "$wrapper_script_dir/report-failure.sh" <"$input_path" 2>&1); then
+      result_status=0
+    else
+      result_status=$?
+    fi
+    if [[ "$result_status" -ne "$status" ]]; then
+      printf 'reporter changed the injected stdin test status: %s (status %s)\n' \
+        "$name" "$status" >&2
+      exit 1
+    fi
+    diagnostics=$(grep '^::error' <<<"$output" || true)
+    if [[ "$diagnostics" != "$expected" || "$output" == *"$canary"* \
+      || "$diagnostics" == *'file='* || "$diagnostics" == *'line='* ]]; then
+      printf 'reporter stdin wrapper changed or exposed output: %s (status %s)\n' \
         "$name" "$status" >&2
       exit 1
     fi
@@ -1272,6 +1315,26 @@ write_execution_case overlapping-build-timeout full-suite unknown "$build_timeou
 
 valid_assertion_event=$(json_event output "TestSmoke/$scenario_failure" \
   "${SMOKE_OUTPUT_INDENT}smoke_test.go:79: [assert:${direct_id}] assertion ${canary}"$'\n')
+stdin_invalid_utf8_input="$fixture_root/stdin-invalid-utf8.json"
+printf '%s\n' "$valid_assertion_event" >"$stdin_invalid_utf8_input"
+python3 - "$stdin_invalid_utf8_input" "$SMOKE_E2E_PACKAGE" <<'PY'
+import json
+import sys
+
+path, package = sys.argv[1:]
+event = {
+    "Package": package,
+    "Action": "output",
+    "Test": "TestOther",
+    "Output": "invalid-utf8-sentinel",
+}
+line = json.dumps(event, separators=(",", ":")).encode("utf-8")
+line = line.replace(b"invalid-utf8-sentinel", b"\xff", 1)
+with open(path, "ab") as stream:
+    stream.write(line + b"\n")
+PY
+printf '%s\n' "$(failure_fixture "TestSmoke/$scenario_failure")" >>"$stdin_invalid_utf8_input"
+assert_execution_stdin_case stdin-invalid-utf8 smoke invalid-stream "$stdin_invalid_utf8_input"
 forged_assertion_stream="$valid_assertion_event"$'\n'"$(json_event output "$timeout_test" 'panic: test timed out after 15m0s in test output')"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
 write_execution_case forged-signature-with-assertion full-suite unknown "$forged_assertion_stream"
 
