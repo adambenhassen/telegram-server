@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/linklanding"
+	"github.com/teagramhq/teagram-server/internal/linklanding"
 )
 
 func TestCheckLandingRequiresTheFixedStaticResponse(t *testing.T) {
