@@ -14,10 +14,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/catalog"
-	"github.com/adambenhassen/telegram-server/internal/keycrypt"
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/keycrypt"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // Store is the Postgres-backed persistence layer.

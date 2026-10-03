@@ -18,7 +18,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/transport"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // loopback is the allowlist used by the tests that stand in for a balancer: the

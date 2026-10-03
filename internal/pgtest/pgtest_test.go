@@ -5,7 +5,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
 )
 
 // TestDSNIsolatesDatabases proves isolation deterministically: create a table in

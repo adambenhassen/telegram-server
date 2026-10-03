@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blob"
 )
 
 // collectPrefix walks a prefix and returns what it yielded, keyed by key.

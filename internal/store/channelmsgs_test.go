@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func post(t *testing.T, s *store.Store, channelID, fromID int64, text string, rid int64) (store.ChannelMessage, int) {
@@ -31,13 +31,13 @@ func TestPostChannelMessageAdvancesStream(t *testing.T) {
 	author := mustUser(t, s, "+15551260001")
 	ch := mustChannel(t, s, author.ID, "news").ID
 
-	if pts, err := s.ChannelState(ctx, ch); err != nil || pts != 0 {
-		t.Fatalf("fresh channel state = %d, err %v; want 0", pts, err)
+	if pts, err := s.ChannelState(ctx, ch); err != nil || pts != 1 {
+		t.Fatalf("fresh channel state = %d, err %v; want creation pts 1", pts, err)
 	}
 
 	first, pts1 := post(t, s, ch, author.ID, "hi", 42)
-	if first.LocalID != 1 || pts1 != 1 {
-		t.Fatalf("first post: local_id %d pts %d, want 1,1", first.LocalID, pts1)
+	if first.LocalID != 2 || pts1 != 2 {
+		t.Fatalf("first post: local_id %d pts %d, want 2,2", first.LocalID, pts1)
 	}
 	if first.ChannelID != ch || first.FromID != author.ID || first.Message != "hi" || first.RandomID != 42 {
 		t.Fatalf("first post row wrong: %+v", first)
@@ -50,13 +50,13 @@ func TestPostChannelMessageAdvancesStream(t *testing.T) {
 	}
 
 	second, pts2 := post(t, s, ch, author.ID, "again", 43)
-	if second.LocalID != 2 || pts2 != 2 {
-		t.Fatalf("second post: local_id %d pts %d, want 2,2", second.LocalID, pts2)
+	if second.LocalID != 3 || pts2 != 3 {
+		t.Fatalf("second post: local_id %d pts %d, want 3,3", second.LocalID, pts2)
 	}
 
 	pts, err := s.ChannelState(ctx, ch)
-	if err != nil || pts != 2 {
-		t.Fatalf("channel state = %d, err %v; want 2", pts, err)
+	if err != nil || pts != 3 {
+		t.Fatalf("channel state = %d, err %v; want 3", pts, err)
 	}
 
 	// One event per post, at the pts that post produced.
@@ -64,10 +64,10 @@ func TestPostChannelMessageAdvancesStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("events window: %v", err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("events = %d, want 2", len(events))
+	if len(events) != 3 {
+		t.Fatalf("events = %d, want creation plus 2 post events", len(events))
 	}
-	for i, want := range []struct{ pts, localID int64 }{{1, 1}, {2, 2}} {
+	for i, want := range []struct{ pts, localID int64 }{{1, 1}, {2, 2}, {3, 3}} {
 		if int64(events[i].Pts) != want.pts || events[i].LocalID != want.localID {
 			t.Fatalf("event %d = pts %d local_id %d, want %d,%d", i, events[i].Pts, events[i].LocalID, want.pts, want.localID)
 		}
@@ -76,11 +76,11 @@ func TestPostChannelMessageAdvancesStream(t *testing.T) {
 		}
 	}
 
-	msgs, err := s.ChannelMessages(ctx, ch, []int64{1, 2, 99})
+	msgs, err := s.ChannelMessages(ctx, ch, []int64{1, 2, 3, 99})
 	if err != nil {
 		t.Fatalf("channel messages: %v", err)
 	}
-	if len(msgs) != 2 || msgs[1].Message != "hi" || msgs[2].Message != "again" {
+	if len(msgs) != 3 || msgs[1].Action != store.ChannelMessageActionCreate || msgs[2].Message != "hi" || msgs[3].Message != "again" {
 		t.Fatalf("channel messages = %+v", msgs)
 	}
 }
@@ -109,22 +109,22 @@ func TestPostChannelMessageDedupsRandomID(t *testing.T) {
 	}
 
 	pts, err := s.ChannelState(ctx, ch)
-	if err != nil || pts != 1 {
-		t.Fatalf("channel state = %d, err %v; want 1", pts, err)
+	if err != nil || pts != 2 {
+		t.Fatalf("channel state = %d, err %v; want 2", pts, err)
 	}
 	history, err := s.ChannelHistory(ctx, ch, 0, 10)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
-	if len(history) != 1 {
-		t.Fatalf("history = %d rows, want 1", len(history))
+	if len(history) != 2 {
+		t.Fatalf("history = %d rows, want create service message and post", len(history))
 	}
 	events, err := s.ChannelEventsWindow(ctx, ch, 0, 10, 10)
 	if err != nil {
 		t.Fatalf("events window: %v", err)
 	}
-	if len(events) != 1 {
-		t.Fatalf("events = %d, want 1", len(events))
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want create and post", len(events))
 	}
 }
 
@@ -173,18 +173,18 @@ func TestChannelHistoryNewestFirstSkipsDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
-	if len(history) != 3 || history[0].LocalID != 3 || history[2].LocalID != 1 {
+	if len(history) != 4 || history[0].LocalID != 4 || history[3].LocalID != 1 {
 		t.Fatalf("history not newest-first: %+v", history)
 	}
 
-	if err := store.SetChannelPostDeleted(ctx, s, ch, 2); err != nil {
+	if err := store.SetChannelPostDeleted(ctx, s, ch, 3); err != nil {
 		t.Fatalf("mark deleted: %v", err)
 	}
 	history, err = s.ChannelHistory(ctx, ch, 0, 10)
 	if err != nil {
 		t.Fatalf("history after delete: %v", err)
 	}
-	if len(history) != 2 || history[0].LocalID != 3 || history[1].LocalID != 1 {
+	if len(history) != 3 || history[0].LocalID != 4 || history[1].LocalID != 2 || history[2].LocalID != 1 {
 		t.Fatalf("deleted row not skipped: %+v", history)
 	}
 
@@ -193,8 +193,8 @@ func TestChannelHistoryNewestFirstSkipsDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("history page: %v", err)
 	}
-	if len(history) != 1 || history[0].LocalID != 1 {
-		t.Fatalf("offset page = %+v, want local_id 1 only", history)
+	if len(history) != 2 || history[0].LocalID != 2 || history[1].LocalID != 1 {
+		t.Fatalf("offset page = %+v, want older post and creation service message", history)
 	}
 }
 
@@ -234,8 +234,8 @@ func TestPostChannelMessageDedupsUnderConcurrency(t *testing.T) {
 		if r.err != nil {
 			t.Fatalf("post %d: %v", i, r.err)
 		}
-		if r.msg.LocalID != 1 || r.pts != 1 {
-			t.Fatalf("post %d: local_id %d pts %d, want 1,1", i, r.msg.LocalID, r.pts)
+		if r.msg.LocalID != 2 || r.pts != 2 {
+			t.Fatalf("post %d: local_id %d pts %d, want 2,2", i, r.msg.LocalID, r.pts)
 		}
 		if r.dup {
 			dups++
@@ -246,15 +246,15 @@ func TestPostChannelMessageDedupsUnderConcurrency(t *testing.T) {
 	}
 
 	pts, err := s.ChannelState(ctx, ch)
-	if err != nil || pts != 1 {
-		t.Fatalf("channel state = %d, err %v; want 1", pts, err)
+	if err != nil || pts != 2 {
+		t.Fatalf("channel state = %d, err %v; want 2", pts, err)
 	}
 	history, err := s.ChannelHistory(ctx, ch, 0, 10)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
-	if len(history) != 1 {
-		t.Fatalf("history = %d rows, want 1", len(history))
+	if len(history) != 2 {
+		t.Fatalf("history = %d rows, want create service message and post", len(history))
 	}
 }
 
@@ -269,15 +269,15 @@ func TestChannelMessagesKeepsDeletedRows(t *testing.T) {
 	ch := mustChannel(t, s, author.ID, "news").ID
 
 	post(t, s, ch, author.ID, "one", 1)
-	if err := store.SetChannelPostDeleted(ctx, s, ch, 1); err != nil {
+	if err := store.SetChannelPostDeleted(ctx, s, ch, 2); err != nil {
 		t.Fatalf("mark deleted: %v", err)
 	}
 
-	msgs, err := s.ChannelMessages(ctx, ch, []int64{1})
+	msgs, err := s.ChannelMessages(ctx, ch, []int64{2})
 	if err != nil {
 		t.Fatalf("channel messages: %v", err)
 	}
-	got, ok := msgs[1]
+	got, ok := msgs[2]
 	if !ok {
 		t.Fatal("deleted post missing from ChannelMessages")
 	}
@@ -289,8 +289,8 @@ func TestChannelMessagesKeepsDeletedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
-	if len(history) != 0 {
-		t.Fatalf("history = %+v, want empty", history)
+	if len(history) != 1 || history[0].Action != store.ChannelMessageActionCreate {
+		t.Fatalf("history = %+v, want only the creation service message", history)
 	}
 }
 
@@ -513,8 +513,8 @@ func TestChannelDialogsForUserReturnsChannelsWithTopMessageAndPts(t *testing.T) 
 	if row.Channel.ID != ch1.ID {
 		t.Fatalf("channel id = %d, want %d", row.Channel.ID, ch1.ID)
 	}
-	if row.Pts != 2 {
-		t.Fatalf("pts = %d, want 2", row.Pts)
+	if row.Pts != 3 {
+		t.Fatalf("pts = %d, want 3", row.Pts)
 	}
 	if row.Top == nil {
 		t.Fatal("top message is nil")
@@ -539,7 +539,7 @@ func TestChannelDialogsForUserIncludesEmptyChannel(t *testing.T) {
 		t.Fatalf("join: %v", err)
 	}
 
-	// No posts — channel appears with nil top.
+	// No posts — the creation service message is the channel's top message.
 	rows, err := s.ChannelDialogsForUser(ctx, member.ID)
 	if err != nil {
 		t.Fatalf("channel dialogs for user: %v", err)
@@ -547,8 +547,8 @@ func TestChannelDialogsForUserIncludesEmptyChannel(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
-	if rows[0].Top != nil {
-		t.Fatalf("top = %+v, want nil for empty channel", rows[0].Top)
+	if rows[0].Top == nil || rows[0].Top.LocalID != 1 || rows[0].Top.Action != store.ChannelMessageActionCreate {
+		t.Fatalf("top = %+v, want creation service message 1", rows[0].Top)
 	}
 }
 
@@ -568,8 +568,8 @@ func TestChannelDialogsForUserExcludesDeletedTopMessage(t *testing.T) {
 	_, _ = post(t, s, ch.ID, creator.ID, "deleted", 301)
 	m3, _ := post(t, s, ch.ID, creator.ID, "new", 302)
 
-	// Delete the middle post (local_id 2) via the exported test helper.
-	if err := store.SetChannelPostDeleted(ctx, s, ch.ID, 2); err != nil {
+	// Delete the middle post (local_id 3) via the exported test helper.
+	if err := store.SetChannelPostDeleted(ctx, s, ch.ID, 3); err != nil {
 		t.Fatalf("delete post: %v", err)
 	}
 
@@ -583,7 +583,7 @@ func TestChannelDialogsForUserExcludesDeletedTopMessage(t *testing.T) {
 	if rows[0].Top == nil {
 		t.Fatal("top is nil — should fall back to newest non-deleted")
 	}
-	// Top should be the newest non-deleted: m3 (local_id 3).
+	// Top should be the newest non-deleted: m3 (local_id 4).
 	if rows[0].Top.LocalID != m3.LocalID {
 		t.Fatalf("top local_id = %d, want %d (newest non-deleted)", rows[0].Top.LocalID, m3.LocalID)
 	}
@@ -695,7 +695,7 @@ func TestChannelPostsFullTextIndexUsesGINIndex(t *testing.T) {
 	var tsv pgtype.Text
 	err = pool.QueryRow(ctx, `
 		SELECT message_tsv FROM channel_messages
-		WHERE channel_id = $1 AND local_id = 1
+		WHERE channel_id = $1 AND local_id = 2
 	`, ch.ID).Scan(&tsv)
 	if err != nil {
 		t.Fatalf("read message_tsv: %v", err)
@@ -724,7 +724,7 @@ func TestSearchChannelPostsScopedToOneChannel(t *testing.T) {
 	post(t, s, ch, author.ID, "budget draft", 34)
 	post(t, s, other, author.ID, "budget of the other channel", 35)
 
-	if err := store.SetChannelPostDeleted(ctx, s, ch, 4); err != nil {
+	if err := store.SetChannelPostDeleted(ctx, s, ch, 5); err != nil {
 		t.Fatalf("mark deleted: %v", err)
 	}
 
@@ -732,8 +732,8 @@ func TestSearchChannelPostsScopedToOneChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
-	if len(hits) != 2 || hits[0].LocalID != 3 || hits[1].LocalID != 1 {
-		t.Fatalf("hits = %+v, want local_ids 3 and 1 newest-first", hits)
+	if len(hits) != 2 || hits[0].LocalID != 4 || hits[1].LocalID != 2 {
+		t.Fatalf("hits = %+v, want local_ids 4 and 2 newest-first", hits)
 	}
 	for _, m := range hits {
 		if m.ChannelID != ch {
@@ -742,12 +742,12 @@ func TestSearchChannelPostsScopedToOneChannel(t *testing.T) {
 	}
 
 	// offsetID pages strictly older.
-	hits, err = s.SearchChannelPosts(ctx, ch, "budget", 3, 10)
+	hits, err = s.SearchChannelPosts(ctx, ch, "budget", 4, 10)
 	if err != nil {
 		t.Fatalf("search page: %v", err)
 	}
-	if len(hits) != 1 || hits[0].LocalID != 1 {
-		t.Fatalf("page = %+v, want local_id 1 only", hits)
+	if len(hits) != 1 || hits[0].LocalID != 2 {
+		t.Fatalf("page = %+v, want local_id 2 only", hits)
 	}
 
 	// limit bounds the page.
@@ -755,8 +755,8 @@ func TestSearchChannelPostsScopedToOneChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("search limited: %v", err)
 	}
-	if len(hits) != 1 || hits[0].LocalID != 3 {
-		t.Fatalf("limited = %+v, want local_id 3 only", hits)
+	if len(hits) != 1 || hits[0].LocalID != 4 {
+		t.Fatalf("limited = %+v, want local_id 4 only", hits)
 	}
 
 	// A word no post carries is an empty result, not an error.

@@ -24,13 +24,13 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/catalog"
-	"github.com/adambenhassen/telegram-server/internal/catalogpublish"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/catalogpublish"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestSmoke(t *testing.T) {
@@ -418,7 +418,7 @@ func testSmokeDefaultDialogFilter(t *testing.T) {
 	if _, ok := listed.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("first folder = %T, want All chats", listed.Filters[0])
 	}
-	wantTitles := []string{"Personal", "Groups", "Channels", "Unread"}
+	wantTitles := []string{"Personal", "Channels", "Groups", "Unread"}
 	for i, want := range wantTitles {
 		folder, ok := listed.Filters[i+1].(*tg.DialogFilter)
 		if !ok || folder.ID != i+2 || folder.Title.Text != want {
@@ -611,9 +611,34 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("initialize default folders: %v", err)
 	}
-	if len(seeded.Filters) != 5 {
-		t.Fatalf("initial folders = %d, want All chats and four defaults", len(seeded.Filters))
+	assertDefaultFolderOrder := func(label string, result *tg.MessagesDialogFilters) {
+		if len(result.Filters) != 5 {
+			t.Fatalf("%s folders = %d, want All chats and four defaults", label, len(result.Filters))
+		}
+		if _, ok := result.Filters[0].(*tg.DialogFilterDefault); !ok {
+			t.Fatalf("%s first folder = %T, want All chats", label, result.Filters[0])
+		}
+		want := []struct {
+			id    int
+			title string
+		}{{2, "Personal"}, {3, "Channels"}, {4, "Groups"}, {5, "Unread"}}
+		for i, expected := range want {
+			folder, ok := result.Filters[i+1].(*tg.DialogFilter)
+			if !ok || folder.ID != expected.id || folder.Title.Text != expected.title {
+				t.Fatalf("%s folder %d = %#v, want ID %d %s", label, i+1, result.Filters[i+1], expected.id, expected.title)
+			}
+		}
 	}
+	assertDefaultFolderOrder("initial", seeded)
+	var repeated *tg.MessagesDialogFilters
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		repeated, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("repeat default folder read: %v", err)
+	}
+	assertDefaultFolderOrder("repeated", repeated)
 
 	filter := &tg.DialogFilter{ID: 6, Title: tg.TextWithEntities{Text: "Groups"}, Groups: true}
 	filter.SetFlags()
@@ -1244,6 +1269,56 @@ func testSmokeChannel(t *testing.T) {
 	})
 
 	channelID := createBroadcastChannel(t, f.ctx, creator.cmds, "Smoke channel")
+	if err := creator.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		result, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+			OffsetPeer: &tg.InputPeerEmpty{},
+			Limit:      100,
+		})
+		if err != nil {
+			return err
+		}
+		var dialogs []tg.DialogClass
+		var messages []tg.MessageClass
+		switch page := result.(type) {
+		case *tg.MessagesDialogs:
+			dialogs, messages = page.Dialogs, page.Messages
+		case *tg.MessagesDialogsSlice:
+			dialogs, messages = page.Dialogs, page.Messages
+		default:
+			return fmt.Errorf("getDialogs response = %T, want a dialogs result", result)
+		}
+		for _, item := range dialogs {
+			dialog, ok := item.(*tg.Dialog)
+			if !ok {
+				continue
+			}
+			peer, ok := dialog.Peer.(*tg.PeerChannel)
+			if !ok || peer.ChannelID != channelID {
+				continue
+			}
+			if dialog.TopMessage != 1 {
+				return fmt.Errorf("new channel top message = %d, want 1", dialog.TopMessage)
+			}
+			for _, message := range messages {
+				if message.GetID() != dialog.TopMessage {
+					continue
+				}
+				service, ok := message.(*tg.MessageService)
+				if !ok {
+					return fmt.Errorf("new channel top message = %T, want *tg.MessageService", message)
+				}
+				action, ok := service.Action.(*tg.MessageActionChannelCreate)
+				if !ok || action.Title != "Smoke channel" {
+					return fmt.Errorf("new channel create action = %+v, want title %q", service.Action, "Smoke channel")
+				}
+				return nil
+			}
+			return fmt.Errorf("getDialogs omitted top message %d for newly created channel", dialog.TopMessage)
+		}
+		return fmt.Errorf("new channel %d absent from getDialogs before first post", channelID)
+	}); err != nil {
+		t.Fatalf("new channel getDialogs: %v", err)
+	}
 	hash := exportChannelInvite(t, f.ctx, creator.id, creator.cmds, channelID)
 	if joinedID := importChannelInvite(t, f.ctx, subscriber.cmds, hash); joinedID != channelID {
 		t.Fatalf("subscriber joined channel %d, want %d", joinedID, channelID)
@@ -1293,8 +1368,8 @@ func testSmokeChannel(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("channel history response = %T, want *tg.MessagesChannelMessages", result)
 		}
-		if len(history.Messages) != 1 {
-			return fmt.Errorf("channel history count = %d, want 1", len(history.Messages))
+		if len(history.Messages) != 2 {
+			return fmt.Errorf("channel history count = %d, want the creation service message and first post", len(history.Messages))
 		}
 		message, ok := history.Messages[0].(*tg.Message)
 		if !ok {

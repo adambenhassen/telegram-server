@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/admin/assets"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/admin/assets"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // csrfCookieName is the name of the cookie that carries the CSRF token hash.

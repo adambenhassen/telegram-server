@@ -115,6 +115,71 @@ jobs:
       # test fixture from the pinned public source so fork PRs need no secrets.
       - uses: docker/setup-buildx-action@v4.4.1
 
+      # Keep the link edge as its own Compose project and build both restricted
+      # images in CI. The explicit empty env file keeps server credentials out
+      # of Compose interpolation during validation.
+      - name: Render isolated link edge Compose projection
+        run: |
+          docker compose --env-file /dev/null --project-directory deploy/link-edge --file deploy/link-edge/compose.yaml config --format json >"$RUNNER_TEMP/link-edge-compose.json"
+          jq -e '
+            (.services | keys | sort) == ["linklanding", "selector"]
+            and all(.services[]; .read_only == true)
+            and all(.services[]; .cap_drop == ["ALL"])
+            and all(.services[]; "no-new-privileges:true" as $required | (.security_opt | index($required)) != null)
+            and all(.services[]; .user == "65532:65532")
+            and all(.services[]; ((.volumes // []) | length) == 0)
+            and all(.services[]; ((.secrets // []) | length) == 0)
+            and all(.services[]; ((.env_file // []) | length) == 0)
+            and all(.services[]; ((.environment // {}) | length) == 0)
+            and all(.services[]; .network_mode == null)
+            and all(.services[]; .mem_limit == null)
+            and all(.services[]; .pids_limit == null)
+            and all(.services[]; .restart == "unless-stopped")
+            and all(.services[]; .logging.driver == "json-file")
+            and all(.services[]; .logging.options["max-size"] == "10m")
+            and all(.services[]; .logging.options["max-file"] == "3")
+            and (.services.linklanding.networks | keys) == ["landing-publish", "private-edge"]
+            and (.services.selector.networks | keys) == ["private-edge", "web-edge"]
+            and (.services.linklanding.ports | length) == 1
+            and (.services.linklanding.ports[0].host_ip == "127.0.0.1")
+            and (.services.linklanding.ports[0].target == 8082)
+            and (.services.linklanding.ports[0].published == "8082")
+            and (.services.selector.ports | length) == 1
+            and (.services.selector.ports[0].host_ip == "127.0.0.1")
+            and (.services.selector.ports[0].target == 8081)
+            and (.services.selector.ports[0].published == "8081")
+            and (.services.linklanding.healthcheck.test == ["CMD", "/usr/local/bin/linkprobe", "landing"])
+            and (.services.selector.healthcheck.test == ["CMD", "/usr/local/bin/linkprobe", "selector"])
+            and ((.services.linklanding.depends_on // {}) | length) == 0
+            and ((.services.selector.depends_on | keys) == ["linklanding"])
+            and ((.volumes // {}) | length) == 0
+            and ((.secrets // {}) | length) == 0
+            and (.networks["private-edge"].internal == true)
+            and (.networks["landing-publish"].driver == "bridge")
+            and ((.networks["landing-publish"].internal // false) == false)
+            and (.networks["landing-publish"].driver_opts["com.docker.network.bridge.enable_ip_masquerade"] == "false")
+            and (.networks["web-edge"].external == true)
+            and (.networks["web-edge"].name == "telegram-web-edge-net")
+          ' "$RUNNER_TEMP/link-edge-compose.json"
+
+      - name: Build isolated link edge images
+        run: docker compose --env-file /dev/null --project-directory deploy/link-edge --file deploy/link-edge/compose.yaml build
+
+      - name: Verify landing loopback publication on the Docker daemon
+        run: |
+          compose=(docker compose --env-file /dev/null --project-directory deploy/link-edge --file deploy/link-edge/compose.yaml)
+          docker network create telegram-web-edge-net
+          cleanup() {
+            "${compose[@]}" down --remove-orphans
+            docker network rm telegram-web-edge-net
+          }
+          trap cleanup EXIT
+          "${compose[@]}" up --detach --wait linklanding
+          landing_id=$("${compose[@]}" ps --quiet linklanding)
+          docker port "$landing_id" 8082/tcp | grep -Fxq '127.0.0.1:8082'
+          ss -ltn 'sport = :8082'
+          curl --fail --silent --show-error --output /dev/null http://127.0.0.1:8082/syntheticname
+
       - name: Build MinIO image for tests
         uses: docker/build-push-action@v7.4.0
         with:
@@ -1235,7 +1300,7 @@ jobs:
           has_test_event() {
             jq -Re --arg action "$1" --arg test "$2" '
               fromjson?
-              | select(.Package == "github.com/adambenhassen/telegram-server/test/e2e"
+              | select(.Package == "github.com/teagramhq/teagram-server/test/e2e"
                   and .Action == $action and (.Test // "") == $test)
             ' <<<"$output" >/dev/null
           }
@@ -1275,7 +1340,7 @@ jobs:
 
           summary=$(jq -Rr '
             fromjson?
-            | select(.Package == "github.com/adambenhassen/telegram-server/test/e2e"
+            | select(.Package == "github.com/teagramhq/teagram-server/test/e2e"
                 and .Action == "pass" and (.Test // "") == "")
             | .Elapsed // empty
           ' <<<"$output" | tail -n 1)
@@ -1283,4 +1348,4 @@ jobs:
             echo "::error::TestSmoke did not report a completed package run (category: package-incomplete; details redacted)"
             exit 1
           fi
-          printf 'ok github.com/adambenhassen/telegram-server/test/e2e %ss\n' "$summary"
+          printf 'ok github.com/teagramhq/teagram-server/test/e2e %ss\n' "$summary"

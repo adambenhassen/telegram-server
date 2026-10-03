@@ -16,12 +16,12 @@ import (
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) {
@@ -141,7 +141,7 @@ func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) 
 	if _, ok := initial.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("initial folder = %T, want All chats", initial.Filters[0])
 	}
-	for i, title := range []string{"Personal", "Groups", "Channels", "Unread"} {
+	for i, title := range []string{"Personal", "Channels", "Groups", "Unread"} {
 		if folder, ok := initial.Filters[i+1].(*tg.DialogFilter); !ok || folder.ID != i+2 || folder.Title.Text != title {
 			t.Fatalf("initial default %d = %#v, want ID %d %s", i, initial.Filters[i+1], i+2, title)
 		}
@@ -170,7 +170,7 @@ func TestDialogFilterRecoveryAcrossReplicasAfterListenerReconnect(t *testing.T) 
 	if _, ok := replicaBDefaults.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("second session first folder = %T, want All chats", replicaBDefaults.Filters[0])
 	}
-	for i, title := range []string{"Personal", "Groups", "Channels", "Unread"} {
+	for i, title := range []string{"Personal", "Channels", "Groups", "Unread"} {
 		folder, ok := replicaBDefaults.Filters[i+1].(*tg.DialogFilter)
 		if !ok || folder.ID != i+2 || folder.Title.Text != title {
 			t.Fatalf("second session default %d = %#v, want ID %d %s", i, replicaBDefaults.Filters[i+1], i+2, title)

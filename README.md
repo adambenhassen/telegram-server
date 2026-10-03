@@ -307,3 +307,7 @@ make sqlc        # regenerate internal/store/db (alias: make generate)
 - `docs/testing.md`: how the Postgres tests get a database, running inside
   containers
 - `ROADMAP.md`: where the project has been and where it is going
+
+## License
+
+telegram-server is licensed under the GNU Affero General Public License v3.0 or later. See LICENSE. This license applies to every version of telegram-server, including all commits made before LICENSE was added.

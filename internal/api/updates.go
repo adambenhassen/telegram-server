@@ -11,9 +11,9 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // replySnippet returns a short preview of the quoted message text, truncated
@@ -119,16 +119,25 @@ func reactionsToTL(reactions []store.Reaction) tg.MessageReactions {
 	return mr
 }
 
-// channelMessageToTL maps a stored channel post to the wire message, the
-// channel counterpart of messageToTL. A channel keeps one row per post rather
-// than one per member, so Out is derived from the viewer here instead of being
-// read off the row, and the peer is always the channel.
+// channelMessageToTL maps a stored channel message to the wire message, the
+// channel counterpart of messageToTL. A channel keeps one row per message
+// rather than one per member, so Out is derived from the viewer here instead of
+// being read off the row, and the peer is always the channel.
 //
-// Channel posts carry no service actions in M7, so this always renders a
-// tg.Message. files is keyed by file id exactly as messageToTL's is, but the
-// "no media" sentinel differs and the trap is worth naming:
+// files is keyed by file id exactly as messageToTL's is, but the "no media"
+// sentinel differs and the trap is worth naming:
 // channel_messages.file_id is NULL for no media, while messages.file_id is 0.
-func channelMessageToTL(m store.ChannelMessage, viewerID int64, files map[int64]*tg.Document) *tg.Message {
+func channelMessageToTL(m store.ChannelMessage, viewerID int64, files map[int64]*tg.Document) tg.MessageClass {
+	if m.Action == store.ChannelMessageActionCreate {
+		return &tg.MessageService{
+			ID:     int(m.LocalID),
+			Out:    m.FromID == viewerID,
+			PeerID: &tg.PeerChannel{ChannelID: m.ChannelID},
+			FromID: &tg.PeerUser{UserID: m.FromID},
+			Date:   int(m.Date.Unix()),
+			Action: &tg.MessageActionChannelCreate{Title: m.Message},
+		}
+	}
 	msg := &tg.Message{
 		ID:      int(m.LocalID),
 		Out:     m.FromID == viewerID,

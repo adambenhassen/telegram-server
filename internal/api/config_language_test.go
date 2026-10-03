@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 func TestGetConfigSuggestionOnlyChangesPerResponseCopy(t *testing.T) {

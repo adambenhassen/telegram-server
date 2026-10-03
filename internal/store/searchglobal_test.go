@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // globalKey identifies one hit the way the cursor does, so a page sequence can

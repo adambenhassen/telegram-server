@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/linklanding"
+	"github.com/teagramhq/teagram-server/internal/linklanding"
 )
 
 const wantLandingBody = `<!doctype html><html lang="en"><body><main>Open this in Telegramd</main></body></html>`

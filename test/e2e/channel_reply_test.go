@@ -9,9 +9,9 @@ import (
 
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestChannelReplyPersisted covers acceptance criteria 1–5 from MAIN-328:
@@ -253,7 +253,7 @@ func TestChannelReplyPersisted(t *testing.T) {
 	})
 
 	// Criterion 4: a reply to a nonexistent message is refused with MESSAGE_ID_INVALID,
-	// and writes nothing (criterion 5: pts stays at 2 after this call).
+	// and writes nothing (criterion 5: pts stays at 3 after this call).
 	ptsBefore := 0
 	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		d, err := c.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
@@ -297,17 +297,17 @@ func TestChannelReplyPersisted(t *testing.T) {
 			if diff.Pts != ptsBefore {
 				t.Errorf("pts after refused reply = %d, want %d (no advance)", diff.Pts, ptsBefore)
 			}
-			if len(diff.NewMessages) != 2 {
-				t.Errorf("message count after refused reply = %d, want 2", len(diff.NewMessages))
+			if len(diff.NewMessages) != 3 {
+				t.Errorf("message count after refused reply = %d, want creation event and 2 posts (3 total)", len(diff.NewMessages))
 			}
 		}
 		return nil
 	})
 
 	// Criterion 4 (cross-channel oracle): a local_id valid in a second channel must
-	// be indistinguishable from an absent id in the first channel. chID currently has
-	// local_ids 1 and 2; post 3 messages in a fresh channel so its third post carries
-	// local_id 3, which exists there but not in chID.
+	// be indistinguishable from an absent id in the first channel. chID has the
+	// creation event and two posts; a third post in the fresh channel gets local_id 4,
+	// which exists there but not in chID.
 	ch2ID := createBroadcastChannel(t, ctx, aCmds, "OtherChannel")
 	for i, randomID := range []int64{96001004, 96001005} {
 		msg := fmt.Sprintf("filler %d", i+1)
@@ -365,8 +365,8 @@ func TestChannelReplyPersisted(t *testing.T) {
 			if diff.Pts != ptsBefore {
 				t.Errorf("pts after cross-channel refusal = %d, want %d (no advance)", diff.Pts, ptsBefore)
 			}
-			if len(diff.NewMessages) != 2 {
-				t.Errorf("message count after cross-channel refusal = %d, want 2 (no row written)", len(diff.NewMessages))
+			if len(diff.NewMessages) != 3 {
+				t.Errorf("message count after cross-channel refusal = %d, want creation event and 2 posts (3 total, no row written)", len(diff.NewMessages))
 			}
 		}
 		return nil

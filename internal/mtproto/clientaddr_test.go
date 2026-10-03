@@ -13,7 +13,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/transport"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // TestRequestCarriesTheSocketPeerAddress is the whole basis of every per-IP

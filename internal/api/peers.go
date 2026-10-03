@@ -3,8 +3,8 @@ package api
 import (
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // peerUserID resolves an input peer to a 1:1 user id. InputPeerSelf is bound to

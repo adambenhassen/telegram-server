@@ -3,7 +3,7 @@ package api_test
 import (
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 func TestIsGeneratedCode(t *testing.T) {

@@ -11,7 +11,7 @@
   "menuColor": "default",
   "menuAccent": "subtle",
   "aliases": {
-    "components": "github.com/adambenhassen/telegram-server/components",
-    "utils": "github.com/adambenhassen/telegram-server/utils"
+    "components": "github.com/teagramhq/teagram-server/components",
+    "utils": "github.com/teagramhq/teagram-server/utils"
   }
 }

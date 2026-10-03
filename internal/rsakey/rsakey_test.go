@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
 )
 
 func TestLoadOrGenerateRoundTrip(t *testing.T) {

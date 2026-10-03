@@ -1,4 +1,4 @@
-module github.com/adambenhassen/telegram-server/tools
+module github.com/teagramhq/teagram-server/tools
 
 go 1.27.1
 

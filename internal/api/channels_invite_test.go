@@ -9,8 +9,8 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func inviteChannelFixture(t *testing.T) (*store.Store, store.User, store.Channel, store.User) {
@@ -378,24 +378,28 @@ func TestInviteToChannelAppearsInDialogsAfterMembershipNotifyLoss(t *testing.T) 
 			t.Fatalf("fresh getDialogs omitted invited channel %d with 102 memberships", ch.ID)
 		}
 	}
-	if d := dialogsByChannel[empty.ID]; d.TopMessage != 0 {
-		t.Errorf("empty channel top_message = %d, want 0", d.TopMessage)
-	} else if pts, hasPts := d.GetPts(); !hasPts || pts != 0 {
-		t.Errorf("empty channel pts = %d present=%v, want 0", pts, hasPts)
+	if d := dialogsByChannel[empty.ID]; d.TopMessage != 1 {
+		t.Errorf("empty channel top_message = %d, want creation service message 1", d.TopMessage)
+	} else if pts, hasPts := d.GetPts(); !hasPts || pts != 1 {
+		t.Errorf("empty channel pts = %d present=%v, want 1", pts, hasPts)
 	}
 	historyDialog := dialogsByChannel[history.ID]
-	if historyDialog.TopMessage != 2 {
-		t.Errorf("history top_message = %d, want 2", historyDialog.TopMessage)
+	if historyDialog.TopMessage != 3 {
+		t.Errorf("history top_message = %d, want 3", historyDialog.TopMessage)
 	}
-	if pts, hasPts := historyDialog.GetPts(); !hasPts || pts != 2 {
-		t.Errorf("history pts = %d present=%v, want 2", pts, hasPts)
+	if pts, hasPts := historyDialog.GetPts(); !hasPts || pts != 3 {
+		t.Errorf("history pts = %d present=%v, want 3", pts, hasPts)
 	}
-	if len(first.Messages) != 1 || first.Messages[0].GetID() != 2 {
-		t.Errorf("getDialogs messages = %v, want only history message 2", first.Messages)
+	messageIDs := make(map[int]bool)
+	for _, message := range first.Messages {
+		messageIDs[message.GetID()] = true
+	}
+	if len(first.Messages) != 2 || !messageIDs[1] || !messageIDs[3] {
+		t.Errorf("getDialogs messages = %v, want empty creation service message 1 and history top 3", first.Messages)
 	}
 	member, found, err := s.ChannelMemberOf(ctx, history.ID, invitee.ID)
-	if err != nil || !found || member.JoinPts != 2 {
-		t.Errorf("history membership = %+v found=%v err=%v, want join_pts 2", member, found, err)
+	if err != nil || !found || member.JoinPts != 3 {
+		t.Errorf("history membership = %+v found=%v err=%v, want join_pts 3", member, found, err)
 	}
 	channelHashes := make(map[int64]int64)
 	for _, class := range first.Chats {

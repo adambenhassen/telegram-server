@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/discovery"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/discovery"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // DiscoveryLimits bounds valid local-direct requests admitted to the discovery

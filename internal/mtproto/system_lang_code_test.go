@@ -10,7 +10,7 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 func TestUnpackInvokeWithAfterMsgKeepsBoundSystemLangCodePerConnection(t *testing.T) {

@@ -153,13 +153,14 @@ SELECT
     top.edit_date AS top_edit_date,
     top.random_id AS top_random_id,
     top.file_id AS top_file_id,
-    top.reply_to_msg_id AS top_reply_to_msg_id
+    top.reply_to_msg_id AS top_reply_to_msg_id,
+    top.action_type AS top_action_type
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
 JOIN LATERAL (
     SELECT cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date,
-           cm.random_id, cm.file_id, cm.reply_to_msg_id
+           cm.random_id, cm.file_id, cm.reply_to_msg_id, cm.action_type
     FROM channel_messages cm
     WHERE cm.channel_id = c.id AND cm.deleted = false
     ORDER BY cm.local_id DESC
@@ -198,6 +199,7 @@ type PeerChannelDialogsForOwnerRow struct {
 	TopRandomID                int64
 	TopFileID                  *int64
 	TopReplyToMsgID            *int32
+	TopActionType              int16
 }
 
 // PeerChannelDialogsForOwner is the channel counterpart of
@@ -238,6 +240,7 @@ func (q *Queries) PeerChannelDialogsForOwner(ctx context.Context, arg PeerChanne
 			&i.TopRandomID,
 			&i.TopFileID,
 			&i.TopReplyToMsgID,
+			&i.TopActionType,
 		); err != nil {
 			return nil, err
 		}

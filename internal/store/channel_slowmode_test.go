@@ -11,8 +11,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func openSlowModeTestDB(t *testing.T, ctx context.Context) (*store.Store, *pgx.Conn) {
@@ -79,11 +79,11 @@ func TestPostChannelMessageAsSlowModeWaitsAfterCommittedPostAndDedupsRetry(t *te
 
 	// A post made with slow mode disabled still establishes the next-send marker.
 	first, firstPts, dup, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "first", 69001, nil, 0)
-	if err != nil || dup || firstPts != 1 {
+	if err != nil || dup || firstPts != 2 {
 		t.Fatalf("first post = %+v pts=%d duplicate=%v err=%v", first, firstPts, dup, err)
 	}
 	second, secondPts, dup, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "second", 69004, nil, 0)
-	if err != nil || dup || secondPts != 2 || second.Message != "second" {
+	if err != nil || dup || secondPts != 3 || second.Message != "second" {
 		t.Fatalf("second post with slow mode disabled = %+v pts=%d duplicate=%v err=%v", second, secondPts, dup, err)
 	}
 	markerBefore := channelLastPostTestState(t, ctx, conn, channel.ID, member.ID)
@@ -100,12 +100,12 @@ func TestPostChannelMessageAsSlowModeWaitsAfterCommittedPostAndDedupsRetry(t *te
 	if !markerAfter.Valid || !markerAfter.Time.Equal(markerBefore.Time) {
 		t.Fatalf("refused post changed last_post_at from %v to %v", markerBefore, markerAfter)
 	}
-	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 2 {
-		t.Fatalf("state after refusal = %d err=%v, want pts 2", pts, err)
+	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 3 {
+		t.Fatalf("state after refusal = %d err=%v, want pts 3", pts, err)
 	}
-	events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 2, 10)
-	if err != nil || len(events) != 2 || events[1].LocalID != second.LocalID {
-		t.Fatalf("events after refusal = %+v err=%v, want only the two disabled-mode posts", events, err)
+	events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 3, 10)
+	if err != nil || len(events) != 3 || events[2].LocalID != second.LocalID {
+		t.Fatalf("events after refusal = %+v err=%v, want creation and two disabled-mode posts", events, err)
 	}
 
 	retry, retryPts, dup, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "retry", 69001, nil, 0)
@@ -122,7 +122,7 @@ func TestPostChannelMessageAsSlowModeWaitsAfterCommittedPostAndDedupsRetry(t *te
 
 	setLastPostTestState(t, ctx, conn, channel.ID, member.ID, 11*time.Second)
 	afterInterval, afterIntervalPts, dup, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "after interval", 69003, nil, 0)
-	if err != nil || dup || afterIntervalPts != 3 || afterInterval.Message != "after interval" {
+	if err != nil || dup || afterIntervalPts != 4 || afterInterval.Message != "after interval" {
 		t.Fatalf("post after interval = %+v pts=%d duplicate=%v err=%v", afterInterval, afterIntervalPts, dup, err)
 	}
 }
@@ -158,12 +158,12 @@ func TestPostChannelMessageAsSlowModeSurvivesLeaveAndRejoin(t *testing.T) {
 	if err == nil || duplicate || !strings.HasPrefix(err.Error(), "SLOWMODE_WAIT_") {
 		t.Fatalf("post after rejoin = duplicate %v, err=%v; want SLOWMODE_WAIT_<seconds>", duplicate, err)
 	}
-	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 1 {
-		t.Fatalf("state after refused post = %d, err=%v; want pts 1", pts, err)
+	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 2 {
+		t.Fatalf("state after refused post = %d, err=%v; want pts 2", pts, err)
 	}
-	events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 1, 10)
-	if err != nil || len(events) != 1 || events[0].LocalID != first.LocalID {
-		t.Fatalf("events after refused post = %+v, err=%v; want only the first post", events, err)
+	events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 2, 10)
+	if err != nil || len(events) != 2 || events[1].LocalID != first.LocalID {
+		t.Fatalf("events after refused post = %+v, err=%v; want creation and the first post", events, err)
 	}
 }
 
@@ -204,12 +204,12 @@ func TestPostChannelMessageAsSlowModeSerializesDistinctConcurrentPosts(t *testin
 	if succeeded != 1 || refused != posters-1 {
 		t.Fatalf("concurrent outcomes = %d succeeded, %d refused; want 1 and %d", succeeded, refused, posters-1)
 	}
-	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 1 {
-		t.Fatalf("state after concurrent posts = %d err=%v, want pts 1", pts, err)
+	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 2 {
+		t.Fatalf("state after concurrent posts = %d err=%v, want pts 2", pts, err)
 	}
-	events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 1, 10)
-	if err != nil || len(events) != 1 {
-		t.Fatalf("events after concurrent posts = %+v err=%v, want one event", events, err)
+	events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 2, 10)
+	if err != nil || len(events) != 2 {
+		t.Fatalf("events after concurrent posts = %+v err=%v, want creation and one post event", events, err)
 	}
 	if marker := channelLastPostTestState(t, ctx, conn, channel.ID, member.ID); !marker.Valid {
 		t.Fatal("successful concurrent post did not establish last_post_at")

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
 )
 
 // TestKeyIDIsSHA256OfSubjectPublicKeyInfo pins the identity to the digest of

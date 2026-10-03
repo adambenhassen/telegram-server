@@ -9,8 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestPostChannelMessageAsClassifiesEveryStoredDefaultRight(t *testing.T) {
@@ -60,7 +60,7 @@ func TestPostChannelMessageAsClassifiesEveryStoredDefaultRight(t *testing.T) {
 		{right: "send_docs"},
 		{right: "send_plain", blocksText: true},
 	}
-	var pts int
+	var pts = 1 // channel creation occupies the first event position.
 	for i, tc := range cases {
 		t.Run(tc.right, func(t *testing.T) {
 			if _, err := conn.Exec(ctx, `UPDATE channels SET default_banned_rights = $2 WHERE id = $1`, channel.ID, []string{tc.right}); err != nil {
@@ -125,22 +125,22 @@ func TestPostChannelMessageAsChecksMediaRestrictionsForFilePosts(t *testing.T) {
 			if _, _, _, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "attachment", int64(93500+i), &fileID, 0); !errors.Is(err, store.ErrChatWriteForbidden) {
 				t.Fatalf("post with file and %s = %v, want ErrChatWriteForbidden", right, err)
 			}
-			if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 0 {
-				t.Fatalf("channel pts after refused %s post = %d, err %v; want 0", right, pts, err)
+			if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 1 {
+				t.Fatalf("channel pts after refused %s post = %d, err %v; want creation pts 1", right, pts, err)
 			}
-			events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 0, 10)
+			events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 1, 10)
 			if err != nil {
 				t.Fatalf("events after refused %s post: %v", right, err)
 			}
-			if len(events) != 0 {
-				t.Fatalf("events after refused %s post = %d, want 0", right, len(events))
+			if len(events) != 1 || events[0].LocalID != 1 {
+				t.Fatalf("events after refused %s post = %d, want only the creation event", right, len(events))
 			}
 			messages, err := s.ChannelMessages(ctx, channel.ID, []int64{1})
 			if err != nil {
 				t.Fatalf("messages after refused %s post: %v", right, err)
 			}
-			if len(messages) != 0 {
-				t.Fatalf("messages after refused %s post = %d, want 0", right, len(messages))
+			if len(messages) != 1 || messages[1].Action != store.ChannelMessageActionCreate {
+				t.Fatalf("messages after refused %s post = %+v, want only the creation service message", right, messages)
 			}
 		})
 	}
@@ -297,13 +297,13 @@ func TestPostChannelMessageKeepsThePermissionReadWindow(t *testing.T) {
 		t.Fatalf("post whose permission read preceded the rights commit: %v", postErr)
 	}
 
-	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 1 {
-		t.Fatalf("channel pts after in-flight post = %d, err %v; want 1", pts, err)
+	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 2 {
+		t.Fatalf("channel pts after in-flight post = %d, err %v; want 2", pts, err)
 	}
 	if _, _, _, err = s.PostChannelMessageAs(ctx, channel.ID, member.ID, "after restriction", 93302, nil, 0); !errors.Is(err, store.ErrChatWriteForbidden) {
 		t.Fatalf("post whose permission read follows the rights commit = %v, want ErrChatWriteForbidden", err)
 	}
-	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 1 {
-		t.Fatalf("channel pts after refused post = %d, err %v; want 1", pts, err)
+	if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 2 {
+		t.Fatalf("channel pts after refused post = %d, err %v; want 2", pts, err)
 	}
 }

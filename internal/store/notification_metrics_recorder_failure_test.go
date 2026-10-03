@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestNotificationMetricsRecorderFailuresAreFixedAndRolling(t *testing.T) {

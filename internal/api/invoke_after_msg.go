@@ -7,7 +7,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 func (h *handlers) handleInvokeAfterMsgRefusal(c *mtproto.Conn, req *mtproto.Request, innerID uint32, reason mtproto.InvokeAfterMsgRefusal, verdict mtproto.UnimplementedVerdict) error {
