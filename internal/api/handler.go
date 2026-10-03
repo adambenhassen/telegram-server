@@ -245,7 +245,9 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 		dialogFilterSync:         dialogFilterSync,
 	}
 	d := mtproto.NewDispatcher()
-	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
+	registerWithConn(d, tg.HelpGetConfigRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, error) {
+		return h.handleGetConfigWithSystemLangCode(req, c.SystemLangCodeHint())
+	})
 	register(d, tg.HelpGetAppConfigRequestTypeID, h.handleGetAppConfig)
 	registerLangpackMethods(d, h)
 	h.registerHelpPolling(d)
