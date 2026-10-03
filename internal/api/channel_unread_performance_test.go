@@ -63,7 +63,8 @@ func TestChannelUnreadSummaryP99At500Memberships(t *testing.T) {
 			t.Errorf("close disposable database connection: %v", err)
 		}
 	})
-	marker := int64(1) << 62
+	channelTop := int64(1) << 62
+	readMarker := int64(1)
 	if _, err = conn.Exec(ctx, `
 INSERT INTO channels (id, title, creator_id, megagroup)
 SELECT $1::bigint + item, 'unread-summary-perf', $2::bigint, true
@@ -74,7 +75,7 @@ FROM generate_series(1, $3::int) AS item`, channelIDBase, owner.ID, membershipCo
 INSERT INTO channel_state (channel_id, next_local_id)
 SELECT channel.id, $2::bigint + 1
 FROM channels AS channel
-WHERE channel.id > $1::bigint AND channel.id <= $1::bigint + $3::int`, channelIDBase, marker, membershipCount); err != nil {
+WHERE channel.id > $1::bigint AND channel.id <= $1::bigint + $3::int`, channelIDBase, channelTop, membershipCount); err != nil {
 		t.Fatalf("seed channel state: %v", err)
 	}
 	if _, err = conn.Exec(ctx, `
@@ -85,30 +86,71 @@ WHERE channel.id > $1::bigint AND channel.id <= $1::bigint + $3::int`, channelID
 		t.Fatalf("seed channel memberships: %v", err)
 	}
 	if _, err = conn.Exec(ctx, `
+INSERT INTO channel_read_state (channel_id, user_id, read_max_id)
+SELECT channel.id, $2::bigint, $3::bigint
+FROM channels AS channel
+WHERE channel.id > $1::bigint AND channel.id <= $1::bigint + $4::int
+ON CONFLICT (channel_id, user_id)
+DO UPDATE SET read_max_id = EXCLUDED.read_max_id`, channelIDBase, owner.ID, readMarker, membershipCount); err != nil {
+		t.Fatalf("seed channel read markers: %v", err)
+	}
+	if _, err = conn.Exec(ctx, `
+INSERT INTO channel_messages (channel_id, local_id, from_id, message)
+SELECT channel.id, 1, $2::bigint, 'read marker post'
+FROM channels AS channel
+WHERE channel.id > $1::bigint AND channel.id <= $1::bigint + $3::int`, channelIDBase, owner.ID, membershipCount); err != nil {
+		t.Fatalf("seed posts at read markers: %v", err)
+	}
+	if _, err = conn.Exec(ctx, `
 INSERT INTO channel_messages (channel_id, local_id, from_id, message)
 SELECT channel.id, $2::bigint + 1, $3::bigint, 'owner post'
 FROM channels AS channel
-WHERE channel.id > $1::bigint AND channel.id <= $1::bigint + $4::int`, channelIDBase, marker, owner.ID, membershipCount); err != nil {
+WHERE channel.id > $1::bigint AND channel.id <= $1::bigint + $4::int`, channelIDBase, channelTop, owner.ID, membershipCount); err != nil {
 		t.Fatalf("seed summary contributions: %v", err)
 	}
 	if _, err = conn.Exec(ctx, `
 UPDATE channel_state
 SET next_local_id = $2::bigint + 2
-WHERE channel_id > $1::bigint AND channel_id <= $1::bigint + $3::int`, channelIDBase, marker, membershipCount); err != nil {
+WHERE channel_id > $1::bigint AND channel_id <= $1::bigint + $3::int`, channelIDBase, channelTop, membershipCount); err != nil {
 		t.Fatalf("advance channel tops: %v", err)
+	}
+	var readStateCount int
+	var minReadMarker, maxReadMarker int64
+	if err = conn.QueryRow(ctx, `
+SELECT count(*)::int,
+       COALESCE(min(read_max_id), 0)::bigint,
+       COALESCE(max(read_max_id), 0)::bigint
+FROM channel_read_state
+WHERE channel_id > $1::bigint AND channel_id <= $1::bigint + $3::int
+  AND user_id = $2::bigint`, channelIDBase, owner.ID, membershipCount).Scan(&readStateCount, &minReadMarker, &maxReadMarker); err != nil {
+		t.Fatalf("read seeded channel markers: %v", err)
+	}
+	if readStateCount != membershipCount || minReadMarker != readMarker || maxReadMarker != readMarker {
+		t.Fatalf("seeded channel read markers: count=%d min=%d max=%d, want %d rows at %d", readStateCount, minReadMarker, maxReadMarker, membershipCount, readMarker)
+	}
+	var totalSummaryChannels, authorSummaryChannels int
+	if err = conn.QueryRow(ctx, `
+SELECT count(DISTINCT channel_id) FILTER (WHERE scope_kind = 0 AND author_id = 0)::int,
+       count(DISTINCT channel_id) FILTER (WHERE scope_kind = 1 AND author_id = $2::bigint)::int
+FROM channel_post_summaries
+WHERE channel_id > $1::bigint AND channel_id <= $1::bigint + $3::int
+`, channelIDBase, owner.ID, membershipCount).Scan(&totalSummaryChannels, &authorSummaryChannels); err != nil {
+		t.Fatalf("count summary scopes: %v", err)
+	}
+	if totalSummaryChannels != membershipCount {
+		t.Fatalf("total summary channels = %d, want %d", totalSummaryChannels, membershipCount)
+	}
+	if authorSummaryChannels != membershipCount {
+		t.Fatalf("author summary channels = %d, want %d", authorSummaryChannels, membershipCount)
 	}
 
 	planRows, err := conn.Query(ctx, `
 EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT live_count
-FROM channel_post_summaries
-WHERE channel_id = $1::bigint
-  AND scope_kind = 0
-  AND author_id = 0
-  AND depth = 63
-  AND prefix = $2::bigint`, channelIDBase+1, marker+1)
+SELECT *
+FROM channel_post_unread_suffix_counts($1::bigint, $2::bigint, $3::bigint)
+	    AS summary(entitled, status_exists, summary_version, summary_ready, total_live, author_live)`, channelIDBase+1, owner.ID, readMarker)
 	if err != nil {
-		t.Fatalf("explain disposable summary key lookup: %v", err)
+		t.Fatalf("explain unread suffix summary probes: %v", err)
 	}
 	var plan []string
 	for planRows.Next() {
@@ -126,8 +168,11 @@ WHERE channel_id = $1::bigint
 	planRows.Close()
 	planText := strings.Join(plan, "\n")
 	t.Logf("disposable equality-key EXPLAIN (ANALYZE, BUFFERS):\n%s", planText)
-	if !strings.Contains(planText, "channel_post_summaries_pkey") {
-		t.Fatalf("summary plan did not use the primary key: %s", planText)
+	if strings.Count(planText, "channel_post_summaries_pkey") < 2 {
+		t.Fatalf("summary plan did not show equality-key probes for total and author scopes: %s", planText)
+	}
+	if strings.Count(planText, "loops=62") < 2 {
+		t.Fatalf("summary plan did not execute 62 equality-key probes for both scopes: %s", planText)
 	}
 
 	state, err := stores[0].State(ctx, owner.ID)
