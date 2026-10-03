@@ -45,19 +45,19 @@ func TestChannelPostSummaryInitializationCountsExactSuffixes(t *testing.T) {
 		`DELETE FROM channel_post_summary_state WHERE channel_id = $1`, channel.ID); err != nil {
 		t.Fatalf("remove simulated pre-migration readiness: %v", err)
 	}
-	if err = store.SetChannelStateNextLocalID(ctx, s, channel.ID, 2008); err != nil {
+	if err = store.SetChannelStateNextLocalID(ctx, s, channel.ID, 2009); err != nil {
 		t.Fatalf("set committed top: %v", err)
 	}
-	if err = store.InsertChannelPostRunForTest(ctx, s, channel.ID, 1, 1002, reader.ID, false); err != nil {
+	if err = store.InsertChannelPostRunForTest(ctx, s, channel.ID, 2, 1003, reader.ID, false); err != nil {
 		t.Fatalf("seed leading self-authored run: %v", err)
 	}
-	if err = store.InsertChannelPostRunForTest(ctx, s, channel.ID, 1003, 1004, creator.ID, false); err != nil {
+	if err = store.InsertChannelPostRunForTest(ctx, s, channel.ID, 1004, 1005, creator.ID, false); err != nil {
 		t.Fatalf("seed inbound posts: %v", err)
 	}
-	if err = store.InsertChannelPostRunForTest(ctx, s, channel.ID, 1005, 1005, creator.ID, true); err != nil {
+	if err = store.InsertChannelPostRunForTest(ctx, s, channel.ID, 1006, 1006, creator.ID, true); err != nil {
 		t.Fatalf("seed deleted post: %v", err)
 	}
-	if err = store.InsertChannelPostRunForTest(ctx, s, channel.ID, 1006, 2007, reader.ID, false); err != nil {
+	if err = store.InsertChannelPostRunForTest(ctx, s, channel.ID, 1007, 2008, reader.ID, false); err != nil {
 		t.Fatalf("seed trailing self-authored run: %v", err)
 	}
 
@@ -82,9 +82,9 @@ func TestChannelPostSummaryInitializationCountsExactSuffixes(t *testing.T) {
 		authorID  int64
 		want      int64
 	}{
-		{name: "total live posts", scopeKind: 0, want: 2006},
+		{name: "total live posts", scopeKind: 0, want: 2007},
 		{name: "reader contribution", scopeKind: 1, authorID: reader.ID, want: 2004},
-		{name: "creator contribution", scopeKind: 1, authorID: creator.ID, want: 2},
+		{name: "creator contribution", scopeKind: 1, authorID: creator.ID, want: 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, tc.scopeKind, tc.authorID)
@@ -100,7 +100,7 @@ func TestChannelPostSummaryInitializationCountsExactSuffixes(t *testing.T) {
 	for _, tc := range []struct {
 		marker int64
 		want   int64
-	}{{marker: 0, want: 2}, {marker: 1003, want: 1}} {
+	}{{marker: 0, want: 3}, {marker: 1004, want: 1}} {
 		got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, tc.marker)
 		if err != nil {
 			t.Fatalf("count suffix after %d: %v", tc.marker, err)
@@ -117,8 +117,8 @@ func TestChannelPostSummaryInitializationCountsExactSuffixes(t *testing.T) {
 		t.Fatalf("repeat initialization: %v", err)
 	}
 	got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, 0)
-	if err != nil || got != 2 {
-		t.Fatalf("unread after idempotent rebuild = %d, err %v; want 2", got, err)
+	if err != nil || got != 3 {
+		t.Fatalf("unread after idempotent rebuild = %d, err %v; want 3", got, err)
 	}
 }
 
@@ -138,8 +138,8 @@ func TestChannelPostSummaryTriggersMaintainMutationsAndFailClosed(t *testing.T) 
 	}
 
 	message, _ := post(t, s, channel.ID, creator.ID, "one", 72101)
-	if message.LocalID != 1 {
-		t.Fatalf("post local ID = %d, want 1", message.LocalID)
+	if message.LocalID != 2 {
+		t.Fatalf("post local ID = %d, want 2", message.LocalID)
 	}
 	if _, _, dup, err := s.PostChannelMessage(ctx, channel.ID, creator.ID, "one", 72101, nil, 0); err != nil || !dup {
 		t.Fatalf("dedup post duplicate=%v err=%v", dup, err)
@@ -158,7 +158,7 @@ func TestChannelPostSummaryTriggersMaintainMutationsAndFailClosed(t *testing.T) 
 		}
 	}()
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`UPDATE channel_messages SET message = 'edited' WHERE channel_id = $1 AND local_id = 1`, channel.ID); err != nil {
+		`UPDATE channel_messages SET message = 'edited' WHERE channel_id = $1 AND local_id = $2`, channel.ID, message.LocalID); err != nil {
 		t.Fatalf("edit post content: %v", err)
 	}
 	notifyCtx, cancelNotify := context.WithTimeout(ctx, 100*time.Millisecond)
@@ -169,16 +169,16 @@ func TestChannelPostSummaryTriggersMaintainMutationsAndFailClosed(t *testing.T) 
 		t.Fatalf("wait for source-trigger notification: %v", notifyErr)
 	}
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`UPDATE channel_messages SET from_id = $3 WHERE channel_id = $1 AND local_id = $2`, channel.ID, int64(1), reader.ID); err != nil {
+		`UPDATE channel_messages SET from_id = $3 WHERE channel_id = $1 AND local_id = $2`, channel.ID, message.LocalID, reader.ID); err != nil {
 		t.Fatalf("change live author: %v", err)
 	}
-	got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, 0)
+	got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, 1)
 	if err != nil || got != 0 {
 		t.Fatalf("self-authored post count = %d, err %v; want 0", got, err)
 	}
 	otherChannel := mustChannel(t, s, creator.ID, "summary-mutation-target")
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`UPDATE channel_messages SET channel_id = $2 WHERE channel_id = $1 AND local_id = 1`, channel.ID, otherChannel.ID); err != nil {
+		`UPDATE channel_messages SET channel_id = $2 WHERE channel_id = $1 AND local_id = $3`, channel.ID, otherChannel.ID, message.LocalID); err != nil {
 		t.Fatalf("move live post to another channel: %v", err)
 	}
 	if got, err = s.ChannelPostUnreadCount(ctx, channel.ID, creator.ID, 0); err != nil || got != 0 {
@@ -188,11 +188,12 @@ func TestChannelPostSummaryTriggersMaintainMutationsAndFailClosed(t *testing.T) 
 		t.Fatalf("new channel count after identity move = %d, err %v; want 1", got, err)
 	}
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`UPDATE channel_messages SET channel_id = $2 WHERE channel_id = $1 AND local_id = 1`, otherChannel.ID, channel.ID); err != nil {
+		`UPDATE channel_messages SET channel_id = $2 WHERE channel_id = $1 AND local_id = $3`, otherChannel.ID, channel.ID, message.LocalID); err != nil {
 		t.Fatalf("move live post back to original channel: %v", err)
 	}
+	movedLocalID := message.LocalID + 1
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`UPDATE channel_messages SET local_id = 2 WHERE channel_id = $1 AND local_id = 1`, channel.ID); err != nil {
+		`UPDATE channel_messages SET local_id = $2 WHERE channel_id = $1 AND local_id = $3`, channel.ID, movedLocalID, message.LocalID); err != nil {
 		t.Fatalf("change live local ID: %v", err)
 	}
 	got, err = s.ChannelPostUnreadCount(ctx, channel.ID, creator.ID, 1)
@@ -200,11 +201,11 @@ func TestChannelPostSummaryTriggersMaintainMutationsAndFailClosed(t *testing.T) 
 		t.Fatalf("moved post suffix = %d, err %v; want 1", got, err)
 	}
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = 2`, channel.ID); err != nil {
+		`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = $2`, channel.ID, movedLocalID); err != nil {
 		t.Fatalf("delete live post: %v", err)
 	}
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = 2`, channel.ID); err != nil {
+		`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = $2`, channel.ID, movedLocalID); err != nil {
 		t.Fatalf("repeat deletion: %v", err)
 	}
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
@@ -216,7 +217,7 @@ func TestChannelPostSummaryTriggersMaintainMutationsAndFailClosed(t *testing.T) 
 		t.Fatalf("count after deletion and file cleanup = %d, err %v; want 0", got, err)
 	}
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`UPDATE channel_messages SET deleted = false WHERE channel_id = $1 AND local_id = 2`, channel.ID); err != nil {
+		`UPDATE channel_messages SET deleted = false WHERE channel_id = $1 AND local_id = $2`, channel.ID, movedLocalID); err != nil {
 		t.Fatalf("restore post: %v", err)
 	}
 	got, err = s.ChannelPostUnreadCount(ctx, channel.ID, creator.ID, 0)
@@ -224,7 +225,7 @@ func TestChannelPostSummaryTriggersMaintainMutationsAndFailClosed(t *testing.T) 
 		t.Fatalf("count after restore = %d, err %v; want 1", got, err)
 	}
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`DELETE FROM channel_messages WHERE channel_id = $1 AND local_id = 2`, channel.ID); err != nil {
+		`DELETE FROM channel_messages WHERE channel_id = $1 AND local_id = $2`, channel.ID, movedLocalID); err != nil {
 		t.Fatalf("physically delete live post: %v", err)
 	}
 	notifyCtx, cancelNotify = context.WithTimeout(ctx, 100*time.Millisecond)
@@ -293,9 +294,11 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 	}
 	first, _ := post(t, s, channel.ID, creator.ID, "first", 72401)
 	second, _ := post(t, s, channel.ID, creator.ID, "second", 72402)
-	if first.LocalID != 1 || second.LocalID != 2 {
-		t.Fatalf("seed local IDs = %d and %d, want 1 and 2", first.LocalID, second.LocalID)
+	if first.LocalID != 2 || second.LocalID != 3 {
+		t.Fatalf("seed local IDs = %d and %d, want 2 and 3", first.LocalID, second.LocalID)
 	}
+	readCommittedLocalID := second.LocalID + 1
+	repeatableReadLocalID := second.LocalID + 2
 
 	conn, err := store.ChannelPostSummaryControlConnection(ctx, s)
 	if err != nil {
@@ -388,15 +391,15 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 	go func() {
 		postDone <- store.ExecChannelPostSummarySQL(ctx, s, `
 			INSERT INTO channel_messages (channel_id, local_id, from_id, message)
-			VALUES ($1, 3, $2, 'old-binary post during initialization')
-		`, channel.ID, creator.ID)
+			VALUES ($1, $2, $3, 'old-binary post during initialization')
+		`, channel.ID, readCommittedLocalID, creator.ID)
 	}()
 	repeatablePostDone := make(chan error, 1)
 	go func() {
 		_, writeErr := staleTx.Exec(ctx, `
 			INSERT INTO channel_messages (channel_id, local_id, from_id, message)
-			VALUES ($1, 4, $2, 'repeatable-read post after initialization')
-		`, channel.ID, creator.ID)
+			VALUES ($1, $2, $3, 'repeatable-read post after initialization')
+		`, channel.ID, repeatableReadLocalID, creator.ID)
 		if writeErr == nil {
 			writeErr = staleTx.Commit(ctx)
 		}
@@ -424,8 +427,8 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 	if err = staleTx.Rollback(ctx); err != nil {
 		t.Fatalf("roll back rejected repeatable-read writer: %v", err)
 	}
-	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 3 {
-		t.Fatalf("root count after init/post overlap = %d, err %v; want 3", got, err)
+	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 4 {
+		t.Fatalf("root count after init/post overlap = %d, err %v; want 4", got, err)
 	}
 
 	// Hold the state row while two independent source writes reach their AFTER
@@ -441,12 +444,12 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 	deleteDone := make(chan error, 1)
 	go func() {
 		deleteDone <- store.ExecChannelPostSummarySQL(ctx, s,
-			`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = 1`, channel.ID)
+			`UPDATE channel_messages SET deleted = true WHERE channel_id = $1 AND local_id = $2`, channel.ID, first.LocalID)
 	}()
 	moveDone := make(chan error, 1)
 	go func() {
 		moveDone <- store.ExecChannelPostSummarySQL(ctx, s,
-			`UPDATE channel_messages SET local_id = 4 WHERE channel_id = $1 AND local_id = 2`, channel.ID)
+			`UPDATE channel_messages SET local_id = $2 WHERE channel_id = $1 AND local_id = $3`, channel.ID, repeatableReadLocalID, second.LocalID)
 	}()
 	if err = store.WaitForLockWaiters(ctx, s, 2); err != nil {
 		_ = stateHold.Rollback(context.Background()) //nolint:errcheck // release waiters before failing
@@ -462,8 +465,8 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 	if err = <-moveDone; err != nil {
 		t.Fatalf("commit concurrent live identity move: %v", err)
 	}
-	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 2 {
-		t.Fatalf("root count after source mutation overlap = %d, err %v; want 2", got, err)
+	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 3 {
+		t.Fatalf("root count after source mutation overlap = %d, err %v; want 3", got, err)
 	}
 	if got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, 1); err != nil || got != 2 {
 		t.Fatalf("unread suffix after source mutation overlap = %d, err %v; want 2", got, err)
@@ -516,8 +519,8 @@ func TestChannelReadMarkerAdmissionAndMonotonicAdvance(t *testing.T) {
 		t.Fatalf("re-admitted member marker = %d, err %v; want new top %d", marker, err, second.LocalID)
 	}
 	marker, err = s.ChannelReadMarker(ctx, channel.ID, oldMember.ID)
-	if err != nil || marker != 0 {
-		t.Fatalf("existing member marker = %d, err %v; want 0", marker, err)
+	if err != nil || marker != 1 {
+		t.Fatalf("existing member marker = %d, err %v; want 1", marker, err)
 	}
 	read, err := s.AdvanceChannelReadMarker(ctx, channel.ID, oldMember.ID, 1)
 	if err != nil || read != 1 {
@@ -607,6 +610,10 @@ func TestChannelPostSummaryFailedRebuildStaysUnavailableAndRetries(t *testing.T)
 	if _, _, err = s.JoinChannelByInvite(ctx, invite, reader.ID); err != nil {
 		t.Fatalf("join reader: %v", err)
 	}
+	readerMarker, err := s.ChannelReadMarker(ctx, channel.ID, reader.ID)
+	if err != nil {
+		t.Fatalf("read reader marker: %v", err)
+	}
 	_, _ = post(t, s, channel.ID, creator.ID, "live", 72301)
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
 		`ALTER TABLE channel_post_summaries ADD CONSTRAINT channel_post_summary_test_fail CHECK (false) NOT VALID`); err != nil {
@@ -619,7 +626,7 @@ func TestChannelPostSummaryFailedRebuildStaysUnavailableAndRetries(t *testing.T)
 	if err != nil || status != store.ChannelPostSummaryNotReady {
 		t.Fatalf("failed rebuild readiness = %v, err %v; want not ready", status, err)
 	}
-	if _, err = s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, 0); !errors.Is(err, store.ErrChannelPostSummaryNotReady) {
+	if _, err = s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, readerMarker); !errors.Is(err, store.ErrChannelPostSummaryNotReady) {
 		t.Fatalf("count after failed rebuild = %v, want not-ready refusal", err)
 	}
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
@@ -633,7 +640,7 @@ func TestChannelPostSummaryFailedRebuildStaysUnavailableAndRetries(t *testing.T)
 	if err != nil || status != store.ChannelPostSummaryReady {
 		t.Fatalf("retry readiness = %v, err %v; want ready", status, err)
 	}
-	got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, 0)
+	got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, readerMarker)
 	if err != nil || got != 1 {
 		t.Fatalf("unread after retry = %d, err %v; want 1", got, err)
 	}
