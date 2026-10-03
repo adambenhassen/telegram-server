@@ -210,8 +210,8 @@ EOF
       ;;
     helper-missing)
       replace_fixture_text "$rpc_fixture" \
-        'func waitForSmokeOwnerLock(t *testing.T, callsiteID string)' \
-        'func waitForSmokeOwnerLockMissing(t *testing.T, callsiteID string)'
+        'func waitForSmokeOwnerLock(t *testing.T, ctx any, lock any, wantBlocked bool, callsiteID string)' \
+        'func waitForSmokeOwnerLockMissing(t *testing.T, ctx any, lock any, wantBlocked bool, callsiteID string)'
       ;;
     helper-duplicate)
       cat >>"$rpc_fixture" <<'EOF'
@@ -233,8 +233,8 @@ EOF
       ;;
     check-helper-missing)
       replace_fixture_text "$rpc_fixture" \
-        'func smokeOwnerLockCount(t *testing.T, callsiteID string) int' \
-        'func smokeOwnerLockCountMissing(t *testing.T, callsiteID string) int'
+        'func smokeOwnerLockCount(t *testing.T, ctx any, lock any, callsiteID string) int' \
+        'func smokeOwnerLockCountMissing(t *testing.T, ctx any, lock any, callsiteID string) int'
       ;;
     check-helper-duplicate)
       cat >>"$rpc_fixture" <<'EOF'
