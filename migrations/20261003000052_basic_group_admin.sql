@@ -25,6 +25,8 @@ CREATE TABLE chat_admin_event_recipients (
 
 CREATE INDEX chat_admin_event_recipients_event_owner_idx
     ON chat_admin_event_recipients (event_id, owner_id);
+CREATE INDEX chat_admin_event_recipients_chat_target_idx
+    ON chat_admin_event_recipients (chat_id, target_id);
 
 -- Keep only the latest pending pull version per member/chat/target. A
 -- successful getDifference consumes the matching event ID; membership
@@ -43,3 +45,5 @@ CREATE TABLE chat_admin_state_markers (
 
 CREATE INDEX chat_admin_state_markers_owner_event_idx
     ON chat_admin_state_markers (owner_id, event_id);
+CREATE INDEX chat_admin_state_markers_chat_target_idx
+    ON chat_admin_state_markers (chat_id, target_id);

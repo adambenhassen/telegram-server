@@ -51,6 +51,36 @@ func TestOpenRejectsMissingFileSubtypeRightsConstraint(t *testing.T) {
 	requireOpenMigrationError(t, ctx, dsn)
 }
 
+func TestChatAdminMarkerIndexesSupportParticipantCascades(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, pgtest.DSN(t))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	for _, index := range []struct {
+		name  string
+		table string
+	}{
+		{name: "chat_admin_event_recipients_chat_target_idx", table: "chat_admin_event_recipients"},
+		{name: "chat_admin_state_markers_chat_target_idx", table: "chat_admin_state_markers"},
+	} {
+		var definition string
+		if err := conn.QueryRow(ctx, `
+			SELECT indexdef
+			FROM pg_indexes
+			WHERE schemaname = current_schema() AND indexname = $1 AND tablename = $2
+		`, index.name, index.table).Scan(&definition); err != nil {
+			t.Fatalf("read %s definition: %v", index.name, err)
+		}
+		if !strings.Contains(definition, "(chat_id, target_id)") {
+			t.Errorf("%s does not cover participant cascade columns: %s", index.name, definition)
+		}
+	}
+}
+
 func TestServerAdministrationMigrationClosesNonEmptyDatabase(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
