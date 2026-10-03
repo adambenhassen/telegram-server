@@ -113,7 +113,10 @@ func rpcCancelDiagnosticFromContext(ctx context.Context) *rpcCancelDiagnostic {
 	if ctx == nil {
 		return nil
 	}
-	diagnostic, _ := ctx.Value(rpcCancelDiagnosticContextKey{}).(*rpcCancelDiagnostic)
+	diagnostic, ok := ctx.Value(rpcCancelDiagnosticContextKey{}).(*rpcCancelDiagnostic)
+	if !ok {
+		return nil
+	}
 	return diagnostic
 }
 

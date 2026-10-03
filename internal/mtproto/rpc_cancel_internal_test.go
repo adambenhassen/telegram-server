@@ -112,6 +112,7 @@ func TestPeerRPCCancellationDiagnosticUsesFixedOutcomes(t *testing.T) {
 		{
 			name: "applied",
 			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				t.Helper()
 				state := newPeerRPCStateWithDiagnostics(newRPCCancelBudget(time.Now, 8), true)
 				_, finish, started := state.begin(1, context.Background())
 				if !started {
@@ -124,6 +125,7 @@ func TestPeerRPCCancellationDiagnosticUsesFixedOutcomes(t *testing.T) {
 		{
 			name: "denied per user",
 			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				t.Helper()
 				now := time.Unix(1_800_000_600, 0)
 				budget := newRPCCancelBudget(func() time.Time { return now }, 8)
 				reservation, ok := budget.reserve(2)
@@ -143,6 +145,7 @@ func TestPeerRPCCancellationDiagnosticUsesFixedOutcomes(t *testing.T) {
 		{
 			name: "denied globally",
 			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				t.Helper()
 				now := time.Unix(1_800_000_600, 0)
 				budget := newRPCCancelBudget(func() time.Time { return now }, 8)
 				for _, userID := range []int64{3, 4} {
@@ -164,6 +167,7 @@ func TestPeerRPCCancellationDiagnosticUsesFixedOutcomes(t *testing.T) {
 		{
 			name: "denied at capacity",
 			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				t.Helper()
 				now := time.Unix(1_800_000_600, 0)
 				budget := newRPCCancelBudget(func() time.Time { return now }, 1)
 				reservation, ok := budget.reserve(6)
@@ -183,6 +187,7 @@ func TestPeerRPCCancellationDiagnosticUsesFixedOutcomes(t *testing.T) {
 		{
 			name: "already finished",
 			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				t.Helper()
 				state := newPeerRPCStateWithDiagnostics(newRPCCancelBudget(time.Now, 8), true)
 				_, finish, started := state.begin(8, context.Background())
 				if !started {

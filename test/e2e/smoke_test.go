@@ -1534,10 +1534,12 @@ func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMo
 }
 
 func newSmokeFixtureWithLifecycle(t *testing.T, regMode config.RegistrationMode, withStatus bool) *smokeFixture {
+	t.Helper()
 	return newSmokeFixtureConfigured(t, regMode, withStatus, nil)
 }
 
 func newSmokeFixtureForPeerDisconnect(t *testing.T) *smokeFixture {
+	t.Helper()
 	return newSmokeFixtureConfigured(t, config.RegistrationClosed, true, store.NewSendMessageDiagnosticForTesting())
 }
 

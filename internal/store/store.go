@@ -229,7 +229,10 @@ func sendMessageDiagnosticFromContext(ctx context.Context) *SendMessageDiagnosti
 	if ctx == nil {
 		return nil
 	}
-	diagnostic, _ := ctx.Value(sendMessageDiagnosticContextKey{}).(*SendMessageDiagnosticForTesting)
+	diagnostic, ok := ctx.Value(sendMessageDiagnosticContextKey{}).(*SendMessageDiagnosticForTesting)
+	if !ok {
+		return nil
+	}
 	return diagnostic
 }
 
