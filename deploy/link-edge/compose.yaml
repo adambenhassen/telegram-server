@@ -12,6 +12,7 @@ services:
       - "127.0.0.1:8082:8082"
     networks:
       - private-edge
+      - landing-publish
     read_only: true
     cap_drop:
       - ALL
@@ -83,3 +84,8 @@ networks:
     external: true
   private-edge:
     internal: true
+  landing-publish:
+    driver: bridge
+    internal: false
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"

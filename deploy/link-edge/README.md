@@ -5,7 +5,9 @@ separately managed Telegram Web container. It does not use the server stack's
 Compose file. The selector reaches Web through `telegram-web-edge-net` as
 `web:8080` and reaches landing over the private `private-edge` bridge. Only the
 selector and landing containers publish ports, both on host loopback. The
-project has no environment, secret, volume, or server-service dependency.
+landing container also joins a dedicated bridge for its published port; that
+bridge has IP masquerading disabled and no other service attached. The project
+has no environment, secret, volume, or server-service dependency.
 
 ## Validate and build
 
@@ -41,9 +43,17 @@ docker compose --env-file /dev/null --project-directory deploy/link-edge --file 
 
 Before changing Serve, verify the health checks and synthetic landing over
 `http://127.0.0.1:8081/` and `http://127.0.0.1:8082/syntheticname`; verify Web
-`/` through the selector. Then change only the HTTPS `/` upstream to
-`http://127.0.0.1:8081` with the installed Tailscale Serve CLI. Save a
-0600 pre-change status snapshot, then apply the root-only mount:
+`/` through the selector. Confirm `docker port` reports only the loopback
+binding for landing and inspect `ss -ltn` for the 8082 listener:
+
+```sh
+docker port "$(docker compose --env-file /dev/null --project-directory deploy/link-edge --file deploy/link-edge/compose.yaml ps --quiet linklanding)" 8082/tcp
+ss -ltn 'sport = :8082'
+```
+
+Then change only the HTTPS `/` upstream to `http://127.0.0.1:8081` with the
+installed Tailscale Serve CLI. Save a 0600 pre-change status snapshot, then
+apply the root-only mount:
 
 ```sh
 snapshot="/root/tailscale-serve-pre-link-edge-$(date +%Y%m%d%H%M%S).json"

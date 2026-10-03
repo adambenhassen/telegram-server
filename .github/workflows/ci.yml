@@ -136,7 +136,7 @@ jobs:
             and all(.services[]; .logging.driver == "json-file")
             and all(.services[]; .logging.options["max-size"] == "10m")
             and all(.services[]; .logging.options["max-file"] == "3")
-            and (.services.linklanding.networks | keys) == ["private-edge"]
+            and (.services.linklanding.networks | keys) == ["landing-publish", "private-edge"]
             and (.services.selector.networks | keys) == ["private-edge", "web-edge"]
             and (.services.linklanding.ports | length) == 1
             and (.services.linklanding.ports[0].host_ip == "127.0.0.1")
@@ -153,12 +153,30 @@ jobs:
             and ((.volumes // {}) | length) == 0
             and ((.secrets // {}) | length) == 0
             and (.networks["private-edge"].internal == true)
+            and (.networks["landing-publish"].driver == "bridge")
+            and (.networks["landing-publish"].internal == false)
+            and (.networks["landing-publish"].driver_opts["com.docker.network.bridge.enable_ip_masquerade"] == "false")
             and (.networks["web-edge"].external == true)
             and (.networks["web-edge"].name == "telegram-web-edge-net")
           ' "$RUNNER_TEMP/link-edge-compose.json"
 
       - name: Build isolated link edge images
         run: docker compose --env-file /dev/null --project-directory deploy/link-edge --file deploy/link-edge/compose.yaml build
+
+      - name: Verify landing loopback publication on the Docker daemon
+        run: |
+          compose=(docker compose --env-file /dev/null --project-directory deploy/link-edge --file deploy/link-edge/compose.yaml)
+          docker network create telegram-web-edge-net
+          cleanup() {
+            "${compose[@]}" down --remove-orphans
+            docker network rm telegram-web-edge-net
+          }
+          trap cleanup EXIT
+          "${compose[@]}" up --detach --wait linklanding
+          landing_id=$("${compose[@]}" ps --quiet linklanding)
+          docker port "$landing_id" 8082/tcp | grep -Fxq '127.0.0.1:8082'
+          ss -ltn 'sport = :8082'
+          curl --fail --silent --show-error --output /dev/null http://127.0.0.1:8082/syntheticname
 
       - name: Build MinIO image for tests
         uses: docker/build-push-action@v7.4.0
