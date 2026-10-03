@@ -124,7 +124,8 @@ func TestPeerRPCCancellationDiagnosticUsesFixedOutcomes(t *testing.T) {
 		{
 			name: "denied per user",
 			prepare: func(t *testing.T) (*peerRPCState, func()) {
-				budget := newRPCCancelBudget(time.Now, 8)
+				now := time.Unix(1_800_000_600, 0)
+				budget := newRPCCancelBudget(func() time.Time { return now }, 8)
 				reservation, ok := budget.reserve(2)
 				if !ok {
 					t.Fatal("initial reservation was denied")
@@ -142,7 +143,8 @@ func TestPeerRPCCancellationDiagnosticUsesFixedOutcomes(t *testing.T) {
 		{
 			name: "denied globally",
 			prepare: func(t *testing.T) (*peerRPCState, func()) {
-				budget := newRPCCancelBudget(time.Now, 8)
+				now := time.Unix(1_800_000_600, 0)
+				budget := newRPCCancelBudget(func() time.Time { return now }, 8)
 				for _, userID := range []int64{3, 4} {
 					reservation, ok := budget.reserve(userID)
 					if !ok {
@@ -162,7 +164,8 @@ func TestPeerRPCCancellationDiagnosticUsesFixedOutcomes(t *testing.T) {
 		{
 			name: "denied at capacity",
 			prepare: func(t *testing.T) (*peerRPCState, func()) {
-				budget := newRPCCancelBudget(time.Now, 1)
+				now := time.Unix(1_800_000_600, 0)
+				budget := newRPCCancelBudget(func() time.Time { return now }, 1)
 				reservation, ok := budget.reserve(6)
 				if !ok {
 					t.Fatal("initial reservation was denied")
