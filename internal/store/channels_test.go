@@ -1030,8 +1030,8 @@ func TestAddChannelMembersPreservesExistingMembershipState(t *testing.T) {
 		t.Errorf("banned member after invite = %+v, want unchanged banned row %+v (found=%v err=%v)", bannedAfter, beforeBanned, found, err)
 	}
 	newMember, found, err := s.ChannelMemberOf(ctx, ch.ID, target.ID)
-	if err != nil || !found || newMember.Role != 0 || newMember.JoinPts != 1 || newMember.Banned(time.Now()) {
-		t.Errorf("new member = %+v, want role 0 at join_pts 1 (found=%v err=%v)", newMember, found, err)
+	if err != nil || !found || newMember.Role != 0 || newMember.JoinPts != 2 || newMember.Banned(time.Now()) {
+		t.Errorf("new member = %+v, want role 0 at join_pts 2 (found=%v err=%v)", newMember, found, err)
 	}
 
 	added, err = s.AddChannelMembers(ctx, ch.ID, admin.ID, []int64{banned.ID, target.ID})

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -223,8 +225,8 @@ func TestHandleGetFullChannelImmediatelyAfterCreate(t *testing.T) {
 	if !full.GetCanViewParticipants() {
 		t.Error("broadcast creator cannot view participants")
 	}
-	if full.Pts != 0 {
-		t.Errorf("channel pts = %d, want 0", full.Pts)
+	if full.Pts != 1 {
+		t.Errorf("channel pts = %d, want creation pts 1", full.Pts)
 	}
 	chat := fullChatChannel(t, response)
 	if chat.ID != channel.ID || chat.AccessHash != api.DeriveChannelHash(creator.ID, channel.ID) || !chat.Creator {
@@ -297,7 +299,7 @@ func TestHandleGetFullChannelAppliesViewerPolicy(t *testing.T) {
 	}
 	adminFull := fullChannelInfo(t, adminResponse)
 	adminChannel := fullChatChannel(t, adminResponse)
-	if adminFull.About != "Visible description" || !adminFull.GetCanViewParticipants() || adminFull.Pts != 1 {
+	if adminFull.About != "Visible description" || !adminFull.GetCanViewParticipants() || adminFull.Pts != 2 {
 		t.Errorf("admin full metadata: about=%q can_view_participants=%v pts=%d", adminFull.About, adminFull.GetCanViewParticipants(), adminFull.Pts)
 	}
 	if adminChannel.Username != "publicsetup" || adminChannel.AccessHash != api.DeriveChannelHash(admin.ID, broadcast.ID) {
@@ -333,7 +335,7 @@ func TestHandleGetFullChannelAppliesViewerPolicy(t *testing.T) {
 	}
 	memberFull := fullChannelInfo(t, memberResponse)
 	memberChannel := fullChatChannel(t, memberResponse)
-	if memberFull.About != "Visible description" || memberFull.GetCanViewParticipants() || memberFull.Pts != 1 {
+	if memberFull.About != "Visible description" || memberFull.GetCanViewParticipants() || memberFull.Pts != 2 {
 		t.Errorf("broadcast member metadata: about=%q can_view_participants=%v pts=%d", memberFull.About, memberFull.GetCanViewParticipants(), memberFull.Pts)
 	}
 	if _, ok := memberFull.GetAdminsCount(); ok {
@@ -573,6 +575,201 @@ func TestHandleCreateChannelMegagroup(t *testing.T) {
 	if !ch.Megagroup || ch.Broadcast {
 		t.Errorf("megagroup=%v broadcast=%v, want true/false", ch.Megagroup, ch.Broadcast)
 	}
+}
+
+func TestCreateChannelServiceMessageAppearsOnAllReadPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		broadcast bool
+		megagroup bool
+	}{
+		{name: "broadcast", broadcast: true},
+		{name: "megagroup", megagroup: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			s := openStore(t)
+			user, err := s.CreateUser(ctx, "+15551294020")
+			if err != nil {
+				t.Fatalf("user: %v", err)
+			}
+			const title = "First day"
+			created, err := api.CreateChannelForTest(s, user.ID, &tg.ChannelsCreateChannelRequest{
+				Broadcast: tc.broadcast,
+				Megagroup: tc.megagroup,
+				Title:     title,
+			})
+			if err != nil {
+				t.Fatalf("create channel: %v", err)
+			}
+			assertEncodes(t, created)
+			updates, ok := created.(*tg.Updates)
+			if !ok {
+				t.Fatalf("create response = %T, want *tg.Updates", created)
+			}
+			channel, ok := updates.Chats[0].(*tg.Channel)
+			if !ok {
+				t.Fatalf("create response chat = %T, want *tg.Channel", updates.Chats[0])
+			}
+
+			assertCreateService := func(messages []tg.MessageClass, surface string) {
+				t.Helper()
+				if len(messages) != 1 {
+					t.Fatalf("%s messages = %d, want the one creation message", surface, len(messages))
+				}
+				service, ok := messages[0].(*tg.MessageService)
+				if !ok {
+					t.Fatalf("%s message = %T, want *tg.MessageService", surface, messages[0])
+				}
+				if service.ID != 1 {
+					t.Errorf("%s message id = %d, want 1", surface, service.ID)
+				}
+				action, ok := service.Action.(*tg.MessageActionChannelCreate)
+				if !ok {
+					t.Fatalf("%s action = %T, want *tg.MessageActionChannelCreate", surface, service.Action)
+				}
+				if action.Title != title {
+					t.Errorf("%s title = %q, want %q", surface, action.Title, title)
+				}
+			}
+
+			var createMessage tg.MessageClass
+			for _, update := range updates.Updates {
+				newMessage, ok := update.(*tg.UpdateNewChannelMessage)
+				if !ok {
+					continue
+				}
+				if newMessage.Pts != 1 || newMessage.PtsCount != 1 {
+					t.Errorf("create update pts = %d/%d, want 1/1", newMessage.Pts, newMessage.PtsCount)
+				}
+				createMessage = newMessage.Message
+				break
+			}
+			if createMessage == nil {
+				t.Fatal("create response has no UpdateNewChannelMessage")
+			}
+			assertCreateService([]tg.MessageClass{createMessage}, "create response")
+
+			dialogs, err := api.GetDialogsForTest(s, user.ID)
+			if err != nil {
+				t.Fatalf("get dialogs: %v", err)
+			}
+			assertEncodes(t, dialogs)
+			gotDialogs, ok := dialogs.(*tg.MessagesDialogs)
+			if !ok {
+				t.Fatalf("get dialogs response = %T, want *tg.MessagesDialogs", dialogs)
+			}
+			var foundChannel bool
+			for _, item := range gotDialogs.Dialogs {
+				dialog, ok := item.(*tg.Dialog)
+				if !ok {
+					continue
+				}
+				peer, ok := dialog.Peer.(*tg.PeerChannel)
+				if ok && peer.ChannelID == channel.ID {
+					foundChannel = true
+					if dialog.TopMessage != 1 {
+						t.Errorf("channel dialog top message = %d, want 1", dialog.TopMessage)
+					}
+				}
+			}
+			if !foundChannel {
+				t.Fatal("get dialogs omitted the channel before its first post")
+			}
+			assertCreateService(gotDialogs.Messages, "get dialogs")
+
+			history, err := api.GetHistoryForTest(s, user.ID, &tg.MessagesGetHistoryRequest{
+				Peer:  api.InputPeerChannel(user.ID, channel.ID),
+				Limit: 10,
+			})
+			if err != nil {
+				t.Fatalf("get history: %v", err)
+			}
+			assertEncodes(t, history)
+			gotHistory, ok := history.(*tg.MessagesChannelMessages)
+			if !ok {
+				t.Fatalf("get history response = %T, want *tg.MessagesChannelMessages", history)
+			}
+			assertCreateService(gotHistory.Messages, "get history")
+
+			difference, err := api.GetChannelDifferenceForTest(s, user.ID, &tg.UpdatesGetChannelDifferenceRequest{
+				Channel: api.InputChannel(user.ID, channel.ID),
+				Filter:  &tg.ChannelMessagesFilterEmpty{},
+				Pts:     0,
+				Limit:   10,
+			})
+			if err != nil {
+				t.Fatalf("get channel difference: %v", err)
+			}
+			assertEncodes(t, difference)
+			gotDifference, ok := difference.(*tg.UpdatesChannelDifference)
+			if !ok {
+				t.Fatalf("get channel difference response = %T, want *tg.UpdatesChannelDifference", difference)
+			}
+			assertCreateService(gotDifference.NewMessages, "get channel difference")
+		})
+	}
+}
+
+func TestBackfillEmptyChannelCreationServiceMessage(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	creator, err := s.CreateUser(ctx, "+15551294029")
+	if err != nil {
+		t.Fatalf("create creator: %v", err)
+	}
+	channel, err := s.CreateChannel(ctx, creator.ID, "Legacy empty", "", false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	// Rewind this freshly created channel to the state of an empty channel on
+	// the old schema so the migration can be exercised against realistic rows.
+	channelExec(t, ctx, dsn, `DELETE FROM channel_events WHERE channel_id = $1`, channel.ID)
+	channelExec(t, ctx, dsn, `DELETE FROM channel_messages WHERE channel_id = $1`, channel.ID)
+	channelExec(t, ctx, dsn, `UPDATE channel_state SET pts = 0, next_local_id = 1 WHERE channel_id = $1`, channel.ID)
+
+	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "20261003000050_backfill_empty_channel_create_messages.sql"))
+	if err != nil {
+		t.Fatalf("read channel creation backfill migration: %v", err)
+	}
+	channelExec(t, ctx, dsn, string(migration))
+
+	assertBackfilled := func() {
+		t.Helper()
+		if pts, err := s.ChannelState(ctx, channel.ID); err != nil || pts != 1 {
+			t.Fatalf("channel state = %d, err=%v; want 1", pts, err)
+		}
+		history, err := s.ChannelHistory(ctx, channel.ID, 0, 10)
+		if err != nil || len(history) != 1 || history[0].LocalID != 1 || history[0].Action != store.ChannelMessageActionCreate || history[0].Message != channel.Title {
+			t.Fatalf("backfilled history = %+v, err=%v; want creation service message 1", history, err)
+		}
+		events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, 1, 10)
+		if err != nil || len(events) != 1 || events[0].Pts != 1 || events[0].LocalID != 1 {
+			t.Fatalf("backfilled events = %+v, err=%v; want creation event at pts 1", events, err)
+		}
+		encoded, err := api.GetDialogsForTest(s, creator.ID)
+		if err != nil {
+			t.Fatalf("get dialogs after backfill: %v", err)
+		}
+		dialogs, ok := encoded.(*tg.MessagesDialogs)
+		if !ok {
+			t.Fatalf("get dialogs = %T, want *tg.MessagesDialogs", encoded)
+		}
+		if len(dialogs.Messages) != 1 {
+			t.Fatalf("dialog messages = %v, want one creation service message", dialogs.Messages)
+		}
+		service, ok := dialogs.Messages[0].(*tg.MessageService)
+		if !ok || service.ID != 1 {
+			t.Fatalf("dialog message = %T (%v), want creation service message 1", dialogs.Messages[0], dialogs.Messages[0])
+		}
+	}
+
+	assertBackfilled()
+	channelExec(t, ctx, dsn, string(migration))
+	assertBackfilled()
 }
 
 func TestHandleCreateChannelRejectsAmbiguousKind(t *testing.T) {
@@ -1129,15 +1326,15 @@ func TestSendMessageToChannelAnnouncesTheChannelPost(t *testing.T) {
 	assertEncodes(t, res)
 
 	nm := newChannelMessage(t, res)
-	if nm.Pts != 1 || nm.PtsCount != 1 {
-		t.Errorf("pts = %d/%d, want 1/1", nm.Pts, nm.PtsCount)
+	if nm.Pts != 2 || nm.PtsCount != 1 {
+		t.Errorf("pts = %d/%d, want 2/1", nm.Pts, nm.PtsCount)
 	}
 	msg, ok := nm.Message.(*tg.Message)
 	if !ok {
 		t.Fatalf("message = %T, want *tg.Message", nm.Message)
 	}
-	if msg.Message != "first" || msg.ID != 1 || !msg.Out {
-		t.Errorf("message = %+v, want out post 1 %q", msg, "first")
+	if msg.Message != "first" || msg.ID != 2 || !msg.Out {
+		t.Errorf("message = %+v, want out post 2 %q", msg, "first")
 	}
 	if peer, isChan := msg.PeerID.(*tg.PeerChannel); !isChan || peer.ChannelID != ch.ID {
 		t.Errorf("peer = %+v, want channel %d", msg.PeerID, ch.ID)
@@ -1181,10 +1378,10 @@ func TestSendMessageToBroadcastRejectsAPlainMember(t *testing.T) {
 		t.Fatalf("got %s, want PEER_ID_INVALID", msg)
 	}
 
-	// Rejected posts write nothing, so the channel is still at pts 0.
+	// Rejected posts write nothing, so only the creation event remains.
 	pts, err := s.ChannelState(ctx, ch.ID)
-	if err != nil || pts != 0 {
-		t.Fatalf("pts = %d err=%v, want 0", pts, err)
+	if err != nil || pts != 1 {
+		t.Fatalf("pts = %d err=%v, want creation pts 1", pts, err)
 	}
 }
 
@@ -1211,8 +1408,8 @@ func TestSendMessageToMegagroupAcceptsAPlainMember(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 	assertEncodes(t, res)
-	if nm := newChannelMessage(t, res); nm.Pts != 1 {
-		t.Errorf("pts = %d, want 1", nm.Pts)
+	if nm := newChannelMessage(t, res); nm.Pts != 2 {
+		t.Errorf("pts = %d, want 2", nm.Pts)
 	}
 }
 
@@ -1244,8 +1441,8 @@ func TestSendMessageToChannelResendIsIdempotent(t *testing.T) {
 		t.Errorf("resend id = %d, want %d", b.Message.GetID(), a.Message.GetID())
 	}
 	pts, err := s.ChannelState(ctx, ch.ID)
-	if err != nil || pts != 1 {
-		t.Fatalf("pts = %d err=%v, want 1 (resend must not advance it)", pts, err)
+	if err != nil || pts != 2 {
+		t.Fatalf("pts = %d err=%v, want 2 (resend must not advance it)", pts, err)
 	}
 }
 
@@ -1366,8 +1563,8 @@ func TestChannelHistoryServesPostsFromBeforeTheMemberJoined(t *testing.T) {
 	}
 
 	m := joinChannelByInvite(t, s, ch, latecomer.ID)
-	if m.JoinPts != 2 {
-		t.Fatalf("join_pts = %d, want 2 (the latecomer joined after both posts)", m.JoinPts)
+	if m.JoinPts != 3 {
+		t.Fatalf("join_pts = %d, want 3 (the latecomer joined after both posts)", m.JoinPts)
 	}
 
 	res, err := api.GetHistoryForTest(s, latecomer.ID, &tg.MessagesGetHistoryRequest{Peer: channelPeer(latecomer.ID, ch.ID)})
@@ -1379,16 +1576,16 @@ func TestChannelHistoryServesPostsFromBeforeTheMemberJoined(t *testing.T) {
 	if !ok {
 		t.Fatalf("reply = %T, want *tg.MessagesChannelMessages", res)
 	}
-	if got.Pts != 2 || got.Count != 2 || len(got.Messages) != 2 {
-		t.Fatalf("pts=%d count=%d messages=%d, want 2/2/2", got.Pts, got.Count, len(got.Messages))
+	if got.Pts != 3 || got.Count != 3 || len(got.Messages) != 3 {
+		t.Fatalf("pts=%d count=%d messages=%d, want 3/3/3", got.Pts, got.Count, len(got.Messages))
 	}
 	// Newest first.
-	if got.Messages[0].GetID() != 2 || got.Messages[1].GetID() != 1 {
-		t.Errorf("ids = %d,%d, want 2,1", got.Messages[0].GetID(), got.Messages[1].GetID())
+	if got.Messages[0].GetID() != 3 || got.Messages[1].GetID() != 2 || got.Messages[2].GetID() != 1 {
+		t.Errorf("ids = %d,%d,%d, want 3,2,1", got.Messages[0].GetID(), got.Messages[1].GetID(), got.Messages[2].GetID())
 	}
 	first, isMsg := got.Messages[1].(*tg.Message)
 	if !isMsg || first.Message != "one" || first.Out {
-		t.Errorf("oldest = %+v, want inbound %q", got.Messages[1], "one")
+		t.Errorf("second newest = %+v, want inbound %q", got.Messages[1], "one")
 	}
 }
 
@@ -1412,8 +1609,8 @@ func TestGetChannelMessagesReturnsTheNamedPosts(t *testing.T) {
 
 	res, err := api.GetChannelMessagesForTest(s, creator.ID, &tg.ChannelsGetMessagesRequest{
 		Channel: api.InputChannel(creator.ID, ch.ID),
-		// The third id has no row and must simply be absent from the reply.
-		ID: []tg.InputMessageClass{&tg.InputMessageID{ID: 3}, &tg.InputMessageID{ID: 1}, &tg.InputMessageID{ID: 99}},
+		// The fourth id has no row and must simply be absent from the reply.
+		ID: []tg.InputMessageClass{&tg.InputMessageID{ID: 4}, &tg.InputMessageID{ID: 2}, &tg.InputMessageID{ID: 99}},
 	})
 	if err != nil {
 		t.Fatalf("get channel messages: %v", err)
@@ -1423,11 +1620,11 @@ func TestGetChannelMessagesReturnsTheNamedPosts(t *testing.T) {
 	if !ok {
 		t.Fatalf("reply = %T, want *tg.MessagesChannelMessages", res)
 	}
-	if got.Pts != 3 || got.Count != 2 || len(got.Messages) != 2 {
-		t.Fatalf("pts=%d count=%d messages=%d, want 3/2/2", got.Pts, got.Count, len(got.Messages))
+	if got.Pts != 4 || got.Count != 2 || len(got.Messages) != 2 {
+		t.Fatalf("pts=%d count=%d messages=%d, want 4/2/2", got.Pts, got.Count, len(got.Messages))
 	}
-	if got.Messages[0].GetID() != 3 || got.Messages[1].GetID() != 1 {
-		t.Errorf("ids = %d,%d, want the requested order 3,1", got.Messages[0].GetID(), got.Messages[1].GetID())
+	if got.Messages[0].GetID() != 4 || got.Messages[1].GetID() != 2 {
+		t.Errorf("ids = %d,%d, want the requested order 4,2", got.Messages[0].GetID(), got.Messages[1].GetID())
 	}
 }
 
@@ -1549,14 +1746,14 @@ func TestGetDialogsListsTheCallersChannels(t *testing.T) {
 	if !isChan || peer.ChannelID != ch.ID {
 		t.Fatalf("peer = %+v, want channel %d", d.Peer, ch.ID)
 	}
-	if d.TopMessage != 2 {
-		t.Errorf("top message = %d, want 2", d.TopMessage)
+	if d.TopMessage != 3 {
+		t.Errorf("top message = %d, want 3", d.TopMessage)
 	}
-	if pts, hasPts := d.GetPts(); !hasPts || pts != 2 {
-		t.Errorf("pts = %d present=%v, want 2", pts, hasPts)
+	if pts, hasPts := d.GetPts(); !hasPts || pts != 3 {
+		t.Errorf("pts = %d present=%v, want 3", pts, hasPts)
 	}
-	if len(got.Messages) != 1 || got.Messages[0].GetID() != 2 {
-		t.Errorf("messages = %+v, want the channel's post 2", got.Messages)
+	if len(got.Messages) != 1 || got.Messages[0].GetID() != 3 {
+		t.Errorf("messages = %+v, want the channel's post 3", got.Messages)
 	}
 	if len(got.Chats) != 1 {
 		t.Fatalf("chats = %d, want the channel", len(got.Chats))
@@ -2037,11 +2234,11 @@ func TestGetChannelDifferenceThreePosts(t *testing.T) {
 	if !diff.Final {
 		t.Fatal("Final = false, want true")
 	}
-	if diff.Pts != 3 {
-		t.Fatalf("Pts = %d, want 3", diff.Pts)
+	if diff.Pts != 4 {
+		t.Fatalf("Pts = %d, want 4", diff.Pts)
 	}
-	if len(diff.NewMessages) != 3 {
-		t.Fatalf("NewMessages = %d, want 3", len(diff.NewMessages))
+	if len(diff.NewMessages) != 4 {
+		t.Fatalf("NewMessages = %d, want creation message plus 3 posts", len(diff.NewMessages))
 	}
 }
 
@@ -2067,11 +2264,11 @@ func TestGetChannelDifferencePartialPts(t *testing.T) {
 	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
 		Channel: api.InputChannel(creator.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
-		Pts:     2,
+		Pts:     3,
 		Limit:   100,
 	})
 	if err != nil {
-		t.Fatalf("getChannelDifference(pts=2): %v", err)
+		t.Fatalf("getChannelDifference(pts=3): %v", err)
 	}
 	assertEncodes(t, enc)
 	diff, ok := enc.(*tg.UpdatesChannelDifference)
@@ -2081,8 +2278,8 @@ func TestGetChannelDifferencePartialPts(t *testing.T) {
 	if !diff.Final {
 		t.Fatal("Final = false, want true")
 	}
-	if diff.Pts != 3 {
-		t.Fatalf("Pts = %d, want 3", diff.Pts)
+	if diff.Pts != 4 {
+		t.Fatalf("Pts = %d, want 4", diff.Pts)
 	}
 	if len(diff.NewMessages) != 1 {
 		t.Fatalf("NewMessages = %d, want 1", len(diff.NewMessages))
@@ -2111,11 +2308,11 @@ func TestGetChannelDifferenceCaughtUp(t *testing.T) {
 	enc, err := api.GetChannelDifferenceForTest(s, creator.ID, &tg.UpdatesGetChannelDifferenceRequest{
 		Channel: api.InputChannel(creator.ID, ch.ID),
 		Filter:  &tg.ChannelMessagesFilterEmpty{},
-		Pts:     3,
+		Pts:     4,
 		Limit:   100,
 	})
 	if err != nil {
-		t.Fatalf("getChannelDifference(pts=3): %v", err)
+		t.Fatalf("getChannelDifference(pts=4): %v", err)
 	}
 	assertEncodes(t, enc)
 	empty, ok := enc.(*tg.UpdatesChannelDifferenceEmpty)
@@ -2125,8 +2322,8 @@ func TestGetChannelDifferenceCaughtUp(t *testing.T) {
 	if !empty.Final {
 		t.Fatal("Final = false, want true")
 	}
-	if empty.Pts != 3 {
-		t.Fatalf("Pts = %d, want 3", empty.Pts)
+	if empty.Pts != 4 {
+		t.Fatalf("Pts = %d, want 4", empty.Pts)
 	}
 }
 
@@ -2163,8 +2360,8 @@ func TestGetChannelDifferenceAheadOfServer(t *testing.T) {
 	if !ok {
 		t.Fatalf("type = %T, want *tg.UpdatesChannelDifferenceEmpty", enc)
 	}
-	if empty.Pts != 3 {
-		t.Fatalf("Pts = %d, want 3", empty.Pts)
+	if empty.Pts != 4 {
+		t.Fatalf("Pts = %d, want 4", empty.Pts)
 	}
 }
 
@@ -2212,8 +2409,8 @@ func TestGetChannelDifferenceJoinPtsClamp(t *testing.T) {
 	if len(diff.NewMessages) != 1 {
 		t.Fatalf("NewMessages = %d, want 1 (clamped to join_pts=2)", len(diff.NewMessages))
 	}
-	if diff.Pts != 3 {
-		t.Fatalf("Pts = %d, want 3", diff.Pts)
+	if diff.Pts != 4 {
+		t.Fatalf("Pts = %d, want 4", diff.Pts)
 	}
 	_ = dsn
 }
@@ -2792,10 +2989,10 @@ func TestGetChannelDifferenceSkippedEvent(t *testing.T) {
 	// message row, to exercise the skipped event path in channelEventToUpdate.
 	channelExec(t, ctx, dsn,
 		`INSERT INTO channel_events (channel_id, pts, "type", local_id) VALUES ($1, $2, 2, 99999)`,
-		ch.ID, 2)
+		ch.ID, 3)
 	channelExec(t, ctx, dsn,
 		`UPDATE channel_state SET pts = $2 WHERE channel_id = $1`,
-		ch.ID, 2)
+		ch.ID, 3)
 
 	if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "msg2", 3, nil, 0); err != nil {
 		t.Fatalf("post2: %v", err)
@@ -2818,12 +3015,12 @@ func TestGetChannelDifferenceSkippedEvent(t *testing.T) {
 	if !diff.Final {
 		t.Fatal("Final = false, want true")
 	}
-	if diff.Pts != 3 {
-		t.Fatalf("Pts = %d, want 3", diff.Pts)
+	if diff.Pts != 4 {
+		t.Fatalf("Pts = %d, want 4", diff.Pts)
 	}
 	// Skipped event (type 2) produces no update; only the two real messages appear.
-	if len(diff.NewMessages) != 2 {
-		t.Fatalf("NewMessages = %d, want 2 (skipped event type 2)", len(diff.NewMessages))
+	if len(diff.NewMessages) != 3 {
+		t.Fatalf("NewMessages = %d, want creation plus 2 posts (skipped event type 2)", len(diff.NewMessages))
 	}
 }
 
@@ -2901,12 +3098,12 @@ func TestGetDialogsMultiChannel(t *testing.T) {
 			t.Errorf("dialog[%d] channel id = %d, want %d", i, peer.ChannelID, ch.ID)
 		}
 		channelIDs[peer.ChannelID] = true
-		// Each channel has 1 post, so TopMessage == 1 and pts == 1.
-		if dlg.TopMessage != 1 {
-			t.Errorf("dialog[%d] top_message = %d, want 1", i, dlg.TopMessage)
+		// Each channel has its create service message and 1 post.
+		if dlg.TopMessage != 2 {
+			t.Errorf("dialog[%d] top_message = %d, want 2", i, dlg.TopMessage)
 		}
-		if pts, hasPts := dlg.GetPts(); !hasPts || pts != 1 {
-			t.Errorf("dialog[%d] pts = %d present=%v, want 1", i, pts, hasPts)
+		if pts, hasPts := dlg.GetPts(); !hasPts || pts != 2 {
+			t.Errorf("dialog[%d] pts = %d present=%v, want 2", i, pts, hasPts)
 		}
 	}
 
@@ -2943,8 +3140,8 @@ func TestGetDialogsMultiChannel(t *testing.T) {
 			t.Errorf("duplicate channel top message for channel %d", peer.ChannelID)
 		}
 		msgChannelIDs[peer.ChannelID] = true
-		if msg.ID != 1 {
-			t.Errorf("channel %d message id = %d, want 1", peer.ChannelID, msg.ID)
+		if msg.ID != 2 {
+			t.Errorf("channel %d message id = %d, want 2", peer.ChannelID, msg.ID)
 		}
 	}
 	if len(msgChannelIDs) != len(channels) {
@@ -3594,8 +3791,8 @@ func TestJoinChannelSetsJoinPts(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("member: found=%v err=%v", found, err)
 	}
-	if member.JoinPts != 3 {
-		t.Errorf("join_pts = %d, want 3 (3 posts before join)", member.JoinPts)
+	if member.JoinPts != 4 {
+		t.Errorf("join_pts = %d, want 4 (creation plus 3 posts before join)", member.JoinPts)
 	}
 
 	// Post after join.
@@ -4341,7 +4538,7 @@ func TestHandleToggleSlowModeSaveFailuresPreservePostsAndCooldown(t *testing.T) 
 
 			const randomID = int64(95231)
 			first, firstPts, duplicate, err := s.PostChannelMessageAs(ctx, channel.ID, member.ID, "committed before failed save", randomID, nil, 0)
-			if err != nil || duplicate || firstPts != 1 {
+			if err != nil || duplicate || firstPts != 2 {
 				t.Fatalf("first member post = %+v pts=%d duplicate=%v err=%v", first, firstPts, duplicate, err)
 			}
 			conn, err := pgx.Connect(ctx, dsn)
@@ -4390,8 +4587,8 @@ func TestHandleToggleSlowModeSaveFailuresPreservePostsAndCooldown(t *testing.T) 
 				t.Fatalf("channel state after failed save and retry = %d err=%v, want %d", pts, err, firstPts)
 			}
 			events, err := s.ChannelEventsWindow(ctx, channel.ID, 0, firstPts, 10)
-			if err != nil || len(events) != 1 || events[0].Pts != firstPts || events[0].LocalID != first.LocalID || events[0].Type != store.EventNewMessage {
-				t.Fatalf("events after failed save and retry = %+v err=%v, want original post event only", events, err)
+			if err != nil || len(events) != 2 || events[1].Pts != firstPts || events[1].LocalID != first.LocalID || events[1].Type != store.EventNewMessage {
+				t.Fatalf("events after failed save and retry = %+v err=%v, want creation and original post events", events, err)
 			}
 		})
 	}

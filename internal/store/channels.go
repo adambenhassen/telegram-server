@@ -250,24 +250,30 @@ func (s *Store) insertChannel(ctx context.Context, tx pgx.Tx, p db.InsertChannel
 	return db.Channel{}, fmt.Errorf("insert channel: %d colliding ids: %w", channelIDAttempts, last)
 }
 
-// CreateChannel creates a channel owned by creatorID, in one transaction: the
-// channels row, its channel_state row, and the creator's participant row at
-// role 2 with join_pts 0 — a creator sees the channel's whole history because
-// there is none before them. ErrTooManyChannels once the creator already holds
+// CreateChannel creates a channel and its channel-create service message.
+func (s *Store) CreateChannel(ctx context.Context, creatorID int64, title, about string, megagroup bool) (Channel, error) {
+	channel, _, _, err := s.CreateChannelWithServiceMessage(ctx, creatorID, title, about, megagroup)
+	return channel, err
+}
+
+// CreateChannelWithServiceMessage creates the channel, its first service
+// message, and its creator membership in one transaction. The creator starts
+// at join_pts 0, so the creation event is also available from channel
+// difference. ErrTooManyChannels once the creator already holds
 // maxChannelsPerUser participant rows, and then nothing is written: creating is
 // the other way an account acquires a row, so leaving the cap to the join path
 // would let an account past it by creating instead of joining. The creator's
 // account lock covers the count and inserts so they are atomic with other
 // admission paths.
-func (s *Store) CreateChannel(ctx context.Context, creatorID int64, title, about string, megagroup bool) (Channel, error) {
+func (s *Store) CreateChannelWithServiceMessage(ctx context.Context, creatorID int64, title, about string, megagroup bool) (Channel, ChannelMessage, int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Channel{}, fmt.Errorf("begin: %w", err)
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
 	if err = lockOwners(ctx, tx, creatorID); err != nil {
-		return Channel{}, fmt.Errorf("lock channel cap owner: %w", err)
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("lock channel cap owner: %w", err)
 	}
 
 	// Same count the join path decides its per-account cap on, and deliberately
@@ -276,31 +282,52 @@ func (s *Store) CreateChannel(ctx context.Context, creatorID int64, title, about
 	// learns to exclude something.
 	joined, err := qtx.CountChannelsForUser(ctx, creatorID)
 	if err != nil {
-		return Channel{}, fmt.Errorf("count channels for user: %w", err)
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("count channels for user: %w", err)
 	}
 	if joined >= int64(s.maxChannelsPerUser) {
-		return Channel{}, ErrTooManyChannels
+		return Channel{}, ChannelMessage{}, 0, ErrTooManyChannels
 	}
 
 	row, err := s.insertChannel(ctx, tx, db.InsertChannelParams{
 		Title: title, About: about, CreatorID: creatorID, Megagroup: megagroup,
 	})
 	if err != nil {
-		return Channel{}, err
+		return Channel{}, ChannelMessage{}, 0, err
 	}
 	if err = qtx.InsertChannelState(ctx, row.ID); err != nil {
-		return Channel{}, fmt.Errorf("insert channel state: %w", err)
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("insert channel state: %w", err)
 	}
 	if err = qtx.InsertChannelParticipant(ctx, db.InsertChannelParticipantParams{
 		ChannelID: row.ID, UserID: creatorID, Role: 2, JoinPts: 0,
 	}); err != nil {
-		return Channel{}, fmt.Errorf("insert creator participant: %w", err)
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("insert creator participant: %w", err)
+	}
+
+	b, err := qtx.BumpChannelState(ctx, row.ID)
+	if err != nil {
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("bump channel state for creation: %w", err)
+	}
+	if err = qtx.InsertChannelCreateMessage(ctx, db.InsertChannelCreateMessageParams{
+		ChannelID: row.ID, LocalID: b.LocalID, FromID: creatorID, Message: title,
+	}); err != nil {
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("insert channel-create message: %w", err)
+	}
+	if err = qtx.InsertChannelEvent(ctx, db.InsertChannelEventParams{
+		ChannelID: row.ID, Pts: b.Pts, Type: int16(EventNewMessage), LocalID: b.LocalID,
+	}); err != nil {
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("insert channel-create event: %w", err)
+	}
+	messageRow, err := qtx.ChannelMessageByLocal(ctx, db.ChannelMessageByLocalParams{
+		ChannelID: row.ID, LocalID: b.LocalID,
+	})
+	if err != nil {
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("reload channel-create message: %w", err)
 	}
 
 	if err = tx.Commit(ctx); err != nil {
-		return Channel{}, fmt.Errorf("commit: %w", err)
+		return Channel{}, ChannelMessage{}, 0, fmt.Errorf("commit: %w", err)
 	}
-	return channelFromRow(row), nil
+	return channelFromRow(row), channelMessageFromFields(channelMsgFields(messageRow)), int(b.Pts), nil
 }
 
 // ChannelByID returns one channel; ok=false when absent.
@@ -1280,6 +1307,7 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 				r.TopRandomID,
 				r.TopFileID,
 				r.TopReplyToMsgID,
+				r.TopActionType,
 			})
 			row.Top = &top
 		}

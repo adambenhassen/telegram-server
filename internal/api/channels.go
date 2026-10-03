@@ -101,10 +101,8 @@ func (h *handlers) inputChannelID(c tg.InputChannelClass, viewerID int64) (int64
 
 // handleCreateChannel serves channels.createChannel.
 //
-// The reply carries no service message and does not move the channel's pts. M7
-// writes no channel service messages at all, and a create that bumped the pts
-// before any client can have read the channel would only make every future
-// getChannelDifference start one step behind.
+// The creator is the channel's first member, so the channel-create service
+// message is written as the first channel event and returned in this reply.
 func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.ChannelsCreateChannelRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -133,7 +131,7 @@ func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) 
 		return nil, errPeerIDInvalid
 	}
 
-	ch, err := h.store.CreateChannel(r.Ctx, r.UserID, title, about, req.Megagroup)
+	ch, createMessage, pts, err := h.store.CreateChannelWithServiceMessage(r.Ctx, r.UserID, title, about, req.Megagroup)
 	// The per-account channel cap reuses USERS_TOO_MUCH, the same wire error the
 	// chat path returns for its participant cap (internal/api/chats.go:150). It
 	// is the closest existing sentinel, and a distinct one would tell a caller
@@ -146,6 +144,7 @@ func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) 
 		h.log.Error("create channel", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	h.notifyChannelPost(r.Ctx, ch.ID)
 
 	chats, err := h.loadChannels(r.Ctx, map[int64]bool{ch.ID: true}, r.UserID)
 	if err != nil {
@@ -158,10 +157,13 @@ func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) 
 		return nil, errInternal
 	}
 	return &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: ch.ID}},
-		Chats:   chats,
-		Users:   users,
-		Date:    int(ch.Date.Unix()),
+		Updates: []tg.UpdateClass{
+			&tg.UpdateNewChannelMessage{Message: channelMessageToTL(createMessage, r.UserID, nil), Pts: pts, PtsCount: 1},
+			&tg.UpdateChannel{ChannelID: ch.ID},
+		},
+		Chats: chats,
+		Users: users,
+		Date:  int(createMessage.Date.Unix()),
 	}, nil
 }
 

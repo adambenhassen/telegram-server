@@ -78,14 +78,14 @@ func TestSearchChannelReturnsMatchingPostsNewestFirst(t *testing.T) {
 		}
 	}
 	// Post 4 matches the query but is deleted, so it must never come back.
-	deleteChannelPost(t, ctx, dsn, ch.ID, 4)
+	deleteChannelPost(t, ctx, dsn, ch.ID, 5)
 
 	enc, err := searchChannel(s, member.ID, ch.ID, "budget", 0, 0)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
-	if ids := channelSearchIDs(t, enc); len(ids) != 2 || ids[0] != 3 || ids[1] != 1 {
-		t.Fatalf("ids = %v, want [3 1] (newest-first, deleted excluded)", ids)
+	if ids := channelSearchIDs(t, enc); len(ids) != 2 || ids[0] != 4 || ids[1] != 2 {
+		t.Fatalf("ids = %v, want [4 2] (newest-first, deleted excluded)", ids)
 	}
 	res, ok := enc.(*tg.MessagesChannelMessages)
 	if !ok {
@@ -93,8 +93,8 @@ func TestSearchChannelReturnsMatchingPostsNewestFirst(t *testing.T) {
 	}
 	// The reply carries the channel's pts so a client can place the batch in
 	// that channel's own update stream, exactly as the history path does.
-	if res.Pts != 4 {
-		t.Errorf("pts = %d, want 4", res.Pts)
+	if res.Pts != 5 {
+		t.Errorf("pts = %d, want 5", res.Pts)
 	}
 	if len(res.Chats) != 1 || res.Chats[0].GetID() != ch.ID {
 		t.Errorf("chats = %+v, want the searched channel", res.Chats)
@@ -105,8 +105,8 @@ func TestSearchChannelReturnsMatchingPostsNewestFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("search paged: %v", err)
 	}
-	if ids := channelSearchIDs(t, enc); len(ids) != 1 || ids[0] != 1 {
-		t.Fatalf("paged ids = %v, want [1]", ids)
+	if ids := channelSearchIDs(t, enc); len(ids) != 1 || ids[0] != 2 {
+		t.Fatalf("paged ids = %v, want [2]", ids)
 	}
 
 	// limit bounds the page.
@@ -114,8 +114,8 @@ func TestSearchChannelReturnsMatchingPostsNewestFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("search limited: %v", err)
 	}
-	if ids := channelSearchIDs(t, enc); len(ids) != 1 || ids[0] != 3 {
-		t.Fatalf("limited ids = %v, want [3]", ids)
+	if ids := channelSearchIDs(t, enc); len(ids) != 1 || ids[0] != 4 {
+		t.Fatalf("limited ids = %v, want [4]", ids)
 	}
 
 	// A word no post carries is an empty page, not an error.
@@ -156,16 +156,16 @@ func TestSearchChannelServesPostsFromBeforeTheMemberJoined(t *testing.T) {
 	}
 
 	m := joinChannelByInvite(t, s, ch, latecomer.ID)
-	if m.JoinPts != 2 {
-		t.Fatalf("join_pts = %d, want 2 (the latecomer joined after both posts)", m.JoinPts)
+	if m.JoinPts != 3 {
+		t.Fatalf("join_pts = %d, want 3 (the latecomer joined after the creation event and both posts)", m.JoinPts)
 	}
 
 	enc, err := searchChannel(s, latecomer.ID, ch.ID, "budget", 0, 0)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
-	if ids := channelSearchIDs(t, enc); len(ids) != 1 || ids[0] != 1 {
-		t.Fatalf("ids = %v, want [1] (the pre-join post)", ids)
+	if ids := channelSearchIDs(t, enc); len(ids) != 1 || ids[0] != 2 {
+		t.Fatalf("ids = %v, want [2] (the pre-join post)", ids)
 	}
 }
 
@@ -319,8 +319,8 @@ func TestSearchChannelRechecksMembershipBetweenPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first page: %v", err)
 	}
-	if ids := channelSearchIDs(t, enc); len(ids) != 1 || ids[0] != 2 {
-		t.Fatalf("first page ids = %v, want [2]", ids)
+	if ids := channelSearchIDs(t, enc); len(ids) != 1 || ids[0] != 3 {
+		t.Fatalf("first page ids = %v, want [3]", ids)
 	}
 
 	banChannelMember(t, ctx, dsn, ch.ID, member.ID, time.Now().Add(time.Hour))

@@ -1189,6 +1189,56 @@ func testSmokeChannel(t *testing.T) {
 	})
 
 	channelID := createBroadcastChannel(t, f.ctx, creator.cmds, "Smoke channel")
+	if err := creator.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		result, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+			OffsetPeer: &tg.InputPeerEmpty{},
+			Limit:      100,
+		})
+		if err != nil {
+			return err
+		}
+		var dialogs []tg.DialogClass
+		var messages []tg.MessageClass
+		switch page := result.(type) {
+		case *tg.MessagesDialogs:
+			dialogs, messages = page.Dialogs, page.Messages
+		case *tg.MessagesDialogsSlice:
+			dialogs, messages = page.Dialogs, page.Messages
+		default:
+			return fmt.Errorf("getDialogs response = %T, want a dialogs result", result)
+		}
+		for _, item := range dialogs {
+			dialog, ok := item.(*tg.Dialog)
+			if !ok {
+				continue
+			}
+			peer, ok := dialog.Peer.(*tg.PeerChannel)
+			if !ok || peer.ChannelID != channelID {
+				continue
+			}
+			if dialog.TopMessage != 1 {
+				return fmt.Errorf("new channel top message = %d, want 1", dialog.TopMessage)
+			}
+			for _, message := range messages {
+				if message.GetID() != dialog.TopMessage {
+					continue
+				}
+				service, ok := message.(*tg.MessageService)
+				if !ok {
+					return fmt.Errorf("new channel top message = %T, want *tg.MessageService", message)
+				}
+				action, ok := service.Action.(*tg.MessageActionChannelCreate)
+				if !ok || action.Title != "Smoke channel" {
+					return fmt.Errorf("new channel create action = %+v, want title %q", service.Action, "Smoke channel")
+				}
+				return nil
+			}
+			return fmt.Errorf("getDialogs omitted top message %d for newly created channel", dialog.TopMessage)
+		}
+		return fmt.Errorf("new channel %d absent from getDialogs before first post", channelID)
+	}); err != nil {
+		t.Fatalf("new channel getDialogs: %v", err)
+	}
 	hash := exportChannelInvite(t, f.ctx, creator.id, creator.cmds, channelID)
 	if joinedID := importChannelInvite(t, f.ctx, subscriber.cmds, hash); joinedID != channelID {
 		t.Fatalf("subscriber joined channel %d, want %d", joinedID, channelID)
@@ -1238,8 +1288,8 @@ func testSmokeChannel(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("channel history response = %T, want *tg.MessagesChannelMessages", result)
 		}
-		if len(history.Messages) != 1 {
-			return fmt.Errorf("channel history count = %d, want 1", len(history.Messages))
+		if len(history.Messages) != 2 {
+			return fmt.Errorf("channel history count = %d, want the creation service message and first post", len(history.Messages))
 		}
 		message, ok := history.Messages[0].(*tg.Message)
 		if !ok {

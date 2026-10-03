@@ -31,7 +31,7 @@ func (e *SlowModeWaitError) Error() string {
 	return fmt.Sprintf("SLOWMODE_WAIT_%d", e.Seconds)
 }
 
-// ChannelMessage is a persisted channel post. Unlike Message there is one row
+// ChannelMessage is a persisted channel message. Unlike Message there is one row
 // per channel rather than one per member, so it carries no owner and no Out.
 // FileID is nil for "no media" — channel_messages.file_id is a nullable FK,
 // where the older messages.file_id uses 0 as that sentinel.
@@ -51,9 +51,19 @@ type ChannelMessage struct {
 	FileID    *int64
 	// ReplyToMsgID is the local_id of the post this post replies to; 0 = no reply.
 	ReplyToMsgID int32
+	Action       ChannelMessageAction
 }
 
-// channelMsgFields is a layout-identical copy of the five sqlc channel-message
+// ChannelMessageAction identifies a service message stored in a channel's
+// shared message stream. Zero is a regular post.
+type ChannelMessageAction int16
+
+const (
+	ChannelMessageActionNone ChannelMessageAction = iota
+	ChannelMessageActionCreate
+)
+
+// channelMsgFields is a layout-identical copy of the sqlc channel-message
 // row types. Any of them converts to this type via a plain type conversion, so
 // the single channelMessageFromFields function below is the only place that maps
 // database columns to ChannelMessage fields.
@@ -68,6 +78,7 @@ type channelMsgFields struct {
 	RandomID     int64
 	FileID       *int64
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 // channelMessageFromFields is the sole row-to-struct converter for channel
@@ -95,12 +106,13 @@ func channelMessageFromFields(r channelMsgFields) ChannelMessage {
 		r.RandomID,
 		r.FileID,
 		replyToMsgID,
+		ChannelMessageAction(r.ActionType),
 	}
 }
 
 // ChannelState returns the channel's current pts. A channel that has never been
-// posted to has no channel_state row yet and reports 0, so a difference against
-// it works from the moment the channel exists.
+// created before channel-create service messages were added may have pts 0, so
+// a difference against them works from the moment the channel exists.
 //
 // A channel id that does not exist reports 0 as well: this is not an existence
 // check and cannot be used as one. Callers gate on the channel and on the
