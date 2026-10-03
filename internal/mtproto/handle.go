@@ -187,6 +187,7 @@ func (s *Server) handle(c *Conn, req *Request) (err error) {
 			return nil
 		}
 		req.Ctx = activeCtx
+		req.rpcCancelDiagnostic = rpcCancelDiagnosticFromContext(activeCtx)
 		defer finish()
 	}
 

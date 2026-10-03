@@ -11,6 +11,8 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 // Request represents a decrypted MTProto RPC request handed to a Handler.
@@ -49,8 +51,9 @@ type Request struct {
 	// rpcMethod and rpcResult are set by the dispatcher and reply path for the
 	// optional RPC tracing boundary. They stay inside this package so request
 	// data can never become trace data by accident.
-	rpcMethod string
-	rpcResult RPCResultClass
+	rpcMethod           string
+	rpcResult           RPCResultClass
+	rpcCancelDiagnostic *rpcCancelDiagnostic
 }
 
 // ServerContext returns the serving connection's lifetime context, before any
@@ -62,6 +65,14 @@ func (r *Request) ServerContext() context.Context { return r.serverCtx }
 // write that can no longer reach the caller.
 func (r *Request) PeerDisconnected() bool {
 	return r.peerRPC != nil && r.peerRPC.disconnected()
+}
+
+// MarkSendMessageStoreCallForTesting marks the fixed sendMessage storage
+// boundary for the opt-in in-process cancellation diagnostic.
+func (r *Request) MarkSendMessageStoreCallForTesting() {
+	if r != nil && r.rpcMethod == "messages.sendMessage" && r.rpcCancelDiagnostic != nil {
+		r.rpcCancelDiagnostic.sendMessageStoreStarted.Store(true)
+	}
 }
 
 // Handler processes decrypted MTProto requests.
@@ -153,6 +164,12 @@ func (d *Dispatcher) OnMessage(c *Conn, req *Request) error {
 		method = unknownRPCMethod
 	}
 	req.rpcMethod = method
+	if req.rpcCancelDiagnostic != nil && method == "messages.sendMessage" {
+		req.rpcCancelDiagnostic.sendMessage.Store(true)
+		if backend := req.rpcCancelDiagnostic.claimSendMessageBackend(); backend != nil {
+			req.Ctx = store.ContextWithSendMessageDiagnosticForTesting(req.Ctx, backend)
+		}
+	}
 
 	if ok {
 		return h.OnMessage(c, req)

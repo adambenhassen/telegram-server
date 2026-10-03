@@ -12,6 +12,8 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/mt"
+
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 func TestPeerRPCStateChargesOneCancellationAcrossConnections(t *testing.T) {
@@ -96,6 +98,166 @@ func TestCompletedRPCDisconnectDoesNotConsumeBudget(t *testing.T) {
 	}
 	if budget.tokens != rpcCancelGlobalBurst {
 		t.Fatalf("completed disconnect left %.2f global tokens, want %.2f", budget.tokens, rpcCancelGlobalBurst)
+	}
+}
+
+func TestPeerRPCCancellationDiagnosticUsesFixedOutcomes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		prepare func(*testing.T) (*peerRPCState, func())
+		want    RPCCancelOutcome
+	}{
+		{
+			name: "applied",
+			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				state := newPeerRPCStateWithDiagnostics(newRPCCancelBudget(time.Now, 8), true)
+				_, finish, started := state.begin(1, context.Background())
+				if !started {
+					t.Fatal("RPC did not start")
+				}
+				return state, finish
+			},
+			want: RPCCancelOutcomeApplied,
+		},
+		{
+			name: "denied per user",
+			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				budget := newRPCCancelBudget(time.Now, 8)
+				reservation, ok := budget.reserve(2)
+				if !ok {
+					t.Fatal("initial reservation was denied")
+				}
+				reservation.commit()
+				state := newPeerRPCStateWithDiagnostics(budget, true)
+				_, finish, started := state.begin(2, context.Background())
+				if !started {
+					t.Fatal("RPC did not start")
+				}
+				return state, finish
+			},
+			want: RPCCancelOutcomeDeniedPerUser,
+		},
+		{
+			name: "denied globally",
+			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				budget := newRPCCancelBudget(time.Now, 8)
+				for _, userID := range []int64{3, 4} {
+					reservation, ok := budget.reserve(userID)
+					if !ok {
+						t.Fatal("initial reservation was denied")
+					}
+					reservation.commit()
+				}
+				state := newPeerRPCStateWithDiagnostics(budget, true)
+				_, finish, started := state.begin(5, context.Background())
+				if !started {
+					t.Fatal("RPC did not start")
+				}
+				return state, finish
+			},
+			want: RPCCancelOutcomeDeniedGlobal,
+		},
+		{
+			name: "denied at capacity",
+			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				budget := newRPCCancelBudget(time.Now, 1)
+				reservation, ok := budget.reserve(6)
+				if !ok {
+					t.Fatal("initial reservation was denied")
+				}
+				reservation.commit()
+				state := newPeerRPCStateWithDiagnostics(budget, true)
+				_, finish, started := state.begin(7, context.Background())
+				if !started {
+					t.Fatal("RPC did not start")
+				}
+				return state, finish
+			},
+			want: RPCCancelOutcomeDeniedCapacity,
+		},
+		{
+			name: "already finished",
+			prepare: func(t *testing.T) (*peerRPCState, func()) {
+				state := newPeerRPCStateWithDiagnostics(newRPCCancelBudget(time.Now, 8), true)
+				_, finish, started := state.begin(8, context.Background())
+				if !started {
+					t.Fatal("RPC did not start")
+				}
+				finish()
+				return state, func() {}
+			},
+			want: RPCCancelOutcomeAlreadyFinished,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state, finish := tt.prepare(t)
+			defer finish()
+
+			state.peerDisconnected()
+			got := state.diagnosticSnapshot()
+			if !got.DisconnectObserved {
+				t.Fatal("diagnostic did not record the peer disconnect")
+			}
+			if got.Outcome != tt.want {
+				t.Fatalf("diagnostic outcome = %v, want %v", got.Outcome, tt.want)
+			}
+		})
+	}
+}
+
+func TestPeerRPCCancellationDiagnosticStartsNotObserved(t *testing.T) {
+	t.Parallel()
+
+	state := newPeerRPCStateWithDiagnostics(newRPCCancelBudget(time.Now, 8), true)
+	_, finish, started := state.begin(9, context.Background())
+	if !started {
+		t.Fatal("RPC did not start")
+	}
+	defer finish()
+
+	got := state.diagnosticSnapshot()
+	if got.DisconnectObserved || got.Outcome != RPCCancelOutcomeNotObserved {
+		t.Fatalf("initial diagnostic = %+v, want no disconnect and not-observed", got)
+	}
+}
+
+func TestRequestDiagnosticMarksOnlySendMessageStorageBoundary(t *testing.T) {
+	t.Parallel()
+
+	diagnostic := &rpcCancelDiagnostic{}
+	req := &Request{rpcMethod: "messages.getHistory", rpcCancelDiagnostic: diagnostic}
+	req.MarkSendMessageStoreCallForTesting()
+	if diagnostic.sendMessageStoreStarted.Load() {
+		t.Fatal("non-send request marked the sendMessage storage boundary")
+	}
+
+	req.rpcMethod = "messages.sendMessage"
+	req.MarkSendMessageStoreCallForTesting()
+	if !diagnostic.sendMessageStoreStarted.Load() {
+		t.Fatal("sendMessage request did not mark its storage boundary")
+	}
+}
+
+func TestRPCCancelDiagnosticProviderClaimsOneTestOwnedHandle(t *testing.T) {
+	t.Parallel()
+
+	backend := store.NewSendMessageDiagnosticForTesting()
+	provider := newRPCCancelDiagnosticProviderForTesting(backend)
+	first := &rpcCancelDiagnostic{provider: provider}
+	second := &rpcCancelDiagnostic{provider: provider}
+
+	if got := first.claimSendMessageBackend(); got != backend {
+		t.Fatal("first send did not claim the test-owned backend handle")
+	}
+	if got := second.claimSendMessageBackend(); got != nil {
+		t.Fatal("a second send claimed the already-consumed backend handle")
+	}
+	if got := first.sendMessageBackend.Load(); got != backend {
+		t.Fatal("claimed handle was not retained by its RPC diagnostic")
 	}
 }
 

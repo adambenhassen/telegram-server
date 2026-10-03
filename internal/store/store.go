@@ -198,6 +198,64 @@ var (
 // Option configures a Store at Open time.
 type Option func(*Store)
 
+type sendMessageDiagnosticContextKey struct{}
+
+// SendMessageDiagnosticForTesting is an opaque test-owned handle for the
+// transaction connection used by one SendMessage call. It exposes no query
+// text or identity; the connection is kept as an in-process handle only.
+type SendMessageDiagnosticForTesting struct {
+	backend atomic.Pointer[pgx.Conn]
+}
+
+// NewSendMessageDiagnosticForTesting creates a handle for one instrumented
+// SendMessage call.
+func NewSendMessageDiagnosticForTesting() *SendMessageDiagnosticForTesting {
+	return &SendMessageDiagnosticForTesting{}
+}
+
+// ContextWithSendMessageDiagnosticForTesting attaches the opaque handle to the
+// request context consumed by SendMessage.
+func ContextWithSendMessageDiagnosticForTesting(ctx context.Context, diagnostic *SendMessageDiagnosticForTesting) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if diagnostic == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, sendMessageDiagnosticContextKey{}, diagnostic)
+}
+
+func sendMessageDiagnosticFromContext(ctx context.Context) *SendMessageDiagnosticForTesting {
+	if ctx == nil {
+		return nil
+	}
+	diagnostic, _ := ctx.Value(sendMessageDiagnosticContextKey{}).(*SendMessageDiagnosticForTesting)
+	return diagnostic
+}
+
+func (d *SendMessageDiagnosticForTesting) captureBackend(conn *pgx.Conn) {
+	if d != nil {
+		d.backend.Store(conn)
+	}
+}
+
+// BackendConnForTesting returns the exact transaction connection as an opaque
+// in-process handle. Callers must not retain or report its backend identifier.
+func (d *SendMessageDiagnosticForTesting) BackendConnForTesting() *pgx.Conn {
+	if d == nil {
+		return nil
+	}
+	return d.backend.Load()
+}
+
+// ClearBackendForTesting releases the transaction connection handle after the
+// test has finished correlating its waiter.
+func (d *SendMessageDiagnosticForTesting) ClearBackendForTesting() {
+	if d != nil {
+		d.backend.Store(nil)
+	}
+}
+
 // assemblyPoolShareDivisor keeps in-flight assemblies to at most one quarter
 // of the configured pool, with the one-slot floor applied at small pool sizes.
 const assemblyPoolShareDivisor = 4

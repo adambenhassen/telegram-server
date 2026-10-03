@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 const (
@@ -18,6 +21,107 @@ var (
 	errPeerRPCDisconnected = errors.New("peer disconnected during rpc")
 	errServerRPCClosed     = errors.New("server closed rpc connection")
 )
+
+// RPCCancelOutcome is the closed vocabulary recorded for one observed peer
+// disconnect and its active request.
+type RPCCancelOutcome uint32
+
+const (
+	RPCCancelOutcomeNotObserved RPCCancelOutcome = iota
+	RPCCancelOutcomeApplied
+	RPCCancelOutcomeDeniedPerUser
+	RPCCancelOutcomeDeniedGlobal
+	RPCCancelOutcomeDeniedCapacity
+	RPCCancelOutcomeAlreadyFinished
+)
+
+// RPCCancelDiagnosticSnapshot contains only fixed request and cancellation
+// state. It carries no connection, user, or request identifier.
+type RPCCancelDiagnosticSnapshot struct {
+	SendMessage             bool
+	SendMessageStoreStarted bool
+	DisconnectObserved      bool
+	Outcome                 RPCCancelOutcome
+}
+
+// RPCCancelDiagnosticHandle is an opaque, bounded handle to one active RPC's
+// fixed diagnostic state. It exists only when the server's test diagnostic is
+// enabled.
+type RPCCancelDiagnosticHandle struct {
+	diagnostic *rpcCancelDiagnostic
+}
+
+// Snapshot returns the fixed diagnostic fields for this RPC.
+func (h *RPCCancelDiagnosticHandle) Snapshot() RPCCancelDiagnosticSnapshot {
+	if h == nil || h.diagnostic == nil {
+		return RPCCancelDiagnosticSnapshot{Outcome: RPCCancelOutcomeNotObserved}
+	}
+	d := h.diagnostic
+	return RPCCancelDiagnosticSnapshot{
+		SendMessage:             d.sendMessage.Load(),
+		SendMessageStoreStarted: d.sendMessageStoreStarted.Load(),
+		DisconnectObserved:      d.disconnectObserved.Load(),
+		Outcome:                 RPCCancelOutcome(d.outcome.Load()),
+	}
+}
+
+// SendMessageBackendForTesting returns the opaque backend handle captured by
+// this RPC's SendMessage transaction.
+func (h *RPCCancelDiagnosticHandle) SendMessageBackendForTesting() *store.SendMessageDiagnosticForTesting {
+	if h == nil || h.diagnostic == nil {
+		return nil
+	}
+	return h.diagnostic.sendMessageBackend.Load()
+}
+
+type rpcCancelDiagnostic struct {
+	sendMessage             atomic.Bool
+	sendMessageStoreStarted atomic.Bool
+	disconnectObserved      atomic.Bool
+	outcome                 atomic.Uint32
+	sendMessageBackend      atomic.Pointer[store.SendMessageDiagnosticForTesting]
+	provider                *rpcCancelDiagnosticProviderForTesting
+}
+
+type rpcCancelDiagnosticProviderForTesting struct {
+	sendMessageBackend atomic.Pointer[store.SendMessageDiagnosticForTesting]
+}
+
+func newRPCCancelDiagnosticProviderForTesting(backend *store.SendMessageDiagnosticForTesting) *rpcCancelDiagnosticProviderForTesting {
+	if backend == nil {
+		return nil
+	}
+	provider := &rpcCancelDiagnosticProviderForTesting{}
+	provider.sendMessageBackend.Store(backend)
+	return provider
+}
+
+func (d *rpcCancelDiagnostic) claimSendMessageBackend() *store.SendMessageDiagnosticForTesting {
+	if d == nil || d.provider == nil {
+		return nil
+	}
+	backend := d.provider.sendMessageBackend.Swap(nil)
+	if backend != nil {
+		d.sendMessageBackend.Store(backend)
+	}
+	return backend
+}
+
+type rpcCancelDiagnosticContextKey struct{}
+
+func rpcCancelDiagnosticFromContext(ctx context.Context) *rpcCancelDiagnostic {
+	if ctx == nil {
+		return nil
+	}
+	diagnostic, _ := ctx.Value(rpcCancelDiagnosticContextKey{}).(*rpcCancelDiagnostic)
+	return diagnostic
+}
+
+func (d *rpcCancelDiagnostic) setOutcome(outcome RPCCancelOutcome) {
+	if d != nil && outcome != RPCCancelOutcomeNotObserved {
+		d.outcome.CompareAndSwap(uint32(RPCCancelOutcomeNotObserved), uint32(outcome))
+	}
+}
 
 type rpcUserCancelWindow struct {
 	until      time.Time
@@ -53,12 +157,15 @@ type rpcCancelReservation struct {
 type peerRPCState struct {
 	mu sync.Mutex
 
-	budget      *rpcCancelBudget
-	changed     chan struct{}
-	generation  uint64
-	peerGone    bool
-	serverClose bool
-	active      *activeRPC
+	budget             *rpcCancelBudget
+	changed            chan struct{}
+	generation         uint64
+	peerGone           bool
+	serverClose        bool
+	diagnosticsEnabled bool
+	lastDiagnostic     *rpcCancelDiagnostic
+	diagnosticProvider *rpcCancelDiagnosticProviderForTesting
+	active             *activeRPC
 }
 
 type activeRPC struct {
@@ -71,6 +178,7 @@ type activeRPC struct {
 	attempting bool
 	cancelled  bool
 	budget     *rpcCancelBudget
+	diagnostic *rpcCancelDiagnostic
 }
 
 func newRPCCancelBudget(now func() time.Time, maxUsers int) *rpcCancelBudget {
@@ -94,6 +202,18 @@ func newPeerRPCState(budget *rpcCancelBudget) *peerRPCState {
 	return &peerRPCState{budget: budget, changed: make(chan struct{}, 1)}
 }
 
+func newPeerRPCStateWithDiagnostics(budget *rpcCancelBudget, enabled bool) *peerRPCState {
+	state := newPeerRPCState(budget)
+	state.diagnosticsEnabled = enabled
+	return state
+}
+
+func newPeerRPCStateWithDiagnosticProvider(budget *rpcCancelBudget, provider *rpcCancelDiagnosticProviderForTesting) *peerRPCState {
+	state := newPeerRPCStateWithDiagnostics(budget, provider != nil)
+	state.diagnosticProvider = provider
+	return state
+}
+
 func (p *peerRPCState) begin(userID int64, parent context.Context) (context.Context, func(), bool) {
 	if parent == nil {
 		parent = context.Background()
@@ -104,14 +224,21 @@ func (p *peerRPCState) begin(userID int64, parent context.Context) (context.Cont
 		return parent, nil, false
 	}
 	ctx, cancel := context.WithCancelCause(parent)
+	var diagnostic *rpcCancelDiagnostic
+	if p.diagnosticsEnabled {
+		diagnostic = &rpcCancelDiagnostic{provider: p.diagnosticProvider}
+		ctx = context.WithValue(ctx, rpcCancelDiagnosticContextKey{}, diagnostic)
+	}
 	active := &activeRPC{
-		ctx:     ctx,
-		cancel:  cancel,
-		userID:  userID,
-		running: true,
-		budget:  p.budget,
+		ctx:        ctx,
+		cancel:     cancel,
+		userID:     userID,
+		running:    true,
+		budget:     p.budget,
+		diagnostic: diagnostic,
 	}
 	p.active = active
+	p.lastDiagnostic = diagnostic
 	p.signalChangeLocked()
 	p.mu.Unlock()
 
@@ -136,8 +263,13 @@ func (p *peerRPCState) peerDisconnected() {
 	p.peerGone = true
 	active := p.active
 	serverClose := p.serverClose
+	lastDiagnostic := p.lastDiagnostic
 	p.mu.Unlock()
 	if active == nil {
+		if !serverClose && lastDiagnostic != nil {
+			lastDiagnostic.disconnectObserved.Store(true)
+			lastDiagnostic.setOutcome(RPCCancelOutcomeAlreadyFinished)
+		}
 		return
 	}
 	if serverClose {
@@ -214,19 +346,49 @@ func (p *peerRPCState) signalChangeLocked() {
 	}
 }
 
+func (p *peerRPCState) currentDiagnostic() *RPCCancelDiagnosticHandle {
+	p.mu.Lock()
+	diagnostic := p.lastDiagnostic
+	if p.active != nil {
+		diagnostic = p.active.diagnostic
+	}
+	p.mu.Unlock()
+	if diagnostic == nil {
+		return nil
+	}
+	return &RPCCancelDiagnosticHandle{diagnostic: diagnostic}
+}
+
+func (p *peerRPCState) diagnosticSnapshot() RPCCancelDiagnosticSnapshot {
+	return p.currentDiagnostic().Snapshot()
+}
+
 func (a *activeRPC) cancelForPeer() {
+	if a.diagnostic != nil {
+		a.diagnostic.disconnectObserved.Store(true)
+	}
 	a.mu.Lock()
 	if !a.running || a.attempting || a.cancelled || a.ctx.Err() != nil {
+		if !a.attempting && !a.cancelled && a.diagnostic != nil {
+			a.diagnostic.setOutcome(RPCCancelOutcomeAlreadyFinished)
+		}
 		a.mu.Unlock()
 		return
 	}
 	a.attempting = true
 	a.mu.Unlock()
 
-	reservation, ok := a.budget.reserve(a.userID)
-	if !ok {
+	reservation, denial := a.budget.reserveForPeer(a.userID)
+	if reservation == nil {
 		a.mu.Lock()
 		a.attempting = false
+		if a.diagnostic != nil {
+			if !a.running || a.ctx.Err() != nil {
+				a.diagnostic.setOutcome(RPCCancelOutcomeAlreadyFinished)
+			} else {
+				a.diagnostic.setOutcome(denial)
+			}
+		}
 		a.mu.Unlock()
 		return
 	}
@@ -234,6 +396,9 @@ func (a *activeRPC) cancelForPeer() {
 	a.mu.Lock()
 	if !a.running || a.ctx.Err() != nil {
 		a.attempting = false
+		if a.diagnostic != nil {
+			a.diagnostic.setOutcome(RPCCancelOutcomeAlreadyFinished)
+		}
 		a.mu.Unlock()
 		reservation.refund()
 		return
@@ -242,6 +407,13 @@ func (a *activeRPC) cancelForPeer() {
 	applied := errors.Is(context.Cause(a.ctx), errPeerRPCDisconnected)
 	a.attempting = false
 	a.cancelled = applied
+	if a.diagnostic != nil {
+		if applied {
+			a.diagnostic.setOutcome(RPCCancelOutcomeApplied)
+		} else {
+			a.diagnostic.setOutcome(RPCCancelOutcomeAlreadyFinished)
+		}
+	}
 	a.mu.Unlock()
 	if applied {
 		reservation.commit()
@@ -262,8 +434,13 @@ func (a *activeRPC) cancelForServer() {
 // reservation after cancellation reached the active request, or refund it when
 // the request completed first. The budget lock is released before either action.
 func (b *rpcCancelBudget) reserve(userID int64) (*rpcCancelReservation, bool) {
+	reservation, _ := b.reserveForPeer(userID)
+	return reservation, reservation != nil
+}
+
+func (b *rpcCancelBudget) reserveForPeer(userID int64) (*rpcCancelReservation, RPCCancelOutcome) {
 	if b == nil || userID < 0 {
-		return nil, false
+		return nil, RPCCancelOutcomeDeniedCapacity
 	}
 
 	b.mu.Lock()
@@ -276,17 +453,17 @@ func (b *rpcCancelBudget) reserve(userID int64) (*rpcCancelReservation, bool) {
 	if userID > 0 {
 		window, exists := b.users[userID]
 		if exists && now.Before(window.until) {
-			return nil, false
+			return nil, RPCCancelOutcomeDeniedPerUser
 		}
 		if !exists && len(b.users) >= b.maxUsers {
 			b.pruneExpiredLocked(now)
 			if len(b.users) >= b.maxUsers {
-				return nil, false
+				return nil, RPCCancelOutcomeDeniedCapacity
 			}
 		}
 	}
 	if b.tokens < 1 {
-		return nil, false
+		return nil, RPCCancelOutcomeDeniedGlobal
 	}
 
 	b.tokens--
@@ -301,7 +478,7 @@ func (b *rpcCancelBudget) reserve(userID int64) (*rpcCancelReservation, bool) {
 			generation: generation,
 		}
 	}
-	return &rpcCancelReservation{budget: b, userID: userID, generation: generation}, true
+	return &rpcCancelReservation{budget: b, userID: userID, generation: generation}, RPCCancelOutcomeNotObserved
 }
 
 func (b *rpcCancelBudget) refillLocked(now time.Time) {

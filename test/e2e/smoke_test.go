@@ -1507,19 +1507,20 @@ func requireSmokeFullUser(users []tg.UserClass, userID int64, source string) (*t
 }
 
 type smokeFixture struct {
-	ctx      context.Context
-	failures *clientFailureSignal
-	key      *rsa.PrivateKey
-	dsn      string
-	store    *store.Store
-	codes    *multiCodeSink
-	dcID     int
-	port     int
-	listener *acceptCountingListener
-	registry *mtproto.SessionRegistry
-	stop     func()
-	regMode  config.RegistrationMode
-	status   bool
+	ctx                   context.Context
+	failures              *clientFailureSignal
+	key                   *rsa.PrivateKey
+	dsn                   string
+	store                 *store.Store
+	codes                 *multiCodeSink
+	dcID                  int
+	port                  int
+	listener              *acceptCountingListener
+	registry              *mtproto.SessionRegistry
+	stop                  func()
+	regMode               config.RegistrationMode
+	status                bool
+	sendMessageDiagnostic *store.SendMessageDiagnosticForTesting
 }
 
 func newSmokeFixture(t *testing.T) *smokeFixture {
@@ -1533,6 +1534,14 @@ func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMo
 }
 
 func newSmokeFixtureWithLifecycle(t *testing.T, regMode config.RegistrationMode, withStatus bool) *smokeFixture {
+	return newSmokeFixtureConfigured(t, regMode, withStatus, nil)
+}
+
+func newSmokeFixtureForPeerDisconnect(t *testing.T) *smokeFixture {
+	return newSmokeFixtureConfigured(t, config.RegistrationClosed, true, store.NewSendMessageDiagnosticForTesting())
+}
+
+func newSmokeFixtureConfigured(t *testing.T, regMode config.RegistrationMode, withStatus bool, sendMessageDiagnostic *store.SendMessageDiagnosticForTesting) *smokeFixture {
 	t.Helper()
 	deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancelDeadline)
@@ -1553,7 +1562,11 @@ func newSmokeFixtureWithLifecycle(t *testing.T, regMode config.RegistrationMode,
 			t.Errorf("store close: %v", err)
 		}
 	})
-	f := &smokeFixture{ctx: ctx, failures: newClientFailureSignal(cancelFailure), key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode, status: withStatus}
+	f := &smokeFixture{
+		ctx: ctx, failures: newClientFailureSignal(cancelFailure), key: key, dsn: dsn, store: st,
+		codes: newMultiCodeSink(), dcID: 2, regMode: regMode, status: withStatus,
+		sendMessageDiagnostic: sendMessageDiagnostic,
+	}
 	f.start(t, "127.0.0.1:0")
 	return f
 }
@@ -1567,7 +1580,7 @@ func (f *smokeFixture) start(t *testing.T, address string) {
 	}
 	f.port = tcpPort(t, ln)
 	f.listener = ln
-	f.registry, f.stop = bootServerWithLifecycle(t, f.ctx, f.key, f.dcID, f.store, f.dsn, f.codes.Logger(), ln, config.RateLimitsConfig{}, f.regMode, f.status)
+	f.registry, f.stop = bootServerWithLifecycleAndDiagnostics(t, f.ctx, f.key, f.dcID, f.store, f.dsn, f.codes.Logger(), ln, config.RateLimitsConfig{}, f.regMode, f.status, f.sendMessageDiagnostic)
 	stop := f.stop
 	t.Cleanup(stop)
 }

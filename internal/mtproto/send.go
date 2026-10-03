@@ -233,6 +233,20 @@ func (c *Conn) AuthKeyID() int64 {
 	return c.authKeyID.Load()
 }
 
+// ActiveRPCCancelDiagnosticForTesting returns an opaque handle to the current
+// or most recent request's fixed peer-cancellation diagnostic. It is available
+// only when the server's test diagnostic is enabled.
+func (c *Conn) ActiveRPCCancelDiagnosticForTesting() *RPCCancelDiagnosticHandle {
+	if c == nil {
+		return nil
+	}
+	state := c.peerRPC.Load()
+	if state == nil {
+		return nil
+	}
+	return state.currentDiagnostic()
+}
+
 // WriteTimeout returns the deadline applied to each transport write. Delivery
 // fan-out uses it to bound one transient callback without multiplying the
 // deadline by the number of sockets it addresses.

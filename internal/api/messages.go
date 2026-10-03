@@ -409,6 +409,7 @@ func (h *handlers) handleSendMessageAfterReplyOnConn(c *mtproto.Conn, r *mtproto
 	}
 
 	attempt := beginSenderRPC(c, r)
+	r.MarkSendMessageStoreCallForTesting()
 	sender, senderPts, _, _, err := h.store.SendMessage(r.Ctx, r.UserID, toID, req.Message, req.RandomID, 0, replyToMsgID)
 	if err != nil {
 		h.clearSenderAndNotify(attempt, r)

@@ -8,16 +8,20 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/adambenhassen/telegram-server/internal/mtproto"
 	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 func testSmokePeerDisconnect(t *testing.T) {
 	t.Helper()
-	f := newSmokeFixtureWithLifecycle(t, config.RegistrationClosed, true)
+	f := newSmokeFixtureForPeerDisconnect(t)
 	const phoneA, phoneB = "+15551048001", "+15551048002"
 	seedPhoneUsers(t, f.ctx, f.store, phoneA, phoneB)
 	a1 := newSmokeClient(t, f, "A1", phoneA)
+	a1Conn := waitForSmokeUserConn(f.ctx, f.registry, a1.id)
+	if a1Conn == nil {
+		t.Fatal("[assert:peer-disconnect.send-connection-unavailable] A1 server connection was not registered")
+	}
 	a2 := newSmokeClient(t, f, "A2", phoneA)
 	b1 := newSmokeClient(t, f, "B1", phoneB)
 	b2 := newSmokeClient(t, f, "B2", phoneB)
@@ -53,9 +57,50 @@ func testSmokePeerDisconnect(t *testing.T) {
 			return err
 		})
 	}()
-	waitForSmokeOwnerLock(t, f.ctx, messageLock, true, "peer-disconnect.message-lock-acquired")
+	diagnostic := waitForSmokeSendDiagnostic(f.ctx, a1Conn)
+	if diagnostic == nil {
+		t.Fatal("[assert:peer-disconnect.send-diagnostic-unavailable] A1 send diagnostic was not observed")
+	}
+	backendHandle := f.sendMessageDiagnostic
+	if backendHandle == nil || diagnostic.SendMessageBackendForTesting() != backendHandle {
+		t.Fatal("[assert:peer-disconnect.send-handle-not-owned] A1 send did not claim the fixture-owned backend handle")
+	}
+	sendBackend := waitForSmokeSendBackend(f.ctx, backendHandle)
+	if sendBackend == nil {
+		t.Fatal("[assert:peer-disconnect.send-backend-unavailable] send backend was not observed")
+	}
+	messageLock.waiter = sendBackend
+	t.Cleanup(func() {
+		backendHandle.ClearBackendForTesting()
+		messageLock.waiter = nil
+	})
+	if !waitForSmokeOwnerLock(t, f.ctx, messageLock, true, "peer-disconnect.message-lock-acquired") {
+		t.Fatal("[assert:peer-disconnect.send-owner-lock-not-observed] exact send backend did not wait on the held owner lock")
+	}
 	a1.disconnectClient(t, "peer-disconnect.send-client-disconnect")
-	waitForSmokeOwnerLock(t, f.ctx, messageLock, false, "peer-disconnect.message-blocker-clear-confirm")
+	waiterCleared := waitForSmokeOwnerLock(t, f.ctx, messageLock, false, "peer-disconnect.message-blocker-clear-confirm")
+	snapshot := diagnostic.Snapshot()
+	if !snapshot.DisconnectObserved {
+		t.Fatal("[assert:peer-disconnect.cancel-disconnect-not-observed] peer disconnect was not observed for the blocked send")
+	}
+	switch snapshot.Outcome {
+	case mtproto.RPCCancelOutcomeApplied:
+		if !waiterCleared {
+			t.Fatal("[assert:peer-disconnect.cancel-applied-wait-retained] applied cancellation left the exact send backend waiting")
+		}
+	case mtproto.RPCCancelOutcomeDeniedPerUser:
+		t.Fatal("[assert:peer-disconnect.cancel-denied-per-user] peer cancellation was denied by the per-user budget")
+	case mtproto.RPCCancelOutcomeDeniedGlobal:
+		t.Fatal("[assert:peer-disconnect.cancel-denied-global] peer cancellation was denied by the global budget")
+	case mtproto.RPCCancelOutcomeDeniedCapacity:
+		t.Fatal("[assert:peer-disconnect.cancel-denied-capacity] peer cancellation was denied by bounded state capacity")
+	case mtproto.RPCCancelOutcomeAlreadyFinished:
+		t.Fatal("[assert:peer-disconnect.cancel-already-finished] the send RPC had already finished when cancellation was considered")
+	default:
+		t.Fatal("[assert:peer-disconnect.cancel-outcome-unavailable] no fixed cancellation outcome was recorded")
+	}
+	backendHandle.ClearBackendForTesting()
+	messageLock.waiter = nil
 	messageLock.release(t, "peer-disconnect.message-lock-release")
 	select {
 	case err := <-messageResult:
@@ -196,6 +241,7 @@ type smokeOwnerLock struct {
 	blocker  *pgx.Conn
 	tx       pgx.Tx
 	observer *pgx.Conn
+	waiter   *pgx.Conn
 	released bool
 }
 
@@ -250,7 +296,7 @@ func (l *smokeOwnerLock) release(t *testing.T, callsiteID string) {
 	l.released = true
 }
 
-func waitForSmokeOwnerLock(t *testing.T, ctx context.Context, lock *smokeOwnerLock, wantBlocked bool, callsiteID string) {
+func waitForSmokeOwnerLock(t *testing.T, ctx context.Context, lock *smokeOwnerLock, wantBlocked bool, callsiteID string) bool {
 	t.Helper()
 	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -259,12 +305,16 @@ func waitForSmokeOwnerLock(t *testing.T, ctx context.Context, lock *smokeOwnerLo
 	for {
 		count := smokeOwnerLockCount(t, waitCtx, lock, callsiteID)
 		if (count > 0) == wantBlocked {
-			return
+			return true
 		}
 		select {
 		case <-ticker.C:
 		case <-waitCtx.Done():
+			if lock.waiter != nil {
+				return false
+			}
 			t.Fatalf("[assert:%s/peer-disconnect.owner-lock-state] owner lock activity blocked=%t, want %t", callsiteID, count > 0, wantBlocked)
+			return false
 		}
 	}
 }
@@ -272,14 +322,76 @@ func waitForSmokeOwnerLock(t *testing.T, ctx context.Context, lock *smokeOwnerLo
 func smokeOwnerLockCount(t *testing.T, ctx context.Context, lock *smokeOwnerLock, callsiteID string) int {
 	t.Helper()
 	var count int
-	err := lock.observer.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-		WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock'
-		AND wait_event = 'advisory' AND $1::integer = ANY(pg_blocking_pids(pid))`,
-		lock.blocker.PgConn().PID()).Scan(&count)
+	var err error
+	if lock.waiter != nil {
+		err = lock.observer.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE pid = $1::integer AND datname = current_database() AND state = 'active'
+			AND wait_event_type = 'Lock' AND wait_event = 'advisory'
+			AND $2::integer = ANY(pg_blocking_pids(pid))`,
+			lock.waiter.PgConn().PID(), lock.blocker.PgConn().PID()).Scan(&count)
+	} else {
+		err = lock.observer.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock'
+			AND wait_event = 'advisory' AND $1::integer = ANY(pg_blocking_pids(pid))`,
+			lock.blocker.PgConn().PID()).Scan(&count)
+	}
 	if err != nil {
 		t.Fatalf("[assert:%s/peer-disconnect.owner-lock-inspection] inspect blocked owner writes: %v", callsiteID, err)
 	}
 	return count
+}
+
+func waitForSmokeUserConn(ctx context.Context, registry *mtproto.SessionRegistry, userID int64) *mtproto.Conn {
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		conns := registry.Conns(userID)
+		if len(conns) > 0 {
+			return conns[0]
+		}
+		select {
+		case <-ticker.C:
+		case <-waitCtx.Done():
+			return nil
+		}
+	}
+}
+
+func waitForSmokeSendDiagnostic(ctx context.Context, conn *mtproto.Conn) *mtproto.RPCCancelDiagnosticHandle {
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		diagnostic := conn.ActiveRPCCancelDiagnosticForTesting()
+		if snapshot := diagnostic.Snapshot(); snapshot.SendMessage && snapshot.SendMessageStoreStarted {
+			return diagnostic
+		}
+		select {
+		case <-ticker.C:
+		case <-waitCtx.Done():
+			return nil
+		}
+	}
+}
+
+func waitForSmokeSendBackend(ctx context.Context, diagnostic *store.SendMessageDiagnosticForTesting) *pgx.Conn {
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if backend := diagnostic.BackendConnForTesting(); backend != nil {
+			return backend
+		}
+		select {
+		case <-ticker.C:
+		case <-waitCtx.Done():
+			return nil
+		}
+	}
 }
 
 func assertSmokeOwnerStaysBlocked(t *testing.T, ctx context.Context, lock *smokeOwnerLock, duration time.Duration, callsiteID string) {
