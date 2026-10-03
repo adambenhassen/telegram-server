@@ -1025,9 +1025,13 @@ func TestHandleCreateChannelAtPerAccountCap(t *testing.T) {
 			INSERT INTO channels (id, title, creator_id)
 			SELECT g, 'filler ' || g, $1 FROM generate_series(1, 500) g
 			RETURNING id
+		), initialized AS (
+			INSERT INTO channel_state (channel_id)
+			SELECT id FROM created
+			RETURNING channel_id
 		)
 		INSERT INTO channel_participants (channel_id, user_id, role, join_pts)
-		SELECT id, $1, 2, 0 FROM created`, u.ID)
+		SELECT channel_id, $1, 2, 0 FROM initialized`, u.ID)
 
 	_, err = api.CreateChannelForTest(s, u.ID, &tg.ChannelsCreateChannelRequest{Broadcast: true, Title: "One more"})
 	if msg := rpcMessage(t, err); msg != "USERS_TOO_MUCH" {

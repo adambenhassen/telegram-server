@@ -41,6 +41,18 @@ export TG_POSTGRES_DSN="postgres://user:pass@host:5432/db?sslmode=disable"
 make migrate   # atlas migrate apply --env local
 ```
 
+The channel post summary migration adds hooks and derived-state tables without
+backfilling existing channels. Initialize one channel explicitly with:
+
+```bash
+telegramd maintenance initialize-channel-post-summaries --channel-id <id>
+```
+
+The command rebuilds only that channel's summary nodes and readiness in a
+separate transaction from the Atlas migration. It serializes with that
+channel's posts; draining writers is an operational performance precaution,
+not a correctness requirement.
+
 The test harness (`internal/pgtest`) and production both apply these same
 migrations to reach the current schema. (Wiring pgtest to apply them lands in a
 later task.)

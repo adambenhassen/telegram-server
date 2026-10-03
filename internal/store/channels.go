@@ -355,6 +355,33 @@ func (s *Store) ChannelMembers(ctx context.Context, channelID int64) ([]ChannelM
 	return out, nil
 }
 
+// ChannelDeliverySnapshot reads channel membership and its current event
+// ceiling from one statement snapshot. A delivery can therefore authorize only
+// the channel events visible alongside those membership rows.
+func (s *Store) ChannelDeliverySnapshot(ctx context.Context, channelID int64) ([]ChannelMember, int, error) {
+	rows, err := s.q.ChannelDeliverySnapshot(ctx, channelID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("channel delivery snapshot: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, 0, nil
+	}
+
+	members := make([]ChannelMember, len(rows))
+	for i, r := range rows {
+		members[i] = channelMemberFromRow(db.ChannelParticipant{
+			ChannelID:   r.ChannelID,
+			UserID:      r.UserID,
+			Role:        r.Role,
+			BannedUntil: r.BannedUntil,
+			JoinPts:     r.JoinPts,
+			Date:        r.Date,
+			LastPostAt:  r.LastPostAt,
+		})
+	}
+	return members, int(rows[0].Pts), nil
+}
+
 // ChannelMemberOf returns userID's participant row of channelID; ok=false when
 // there is none. The row is returned as it stands: a ban is data here, not a
 // verdict, and the caller decides what it means by calling ChannelMember.Banned.

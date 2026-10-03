@@ -62,6 +62,21 @@ func TestRunCommandMaintenanceAssignOperatorRequiresExactInvocation(t *testing.T
 	}
 }
 
+func TestRunCommandMaintenanceSummaryInitializerRequiresPositiveChannelID(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"maintenance", "initialize-channel-post-summaries"},
+		{"maintenance", "initialize-channel-post-summaries", "--channel-id", "0"},
+		{"maintenance", "initialize-channel-post-summaries", "--channel-id", "-1"},
+		{"maintenance", "initialize-channel-post-summaries", "--channel-id", "not-an-id"},
+		{"maintenance", "initialize-channel-post-summaries", "--channel-id", "1", "extra"},
+	} {
+		if err := runCommand(args, slog.New(slog.DiscardHandler), &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+			t.Fatalf("runCommand(%v) succeeded, want usage error", args)
+		}
+	}
+}
+
 func seedMaintenanceOperator(t *testing.T, dsn string) {
 	t.Helper()
 	ctx := context.Background()
