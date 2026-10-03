@@ -156,7 +156,7 @@ jobs:
             and ((.secrets // {}) | length) == 0
             and (.networks["private-edge"].internal == true)
             and (.networks["landing-publish"].driver == "bridge")
-            and (.networks["landing-publish"].internal == false)
+            and ((.networks["landing-publish"].internal // false) == false)
             and (.networks["landing-publish"].driver_opts["com.docker.network.bridge.enable_ip_masquerade"] == "false")
             and (.networks["web-edge"].external == true)
             and (.networks["web-edge"].name == "telegram-web-edge-net")
