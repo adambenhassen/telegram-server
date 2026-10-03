@@ -412,19 +412,19 @@ func TestSuggestedDialogFiltersOfferOnlyMissingDefaultTitles(t *testing.T) {
 
 	initial := getSuggestions()
 	if len(initial) != 3 {
-		t.Fatalf("initial suggestions = %d, want missing Personal, Groups and Channels", len(initial))
+		t.Fatalf("initial suggestions = %d, want missing Personal, Channels and Groups", len(initial))
 	}
 	personal := assertSuggestion(initial[0], 3, "Personal", "Private chats")
 	if !personal.Contacts || !personal.NonContacts || !personal.Bots || personal.Groups || personal.Broadcasts || personal.ExcludeRead || len(personal.IncludePeers) != 0 || len(personal.PinnedPeers) != 0 || len(personal.ExcludePeers) != 0 {
 		t.Fatalf("Personal suggestion = %+v, want private contacts, non-contacts and bots with empty peers", personal)
 	}
-	groups := assertSuggestion(initial[1], 4, "Groups", "Group chats")
-	if !groups.Groups || groups.Contacts || groups.NonContacts || groups.Broadcasts || groups.Bots || groups.ExcludeRead || len(groups.IncludePeers) != 0 {
-		t.Fatalf("Groups suggestion = %+v, want basic groups and megagroups with empty peers", groups)
-	}
-	channels := assertSuggestion(initial[2], 5, "Channels", "Broadcast channels")
+	channels := assertSuggestion(initial[1], 4, "Channels", "Broadcast channels")
 	if !channels.Broadcasts || channels.Contacts || channels.NonContacts || channels.Groups || channels.Bots || channels.ExcludeRead || len(channels.IncludePeers) != 0 {
 		t.Fatalf("Channels suggestion = %+v, want broadcast channels with empty peers", channels)
+	}
+	groups := assertSuggestion(initial[2], 5, "Groups", "Group chats")
+	if !groups.Groups || groups.Contacts || groups.NonContacts || groups.Broadcasts || groups.Bots || groups.ExcludeRead || len(groups.IncludePeers) != 0 {
+		t.Fatalf("Groups suggestion = %+v, want basic groups and megagroups with empty peers", groups)
 	}
 	seeded, err := s.DialogFilterDefaultsSeeded(ctx, owner.ID)
 	if err != nil || seeded {
