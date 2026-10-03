@@ -822,6 +822,7 @@ run_probe build -json -count=1 -timeout 1m -run '^TestBuildFailure$'
 
 probe_attributions=$(python3 - "$probe_root/timeout.json" "$probe_root/race.json" "$probe_root/build.json" <<'PY'
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -856,7 +857,24 @@ race_output = [
     for event in race_events
     if event.get("Action") == "output" and event.get("Output") == "WARNING: DATA RACE\n"
 ]
-if len(race_output) != 1 or race_output[0].get("Test") != "TestRace":
+race_companion = [
+    event
+    for event in race_events
+    if event.get("Action") == "output"
+    and event.get("Test") == "TestRace"
+    and isinstance(event.get("Output"), str)
+    and "race detected during execution of test" in event["Output"]
+]
+if (
+    len(race_output) != 1
+    or race_output[0].get("Test") != "TestRace"
+    or len(race_companion) != 1
+    or re.fullmatch(
+        r" +testing\.go:[1-9][0-9]*: race detected during execution of test\n",
+        race_companion[0]["Output"],
+    )
+    is None
+):
     raise SystemExit("Go race event shape drifted")
 
 build_events = events(sys.argv[3])
@@ -1211,7 +1229,9 @@ full_timeout_stream="$timeout_full"$'\n'"$(failure_fixture "TestSmoke/$scenario_
 write_execution_case timeout-full-suite full-suite timeout-signature "$full_timeout_stream"
 
 race_event=$(json_event output "$race_test" $'WARNING: DATA RACE\n')
-race_stream="$race_event"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+race_companion_event=$(json_event output "$race_test" \
+  $'    testing.go:1865: race detected during execution of test\n')
+race_stream="$race_event"$'\n'"$race_companion_event"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
 write_execution_case race-full-suite full-suite race-signature "$race_stream"
 
 build_events_stream=$(go_build_event build-output example.com/build-probe "compiler output ${canary}")

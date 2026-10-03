@@ -1380,7 +1380,7 @@ def signature_reason(stream: EventStream, profile: str) -> str | None:
         exact_race = [
             text for _test, text in race_events if text == "WARNING: DATA RACE\n"
         ]
-        if not settings["race"] or len(exact_race) != len(race_events):
+        if not settings["race"] or not exact_race:
             return "unknown"
         signatures.add("race-signature")
 
