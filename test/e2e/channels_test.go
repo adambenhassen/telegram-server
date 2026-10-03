@@ -1322,9 +1322,51 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 	}
 }
 
+func TestSamePreBanChannelUpdate(t *testing.T) {
+	preBan := chanMsgUpdate{Msg: &tg.Message{ID: 2, Message: "live 1"}, Pts: 2}
+	tests := []struct {
+		name   string
+		update chanMsgUpdate
+		want   bool
+	}{
+		{
+			name:   "same message id and pts",
+			update: chanMsgUpdate{Msg: &tg.Message{ID: 2, Message: "live 1"}, Pts: 2},
+			want:   true,
+		},
+		{
+			name:   "new id and pts with old fixture text",
+			update: chanMsgUpdate{Msg: &tg.Message{ID: 3, Message: "live 1"}, Pts: 3},
+			want:   false,
+		},
+		{
+			name:   "same id with changed pts",
+			update: chanMsgUpdate{Msg: &tg.Message{ID: 2, Message: "live 1"}, Pts: 3},
+			want:   false,
+		},
+		{
+			name:   "new id at the same pts",
+			update: chanMsgUpdate{Msg: &tg.Message{ID: 3, Message: "live 2"}, Pts: 2},
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := samePreBanChannelUpdate(tt.update, preBan); got != tt.want {
+				t.Errorf("samePreBanChannelUpdate() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func samePreBanChannelUpdate(update, preBan chanMsgUpdate) bool {
+	return update.Msg != nil && preBan.Msg != nil && update.Msg.ID == preBan.Msg.ID && update.Pts == preBan.Pts
+}
+
 // TestChannelsBan proves gate 6: A bans B; B's getHistory and
-// getChannelDifference both fail with PEER_ID_INVALID, B receives no further
-// live posts; unban restores getHistory and getChannelDifference.
+// getChannelDifference both fail with PEER_ID_INVALID, B receives no fresh
+// posts; unban restores getHistory and getChannelDifference.
 //
 // The media assertion from gate 6 (LOCATION_INVALID on a previously accessible
 // file after ban) is omitted: messages.sendMedia returns PEER_ID_INVALID for
@@ -1360,18 +1402,21 @@ func TestChannelsBan(t *testing.T) {
 	stop := bootServerWithDelivery(t, ctx, key, dcID, st, dsn, codes.Logger(), ln)
 	t.Cleanup(stop)
 
-	const phoneA, phoneB = "+15551295051", "+15551295052"
-	seedPhoneUsers(t, ctx, st, phoneA, phoneB)
+	const phoneA, phoneB, phoneC = "+15551295051", "+15551295052", "+15551295053"
+	seedPhoneUsers(t, ctx, st, phoneA, phoneB, phoneC)
 
-	collB := newUpdateCollector()
-	aCmds, bCmds := make(chan command), make(chan command)
-	aID, bID := make(chan int64, 1), make(chan int64, 1)
-	errA, errB := make(chan error, 1), make(chan error, 1)
+	collB, collC := newUpdateCollector(), newUpdateCollector()
+	aCmds, bCmds, cCmds := make(chan command), make(chan command), make(chan command)
+	aID, bID, cID := make(chan int64, 1), make(chan int64, 1), make(chan int64, 1)
+	errA, errB, errC := make(chan error, 1), make(chan error, 1), make(chan error, 1)
 	go func() {
 		errA <- runInteractive(ctx, createClient(addr.Port, key, dcID, newUpdateCollector(), nil), flowFor(phoneA, codes), aID, aCmds)
 	}()
 	go func() {
 		errB <- runInteractive(ctx, createClient(addr.Port, key, dcID, collB, nil), flowFor(phoneB, codes), bID, bCmds)
+	}()
+	go func() {
+		errC <- runInteractive(ctx, createClient(addr.Port, key, dcID, collC, nil), flowFor(phoneC, codes), cID, cCmds)
 	}()
 
 	login := func(ch chan int64, who string) int64 {
@@ -1385,11 +1430,13 @@ func TestChannelsBan(t *testing.T) {
 	}
 	aUserID := login(aID, "A")
 	bUserID := login(bID, "B")
+	login(cID, "C")
 
-	// A creates broadcast channel. B joins via invite.
+	// A creates broadcast channel. B and C join via invite.
 	chID := createBroadcastChannel(t, ctx, aCmds, "BanTest")
 	hash := exportChannelInvite(t, ctx, aUserID, aCmds, chID)
 	importChannelInvite(t, ctx, bCmds, hash)
+	importChannelInvite(t, ctx, cCmds, hash)
 
 	// A posts "live 1"; B receives it to confirm live delivery works pre-ban.
 	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -1400,13 +1447,22 @@ func TestChannelsBan(t *testing.T) {
 		})
 		return err
 	})
+	var preBanUpdate chanMsgUpdate
 	select {
-	case upd := <-collB.newChannelMsg:
-		if upd.Msg.Message != "live 1" {
-			t.Fatalf("B pre-ban msg = %q, want %q", upd.Msg.Message, "live 1")
+	case preBanUpdate = <-collB.newChannelMsg:
+		if preBanUpdate.Msg.Message != "live 1" {
+			t.Fatalf("B pre-ban msg = %q, want %q", preBanUpdate.Msg.Message, "live 1")
 		}
 	case <-ctx.Done():
 		t.Fatalf("B timed out waiting for live 1: %v", ctx.Err())
+	}
+	select {
+	case update := <-collC.newChannelMsg:
+		if !samePreBanChannelUpdate(update, preBanUpdate) {
+			t.Fatalf("C pre-ban update = {id:%d pts:%d text:%q}, want B's live 1 id=%d pts=%d", update.Msg.ID, update.Pts, update.Msg.Message, preBanUpdate.Msg.ID, preBanUpdate.Pts)
+		}
+	case <-ctx.Done():
+		t.Fatalf("C timed out waiting for live 1: %v", ctx.Err())
 	}
 
 	// A bans B permanently.
@@ -1442,7 +1498,7 @@ func TestChannelsBan(t *testing.T) {
 		return err
 	})
 
-	// A posts "live 2"; B should NOT receive it (banned).
+	// A posts "live 2"; B should not receive it, while authorized C still does.
 	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 			Peer:     peerChannel(aUserID, chID),
@@ -1451,15 +1507,34 @@ func TestChannelsBan(t *testing.T) {
 		})
 		return err
 	})
-	// The window is the assertion, so it hangs off Background: derived from ctx
-	// an already-exhausted parent would return immediately and pass vacuously.
-	noCtx, noCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	select {
-	case <-collB.newChannelMsg:
-		t.Error("B should not receive channel message after ban")
-	case <-noCtx.Done():
+	// Keep observing for the full window after tolerating only B's exact pre-ban
+	// ID+pts pair. An exhausted test context must not make the assertion pass.
+	postBanWindow := time.NewTimer(3 * time.Second)
+	defer postBanWindow.Stop()
+	authorizedReceivedLive2 := false
+	windowOpen := true
+	for windowOpen {
+		select {
+		case update := <-collB.newChannelMsg:
+			if samePreBanChannelUpdate(update, preBanUpdate) {
+				continue
+			}
+			t.Fatalf("B received post-ban channel update: channel=%d id=%d pts=%d text=%q; pre-ban id=%d pts=%d", chID, update.Msg.ID, update.Pts, update.Msg.Message, preBanUpdate.Msg.ID, preBanUpdate.Pts)
+		case update := <-collC.newChannelMsg:
+			if samePreBanChannelUpdate(update, preBanUpdate) {
+				continue
+			}
+			if update.Msg.Message != "live 2" || update.Msg.ID <= preBanUpdate.Msg.ID || update.Pts <= preBanUpdate.Pts {
+				t.Fatalf("C received unexpected authorized update: channel=%d id=%d pts=%d text=%q; want live 2 after id=%d pts=%d", chID, update.Msg.ID, update.Pts, update.Msg.Message, preBanUpdate.Msg.ID, preBanUpdate.Pts)
+			}
+			authorizedReceivedLive2 = true
+		case <-postBanWindow.C:
+			windowOpen = false
+		}
 	}
-	noCancel()
+	if !authorizedReceivedLive2 {
+		t.Fatal("C timed out waiting for authorized live 2")
+	}
 
 	// A unbans B (zero BannedRights).
 	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
@@ -1532,7 +1607,8 @@ func TestChannelsBan(t *testing.T) {
 
 	close(aCmds)
 	close(bCmds)
-	for _, ch := range []chan error{errA, errB} {
+	close(cCmds)
+	for _, ch := range []chan error{errA, errB, errC} {
 		if err := <-ch; err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("client run: %v", err)
 		}
