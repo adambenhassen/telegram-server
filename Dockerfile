@@ -1,3 +1,5 @@
+# check=skip=SecretsUsedInArgOrEnv
+# The matched environment variables are file paths, not secret values.
 # golang:1.27 matches the `go 1.27.1` directive in go.mod; the module file stays
 # the single source of the version, so a bump there is the only thing to change.
 FROM golang:1.27 AS build
