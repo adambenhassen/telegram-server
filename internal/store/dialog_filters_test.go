@@ -85,9 +85,9 @@ func TestDialogFiltersSeedDefaultsOnceAndKeepDeletion(t *testing.T) {
 		t.Fatalf("read default dialog filters: %v", err)
 	}
 	if len(snapshot.Filters) != 4 {
-		t.Fatalf("seed returned %d folders, want Personal, Groups, Channels and Unread", len(snapshot.Filters))
+		t.Fatalf("seed returned %d folders, want Personal, Channels, Groups and Unread", len(snapshot.Filters))
 	}
-	wantTitles := []string{"Personal", "Groups", "Channels", "Unread"}
+	wantTitles := []string{"Personal", "Channels", "Groups", "Unread"}
 	for i, want := range wantTitles {
 		if snapshot.Filters[i].ID != i+2 || snapshot.Filters[i].Title != want {
 			t.Fatalf("default %d = %+v, want ID %d %s", i, snapshot.Filters[i], i+2, want)
@@ -97,7 +97,19 @@ func TestDialogFiltersSeedDefaultsOnceAndKeepDeletion(t *testing.T) {
 		}
 	}
 	if len(snapshot.Order) != 5 || snapshot.Order[0] != 0 || snapshot.Order[1] != 2 || snapshot.Order[2] != 3 || snapshot.Order[3] != 4 || snapshot.Order[4] != 5 {
-		t.Fatalf("default folder order = %v, want All chats then Personal, Groups, Channels, Unread", snapshot.Order)
+		t.Fatalf("default folder order = %v, want All chats then Personal, Channels, Groups, Unread", snapshot.Order)
+	}
+	firstRead := snapshot
+	seeded, err = s.SeedDefaultDialogFilters(ctx, owner.ID)
+	if err != nil || seeded {
+		t.Fatalf("repeat default dialog filter seed: seeded %v, err %v; want no-op", seeded, err)
+	}
+	repeatedRead, err := s.DialogFilters(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("read repeated default dialog filters: %v", err)
+	}
+	if !reflect.DeepEqual(repeatedRead.Filters, firstRead.Filters) || !reflect.DeepEqual(repeatedRead.Order, firstRead.Order) || !reflect.DeepEqual(repeatedRead.ChangedAt, firstRead.ChangedAt) {
+		t.Fatalf("repeat read changed default folders: before=%#v after=%#v", firstRead, repeatedRead)
 	}
 
 	if _, err := s.DeleteDialogFilter(ctx, owner.ID, 5); err != nil {
@@ -117,6 +129,79 @@ func TestDialogFiltersSeedDefaultsOnceAndKeepDeletion(t *testing.T) {
 	}
 	if len(afterRepeat.Filters) != 3 || afterRepeat.ChangedAt == nil || beforeRepeat.ChangedAt == nil || !afterRepeat.ChangedAt.Equal(*beforeRepeat.ChangedAt) {
 		t.Fatalf("repeat seed changed deleted defaults or marker: filters=%#v before=%v after=%v", afterRepeat.Filters, beforeRepeat.ChangedAt, afterRepeat.ChangedAt)
+	}
+}
+
+func TestDialogFilterSeedPreservesAlreadySeededLegacyOrder(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	legacyDefaults := []store.DialogFilter{
+		{ID: 2, Title: "Personal", Contacts: true, NonContacts: true, Bots: true},
+		{ID: 3, Title: "Groups", Groups: true},
+		{ID: 4, Title: "Channels", Broadcasts: true},
+		{ID: 5, Title: "Unread", Contacts: true, NonContacts: true, Groups: true, Broadcasts: true, Bots: true, ExcludeRead: true},
+	}
+	for i, scenario := range []struct {
+		name          string
+		revertEdit    bool
+		revertReorder bool
+	}{
+		{name: "untouched"},
+		{name: "edited then reverted", revertEdit: true},
+		{name: "reordered then reverted", revertReorder: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			dsn := pgtest.DSN(t)
+			s := openDialogFilterStore(t, dsn)
+			owner := mustUser(t, s, fmt.Sprintf("+155510917%02d", i))
+			for _, definition := range legacyDefaults {
+				if err := s.SaveDialogFilter(ctx, owner.ID, definition); err != nil {
+					t.Fatalf("save existing %s folder: %v", definition.Title, err)
+				}
+			}
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatalf("connect to mark existing defaults seeded: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := conn.Close(context.Background()); err != nil {
+					t.Errorf("close seeded-state connection: %v", err)
+				}
+			})
+			if _, err := conn.Exec(ctx, `UPDATE user_dialog_filter_state SET defaults_seeded_at = clock_timestamp() WHERE owner_id = $1`, owner.ID); err != nil {
+				t.Fatalf("mark existing defaults seeded: %v", err)
+			}
+			if scenario.revertEdit {
+				edited := legacyDefaults[1]
+				edited.Title = "Other groups"
+				edited.Groups = false
+				if err := s.SaveDialogFilter(ctx, owner.ID, edited); err != nil {
+					t.Fatalf("edit existing Groups folder: %v", err)
+				}
+				if err := s.SaveDialogFilter(ctx, owner.ID, legacyDefaults[1]); err != nil {
+					t.Fatalf("restore existing Groups folder: %v", err)
+				}
+			}
+			if scenario.revertReorder {
+				if changed, err := s.UpdateDialogFilterOrder(ctx, owner.ID, []int{0, 3, 2, 4, 5}); err != nil || !changed {
+					t.Fatalf("reorder existing defaults: changed %v, err %v", changed, err)
+				}
+				if changed, err := s.UpdateDialogFilterOrder(ctx, owner.ID, []int{0, 2, 3, 4, 5}); err != nil || !changed {
+					t.Fatalf("restore existing default order: changed %v, err %v", changed, err)
+				}
+			}
+			if seeded, err := s.SeedDefaultDialogFilters(ctx, owner.ID); err != nil || seeded {
+				t.Fatalf("read existing seeded defaults: seeded %v, err %v; want no reseed", seeded, err)
+			}
+			snapshot, err := s.DialogFilters(ctx, owner.ID)
+			if err != nil {
+				t.Fatalf("read existing seeded folders: %v", err)
+			}
+			if !reflect.DeepEqual(snapshot.Filters, legacyDefaults) || !reflect.DeepEqual(snapshot.Order, []int{0, 2, 3, 4, 5}) {
+				t.Fatalf("existing seeded state = folders %#v, order %v; want legacy defaults and order [0 2 3 4 5]", snapshot.Filters, snapshot.Order)
+			}
+		})
 	}
 }
 
@@ -219,8 +304,8 @@ func TestDialogFilterSeedPreservesExistingFoldersAndCapacity(t *testing.T) {
 	if snapshot.Filters[0].ID != 2 || snapshot.Filters[0].Title != "Folder 1" || !snapshot.Filters[0].Groups || len(snapshot.Filters[0].IncludePeers) != 1 || snapshot.Filters[0].IncludePeers[0].ID != member.ID {
 		t.Fatalf("existing id 2 folder changed: %+v", snapshot.Filters[0])
 	}
-	if snapshot.Filters[1].ID != 3 || snapshot.Filters[1].Title != "Personal" || snapshot.Filters[2].ID != 4 || snapshot.Filters[2].Title != "Groups" || snapshot.Filters[3].ID != 5 || snapshot.Filters[3].Title != "unread" || !snapshot.Filters[3].ExcludeMuted || snapshot.Filters[4].ID != 6 || snapshot.Filters[4].Title != "Channels" {
-		t.Fatalf("seeded folders or ids = %+v, want missing defaults appended in canonical order without duplicate Unread", snapshot.Filters)
+	if snapshot.Filters[1].ID != 3 || snapshot.Filters[1].Title != "Personal" || snapshot.Filters[2].ID != 4 || snapshot.Filters[2].Title != "Channels" || snapshot.Filters[3].ID != 5 || snapshot.Filters[3].Title != "unread" || !snapshot.Filters[3].ExcludeMuted || snapshot.Filters[4].ID != 6 || snapshot.Filters[4].Title != "Groups" {
+		t.Fatalf("seeded folders or ids = %+v, want missing defaults appended in new order without duplicate Unread", snapshot.Filters)
 	}
 	if len(snapshot.Order) != 6 || snapshot.Order[0] != 0 || snapshot.Order[1] != 5 || snapshot.Order[2] != 2 || snapshot.Order[3] != 3 || snapshot.Order[4] != 4 || snapshot.Order[5] != 6 {
 		t.Fatalf("order after seeding = %v, want existing order followed by missing defaults", snapshot.Order)
