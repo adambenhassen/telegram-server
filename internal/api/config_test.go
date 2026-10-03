@@ -29,6 +29,9 @@ func TestGetConfigStampsCurrentTime(t *testing.T) {
 	if cfg.Expires <= cfg.Date {
 		t.Errorf("expires %d is not ahead of date %d", cfg.Expires, cfg.Date)
 	}
+	if cfg.SuggestedLangCode != "en" {
+		t.Errorf("suggested_lang_code = %q, want English fallback", cfg.SuggestedLangCode)
+	}
 }
 
 // TestGetConfigTimesFollowTheClock is what a pair computed once — at process

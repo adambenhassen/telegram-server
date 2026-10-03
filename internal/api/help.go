@@ -4,10 +4,15 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
+	"github.com/adambenhassen/telegram-server/internal/catalog"
 	"github.com/adambenhassen/telegram-server/internal/mtproto"
 )
 
 func (h *handlers) handleGetConfig(r *mtproto.Request) (bin.Encoder, error) {
+	return h.handleGetConfigWithSystemLangCode(r, "")
+}
+
+func (h *handlers) handleGetConfigWithSystemLangCode(r *mtproto.Request, systemLangCode string) (bin.Encoder, error) {
 	var req tg.HelpGetConfigRequest
 	if err := req.Decode(r.Buf); err != nil {
 		return nil, errMethodNotImpl
@@ -21,6 +26,11 @@ func (h *handlers) handleGetConfig(r *mtproto.Request) (bin.Encoder, error) {
 	cfg.ThisDC = h.dcID
 	cfg.Date = int(now.Unix())
 	cfg.Expires = int(now.Add(configTTL).Unix())
+	var snapshot *catalog.Snapshot
+	if h.store != nil {
+		snapshot = h.store.CatalogSnapshot()
+	}
+	cfg.SetSuggestedLangCode(catalog.SuggestedLanguageCode(snapshot, systemLangCode))
 	return &cfg, nil
 }
 

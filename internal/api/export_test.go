@@ -1395,3 +1395,36 @@ func GetConfigSeqForTest(dcID int, host string, port int, now func() time.Time, 
 		return cfg, nil
 	}
 }
+
+// GetConfigSeqWithSystemLangCodeForTest returns a response function and a
+// snapshot of the shared config template. Calls use one handlers value so
+// concurrent requests can verify they only change their response copies.
+func GetConfigSeqWithSystemLangCodeForTest(dcID int, host string, port int, now func() time.Time) (func(string) (*tg.Config, error), func() *tg.Config) {
+	h := testHandlers(nil)
+	h.cfg = DefaultConfig(dcID, host, port)
+	h.cfg.SetSuggestedLangCode("shared")
+	h.cfg.SetLangPackVersion(12)
+	h.cfg.SetBaseLangPackVersion(13)
+	h.dcID = dcID
+	h.now = now
+	getConfig := func(systemLangCode string) (*tg.Config, error) {
+		var buf bin.Buffer
+		if err := (&tg.HelpGetConfigRequest{}).Encode(&buf); err != nil {
+			return nil, err
+		}
+		res, err := h.handleGetConfigWithSystemLangCode(&mtproto.Request{Ctx: context.Background(), Buf: &buf}, systemLangCode)
+		if err != nil {
+			return nil, err
+		}
+		cfg, ok := res.(*tg.Config)
+		if !ok {
+			return nil, fmt.Errorf("help.getConfig returned %T, want *tg.Config", res)
+		}
+		return cfg, nil
+	}
+	configTemplate := func() *tg.Config {
+		cfg := *h.cfg
+		return &cfg
+	}
+	return getConfig, configTemplate
+}

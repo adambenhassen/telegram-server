@@ -198,7 +198,11 @@ func UnpackInvoke(next Handler) Handler {
 			case tg.InvokeWithLayerRequestTypeID:
 				r = &tg.InvokeWithLayerRequest{Query: obj}
 			case tg.InitConnectionRequestTypeID:
-				r = &tg.InitConnectionRequest{Query: obj}
+				if err := unpackInitConnection(c, req, obj); err != nil {
+					return err
+				}
+				id = obj.TypeID
+				continue
 			case tg.InvokeWithoutUpdatesRequestTypeID:
 				r = &tg.InvokeWithoutUpdatesRequest{Query: obj}
 			default:
@@ -211,6 +215,17 @@ func UnpackInvoke(next Handler) Handler {
 			id = obj.TypeID
 		}
 	})
+}
+
+func unpackInitConnection(c *Conn, req *Request, obj *peekIDObject) error {
+	init := &tg.InitConnectionRequest{Query: obj}
+	if err := init.Decode(req.Buf); err != nil {
+		return err
+	}
+	if c != nil {
+		c.setSystemLangCodeHint(init.SystemLangCode)
+	}
+	return nil
 }
 
 // InvokeAfterMsgRefusal identifies whether an invokeAfterMsg dependency was
@@ -276,7 +291,7 @@ func UnpackInvokeWithAfterMsg(next Handler, onRefusal func(*Conn, *Request, uint
 				}
 				id = obj.TypeID
 			case tg.InitConnectionRequestTypeID:
-				if err := (&tg.InitConnectionRequest{Query: obj}).Decode(req.Buf); err != nil {
+				if err := unpackInitConnection(c, req, obj); err != nil {
 					return err
 				}
 				id = obj.TypeID
