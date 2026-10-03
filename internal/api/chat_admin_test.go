@@ -98,6 +98,289 @@ func assertFullChatAdmin(t *testing.T, full *tg.MessagesChatFull, targetID int64
 	t.Fatalf("getFullChat omitted participant %d", targetID)
 }
 
+func TestGetDifferenceConsumesAdminSnapshotAfterReply(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close connection: %v", err)
+		}
+	})
+	creator := chatUser(t, s, 730)
+	target := chatUser(t, s, 734)
+	observer := chatUser(t, s, 735)
+	chat, err := s.CreateChat(ctx, creator.ID, "Admin snapshot acknowledgement", []int64{target.ID, observer.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	if result, rpc := editChatAdmin(t, fullChannelDispatcher(s), creator.ID, target.ID, chat.ID, true); result == nil || rpc != nil {
+		t.Fatalf("promote admin result = %v, rpc = %v", result, rpc)
+	}
+
+	state, err := s.State(ctx, observer.ID)
+	if err != nil {
+		t.Fatalf("observer state: %v", err)
+	}
+	first, err := api.GetDifferenceForTest(s, observer.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts: state.Pts, Date: state.Date,
+	})
+	if err != nil {
+		t.Fatalf("first getDifference: %v", err)
+	}
+	difference, ok := first.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("first getDifference = %T, want updates.difference", first)
+	}
+	found := false
+	for _, update := range difference.OtherUpdates {
+		if admin, ok := update.(*tg.UpdateChatParticipantAdmin); ok && admin.ChatID == chat.ID && admin.UserID == target.ID && admin.IsAdmin {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("first getDifference omitted the pending admin snapshot")
+	}
+	var liveRecipients, pendingMarkers int
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_event_recipients
+		WHERE owner_id = $1 AND chat_id = $2 AND target_id = $3`,
+		observer.ID, chat.ID, target.ID,
+	).Scan(&liveRecipients); err != nil {
+		t.Fatalf("count live recipients after pull: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_state_markers
+		WHERE owner_id = $1 AND chat_id = $2 AND target_id = $3`,
+		observer.ID, chat.ID, target.ID,
+	).Scan(&pendingMarkers); err != nil {
+		t.Fatalf("count pending markers after pull: %v", err)
+	}
+	if liveRecipients != 1 || pendingMarkers != 0 {
+		t.Fatalf("recipient state after pull = live:%d pending:%d, want live fanout retained and pull marker consumed", liveRecipients, pendingMarkers)
+	}
+
+	second, err := api.GetDifferenceForTest(s, observer.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts: difference.State.Pts, Date: difference.State.Date,
+	})
+	if err != nil {
+		t.Fatalf("second getDifference: %v", err)
+	}
+	if _, ok := second.(*tg.UpdatesDifferenceEmpty); !ok {
+		t.Fatalf("second getDifference = %T (%+v), want updates.differenceEmpty after the snapshot was delivered", second, second)
+	}
+}
+
+func TestGetDifferenceReplyAckKeepsConcurrentAdminChangePending(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	creator := chatUser(t, s, 742)
+	target := chatUser(t, s, 743)
+	observer := chatUser(t, s, 744)
+	chat, err := s.CreateChat(ctx, creator.ID, "Concurrent admin snapshot", []int64{target.ID, observer.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	if result, rpc := editChatAdmin(t, fullChannelDispatcher(s), creator.ID, target.ID, chat.ID, true); result == nil || rpc != nil {
+		t.Fatalf("promote admin result = %v, rpc = %v", result, rpc)
+	}
+	state, err := s.State(ctx, observer.ID)
+	if err != nil {
+		t.Fatalf("observer state: %v", err)
+	}
+	first, afterReply, err := api.GetDifferenceWithAfterReplyForTest(s, observer.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts: state.Pts, Date: state.Date,
+	})
+	if err != nil {
+		t.Fatalf("first getDifference: %v", err)
+	}
+	if afterReply == nil {
+		t.Fatal("getDifference returned no success hook for its pending admin snapshot")
+	}
+	if _, ok := first.(*tg.UpdatesDifference); !ok {
+		t.Fatalf("first getDifference = %T, want updates.difference", first)
+	}
+	if result, rpc := editChatAdmin(t, fullChannelDispatcher(s), creator.ID, target.ID, chat.ID, false); result == nil || rpc != nil {
+		t.Fatalf("demote admin before reply acknowledgement = %v, rpc = %v", result, rpc)
+	}
+	afterReply()
+
+	latest, err := api.GetDifferenceForTest(s, observer.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts: state.Pts, Date: state.Date,
+	})
+	if err != nil {
+		t.Fatalf("getDifference after concurrent demotion: %v", err)
+	}
+	difference, ok := latest.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("getDifference after concurrent demotion = %T, want updates.difference", latest)
+	}
+	for _, update := range difference.OtherUpdates {
+		if admin, ok := update.(*tg.UpdateChatParticipantAdmin); ok && admin.ChatID == chat.ID && admin.UserID == target.ID && !admin.IsAdmin {
+			return
+		}
+	}
+	t.Fatal("reply acknowledgement consumed a newer concurrent demotion marker")
+}
+
+func TestChatAdminStateMarkerCoalescesRoleChanges(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close connection: %v", err)
+		}
+	})
+
+	creator := chatUser(t, s, 736)
+	target := chatUser(t, s, 737)
+	observer := chatUser(t, s, 738)
+	chat, err := s.CreateChat(ctx, creator.ID, "Coalesced admin marker", []int64{target.ID, observer.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	for _, isAdmin := range []bool{true, false, true} {
+		if result, rpc := editChatAdmin(t, fullChannelDispatcher(s), creator.ID, target.ID, chat.ID, isAdmin); result == nil || rpc != nil {
+			t.Fatalf("set admin=%t result = %v, rpc = %v", isAdmin, result, rpc)
+		}
+	}
+
+	var markers, liveRecipients int
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_state_markers
+		WHERE owner_id = $1 AND chat_id = $2 AND target_id = $3`,
+		observer.ID, chat.ID, target.ID,
+	).Scan(&markers); err != nil {
+		t.Fatalf("count coalesced pull markers: %v", err)
+	}
+	if markers != 1 {
+		t.Fatalf("pending pull markers = %d, want one after three role changes", markers)
+	}
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_event_recipients
+		WHERE owner_id = $1 AND chat_id = $2 AND target_id = $3`,
+		observer.ID, chat.ID, target.ID,
+	).Scan(&liveRecipients); err != nil {
+		t.Fatalf("count coalesced live recipients: %v", err)
+	}
+	if liveRecipients != 1 {
+		t.Fatalf("live recipient rows = %d, want one after three role changes", liveRecipients)
+	}
+	var recipientEventID, latestEventID int64
+	if err := conn.QueryRow(ctx, `
+		SELECT event_id FROM chat_admin_event_recipients
+		WHERE owner_id = $1 AND chat_id = $2 AND target_id = $3`,
+		observer.ID, chat.ID, target.ID,
+	).Scan(&recipientEventID); err != nil {
+		t.Fatalf("load coalesced live event ID: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `SELECT max(id) FROM chat_admin_events WHERE chat_id = $1`, chat.ID).Scan(&latestEventID); err != nil {
+		t.Fatalf("load latest chat admin event ID: %v", err)
+	}
+	if recipientEventID != latestEventID {
+		t.Fatalf("live recipient event ID = %d, want latest event %d", recipientEventID, latestEventID)
+	}
+}
+
+func TestChatAdminStateMarkerIsDeletedWhenRecipientLeaves(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close connection: %v", err)
+		}
+	})
+
+	creator := chatUser(t, s, 739)
+	target := chatUser(t, s, 740)
+	observer := chatUser(t, s, 741)
+	chat, err := s.CreateChat(ctx, creator.ID, "Removed admin recipient", []int64{target.ID, observer.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	if result, rpc := editChatAdmin(t, fullChannelDispatcher(s), creator.ID, target.ID, chat.ID, true); result == nil || rpc != nil {
+		t.Fatalf("promote admin result = %v, rpc = %v", result, rpc)
+	}
+	var markers, liveRecipients int
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_state_markers
+		WHERE owner_id = $1 AND chat_id = $2`, observer.ID, chat.ID,
+	).Scan(&markers); err != nil {
+		t.Fatalf("count pull markers before leave: %v", err)
+	}
+	if markers != 1 {
+		t.Fatalf("pending pull markers before recipient leaves = %d, want 1", markers)
+	}
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_event_recipients
+		WHERE owner_id = $1 AND chat_id = $2`, observer.ID, chat.ID,
+	).Scan(&liveRecipients); err != nil {
+		t.Fatalf("count live recipients before leave: %v", err)
+	}
+	if liveRecipients != 1 {
+		t.Fatalf("live recipient rows before recipient leaves = %d, want 1", liveRecipients)
+	}
+
+	if _, err := api.DeleteChatUserForTest(s, creator.ID, &tg.MessagesDeleteChatUserRequest{
+		ChatID: chat.ID, UserID: api.InputUser(creator.ID, observer.ID),
+	}); err != nil {
+		t.Fatalf("remove observer: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_state_markers
+		WHERE owner_id = $1 AND chat_id = $2`, observer.ID, chat.ID,
+	).Scan(&markers); err != nil {
+		t.Fatalf("count pull markers after leave: %v", err)
+	}
+	if markers != 0 {
+		t.Fatalf("pending pull markers after recipient left = %d, want 0", markers)
+	}
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_event_recipients
+		WHERE owner_id = $1 AND chat_id = $2`, observer.ID, chat.ID,
+	).Scan(&liveRecipients); err != nil {
+		t.Fatalf("count live recipients after leave: %v", err)
+	}
+	if liveRecipients != 0 {
+		t.Fatalf("live recipient rows after recipient left = %d, want 0", liveRecipients)
+	}
+
+	if _, err := api.AddChatUserForTest(s, creator.ID, &tg.MessagesAddChatUserRequest{
+		ChatID: chat.ID, UserID: api.InputUser(creator.ID, observer.ID),
+	}); err != nil {
+		t.Fatalf("re-add observer: %v", err)
+	}
+	assertFullChatAdmin(t, getFullChat(t, fullChannelDispatcher(s), observer.ID, chat.ID), target.ID, true)
+	state, err := s.State(ctx, observer.ID)
+	if err != nil {
+		t.Fatalf("observer state after re-add: %v", err)
+	}
+	difference, err := api.GetDifferenceForTest(s, observer.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts: state.Pts, Date: state.Date,
+	})
+	if err != nil {
+		t.Fatalf("getDifference after re-add: %v", err)
+	}
+	if _, ok := difference.(*tg.UpdatesDifferenceEmpty); !ok {
+		t.Fatalf("getDifference after re-add = %T (%+v), want no stale admin replay", difference, difference)
+	}
+}
+
 func TestCreatorPromotesAndDemotesBasicGroupAdmin(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -128,7 +411,6 @@ func TestCreatorPromotesAndDemotesBasicGroupAdmin(t *testing.T) {
 		if got := apiPts(t, s, userID); got != fromPts[userID] {
 			t.Errorf("owner %d pts after promotion = %d, want unchanged %d", userID, got, fromPts[userID])
 		}
-		assertChatAdminDifference(t, s, userID, fromPts[userID], chat.ID, target.ID, promoted.Version, true)
 		assertFullChatAdmin(t, getFullChat(t, h, userID, chat.ID), target.ID, true)
 	}
 
@@ -153,29 +435,30 @@ func TestCreatorPromotesAndDemotesBasicGroupAdmin(t *testing.T) {
 	if !foundNextPts {
 		t.Fatalf("message after promotion did not use pts %d with count 1: %+v", fromPts[target.ID]+1, updates.Updates)
 	}
-	afterMessageState, err := s.State(ctx, target.ID)
-	if err != nil {
-		t.Fatalf("state after message following promotion: %v", err)
-	}
-	difference, err := api.GetDifferenceForTest(s, target.ID, &tg.UpdatesGetDifferenceRequest{
-		Pts:  fromPts[target.ID],
-		Date: afterMessageState.Date,
-	})
-	if err != nil {
-		t.Fatalf("getDifference after message following promotion: %v", err)
-	}
-	diff, ok := difference.(*tg.UpdatesDifference)
-	if !ok || diff.State.Pts != fromPts[target.ID]+1 || len(diff.NewMessages) != 1 {
-		t.Fatalf("getDifference after message following promotion = %#v, want one message and pts %d", difference, fromPts[target.ID]+1)
-	}
-	foundRoleSnapshot := false
-	for _, update := range diff.OtherUpdates {
-		if admin, ok := update.(*tg.UpdateChatParticipantAdmin); ok && admin.ChatID == chat.ID && admin.UserID == target.ID && admin.IsAdmin {
-			foundRoleSnapshot = true
+	for _, userID := range users {
+		afterMessageState, err := s.State(ctx, userID)
+		if err != nil {
+			t.Fatalf("state after message for user %d: %v", userID, err)
 		}
-	}
-	if !foundRoleSnapshot {
-		t.Fatal("getDifference omitted durable admin state after the member date advanced past the missed push")
+		difference, err := api.GetDifferenceForTest(s, userID, &tg.UpdatesGetDifferenceRequest{
+			Pts: fromPts[userID], Date: afterMessageState.Date,
+		})
+		if err != nil {
+			t.Fatalf("getDifference after message for user %d: %v", userID, err)
+		}
+		diff, ok := difference.(*tg.UpdatesDifference)
+		if !ok || diff.State.Pts != fromPts[userID]+1 || len(diff.NewMessages) != 1 {
+			t.Fatalf("getDifference after message for user %d = %#v, want one message and pts %d", userID, difference, fromPts[userID]+1)
+		}
+		foundRoleSnapshot := false
+		for _, update := range diff.OtherUpdates {
+			if admin, ok := update.(*tg.UpdateChatParticipantAdmin); ok && admin.ChatID == chat.ID && admin.UserID == target.ID && admin.IsAdmin && admin.Version == promoted.Version {
+				foundRoleSnapshot = true
+			}
+		}
+		if !foundRoleSnapshot {
+			t.Errorf("getDifference omitted durable admin state for user %d after their date advanced past the missed push", userID)
+		}
 	}
 
 	result, rpc = editChatAdmin(t, h, creator.ID, target.ID, chat.ID, false)
@@ -293,8 +576,8 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := conn.Exec(ctx, `DROP TRIGGER IF EXISTS fail_chat_admin_delivery ON chat_admin_event_recipients`); err != nil {
-			t.Errorf("drop event failure trigger: %v", err)
+		if _, err := conn.Exec(ctx, `DROP TRIGGER IF EXISTS fail_chat_admin_delivery ON chat_admin_state_markers`); err != nil {
+			t.Errorf("drop state marker failure trigger: %v", err)
 		}
 		if _, err := conn.Exec(ctx, `DROP FUNCTION IF EXISTS fail_chat_admin_delivery()`); err != nil {
 			t.Errorf("drop event failure function: %v", err)
@@ -328,9 +611,9 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 	}
 	if _, err = conn.Exec(ctx, `
 		CREATE TRIGGER fail_chat_admin_delivery
-		BEFORE INSERT ON chat_admin_event_recipients
+		BEFORE INSERT ON chat_admin_state_markers
 		FOR EACH ROW EXECUTE FUNCTION fail_chat_admin_delivery()`); err != nil {
-		t.Fatalf("create recipient failure trigger: %v", err)
+		t.Fatalf("create state marker failure trigger: %v", err)
 	}
 	if result, rpc := editChatAdmin(t, fullChannelDispatcher(s), creator.ID, target.ID, chat.ID, true); result != nil || rpc == nil || rpc.ErrorMessage != "INTERNAL" {
 		t.Fatalf("promotion with failed delivery = result:%v rpc:%v, want INTERNAL", result, rpc)
@@ -349,15 +632,18 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 			t.Fatal("role change persisted after update delivery failed")
 		}
 	}
-	var adminEvents, recipientMarkers int
+	var adminEvents, recipientMarkers, stateMarkers int
 	if err = conn.QueryRow(ctx, `SELECT count(*) FROM chat_admin_events WHERE chat_id = $1`, chat.ID).Scan(&adminEvents); err != nil {
 		t.Fatalf("count admin events: %v", err)
 	}
 	if err = conn.QueryRow(ctx, `SELECT count(*) FROM chat_admin_event_recipients WHERE event_id IN (SELECT id FROM chat_admin_events WHERE chat_id = $1)`, chat.ID).Scan(&recipientMarkers); err != nil {
 		t.Fatalf("count recipient markers: %v", err)
 	}
-	if adminEvents != 0 || recipientMarkers != 0 {
-		t.Fatalf("persisted state after failed recipient marker = admin events:%d recipient markers:%d, want none", adminEvents, recipientMarkers)
+	if err = conn.QueryRow(ctx, `SELECT count(*) FROM chat_admin_state_markers WHERE chat_id = $1`, chat.ID).Scan(&stateMarkers); err != nil {
+		t.Fatalf("count state markers: %v", err)
+	}
+	if adminEvents != 0 || recipientMarkers != 0 || stateMarkers != 0 {
+		t.Fatalf("persisted state after failed state marker = admin events:%d recipient markers:%d state markers:%d, want none", adminEvents, recipientMarkers, stateMarkers)
 	}
 	for userID, wantPts := range pts {
 		if got := apiPts(t, s, userID); got != wantPts {
@@ -369,7 +655,16 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 func TestEditChatAdminResetsRoleWhenMemberIsReAdded(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close connection: %v", err)
+		}
+	})
 	creator := chatUser(t, s, 754)
 	target := chatUser(t, s, 755)
 	chat, err := s.CreateChat(ctx, creator.ID, "Admin re-add", []int64{target.ID})
@@ -385,12 +680,41 @@ func TestEditChatAdminResetsRoleWhenMemberIsReAdded(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("remove admin: %v", err)
 	}
+	var recipientRows, markerRows int
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_event_recipients
+		WHERE chat_id = $1 AND target_id = $2`, chat.ID, target.ID,
+	).Scan(&recipientRows); err != nil {
+		t.Fatalf("count recipients after target leaves: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM chat_admin_state_markers
+		WHERE chat_id = $1 AND target_id = $2`, chat.ID, target.ID,
+	).Scan(&markerRows); err != nil {
+		t.Fatalf("count pull markers after target leaves: %v", err)
+	}
+	if recipientRows != 0 || markerRows != 0 {
+		t.Fatalf("rows for former admin after leave = recipients:%d markers:%d, want none", recipientRows, markerRows)
+	}
 	if _, err = api.AddChatUserForTest(s, creator.ID, &tg.MessagesAddChatUserRequest{
 		ChatID: chat.ID, UserID: api.InputUser(creator.ID, target.ID),
 	}); err != nil {
 		t.Fatalf("re-add former admin: %v", err)
 	}
 	assertFullChatAdmin(t, getFullChat(t, h, creator.ID, chat.ID), target.ID, false)
+	state, err := s.State(ctx, creator.ID)
+	if err != nil {
+		t.Fatalf("creator state after re-add: %v", err)
+	}
+	difference, err := api.GetDifferenceForTest(s, creator.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts: state.Pts, Date: state.Date,
+	})
+	if err != nil {
+		t.Fatalf("getDifference after former admin was re-added: %v", err)
+	}
+	if _, ok := difference.(*tg.UpdatesDifferenceEmpty); !ok {
+		t.Fatalf("getDifference after former admin was re-added = %T (%+v), want no stale admin marker", difference, difference)
+	}
 }
 
 func TestGetFullChatKeepsRoleAndVersionInOneSnapshot(t *testing.T) {

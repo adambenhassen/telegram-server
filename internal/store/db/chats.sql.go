@@ -33,9 +33,11 @@ SELECT recipient.owner_id
 FROM chat_admin_event_recipients AS recipient
 JOIN chat_admin_events AS event ON event.id = recipient.event_id
 JOIN chat_participants AS participant
-  ON participant.chat_id = event.chat_id
+  ON participant.chat_id = recipient.chat_id
  AND participant.user_id = recipient.owner_id
 WHERE recipient.event_id = $1
+  AND recipient.chat_id = event.chat_id
+  AND recipient.target_id = event.user_id
 ORDER BY recipient.owner_id
 `
 
@@ -94,35 +96,38 @@ func (q *Queries) ChatAdminEventsByIDs(ctx context.Context, eventIds []int64) ([
 }
 
 const chatAdminSnapshotsForMember = `-- name: ChatAdminSnapshotsForMember :many
-SELECT DISTINCT ON (event.chat_id, event.user_id)
-       event.chat_id,
-       event.user_id,
+SELECT marker.event_id,
+       marker.chat_id,
+       marker.target_id AS user_id,
        target.is_admin,
        chat.version
-FROM chat_admin_event_recipients AS recipient
-JOIN chat_admin_events AS event ON event.id = recipient.event_id
+FROM chat_admin_state_markers AS marker
+JOIN chat_admin_events AS event
+  ON event.id = marker.event_id
+ AND event.chat_id = marker.chat_id
+ AND event.user_id = marker.target_id
 JOIN chat_participants AS viewer
-  ON viewer.chat_id = event.chat_id
- AND viewer.user_id = recipient.owner_id
-JOIN chats AS chat ON chat.id = event.chat_id
+  ON viewer.chat_id = marker.chat_id
+ AND viewer.user_id = marker.owner_id
+JOIN chats AS chat ON chat.id = marker.chat_id
 JOIN chat_participants AS target
-  ON target.chat_id = event.chat_id
- AND target.user_id = event.user_id
-WHERE recipient.owner_id = $1
-ORDER BY event.chat_id, event.user_id, event.id DESC
+  ON target.chat_id = marker.chat_id
+ AND target.user_id = marker.target_id
+WHERE marker.owner_id = $1
+ORDER BY marker.chat_id, marker.target_id
 `
 
 type ChatAdminSnapshotsForMemberRow struct {
+	EventID int64
 	ChatID  int64
 	UserID  int64
 	IsAdmin bool
 	Version int32
 }
 
-// ChatAdminSnapshotsForMember replays the latest current role for every target
-// whose admin state this member was entitled to observe. It is a durable pull
-// path independent of pts and request date, so a missed transient notification
-// cannot strand the client at the old role.
+// ChatAdminSnapshotsForMember returns the current role state for each target
+// with a pending pull marker. EventID lets the response-success hook consume
+// only versions included in this response, preserving newer concurrent changes.
 func (q *Queries) ChatAdminSnapshotsForMember(ctx context.Context, ownerID int64) ([]ChatAdminSnapshotsForMemberRow, error) {
 	rows, err := q.db.Query(ctx, chatAdminSnapshotsForMember, ownerID)
 	if err != nil {
@@ -133,6 +138,7 @@ func (q *Queries) ChatAdminSnapshotsForMember(ctx context.Context, ownerID int64
 	for rows.Next() {
 		var i ChatAdminSnapshotsForMemberRow
 		if err := rows.Scan(
+			&i.EventID,
 			&i.ChatID,
 			&i.UserID,
 			&i.IsAdmin,
@@ -430,6 +436,24 @@ func (q *Queries) ChatsForUser(ctx context.Context, userID int64) ([]Chat, error
 	return items, nil
 }
 
+const deleteChatAdminStateMarkersByEventIDs = `-- name: DeleteChatAdminStateMarkersByEventIDs :exec
+DELETE FROM chat_admin_state_markers
+WHERE owner_id = $1
+  AND event_id = ANY($2::bigint[])
+`
+
+type DeleteChatAdminStateMarkersByEventIDsParams struct {
+	OwnerID  int64
+	EventIds []int64
+}
+
+// DeleteChatAdminStateMarkersByEventIDs consumes the exact versions included
+// in a successfully written difference response.
+func (q *Queries) DeleteChatAdminStateMarkersByEventIDs(ctx context.Context, arg DeleteChatAdminStateMarkersByEventIDsParams) error {
+	_, err := q.db.Exec(ctx, deleteChatAdminStateMarkersByEventIDs, arg.OwnerID, arg.EventIds)
+	return err
+}
+
 const deleteChatParticipant = `-- name: DeleteChatParticipant :execrows
 DELETE FROM chat_participants WHERE chat_id = $1 AND user_id = $2
 `
@@ -515,25 +539,6 @@ func (q *Queries) InsertChatAdminEvent(ctx context.Context, arg InsertChatAdminE
 		&i.Version,
 	)
 	return i, err
-}
-
-const insertChatAdminEventRecipients = `-- name: InsertChatAdminEventRecipients :exec
-INSERT INTO chat_admin_event_recipients (event_id, owner_id)
-SELECT $1::bigint, recipient.owner_id
-FROM unnest($2::bigint[]) AS recipient(owner_id)
-ON CONFLICT (event_id, owner_id) DO NOTHING
-`
-
-type InsertChatAdminEventRecipientsParams struct {
-	EventID  int64
-	OwnerIds []int64
-}
-
-// InsertChatAdminEventRecipients persists the membership snapshot from the
-// same chat mutation transaction as the role and version change.
-func (q *Queries) InsertChatAdminEventRecipients(ctx context.Context, arg InsertChatAdminEventRecipientsParams) error {
-	_, err := q.db.Exec(ctx, insertChatAdminEventRecipients, arg.EventID, arg.OwnerIds)
-	return err
 }
 
 const insertChatParticipant = `-- name: InsertChatParticipant :exec
@@ -771,4 +776,58 @@ func (q *Queries) SetChatTitle(ctx context.Context, arg SetChatTitleParams) (Cha
 		&i.DefaultBannedRights,
 	)
 	return i, err
+}
+
+const upsertChatAdminEventRecipients = `-- name: UpsertChatAdminEventRecipients :exec
+INSERT INTO chat_admin_event_recipients (owner_id, chat_id, target_id, event_id)
+SELECT recipient.owner_id, $1::bigint, $2::bigint, $3::bigint
+FROM unnest($4::bigint[]) AS recipient(owner_id)
+ON CONFLICT (owner_id, chat_id, target_id)
+DO UPDATE SET event_id = EXCLUDED.event_id
+`
+
+type UpsertChatAdminEventRecipientsParams struct {
+	ChatID   int64
+	TargetID int64
+	EventID  int64
+	OwnerIds []int64
+}
+
+// UpsertChatAdminEventRecipients keeps one current live recipient per
+// member/chat/target tuple for transient fanout in the role mutation transaction.
+func (q *Queries) UpsertChatAdminEventRecipients(ctx context.Context, arg UpsertChatAdminEventRecipientsParams) error {
+	_, err := q.db.Exec(ctx, upsertChatAdminEventRecipients,
+		arg.ChatID,
+		arg.TargetID,
+		arg.EventID,
+		arg.OwnerIds,
+	)
+	return err
+}
+
+const upsertChatAdminStateMarkers = `-- name: UpsertChatAdminStateMarkers :exec
+INSERT INTO chat_admin_state_markers (owner_id, chat_id, target_id, event_id)
+SELECT recipient.owner_id, $1::bigint, $2::bigint, $3::bigint
+FROM unnest($4::bigint[]) AS recipient(owner_id)
+ON CONFLICT (owner_id, chat_id, target_id)
+DO UPDATE SET event_id = EXCLUDED.event_id
+`
+
+type UpsertChatAdminStateMarkersParams struct {
+	ChatID   int64
+	TargetID int64
+	EventID  int64
+	OwnerIds []int64
+}
+
+// UpsertChatAdminStateMarkers keeps the latest pending pull version separately
+// so acknowledging one connection's difference does not suppress live fanout.
+func (q *Queries) UpsertChatAdminStateMarkers(ctx context.Context, arg UpsertChatAdminStateMarkersParams) error {
+	_, err := q.db.Exec(ctx, upsertChatAdminStateMarkers,
+		arg.ChatID,
+		arg.TargetID,
+		arg.EventID,
+		arg.OwnerIds,
+	)
+	return err
 }

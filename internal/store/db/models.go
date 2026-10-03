@@ -147,8 +147,17 @@ type ChatAdminEvent struct {
 }
 
 type ChatAdminEventRecipient struct {
-	EventID int64
-	OwnerID int64
+	OwnerID  int64
+	ChatID   int64
+	TargetID int64
+	EventID  int64
+}
+
+type ChatAdminStateMarker struct {
+	OwnerID  int64
+	ChatID   int64
+	TargetID int64
+	EventID  int64
 }
 
 type ChatParticipant struct {

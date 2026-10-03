@@ -973,19 +973,21 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 		return nil, nil, errInternal
 	}
 
-	// Role state is a durable, non-pts snapshot. Render it on every difference
-	// so a member who missed the transient notification can recover even when
-	// their pts and date have already advanced for unrelated updates.
+	// Role state is a durable, non-pts snapshot. Pending markers let a member
+	// recover a missed transient notification even after unrelated pts/date
+	// progress; the response-success hook consumes only the versions it carried.
 	adminSnapshots, err := h.store.ChatAdminSnapshotsForMember(r.Ctx, r.UserID)
 	if err != nil {
 		h.log.Error("get difference chat admin snapshots", "user_id", r.UserID, "err", err)
 		return nil, nil, errInternal
 	}
 	var adminUpdates []tg.UpdateClass
+	adminEventIDs := make([]int64, 0, len(adminSnapshots))
 	if len(adminSnapshots) > 0 {
 		userIDs := make(map[int64]bool, len(adminSnapshots))
 		chatIDs := make(map[int64]bool, len(adminSnapshots))
 		for _, snapshot := range adminSnapshots {
+			adminEventIDs = append(adminEventIDs, snapshot.EventID)
 			userIDs[snapshot.UserID] = true
 			chatIDs[snapshot.ChatID] = true
 			adminUpdates = append(adminUpdates, &tg.UpdateChatParticipantAdmin{
@@ -1007,6 +1009,14 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 		}
 		b.users = appendUniqueDifferenceUsers(b.users, users)
 		b.chats = appendUniqueDifferenceChats(b.chats, chats)
+	}
+	consumeAdminMarkers := func() {
+		if len(adminEventIDs) == 0 {
+			return
+		}
+		if err := h.store.DeleteChatAdminStateMarkersByEventIDs(r.Ctx, r.UserID, adminEventIDs); err != nil {
+			h.log.Error("consume get difference chat admin markers", "user_id", r.UserID, "err", err)
+		}
 	}
 
 	// Qts gap: fill encrypted messages the client has not yet seen.
@@ -1086,6 +1096,10 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	st.Qts = newQts
 
 	if b.more || encMore {
+		var afterReply func()
+		if len(adminEventIDs) > 0 {
+			afterReply = consumeAdminMarkers
+		}
 		return &tg.UpdatesDifferenceSlice{
 			NewMessages:          newMessages,
 			NewEncryptedMessages: encMsgs,
@@ -1093,7 +1107,7 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 			Users:                b.users,
 			Chats:                b.chats,
 			IntermediateState:    *stateToTL(st),
-		}, nil, nil
+		}, afterReply, nil
 	}
 	result := &tg.UpdatesDifference{
 		NewMessages:          newMessages,
@@ -1104,8 +1118,13 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 		State:                *stateToTL(st),
 	}
 	var afterReply func()
-	if c != nil && includeFilterRefresh {
-		afterReply = func() { h.dialogFilterSync.AcknowledgeDifference(c, r, recovery, true) }
+	if len(adminEventIDs) > 0 || c != nil && includeFilterRefresh {
+		afterReply = func() {
+			consumeAdminMarkers()
+			if c != nil && includeFilterRefresh {
+				h.dialogFilterSync.AcknowledgeDifference(c, r, recovery, true)
+			}
+		}
 	}
 	return result, afterReply, nil
 }

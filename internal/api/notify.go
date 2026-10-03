@@ -229,9 +229,9 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	}
 }
 
-// DeliverChatAdmin pushes one persisted chat-admin event to its original
-// recipients who remain members. The durable recipient markers are also read
-// by getDifference, so this transient notification is only a low-latency path.
+// DeliverChatAdmin pushes one persisted chat-admin event to its currently
+// pending recipients who remain members. Separate durable pull markers let a
+// difference response recover missed pushes without suppressing other sessions.
 func (u *Updater) DeliverChatAdmin(ctx context.Context, chatID, eventID int64) {
 	events, err := u.h.store.ChatAdminEventsByIDs(ctx, []int64{eventID})
 	if err != nil {

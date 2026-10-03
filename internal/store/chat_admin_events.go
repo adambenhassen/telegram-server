@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"fmt"
+
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 type ChatAdminEvent struct {
@@ -16,6 +18,7 @@ type ChatAdminEvent struct {
 // ChatAdminSnapshot is the current role and chat version for a participant
 // whose admin state the requesting member was entitled to observe.
 type ChatAdminSnapshot struct {
+	EventID int64
 	ChatID  int64
 	UserID  int64
 	IsAdmin bool
@@ -43,8 +46,8 @@ func (s *Store) ChatAdminEventsByIDs(ctx context.Context, ids []int64) ([]ChatAd
 	return events, nil
 }
 
-// ChatAdminEventRecipientsByEvent lists the event's original recipients who
-// are still members of the chat, for best-effort live delivery.
+// ChatAdminEventRecipientsByEvent lists the currently pending recipients for
+// an event who are still members, for best-effort live delivery.
 func (s *Store) ChatAdminEventRecipientsByEvent(ctx context.Context, eventID int64) ([]int64, error) {
 	rows, err := s.q.ChatAdminEventRecipientsByEvent(ctx, eventID)
 	if err != nil {
@@ -53,9 +56,9 @@ func (s *Store) ChatAdminEventRecipientsByEvent(ctx context.Context, eventID int
 	return rows, nil
 }
 
-// ChatAdminSnapshotsForMember returns durable current role state for every
-// participant whose admin state the member was entitled to observe. It is
-// intentionally independent of pts so getDifference can repair a missed push.
+// ChatAdminSnapshotsForMember returns pending durable current role state for
+// participants whose admin state the member may observe. It is independent of
+// pts so getDifference can repair a missed push.
 func (s *Store) ChatAdminSnapshotsForMember(ctx context.Context, ownerID int64) ([]ChatAdminSnapshot, error) {
 	rows, err := s.q.ChatAdminSnapshotsForMember(ctx, ownerID)
 	if err != nil {
@@ -64,6 +67,7 @@ func (s *Store) ChatAdminSnapshotsForMember(ctx context.Context, ownerID int64) 
 	snapshots := make([]ChatAdminSnapshot, len(rows))
 	for i, row := range rows {
 		snapshots[i] = ChatAdminSnapshot{
+			EventID: row.EventID,
 			ChatID:  row.ChatID,
 			UserID:  row.UserID,
 			IsAdmin: row.IsAdmin,
@@ -71,4 +75,20 @@ func (s *Store) ChatAdminSnapshotsForMember(ctx context.Context, ownerID int64) 
 		}
 	}
 	return snapshots, nil
+}
+
+// DeleteChatAdminStateMarkersByEventIDs consumes the exact role snapshots
+// delivered to ownerID. A newer role change has a different event ID and is
+// therefore left pending.
+func (s *Store) DeleteChatAdminStateMarkersByEventIDs(ctx context.Context, ownerID int64, eventIDs []int64) error {
+	if len(eventIDs) == 0 {
+		return nil
+	}
+	if err := s.q.DeleteChatAdminStateMarkersByEventIDs(ctx, db.DeleteChatAdminStateMarkersByEventIDsParams{
+		OwnerID:  ownerID,
+		EventIds: eventIDs,
+	}); err != nil {
+		return fmt.Errorf("delete chat admin state markers: %w", err)
+	}
+	return nil
 }
