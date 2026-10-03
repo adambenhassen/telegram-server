@@ -397,7 +397,7 @@ func testSmokeDefaultDialogFilter(t *testing.T) {
 	if _, ok := listed.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("first folder = %T, want All chats", listed.Filters[0])
 	}
-	wantTitles := []string{"Personal", "Groups", "Channels", "Unread"}
+	wantTitles := []string{"Personal", "Channels", "Groups", "Unread"}
 	for i, want := range wantTitles {
 		folder, ok := listed.Filters[i+1].(*tg.DialogFilter)
 		if !ok || folder.ID != i+2 || folder.Title.Text != want {
@@ -590,9 +590,34 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("initialize default folders: %v", err)
 	}
-	if len(seeded.Filters) != 5 {
-		t.Fatalf("initial folders = %d, want All chats and four defaults", len(seeded.Filters))
+	assertDefaultFolderOrder := func(label string, result *tg.MessagesDialogFilters) {
+		if len(result.Filters) != 5 {
+			t.Fatalf("%s folders = %d, want All chats and four defaults", label, len(result.Filters))
+		}
+		if _, ok := result.Filters[0].(*tg.DialogFilterDefault); !ok {
+			t.Fatalf("%s first folder = %T, want All chats", label, result.Filters[0])
+		}
+		want := []struct {
+			id    int
+			title string
+		}{{2, "Personal"}, {3, "Channels"}, {4, "Groups"}, {5, "Unread"}}
+		for i, expected := range want {
+			folder, ok := result.Filters[i+1].(*tg.DialogFilter)
+			if !ok || folder.ID != expected.id || folder.Title.Text != expected.title {
+				t.Fatalf("%s folder %d = %#v, want ID %d %s", label, i+1, result.Filters[i+1], expected.id, expected.title)
+			}
+		}
 	}
+	assertDefaultFolderOrder("initial", seeded)
+	var repeated *tg.MessagesDialogFilters
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		repeated, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("repeat default folder read: %v", err)
+	}
+	assertDefaultFolderOrder("repeated", repeated)
 
 	filter := &tg.DialogFilter{ID: 6, Title: tg.TextWithEntities{Text: "Groups"}, Groups: true}
 	filter.SetFlags()
