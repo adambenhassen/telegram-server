@@ -92,31 +92,6 @@ AFTER INSERT ON channel_participants
 FOR EACH ROW
 EXECUTE FUNCTION channel_read_state_initialize_member();
 
--- The suffix above a marker is decomposed into at most 63 disjoint prefix
--- nodes. Marker zero can use the root directly.
-CREATE FUNCTION channel_post_summary_suffix_keys(p_marker BIGINT)
-RETURNS TABLE (depth SMALLINT, prefix BIGINT)
-LANGUAGE plpgsql
-IMMUTABLE
-STRICT
-AS $$
-BEGIN
-    IF p_marker < 0 THEN
-        RAISE EXCEPTION 'channel post marker must be nonnegative';
-    END IF;
-    IF p_marker = 0 THEN
-        RETURN QUERY SELECT 0::SMALLINT, 0::BIGINT;
-        RETURN;
-    END IF;
-
-    RETURN QUERY
-    SELECT bits.depth::SMALLINT,
-           (((p_marker >> (64 - bits.depth)) << 1) | 1)::BIGINT
-      FROM generate_series(1, 63) AS bits(depth)
-     WHERE ((p_marker >> (63 - bits.depth)) & 1) = 0;
-END;
-$$;
-
 -- Source IDs are the range keys and author IDs are scope keys. Reject values
 -- that could alias the total scope or fall outside the positive BIGINT tree.
 CREATE FUNCTION channel_post_summary_validate_source_ids()

@@ -39,17 +39,6 @@ func ChannelPostSummaryRootCount(ctx context.Context, s *Store, channelID int64,
 	return count, err
 }
 
-func ChannelReadStateMarker(ctx context.Context, s *Store, channelID, userID int64) (int64, bool, error) {
-	var marker int64
-	err := s.pool.QueryRow(ctx, `
-		SELECT read_max_id FROM channel_read_state WHERE channel_id = $1 AND user_id = $2
-	`, channelID, userID).Scan(&marker)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
-	}
-	return marker, err == nil, err
-}
-
 func InsertChannelPostRunForTest(ctx context.Context, s *Store, channelID, firstID, lastID, authorID int64, deleted bool) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO channel_messages (channel_id, local_id, from_id, message, deleted)
