@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestDownloadRateLimiterAdmitsLimitAndResetsWindow(t *testing.T) {

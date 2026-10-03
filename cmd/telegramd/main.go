@@ -27,17 +27,17 @@ import (
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/tdsync"
 
-	"github.com/adambenhassen/telegram-server/internal/admin"
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/blobscan"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/discovery"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	tsrp "github.com/adambenhassen/telegram-server/internal/srp"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/admin"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blobscan"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/discovery"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	tsrp "github.com/teagramhq/teagram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func main() {

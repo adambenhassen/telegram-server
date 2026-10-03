@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 // TestGetConfigStampsCurrentTime covers the two time fields a client reads off
@@ -28,6 +28,9 @@ func TestGetConfigStampsCurrentTime(t *testing.T) {
 	}
 	if cfg.Expires <= cfg.Date {
 		t.Errorf("expires %d is not ahead of date %d", cfg.Expires, cfg.Date)
+	}
+	if cfg.SuggestedLangCode != "en" {
+		t.Errorf("suggested_lang_code = %q, want English fallback", cfg.SuggestedLangCode)
 	}
 }
 

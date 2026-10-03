@@ -6,7 +6,7 @@ import (
 
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 // TestSendChatMessageRetryUsersAreTheSendTimeRecipients pins who a chat retry

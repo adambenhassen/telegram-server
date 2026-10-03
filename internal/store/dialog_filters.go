@@ -12,7 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 const (
@@ -91,8 +91,8 @@ func (s *Store) DialogFilterDefinitions(ctx context.Context, ownerID int64) ([]D
 func DefaultDialogFilters() []DialogFilter {
 	return []DialogFilter{
 		{Title: "Personal", Contacts: true, NonContacts: true, Bots: true},
-		{Title: "Groups", Groups: true},
 		{Title: "Channels", Broadcasts: true},
+		{Title: "Groups", Groups: true},
 		{Title: "Unread", Contacts: true, NonContacts: true, Groups: true, Broadcasts: true, Bots: true, ExcludeRead: true},
 	}
 }

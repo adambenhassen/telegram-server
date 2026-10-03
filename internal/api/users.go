@@ -10,9 +10,9 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // handleResolvePhone serves contacts.resolvePhone: resolve a phone number to a

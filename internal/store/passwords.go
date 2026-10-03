@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // UserPassword is a persisted 2FA cloud password. Verifier holds the decrypted

@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // validEncKey is 64 hex chars = 32 bytes, the required master-key length.

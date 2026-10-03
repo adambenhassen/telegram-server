@@ -8,8 +8,8 @@ import (
 
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // searchChannels runs contacts.search for the caller and returns the response.

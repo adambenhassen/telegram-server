@@ -6,8 +6,8 @@ import (
 	"net"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
 	"github.com/gotd/td/tg"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 func fixtureConfigForListener(t *testing.T, dcID int, listener net.Listener) *tg.Config {

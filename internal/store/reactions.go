@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
 	"github.com/jackc/pgx/v5"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // Reaction is a single reaction on a message copy.

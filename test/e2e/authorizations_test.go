@@ -14,9 +14,9 @@ import (
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestSessionManagement is the Phase E gate: it proves account.getAuthorizations

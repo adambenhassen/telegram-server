@@ -8,7 +8,7 @@ import (
 
 	"github.com/gotd/td/exchange"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // TestServeReturnsOnListenerClose verifies Serve unblocks promptly when the

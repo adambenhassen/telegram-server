@@ -6,8 +6,8 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 func handleSettingsForTest(userID int64, req bin.Encoder, handle func(*handlers, *mtproto.Request) (bin.Encoder, error)) (bin.Encoder, error) {

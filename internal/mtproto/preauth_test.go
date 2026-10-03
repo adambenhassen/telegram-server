@@ -20,7 +20,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/transport"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // What an unauthenticated peer may hold is bounded by three numbers, and each

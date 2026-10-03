@@ -11,7 +11,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 func encodedUnhandledBody(t *testing.T, request bin.Encoder) *bin.Buffer {

@@ -10,8 +10,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // ChannelPostSummarySchemaInstalled lets store integration tests distinguish

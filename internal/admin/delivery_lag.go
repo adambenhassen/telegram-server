@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // DeliveryLagState describes whether the last complete live-connection lag

@@ -9,7 +9,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/catalog"
 )
 
 func TestLangpackResponsesUsePreparedEnglishCatalog(t *testing.T) {

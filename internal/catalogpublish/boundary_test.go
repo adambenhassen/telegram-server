@@ -19,7 +19,7 @@ func TestRuntimePackagesDoNotDependOnCatalogPublisher(t *testing.T) {
 		t.Fatalf("list runtime dependencies: %v", err)
 	}
 	for dependency := range strings.FieldsSeq(string(output)) {
-		if dependency == "github.com/adambenhassen/telegram-server/internal/catalogpublish" {
+		if dependency == "github.com/teagramhq/teagram-server/internal/catalogpublish" {
 			t.Fatal("runtime dependency graph reaches the catalog publisher")
 		}
 	}

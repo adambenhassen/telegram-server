@@ -9,8 +9,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // The dedup branches answer a resend from the stored message's own pts, and

@@ -20,9 +20,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	tsrp "github.com/adambenhassen/telegram-server/internal/srp"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	tsrp "github.com/teagramhq/teagram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestRunCommandAdminSetPasswordRejectsPasswordFlagsBeforeOpeningStore(t *testing.T) {

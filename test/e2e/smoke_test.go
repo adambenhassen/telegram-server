@@ -24,13 +24,13 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/catalog"
-	"github.com/adambenhassen/telegram-server/internal/catalogpublish"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/catalogpublish"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestSmoke(t *testing.T) {
@@ -220,10 +220,11 @@ func testSmokeLangpack(t *testing.T) {
 		}
 	})
 	storage := &session.StorageMemory{}
-	unboundClient := f.savedSessionClient(storage)
+	unboundClient := f.savedSessionClientWithSystemLangCode(storage, "en-US")
 	if err := unboundClient.Run(f.ctx, func(ctx context.Context) error {
 		raw := tg.NewClient(unboundClient)
 		assertLangpackSmokeCalls(t, ctx, raw, f.dcID, artifact)
+		assertHelpConfigSuggestion(t, ctx, raw)
 		if _, err := raw.AccountGetPassword(ctx); err == nil || !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
 			t.Errorf("account.getPassword error = %v, want AUTH_KEY_UNREGISTERED", err)
 		}
@@ -241,6 +242,10 @@ func testSmokeLangpack(t *testing.T) {
 		t.Fatalf("auth key id length = %d, want %d", len(data.AuthKeyID), len(authKeyID))
 	}
 	copy(authKeyID[:], data.AuthKeyID)
+	key, ok, err := f.store.AuthKeyByID(f.ctx, mtproto.AuthKeyIDInt64(authKeyID))
+	if err != nil || !ok || key.UserID != 0 || key.PendingUserID != 0 || key.Provisional {
+		t.Fatalf("unbound startup auth key binding = user:%d pending:%d provisional:%v, ok=%v, err=%v", key.UserID, key.PendingUserID, key.Provisional, ok, err)
+	}
 	username := fmt.Sprintf("langpack%d", time.Now().UnixNano())
 	user, err := f.store.CreateUsernameUser(f.ctx, username, "Langpack", "Smoke")
 	if err != nil {
@@ -253,12 +258,28 @@ func testSmokeLangpack(t *testing.T) {
 		t.Fatalf("bind auth key to provisional user: %v", err)
 	}
 
-	provisionalClient := f.savedSessionClient(storage)
+	provisionalClient := f.savedSessionClientWithSystemLangCode(storage, "en_GB")
 	if err := provisionalClient.Run(f.ctx, func(ctx context.Context) error {
-		assertLangpackSmokeCalls(t, ctx, tg.NewClient(provisionalClient), f.dcID, artifact)
+		raw := tg.NewClient(provisionalClient)
+		assertLangpackSmokeCalls(t, ctx, raw, f.dcID, artifact)
+		assertHelpConfigSuggestion(t, ctx, raw)
+		if _, err := raw.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{OffsetPeer: &tg.InputPeerEmpty{}}); err == nil || !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
+			t.Errorf("provisional messages.getDialogs error = %v, want AUTH_KEY_UNREGISTERED", err)
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("provisional client run: %v", err)
+	}
+}
+
+func assertHelpConfigSuggestion(t *testing.T, ctx context.Context, raw *tg.Client) {
+	t.Helper()
+	config, err := raw.HelpGetConfig(ctx)
+	if err != nil {
+		t.Fatalf("help.getConfig: %v", err)
+	}
+	if config.SuggestedLangCode != catalog.LanguageEnglish {
+		t.Fatalf("help.getConfig suggested_lang_code = %q, want %q", config.SuggestedLangCode, catalog.LanguageEnglish)
 	}
 }
 
@@ -397,7 +418,7 @@ func testSmokeDefaultDialogFilter(t *testing.T) {
 	if _, ok := listed.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("first folder = %T, want All chats", listed.Filters[0])
 	}
-	wantTitles := []string{"Personal", "Groups", "Channels", "Unread"}
+	wantTitles := []string{"Personal", "Channels", "Groups", "Unread"}
 	for i, want := range wantTitles {
 		folder, ok := listed.Filters[i+1].(*tg.DialogFilter)
 		if !ok || folder.ID != i+2 || folder.Title.Text != want {
@@ -590,9 +611,34 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("initialize default folders: %v", err)
 	}
-	if len(seeded.Filters) != 5 {
-		t.Fatalf("initial folders = %d, want All chats and four defaults", len(seeded.Filters))
+	assertDefaultFolderOrder := func(label string, result *tg.MessagesDialogFilters) {
+		if len(result.Filters) != 5 {
+			t.Fatalf("%s folders = %d, want All chats and four defaults", label, len(result.Filters))
+		}
+		if _, ok := result.Filters[0].(*tg.DialogFilterDefault); !ok {
+			t.Fatalf("%s first folder = %T, want All chats", label, result.Filters[0])
+		}
+		want := []struct {
+			id    int
+			title string
+		}{{2, "Personal"}, {3, "Channels"}, {4, "Groups"}, {5, "Unread"}}
+		for i, expected := range want {
+			folder, ok := result.Filters[i+1].(*tg.DialogFilter)
+			if !ok || folder.ID != expected.id || folder.Title.Text != expected.title {
+				t.Fatalf("%s folder %d = %#v, want ID %d %s", label, i+1, result.Filters[i+1], expected.id, expected.title)
+			}
+		}
 	}
+	assertDefaultFolderOrder("initial", seeded)
+	var repeated *tg.MessagesDialogFilters
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		repeated, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("repeat default folder read: %v", err)
+	}
+	assertDefaultFolderOrder("repeated", repeated)
 
 	filter := &tg.DialogFilter{ID: 6, Title: tg.TextWithEntities{Text: "Groups"}, Groups: true}
 	filter.SetFlags()
@@ -1817,12 +1863,17 @@ func (f *smokeFixture) managedClient(sess *session.StorageMemory, seen, push *up
 }
 
 func (f *smokeFixture) savedSessionClient(sess *session.StorageMemory) *telegram.Client {
+	return f.savedSessionClientWithSystemLangCode(sess, "en")
+}
+
+func (f *smokeFixture) savedSessionClientWithSystemLangCode(sess *session.StorageMemory, systemLangCode string) *telegram.Client {
 	return telegram.NewClient(1, "hash", telegram.Options{
 		DC:             f.dcID,
 		DCList:         dcs.List{Options: []tg.DCOption{{ID: f.dcID, IPAddress: "127.0.0.1", Port: f.port}}},
 		PublicKeys:     []telegram.PublicKey{{RSA: &f.key.PublicKey}},
 		Resolver:       dcs.Plain(dcs.PlainOptions{}),
 		SessionStorage: sess,
+		Device:         telegram.DeviceConfig{SystemLangCode: systemLangCode},
 	})
 }
 

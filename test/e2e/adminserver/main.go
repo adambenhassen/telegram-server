@@ -26,11 +26,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/admin"
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/admin"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 const adminListenAddr = "127.0.0.1:2444"

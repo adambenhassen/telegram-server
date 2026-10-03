@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
 )
 
 func TestNotifyHasFiniteBudgetWhenPoolIsSaturated(t *testing.T) {

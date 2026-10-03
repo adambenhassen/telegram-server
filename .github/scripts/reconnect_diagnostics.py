@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterable
 
 
-PACKAGE = "github.com/adambenhassen/telegram-server/test/e2e"
+PACKAGE = "github.com/teagramhq/teagram-server/test/e2e"
 TARGET = "TestMessagingReconnectPushGap"
 RUN_TEST_PATTERN = f"^{TARGET}$"
 PG_CONTAINER_NAME = "tg-test-pg"

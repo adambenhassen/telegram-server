@@ -12,10 +12,10 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // storeAndEvicts opens a store and a raw connection listening on tg_evict over

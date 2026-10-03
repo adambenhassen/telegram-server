@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // seedPhoneUsers creates the existing phone accounts used by e2e login flows.

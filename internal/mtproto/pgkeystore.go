@@ -6,7 +6,7 @@ import (
 
 	"github.com/gotd/td/crypto"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // pgAuthKeyStore is an AuthKeyStore backed by the Postgres store. It persists
