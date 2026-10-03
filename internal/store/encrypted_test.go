@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestEncryptedReceivedQueue(t *testing.T) {

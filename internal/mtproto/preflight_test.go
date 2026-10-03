@@ -18,7 +18,7 @@ import (
 
 	"github.com/gotd/td/exchange"
 
-	"github.com/adambenhassen/telegram-server/internal/discovery"
+	"github.com/teagramhq/teagram-server/internal/discovery"
 )
 
 func TestProbePreflightReplaysEveryNonMatchingByte(t *testing.T) {

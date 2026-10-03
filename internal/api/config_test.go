@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 // TestGetConfigStampsCurrentTime covers the two time fields a client reads off

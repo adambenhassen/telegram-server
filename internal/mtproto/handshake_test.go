@@ -15,7 +15,7 @@ import (
 	"github.com/gotd/td/mt"
 	"github.com/gotd/td/transport"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // revokedKeyStore reports the key as bound to userID on the first lookup and

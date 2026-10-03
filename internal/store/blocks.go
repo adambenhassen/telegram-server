@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // ErrInvalidBlock is returned when a block operation names no user or the

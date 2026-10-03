@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func dialogWith(t *testing.T, s *store.Store, ownerID, peerID int64) store.Dialog {

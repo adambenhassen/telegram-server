@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestOpenToleratesPoolParamsInDSN pins that a DSN tuning the pool through its

@@ -3,7 +3,7 @@ package catalog_test
 import (
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/catalog"
 )
 
 type Pack = catalog.Pack

@@ -9,7 +9,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 func execDB(t *testing.T, dsn, sql string, args ...any) {

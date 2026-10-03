@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // SampleState describes whether a response contains a current or retained

@@ -11,7 +11,7 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/mt"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // fakeConn is a transport.Conn that records writes and can force a send error.

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // Every dedup branch in this package answers a resend with a pts, and the pts it

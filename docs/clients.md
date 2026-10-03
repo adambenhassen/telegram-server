@@ -487,7 +487,7 @@ on a branch of our fork, deliberately not vendored here: the checkout is
 
 | | |
 |---|---|
-| Fork | `https://github.com/adambenhassen/tdesktop` |
+| Fork | `https://github.com/teagramhq/teagram-desktop` |
 | Branch | `spike/MAIN-263-telegramd-endpoint` |
 | Upstream base | `8e18cb71103d83d7d98994ff27f0a2bca55c489c` (`dev`) |
 | Schema layer | 228, the same layer `gotd/td v0.161.0` pins — constructor ids match, no translation needed |

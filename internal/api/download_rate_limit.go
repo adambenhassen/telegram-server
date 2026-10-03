@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // downloadRateLimiter is the process-local fixed-window counter for

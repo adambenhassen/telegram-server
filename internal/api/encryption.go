@@ -11,10 +11,10 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/srp"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 const (

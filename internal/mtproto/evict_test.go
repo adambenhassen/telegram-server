@@ -10,8 +10,8 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/mt"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // seededKey builds a distinct auth key per seed, so a test can tell two

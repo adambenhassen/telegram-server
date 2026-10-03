@@ -10,8 +10,8 @@ import (
 
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // generousIPLimits is wide enough that no case reaches it by accident, for the

@@ -6,7 +6,7 @@ import (
 
 	"github.com/gotd/td/crypto"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 func TestMemoryAuthKeyStoreSaveGet(t *testing.T) {
