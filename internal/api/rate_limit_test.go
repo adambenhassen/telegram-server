@@ -1024,13 +1024,13 @@ func TestChannelPostRateLimit(t *testing.T) {
 		t.Fatalf("post 3: expected FLOOD_WAIT, got %v", err)
 	}
 
-	// No side effects: only 2 channel messages should exist.
+	// The create service message and 2 accepted posts should exist.
 	history, err := s.ChannelHistory(ctx, channel.ID, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(history) != 2 {
-		t.Fatalf("channel history = %d, want 2 (denied channel post wrote row)", len(history))
+	if len(history) != 3 {
+		t.Fatalf("channel history = %d, want creation plus 2 posts (denied post wrote row)", len(history))
 	}
 }
 

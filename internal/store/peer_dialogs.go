@@ -371,5 +371,6 @@ func channelMessageFromPeerDialogRow(row db.PeerChannelDialogsForOwnerRow) Chann
 		RandomID:     row.TopRandomID,
 		FileID:       row.TopFileID,
 		ReplyToMsgID: row.TopReplyToMsgID,
+		ActionType:   row.TopActionType,
 	})
 }

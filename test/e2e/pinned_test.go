@@ -552,6 +552,13 @@ func TestPinnedChannel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("createChannel: %v", err)
 	}
+	assertChannelRPCError(t, ctx, aCmds, "MESSAGE_ID_INVALID", func(ctx context.Context, c *tg.Client) error {
+		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer: peerChannel(aUserID, channelID),
+			ID:   1,
+		})
+		return err
+	})
 
 	// 2. A exports an invite and B joins.
 	var inviteHash string
@@ -729,9 +736,8 @@ func TestPinnedChannel(t *testing.T) {
 	}
 
 	// 10. Pin a non-existent message ID against the channel — should fail.
-	// Using postID + 99999 avoids the local-ID collision problem: the first DM
-	// and the first channel post both have local ID = 1, so a DM's message ID
-	// could accidentally match a channel post when both are sent in the same test.
+	// The first DM and channel-create service message share local ID 1, so use a
+	// high ID to avoid accidentally matching either when testing a wrong peer.
 	var wrongPeerErr error
 	if execErr := exec(aCmds, func(ctx context.Context, c *tg.Client) error {
 		_, err := c.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
