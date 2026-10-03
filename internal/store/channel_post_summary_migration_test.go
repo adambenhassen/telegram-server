@@ -14,7 +14,7 @@ import (
 
 func TestChannelPostSummaryMigrationIsAdditiveAndTransactional(t *testing.T) {
 	ctx := context.Background()
-	const migrationName = "20261002000049_channel_post_summaries.sql"
+	const migrationName = "20261003000051_channel_post_summaries.sql"
 	migrationsDir := filepath.Join("..", "..", "migrations")
 	entries, err := os.ReadDir(migrationsDir)
 	if err != nil {
