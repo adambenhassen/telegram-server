@@ -178,7 +178,7 @@ func (h *handlers) handleEditChatAdmin(r *mtproto.Request) (bin.Encoder, error) 
 		return nil, errUserIDInvalid
 	}
 
-	changed, perOwner, err := h.store.SetChatAdmin(r.Ctx, req.ChatID, targetID, r.UserID, req.IsAdmin)
+	changed, eventID, err := h.store.SetChatAdmin(r.Ctx, req.ChatID, targetID, r.UserID, req.IsAdmin)
 	switch {
 	case errors.Is(err, store.ErrNotMember):
 		return nil, errPeerIDInvalid
@@ -195,6 +195,14 @@ func (h *handlers) handleEditChatAdmin(r *mtproto.Request) (bin.Encoder, error) 
 	if !changed {
 		return &tg.BoolFalse{}, nil
 	}
-	h.notifyOwners(r.Ctx, perOwner, 0)
+	h.notifyChatAdmin(r.Ctx, req.ChatID, eventID)
 	return &tg.BoolTrue{}, nil
+}
+
+func (h *handlers) notifyChatAdmin(ctx context.Context, chatID, eventID int64) {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	if err := h.store.Notify(notifyCtx, store.ChannelUpdates, store.ChatAdminPayload(chatID, eventID)); err != nil {
+		h.log.Error("notify chat admin", "event_id", eventID, "err", err)
+	}
 }

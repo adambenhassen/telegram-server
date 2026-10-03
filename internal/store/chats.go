@@ -301,68 +301,49 @@ func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64) (
 }
 
 // SetChatAdmin changes one participant's basic-group administrator status and
-// records one owner event per current member in the same transaction.
-func (s *Store) SetChatAdmin(ctx context.Context, chatID, targetID, callerID int64, isAdmin bool) (bool, map[int64]int, error) {
+// records its versioned event in the same transaction.
+func (s *Store) SetChatAdmin(ctx context.Context, chatID, targetID, callerID int64, isAdmin bool) (bool, int64, error) {
 	m, err := s.beginChatMutation(ctx, chatID, callerID)
 	if err != nil {
-		return false, nil, err
+		return false, 0, err
 	}
 	defer func() { _ = m.tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 
 	if callerID != m.creatorID {
-		return false, nil, ErrChatAdminRequired
+		return false, 0, ErrChatAdminRequired
 	}
 	if targetID == m.creatorID {
-		return false, nil, ErrChatAdminTargetCreator
+		return false, 0, ErrChatAdminTargetCreator
 	}
 	if !m.seen[targetID] {
-		return false, nil, ErrChatTargetNotMember
+		return false, 0, ErrChatTargetNotMember
 	}
 	if m.admins[targetID] == isAdmin {
-		return false, nil, nil
-	}
-	if err := m.lockOwners(ctx); err != nil {
-		return false, nil, err
+		return false, 0, nil
 	}
 	updated, err := m.qtx.SetChatParticipantAdmin(ctx, db.SetChatParticipantAdminParams{
 		ChatID: chatID, UserID: targetID, IsAdmin: isAdmin,
 	})
 	if err != nil {
-		return false, nil, fmt.Errorf("set chat participant admin: %w", err)
+		return false, 0, fmt.Errorf("set chat participant admin: %w", err)
 	}
 	if updated != 1 {
-		return false, nil, fmt.Errorf("set chat participant admin: updated %d rows, want 1", updated)
+		return false, 0, fmt.Errorf("set chat participant admin: updated %d rows, want 1", updated)
 	}
 	chat, err := m.qtx.BumpChatVersion(ctx, chatID)
 	if err != nil {
-		return false, nil, fmt.Errorf("bump chat version: %w", err)
+		return false, 0, fmt.Errorf("bump chat version: %w", err)
 	}
 	event, err := m.qtx.InsertChatAdminEvent(ctx, db.InsertChatAdminEventParams{
 		ChatID: chatID, UserID: targetID, IsAdmin: isAdmin, Version: chat.Version,
 	})
 	if err != nil {
-		return false, nil, fmt.Errorf("insert chat admin event: %w", err)
-	}
-	perOwner := make(map[int64]int, len(m.members))
-	for _, ownerID := range m.members {
-		pts, err := m.qtx.BumpPtsOnly(ctx, ownerID)
-		if err != nil {
-			return false, nil, fmt.Errorf("bump owner %d pts: %w", ownerID, err)
-		}
-		if err := m.qtx.InsertEvent(ctx, db.InsertEventParams{
-			OwnerID: ownerID,
-			Pts:     pts,
-			Type:    int16(EventChatParticipantAdmin),
-			LocalID: event.ID,
-		}); err != nil {
-			return false, nil, fmt.Errorf("insert owner %d chat admin event: %w", ownerID, err)
-		}
-		perOwner[ownerID] = int(pts)
+		return false, 0, fmt.Errorf("insert chat admin event: %w", err)
 	}
 	if err := m.tx.Commit(ctx); err != nil {
-		return false, nil, fmt.Errorf("commit: %w", err)
+		return false, 0, fmt.Errorf("commit: %w", err)
 	}
-	return true, perOwner, nil
+	return true, event.ID, nil
 }
 
 // lockOwners acquires every owner lock this mutation will touch in one sorted

@@ -52,30 +52,14 @@ func getFullChat(t *testing.T, h mtproto.Handler, userID, chatID int64) *tg.Mess
 	return &result
 }
 
-func assertChatAdminDifference(
-	t *testing.T,
-	s *store.Store,
-	userID int64,
-	fromPts int,
-	chatID, targetID int64,
-	isAdmin bool,
-	version int,
-) {
+func assertEmptyAdminDifference(t *testing.T, s *store.Store, userID int64, fromPts int) {
 	t.Helper()
 	result, err := api.GetDifferenceForTest(s, userID, &tg.UpdatesGetDifferenceRequest{Pts: fromPts})
 	if err != nil {
 		t.Fatalf("getDifference for user %d: %v", userID, err)
 	}
-	difference, ok := result.(*tg.UpdatesDifference)
-	if !ok {
-		t.Fatalf("getDifference result = %T, want *tg.UpdatesDifference", result)
-	}
-	if len(difference.OtherUpdates) != 1 {
-		t.Fatalf("getDifference updates for user %d = %d, want one admin update", userID, len(difference.OtherUpdates))
-	}
-	update, ok := difference.OtherUpdates[0].(*tg.UpdateChatParticipantAdmin)
-	if !ok || update.ChatID != chatID || update.UserID != targetID || update.IsAdmin != isAdmin || update.Version != version {
-		t.Fatalf("getDifference update for user %d = %#v, want chat %d user %d admin %t version %d", userID, difference.OtherUpdates[0], chatID, targetID, isAdmin, version)
+	if _, ok := result.(*tg.UpdatesDifferenceEmpty); !ok {
+		t.Fatalf("getDifference result for user %d = %T, want empty because admin updates do not consume pts", userID, result)
 	}
 }
 
@@ -115,26 +99,32 @@ func TestCreatorPromotesAndDemotesBasicGroupAdmin(t *testing.T) {
 	}
 	h := fullChannelDispatcher(s)
 	users := []int64{creator.ID, target.ID, observer.ID}
+	fromPts := make(map[int64]int, len(users))
+	for _, userID := range users {
+		fromPts[userID] = apiPts(t, s, userID)
+	}
 
 	result, rpc := editChatAdmin(t, h, creator.ID, target.ID, chat.ID, true)
 	if result == nil || rpc != nil {
 		t.Fatalf("promote admin result = %v, rpc = %v", result, rpc)
 	}
 	for _, userID := range users {
-		assertChatAdminDifference(t, s, userID, 0, chat.ID, target.ID, true, 2)
+		if got := apiPts(t, s, userID); got != fromPts[userID] {
+			t.Errorf("owner %d pts after promotion = %d, want unchanged %d", userID, got, fromPts[userID])
+		}
+		assertEmptyAdminDifference(t, s, userID, fromPts[userID])
 		assertFullChatAdmin(t, getFullChat(t, h, userID, chat.ID), target.ID, true)
 	}
 
-	fromPts := make(map[int64]int, len(users))
-	for _, userID := range users {
-		fromPts[userID] = apiPts(t, s, userID)
-	}
 	result, rpc = editChatAdmin(t, h, creator.ID, target.ID, chat.ID, false)
 	if result == nil || rpc != nil {
 		t.Fatalf("demote admin result = %v, rpc = %v", result, rpc)
 	}
 	for _, userID := range users {
-		assertChatAdminDifference(t, s, userID, fromPts[userID], chat.ID, target.ID, false, 3)
+		if got := apiPts(t, s, userID); got != fromPts[userID] {
+			t.Errorf("owner %d pts after demotion = %d, want unchanged %d", userID, got, fromPts[userID])
+		}
+		assertEmptyAdminDifference(t, s, userID, fromPts[userID])
 		assertFullChatAdmin(t, getFullChat(t, h, userID, chat.ID), target.ID, false)
 	}
 }
@@ -223,7 +213,7 @@ func TestEditChatAdminNoOpKeepsVersionAndUpdatesStable(t *testing.T) {
 		if got := apiPts(t, s, userID); got != pts[userID] {
 			t.Errorf("owner %d pts after no-op = %d, want unchanged %d", userID, got, pts[userID])
 		}
-		assertChatAdminDifference(t, s, userID, 0, chat.ID, target.ID, true, versioned.Version)
+		assertEmptyAdminDifference(t, s, userID, 0)
 	}
 }
 
@@ -236,7 +226,7 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := conn.Exec(ctx, `DROP TRIGGER IF EXISTS fail_chat_admin_delivery ON message_events`); err != nil {
+		if _, err := conn.Exec(ctx, `DROP TRIGGER IF EXISTS fail_chat_admin_delivery ON chat_admin_events`); err != nil {
 			t.Errorf("drop event failure trigger: %v", err)
 		}
 		if _, err := conn.Exec(ctx, `DROP FUNCTION IF EXISTS fail_chat_admin_delivery()`); err != nil {
@@ -263,9 +253,7 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 		CREATE FUNCTION fail_chat_admin_delivery() RETURNS trigger
 		LANGUAGE plpgsql AS $$
 		BEGIN
-			IF NEW.type = 6 THEN
-				RAISE EXCEPTION 'injected chat admin delivery failure';
-			END IF;
+			RAISE EXCEPTION 'injected chat admin delivery failure';
 			RETURN NEW;
 		END;
 		$$`); err != nil {
@@ -273,7 +261,7 @@ func TestEditChatAdminRollsBackWhenUpdateDeliveryCannotPersist(t *testing.T) {
 	}
 	if _, err = conn.Exec(ctx, `
 		CREATE TRIGGER fail_chat_admin_delivery
-		BEFORE INSERT ON message_events
+		BEFORE INSERT ON chat_admin_events
 		FOR EACH ROW EXECUTE FUNCTION fail_chat_admin_delivery()`); err != nil {
 		t.Fatalf("create event failure trigger: %v", err)
 	}
