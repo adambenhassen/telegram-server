@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
 	"github.com/jackc/pgx/v5"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestChannelPostSummaryMigrationIsAdditiveAndTransactional(t *testing.T) {
