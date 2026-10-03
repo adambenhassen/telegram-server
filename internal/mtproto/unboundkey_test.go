@@ -134,20 +134,36 @@ func TestUnboundKeyCapReleasesASignedInConnectionForGood(t *testing.T) {
 	sendFrame(t, ctx, conn, keys.key, session, int64(2)<<32)
 	wantRequests(t, seen, 1)
 
-	// The key is unbound again, and another connection takes the freed slot —
-	// so the key is at its cap once more, with the signed-in connection outside
-	// it.
+	// The key is unbound again. A's next frame is an ordering barrier: the
+	// server cannot dispatch it until frame 2's post-dispatch charge has
+	// released A's slot. Handler entry for frame 2 alone does not prove that
+	// transition finished.
 	keys.bind(0)
+	sendFrame(t, ctx, conn, keys.key, session, int64(3)<<32)
+	wantRequests(t, seen, 1)
+
+	// Another connection takes the freed slot — so the key is at its cap once
+	// more, with the signed-in connection outside it. This is one admission
+	// attempt; retrying could hide a missing release.
 	other, _ := keyClient(t, ctx, addr, keys.key, session+1)
 	wantRequests(t, seen, 1)
 	if closedByServer(t, other, time.Second) {
 		t.Fatal("the slot a signed-in connection released was never given back")
 	}
 
-	sendFrame(t, ctx, conn, keys.key, session, int64(3)<<32)
+	sendFrame(t, ctx, conn, keys.key, session, int64(4)<<32)
 	wantRequests(t, seen, 1)
 	if closedByServer(t, signedIn, time.Second) {
 		t.Fatal("a connection whose key had signed in was later closed at the unbound-key cap")
+	}
+
+	// A's next frame orders after frame 4's post-dispatch charge. Once its
+	// handler is reached, check that A did not release B's only slot twice.
+	sendFrame(t, ctx, conn, keys.key, session, int64(5)<<32)
+	wantRequests(t, seen, 1)
+	third, _ := keyClient(t, ctx, addr, keys.key, session+2)
+	if !closedByServer(t, third, 2*time.Second) {
+		t.Fatal("a third connection took the slot already held by the admitted connection")
 	}
 }
 
