@@ -82,9 +82,9 @@ func TestChannelPostSummaryInitializationCountsExactSuffixes(t *testing.T) {
 		authorID  int64
 		want      int64
 	}{
-		{name: "total live posts", scopeKind: 0, want: 2007},
+		{name: "total live posts", scopeKind: 0, want: 2006},
 		{name: "reader contribution", scopeKind: 1, authorID: reader.ID, want: 2004},
-		{name: "creator contribution", scopeKind: 1, authorID: creator.ID, want: 3},
+		{name: "creator contribution", scopeKind: 1, authorID: creator.ID, want: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, tc.scopeKind, tc.authorID)
@@ -100,7 +100,7 @@ func TestChannelPostSummaryInitializationCountsExactSuffixes(t *testing.T) {
 	for _, tc := range []struct {
 		marker int64
 		want   int64
-	}{{marker: 0, want: 3}, {marker: 1004, want: 1}} {
+	}{{marker: 0, want: 2}, {marker: 1004, want: 1}} {
 		got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, tc.marker)
 		if err != nil {
 			t.Fatalf("count suffix after %d: %v", tc.marker, err)
@@ -117,8 +117,8 @@ func TestChannelPostSummaryInitializationCountsExactSuffixes(t *testing.T) {
 		t.Fatalf("repeat initialization: %v", err)
 	}
 	got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, 0)
-	if err != nil || got != 3 {
-		t.Fatalf("unread after idempotent rebuild = %d, err %v; want 3", got, err)
+	if err != nil || got != 2 {
+		t.Fatalf("unread after idempotent rebuild = %d, err %v; want 2", got, err)
 	}
 }
 
@@ -136,10 +136,30 @@ func TestChannelPostSummaryTriggersMaintainMutationsAndFailClosed(t *testing.T) 
 	if _, _, err = s.JoinChannelByInvite(ctx, invite, reader.ID); err != nil {
 		t.Fatalf("join reader: %v", err)
 	}
+	if got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, 0); err != nil || got != 0 {
+		t.Fatalf("new channel unread service messages = %d, err %v; want 0", got, err)
+	}
 
 	message, _ := post(t, s, channel.ID, creator.ID, "one", 72101)
 	if message.LocalID != 2 {
 		t.Fatalf("post local ID = %d, want 2", message.LocalID)
+	}
+	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 1 {
+		t.Fatalf("root count after user post = %d, err %v; want 1", got, err)
+	}
+	if err = store.ExecChannelPostSummarySQL(ctx, s,
+		`UPDATE channel_messages SET action_type = 1 WHERE channel_id = $1 AND local_id = $2`, channel.ID, message.LocalID); err != nil {
+		t.Fatalf("change live post to service action: %v", err)
+	}
+	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 0 {
+		t.Fatalf("root count after service action change = %d, err %v; want 0", got, err)
+	}
+	if err = store.ExecChannelPostSummarySQL(ctx, s,
+		`UPDATE channel_messages SET action_type = 0 WHERE channel_id = $1 AND local_id = $2`, channel.ID, message.LocalID); err != nil {
+		t.Fatalf("restore user post action: %v", err)
+	}
+	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 1 {
+		t.Fatalf("root count after restoring user action = %d, err %v; want 1", got, err)
 	}
 	if _, _, dup, err := s.PostChannelMessage(ctx, channel.ID, creator.ID, "one", 72101, nil, 0); err != nil || !dup {
 		t.Fatalf("dedup post duplicate=%v err=%v", dup, err)
@@ -427,8 +447,8 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 	if err = staleTx.Rollback(ctx); err != nil {
 		t.Fatalf("roll back rejected repeatable-read writer: %v", err)
 	}
-	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 4 {
-		t.Fatalf("root count after init/post overlap = %d, err %v; want 4", got, err)
+	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 3 {
+		t.Fatalf("root count after init/post overlap = %d, err %v; want 3", got, err)
 	}
 
 	// Hold the state row while two independent source writes reach their AFTER
@@ -465,8 +485,8 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 	if err = <-moveDone; err != nil {
 		t.Fatalf("commit concurrent live identity move: %v", err)
 	}
-	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 3 {
-		t.Fatalf("root count after source mutation overlap = %d, err %v; want 3", got, err)
+	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 2 {
+		t.Fatalf("root count after source mutation overlap = %d, err %v; want 2", got, err)
 	}
 	if got, err := s.ChannelPostUnreadCount(ctx, channel.ID, reader.ID, 1); err != nil || got != 2 {
 		t.Fatalf("unread suffix after source mutation overlap = %d, err %v; want 2", got, err)

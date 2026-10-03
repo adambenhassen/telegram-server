@@ -143,13 +143,13 @@ BEGIN
         old_channel_id := OLD.channel_id;
         old_local_id := OLD.local_id;
         old_from_id := OLD.from_id;
-        old_live := NOT OLD.deleted;
+        old_live := NOT OLD.deleted AND OLD.action_type = 0;
     END IF;
     IF TG_OP <> 'DELETE' THEN
         new_channel_id := NEW.channel_id;
         new_local_id := NEW.local_id;
         new_from_id := NEW.from_id;
-        new_live := NOT NEW.deleted;
+        new_live := NOT NEW.deleted AND NEW.action_type = 0;
     END IF;
 
     IF NOT old_live AND NOT new_live THEN
@@ -160,7 +160,8 @@ BEGIN
        AND old_live AND new_live
        AND old_channel_id = new_channel_id
        AND old_local_id = new_local_id
-       AND old_from_id = new_from_id THEN
+       AND old_from_id = new_from_id
+       AND OLD.action_type = NEW.action_type THEN
         RETURN NEW;
     END IF;
 
@@ -317,6 +318,7 @@ BEGIN
       ) AS contributions
      WHERE post.channel_id = p_channel_id
        AND post.deleted = false
+       AND post.action_type = 0
      GROUP BY contributions.scope_kind, contributions.author_id,
               contributions.depth, contributions.prefix
      ORDER BY contributions.scope_kind, contributions.author_id,
