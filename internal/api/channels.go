@@ -183,6 +183,9 @@ func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error)
 	if err != nil {
 		return nil, err
 	}
+	if err := h.checkChannelUnreadCountRateLimit(r); err != nil {
+		return nil, err
+	}
 
 	snapshot, found, err := h.store.ChannelFullInfoForViewer(r.Ctx, channelID, r.UserID)
 	if err != nil {

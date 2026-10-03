@@ -103,6 +103,11 @@ func (h *handlers) handleGetDialogs(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
+	if req.OffsetID == 0 {
+		if err := h.checkChannelUnreadCountRateLimit(r); err != nil {
+			return nil, err
+		}
+	}
 
 	limit := req.Limit
 	if limit <= 0 {
@@ -299,6 +304,9 @@ func (h *handlers) handleGetPeerDialogs(r *mtproto.Request) (bin.Encoder, error)
 		}
 		seen[key] = true
 		peers = append(peers, key)
+	}
+	if err := h.checkChannelUnreadCountRateLimit(r); err != nil {
+		return nil, err
 	}
 
 	snapshot, err := h.store.PeerDialogsSnapshot(r.Ctx, r.UserID, peers)

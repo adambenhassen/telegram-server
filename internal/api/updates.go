@@ -894,6 +894,9 @@ func (h *handlers) handleGetState(r *mtproto.Request) (bin.Encoder, error) {
 	if r.UserID == 0 {
 		return nil, errAuthKeyUnreg
 	}
+	if err := h.checkChannelUnreadCountRateLimit(r); err != nil {
+		return nil, err
+	}
 	st, err := h.store.State(r.Ctx, r.UserID)
 	if err != nil {
 		h.log.Error("get state", "user_id", r.UserID, "err", err)
@@ -930,6 +933,9 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	}
 	if r.UserID == 0 {
 		return nil, nil, errAuthKeyUnreg
+	}
+	if err := h.checkChannelUnreadCountRateLimit(r); err != nil {
+		return nil, nil, err
 	}
 	var recovery DialogFilterCapture
 	if c != nil {

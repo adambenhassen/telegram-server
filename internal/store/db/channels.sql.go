@@ -156,6 +156,12 @@ SELECT
     p.join_pts AS member_join_pts,
     COALESCE(read_state.read_max_id, 0)::bigint AS read_inbox_max_id,
     unread.unread_count,
+    unread.entitled AS summary_entitled,
+    unread.status_exists AS summary_status_exists,
+    unread.summary_version,
+    unread.summary_ready,
+    unread.total_live AS summary_total_live,
+    unread.author_live AS summary_author_live,
     cs.pts,
     cs.next_local_id,
     cs.date AS state_date,
@@ -174,20 +180,20 @@ JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
 LEFT JOIN channel_read_state read_state
   ON read_state.channel_id = c.id AND read_state.user_id = p.user_id
-LEFT JOIN LATERAL (
-    SELECT LEAST(
-        count(*) FILTER (WHERE unread_posts.from_id <> p.user_id AND NOT unread_posts.deleted),
-        1000
-    )::int AS unread_count
-    FROM (
-        SELECT cm.local_id, cm.from_id, cm.deleted
-        FROM channel_messages cm
-        WHERE cm.channel_id = c.id
-          AND cm.local_id > COALESCE(read_state.read_max_id, 0)
-        ORDER BY cm.local_id
-        LIMIT 1001
-    ) unread_posts
-) unread ON true
+CROSS JOIN LATERAL (
+    SELECT LEAST(GREATEST(summary.total_live - summary.author_live, 0), 1000)::int AS unread_count,
+           summary.entitled::boolean AS entitled,
+           summary.status_exists::boolean AS status_exists,
+           summary.summary_version::smallint AS summary_version,
+           summary.summary_ready::boolean AS summary_ready,
+           summary.total_live::bigint AS total_live,
+           summary.author_live::bigint AS author_live
+    FROM channel_post_unread_suffix_counts(
+        c.id,
+        p.user_id,
+        COALESCE(read_state.read_max_id, 0)
+    ) AS summary(entitled, status_exists, summary_version, summary_ready, total_live, author_live)
+) AS unread
 LEFT JOIN LATERAL (
     SELECT cm.channel_id, cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date, cm.deleted, cm.random_id, cm.file_id, cm.reply_to_msg_id, cm.action_type
     FROM channel_messages cm
@@ -215,6 +221,12 @@ type ChannelDialogsForUserRow struct {
 	MemberJoinPts       int64
 	ReadInboxMaxID      int64
 	UnreadCount         int32
+	SummaryEntitled     bool
+	SummaryStatusExists bool
+	SummaryVersion      int16
+	SummaryReady        bool
+	SummaryTotalLive    int64
+	SummaryAuthorLive   int64
 	Pts                 int64
 	NextLocalID         int64
 	StateDate           pgtype.Timestamptz
@@ -261,6 +273,12 @@ func (q *Queries) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Ch
 			&i.MemberJoinPts,
 			&i.ReadInboxMaxID,
 			&i.UnreadCount,
+			&i.SummaryEntitled,
+			&i.SummaryStatusExists,
+			&i.SummaryVersion,
+			&i.SummaryReady,
+			&i.SummaryTotalLive,
+			&i.SummaryAuthorLive,
 			&i.Pts,
 			&i.NextLocalID,
 			&i.StateDate,
@@ -608,27 +626,22 @@ func (q *Queries) ChannelPostDefaults(ctx context.Context, id int64) (ChannelPos
 
 const channelReadStateForViewer = `-- name: ChannelReadStateForViewer :one
 SELECT COALESCE(read_state.read_max_id, 0)::bigint AS read_max_id,
-       (
-           SELECT LEAST(
-               count(*) FILTER (
-                   WHERE unread_posts.from_id <> participant.user_id
-                     AND NOT unread_posts.deleted
-               ),
-               1000
-           )::int
-           FROM (
-               SELECT cm.local_id, cm.from_id, cm.deleted
-               FROM channel_messages cm
-               WHERE cm.channel_id = participant.channel_id
-                 AND cm.local_id > COALESCE(read_state.read_max_id, 0)
-               ORDER BY cm.local_id
-               LIMIT 1001
-           ) unread_posts
-       ) AS unread_count
+       LEAST(GREATEST(unread.total_live - unread.author_live, 0), 1000)::int AS unread_count,
+       unread.entitled::boolean AS summary_entitled,
+       unread.status_exists::boolean AS summary_status_exists,
+       unread.summary_version::smallint,
+       unread.summary_ready::boolean,
+       unread.total_live::bigint AS summary_total_live,
+       unread.author_live::bigint AS summary_author_live
 FROM channel_participants participant
 LEFT JOIN channel_read_state read_state
   ON read_state.channel_id = participant.channel_id
  AND read_state.user_id = participant.user_id
+CROSS JOIN LATERAL channel_post_unread_suffix_counts(
+    participant.channel_id,
+    participant.user_id,
+    COALESCE(read_state.read_max_id, 0)
+) AS unread(entitled, status_exists, summary_version, summary_ready, total_live, author_live)
 WHERE participant.channel_id = $1::bigint
   AND participant.user_id = $2::bigint
   AND (participant.banned_until IS NULL OR participant.banned_until <= now())
@@ -640,16 +653,31 @@ type ChannelReadStateForViewerParams struct {
 }
 
 type ChannelReadStateForViewerRow struct {
-	ReadMaxID   int64
-	UnreadCount int32
+	ReadMaxID            int64
+	UnreadCount          int32
+	SummaryEntitled      bool
+	SummaryStatusExists  bool
+	UnreadSummaryVersion int16
+	UnreadSummaryReady   bool
+	SummaryTotalLive     int64
+	SummaryAuthorLive    int64
 }
 
 // ChannelReadStateForViewer returns only the entitled member's read state and
-// unread live posts. The inner LIMIT bounds rows scanned before unread filters.
+// exact unread count from the bounded summary suffix lookup.
 func (q *Queries) ChannelReadStateForViewer(ctx context.Context, arg ChannelReadStateForViewerParams) (ChannelReadStateForViewerRow, error) {
 	row := q.db.QueryRow(ctx, channelReadStateForViewer, arg.ChannelID, arg.UserID)
 	var i ChannelReadStateForViewerRow
-	err := row.Scan(&i.ReadMaxID, &i.UnreadCount)
+	err := row.Scan(
+		&i.ReadMaxID,
+		&i.UnreadCount,
+		&i.SummaryEntitled,
+		&i.SummaryStatusExists,
+		&i.UnreadSummaryVersion,
+		&i.UnreadSummaryReady,
+		&i.SummaryTotalLive,
+		&i.SummaryAuthorLive,
+	)
 	return i, err
 }
 

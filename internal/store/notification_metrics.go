@@ -18,7 +18,7 @@ const (
 	pushOutcomeCount            = 4
 	pushLatencyFiniteBuckets    = 15
 	pushLatencyBucketCount      = pushLatencyFiniteBuckets + 1
-	rateLimitDenialSurfaceCount = 21 // twenty fixed surfaces plus dropped
+	rateLimitDenialSurfaceCount = 22 // twenty-one fixed surfaces plus dropped
 	rateLimitDenialDroppedIndex = rateLimitDenialSurfaceCount - 1
 )
 
@@ -99,6 +99,7 @@ type RateLimitDenialSurfaceCounts struct {
 	GetPassword               int64
 	UpdateProfile             int64
 	DialogFilterMutation      int64
+	ChannelUnreadCount        int64
 }
 
 // PushOutcomeCounts holds one count for every possible result of an attempted
@@ -454,6 +455,7 @@ func (m *NotificationMetrics) Snapshot() NotificationMetricsSnapshot {
 				GetPassword:               rateLimitDenials[17],
 				UpdateProfile:             rateLimitDenials[18],
 				DialogFilterMutation:      rateLimitDenials[19],
+				ChannelUnreadCount:        rateLimitDenials[20],
 			},
 			Dropped: rateLimitDenials[rateLimitDenialDroppedIndex],
 		},
@@ -639,6 +641,8 @@ func rateLimitDenialSurfaceIndex(surface string) int {
 		return 18
 	case "dialog_filter_mutation":
 		return 19
+	case "channel_unread_count":
+		return 20
 	default:
 		return -1
 	}

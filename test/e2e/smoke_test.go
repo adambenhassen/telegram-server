@@ -1371,7 +1371,7 @@ func testSmokeChannel(t *testing.T) {
 			t.Fatalf("%s channel read state: %v", client.label, err)
 		}
 	}
-	checkChannelReadState(subscriber, 0, 2)
+	checkChannelReadState(subscriber, 1, 2)
 
 	secondPostID := postIDs[posts[1]]
 	if err := subscriber.call(f.ctx, func(ctx context.Context, api *tg.Client) error {

@@ -11,10 +11,10 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestChannelsReadHistoryAdvancesMonotonicallyAndPersists(t *testing.T) {
@@ -55,11 +55,12 @@ func TestChannelsReadHistoryAdvancesMonotonicallyAndPersists(t *testing.T) {
 		t.Fatalf("creator events before read: %v", err)
 	}
 	creatorReadMarker := readChannelMarker(t, ctx, dsn, channel.ID, creator.ID)
+	readerReadMarker := readChannelMarker(t, ctx, dsn, channel.ID, reader.ID)
 	channelExec(t, ctx, dsn, `DELETE FROM update_state WHERE user_id = $1`, reader.ID)
 	h := fullChannelDispatcher(s)
 
-	requireChannelReadState(t, s, reader.ID, channel.ID, 0, 2)
-	requirePeerChannelReadState(t, s, reader.ID, channel.ID, 0, 2)
+	requireChannelReadState(t, s, reader.ID, channel.ID, readerReadMarker, 2)
+	requirePeerChannelReadState(t, s, reader.ID, channel.ID, readerReadMarker, 2)
 	requireChannelOwnerUnreadTotal(t, s, reader.ID, channel.ID, 3)
 
 	readerState, err := s.State(ctx, reader.ID)
@@ -212,25 +213,25 @@ func TestChannelsReadHistoryIsScopedToMemberAndChannel(t *testing.T) {
 	assertScopedReadStates := func(wantReaderFirstMarker int64, wantReaderFirstUnread int, wantReaderSecondMarker int64, wantReaderSecondUnread int) {
 		t.Helper()
 		requireChannelReadState(t, s, reader.ID, firstChannel.ID, wantReaderFirstMarker, wantReaderFirstUnread)
-		requireChannelReadState(t, s, otherReader.ID, firstChannel.ID, 0, 2)
+		requireChannelReadState(t, s, otherReader.ID, firstChannel.ID, 1, 2)
 		requireChannelReadState(t, s, reader.ID, secondChannel.ID, wantReaderSecondMarker, wantReaderSecondUnread)
-		requireChannelReadState(t, s, otherReader.ID, secondChannel.ID, 0, 1)
+		requireChannelReadState(t, s, otherReader.ID, secondChannel.ID, 1, 1)
 	}
-	assertScopedReadStates(0, 2, 0, 1)
+	assertScopedReadStates(1, 2, 1, 1)
 
 	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, firstChannel.ID), int(firstPost.LocalID)); rpc != nil || !ok {
 		t.Fatalf("partial first-channel read: ok=%v rpc=%v", ok, rpc)
 	}
-	assertScopedReadStates(firstPost.LocalID, 1, 0, 1)
+	assertScopedReadStates(firstPost.LocalID, 1, 1, 1)
 
 	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, firstChannel.ID), int(secondPost.LocalID)); rpc != nil || !ok {
 		t.Fatalf("full first-channel read: ok=%v rpc=%v", ok, rpc)
 	}
-	assertScopedReadStates(secondPost.LocalID, 0, 0, 1)
+	assertScopedReadStates(secondPost.LocalID, 0, 1, 1)
 	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, firstChannel.ID), int(firstPost.LocalID)); rpc != nil || !ok {
 		t.Fatalf("lower repeated first-channel read: ok=%v rpc=%v", ok, rpc)
 	}
-	assertScopedReadStates(secondPost.LocalID, 0, 0, 1)
+	assertScopedReadStates(secondPost.LocalID, 0, 1, 1)
 
 	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, secondChannel.ID), int(otherChannelPost.LocalID)); rpc != nil || !ok {
 		t.Fatalf("full second-channel read: ok=%v rpc=%v", ok, rpc)
@@ -238,7 +239,7 @@ func TestChannelsReadHistoryIsScopedToMemberAndChannel(t *testing.T) {
 	assertScopedReadStates(secondPost.LocalID, 0, otherChannelPost.LocalID, 0)
 }
 
-func TestChannelUnreadCountsBoundScanBeforeFiltering(t *testing.T) {
+func TestChannelUnreadCountsStayExactWithLongExcludedRuns(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, dsn := openStoreDSN(t)
@@ -253,42 +254,50 @@ func TestChannelUnreadCountsBoundScanBeforeFiltering(t *testing.T) {
 	if _, _, err := s.JoinChannelByInvite(ctx, invite, reader.ID); err != nil {
 		t.Fatalf("join reader: %v", err)
 	}
+	selfPostInvite, err := s.CreateChannelInvite(ctx, selfPostChannel.ID, creator.ID)
+	if err != nil {
+		t.Fatalf("create self-post channel invite: %v", err)
+	}
+	if _, _, err := s.JoinChannelByInvite(ctx, selfPostInvite, reader.ID); err != nil {
+		t.Fatalf("join reader to self-post channel: %v", err)
+	}
 	channelExec(t, ctx, dsn, `
 INSERT INTO channel_messages (channel_id, local_id, from_id, message, deleted)
 SELECT $1::bigint, local_id::bigint, $2::bigint, 'deleted history', true
-FROM generate_series(1, 1002) local_id`, deletedChannel.ID, creator.ID)
+FROM generate_series(2, 1003) local_id`, deletedChannel.ID, creator.ID)
 	channelExec(t, ctx, dsn, `
 INSERT INTO channel_messages (channel_id, local_id, from_id, message)
-VALUES ($1, 1003, $2, 'live post beyond the bounded scan')`, deletedChannel.ID, creator.ID)
+VALUES ($1, 1004, $2, 'live post after deleted run')`, deletedChannel.ID, creator.ID)
 	channelExec(t, ctx, dsn, `
 INSERT INTO channel_messages (channel_id, local_id, from_id, message)
 SELECT $1::bigint, local_id::bigint, $2::bigint, 'own history'
-FROM generate_series(1, 1002) local_id`, selfPostChannel.ID, creator.ID)
+FROM generate_series(2, 1003) local_id`, selfPostChannel.ID, creator.ID)
 	channelExec(t, ctx, dsn, `
 INSERT INTO channel_messages (channel_id, local_id, from_id, message)
-VALUES ($1, 1003, $2, 'live post beyond the bounded scan')`, selfPostChannel.ID, reader.ID)
+VALUES ($1, 1004, $2, 'live post after own-post run')`, selfPostChannel.ID, reader.ID)
 
 	for _, tc := range []struct {
 		name      string
 		channelID int64
 		viewerID  int64
+		markerID  int64
+		total     int
 	}{
-		{name: "deleted posts", channelID: deletedChannel.ID, viewerID: reader.ID},
-		{name: "own posts", channelID: selfPostChannel.ID, viewerID: creator.ID},
+		{name: "deleted posts", channelID: deletedChannel.ID, viewerID: reader.ID, markerID: 1, total: 1001},
+		{name: "own posts", channelID: selfPostChannel.ID, viewerID: creator.ID, total: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// More than 1001 non-counting rows consume the scan window before
-			// the live post. Unread filters must not scan farther into history.
-			requireChannelReadState(t, s, tc.viewerID, tc.channelID, 0, 0)
-			requirePeerChannelReadState(t, s, tc.viewerID, tc.channelID, 0, 0)
-			requireChannelOwnerUnreadTotal(t, s, tc.viewerID, tc.channelID, 0)
+			// The live post follows 1,002 excluded rows, beyond the old scan cap.
+			requireChannelReadState(t, s, tc.viewerID, tc.channelID, tc.markerID, 1)
+			requirePeerChannelReadState(t, s, tc.viewerID, tc.channelID, tc.markerID, 1)
+			requireChannelOwnerUnreadTotal(t, s, tc.viewerID, tc.channelID, tc.total)
 			fullResponse, rpc := getFullChannelViaDispatcher(t, fullChannelDispatcher(s), tc.viewerID, false, api.InputChannel(tc.viewerID, tc.channelID))
 			if rpc != nil {
 				t.Fatalf("reader getFullChannel: %d %s", rpc.ErrorCode, rpc.ErrorMessage)
 			}
 			full := fullChannelInfo(t, fullResponse)
-			if full.ReadInboxMaxID != 0 || full.UnreadCount != 0 {
-				t.Fatalf("full channel read state = marker %d unread %d, want 0/0 for bounded scan", full.ReadInboxMaxID, full.UnreadCount)
+			if int64(full.ReadInboxMaxID) != tc.markerID || full.UnreadCount != 1 {
+				t.Fatalf("full channel read state = marker %d unread %d, want %d/1 across long excluded run", full.ReadInboxMaxID, full.UnreadCount, tc.markerID)
 			}
 		})
 	}
@@ -400,18 +409,18 @@ func TestChannelUnreadCountSaturatesAtOneThousand(t *testing.T) {
 	channelExec(t, ctx, dsn, `
 		INSERT INTO channel_messages (channel_id, local_id, from_id, message)
 		SELECT $1, post_id, $2, 'bulk-' || post_id::text
-		FROM generate_series(1, 1002) AS post_id`, channel.ID, creator.ID)
-	channelExec(t, ctx, dsn, `UPDATE channel_state SET pts = 1002, next_local_id = 1003 WHERE channel_id = $1`, channel.ID)
+		FROM generate_series(2, 1003) AS post_id`, channel.ID, creator.ID)
+	channelExec(t, ctx, dsn, `UPDATE channel_state SET pts = 1003, next_local_id = 1004 WHERE channel_id = $1`, channel.ID)
 	channelExec(t, ctx, dsn, `
 		INSERT INTO channel_events (channel_id, pts, type, local_id)
 		SELECT $1, post_id, 1, post_id
-		FROM generate_series(1, 1002) AS post_id`, channel.ID)
-	requireChannelReadState(t, s, reader.ID, channel.ID, 0, 1000)
-	requirePeerChannelReadState(t, s, reader.ID, channel.ID, 0, 1000)
-	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, channel.ID), 1000); rpc != nil || !ok {
+		FROM generate_series(2, 1003) AS post_id`, channel.ID)
+	requireChannelReadState(t, s, reader.ID, channel.ID, 1, 1000)
+	requirePeerChannelReadState(t, s, reader.ID, channel.ID, 1, 1000)
+	if ok, rpc := channelsReadHistoryViaDispatcher(t, fullChannelDispatcher(s), reader.ID, false, api.InputChannel(reader.ID, channel.ID), 1001); rpc != nil || !ok {
 		t.Fatalf("partial capped read: ok=%v rpc=%v", ok, rpc)
 	}
-	requireChannelReadState(t, s, reader.ID, channel.ID, 1000, 2)
+	requireChannelReadState(t, s, reader.ID, channel.ID, 1001, 2)
 }
 
 func TestChannelsReadHistoryRefusesUnauthorizedReaders(t *testing.T) {
@@ -468,18 +477,22 @@ func TestChannelsReadHistoryRefusesUnauthorizedReaders(t *testing.T) {
 		{name: "provisional", userID: member.ID, input: validMemberInput, provisional: true, want: "AUTH_KEY_UNREGISTERED"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var markerBefore int64
+			if tc.userID != 0 {
+				markerBefore = readChannelMarker(t, ctx, dsn, channel.ID, tc.userID)
+			}
 			ok, rpc := channelsReadHistoryViaDispatcher(t, h, tc.userID, tc.provisional, tc.input, 1)
 			if ok || rpc == nil || rpc.ErrorMessage != tc.want {
 				t.Fatalf("channels.readHistory = ok:%v rpc:%v, want %s", ok, rpc, tc.want)
 			}
 			if tc.userID != 0 {
-				if got := readChannelMarker(t, ctx, dsn, channel.ID, tc.userID); got != 0 {
-					t.Errorf("refused request changed caller marker to %d", got)
+				if got := readChannelMarker(t, ctx, dsn, channel.ID, tc.userID); got != markerBefore {
+					t.Errorf("refused request changed caller marker from %d to %d", markerBefore, got)
 				}
 			}
 		})
 	}
-	requireChannelReadState(t, s, member.ID, channel.ID, 0, 1)
+	requireChannelReadState(t, s, member.ID, channel.ID, 1, 1)
 	channelPtsAfter, err := s.ChannelState(ctx, channel.ID)
 	if err != nil {
 		t.Fatalf("channel state after refused reads: %v", err)

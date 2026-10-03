@@ -134,6 +134,20 @@ func (s *Store) PeerDialogsSnapshot(ctx context.Context, ownerID int64, peers []
 		return PeerDialogsSnapshot{}, fmt.Errorf("peer channel dialogs: %w", err)
 	}
 	for _, row := range channelRows {
+		exactUnread, err := channelPostUnreadSummaryCount(
+			row.SummaryEntitled,
+			row.SummaryStatusExists,
+			row.SummaryVersion,
+			row.SummaryReady,
+			row.SummaryTotalLive,
+			row.SummaryAuthorLive,
+		)
+		if err != nil {
+			return PeerDialogsSnapshot{}, fmt.Errorf("peer channel %d unread summary: %w", row.ChannelID, err)
+		}
+		if int64(row.UnreadCount) != int64(saturatedChannelPostUnreadCount(exactUnread)) {
+			return PeerDialogsSnapshot{}, fmt.Errorf("%w: peer channel %d unread count disagrees with summary", ErrChannelPostSummaryCorrupt, row.ChannelID)
+		}
 		channel := channelFromPeerDialogRow(row)
 		member := channelMemberFromPeerDialogRow(row, ownerID)
 		post := channelMessageFromPeerDialogRow(row)
@@ -239,7 +253,10 @@ func (s *Store) PeerDialogsSnapshot(ctx context.Context, ownerID int64, peers []
 	if err != nil {
 		return PeerDialogsSnapshot{}, fmt.Errorf("peer dialog unread count: %w", err)
 	}
-	snapshot.State.UnreadCount = int(unread)
+	snapshot.State.UnreadCount, err = channelOwnerUnreadCount(unread)
+	if err != nil {
+		return PeerDialogsSnapshot{}, fmt.Errorf("peer dialog unread count: %w", err)
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return PeerDialogsSnapshot{}, fmt.Errorf("commit peer dialogs snapshot: %w", err)

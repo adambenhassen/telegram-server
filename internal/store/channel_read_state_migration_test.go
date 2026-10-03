@@ -10,11 +10,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
-const channelReadStateMigration = "20261002000048_channel_read_state.sql"
+const channelReadStateMigration = "20261003000051_channel_post_summaries.sql"
 
 func TestChannelReadStateMigrationInitializesFreshSchema(t *testing.T) {
 	t.Parallel()

@@ -79,8 +79,8 @@ func (s *Store) EnsureUpdateState(ctx context.Context, userID int64) error {
 	return nil
 }
 
-func (s *Store) readState(ctx context.Context, userID int64) (State, bool, error) {
-	row, err := s.q.GetState(ctx, userID)
+func readState(ctx context.Context, q *db.Queries, userID int64) (State, bool, error) {
+	row, err := q.GetState(ctx, userID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return State{}, false, nil
 	}
@@ -99,31 +99,41 @@ func (s *Store) readState(ctx context.Context, userID int64) (State, bool, error
 // the account's dialogs. Live update pushes do not serialize unread totals and
 // use this read to avoid account-wide aggregation during fan-out.
 func (s *Store) StateWithoutUnread(ctx context.Context, userID int64) (State, error) {
-	state, _, err := s.readState(ctx, userID)
+	state, _, err := readState(ctx, s.q, userID)
 	if err != nil {
 		return State{}, err
 	}
 	return state, nil
 }
 
-// State returns the user's current pts/seq/date and total unread count. A user
-// with no update_state row reports the zero update state without summing dialogs.
+// State returns the user's current pts/seq/date and total unread count from one
+// snapshot. A user with no update_state row keeps the zero update state while
+// the dialog total is still calculated.
 func (s *Store) State(ctx context.Context, userID int64) (State, error) {
-	state, exists, err := s.readState(ctx, userID)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return State{}, fmt.Errorf("begin update state snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+	state, _, err := readState(ctx, qtx, userID)
 	if err != nil {
 		return State{}, err
 	}
-	if !exists {
-		return State{}, nil
-	}
-	var unread int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(SUM(unread_count), 0) FROM dialogs WHERE owner_id = $1`,
-		userID,
-	).Scan(&unread); err != nil {
+	unread, err := qtx.UnreadCountForOwner(ctx, userID)
+	if err != nil {
 		return State{}, fmt.Errorf("sum unread: %w", err)
 	}
-	state.UnreadCount = unread
+	state.UnreadCount, err = channelOwnerUnreadCount(unread)
+	if err != nil {
+		return State{}, fmt.Errorf("sum unread: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return State{}, fmt.Errorf("commit update state snapshot: %w", err)
+	}
 	return state, nil
 }
 

@@ -82,6 +82,47 @@ func (s *Store) ValidateChannelPostSummariesReady(ctx context.Context) error {
 	return nil
 }
 
+func channelPostUnreadSummaryCount(
+	entitled, statusExists bool,
+	version int16,
+	ready bool,
+	totalLive, authorLive int64,
+) (int64, error) {
+	if !entitled {
+		return 0, ErrNotMember
+	}
+	if !statusExists {
+		return 0, ErrChannelPostSummaryMissing
+	}
+	if version != 1 {
+		return 0, ErrChannelPostSummaryWrongVersion
+	}
+	if !ready {
+		return 0, ErrChannelPostSummaryNotReady
+	}
+	if totalLive < authorLive {
+		return 0, fmt.Errorf("%w: author suffix exceeds total suffix", ErrChannelPostSummaryCorrupt)
+	}
+	return totalLive - authorLive, nil
+}
+
+func channelOwnerUnreadCount(row db.UnreadCountForOwnerRow) (int, error) {
+	if row.UnavailableChannelCount != 0 {
+		return 0, fmt.Errorf("%w: %d channel summaries unavailable", ErrChannelPostSummaryNotReady, row.UnavailableChannelCount)
+	}
+	if row.CorruptChannelCount != 0 {
+		return 0, fmt.Errorf("%w: %d channel summaries inconsistent", ErrChannelPostSummaryCorrupt, row.CorruptChannelCount)
+	}
+	return int(row.UnreadCount), nil
+}
+
+func saturatedChannelPostUnreadCount(count int64) int {
+	if count > 1000 {
+		return 1000
+	}
+	return int(count)
+}
+
 // InitializeChannelPostSummaries rebuilds only derived nodes and readiness for
 // one channel. The committed not-ready phase makes a failed rebuild unavailable
 // until a later retry succeeds; writers continue to commit source rows and skip
@@ -166,25 +207,21 @@ func (s *Store) ChannelPostUnreadCount(ctx context.Context, channelID, viewerID,
 	if err != nil {
 		return 0, fmt.Errorf("count channel post unread suffix: %w", err)
 	}
-	if !row.Entitled {
-		return 0, ErrNotMember
-	}
-	if !row.StatusExists {
-		return 0, ErrChannelPostSummaryMissing
-	}
-	if row.Version != 1 {
-		return 0, ErrChannelPostSummaryWrongVersion
-	}
-	if !row.Ready {
-		return 0, ErrChannelPostSummaryNotReady
-	}
-	if row.TotalLive < row.AuthorLive {
-		return 0, fmt.Errorf("%w: author suffix exceeds total suffix", ErrChannelPostSummaryCorrupt)
+	unread, err := channelPostUnreadSummaryCount(
+		row.Entitled,
+		row.StatusExists,
+		row.Version,
+		row.Ready,
+		row.TotalLive,
+		row.AuthorLive,
+	)
+	if err != nil {
+		return 0, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit channel post unread snapshot: %w", err)
 	}
-	return row.TotalLive - row.AuthorLive, nil
+	return unread, nil
 }
 
 // ChannelReadMarker returns zero for a current member whose existing marker

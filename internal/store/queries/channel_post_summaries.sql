@@ -1,7 +1,8 @@
 -- name: ChannelPostSummarySchemaInstalled :one
 SELECT to_regclass('public.channel_read_state') IS NOT NULL
    AND to_regclass('public.channel_post_summary_state') IS NOT NULL
-   AND to_regclass('public.channel_post_summaries') IS NOT NULL;
+   AND to_regclass('public.channel_post_summaries') IS NOT NULL
+   AND to_regprocedure('public.channel_post_unread_suffix_counts(bigint,bigint,bigint)') IS NOT NULL;
 
 -- name: ChannelPostSummaryReadinessByChannel :one
 SELECT version, ready
@@ -39,58 +40,17 @@ SELECT initialize_channel_post_summaries($1);
 -- Each suffix has at most 63 keys, so the two correlated PK lookups are bounded
 -- at 126 equality probes and do not visit channel_messages.
 -- name: ChannelPostUnreadSuffixCounts :one
-WITH member AS MATERIALIZED (
-    SELECT participant.user_id
-    FROM channel_participants AS participant
-    WHERE participant.channel_id = sqlc.arg(channel_id)::bigint
-      AND participant.user_id = sqlc.arg(viewer_id)::bigint
-      AND (participant.banned_until IS NULL OR participant.banned_until <= now())
-), summary_state AS MATERIALIZED (
-    SELECT state.version, state.ready
-    FROM channel_post_summary_state AS state
-    WHERE state.channel_id = sqlc.arg(channel_id)::bigint
-), suffix_keys AS MATERIALIZED (
-    SELECT 0::smallint AS depth, 0::bigint AS prefix
-    WHERE sqlc.arg(marker)::bigint = 0
-    UNION ALL
-    SELECT bits.depth::smallint AS depth,
-           (((sqlc.arg(marker)::bigint >> (64 - bits.depth)) << 1) | 1)::bigint AS prefix
-    FROM generate_series(1, 63) AS bits(depth)
-    WHERE sqlc.arg(marker)::bigint > 0
-      AND ((sqlc.arg(marker)::bigint >> (63 - bits.depth)) & 1) = 0
-)
-SELECT EXISTS (SELECT 1 FROM member) AS entitled,
-       EXISTS (SELECT 1 FROM summary_state) AS status_exists,
-       COALESCE((SELECT version FROM summary_state), 0)::smallint AS version,
-       COALESCE((SELECT ready FROM summary_state), false)::boolean AS ready,
-       COALESCE((
-           SELECT sum((
-               SELECT summary.live_count
-               FROM channel_post_summaries AS summary
-               WHERE summary.channel_id = sqlc.arg(channel_id)::bigint
-                 AND summary.scope_kind = 0
-                 AND summary.author_id = 0
-                 AND summary.depth = suffix_key.depth
-                 AND summary.prefix = suffix_key.prefix
-           ))::bigint
-           FROM suffix_keys AS suffix_key
-           WHERE EXISTS (SELECT 1 FROM member)
-             AND EXISTS (SELECT 1 FROM summary_state WHERE version = 1 AND ready)
-       ), 0)::bigint AS total_live,
-       COALESCE((
-           SELECT sum((
-               SELECT summary.live_count
-               FROM channel_post_summaries AS summary
-               WHERE summary.channel_id = sqlc.arg(channel_id)::bigint
-                 AND summary.scope_kind = 1
-                 AND summary.author_id = member.user_id
-                 AND summary.depth = suffix_key.depth
-                 AND summary.prefix = suffix_key.prefix
-           ))::bigint
-           FROM member
-           CROSS JOIN suffix_keys AS suffix_key
-           WHERE EXISTS (SELECT 1 FROM summary_state WHERE version = 1 AND ready)
-       ), 0)::bigint AS author_live;
+SELECT summary.entitled::boolean AS entitled,
+       summary.status_exists::boolean AS status_exists,
+       summary.summary_version::smallint AS version,
+       summary.summary_ready::boolean AS ready,
+       summary.total_live::bigint AS total_live,
+       summary.author_live::bigint AS author_live
+FROM channel_post_unread_suffix_counts(
+    sqlc.arg(channel_id)::bigint,
+    sqlc.arg(viewer_id)::bigint,
+    sqlc.arg(marker)::bigint
+) AS summary(entitled, status_exists, summary_version, summary_ready, total_live, author_live);
 
 -- name: ChannelReadMarkerForMember :one
 SELECT COALESCE(read_state.read_max_id, 0)::bigint AS read_max_id

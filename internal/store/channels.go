@@ -1286,6 +1286,20 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 	}
 	out := make([]ChannelDialogRow, len(rows))
 	for i, r := range rows {
+		exactUnread, err := channelPostUnreadSummaryCount(
+			r.SummaryEntitled,
+			r.SummaryStatusExists,
+			r.SummaryVersion,
+			r.SummaryReady,
+			r.SummaryTotalLive,
+			r.SummaryAuthorLive,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("channel %d unread summary: %w", r.ChannelID, err)
+		}
+		if int64(r.UnreadCount) != int64(saturatedChannelPostUnreadCount(exactUnread)) {
+			return nil, fmt.Errorf("%w: channel %d unread count disagrees with summary", ErrChannelPostSummaryCorrupt, r.ChannelID)
+		}
 		ch := Channel{
 			ID:                  r.ChannelID,
 			Title:               r.Title,

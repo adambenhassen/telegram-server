@@ -74,6 +74,9 @@ type handlers struct {
 	// search reads every dialog the caller is in, so one call is not the same
 	// unit of work as a search inside a named peer.
 	rateLimitSearchGlobal store.RateLimitConfig
+	// rateLimitChannelUnreadCounts bounds repeated explicit summary aggregation
+	// across all sessions for one account. Live push hydration does not use it.
+	rateLimitChannelUnreadCounts store.RateLimitConfig
 	// rateLimitSaveFilePart limits upload.saveFilePart and upload.saveBigFilePart
 	// to one shared budget per account: both write the same parts table.
 	rateLimitSaveFilePart store.RateLimitConfig
@@ -208,41 +211,42 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 		langpackSnapshot = s.CatalogSnapshot()
 	}
 	h := &handlers{
-		peers:                    peers,
-		store:                    s,
-		langpack:                 newLangpackService(langpackSnapshot, dcID),
-		cfg:                      cfg,
-		dcID:                     dcID,
-		log:                      log,
-		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
-		now:                      time.Now,
-		logLoginCodes:            logLoginCodes,
-		maxFileBytes:             maxFileBytes,
-		blobs:                    blobs,
-		maxUserStorageBytes:      maxUserStorageBytes,
-		downloads:                map[int64]bool{},
-		rateLimitMessageSend:     rateLimits.MessageSend,
-		rateLimitCreateChat:      rateLimits.CreateChat,
-		rateLimitAddChatUser:     rateLimits.AddChatUser,
-		rateLimitCreateChannel:   rateLimits.CreateChannel,
-		rateLimitSearchMessages:  rateLimits.SearchMessages,
-		rateLimitSearchContacts:  rateLimits.SearchContacts,
-		rateLimitSearchGlobal:    rateLimits.SearchGlobal,
-		rateLimitSaveFilePart:    rateLimits.SaveFilePart,
-		rateLimitGetFile:         rateLimits.GetFile,
-		getFileReplicaLimiter:    newDownloadRateLimiter(rateLimits.GetFileReplica),
-		rateLimitSendCodeIP:      rateLimits.SendCodeIP,
-		rateLimitSignInFailIP:    rateLimits.SignInFailIP,
-		rateLimitCheckPassword:   rateLimits.CheckPassword,
-		rateLimitCheckPasswordIP: rateLimits.CheckPasswordIP,
-		rateLimitGetPasswordIP:   rateLimits.GetPasswordIP,
-		rateLimitSignUpIP:        rateLimits.SignUpIP,
-		rateLimitPasswordProof:   rateLimits.PasswordProof,
-		rateLimitGetPassword:     rateLimits.GetPassword,
-		rateLimitUpdateProfile:   rateLimits.UpdateProfile,
-		registrationMode:         registrationMode,
-		rateLimitMetrics:         denialMetrics,
-		dialogFilterSync:         dialogFilterSync,
+		peers:                        peers,
+		store:                        s,
+		langpack:                     newLangpackService(langpackSnapshot, dcID),
+		cfg:                          cfg,
+		dcID:                         dcID,
+		log:                          log,
+		srp:                          srp.NewChallengeStore(srp.DefaultTTL),
+		now:                          time.Now,
+		logLoginCodes:                logLoginCodes,
+		maxFileBytes:                 maxFileBytes,
+		blobs:                        blobs,
+		maxUserStorageBytes:          maxUserStorageBytes,
+		downloads:                    map[int64]bool{},
+		rateLimitMessageSend:         rateLimits.MessageSend,
+		rateLimitCreateChat:          rateLimits.CreateChat,
+		rateLimitAddChatUser:         rateLimits.AddChatUser,
+		rateLimitCreateChannel:       rateLimits.CreateChannel,
+		rateLimitSearchMessages:      rateLimits.SearchMessages,
+		rateLimitSearchContacts:      rateLimits.SearchContacts,
+		rateLimitSearchGlobal:        rateLimits.SearchGlobal,
+		rateLimitChannelUnreadCounts: channelUnreadCountRateLimit,
+		rateLimitSaveFilePart:        rateLimits.SaveFilePart,
+		rateLimitGetFile:             rateLimits.GetFile,
+		getFileReplicaLimiter:        newDownloadRateLimiter(rateLimits.GetFileReplica),
+		rateLimitSendCodeIP:          rateLimits.SendCodeIP,
+		rateLimitSignInFailIP:        rateLimits.SignInFailIP,
+		rateLimitCheckPassword:       rateLimits.CheckPassword,
+		rateLimitCheckPasswordIP:     rateLimits.CheckPasswordIP,
+		rateLimitGetPasswordIP:       rateLimits.GetPasswordIP,
+		rateLimitSignUpIP:            rateLimits.SignUpIP,
+		rateLimitPasswordProof:       rateLimits.PasswordProof,
+		rateLimitGetPassword:         rateLimits.GetPassword,
+		rateLimitUpdateProfile:       rateLimits.UpdateProfile,
+		registrationMode:             registrationMode,
+		rateLimitMetrics:             denialMetrics,
+		dialogFilterSync:             dialogFilterSync,
 	}
 	d := mtproto.NewDispatcher()
 	registerWithConn(d, tg.HelpGetConfigRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, error) {

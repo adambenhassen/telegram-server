@@ -112,6 +112,20 @@ func (s *Store) ChannelFullInfoForViewer(
 		if err != nil {
 			return ChannelFullInfoSnapshot{}, false, fmt.Errorf("select channel viewer read state: %w", err)
 		}
+		exactUnread, err := channelPostUnreadSummaryCount(
+			readState.SummaryEntitled,
+			readState.SummaryStatusExists,
+			readState.UnreadSummaryVersion,
+			readState.UnreadSummaryReady,
+			readState.SummaryTotalLive,
+			readState.SummaryAuthorLive,
+		)
+		if err != nil {
+			return ChannelFullInfoSnapshot{}, false, fmt.Errorf("validate channel viewer unread summary: %w", err)
+		}
+		if int64(readState.UnreadCount) != int64(saturatedChannelPostUnreadCount(exactUnread)) {
+			return ChannelFullInfoSnapshot{}, false, fmt.Errorf("%w: channel unread count disagrees with summary", ErrChannelPostSummaryCorrupt)
+		}
 		snapshot.ReadInboxMaxID = readState.ReadMaxID
 		snapshot.UnreadCount = int(readState.UnreadCount)
 	}
