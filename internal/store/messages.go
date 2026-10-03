@@ -158,6 +158,9 @@ func (s *Store) SendMessage(ctx context.Context, fromID, toID int64, text string
 		return Message{}, 0, 0, false, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	if diagnostic := sendMessageDiagnosticFromContext(ctx); diagnostic != nil {
+		diagnostic.captureBackend(tx.Conn())
+	}
 	qtx := s.q.WithTx(tx)
 
 	// Take the sorted advisory locks before any per-owner insert. Provisioning

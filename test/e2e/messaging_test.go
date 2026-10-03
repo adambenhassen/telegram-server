@@ -265,12 +265,24 @@ func bootServerWithLifecycle(
 	dsn string, log *slog.Logger, ln net.Listener, rateLimits config.RateLimitsConfig, regMode config.RegistrationMode, withStatus bool,
 ) (*mtproto.SessionRegistry, func()) {
 	t.Helper()
+	return bootServerWithLifecycleAndDiagnostics(t, ctx, key, dcID, st, dsn, log, ln, rateLimits, regMode, withStatus, nil)
+}
+
+func bootServerWithLifecycleAndDiagnostics(
+	t *testing.T, ctx context.Context, key *rsa.PrivateKey, dcID int, st *store.Store,
+	dsn string, log *slog.Logger, ln net.Listener, rateLimits config.RateLimitsConfig, regMode config.RegistrationMode,
+	withStatus bool, sendMessageDiagnostic *store.SendMessageDiagnosticForTesting,
+) (*mtproto.SessionRegistry, func()) {
+	t.Helper()
 	tgcfg := fixtureConfigForListener(t, dcID, ln)
 	// Sign-in here reads the code off the log, so the gated line must be on.
 	blobs := testBlobs(t)
 	dialogFilterSync := api.NewDialogFilterSync()
 	handler := api.NewWithDialogFilterSync(st, dcID, tgcfg, log, true, 100<<20, blobs, 2<<30, pgtest.PeerDeriver(), rateLimits, regMode, dialogFilterSync)
 	server := mtproto.New(exchange.PrivateKey{RSA: key}, dcID, mtproto.NewPgAuthKeyStore(st), handler, log)
+	if sendMessageDiagnostic != nil {
+		server.EnableRPCCancelDiagnosticsForTesting(sendMessageDiagnostic)
+	}
 
 	if withStatus {
 		server.OnStatusChange(func(ctx context.Context, userID int64, online bool) {

@@ -1,0 +1,15 @@
+SMOKE_SCENARIOS=(
+  one-to-one
+  shared-media-search
+  saved-messages
+  default-dialog-filter
+  dialog-filters
+  basic-group
+  channel
+  megagroup-slow-mode
+  contacts-search
+  username-registration
+  username-password-reset
+  admin-proxy-login
+  peer-disconnect
+)

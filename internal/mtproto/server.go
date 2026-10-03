@@ -26,6 +26,8 @@ import (
 	"github.com/gotd/td/proto/codec"
 	"github.com/gotd/td/tdsync"
 	"github.com/gotd/td/transport"
+
+	"github.com/adambenhassen/telegram-server/internal/store"
 )
 
 const (
@@ -166,7 +168,8 @@ type Server struct {
 	pendingLoginCapLog     logSampler
 	pendingLoginCeilingLog logSampler
 	// rpcCancelBudget is shared by every connection handled by this replica.
-	rpcCancelBudget *rpcCancelBudget
+	rpcCancelBudget               *rpcCancelBudget
+	rpcCancelDiagnosticForTesting *rpcCancelDiagnosticProviderForTesting
 
 	// onStatusChange fires when a user's connection count transitions between
 	// zero and non-zero. Called after the registry has been updated, so a
@@ -193,6 +196,14 @@ func (s *Server) SetRPCTracer(tracer *RPCTracer) {
 		s.handler = existing.next
 	}
 	s.rpcTracer = tracer
+}
+
+// EnableRPCCancelDiagnosticsForTesting enables fixed in-process peer-cancel
+// observations for servers created by hosted diagnostic tests. backend is a
+// test-owned handle claimed by at most one messages.sendMessage RPC. It must be
+// called before Serve; production servers leave the instrumentation disabled.
+func (s *Server) EnableRPCCancelDiagnosticsForTesting(backend *store.SendMessageDiagnosticForTesting) {
+	s.rpcCancelDiagnosticForTesting = newRPCCancelDiagnosticProviderForTesting(backend)
 }
 
 // TrustProxyV2Headers makes the server take each client address from a PROXY
@@ -603,7 +614,7 @@ func isDisconnect(err error) bool {
 // that was never accepted through a listener.
 func (s *Server) serveConn(ctx context.Context, tconn transport.Conn, clientAddr netip.Addr, slot *preAuthSlot) (rErr error) {
 	conn := newConn(tconn, s.cipher, s.msgID, s.clock, s.writeTimeout, s.log)
-	peerRPC := newPeerRPCState(s.rpcCancelBudget)
+	peerRPC := newPeerRPCStateWithDiagnosticProvider(s.rpcCancelBudget, s.rpcCancelDiagnosticForTesting)
 	conn.peerRPC.Store(peerRPC)
 	stopServerClose := context.AfterFunc(ctx, peerRPC.serverClosed)
 	var reader *rpcFrameReader
