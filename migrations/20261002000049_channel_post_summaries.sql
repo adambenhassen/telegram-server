@@ -145,8 +145,9 @@ EXECUTE FUNCTION channel_post_summary_validate_source_ids();
 
 -- Every contribution mutation first serializes on all affected channel_state
 -- rows in channel-id order, then applies summary-node changes in key order.
--- Separate statements after each lock intentionally read readiness after any
+-- Under READ COMMITTED, statements after each lock read readiness after any
 -- wait, so a writer released by initialization sees its committed ready state.
+-- Higher isolation keeps a stale snapshot across that wait, so reject it.
 CREATE FUNCTION channel_post_summary_maintain_source()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -215,6 +216,11 @@ BEGIN
                 target_channel_id, state_version;
         END IF;
     END LOOP;
+
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'channel post summary mutations require READ COMMITTED isolation (got %)',
+            current_setting('transaction_isolation');
+    END IF;
 
     WITH source_changes (channel_id, local_id, from_id, delta) AS (
         SELECT old_channel_id, old_local_id, old_from_id, -1::BIGINT WHERE old_live

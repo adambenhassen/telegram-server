@@ -3,10 +3,12 @@ package store_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestChannelPostSummarySchemaIsInstalled(t *testing.T) {
@@ -343,12 +345,35 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 	}
 	barrierHeld = true
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
-		`UPDATE channel_post_summary_state SET ready = false WHERE channel_id = $1`, channel.ID); err != nil {
-		t.Fatalf("mark channel unready for race: %v", err)
+		`DELETE FROM channel_post_summary_state WHERE channel_id = $1`, channel.ID); err != nil {
+		t.Fatalf("remove readiness row for race: %v", err)
 	}
 	if err = store.ExecChannelPostSummarySQL(ctx, s,
 		`DELETE FROM channel_post_summaries WHERE channel_id = $1`, channel.ID); err != nil {
 		t.Fatalf("clear derived rows for race: %v", err)
+	}
+
+	staleConn, err := store.ChannelPostSummaryControlConnection(ctx, s)
+	if err != nil {
+		t.Fatalf("open repeatable-read writer connection: %v", err)
+	}
+	defer func() {
+		if closeErr := staleConn.Close(context.Background()); closeErr != nil {
+			t.Errorf("close repeatable-read writer connection: %v", closeErr)
+		}
+	}()
+	staleTx, err := staleConn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatalf("begin repeatable-read writer: %v", err)
+	}
+	var readinessExists bool
+	if err = staleTx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM channel_post_summary_state WHERE channel_id = $1)
+	`, channel.ID).Scan(&readinessExists); err != nil {
+		t.Fatalf("establish stale readiness snapshot: %v", err)
+	}
+	if readinessExists {
+		t.Fatal("repeatable-read writer snapshot unexpectedly sees readiness")
 	}
 
 	initDone := make(chan error, 1)
@@ -366,10 +391,21 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 			VALUES ($1, 3, $2, 'old-binary post during initialization')
 		`, channel.ID, creator.ID)
 	}()
-	if err = store.WaitForLockWaiters(ctx, s, 2); err != nil {
+	repeatablePostDone := make(chan error, 1)
+	go func() {
+		_, writeErr := staleTx.Exec(ctx, `
+			INSERT INTO channel_messages (channel_id, local_id, from_id, message)
+			VALUES ($1, 4, $2, 'repeatable-read post after initialization')
+		`, channel.ID, creator.ID)
+		if writeErr == nil {
+			writeErr = staleTx.Commit(ctx)
+		}
+		repeatablePostDone <- writeErr
+	}()
+	if err = store.WaitForLockWaiters(ctx, s, 3); err != nil {
 		releaseBarrier()
-		initErr, postErr := <-initDone, <-postDone
-		t.Fatalf("wait for old-binary post to serialize behind initialization: %v (initializer %v, post %v)", err, initErr, postErr)
+		initErr, postErr, repeatablePostErr := <-initDone, <-postDone, <-repeatablePostDone
+		t.Fatalf("wait for source writers behind initialization: %v (initializer %v, read committed %v, repeatable read %v)", err, initErr, postErr, repeatablePostErr)
 	}
 	releaseBarrier()
 	if err = <-initDone; err != nil {
@@ -377,6 +413,16 @@ func TestChannelPostSummaryInitializationAndSourceMutationsSerialize(t *testing.
 	}
 	if err = <-postDone; err != nil {
 		t.Fatalf("commit old-binary post after initialization: %v", err)
+	}
+	repeatablePostErr := <-repeatablePostDone
+	if repeatablePostErr == nil {
+		t.Fatal("repeatable-read source mutation committed with a stale readiness snapshot")
+	}
+	if !strings.Contains(repeatablePostErr.Error(), "require READ COMMITTED") {
+		t.Fatalf("repeatable-read source mutation error = %v, want unsupported-isolation refusal", repeatablePostErr)
+	}
+	if err = staleTx.Rollback(ctx); err != nil {
+		t.Fatalf("roll back rejected repeatable-read writer: %v", err)
 	}
 	if got, err := store.ChannelPostSummaryRootCount(ctx, s, channel.ID, 0, 0); err != nil || got != 3 {
 		t.Fatalf("root count after init/post overlap = %d, err %v; want 3", got, err)
