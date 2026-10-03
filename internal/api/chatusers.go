@@ -155,3 +155,46 @@ func (h *handlers) handleDeleteChatUser(r *mtproto.Request) (bin.Encoder, error)
 	}
 	return ups, nil
 }
+
+func (h *handlers) handleEditChatAdmin(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.MessagesEditChatAdminRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	if req.ChatID <= 0 {
+		return nil, errPeerIDInvalid
+	}
+	targetID, err := h.inputUserID(req.UserID, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if _, found, err := h.store.UserByID(r.Ctx, targetID); err != nil {
+		h.log.Error("edit chat admin: resolve target", "chat_id", req.ChatID, "user_id", targetID, "err", err)
+		return nil, errInternal
+	} else if !found {
+		return nil, errUserIDInvalid
+	}
+
+	changed, perOwner, err := h.store.SetChatAdmin(r.Ctx, req.ChatID, targetID, r.UserID, req.IsAdmin)
+	switch {
+	case errors.Is(err, store.ErrNotMember):
+		return nil, errPeerIDInvalid
+	case errors.Is(err, store.ErrChatAdminRequired):
+		return nil, errChatAdminRequired
+	case errors.Is(err, store.ErrChatAdminTargetCreator):
+		return nil, errUserIDInvalid
+	case errors.Is(err, store.ErrChatTargetNotMember):
+		return nil, errUserNotParticipant
+	case err != nil:
+		h.log.Error("edit chat admin", "chat_id", req.ChatID, "user_id", r.UserID, "target_id", targetID, "err", err)
+		return nil, errInternal
+	}
+	if !changed {
+		return &tg.BoolFalse{}, nil
+	}
+	h.notifyOwners(r.Ctx, perOwner, 0)
+	return &tg.BoolTrue{}, nil
+}

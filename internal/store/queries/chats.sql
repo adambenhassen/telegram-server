@@ -31,8 +31,21 @@ ON CONFLICT (chat_id, user_id) DO NOTHING;
 -- name: DeleteChatParticipant :execrows
 DELETE FROM chat_participants WHERE chat_id = $1 AND user_id = $2;
 
+-- name: SetChatParticipantAdmin :execrows
+UPDATE chat_participants SET is_admin = $3 WHERE chat_id = $1 AND user_id = $2;
+
 -- name: BumpChatVersion :one
 UPDATE chats SET version = version + 1 WHERE id = $1 RETURNING *;
+
+-- name: InsertChatAdminEvent :one
+INSERT INTO chat_admin_events (chat_id, user_id, is_admin, version)
+VALUES ($1, $2, $3, $4)
+RETURNING *;
+
+-- name: ChatAdminEventsByIDs :many
+SELECT * FROM chat_admin_events
+WHERE id = ANY(sqlc.arg(event_ids)::bigint[])
+ORDER BY id;
 
 -- name: SetChatTitle :one
 UPDATE chats SET title = $2, version = version + 1 WHERE id = $1 RETURNING *;

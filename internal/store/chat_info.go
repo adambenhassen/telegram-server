@@ -148,7 +148,7 @@ func (s *Store) ChatInfoForMemberSnapshot(ctx context.Context, viewerID int64, c
 	}
 	userIDSet := make(map[int64]struct{}, len(participantRows)*2)
 	for _, row := range participantRows {
-		participant := Participant{UserID: row.UserID, InviterID: row.InviterID, Date: row.Date.Time}
+		participant := Participant{UserID: row.UserID, InviterID: row.InviterID, Date: row.Date.Time, Admin: row.IsAdmin}
 		snapshot.Participants[row.ChatID] = append(snapshot.Participants[row.ChatID], participant)
 		userIDSet[participant.UserID] = struct{}{}
 		userIDSet[participant.InviterID] = struct{}{}

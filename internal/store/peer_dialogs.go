@@ -176,6 +176,7 @@ func (s *Store) PeerDialogsSnapshot(ctx context.Context, ownerID int64, peers []
 			UserID:    row.UserID,
 			InviterID: row.InviterID,
 			Date:      row.Date.Time,
+			Admin:     row.IsAdmin,
 		})
 	}
 	for chatID := range snapshot.Chats {

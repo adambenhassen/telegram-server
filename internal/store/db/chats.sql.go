@@ -28,6 +28,38 @@ func (q *Queries) BumpChatVersion(ctx context.Context, id int64) (Chat, error) {
 	return i, err
 }
 
+const chatAdminEventsByIDs = `-- name: ChatAdminEventsByIDs :many
+SELECT id, chat_id, user_id, is_admin, version FROM chat_admin_events
+WHERE id = ANY($1::bigint[])
+ORDER BY id
+`
+
+func (q *Queries) ChatAdminEventsByIDs(ctx context.Context, eventIds []int64) ([]ChatAdminEvent, error) {
+	rows, err := q.db.Query(ctx, chatAdminEventsByIDs, eventIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChatAdminEvent
+	for rows.Next() {
+		var i ChatAdminEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.ChatID,
+			&i.UserID,
+			&i.IsAdmin,
+			&i.Version,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const chatByID = `-- name: ChatByID :one
 SELECT id, title, creator_id, version, date, pinned_message_id, default_banned_rights FROM chats WHERE id = $1
 `
@@ -104,7 +136,7 @@ func (q *Queries) ChatParticipantCountsByChatIDs(ctx context.Context, chatIds []
 }
 
 const chatParticipants = `-- name: ChatParticipants :many
-SELECT chat_id, user_id, inviter_id, date FROM chat_participants WHERE chat_id = $1 ORDER BY user_id
+SELECT chat_id, user_id, inviter_id, date, is_admin FROM chat_participants WHERE chat_id = $1 ORDER BY user_id
 `
 
 // ChatParticipants is ascending by user_id: the fan-out takes its advisory locks
@@ -123,6 +155,7 @@ func (q *Queries) ChatParticipants(ctx context.Context, chatID int64) ([]ChatPar
 			&i.UserID,
 			&i.InviterID,
 			&i.Date,
+			&i.IsAdmin,
 		); err != nil {
 			return nil, err
 		}
@@ -365,6 +398,37 @@ func (q *Queries) InsertChat(ctx context.Context, arg InsertChatParams) (Chat, e
 	return i, err
 }
 
+const insertChatAdminEvent = `-- name: InsertChatAdminEvent :one
+INSERT INTO chat_admin_events (chat_id, user_id, is_admin, version)
+VALUES ($1, $2, $3, $4)
+RETURNING id, chat_id, user_id, is_admin, version
+`
+
+type InsertChatAdminEventParams struct {
+	ChatID  int64
+	UserID  int64
+	IsAdmin bool
+	Version int32
+}
+
+func (q *Queries) InsertChatAdminEvent(ctx context.Context, arg InsertChatAdminEventParams) (ChatAdminEvent, error) {
+	row := q.db.QueryRow(ctx, insertChatAdminEvent,
+		arg.ChatID,
+		arg.UserID,
+		arg.IsAdmin,
+		arg.Version,
+	)
+	var i ChatAdminEvent
+	err := row.Scan(
+		&i.ID,
+		&i.ChatID,
+		&i.UserID,
+		&i.IsAdmin,
+		&i.Version,
+	)
+	return i, err
+}
+
 const insertChatParticipant = `-- name: InsertChatParticipant :exec
 INSERT INTO chat_participants (chat_id, user_id, inviter_id) VALUES ($1, $2, $3)
 `
@@ -531,6 +595,24 @@ func (q *Queries) SetChatDefaultBannedRights(ctx context.Context, arg SetChatDef
 		&i.DefaultBannedRights,
 	)
 	return i, err
+}
+
+const setChatParticipantAdmin = `-- name: SetChatParticipantAdmin :execrows
+UPDATE chat_participants SET is_admin = $3 WHERE chat_id = $1 AND user_id = $2
+`
+
+type SetChatParticipantAdminParams struct {
+	ChatID  int64
+	UserID  int64
+	IsAdmin bool
+}
+
+func (q *Queries) SetChatParticipantAdmin(ctx context.Context, arg SetChatParticipantAdminParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setChatParticipantAdmin, arg.ChatID, arg.UserID, arg.IsAdmin)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setChatPinnedMessage = `-- name: SetChatPinnedMessage :one

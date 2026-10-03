@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"sort"
 	"time"
 	"unicode/utf8"
@@ -430,6 +431,10 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int, 
 	if err != nil {
 		return updateBatch{}, err
 	}
+	chatAdminEvents, err := h.batchChatAdminEvents(ctx, events)
+	if err != nil {
+		return updateBatch{}, err
+	}
 	rows := make([]store.Message, 0, len(msgs))
 	for _, m := range msgs {
 		rows = append(rows, m)
@@ -443,7 +448,7 @@ func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int, 
 	basicChats := map[int64]bool{}
 	channels := map[int64]bool{}
 	for _, ev := range events {
-		up, refs, chatRefs, channelRefs, uerr := h.eventToUpdate(ctx, userID, ev, msgs, files)
+		up, refs, chatRefs, channelRefs, uerr := h.eventToUpdate(ctx, userID, ev, msgs, files, chatAdminEvents)
 		if uerr != nil {
 			return updateBatch{}, uerr
 		}
@@ -515,12 +520,30 @@ func (h *handlers) batchMessages(ctx context.Context, userID int64, events []sto
 	return msgs, nil
 }
 
+func (h *handlers) batchChatAdminEvents(ctx context.Context, events []store.Event) (map[int64]store.ChatAdminEvent, error) {
+	ids := make([]int64, 0, len(events))
+	for _, ev := range events {
+		if ev.Type == store.EventChatParticipantAdmin {
+			ids = append(ids, ev.LocalID)
+		}
+	}
+	rows, err := h.store.ChatAdminEventsByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int64]store.ChatAdminEvent, len(rows))
+	for _, row := range rows {
+		byID[row.ID] = row
+	}
+	return byID, nil
+}
+
 // eventToUpdate builds the wire update for one event owned by userID, returning
 // the update, the user ids it references, the chat ids (basic chats only) and
 // the channel ids it references. A nil update (message vanished, or an empty
 // read marker) is skipped by the caller.
 // msgs and files are the batch's pre-loaded rows and their media.
-func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Event, msgs map[int64]store.Message, files map[int64]*tg.Document) (tg.UpdateClass, []int64, []int64, []int64, error) {
+func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Event, msgs map[int64]store.Message, files map[int64]*tg.Document, chatAdminEvents map[int64]store.ChatAdminEvent) (tg.UpdateClass, []int64, []int64, []int64, error) {
 	switch ev.Type {
 	case store.EventNewMessage, store.EventEdit:
 		m, ok := msgs[ev.LocalID]
@@ -603,6 +626,18 @@ func (h *handlers) eventToUpdate(ctx context.Context, userID int64, ev store.Eve
 			return &tg.UpdateReadHistoryOutbox{Peer: peer, MaxID: int(ev.LocalID), Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil, nil
 		}
 		return &tg.UpdateReadHistoryInbox{Peer: peer, MaxID: int(ev.LocalID), StillUnreadCount: 0, Pts: ev.Pts, PtsCount: 1}, refs, chatRefs, nil, nil
+
+	case store.EventChatParticipantAdmin:
+		event, ok := chatAdminEvents[ev.LocalID]
+		if !ok {
+			return nil, nil, nil, nil, fmt.Errorf("chat admin event %d is missing", ev.LocalID)
+		}
+		return &tg.UpdateChatParticipantAdmin{
+			ChatID:  event.ChatID,
+			UserID:  event.UserID,
+			IsAdmin: event.IsAdmin,
+			Version: event.Version,
+		}, []int64{event.UserID}, []int64{event.ChatID}, nil, nil
 
 	default:
 		return nil, nil, nil, nil, nil

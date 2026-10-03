@@ -818,6 +818,61 @@ func testSmokeBasicGroup(t *testing.T) {
 		t.Fatalf("create smoke group: %v", err)
 	}
 
+	for _, change := range []struct {
+		isAdmin bool
+		version int
+	}{{true, 2}, {false, 3}} {
+		if err := a.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+			result, err := api.MessagesEditChatAdmin(ctx, &tg.MessagesEditChatAdminRequest{
+				ChatID:  chatID,
+				UserID:  inputUser(a.id, b.id),
+				IsAdmin: change.isAdmin,
+			})
+			if err != nil {
+				return err
+			}
+			if !result {
+				return errors.New("editChatAdmin result is false")
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("set member admin to %t: %v", change.isAdmin, err)
+		}
+		for _, member := range []*smokeClient{a, b, c} {
+			update := recvOrCtx(t, f.ctx, member.push.chatAdmin, "group admin update")
+			if update.ChatID != chatID || update.UserID != b.id || update.IsAdmin != change.isAdmin || update.Version != change.version {
+				t.Fatalf("admin update for member %d = %+v, want chat %d user %d admin %t version %d", member.id, update, chatID, b.id, change.isAdmin, change.version)
+			}
+			if err := member.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+				full, err := api.MessagesGetFullChat(ctx, chatID)
+				if err != nil {
+					return fmt.Errorf("getFullChat: %w", err)
+				}
+				chat, ok := full.FullChat.(*tg.ChatFull)
+				if !ok {
+					return fmt.Errorf("full chat = %T, want *tg.ChatFull", full.FullChat)
+				}
+				participants, ok := chat.Participants.(*tg.ChatParticipants)
+				if !ok {
+					return fmt.Errorf("chat participants = %T, want *tg.ChatParticipants", chat.Participants)
+				}
+				for _, participant := range participants.Participants {
+					if participant.GetUserID() != b.id {
+						continue
+					}
+					_, gotAdmin := participant.(*tg.ChatParticipantAdmin)
+					if gotAdmin != change.isAdmin {
+						return fmt.Errorf("member %d admin = %t, want %t", b.id, gotAdmin, change.isAdmin)
+					}
+					return nil
+				}
+				return fmt.Errorf("getFullChat omitted member %d", b.id)
+			}); err != nil {
+				t.Fatalf("getFullChat for member %d after admin change: %v", member.id, err)
+			}
+		}
+	}
+
 	wantSenders := map[string]int64{
 		"group-a": a.id,
 		"group-b": b.id,
