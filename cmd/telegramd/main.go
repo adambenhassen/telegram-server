@@ -219,7 +219,27 @@ func readAdminPassword(stdin io.Reader) ([]byte, error) {
 }
 
 func runMaintenanceCommand(args []string, log *slog.Logger, _ io.Writer, stderr io.Writer) (err error) {
-	if len(args) != 1 || args[0] != "assign-operator" {
+	var channelSummaryID int64
+	if len(args) == 0 {
+		return maintenanceUsageError()
+	}
+	switch args[0] {
+	case "assign-operator":
+		if len(args) != 1 {
+			return maintenanceUsageError()
+		}
+	case "initialize-channel-post-summaries":
+		if len(args) != 3 {
+			return maintenanceUsageError()
+		}
+		if args[1] != "--channel-id" {
+			return maintenanceUsageError()
+		}
+		channelSummaryID, err = strconv.ParseInt(args[2], 10, 64)
+		if err != nil || channelSummaryID <= 0 {
+			return maintenanceUsageError()
+		}
+	default:
 		return maintenanceUsageError()
 	}
 
@@ -245,6 +265,15 @@ func runMaintenanceCommand(args []string, log *slog.Logger, _ io.Writer, stderr 
 		}
 	}()
 
+	if channelSummaryID > 0 {
+		if err := st.InitializeChannelPostSummaries(ctx, channelSummaryID); err != nil {
+			return fmt.Errorf("initialize channel post summaries: %w", err)
+		}
+		if _, err := fmt.Fprintf(stderr, "Channel post summaries initialized: %d\n", channelSummaryID); err != nil {
+			return fmt.Errorf("write channel post summary confirmation: %w", err)
+		}
+		return nil
+	}
 	if err := st.AssignOperatorServerAdministrator(ctx); err != nil {
 		return fmt.Errorf("assign operator server administrator: %w", err)
 	}
@@ -255,7 +284,7 @@ func runMaintenanceCommand(args []string, log *slog.Logger, _ io.Writer, stderr 
 }
 
 func maintenanceUsageError() error {
-	return errors.New("usage: telegramd maintenance assign-operator")
+	return errors.New("usage: telegramd maintenance assign-operator | initialize-channel-post-summaries --channel-id <positive-id>")
 }
 
 func writeClientConfigUsage(w io.Writer) error {

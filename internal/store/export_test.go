@@ -14,6 +14,112 @@ import (
 	"github.com/adambenhassen/telegram-server/internal/store/db"
 )
 
+// ChannelPostSummarySchemaInstalled lets store integration tests distinguish
+// an expanded database from one that has not received the summary migration.
+func ChannelPostSummarySchemaInstalled(ctx context.Context, s *Store) (bool, error) {
+	var installed bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT to_regclass('public.channel_read_state') IS NOT NULL
+		   AND to_regclass('public.channel_post_summary_state') IS NOT NULL
+		   AND to_regclass('public.channel_post_summaries') IS NOT NULL
+	`).Scan(&installed)
+	return installed, err
+}
+
+func ChannelPostSummaryRootCount(ctx context.Context, s *Store, channelID int64, scopeKind int16, authorID int64) (int64, error) {
+	var count int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE((
+		    SELECT live_count
+		      FROM channel_post_summaries
+		     WHERE channel_id = $1 AND scope_kind = $2 AND author_id = $3
+		       AND depth = 0 AND prefix = 0
+		), 0)::bigint
+	`, channelID, scopeKind, authorID).Scan(&count)
+	return count, err
+}
+
+func ChannelReadStateMarker(ctx context.Context, s *Store, channelID, userID int64) (int64, bool, error) {
+	var marker int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT read_max_id FROM channel_read_state WHERE channel_id = $1 AND user_id = $2
+	`, channelID, userID).Scan(&marker)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	return marker, err == nil, err
+}
+
+func InsertChannelPostRunForTest(ctx context.Context, s *Store, channelID, firstID, lastID, authorID int64, deleted bool) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO channel_messages (channel_id, local_id, from_id, message, deleted)
+		SELECT $1, post_id, $4, 'seeded channel post', $5
+		  FROM generate_series($2::bigint, $3::bigint) AS post_id
+	`, channelID, firstID, lastID, authorID, deleted)
+	return err
+}
+
+func ExecChannelPostSummarySQL(ctx context.Context, s *Store, query string, args ...any) error {
+	_, err := s.pool.Exec(ctx, query, args...)
+	return err
+}
+
+func ChannelPostSummaryControlConnection(ctx context.Context, s *Store) (*pgx.Conn, error) {
+	return pgx.Connect(ctx, s.pool.Config().ConnString())
+}
+
+func BeginChannelPostSummaryStateHold(ctx context.Context, s *Store) (pgx.Tx, error) {
+	return s.pool.Begin(ctx)
+}
+
+func SetChannelStateNextLocalID(ctx context.Context, s *Store, channelID, nextLocalID int64) error {
+	_, err := s.pool.Exec(ctx, `UPDATE channel_state SET next_local_id = $2 WHERE channel_id = $1`, channelID, nextLocalID)
+	return err
+}
+
+func ChannelPostSourceFingerprints(ctx context.Context, s *Store, channelID int64) ([5]string, error) {
+	var fingerprints [5]string
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+		    md5(COALESCE((SELECT string_agg(row_to_json(post)::text, E'\\n' ORDER BY post.local_id)
+		                    FROM channel_messages AS post WHERE post.channel_id = $1), '')),
+		    md5(COALESCE((SELECT string_agg(row_to_json(member)::text, E'\\n' ORDER BY member.user_id)
+		                    FROM channel_participants AS member WHERE member.channel_id = $1), '')),
+		    md5(COALESCE((SELECT string_agg(row_to_json(marker)::text, E'\\n' ORDER BY marker.user_id)
+		                    FROM channel_read_state AS marker WHERE marker.channel_id = $1), '')),
+		    md5(COALESCE((SELECT row_to_json(state)::text FROM channel_state AS state WHERE state.channel_id = $1), '')),
+		    md5(COALESCE((SELECT string_agg(row_to_json(event)::text, E'\\n' ORDER BY event.pts)
+		                    FROM channel_events AS event WHERE event.channel_id = $1), ''))
+	`, channelID).Scan(
+		&fingerprints[0], &fingerprints[1], &fingerprints[2], &fingerprints[3], &fingerprints[4],
+	)
+	return fingerprints, err
+}
+
+func ChannelPostDeliveryFingerprints(ctx context.Context, s *Store, channelID int64) ([2]string, error) {
+	var fingerprints [2]string
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+		    md5(COALESCE((SELECT row_to_json(state)::text
+	                    FROM channel_state AS state WHERE state.channel_id = $1), '')),
+		    md5(COALESCE((SELECT string_agg(row_to_json(event)::text, E'\\n' ORDER BY event.pts)
+	                    FROM channel_events AS event WHERE event.channel_id = $1), ''))
+	`, channelID).Scan(&fingerprints[0], &fingerprints[1])
+	return fingerprints, err
+}
+
+func ListenChannelPostNotificationsForTest(ctx context.Context, s *Store) (*pgx.Conn, error) {
+	conn, err := pgx.Connect(ctx, s.pool.Config().ConnString())
+	if err != nil {
+		return nil, err
+	}
+	if _, err = conn.Exec(ctx, `LISTEN tg_channel_post`); err != nil {
+		_ = conn.Close(ctx) //nolint:errcheck // close after failed setup
+		return nil, err
+	}
+	return conn, nil
+}
+
 // Reconnect pacing, exported so the flapping and idle-recovery cases can be
 // asserted on the rule itself instead of on a 30-second wall clock.
 func NextBackoff(prev, uptime time.Duration) time.Duration { return nextBackoff(prev, uptime) }

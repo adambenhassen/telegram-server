@@ -94,6 +94,27 @@ type ChannelPostMarker struct {
 	LastPostAt pgtype.Timestamptz
 }
 
+type ChannelPostSummary struct {
+	ChannelID int64
+	ScopeKind int16
+	AuthorID  int64
+	Depth     int16
+	Prefix    int64
+	LiveCount int64
+}
+
+type ChannelPostSummaryState struct {
+	ChannelID int64
+	Version   int16
+	Ready     bool
+}
+
+type ChannelReadState struct {
+	ChannelID int64
+	UserID    int64
+	ReadMaxID int64
+}
+
 type ChannelState struct {
 	ChannelID   int64
 	Pts         int64
