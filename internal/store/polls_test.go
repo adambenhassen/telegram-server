@@ -733,3 +733,132 @@ func waitForLockWaiterOrDone(ctx context.Context, s *store.Store, minWaiters int
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+func TestDeleteMessagesBatchLocksPollsInStableOrder(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	creator := mustUser(t, s, "+15551400020")
+	first := mustUser(t, s, "+15551400021")
+	second := mustUser(t, s, "+15551400022")
+	chat := chatWith(t, s, creator, first, second)
+
+	firstMessage, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: creator.ID, Text: "poll P", RandomID: 140011})
+	secondMessage, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: creator.ID, Text: "poll Q", RandomID: 140012})
+	for _, message := range []store.Message{firstMessage, secondMessage} {
+		ref := store.PollMessageRef{PeerType: store.PeerTypeChat, PeerID: chat.ID, LocalID: message.LocalID}
+		if _, _, err := s.CreatePoll(ctx, creator.ID, ref, ordinaryPollDraft()); err != nil {
+			t.Fatalf("create poll for %q: %v", message.Text, err)
+		}
+	}
+
+	copyLocalID := func(ownerID int64, text string) int64 {
+		t.Helper()
+		history, err := s.History(ctx, ownerID, store.PeerTypeChat, chat.ID, 0, 20)
+		if err != nil {
+			t.Fatalf("history for owner %d: %v", ownerID, err)
+		}
+		for _, message := range history {
+			if message.Text == text {
+				return message.LocalID
+			}
+		}
+		t.Fatalf("owner %d has no copy of %q", ownerID, text)
+		return 0
+	}
+	firstP, firstQ := copyLocalID(first.ID, "poll P"), copyLocalID(first.ID, "poll Q")
+	secondP, secondQ := copyLocalID(second.ID, "poll P"), copyLocalID(second.ID, "poll Q")
+
+	entered := make(chan int64, 4)
+	resume := make(chan struct{})
+	var resumeOnce sync.Once
+	unblock := func() { resumeOnce.Do(func() { close(resume) }) }
+	store.SetDeleteCopyHook(s, func(ownerID, _ int64) {
+		entered <- ownerID
+		<-resume
+	})
+	type result struct {
+		ownerID int64
+		err     error
+	}
+	done := make(chan result, 2)
+	started := 0
+	doneCount := 0
+	t.Cleanup(func() {
+		unblock()
+		for doneCount < started {
+			select {
+			case <-done:
+				doneCount++
+			case <-time.After(5 * time.Second):
+				cancel()
+				return
+			}
+		}
+		store.SetDeleteCopyHook(s, nil)
+	})
+	go func() {
+		_, err := s.DeleteMessages(ctx, first.ID, []int64{firstP, firstQ}, false)
+		done <- result{ownerID: first.ID, err: err}
+	}()
+	started++
+	select {
+	case ownerID := <-entered:
+		if ownerID != first.ID {
+			t.Fatalf("first delete hook owner = %d, want %d", ownerID, first.ID)
+		}
+	case r := <-done:
+		doneCount++
+		t.Fatalf("first batch returned before its first deleted copy: %v", r.err)
+	case <-ctx.Done():
+		t.Fatalf("first batch did not reach its first delete: %v", ctx.Err())
+	}
+
+	go func() {
+		_, err := s.DeleteMessages(ctx, second.ID, []int64{secondQ, secondP}, false)
+		done <- result{ownerID: second.ID, err: err}
+	}()
+	started++
+
+	// With stable poll-row locking the second transaction must wait for the
+	// first transaction's lowest poll ID before it can delete its first copy.
+	// The previous per-copy trigger order instead lets it delete Q and reach the
+	// hook while the first transaction holds P, creating a P/Q lock cycle.
+	waitCtx, cancelWait := context.WithTimeout(ctx, 10*time.Second)
+	lockWait := make(chan error, 1)
+	go func() { lockWait <- store.WaitForLockWaiters(waitCtx, s, 1) }()
+	secondReachedDelete := false
+	blockedOnPoll := false
+	select {
+	case ownerID := <-entered:
+		secondReachedDelete = ownerID == second.ID
+	case err := <-lockWait:
+		blockedOnPoll = err == nil
+	case r := <-done:
+		doneCount++
+		t.Fatalf("batch for owner %d returned before serialized poll locking: %v", r.ownerID, r.err)
+	case <-ctx.Done():
+		t.Fatalf("second batch neither blocked nor reached a delete: %v", ctx.Err())
+	}
+	cancelWait()
+	unblock()
+
+	for doneCount < started {
+		select {
+		case r := <-done:
+			doneCount++
+			if r.err != nil {
+				t.Errorf("delete batch for owner %d: %v", r.ownerID, r.err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("delete batches did not finish: %v", ctx.Err())
+		}
+	}
+	if secondReachedDelete {
+		t.Fatal("opposite-order batch deleted its first copy while another batch held a poll row")
+	}
+	if !blockedOnPoll {
+		t.Fatal("second batch did not wait on the poll row before deleting a copy")
+	}
+}

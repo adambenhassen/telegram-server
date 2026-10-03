@@ -73,6 +73,11 @@ type Store struct {
 	// Scoped to the Store for the reason searchPageHook is.
 	deleteWalkHook func()
 
+	// deleteCopyHook is a test-only callback after one self-only message copy
+	// has been soft-deleted. It lets concurrency tests hold the transaction
+	// between rows in a batch, with any trigger locks still held.
+	deleteCopyHook func(ownerID, localID int64)
+
 	// peerDialogsSnapshotHook is a test-only callback fired after the
 	// messages.getPeerDialogs transaction starts and before its first read. It
 	// gives concurrency tests a deterministic point to commit a membership

@@ -206,6 +206,10 @@ func SetSearchPageHook(s *Store, fn func()) { s.searchPageHook = fn }
 // exists to close. Scoped to the Store for the reason SetSearchPageHook is.
 func SetDeleteWalkHook(s *Store, fn func()) { s.deleteWalkHook = fn }
 
+// SetDeleteCopyHook installs the callback DeleteMessages fires after a
+// self-only message copy is deleted. Tests use it to induce a batch interleave.
+func SetDeleteCopyHook(s *Store, fn func(ownerID, localID int64)) { s.deleteCopyHook = fn }
+
 const (
 	ListenerBackoffMin = listenerBackoffMin
 	ListenerBackoffMax = listenerBackoffMax

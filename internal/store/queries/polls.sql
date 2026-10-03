@@ -25,6 +25,17 @@ WHERE c.owner_id = $1
 -- name: PollByIDForUpdate :one
 SELECT * FROM polls WHERE id = $1 FOR UPDATE;
 
+-- PollIDsForMessageCopies finds every canonical poll row a message batch will
+-- touch. The caller locks the returned IDs in order before changing any message
+-- rows, so per-copy cleanup triggers already hold the same locks when they run.
+-- name: PollIDsForMessageCopies :many
+SELECT DISTINCT c.poll_id
+FROM unnest(sqlc.arg(owner_ids)::bigint[]) WITH ORDINALITY AS owners(owner_id, ord)
+JOIN unnest(sqlc.arg(local_ids)::bigint[]) WITH ORDINALITY AS locals(local_id, ord) USING (ord)
+JOIN poll_message_copies c
+  ON c.owner_id = owners.owner_id AND c.local_id = locals.local_id
+ORDER BY c.poll_id;
+
 -- name: InsertPollOption :exec
 INSERT INTO poll_options (poll_id, option, text, correct, position)
 VALUES ($1, $2, $3, $4, $5);

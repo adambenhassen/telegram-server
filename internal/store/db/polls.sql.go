@@ -290,6 +290,43 @@ func (q *Queries) PollByMessage(ctx context.Context, arg PollByMessageParams) (P
 	return i, err
 }
 
+const pollIDsForMessageCopies = `-- name: PollIDsForMessageCopies :many
+SELECT DISTINCT c.poll_id
+FROM unnest($1::bigint[]) WITH ORDINALITY AS owners(owner_id, ord)
+JOIN unnest($2::bigint[]) WITH ORDINALITY AS locals(local_id, ord) USING (ord)
+JOIN poll_message_copies c
+  ON c.owner_id = owners.owner_id AND c.local_id = locals.local_id
+ORDER BY c.poll_id
+`
+
+type PollIDsForMessageCopiesParams struct {
+	OwnerIds []int64
+	LocalIds []int64
+}
+
+// PollIDsForMessageCopies finds every canonical poll row a message batch will
+// touch. The caller locks the returned IDs in order before changing any message
+// rows, so per-copy cleanup triggers already hold the same locks when they run.
+func (q *Queries) PollIDsForMessageCopies(ctx context.Context, arg PollIDsForMessageCopiesParams) ([]int64, error) {
+	rows, err := q.db.Query(ctx, pollIDsForMessageCopies, arg.OwnerIds, arg.LocalIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var poll_id int64
+		if err := rows.Scan(&poll_id); err != nil {
+			return nil, err
+		}
+		items = append(items, poll_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const pollIsClosed = `-- name: PollIsClosed :one
 SELECT COALESCE(closed OR (close_date IS NOT NULL AND close_date <= clock_timestamp()), false)::boolean AS is_closed
 FROM polls
