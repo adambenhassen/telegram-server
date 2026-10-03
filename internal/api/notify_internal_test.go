@@ -1481,6 +1481,104 @@ func chanPtsOf(t *testing.T, up *tg.Updates) []int {
 	return out
 }
 
+func TestDeliverChannelPostDoesNotPushPostCommittedAfterBan(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(blobs))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	creator, err := s.CreateUser(ctx, "+15550000211")
+	if err != nil {
+		t.Fatalf("create creator: %v", err)
+	}
+	banned, err := s.CreateUser(ctx, "+15550000212")
+	if err != nil {
+		t.Fatalf("create member B: %v", err)
+	}
+	active, err := s.CreateUser(ctx, "+15550000213")
+	if err != nil {
+		t.Fatalf("create member C: %v", err)
+	}
+	ch, err := s.CreateChannel(ctx, creator.ID, "ban delivery", "", true)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err = s.AddChannelMembers(ctx, ch.ID, creator.ID, []int64{banned.ID, active.ID}); err != nil {
+		t.Fatalf("add members: %v", err)
+	}
+
+	creatorConn, bannedConn, activeConn := &fakePushConn{}, &fakePushConn{}, &fakePushConn{}
+	u := &Updater{h: &handlers{store: s, log: slog.New(slog.DiscardHandler), peers: pgtest.PeerDeriver()}, log: slog.New(slog.DiscardHandler)}
+	connsFor := func(userID int64) []pushConn {
+		switch userID {
+		case creator.ID:
+			return []pushConn{creatorConn}
+		case banned.ID:
+			return []pushConn{bannedConn}
+		case active.ID:
+			return []pushConn{activeConn}
+		default:
+			return nil
+		}
+	}
+
+	// Commit the ban and post after the delivery snapshot but before it reads
+	// channel events. The snapshot ceiling must keep that new post out of B's
+	// stale, pre-ban authorization decision.
+	u.channelPostSnapshotHook = func() {
+		banConn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			t.Fatalf("connect for ban: %v", err)
+		}
+		if _, err = banConn.Exec(ctx, `UPDATE channel_participants SET banned_until = $3 WHERE channel_id = $1 AND user_id = $2`, ch.ID, banned.ID, time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("commit ban: %v", err)
+		}
+		if err = banConn.Close(ctx); err != nil {
+			t.Fatalf("close ban connection: %v", err)
+		}
+		if _, _, _, err = s.PostChannelMessage(ctx, ch.ID, creator.ID, "live 2", 99212, nil, 0); err != nil {
+			t.Fatalf("post after ban: %v", err)
+		}
+	}
+	u.deliverChannelPost(ctx, ch.ID, connsFor)
+	u.channelPostSnapshotHook = nil
+
+	if len(bannedConn.got) != 0 {
+		t.Fatalf("member B got %d pushes from the pre-ban snapshot, want none", len(bannedConn.got))
+	}
+	if len(activeConn.got) != 0 {
+		t.Fatalf("member C got %d pushes from a snapshot before the post, want none", len(activeConn.got))
+	}
+	if len(creatorConn.got) != 1 || !slices.Equal(chanPtsOf(t, creatorConn.got[0]), []int{1}) {
+		t.Fatalf("creator create event pushes = %v, want one event at pts 1", creatorConn.got)
+	}
+
+	// A later delivery observes the committed post with current membership: C
+	// receives it, while B is now excluded. The creator's original create event
+	// remains in its earlier push.
+	u.deliverChannelPost(ctx, ch.ID, connsFor)
+	if len(bannedConn.got) != 0 {
+		t.Fatalf("banned member B got %d post-ban pushes, want none", len(bannedConn.got))
+	}
+	if len(activeConn.got) != 1 || !slices.Equal(chanPtsOf(t, activeConn.got[0]), []int{2}) {
+		t.Fatalf("active member C pushes = %v, want post at pts 2", activeConn.got)
+	}
+	if len(creatorConn.got) != 2 || !slices.Equal(chanPtsOf(t, creatorConn.got[0]), []int{1}) || !slices.Equal(chanPtsOf(t, creatorConn.got[1]), []int{2}) {
+		t.Fatalf("creator pushes = %v, want create event at pts 1 and post at pts 2", creatorConn.got)
+	}
+}
+
 // TestDeliverChannelPostPushes verifies a post pushes UpdateNewChannelMessage
 // to a member's live conn and does not advance the per-account watermark.
 func TestDeliverChannelPostPushes(t *testing.T) {

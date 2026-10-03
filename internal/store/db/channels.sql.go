@@ -117,6 +117,57 @@ func (q *Queries) ChannelByID(ctx context.Context, id int64) (Channel, error) {
 	return i, err
 }
 
+const channelDeliverySnapshot = `-- name: ChannelDeliverySnapshot :many
+SELECT participant.channel_id, participant.user_id, participant.role, participant.banned_until, participant.join_pts, participant.date, participant.last_post_at, state.pts
+FROM channel_participants AS participant
+JOIN channel_state AS state ON state.channel_id = participant.channel_id
+WHERE participant.channel_id = $1
+ORDER BY participant.user_id
+`
+
+type ChannelDeliverySnapshotRow struct {
+	ChannelID   int64
+	UserID      int64
+	Role        int16
+	BannedUntil pgtype.Timestamptz
+	JoinPts     int64
+	Date        pgtype.Timestamptz
+	LastPostAt  pgtype.Timestamptz
+	Pts         int64
+}
+
+// ChannelDeliverySnapshot binds the member authorization rows and the event
+// ceiling to one statement snapshot. Live delivery must not authorize from an
+// older member read and then include events committed after a later state read.
+func (q *Queries) ChannelDeliverySnapshot(ctx context.Context, channelID int64) ([]ChannelDeliverySnapshotRow, error) {
+	rows, err := q.db.Query(ctx, channelDeliverySnapshot, channelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChannelDeliverySnapshotRow
+	for rows.Next() {
+		var i ChannelDeliverySnapshotRow
+		if err := rows.Scan(
+			&i.ChannelID,
+			&i.UserID,
+			&i.Role,
+			&i.BannedUntil,
+			&i.JoinPts,
+			&i.Date,
+			&i.LastPostAt,
+			&i.Pts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const channelDialogsForUser = `-- name: ChannelDialogsForUser :many
 SELECT
     c.id AS channel_id,
