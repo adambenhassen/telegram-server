@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/srp"
 )
 
 func testVerifier(t *testing.T) []byte {

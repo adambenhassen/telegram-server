@@ -11,11 +11,11 @@ import (
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
 )
 
 type helpPollingBudgetConn struct {

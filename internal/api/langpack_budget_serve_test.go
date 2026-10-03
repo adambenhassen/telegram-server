@@ -15,8 +15,8 @@ import (
 	"github.com/gotd/td/proto"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/catalog"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 type langpackBudgetKeyStore struct {

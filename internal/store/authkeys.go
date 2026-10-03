@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // AuthKey is a persisted MTProto auth key. UserID is 0 while the key is

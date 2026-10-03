@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func post(t *testing.T, s *store.Store, channelID, fromID int64, text string, rid int64) (store.ChannelMessage, int) {

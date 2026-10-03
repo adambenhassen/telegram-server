@@ -55,7 +55,7 @@ migrate:
 # contention (observed runtime ~300s). 15m gives 3x headroom while staying
 # inside CI's timeout-minutes: 20 so Go's goroutine dump fires before GitHub
 # cancels the job.
-E2E_PKG := github.com/adambenhassen/telegram-server/test/e2e
+E2E_PKG := github.com/teagramhq/teagram-server/test/e2e
 
 test: docker-bridge
 	$(TESTENV) go test -race $$(go list ./... | grep -v '^$(E2E_PKG)$$')

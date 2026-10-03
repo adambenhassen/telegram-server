@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // ErrNoClientAddr is returned when a per-IP check is handed a request whose

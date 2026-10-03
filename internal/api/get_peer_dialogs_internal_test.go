@@ -8,7 +8,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 func TestHandleGetPeerDialogsRejectsTruncatedInputBeforeStorage(t *testing.T) {

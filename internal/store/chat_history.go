@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // ChatHistorySnapshot is the complete read set needed to render one basic-chat

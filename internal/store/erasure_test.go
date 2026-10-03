@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // future and past are cutoffs either side of every file a test creates, so the

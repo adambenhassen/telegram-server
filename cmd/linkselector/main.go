@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/linkselector"
+	"github.com/teagramhq/teagram-server/internal/linkselector"
 )
 
 const (

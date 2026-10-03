@@ -9,8 +9,8 @@ import (
 	"github.com/gotd/td/telegram/query/hasher"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func (h *handlers) contactMutationError(op string, userID int64, err error) error {

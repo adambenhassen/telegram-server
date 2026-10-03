@@ -6,7 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // AdminSessionRow holds the fields returned by a session lookup.

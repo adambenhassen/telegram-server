@@ -8,8 +8,8 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/catalog"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 const maxLangpackKeys = 1024

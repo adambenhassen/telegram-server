@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/discovery"
+	"github.com/teagramhq/teagram-server/internal/discovery"
 )
 
 func TestDocumentIsCanonicalAndContainsOnlyPublicIdentity(t *testing.T) {

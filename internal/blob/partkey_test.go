@@ -5,7 +5,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blob"
 )
 
 // TestPartKeyDisjointFromAssembledKeys is the prefix rule as a test, not a

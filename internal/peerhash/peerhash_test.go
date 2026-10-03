@@ -3,7 +3,7 @@ package peerhash_test
 import (
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
 )
 
 // master keys used across the table. They are test material only.

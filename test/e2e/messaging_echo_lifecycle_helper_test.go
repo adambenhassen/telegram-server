@@ -14,7 +14,7 @@ import (
 
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 var (

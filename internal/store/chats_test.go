@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func participantIDs(t *testing.T, s *store.Store, chatID int64) []int64 {

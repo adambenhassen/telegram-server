@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // sessionCookieName is the name of the cookie that carries an admin session id.

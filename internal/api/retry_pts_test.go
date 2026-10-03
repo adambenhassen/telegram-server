@@ -7,7 +7,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 // The pts a retry reports is an update-delivery contract, not a cosmetic field.

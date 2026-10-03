@@ -28,7 +28,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcnet "github.com/testcontainers/testcontainers-go/network"
 
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
 )
 
 // migration is one Atlas migration file: its name and SQL body.

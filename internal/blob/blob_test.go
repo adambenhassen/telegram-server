@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blob"
 )
 
 const payload = "hello world, this is a blob"

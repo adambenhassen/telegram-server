@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/config"
 )
 
 func TestAdminDisabled(t *testing.T) {

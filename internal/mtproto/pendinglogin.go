@@ -3,7 +3,7 @@ package mtproto
 import (
 	"sync/atomic"
 
-	"github.com/adambenhassen/telegram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/srp"
 )
 
 const (

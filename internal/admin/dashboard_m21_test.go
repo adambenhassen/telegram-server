@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/admin"
+	"github.com/teagramhq/teagram-server/internal/admin"
 )
 
 func TestDashboardM21RendersFixedOperationalFamilies(t *testing.T) {

@@ -13,7 +13,7 @@ import (
 	"github.com/gotd/td/mt"
 	"github.com/gotd/td/proto"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // containerFrame encrypts a MessageContainer with N ping requests, the way a

@@ -24,7 +24,7 @@ from reconnect_diagnostics import (
 )
 
 
-PACKAGE = "github.com/adambenhassen/telegram-server/test/e2e"
+PACKAGE = "github.com/teagramhq/teagram-server/test/e2e"
 TARGET = "TestMessagingReconnectPushGap"
 
 
