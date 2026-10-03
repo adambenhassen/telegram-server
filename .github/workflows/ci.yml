@@ -1300,7 +1300,7 @@ jobs:
           has_test_event() {
             jq -Re --arg action "$1" --arg test "$2" '
               fromjson?
-              | select(.Package == "github.com/adambenhassen/telegram-server/test/e2e"
+              | select(.Package == "github.com/teagramhq/teagram-server/test/e2e"
                   and .Action == $action and (.Test // "") == $test)
             ' <<<"$output" >/dev/null
           }
@@ -1340,7 +1340,7 @@ jobs:
 
           summary=$(jq -Rr '
             fromjson?
-            | select(.Package == "github.com/adambenhassen/telegram-server/test/e2e"
+            | select(.Package == "github.com/teagramhq/teagram-server/test/e2e"
                 and .Action == "pass" and (.Test // "") == "")
             | .Elapsed // empty
           ' <<<"$output" | tail -n 1)
@@ -1348,4 +1348,4 @@ jobs:
             echo "::error::TestSmoke did not report a completed package run (category: package-incomplete; details redacted)"
             exit 1
           fi
-          printf 'ok github.com/adambenhassen/telegram-server/test/e2e %ss\n' "$summary"
+          printf 'ok github.com/teagramhq/teagram-server/test/e2e %ss\n' "$summary"

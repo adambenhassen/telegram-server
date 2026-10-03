@@ -10,7 +10,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
 )
 
 // TestContainerOptionsHaveNoLogWaitStrategy pins the reason readiness moved off

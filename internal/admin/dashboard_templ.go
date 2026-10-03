@@ -9,12 +9,12 @@ import "github.com/a-h/templ"
 import templruntime "github.com/a-h/templ/runtime"
 
 import (
-	"github.com/adambenhassen/telegram-server/components/alert"
-	"github.com/adambenhassen/telegram-server/components/badge"
-	"github.com/adambenhassen/telegram-server/components/button"
-	"github.com/adambenhassen/telegram-server/components/card"
-	"github.com/adambenhassen/telegram-server/components/progress"
-	"github.com/adambenhassen/telegram-server/components/table"
+	"github.com/teagramhq/teagram-server/components/alert"
+	"github.com/teagramhq/teagram-server/components/badge"
+	"github.com/teagramhq/teagram-server/components/button"
+	"github.com/teagramhq/teagram-server/components/card"
+	"github.com/teagramhq/teagram-server/components/progress"
+	"github.com/teagramhq/teagram-server/components/table"
 )
 
 // dashboardPage renders the authenticated admin operations dashboard.

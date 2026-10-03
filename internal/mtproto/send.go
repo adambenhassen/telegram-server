@@ -95,6 +95,9 @@ type Conn struct {
 
 	// created is touched only by the connection's single serve goroutine.
 	created map[int64]struct{}
+	// systemLangCodeHint is captured from initConnection and read by that same
+	// serve goroutine for help.getConfig. It is bounded and connection-local.
+	systemLangCodeHint string
 
 	// unimplemented bounds what this connection may spend on methods this
 	// server does not implement, and thins the line they produce. Touched only

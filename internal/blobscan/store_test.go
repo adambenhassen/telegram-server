@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/blobscan"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blobscan"
 )
 
 type storeWithoutTree struct{ blob.Store }

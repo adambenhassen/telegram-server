@@ -13,9 +13,9 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestContactsSearch proves contacts.search returns only dialog partners and

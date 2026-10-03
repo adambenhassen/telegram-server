@@ -11,13 +11,13 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/catalog"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/srp"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 type handlers struct {
@@ -245,7 +245,9 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 		dialogFilterSync:         dialogFilterSync,
 	}
 	d := mtproto.NewDispatcher()
-	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
+	registerWithConn(d, tg.HelpGetConfigRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, error) {
+		return h.handleGetConfigWithSystemLangCode(req, c.SystemLangCodeHint())
+	})
 	register(d, tg.HelpGetAppConfigRequestTypeID, h.handleGetAppConfig)
 	registerLangpackMethods(d, h)
 	h.registerHelpPolling(d)

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // gaFor builds a distinct 256-byte g_a-shaped value. The store does not

@@ -12,8 +12,8 @@ import (
 	"github.com/gotd/td/tgerr"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func contactsSearchUsernames(t *testing.T, s *store.Store, callerID int64, q string) *tg.ContactsFound {

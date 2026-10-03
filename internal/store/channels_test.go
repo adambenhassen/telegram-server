@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func mustChannel(t *testing.T, s *store.Store, creatorID int64, title string) store.Channel {

@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/admin"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/admin"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestAuthGate_enumerates_routes verifies that every route registered on the

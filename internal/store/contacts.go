@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // ErrInvalidContact is returned when a contact edge has a non-positive id or

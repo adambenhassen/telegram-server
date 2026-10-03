@@ -13,9 +13,9 @@ import (
 	"github.com/gotd/td/tgerr"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // isInputRequestInvalid reports whether err is a 400 INPUT_REQUEST_INVALID error.

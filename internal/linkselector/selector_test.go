@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/linklanding"
-	"github.com/adambenhassen/telegram-server/internal/linkselector"
+	"github.com/teagramhq/teagram-server/internal/linklanding"
+	"github.com/teagramhq/teagram-server/internal/linkselector"
 )
 
 const (

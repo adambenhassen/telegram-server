@@ -17,8 +17,8 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/exchange"
 
-	"github.com/adambenhassen/telegram-server/internal/discovery"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/discovery"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 func TestLocalPreflightReturnsConfiguredPublicIdentityAndDC(t *testing.T) {

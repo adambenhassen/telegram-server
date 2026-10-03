@@ -18,7 +18,7 @@ import (
 	"github.com/gotd/td/proto/codec"
 	"github.com/gotd/td/transport"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 type authKeyLogRecord struct {

@@ -6,7 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
 )
 
 func TestNewGroupChannelPermissionStateDefaults(t *testing.T) {

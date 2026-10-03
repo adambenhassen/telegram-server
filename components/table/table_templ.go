@@ -8,7 +8,7 @@ package table
 import "github.com/a-h/templ"
 import templruntime "github.com/a-h/templ/runtime"
 
-import "github.com/adambenhassen/telegram-server/utils"
+import "github.com/teagramhq/teagram-server/utils"
 
 type Props struct {
 	ID         string

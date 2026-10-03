@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/config"
 )
 
 var blobS3EnvNames = []string{

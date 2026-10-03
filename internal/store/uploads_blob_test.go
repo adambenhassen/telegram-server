@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestUploadPartBytesLeavePostgres is criterion 2: after a part is saved, no

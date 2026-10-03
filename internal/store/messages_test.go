@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func mustUser(t *testing.T, s *store.Store, phone string) store.User {

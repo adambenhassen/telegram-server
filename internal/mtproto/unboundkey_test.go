@@ -11,7 +11,7 @@ import (
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/transport"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // A key exchange used to buy a hold that nothing counted. The pre-auth bounds

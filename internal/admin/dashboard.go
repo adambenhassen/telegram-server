@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // DashboardFragmentRenderer renders the metrics sections fragment using templ

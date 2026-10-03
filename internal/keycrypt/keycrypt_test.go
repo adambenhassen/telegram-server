@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/keycrypt"
+	"github.com/teagramhq/teagram-server/internal/keycrypt"
 )
 
 func testKey(b byte) []byte { return bytes.Repeat([]byte{b}, keycrypt.KeyLen) }

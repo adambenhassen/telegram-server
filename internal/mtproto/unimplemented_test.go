@@ -10,7 +10,7 @@ import (
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // flushLineRecorder captures the one line the serve loop's drop writes when it

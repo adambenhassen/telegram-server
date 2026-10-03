@@ -14,7 +14,7 @@ import (
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 var errPendingDeadlineTooLong = errors.New("pending-login deadline was not installed")

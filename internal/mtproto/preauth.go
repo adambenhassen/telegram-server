@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // preAuthLogInterval bounds how often a pre-auth refusal is logged. Refusals are

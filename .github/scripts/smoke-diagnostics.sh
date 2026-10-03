@@ -70,7 +70,7 @@ smoke_emit_raw_output() {
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SMOKE_DIAGNOSTICS_ROOT="${SMOKE_DIAGNOSTICS_ROOT:-$(cd -- "$script_dir/../.." && pwd)}"
-SMOKE_E2E_PACKAGE="github.com/adambenhassen/telegram-server/test/e2e"
+SMOKE_E2E_PACKAGE="github.com/teagramhq/teagram-server/test/e2e"
 source "$script_dir/smoke-scenarios.sh"
 
 report_smoke_failure_diagnostics() {

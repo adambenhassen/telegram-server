@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestCheckAndChargeLookupConcurrentBoundary verifies that the advisory lock in
