@@ -31,8 +31,85 @@ ON CONFLICT (chat_id, user_id) DO NOTHING;
 -- name: DeleteChatParticipant :execrows
 DELETE FROM chat_participants WHERE chat_id = $1 AND user_id = $2;
 
+-- name: SetChatParticipantAdmin :execrows
+UPDATE chat_participants SET is_admin = $3 WHERE chat_id = $1 AND user_id = $2;
+
 -- name: BumpChatVersion :one
 UPDATE chats SET version = version + 1 WHERE id = $1 RETURNING *;
+
+-- name: InsertChatAdminEvent :one
+INSERT INTO chat_admin_events (chat_id, user_id, is_admin, version)
+VALUES ($1, $2, $3, $4)
+RETURNING *;
+
+-- UpsertChatAdminEventRecipients keeps one current live recipient per
+-- member/chat/target tuple for transient fanout in the role mutation transaction.
+-- name: UpsertChatAdminEventRecipients :exec
+INSERT INTO chat_admin_event_recipients (owner_id, chat_id, target_id, event_id)
+SELECT recipient.owner_id, sqlc.arg(chat_id)::bigint, sqlc.arg(target_id)::bigint, sqlc.arg(event_id)::bigint
+FROM unnest(sqlc.arg(owner_ids)::bigint[]) AS recipient(owner_id)
+ON CONFLICT (owner_id, chat_id, target_id)
+DO UPDATE SET event_id = EXCLUDED.event_id;
+
+-- UpsertChatAdminStateMarkers keeps the latest pending pull version separately
+-- so acknowledging one connection's difference does not suppress live fanout.
+-- name: UpsertChatAdminStateMarkers :exec
+INSERT INTO chat_admin_state_markers (owner_id, chat_id, target_id, event_id)
+SELECT recipient.owner_id, sqlc.arg(chat_id)::bigint, sqlc.arg(target_id)::bigint, sqlc.arg(event_id)::bigint
+FROM unnest(sqlc.arg(owner_ids)::bigint[]) AS recipient(owner_id)
+ON CONFLICT (owner_id, chat_id, target_id)
+DO UPDATE SET event_id = EXCLUDED.event_id;
+
+-- ChatAdminEventRecipientsByEvent returns only recipients who remain members;
+-- a delayed live push must not disclose an admin event after a member leaves.
+-- name: ChatAdminEventRecipientsByEvent :many
+SELECT recipient.owner_id
+FROM chat_admin_event_recipients AS recipient
+JOIN chat_admin_events AS event ON event.id = recipient.event_id
+JOIN chat_participants AS participant
+  ON participant.chat_id = recipient.chat_id
+ AND participant.user_id = recipient.owner_id
+WHERE recipient.event_id = $1
+  AND recipient.chat_id = event.chat_id
+  AND recipient.target_id = event.user_id
+ORDER BY recipient.owner_id;
+
+-- ChatAdminSnapshotsForMember returns the current role state for each target
+-- with a pending pull marker. EventID lets the response-success hook consume
+-- only versions included in this response, preserving newer concurrent changes.
+-- name: ChatAdminSnapshotsForMember :many
+SELECT marker.event_id,
+       marker.chat_id,
+       marker.target_id AS user_id,
+       target.is_admin,
+       chat.version
+FROM chat_admin_state_markers AS marker
+JOIN chat_admin_events AS event
+  ON event.id = marker.event_id
+ AND event.chat_id = marker.chat_id
+ AND event.user_id = marker.target_id
+JOIN chat_participants AS viewer
+  ON viewer.chat_id = marker.chat_id
+ AND viewer.user_id = marker.owner_id
+JOIN chats AS chat ON chat.id = marker.chat_id
+JOIN chat_participants AS target
+  ON target.chat_id = marker.chat_id
+ AND target.user_id = marker.target_id
+WHERE marker.owner_id = $1
+ORDER BY marker.event_id
+LIMIT sqlc.arg(lim)::int;
+
+-- DeleteChatAdminStateMarkersByEventIDs consumes the exact versions included
+-- in a successfully written difference response.
+-- name: DeleteChatAdminStateMarkersByEventIDs :exec
+DELETE FROM chat_admin_state_markers
+WHERE owner_id = sqlc.arg(owner_id)
+  AND event_id = ANY(sqlc.arg(event_ids)::bigint[]);
+
+-- name: ChatAdminEventsByIDs :many
+SELECT * FROM chat_admin_events
+WHERE id = ANY(sqlc.arg(event_ids)::bigint[])
+ORDER BY id;
 
 -- name: SetChatTitle :one
 UPDATE chats SET title = $2, version = version + 1 WHERE id = $1 RETURNING *;

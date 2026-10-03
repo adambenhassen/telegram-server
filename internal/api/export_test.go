@@ -561,13 +561,27 @@ func ExportMessageLinkForTest(s *store.Store, userID int64, req *tg.ChannelsExpo
 	return testHandlers(s).handleExportMessageLink(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
-// GetDifferenceForTest encodes req and invokes handleGetDifference for the caller.
+// GetDifferenceForTest encodes req and treats its result as a successful reply,
+// running the handler's after-reply hook when present.
 func GetDifferenceForTest(s *store.Store, userID int64, req *tg.UpdatesGetDifferenceRequest) (bin.Encoder, error) {
-	var buf bin.Buffer
-	if err := req.Encode(&buf); err != nil {
+	result, afterReply, err := GetDifferenceWithAfterReplyForTest(s, userID, req)
+	if err != nil {
 		return nil, err
 	}
-	return testHandlers(s).handleGetDifference(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+	if afterReply != nil {
+		afterReply()
+	}
+	return result, nil
+}
+
+// GetDifferenceWithAfterReplyForTest lets tests control when the RPC's
+// successful-write hook runs, including mutations that race with the response.
+func GetDifferenceWithAfterReplyForTest(s *store.Store, userID int64, req *tg.UpdatesGetDifferenceRequest) (bin.Encoder, func(), error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, nil, err
+	}
+	return testHandlers(s).handleGetDifferenceForConn(nil, &mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // GetHistoryForTest encodes req and invokes handleGetHistory for the caller.

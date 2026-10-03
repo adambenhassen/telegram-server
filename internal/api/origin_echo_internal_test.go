@@ -107,9 +107,21 @@ func assertWireMessage(t *testing.T, got tg.MessageClass, want store.Message) {
 	if !ok || from.UserID != want.FromID {
 		t.Fatalf("wire message from = %T/%d, want user %d", message.FromID, peerUserID(message.FromID), want.FromID)
 	}
-	peer, ok := message.PeerID.(*tg.PeerUser)
-	if !ok || peer.UserID != want.PeerID {
-		t.Fatalf("wire message peer = %T/%d, want user %d", message.PeerID, peerUserID(message.PeerID), want.PeerID)
+	var peerType store.PeerType
+	var peerID int64
+	switch peer := message.PeerID.(type) {
+	case *tg.PeerUser:
+		peerType = store.PeerTypeUser
+		peerID = peer.UserID
+	case *tg.PeerChat:
+		peerType = store.PeerTypeChat
+		peerID = peer.ChatID
+	case *tg.PeerChannel:
+		peerType = store.PeerTypeChannel
+		peerID = peer.ChannelID
+	}
+	if peerType != want.PeerType || peerID != want.PeerID {
+		t.Fatalf("wire message peer = %T/%d, want %d/%d", message.PeerID, peerID, want.PeerType, want.PeerID)
 	}
 }
 

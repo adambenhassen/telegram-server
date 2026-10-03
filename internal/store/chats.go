@@ -46,6 +46,7 @@ type Participant struct {
 	UserID    int64
 	InviterID int64
 	Date      time.Time
+	Admin     bool
 }
 
 // ChatPinSnapshot contains one committed pin state and each member's copy as
@@ -172,7 +173,7 @@ func (s *Store) Participants(ctx context.Context, chatID int64) ([]Participant, 
 	}
 	out := make([]Participant, len(rows))
 	for i, r := range rows {
-		out[i] = Participant{UserID: r.UserID, InviterID: r.InviterID, Date: r.Date.Time}
+		out[i] = Participant{UserID: r.UserID, InviterID: r.InviterID, Date: r.Date.Time, Admin: r.IsAdmin}
 	}
 	return out, nil
 }
@@ -198,6 +199,7 @@ type chatMutation struct {
 	defaultBannedRights []string
 	members             []int64        // ascending, as read under the chats row lock
 	seen                map[int64]bool // membership of members, for O(1) tests
+	admins              map[int64]bool // admin status of members, read under the same lock
 }
 
 // beginChatMutation opens the transaction AddChatUser, RemoveChatUser and
@@ -283,10 +285,12 @@ func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64) (
 		defaultBannedRights: chat.DefaultBannedRights,
 		members:             make([]int64, len(parts)),
 		seen:                make(map[int64]bool, len(parts)),
+		admins:              make(map[int64]bool, len(parts)),
 	}
 	for i, p := range parts {
 		m.members[i] = p.UserID
 		m.seen[p.UserID] = true
+		m.admins[p.UserID] = p.IsAdmin
 	}
 	if !m.seen[callerID] {
 		return nil, ErrNotMember
@@ -294,6 +298,68 @@ func (s *Store) beginChatMutation(ctx context.Context, chatID, callerID int64) (
 
 	ok = true
 	return m, nil
+}
+
+// SetChatAdmin changes one participant's basic-group administrator status and
+// records its versioned event in the same transaction.
+func (s *Store) SetChatAdmin(ctx context.Context, chatID, targetID, callerID int64, isAdmin bool) (bool, int64, error) {
+	m, err := s.beginChatMutation(ctx, chatID, callerID)
+	if err != nil {
+		return false, 0, err
+	}
+	defer func() { _ = m.tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+
+	if callerID != m.creatorID {
+		return false, 0, ErrChatAdminRequired
+	}
+	if targetID == m.creatorID {
+		return false, 0, ErrChatAdminTargetCreator
+	}
+	if !m.seen[targetID] {
+		return false, 0, ErrChatTargetNotMember
+	}
+	if m.admins[targetID] == isAdmin {
+		return false, 0, nil
+	}
+	updated, err := m.qtx.SetChatParticipantAdmin(ctx, db.SetChatParticipantAdminParams{
+		ChatID: chatID, UserID: targetID, IsAdmin: isAdmin,
+	})
+	if err != nil {
+		return false, 0, fmt.Errorf("set chat participant admin: %w", err)
+	}
+	if updated != 1 {
+		return false, 0, fmt.Errorf("set chat participant admin: updated %d rows, want 1", updated)
+	}
+	chat, err := m.qtx.BumpChatVersion(ctx, chatID)
+	if err != nil {
+		return false, 0, fmt.Errorf("bump chat version: %w", err)
+	}
+	event, err := m.qtx.InsertChatAdminEvent(ctx, db.InsertChatAdminEventParams{
+		ChatID: chatID, UserID: targetID, IsAdmin: isAdmin, Version: chat.Version,
+	})
+	if err != nil {
+		return false, 0, fmt.Errorf("insert chat admin event: %w", err)
+	}
+	if err := m.qtx.UpsertChatAdminEventRecipients(ctx, db.UpsertChatAdminEventRecipientsParams{
+		ChatID:   chatID,
+		TargetID: targetID,
+		EventID:  event.ID,
+		OwnerIds: m.members,
+	}); err != nil {
+		return false, 0, fmt.Errorf("upsert chat admin event recipients: %w", err)
+	}
+	if err := m.qtx.UpsertChatAdminStateMarkers(ctx, db.UpsertChatAdminStateMarkersParams{
+		ChatID:   chatID,
+		TargetID: targetID,
+		EventID:  event.ID,
+		OwnerIds: m.members,
+	}); err != nil {
+		return false, 0, fmt.Errorf("upsert chat admin state markers: %w", err)
+	}
+	if err := m.tx.Commit(ctx); err != nil {
+		return false, 0, fmt.Errorf("commit: %w", err)
+	}
+	return true, event.ID, nil
 }
 
 // lockOwners acquires every owner lock this mutation will touch in one sorted

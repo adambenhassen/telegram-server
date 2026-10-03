@@ -208,6 +208,10 @@ type pendingRPCReadyConn interface {
 // advancing each conn's last-pushed pts. It is best-effort: a push failure is
 // logged and the client's next getDifference backfills.
 func (u *Updater) Deliver(ctx context.Context, userID int64) {
+	if chatID, eventID, ok := store.ChatAdminUpdateFromContext(ctx); ok {
+		u.DeliverChatAdmin(ctx, chatID, eventID)
+		return
+	}
 	conns := u.registry.Conns(userID)
 	if len(conns) > 0 {
 		suppressed, _ := store.SuppressedUpdateFromContext(ctx)
@@ -223,6 +227,55 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	if channelID, ok := store.ChannelMembershipUpdateFromContext(ctx); ok {
 		u.deliverChannelMembership(ctx, userID, channelID)
 	}
+}
+
+// DeliverChatAdmin pushes one persisted chat-admin event to its currently
+// pending recipients who remain members. Separate durable pull markers let a
+// difference response recover missed pushes without suppressing other sessions.
+func (u *Updater) DeliverChatAdmin(ctx context.Context, chatID, eventID int64) {
+	events, err := u.h.store.ChatAdminEventsByIDs(ctx, []int64{eventID})
+	if err != nil {
+		u.log.Error("deliver chat admin event", "event_id", eventID, "err", err)
+		return
+	}
+	if len(events) != 1 {
+		u.log.Warn("deliver missing chat admin event", "event_id", eventID)
+		return
+	}
+	event := events[0]
+	if event.ChatID != chatID {
+		u.log.Warn("deliver mismatched chat admin event", "event_id", eventID, "chat_id", chatID)
+		return
+	}
+	recipients, err := u.h.store.ChatAdminEventRecipientsByEvent(ctx, eventID)
+	if err != nil {
+		u.log.Error("deliver chat admin recipients", "event_id", eventID, "chat_id", event.ChatID, "err", err)
+		return
+	}
+	update := &tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateChatParticipantAdmin{
+			ChatID:  event.ChatID,
+			UserID:  event.UserID,
+			IsAdmin: event.IsAdmin,
+			Version: event.Version,
+		}},
+		Date: int(time.Now().Unix()),
+		Seq:  0,
+	}
+	var pushes []transientPush
+	for _, owner := range recipients {
+		for _, conn := range u.registry.Conns(owner) {
+			pushes = append(pushes, transientPush{
+				owner: owner,
+				conn:  conn,
+				enc:   update,
+				onError: func(err error) {
+					u.log.Info("deliver chat admin push", "event_id", eventID, "user_id", owner, "err", err)
+				},
+			})
+		}
+	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // deliverChannelMembership pushes a newly invited user their own channel peer
