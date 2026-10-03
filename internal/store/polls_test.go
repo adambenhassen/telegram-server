@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -83,6 +84,118 @@ func TestCreatePollDeduplicatesAcrossMessageCopies(t *testing.T) {
 	}
 	if !duplicate || retried.ID != created.ID || string(retried.Question) != "Which option?" {
 		t.Fatalf("retry = (%+v, duplicate=%v), want original canonical poll %d", retried, duplicate, created.ID)
+	}
+}
+
+func TestTimedPollRetrySurvivesNearAndPastDeadline(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551400014")
+	member := mustUser(t, s, "+15551400015")
+	chat := chatWith(t, s, creator, member)
+	message, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: creator.ID, Text: "timed poll", RandomID: 140008})
+	ref := store.PollMessageRef{PeerType: store.PeerTypeChat, PeerID: chat.ID, LocalID: message.LocalID}
+	now := time.Now().UTC()
+	closeDate := now.Add(5 * time.Minute)
+	draft := ordinaryPollDraft()
+	draft.CloseDate = &closeDate
+	store.SetNowFunc(s, func() time.Time { return now })
+	original, duplicate, err := s.CreatePoll(ctx, creator.ID, ref, draft)
+	if err != nil || duplicate {
+		t.Fatalf("create timed poll = duplicate %v, err %v", duplicate, err)
+	}
+
+	store.SetNowFunc(s, func() time.Time { return closeDate.Add(-3 * time.Second) })
+	nearDeadline, duplicate, err := s.CreatePoll(ctx, creator.ID, ref, draft)
+	if err != nil || !duplicate || nearDeadline.ID != original.ID {
+		t.Fatalf("near-deadline retry = poll %d duplicate %v err %v, want stored poll %d", nearDeadline.ID, duplicate, err, original.ID)
+	}
+
+	store.SetNowFunc(s, func() time.Time { return closeDate.Add(time.Second) })
+	afterDeadline, duplicate, err := s.CreatePoll(ctx, creator.ID, ref, draft)
+	if err != nil || !duplicate || afterDeadline.ID != original.ID {
+		t.Fatalf("expired retry = poll %d duplicate %v err %v, want stored poll %d", afterDeadline.ID, duplicate, err, original.ID)
+	}
+}
+
+func TestCreatePollSerializesWithConcurrentRestriction(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	owner := mustUser(t, s, "+15551400016")
+	sender := mustUser(t, s, "+15551400017")
+	chat := chatWith(t, s, owner, sender)
+	message, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: sender.ID, Text: "poll", RandomID: 140009})
+	ref := store.PollMessageRef{PeerType: store.PeerTypeChat, PeerID: chat.ID, LocalID: message.LocalID}
+
+	release, err := store.HoldChatRowLock(ctx, s, chat.ID)
+	if err != nil {
+		t.Fatalf("hold chat row: %v", err)
+	}
+	lockReleased := false
+	releaseLock := func() {
+		if !lockReleased {
+			release()
+			lockReleased = true
+		}
+	}
+	defer releaseLock()
+
+	type restrictionResult struct {
+		changed bool
+		err     error
+	}
+	restrictionDone := make(chan struct{})
+	var restriction restrictionResult
+	go func() {
+		_, restriction.changed, restriction.err = s.SetChatDefaultBannedRights(ctx, chat.ID, owner.ID, []string{"send_polls"})
+		close(restrictionDone)
+	}()
+	if err = store.WaitForLockWaiters(ctx, s, 1); err != nil {
+		releaseLock()
+		<-restrictionDone
+		t.Fatalf("wait for restriction to block on chat row: %v", err)
+	}
+
+	type createResult struct {
+		poll      store.Poll
+		duplicate bool
+		err       error
+	}
+	createDone := make(chan struct{})
+	var created createResult
+	go func() {
+		created.poll, created.duplicate, created.err = s.CreatePoll(ctx, sender.ID, ref, ordinaryPollDraft())
+		close(createDone)
+	}()
+	blocked, waitErr := waitForLockWaiterOrDone(ctx, s, 2, createDone)
+	if waitErr != nil {
+		releaseLock()
+		<-restrictionDone
+		<-createDone
+		t.Fatalf("wait for restriction and create to serialize: %v", waitErr)
+	}
+	if !blocked {
+		releaseLock()
+		<-restrictionDone
+		if created.err == nil {
+			t.Fatal("poll creation completed while the restriction held the chat row")
+		}
+		t.Fatalf("poll creation completed before the restriction: %v", created.err)
+	}
+
+	releaseLock()
+	<-restrictionDone
+	if restriction.err != nil || !restriction.changed {
+		t.Fatalf("set send_polls restriction = changed %v err %v", restriction.changed, restriction.err)
+	}
+	<-createDone
+	if !errors.Is(created.err, store.ErrChatWriteForbidden) {
+		t.Fatalf("poll create after committed restriction = %v, want ErrChatWriteForbidden", created.err)
+	}
+	if got := pollRowCount(t, s); got != 0 {
+		t.Fatalf("restricted create left %d polls, want none", got)
 	}
 }
 
@@ -423,6 +536,124 @@ func TestPollCleanupKeepsAnotherPeersRetainedCopy(t *testing.T) {
 	}
 }
 
+func TestConcurrentLastCopyDeletesSerializePollCleanup(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551400018")
+	member := mustUser(t, s, "+15551400019")
+	chat := chatWith(t, s, creator, member)
+	message, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: creator.ID, Text: "poll", RandomID: 140010})
+	creatorRef := store.PollMessageRef{PeerType: store.PeerTypeChat, PeerID: chat.ID, LocalID: message.LocalID}
+	poll, _, err := s.CreatePoll(ctx, creator.ID, creatorRef, ordinaryPollDraft())
+	if err != nil {
+		t.Fatalf("create poll: %v", err)
+	}
+	memberHistory, err := s.History(ctx, member.ID, store.PeerTypeChat, chat.ID, 0, 10)
+	if err != nil || len(memberHistory) != 1 {
+		t.Fatalf("member history = %d messages, err=%v", len(memberHistory), err)
+	}
+	memberRef := store.PollMessageRef{PeerType: store.PeerTypeChat, PeerID: chat.ID, LocalID: memberHistory[0].LocalID}
+	if _, err = s.CastPollVote(ctx, member.ID, memberRef, [][]byte{[]byte("a")}); err != nil {
+		t.Fatalf("record vote before deletes: %v", err)
+	}
+
+	first, err := store.StorePool(s).Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin first delete: %v", err)
+	}
+	defer func() { _ = first.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	second, err := store.StorePool(s).Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin second delete: %v", err)
+	}
+	defer func() { _ = second.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	if _, err = first.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, creator.ID); err != nil {
+		t.Fatalf("lock first owner: %v", err)
+	}
+	if _, err = second.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, member.ID); err != nil {
+		t.Fatalf("lock second owner: %v", err)
+	}
+	if tag, e := first.Exec(ctx, `UPDATE messages SET deleted = true WHERE owner_id = $1 AND local_id = $2 AND NOT deleted`, creator.ID, message.LocalID); e != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("delete creator copy = rows %d err %v", tag.RowsAffected(), e)
+	}
+
+	deleteDone := make(chan struct{})
+	var deleteErr error
+	go func() {
+		_, deleteErr = second.Exec(ctx, `UPDATE messages SET deleted = true WHERE owner_id = $1 AND local_id = $2 AND NOT deleted`, member.ID, memberHistory[0].LocalID)
+		close(deleteDone)
+	}()
+	blocked, waitErr := waitForLockWaiterOrDone(ctx, s, 1, deleteDone)
+	if waitErr != nil {
+		_ = first.Rollback(ctx) //nolint:errcheck // unblock second delete before failing
+		<-deleteDone
+		t.Fatalf("wait for second cleanup to lock the canonical poll: %v", waitErr)
+	}
+	if err = first.Commit(ctx); err != nil {
+		t.Fatalf("commit first copy delete: %v", err)
+	}
+	if blocked {
+		<-deleteDone
+	}
+	if deleteErr != nil {
+		t.Fatalf("delete member copy: %v", deleteErr)
+	}
+	if err = second.Commit(ctx); err != nil {
+		t.Fatalf("commit second copy delete: %v", err)
+	}
+	if got := pollRowCount(t, s); got != 0 {
+		t.Fatalf("concurrent last-copy deletes left %d poll rows, want cleanup", got)
+	}
+	var votes int64
+	if err = store.StorePool(s).QueryRow(ctx, `SELECT count(*) FROM poll_votes WHERE poll_id = $1`, poll.ID).Scan(&votes); err != nil {
+		t.Fatalf("count retained votes: %v", err)
+	}
+	if votes != 0 {
+		t.Fatalf("concurrent last-copy deletes left %d votes, want cleanup", votes)
+	}
+}
+
+func TestExpiredQuizReadRevealsKeyWithoutExplicitClose(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551400020")
+	member := mustUser(t, s, "+15551400021")
+	chat := chatWith(t, s, creator, member)
+	message, _ := sendChat(t, s, store.FanOut{ChatID: chat.ID, FromID: creator.ID, Text: "quiz", RandomID: 140011})
+	creatorRef := store.PollMessageRef{PeerType: store.PeerTypeChat, PeerID: chat.ID, LocalID: message.LocalID}
+	draft := store.PollDraft{
+		Question:         []byte("Question"),
+		Answers:          []store.PollAnswer{{Option: []byte("a"), Text: []byte("A"), Correct: true}, {Option: []byte("b"), Text: []byte("B")}},
+		Quiz:             true,
+		RevotingDisabled: true,
+		CloseDate:        func() *time.Time { date := time.Now().Add(5 * time.Minute); return &date }(),
+		Solution:         []byte("A is correct"),
+	}
+	if _, _, err := s.CreatePoll(ctx, creator.ID, creatorRef, draft); err != nil {
+		t.Fatalf("create timed quiz: %v", err)
+	}
+	memberHistory, err := s.History(ctx, member.ID, store.PeerTypeChat, chat.ID, 0, 10)
+	if err != nil || len(memberHistory) != 1 {
+		t.Fatalf("member history = %d messages, err=%v", len(memberHistory), err)
+	}
+	memberRef := store.PollMessageRef{PeerType: store.PeerTypeChat, PeerID: chat.ID, LocalID: memberHistory[0].LocalID}
+	if _, err = store.StorePool(s).Exec(ctx, `UPDATE polls SET close_date = clock_timestamp() - interval '1 second' WHERE creator_id = $1`, creator.ID); err != nil {
+		t.Fatalf("expire quiz deadline: %v", err)
+	}
+	view, err := s.PollForMessage(ctx, member.ID, memberRef)
+	if err != nil {
+		t.Fatalf("read expired quiz: %v", err)
+	}
+	if !view.Closed || !pollAnswer(t, view, "a").Correct || string(view.Solution) != "A is correct" {
+		t.Fatalf("expired quiz view = %+v, want effective closed state and revealed answer key", view)
+	}
+	if _, err = s.CastPollVote(ctx, member.ID, memberRef, [][]byte{[]byte("a")}); !errors.Is(err, store.ErrPollClosed) {
+		t.Fatalf("vote after expiry = %v, want ErrPollClosed", err)
+	}
+}
+
 type pollUpdateState struct {
 	pts    int
 	events int
@@ -475,5 +706,30 @@ func assertPollUpdateStateUnchanged(t *testing.T, s *store.Store, before map[int
 		if got := capturePollUpdateState(t, s, userID); got != prior {
 			t.Errorf("user %d update state changed: before %+v after %+v", userID, prior, got)
 		}
+	}
+}
+
+func waitForLockWaiterOrDone(ctx context.Context, s *store.Store, minWaiters int, done <-chan struct{}) (bool, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		select {
+		case <-done:
+			return false, nil
+		default:
+		}
+		var waiters int
+		if err := store.StorePool(s).QueryRow(ctx,
+			`SELECT count(*) FROM pg_stat_activity
+			 WHERE datname = current_database() AND wait_event_type = 'Lock'`,
+		).Scan(&waiters); err != nil {
+			return false, err
+		}
+		if waiters >= minWaiters {
+			return true, nil
+		}
+		if time.Now().After(deadline) {
+			return false, fmt.Errorf("waited 10s for %d lock waiters", minWaiters)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }

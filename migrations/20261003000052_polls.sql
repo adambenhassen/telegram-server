@@ -74,11 +74,22 @@ DECLARE
     removed_poll_id BIGINT;
 BEGIN
     IF NOT OLD.deleted AND NEW.deleted THEN
-        DELETE FROM poll_message_copies
-         WHERE owner_id = NEW.owner_id AND local_id = NEW.local_id
-         RETURNING poll_id INTO removed_poll_id;
+        SELECT poll_id INTO removed_poll_id
+          FROM poll_message_copies
+         WHERE owner_id = NEW.owner_id AND local_id = NEW.local_id;
 
         IF removed_poll_id IS NOT NULL THEN
+            -- Every cleanup locks the canonical row before removing a copy
+            -- reference. Concurrent last-copy deletes then observe each
+            -- other's committed removal in sequence instead of both keeping
+            -- the poll because the other reference is still uncommitted.
+            PERFORM 1 FROM polls WHERE id = removed_poll_id FOR UPDATE;
+
+            DELETE FROM poll_message_copies
+             WHERE owner_id = NEW.owner_id
+               AND local_id = NEW.local_id
+               AND poll_id = removed_poll_id;
+
             DELETE FROM polls p
              WHERE p.id = removed_poll_id
                AND NOT EXISTS (

@@ -99,6 +99,21 @@ func (s *Store) CreatePoll(ctx context.Context, creatorID int64, ref PollMessage
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
 	qtx := s.q.WithTx(tx)
+	var lockedChat db.Chat
+	if ref.PeerType == PeerTypeChat {
+		if err = pollPeerAccess(ctx, qtx, creatorID, ref); err != nil {
+			return Poll{}, false, err
+		}
+		// Match chat fan-out lock order: hold the chat row before taking any
+		// per-owner locks, so poll admission observes rights changes in sequence.
+		lockedChat, err = qtx.ChatByIDForUpdate(ctx, ref.PeerID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return Poll{}, false, ErrNotMember
+		case err != nil:
+			return Poll{}, false, fmt.Errorf("lock poll chat: %w", err)
+		}
+	}
 
 	msg, copies, err := lockPollMessage(ctx, tx, qtx, creatorID, ref)
 	if err != nil {
@@ -106,10 +121,6 @@ func (s *Store) CreatePoll(ctx context.Context, creatorID int64, ref PollMessage
 	}
 	if !msg.Out || msg.FromID != creatorID {
 		return Poll{}, false, ErrMessageInvalid
-	}
-	canonical, err := normalizePollDraft(draft, s.now())
-	if err != nil {
-		return Poll{}, false, err
 	}
 	if msg.RandomID != 0 {
 		prior, e := qtx.PollByCreatorRandomID(ctx, db.PollByCreatorRandomIDParams{
@@ -133,14 +144,12 @@ func (s *Store) CreatePoll(ctx context.Context, creatorID int64, ref PollMessage
 			return Poll{}, false, fmt.Errorf("poll create dedup lookup: %w", e)
 		}
 	}
+	canonical, err := normalizePollDraft(draft, s.now())
+	if err != nil {
+		return Poll{}, false, err
+	}
 	if ref.PeerType == PeerTypeChat {
-		chat, e := qtx.ChatByID(ctx, ref.PeerID)
-		switch {
-		case errors.Is(e, pgx.ErrNoRows):
-			return Poll{}, false, ErrNotMember
-		case e != nil:
-			return Poll{}, false, fmt.Errorf("load poll chat: %w", e)
-		case creatorID != chat.CreatorID && hasChatRight(chat.DefaultBannedRights, "send_polls"):
+		if creatorID != lockedChat.CreatorID && hasChatRight(lockedChat.DefaultBannedRights, "send_polls") {
 			return Poll{}, false, ErrChatWriteForbidden
 		}
 	}
@@ -644,6 +653,10 @@ func samePollSelection(previous [][]byte, selected [][]byte) bool {
 }
 
 func pollView(ctx context.Context, q *db.Queries, row db.Poll, viewerID int64) (Poll, error) {
+	closed, err := q.PollIsClosed(ctx, row.ID)
+	if err != nil {
+		return Poll{}, fmt.Errorf("poll closed state: %w", err)
+	}
 	voterCount, err := q.PollVoterCount(ctx, row.ID)
 	if err != nil {
 		return Poll{}, fmt.Errorf("poll voter count: %w", err)
@@ -657,7 +670,7 @@ func pollView(ctx context.Context, q *db.Queries, row db.Poll, viewerID int64) (
 	if err != nil {
 		return Poll{}, fmt.Errorf("poll option results: %w", err)
 	}
-	reveal := row.Closed || hasVoted
+	reveal := closed || hasVoted
 	poll := Poll{
 		ID:               row.ID,
 		Creator:          row.CreatorID == viewerID,
@@ -668,7 +681,7 @@ func pollView(ctx context.Context, q *db.Queries, row db.Poll, viewerID int64) (
 		OpenAnswers:      false,
 		ShuffleAnswers:   row.ShuffleAnswers,
 		RevotingDisabled: row.RevotingDisabled,
-		Closed:           row.Closed,
+		Closed:           closed,
 		HasVoted:         hasVoted,
 		VoterCount:       voterCount,
 	}
