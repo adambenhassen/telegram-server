@@ -310,6 +310,4 @@ make sqlc        # regenerate internal/store/db (alias: make generate)
 
 ## License
 
-telegram-server is source-available under the PolyForm Noncommercial License 1.0.0. Commercial use requires permission from the author. See LICENSE.md.
-
-This license applies to every version of telegram-server, including all commits made before LICENSE.md was added.
+telegram-server is licensed under the GNU Affero General Public License v3.0 or later. See LICENSE. This license applies to every version of telegram-server, including all commits made before LICENSE was added.
