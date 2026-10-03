@@ -531,6 +531,119 @@ def calls_named_in_function(
     return matches
 
 
+def function_literal_scopes(
+    tree: SourceTree, function: SourceFunction
+) -> list[tuple[int, int]] | None:
+    if function.end_line is None:
+        return None
+    body_lines = tree.code_lines[function.path][
+        function.declaration_line : function.end_line
+    ]
+    source = "\n".join(body_lines)
+    body_start_line = function.declaration_line + 1
+    scopes: list[tuple[int, int]] = []
+    headers: list[tuple[int, int]] = []
+    for match in re.finditer(r"\bfunc\s*\(", source):
+        if any(start <= match.start() < body_open for start, body_open in headers):
+            continue
+        opening = match.end() - 1
+        closing = matching_delimiter(source, opening, "(", ")")
+        if closing is None:
+            return None
+        cursor = closing + 1
+        body_open: int | None = None
+        parentheses = 0
+        brackets = 0
+        previous = ")"
+        while cursor < len(source):
+            character = source[cursor]
+            if character == "\n" and parentheses == 0 and brackets == 0:
+                if previous.isalnum() or previous in "_)]}":
+                    break
+            if character == ";" and parentheses == 0 and brackets == 0:
+                break
+            if character == "(":
+                parentheses += 1
+            elif character == ")" and parentheses:
+                parentheses -= 1
+            elif character == "[":
+                brackets += 1
+            elif character == "]" and brackets:
+                brackets -= 1
+            elif character == "{" and parentheses == 0 and brackets == 0:
+                prefix = source[:cursor].rstrip()
+                if re.search(r"\b(?:struct|interface)\s*$", prefix):
+                    type_end = matching_delimiter(source, cursor, "{", "}")
+                    if type_end is None:
+                        return None
+                    previous = "}"
+                    cursor = type_end + 1
+                    continue
+                body_open = cursor
+                break
+            if not character.isspace():
+                previous = character
+            cursor += 1
+        if body_open is None:
+            continue
+        body_close = matching_delimiter(source, body_open, "{", "}")
+        if body_close is None:
+            return None
+        headers.append((match.start(), body_open))
+        scopes.append(
+            (
+                body_start_line + source.count("\n", 0, match.start()),
+                body_start_line + source.count("\n", 0, body_close),
+            )
+        )
+    return scopes
+
+
+def function_literal_scopes_at(
+    tree: SourceTree, function: SourceFunction, line_number: int
+) -> list[tuple[int, int]] | None:
+    scopes = function_literal_scopes(tree, function)
+    if scopes is None:
+        return None
+    return [scope for scope in scopes if scope[0] <= line_number <= scope[1]]
+
+
+def line_is_direct_in_function(
+    tree: SourceTree, function: SourceFunction, line_number: int
+) -> bool:
+    return function_literal_scopes_at(tree, function, line_number) == []
+
+
+def line_is_in_scenario_closure(
+    tree: SourceTree, binding: ScenarioBinding, line_number: int
+) -> bool:
+    test_function = unique_function(tree, "TestSmoke")
+    return (
+        test_function is not None
+        and test_function.path == binding.test_path
+        and function_literal_scopes_at(tree, test_function, line_number)
+        == [(binding.closure_start_line, binding.closure_end_line)]
+    )
+
+
+def synchronous_call_statement(
+    tree: SourceTree, path: str, line_number: int, call: SourceCall
+) -> bool:
+    if call.end is None:
+        return False
+    code = tree.code_lines[path][line_number - 1]
+    prefix = code[: call.start].strip()
+    suffix = code[call.end + 1 :].strip()
+    if suffix not in {"", ";"}:
+        return False
+    if prefix and re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*\s*(?::=|=)",
+        prefix,
+    ) is None:
+        return False
+    return True
+
+
 def calls_named_in_tree(tree: SourceTree, name: str) -> list[tuple[str, int, SourceCall]] | None:
     matches: list[tuple[str, int, SourceCall]] = []
     for path in tree.paths:
@@ -826,6 +939,8 @@ def mapped_assertion(
 
     if second_id is None:
         if first.function == binding.root_function.name:
+            if not line_is_direct_in_function(tree, binding.root_function, first.line):
+                return None
             expected = predicted_frame(tree, binding, first)
             if expected is None or reported_location != expected:
                 return None
@@ -850,6 +965,7 @@ def mapped_assertion(
         if (
             first.function == "TestSmoke"
             and binding.closure_start_line < first.line < binding.closure_end_line
+            and line_is_in_scenario_closure(tree, binding, first.line)
             and basename_is_unique(tree, first.path)
             and reported_location == (first.path.rsplit("/", 1)[-1], first.line)
         ):
@@ -876,6 +992,7 @@ def mapped_assertion(
             helper is None
             or not is_plain_function(helper)
             or not has_helper_first(tree, helper)
+            or not line_is_direct_in_function(tree, helper, first.line)
             or not direct_assertion_for_id(tree, first, first_id)
             or binding.root_has_helper
         ):
@@ -896,6 +1013,7 @@ def mapped_assertion(
         if (
             caller_location is None
             or caller_location.function != binding.root_function.name
+            or not line_is_direct_in_function(tree, binding.root_function, caller_line)
             or not basename_is_unique(tree, caller_location.path)
             or reported_location
             != (caller_location.path.rsplit("/", 1)[-1], caller_location.line)
@@ -911,6 +1029,8 @@ def mapped_assertion(
 
     second = resolve_literal(tree, second_id)
     if second is None or first.function != binding.root_function.name:
+        return None
+    if not line_is_direct_in_function(tree, binding.root_function, first.line):
         return None
     expected = predicted_frame(tree, binding, first)
     if expected is None or reported_location != expected:
@@ -943,10 +1063,17 @@ def mapped_assertion(
             or (helper_calls[0][1].arguments or ())[check_parameter].strip() != "callsiteID"
         ):
             return None
+        hop_line, hop_call = helper_calls[0]
+        if (
+            not line_is_direct_in_function(tree, helper, hop_line)
+            or not synchronous_call_statement(tree, helper.path, hop_line, hop_call)
+        ):
+            return None
     if (
         not has_helper_first(tree, helper)
         or not has_helper_first(tree, check_helper)
         or second.function != check_helper.name
+        or not line_is_direct_in_function(tree, check_helper, second.line)
         or not helper_assertion_for_id(tree, second, second_id)
     ):
         return None

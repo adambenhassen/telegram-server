@@ -290,6 +290,31 @@ EOF
         '    waitForSmokeOwnerLock(t, nil, nil, false, "peer-disconnect.message-blocker-clear-confirm")' \
         $'    waitForSmokeOwnerLock(\n        t,\n        nil,\n        nil,\n        false,\n        "peer-disconnect.message-blocker-clear-confirm",\n    )'
       ;;
+    root-callsite-in-cleanup-closure)
+      replace_fixture_text "$rpc_fixture" \
+        '    waitForSmokeOwnerLock(t, nil, nil, false, "peer-disconnect.message-blocker-clear-confirm")' \
+        $'    t.Cleanup(func() {\n        waitForSmokeOwnerLock(t, nil, nil, false, "peer-disconnect.message-blocker-clear-confirm")\n    })'
+      ;;
+    direct-root-check-in-cleanup-closure)
+      replace_fixture_text "$rpc_fixture" \
+        '    t.Fatalf("[assert:peer-disconnect.initial-state] initial state: %v", "fixture")' \
+        $'    t.Cleanup(func() {\n        t.Fatalf("[assert:peer-disconnect.initial-state] initial state: %v", "fixture")\n    })'
+      ;;
+    helper-check-in-cleanup-closure)
+      replace_fixture_text "$rpc_fixture" \
+        '        t.Fatalf("[assert:%s/peer-disconnect.owner-lock-state] owner lock state %t", callsiteID, wantBlocked)' \
+        $'        t.Cleanup(func() {\n            t.Fatalf("[assert:%s/peer-disconnect.owner-lock-state] owner lock state %t", callsiteID, wantBlocked)\n        })'
+      ;;
+    inspection-check-in-cleanup-closure)
+      replace_fixture_text "$rpc_fixture" \
+        '    t.Fatalf("[assert:%s/peer-disconnect.owner-lock-inspection] inspect owner lock", callsiteID)' \
+        $'    t.Cleanup(func() {\n        t.Fatalf("[assert:%s/peer-disconnect.owner-lock-inspection] inspect owner lock", callsiteID)\n    })'
+      ;;
+    goroutine-check-hop)
+      replace_fixture_text "$rpc_fixture" \
+        '    smokeOwnerLockCount(t, ctx, lock, callsiteID)' \
+        '    go smokeOwnerLockCount(t, ctx, lock, callsiteID)'
+      ;;
     root-signature-mismatch)
       replace_fixture_text "$smoke_fixture" \
         'func TestSmoke(t *testing.T)' 'func TestSmoke(t testing.TB)'
@@ -586,6 +611,16 @@ assert_unavailable_case root-helper-missing-helper-marker \
   "$callsite_one/$owner_lock_state" 'smoke_test.go:79' helper-no-helper
 assert_unavailable_case check-helper-missing-helper-marker \
   "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' check-helper-no-helper
+assert_unavailable_case root-callsite-in-cleanup-closure \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' root-callsite-in-cleanup-closure
+assert_unavailable_case direct-root-check-in-cleanup-closure \
+  "$direct_id" 'smoke_test.go:79' direct-root-check-in-cleanup-closure
+assert_unavailable_case helper-check-in-cleanup-closure \
+  "$callsite_one/$owner_lock_state" 'smoke_test.go:79' helper-check-in-cleanup-closure
+assert_unavailable_case inspection-check-in-cleanup-closure \
+  "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' inspection-check-in-cleanup-closure
+assert_unavailable_case goroutine-check-hop \
+  "$callsite_one/$owner_lock_inspection" 'smoke_test.go:79' goroutine-check-hop
 
 assert_unavailable_case scenario-closure-has-no-root-call \
   "$callsite_one/$owner_lock_state" 'smoke_test.go:79' closure-zero-call
