@@ -186,8 +186,8 @@ func TestGetStateWithoutUpdateStatePreservesBaseline(t *testing.T) {
 	if !ok {
 		t.Fatalf("get state result = %T, want *tg.UpdatesState", stateEnc)
 	}
-	if state.Pts != 0 || state.UnreadCount != 0 {
-		t.Fatalf("getState state = %+v, want pts=0 unread=0", state)
+	if state.Pts != 0 || state.UnreadCount != 1 {
+		t.Fatalf("getState state = %+v, want pts=0 unread=1", state)
 	}
 
 	peerEnc, err := api.GetPeerDialogsForTest(s, recipient.ID, &tg.MessagesGetPeerDialogsRequest{

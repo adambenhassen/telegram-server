@@ -616,6 +616,40 @@ func TestChannelPostSummaryReadinessDistinguishesEmptyMissingAndWrongVersion(t *
 	}
 }
 
+func TestExplicitUnreadSurfacesFailWhenSummariesAreNotReady(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := context.Background()
+	creator := mustUser(t, s, "+15551269051")
+	reader := mustUser(t, s, "+15551269052")
+	channel := mustChannel(t, s, creator.ID, "summary-surface-not-ready")
+	invite, err := s.CreateChannelInvite(ctx, channel.ID, creator.ID)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if _, _, err = s.JoinChannelByInvite(ctx, invite, reader.ID); err != nil {
+		t.Fatalf("join reader: %v", err)
+	}
+	post(t, s, channel.ID, creator.ID, "unread", 72351)
+	if err = store.ExecChannelPostSummarySQL(ctx, s,
+		`UPDATE channel_post_summary_state SET ready = false WHERE channel_id = $1`, channel.ID); err != nil {
+		t.Fatalf("mark summaries not ready: %v", err)
+	}
+
+	if _, err = s.ChannelDialogsForUser(ctx, reader.ID); !errors.Is(err, store.ErrChannelPostSummaryNotReady) {
+		t.Fatalf("channel dialogs with unready summaries = %v, want not-ready refusal", err)
+	}
+	if _, _, err := s.ChannelFullInfoForViewer(ctx, channel.ID, reader.ID); !errors.Is(err, store.ErrChannelPostSummaryNotReady) {
+		t.Fatalf("full-channel info with unready summaries = %v, want not-ready refusal", err)
+	}
+	if _, err = s.PeerDialogsSnapshot(ctx, reader.ID, []store.PeerDialogKey{{PeerType: store.PeerTypeChannel, PeerID: channel.ID}}); !errors.Is(err, store.ErrChannelPostSummaryNotReady) {
+		t.Fatalf("peer dialogs with unready summaries = %v, want not-ready refusal", err)
+	}
+	if _, err = s.State(ctx, reader.ID); !errors.Is(err, store.ErrChannelPostSummaryNotReady) {
+		t.Fatalf("account state with unready summaries = %v, want not-ready refusal", err)
+	}
+}
+
 func TestChannelPostSummaryFailedRebuildStaysUnavailableAndRetries(t *testing.T) {
 	t.Parallel()
 	s := open(t)

@@ -55,6 +55,7 @@ const channelPostSummarySchemaInstalled = `-- name: ChannelPostSummarySchemaInst
 SELECT to_regclass('public.channel_read_state') IS NOT NULL
    AND to_regclass('public.channel_post_summary_state') IS NOT NULL
    AND to_regclass('public.channel_post_summaries') IS NOT NULL
+   AND to_regprocedure('public.channel_post_unread_suffix_counts(bigint,bigint,bigint)') IS NOT NULL
 `
 
 func (q *Queries) ChannelPostSummarySchemaInstalled(ctx context.Context) (*bool, error) {
@@ -82,58 +83,17 @@ func (q *Queries) ChannelPostSummaryUnavailableChannels(ctx context.Context) (in
 }
 
 const channelPostUnreadSuffixCounts = `-- name: ChannelPostUnreadSuffixCounts :one
-WITH member AS MATERIALIZED (
-    SELECT participant.user_id
-    FROM channel_participants AS participant
-    WHERE participant.channel_id = $1::bigint
-      AND participant.user_id = $2::bigint
-      AND (participant.banned_until IS NULL OR participant.banned_until <= now())
-), summary_state AS MATERIALIZED (
-    SELECT state.version, state.ready
-    FROM channel_post_summary_state AS state
-    WHERE state.channel_id = $1::bigint
-), suffix_keys AS MATERIALIZED (
-    SELECT 0::smallint AS depth, 0::bigint AS prefix
-    WHERE $3::bigint = 0
-    UNION ALL
-    SELECT bits.depth::smallint AS depth,
-           ((($3::bigint >> (64 - bits.depth)) << 1) | 1)::bigint AS prefix
-    FROM generate_series(1, 63) AS bits(depth)
-    WHERE $3::bigint > 0
-      AND (($3::bigint >> (63 - bits.depth)) & 1) = 0
-)
-SELECT EXISTS (SELECT 1 FROM member) AS entitled,
-       EXISTS (SELECT 1 FROM summary_state) AS status_exists,
-       COALESCE((SELECT version FROM summary_state), 0)::smallint AS version,
-       COALESCE((SELECT ready FROM summary_state), false)::boolean AS ready,
-       COALESCE((
-           SELECT sum((
-               SELECT summary.live_count
-               FROM channel_post_summaries AS summary
-               WHERE summary.channel_id = $1::bigint
-                 AND summary.scope_kind = 0
-                 AND summary.author_id = 0
-                 AND summary.depth = suffix_key.depth
-                 AND summary.prefix = suffix_key.prefix
-           ))::bigint
-           FROM suffix_keys AS suffix_key
-           WHERE EXISTS (SELECT 1 FROM member)
-             AND EXISTS (SELECT 1 FROM summary_state WHERE version = 1 AND ready)
-       ), 0)::bigint AS total_live,
-       COALESCE((
-           SELECT sum((
-               SELECT summary.live_count
-               FROM channel_post_summaries AS summary
-               WHERE summary.channel_id = $1::bigint
-                 AND summary.scope_kind = 1
-                 AND summary.author_id = member.user_id
-                 AND summary.depth = suffix_key.depth
-                 AND summary.prefix = suffix_key.prefix
-           ))::bigint
-           FROM member
-           CROSS JOIN suffix_keys AS suffix_key
-           WHERE EXISTS (SELECT 1 FROM summary_state WHERE version = 1 AND ready)
-       ), 0)::bigint AS author_live
+SELECT summary.entitled::boolean AS entitled,
+       summary.status_exists::boolean AS status_exists,
+       summary.summary_version::smallint AS version,
+       summary.summary_ready::boolean AS ready,
+       summary.total_live::bigint AS total_live,
+       summary.author_live::bigint AS author_live
+FROM channel_post_unread_suffix_counts(
+    $1::bigint,
+    $2::bigint,
+    $3::bigint
+) AS summary(entitled, status_exists, summary_version, summary_ready, total_live, author_live)
 `
 
 type ChannelPostUnreadSuffixCountsParams struct {

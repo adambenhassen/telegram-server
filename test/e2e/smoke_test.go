@@ -1323,28 +1323,33 @@ func testSmokeChannel(t *testing.T) {
 	if joinedID := importChannelInvite(t, f.ctx, subscriber.cmds, hash); joinedID != channelID {
 		t.Fatalf("subscriber joined channel %d, want %d", joinedID, channelID)
 	}
+	subscriberOtherSession := newSmokeClient(t, f, "B2", phoneSubscriber)
 
-	const post = "channel-smoke"
-	execChannel(t, f.ctx, creator.cmds, func(ctx context.Context, api *tg.Client) error {
-		_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:     peerChannel(creator.id, channelID),
-			Message:  post,
-			RandomID: 1048001,
+	posts := []string{"channel-smoke-one", "channel-smoke-two"}
+	postIDs := make(map[string]int, len(posts))
+	for i, post := range posts {
+		randomID := int64(1048001 + i)
+		execChannel(t, f.ctx, creator.cmds, func(ctx context.Context, api *tg.Client) error {
+			_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+				Peer:     peerChannel(creator.id, channelID),
+				Message:  post,
+				RandomID: randomID,
+			})
+			return err
 		})
-		return err
-	})
-
-	update := recvOrCtx(t, f.ctx, subscriber.seen.newChannelMsg, "subscriber channel update")
-	if update.Msg.Message != post || update.Msg.ID <= 0 {
-		t.Fatalf("subscriber channel message = {text:%q id:%d}, want {%q, positive id}", update.Msg.Message, update.Msg.ID, post)
-	}
-	peer, ok := update.Msg.PeerID.(*tg.PeerChannel)
-	if !ok || peer.ChannelID != channelID {
-		t.Fatalf("subscriber channel peer = %+v, want channel %d", update.Msg.PeerID, channelID)
-	}
-	from, ok := update.Msg.FromID.(*tg.PeerUser)
-	if !ok || from.UserID != creator.id {
-		t.Fatalf("subscriber channel sender = %+v, want creator %d", update.Msg.FromID, creator.id)
+		update := recvOrCtx(t, f.ctx, subscriber.seen.newChannelMsg, "subscriber channel update")
+		if update.Msg.Message != post || update.Msg.ID <= 0 {
+			t.Fatalf("subscriber channel message = {text:%q id:%d}, want {%q, positive id}", update.Msg.Message, update.Msg.ID, post)
+		}
+		peer, ok := update.Msg.PeerID.(*tg.PeerChannel)
+		if !ok || peer.ChannelID != channelID {
+			t.Fatalf("subscriber channel peer = %+v, want channel %d", update.Msg.PeerID, channelID)
+		}
+		from, ok := update.Msg.FromID.(*tg.PeerUser)
+		if !ok || from.UserID != creator.id {
+			t.Fatalf("subscriber channel sender = %+v, want creator %d", update.Msg.FromID, creator.id)
+		}
+		postIDs[post] = update.Msg.ID
 	}
 	noDuplicate := time.NewTimer(50 * time.Millisecond)
 	defer noDuplicate.Stop()
@@ -1368,38 +1373,85 @@ func testSmokeChannel(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("channel history response = %T, want *tg.MessagesChannelMessages", result)
 		}
-		if len(history.Messages) != 2 {
-			return fmt.Errorf("channel history count = %d, want the creation service message and first post", len(history.Messages))
+		if len(history.Messages) != len(posts)+1 {
+			return fmt.Errorf("channel history count = %d, want %d posts plus creation service message", len(history.Messages), len(posts))
 		}
-		message, ok := history.Messages[0].(*tg.Message)
-		if !ok {
-			return fmt.Errorf("channel history message = %T, want *tg.Message", history.Messages[0])
+		var sawCreate bool
+		for _, class := range history.Messages {
+			if service, ok := class.(*tg.MessageService); ok {
+				action, actionOK := service.Action.(*tg.MessageActionChannelCreate)
+				if !actionOK || service.ID != 1 || action.Title != "Smoke channel" {
+					return fmt.Errorf("channel history create service = %+v, want channel creation at id 1", service)
+				}
+				sawCreate = true
+				continue
+			}
+			message, ok := class.(*tg.Message)
+			if !ok {
+				return fmt.Errorf("channel history message = %T, want *tg.Message", class)
+			}
+			wantID, ok := postIDs[message.Message]
+			if !ok || message.ID != wantID || message.Out {
+				return fmt.Errorf("channel history message = {text:%q id:%d out:%v}, want a known post id and out:false", message.Message, message.ID, message.Out)
+			}
+			peer, ok := message.PeerID.(*tg.PeerChannel)
+			if !ok || peer.ChannelID != channelID {
+				return fmt.Errorf("channel history peer = %+v, want channel %d", message.PeerID, channelID)
+			}
+			from, ok := message.FromID.(*tg.PeerUser)
+			if !ok || from.UserID != creator.id {
+				return fmt.Errorf("channel history sender = %+v, want creator %d", message.FromID, creator.id)
+			}
 		}
-		if message.Message != post || message.ID != update.Msg.ID || message.Out {
-			return fmt.Errorf("channel history message = {text:%q id:%d out:%v}, want {%q id:%d out:false}", message.Message, message.ID, message.Out, post, update.Msg.ID)
-		}
-		peer, ok := message.PeerID.(*tg.PeerChannel)
-		if !ok || peer.ChannelID != channelID {
-			return fmt.Errorf("channel history peer = %+v, want channel %d", message.PeerID, channelID)
-		}
-		from, ok := message.FromID.(*tg.PeerUser)
-		if !ok || from.UserID != creator.id {
-			return fmt.Errorf("channel history sender = %+v, want creator %d", message.FromID, creator.id)
+		if !sawCreate {
+			return errors.New("channel history omitted creation service message")
 		}
 		return nil
 	}); err != nil {
 		t.Fatalf("subscriber getHistory: %v", err)
 	}
 
+	checkChannelReadState := func(client *smokeClient, wantMarker, wantUnread int) {
+		t.Helper()
+		if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+			dialog, err := smokeChannelDialog(ctx, api, channelID)
+			if err != nil {
+				return err
+			}
+			if dialog.ReadInboxMaxID != wantMarker || dialog.UnreadCount != wantUnread {
+				return fmt.Errorf("getDialogs channel read state = marker %d unread %d, want %d/%d", dialog.ReadInboxMaxID, dialog.UnreadCount, wantMarker, wantUnread)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("%s channel read state: %v", client.label, err)
+		}
+	}
+	checkChannelReadState(subscriber, 1, 2)
+
+	secondPostID := postIDs[posts[1]]
 	if err := subscriber.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
-		exported, err := api.ChannelsExportMessageLink(ctx, &tg.ChannelsExportMessageLinkRequest{
-			Channel: inputChannel(subscriber.id, channelID),
-			ID:      update.Msg.ID,
+		ok, err := api.ChannelsReadHistory(ctx, &tg.ChannelsReadHistoryRequest{
+			Channel: inputChannel(subscriber.id, channelID), MaxID: secondPostID,
 		})
 		if err != nil {
 			return err
 		}
-		want := testPublicLinkPrefix + "c/" + strconv.FormatInt(channelID, 10) + "/" + strconv.Itoa(update.Msg.ID)
+		if !ok {
+			return errors.New("channels.readHistory returned false")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("subscriber channels.readHistory: %v", err)
+	}
+	if err := subscriber.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		exported, err := api.ChannelsExportMessageLink(ctx, &tg.ChannelsExportMessageLinkRequest{
+			Channel: inputChannel(subscriber.id, channelID),
+			ID:      secondPostID,
+		})
+		if err != nil {
+			return err
+		}
+		want := testPublicLinkPrefix + "c/" + strconv.FormatInt(channelID, 10) + "/" + strconv.Itoa(secondPostID)
 		if exported.Link != want {
 			return fmt.Errorf("exported channel message link = %q, want %q", exported.Link, want)
 		}
@@ -1407,7 +1459,36 @@ func testSmokeChannel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("subscriber exportMessageLink: %v", err)
 	}
+	checkChannelReadState(subscriber, secondPostID, 0)
+	if err := subscriberOtherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		result, err := api.ChannelsGetFullChannel(ctx, inputChannel(subscriberOtherSession.id, channelID))
+		if err != nil {
+			return err
+		}
+		full, ok := result.FullChat.(*tg.ChannelFull)
+		if !ok {
+			return fmt.Errorf("other-session getFullChannel = %T, want *tg.ChannelFull", result.FullChat)
+		}
+		if full.ReadInboxMaxID != secondPostID || full.UnreadCount != 0 {
+			return fmt.Errorf("other-session full channel read state = marker %d unread %d, want %d/0", full.ReadInboxMaxID, full.UnreadCount, secondPostID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("subscriber other-session getFullChannel: %v", err)
+	}
 
+	const laterPost = "channel-smoke-three"
+	execChannel(t, f.ctx, creator.cmds, func(ctx context.Context, api *tg.Client) error {
+		_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer: peerChannel(creator.id, channelID), Message: laterPost, RandomID: 1048003,
+		})
+		return err
+	})
+	laterUpdate := recvOrCtx(t, f.ctx, subscriber.seen.newChannelMsg, "subscriber later channel update")
+	if laterUpdate.Msg.Message != laterPost || laterUpdate.Msg.ID <= secondPostID {
+		t.Fatalf("later channel post = {text:%q id:%d}, want %q with id above %d", laterUpdate.Msg.Message, laterUpdate.Msg.ID, laterPost, secondPostID)
+	}
+	checkChannelReadState(subscriber, secondPostID, 1)
 	if err := creator.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		fullResult, err := api.ChannelsGetFullChannel(ctx, inputChannel(creator.id, channelID))
 		if err != nil {
@@ -2168,6 +2249,36 @@ func smokeGroupDialog(ctx context.Context, api *tg.Client, chatID int64) (*tg.Di
 		}
 	}
 	return nil, fmt.Errorf("getDialogs omitted chat %d", chatID)
+}
+
+func smokeChannelDialog(ctx context.Context, api *tg.Client, channelID int64) (*tg.Dialog, error) {
+	result, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+		OffsetPeer: &tg.InputPeerEmpty{},
+		Limit:      20,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var dialogs []tg.DialogClass
+	switch response := result.(type) {
+	case *tg.MessagesDialogs:
+		dialogs = response.Dialogs
+	case *tg.MessagesDialogsSlice:
+		dialogs = response.Dialogs
+	default:
+		return nil, fmt.Errorf("getDialogs response = %T, want MessagesDialogs or MessagesDialogsSlice", result)
+	}
+	for _, entry := range dialogs {
+		dialog, ok := entry.(*tg.Dialog)
+		if !ok {
+			continue
+		}
+		peer, ok := dialog.Peer.(*tg.PeerChannel)
+		if ok && peer.ChannelID == channelID {
+			return dialog, nil
+		}
+	}
+	return nil, fmt.Errorf("getDialogs omitted channel %d", channelID)
 }
 
 func verifySmokeGroupHistory(

@@ -39,6 +39,8 @@ import (
 // cycle either. Every admission path takes existing channel-specific locks
 // before account advisory locks; CreateChannel is the only path with no
 // existing channel-specific lock.
+// ReadChannelHistory takes LockChannel before channel_state, matching rights
+// changes and serializing its membership decision with ban/removal.
 //
 // EditChannelUsername takes an advisory lock (pg_advisory_xact_lock on channelID)
 // first, then the channels row lock (LockChannel). The advisory lock serialises
@@ -573,6 +575,9 @@ func (s *Store) JoinChannelByInvite(ctx context.Context, hash string, userID int
 		member = db.ChannelParticipant{
 			ChannelID: invite.ChannelID, UserID: userID, Role: 0, JoinPts: state.Pts,
 		}
+		if err := insertInitialChannelReadState(ctx, qtx, invite.ChannelID, userID, state.NextLocalID-1); err != nil {
+			return Channel{}, ChannelMember{}, fmt.Errorf("insert initial channel read state: %w", err)
+		}
 	}
 
 	if err = tx.Commit(ctx); err != nil {
@@ -687,6 +692,9 @@ func (s *Store) AddChannelMembers(ctx context.Context, channelID, callerID int64
 		}
 		if n == 0 {
 			continue
+		}
+		if err := insertInitialChannelReadState(ctx, qtx, channelID, targetID, state.NextLocalID-1); err != nil {
+			return nil, fmt.Errorf("insert initial channel read state for target %d: %w", targetID, err)
 		}
 		added = append(added, targetID)
 		seats++
@@ -1286,10 +1294,12 @@ func (s *Store) SearchMemberChannels(
 // viewer's membership, pts, and newest non-deleted post (top message). Top is
 // nil when the channel has no posts or all posts are deleted.
 type ChannelDialogRow struct {
-	Channel Channel
-	Member  ChannelMember
-	Pts     int
-	Top     *ChannelMessage
+	Channel        Channel
+	Member         ChannelMember
+	Pts            int
+	ReadInboxMaxID int64
+	UnreadCount    int
+	Top            *ChannelMessage
 }
 
 // ChannelDialogsForUser returns every unbanned channel the user belongs to,
@@ -1303,6 +1313,20 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 	}
 	out := make([]ChannelDialogRow, len(rows))
 	for i, r := range rows {
+		exactUnread, err := channelPostUnreadSummaryCount(
+			r.SummaryEntitled,
+			r.SummaryStatusExists,
+			r.SummaryVersion,
+			r.SummaryReady,
+			r.SummaryTotalLive,
+			r.SummaryAuthorLive,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("channel %d unread summary: %w", r.ChannelID, err)
+		}
+		if int64(r.UnreadCount) != int64(saturatedChannelPostUnreadCount(exactUnread)) {
+			return nil, fmt.Errorf("%w: channel %d unread count disagrees with summary", ErrChannelPostSummaryCorrupt, r.ChannelID)
+		}
 		ch := Channel{
 			ID:                  r.ChannelID,
 			Title:               r.Title,
@@ -1321,7 +1345,13 @@ func (s *Store) ChannelDialogsForUser(ctx context.Context, userID int64) ([]Chan
 			BannedUntil: r.MemberBannedUntil,
 			JoinPts:     r.MemberJoinPts,
 		})
-		row := ChannelDialogRow{Channel: ch, Member: member, Pts: int(r.Pts)}
+		row := ChannelDialogRow{
+			Channel:        ch,
+			Member:         member,
+			Pts:            int(r.Pts),
+			ReadInboxMaxID: r.ReadInboxMaxID,
+			UnreadCount:    int(r.UnreadCount),
+		}
 		if r.TopLocalID != 0 {
 			top := channelMessageFromFields(channelMsgFields{
 				r.ChannelID,
@@ -1591,6 +1621,9 @@ func (s *Store) JoinChannelByUsername(ctx context.Context, channelID, userID int
 	} else {
 		member = db.ChannelParticipant{
 			ChannelID: channelID, UserID: userID, Role: 0, JoinPts: state.Pts,
+		}
+		if err := insertInitialChannelReadState(ctx, qtx, channelID, userID, state.NextLocalID-1); err != nil {
+			return Channel{}, ChannelMember{}, fmt.Errorf("insert initial channel read state: %w", err)
 		}
 	}
 

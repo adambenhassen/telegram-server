@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
 	"github.com/teagramhq/teagram-server/internal/store"
 )
 
@@ -64,5 +66,43 @@ func TestUpdateStateEventsSince(t *testing.T) {
 	}
 	if st.Pts != 2 {
 		t.Fatalf("pts after two events = %d, want 2", st.Pts)
+	}
+}
+
+func TestStateCountsUnreadWithoutUpdateStateRow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dsn := pgtest.DSN(t)
+	s := openStore(t, dsn)
+	creator := mustUser(t, s, "+15551239011")
+	reader := mustUser(t, s, "+15551239012")
+	channel := mustChannel(t, s, creator.ID, "missing update state")
+	invite, err := s.CreateChannelInvite(ctx, channel.ID, creator.ID)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if _, _, err = s.JoinChannelByInvite(ctx, invite, reader.ID); err != nil {
+		t.Fatalf("join channel: %v", err)
+	}
+	post(t, s, channel.ID, creator.ID, "unread post", 901101)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect to test database: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := conn.Close(ctx); closeErr != nil {
+			t.Errorf("close test database connection: %v", closeErr)
+		}
+	})
+	if _, err = conn.Exec(ctx, `DELETE FROM update_state WHERE user_id = $1`, reader.ID); err != nil {
+		t.Fatalf("remove update state row: %v", err)
+	}
+
+	state, err := s.State(ctx, reader.ID)
+	if err != nil {
+		t.Fatalf("read state without update_state row: %v", err)
+	}
+	if state.Pts != 0 || state.Qts != 0 || state.Seq != 0 || state.Date != 0 || state.UnreadCount != 1 {
+		t.Fatalf("state without update_state row = %+v, want zero update state and unread 1", state)
 	}
 }

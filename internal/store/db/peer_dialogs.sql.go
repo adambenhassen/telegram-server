@@ -11,6 +11,21 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const basicUnreadCountForOwner = `-- name: BasicUnreadCountForOwner :one
+SELECT COALESCE(SUM(dialog.unread_count), 0)::bigint AS unread_count
+FROM dialogs AS dialog
+WHERE dialog.owner_id = $1::bigint
+`
+
+// BasicUnreadCountForOwner is used by getDifference, which must preserve
+// ordinary dialog unread state without depending on channel summary readiness.
+func (q *Queries) BasicUnreadCountForOwner(ctx context.Context, ownerID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, basicUnreadCountForOwner, ownerID)
+	var unread_count int64
+	err := row.Scan(&unread_count)
+	return unread_count, err
+}
+
 const chatParticipantsByChatIDs = `-- name: ChatParticipantsByChatIDs :many
 SELECT chat_id, user_id, inviter_id, date, is_admin FROM chat_participants
 WHERE chat_id = ANY($1::bigint[])
@@ -145,6 +160,14 @@ SELECT
     p.role AS member_role,
     p.banned_until AS member_banned_until,
     p.join_pts AS member_join_pts,
+    COALESCE(read_state.read_max_id, 0)::bigint AS read_inbox_max_id,
+    unread.unread_count,
+    unread.entitled::boolean AS summary_entitled,
+    unread.status_exists::boolean AS summary_status_exists,
+    unread.summary_version::smallint AS summary_version,
+    unread.summary_ready::boolean AS summary_ready,
+    unread.total_live::bigint AS summary_total_live,
+    unread.author_live::bigint AS summary_author_live,
     cs.pts AS channel_pts,
     top.local_id AS top_local_id,
     top.from_id AS top_from_id,
@@ -158,6 +181,22 @@ SELECT
 FROM channels c
 JOIN channel_participants p ON p.channel_id = c.id
 JOIN channel_state cs ON cs.channel_id = c.id
+LEFT JOIN channel_read_state read_state
+  ON read_state.channel_id = c.id AND read_state.user_id = p.user_id
+CROSS JOIN LATERAL (
+    SELECT LEAST(GREATEST(summary.total_live - summary.author_live, 0), 1000)::int AS unread_count,
+           summary.entitled::boolean AS entitled,
+           summary.status_exists::boolean AS status_exists,
+           summary.summary_version::smallint AS summary_version,
+           summary.summary_ready::boolean AS summary_ready,
+           summary.total_live::bigint AS total_live,
+           summary.author_live::bigint AS author_live
+    FROM channel_post_unread_suffix_counts(
+        c.id,
+        p.user_id,
+        COALESCE(read_state.read_max_id, 0)
+    ) AS summary(entitled, status_exists, summary_version, summary_ready, total_live, author_live)
+) AS unread
 JOIN LATERAL (
     SELECT cm.local_id, cm.from_id, cm.date, cm.message, cm.edit_date,
            cm.random_id, cm.file_id, cm.reply_to_msg_id, cm.action_type
@@ -190,6 +229,14 @@ type PeerChannelDialogsForOwnerRow struct {
 	MemberRole                 int16
 	MemberBannedUntil          pgtype.Timestamptz
 	MemberJoinPts              int64
+	ReadInboxMaxID             int64
+	UnreadCount                int32
+	SummaryEntitled            bool
+	SummaryStatusExists        bool
+	SummaryVersion             int16
+	SummaryReady               bool
+	SummaryTotalLive           int64
+	SummaryAuthorLive          int64
 	ChannelPts                 int64
 	TopLocalID                 int64
 	TopFromID                  int64
@@ -231,6 +278,14 @@ func (q *Queries) PeerChannelDialogsForOwner(ctx context.Context, arg PeerChanne
 			&i.MemberRole,
 			&i.MemberBannedUntil,
 			&i.MemberJoinPts,
+			&i.ReadInboxMaxID,
+			&i.UnreadCount,
+			&i.SummaryEntitled,
+			&i.SummaryStatusExists,
+			&i.SummaryVersion,
+			&i.SummaryReady,
+			&i.SummaryTotalLive,
+			&i.SummaryAuthorLive,
 			&i.ChannelPts,
 			&i.TopLocalID,
 			&i.TopFromID,
@@ -299,14 +354,51 @@ func (q *Queries) PeerDialogsForOwner(ctx context.Context, arg PeerDialogsForOwn
 }
 
 const unreadCountForOwner = `-- name: UnreadCountForOwner :one
-SELECT COALESCE(SUM(unread_count), 0)::bigint
-FROM dialogs
-WHERE owner_id = $1::bigint
+WITH channel_unread AS MATERIALIZED (
+    SELECT summary.entitled::boolean AS entitled,
+           summary.status_exists::boolean AS status_exists,
+           summary.summary_version::smallint AS summary_version,
+           summary.summary_ready::boolean AS summary_ready,
+           summary.total_live::bigint AS total_live,
+           summary.author_live::bigint AS author_live,
+           LEAST(GREATEST(summary.total_live - summary.author_live, 0), 1000)::bigint AS unread_count
+    FROM channel_participants AS participant
+    LEFT JOIN channel_read_state AS read_state
+      ON read_state.channel_id = participant.channel_id
+     AND read_state.user_id = participant.user_id
+    CROSS JOIN LATERAL channel_post_unread_suffix_counts(
+        participant.channel_id,
+        participant.user_id,
+        COALESCE(read_state.read_max_id, 0)
+    ) AS summary(entitled, status_exists, summary_version, summary_ready, total_live, author_live)
+    WHERE participant.user_id = $1::bigint
+      AND (participant.banned_until IS NULL OR participant.banned_until <= now())
+)
+SELECT ((
+           SELECT COALESCE(SUM(dialog.unread_count), 0)
+           FROM dialogs AS dialog
+           WHERE dialog.owner_id = $1::bigint
+       ) + COALESCE((SELECT SUM(channel_unread.unread_count) FROM channel_unread), 0)::bigint)::bigint AS unread_count,
+       (SELECT COUNT(*)::bigint
+        FROM channel_unread
+        WHERE NOT channel_unread.entitled
+           OR NOT channel_unread.status_exists
+           OR channel_unread.summary_version <> 1
+           OR NOT channel_unread.summary_ready) AS unavailable_channel_count,
+       (SELECT COUNT(*)::bigint
+        FROM channel_unread
+        WHERE channel_unread.total_live < channel_unread.author_live) AS corrupt_channel_count
 `
 
-func (q *Queries) UnreadCountForOwner(ctx context.Context, ownerID int64) (int64, error) {
+type UnreadCountForOwnerRow struct {
+	UnreadCount             int64
+	UnavailableChannelCount int64
+	CorruptChannelCount     int64
+}
+
+func (q *Queries) UnreadCountForOwner(ctx context.Context, ownerID int64) (UnreadCountForOwnerRow, error) {
 	row := q.db.QueryRow(ctx, unreadCountForOwner, ownerID)
-	var column_1 int64
-	err := row.Scan(&column_1)
-	return column_1, err
+	var i UnreadCountForOwnerRow
+	err := row.Scan(&i.UnreadCount, &i.UnavailableChannelCount, &i.CorruptChannelCount)
+	return i, err
 }

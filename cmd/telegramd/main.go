@@ -497,6 +497,14 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if cerr := st.Close(); cerr != nil {
+			log.Error("store close", "err", cerr)
+		}
+	}()
+	if err := st.ValidateChannelPostSummariesReady(ctx); err != nil {
+		return fmt.Errorf("validate channel post summaries before startup: %w", err)
+	}
 	if err := st.RefreshCatalogSnapshot(ctx); err != nil {
 		// Catalog data is optional for the built-in English behavior. A failed
 		// refresh must not prevent the core server from starting.
@@ -505,11 +513,6 @@ func run(log *slog.Logger) error {
 	log.Info("file assembly concurrency bound",
 		"limit", st.AssemblyConcurrencyLimit(),
 		"reserved_pool_connections", st.AssemblyPoolHeadroom())
-	defer func() {
-		if cerr := st.Close(); cerr != nil {
-			log.Error("store close", "err", cerr)
-		}
-	}()
 
 	// Run the sweep under a cancelable child context and wait for it to exit
 	// before the store pool closes, so shutdown never closes the pool out from

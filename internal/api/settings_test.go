@@ -255,6 +255,11 @@ func (transport *settingsDispatcherTransport) result(t *testing.T, key crypto.Au
 
 func dispatchSettings(t *testing.T, h mtproto.Handler, method settingsHandler, userID int64, provisional bool) []byte {
 	t.Helper()
+	return dispatchSettingsWithContext(t, h, method, userID, provisional, context.Background())
+}
+
+func dispatchSettingsWithContext(t *testing.T, h mtproto.Handler, method settingsHandler, userID int64, provisional bool, ctx context.Context) []byte {
+	t.Helper()
 	key := testKey()
 	transport := &settingsDispatcherTransport{}
 	conn := mtproto.NewTestConn(transport, key)
@@ -269,7 +274,7 @@ func dispatchSettings(t *testing.T, h mtproto.Handler, method settingsHandler, u
 		Provisional: provisional,
 		MsgID:       msgID,
 		Buf:         &body,
-		Ctx:         context.Background(),
+		Ctx:         ctx,
 	}); err != nil {
 		t.Fatalf("dispatch %s: %v", method.name, err)
 	}
