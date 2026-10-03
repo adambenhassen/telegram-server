@@ -15,8 +15,9 @@ import (
 
 // Postgres LISTEN/NOTIFY channels used for cross-replica update delivery.
 const (
-	// ChannelUpdates carries user update nudges. Payloads are a user id, a
-	// sender-suppression tuple, or ChannelMembershipPayload.
+	// ChannelUpdates carries user update nudges and persisted transient updates.
+	// Payloads are a user id, a sender-suppression tuple, a channel-membership
+	// update, or a chat-admin event.
 	ChannelUpdates = "tg_updates"
 	ChannelTyping  = "tg_typing"       // payload: "<peerUserID>|<fromUserID>"
 	ChannelEvict   = "tg_evict"        // payload: "<userID>|<authKeyID>"
@@ -45,12 +46,19 @@ const (
 )
 
 const channelMembershipPayloadPrefix = "channel_membership|"
+const chatAdminPayloadPrefix = "chat_admin|"
 
 type notificationAcceptedAtKey struct{}
 
 type suppressedUpdateKey struct{}
 
 type channelMembershipUpdateKey struct{}
+type chatAdminUpdateKey struct{}
+
+type chatAdminUpdate struct {
+	chatID  int64
+	eventID int64
+}
 
 // SuppressedUpdate identifies the sendMessage update that will be returned by
 // an RPC result to one authenticated key. It is carried only to the in-process
@@ -92,6 +100,24 @@ func ChannelMembershipUpdateFromContext(ctx context.Context) (int64, bool) {
 	}
 	channelID, ok := ctx.Value(channelMembershipUpdateKey{}).(int64)
 	return channelID, ok && channelID > 0
+}
+
+// WithChatAdminUpdate marks an updates notification as a prompt to push one
+// persisted, transient basic-chat administrator update.
+func WithChatAdminUpdate(ctx context.Context, chatID, eventID int64) context.Context {
+	return context.WithValue(ctx, chatAdminUpdateKey{}, chatAdminUpdate{
+		chatID: chatID, eventID: eventID,
+	})
+}
+
+// ChatAdminUpdateFromContext returns the chat and event ids carried by a
+// transient update notification, if this delivery is one.
+func ChatAdminUpdateFromContext(ctx context.Context) (chatID, eventID int64, ok bool) {
+	if ctx == nil {
+		return 0, 0, false
+	}
+	update, ok := ctx.Value(chatAdminUpdateKey{}).(chatAdminUpdate)
+	return update.chatID, update.eventID, ok && update.chatID > 0 && update.eventID > 0
 }
 
 // WithNotificationAcceptedAt carries a valid tg_updates acceptance timestamp
@@ -407,6 +433,22 @@ func (l *Listener) dispatch(
 				})
 				continue
 			}
+			if strings.HasPrefix(n.Payload, chatAdminPayloadPrefix) {
+				chatID, eventID, perr := parseChatAdminPayload(n.Payload)
+				if perr != nil {
+					l.recordInvalidNotification()
+					l.log.Warn("bad tg_updates chat admin payload")
+					continue
+				}
+				l.recordValidNotification(ChannelUpdates)
+				l.schedule("chat-admin:"+strconv.FormatInt(chatID, 10), notificationTask{
+					ctx: WithChatAdminUpdate(ctx, chatID, eventID),
+					run: func(ctx context.Context) {
+						deliver(ctx, 0)
+					},
+				})
+				continue
+			}
 			userID, update, perr := parseUpdatesPayload(n.Payload)
 			if perr != nil {
 				l.recordInvalidNotification()
@@ -636,6 +678,17 @@ func parseChannelMembershipPayload(payload string) (int64, int64, error) {
 	return userID, channelID, nil
 }
 
+func parseChatAdminPayload(payload string) (int64, int64, error) {
+	if !strings.HasPrefix(payload, chatAdminPayloadPrefix) {
+		return 0, 0, errors.New("invalid chat admin payload prefix")
+	}
+	chatID, eventID, err := parsePairPayload(strings.TrimPrefix(payload, chatAdminPayloadPrefix))
+	if err != nil || chatID <= 0 || eventID <= 0 {
+		return 0, 0, errors.New("invalid chat admin payload")
+	}
+	return chatID, eventID, nil
+}
+
 // recordValidNotification isolates the listener from recorder failures. A
 // recorder is telemetry only: an error or panic must not alter delivery.
 func (l *Listener) recordValidNotification(channel string) {
@@ -696,6 +749,12 @@ func ChannelPostPayload(channelID int64) string {
 // channelID's viewer-specific membership view to userID.
 func ChannelMembershipPayload(userID, channelID int64) string {
 	return channelMembershipPayloadPrefix + pairPayload(userID, channelID)
+}
+
+// ChatAdminPayload formats a tg_updates notification naming one persisted,
+// transient chat-admin update event.
+func ChatAdminPayload(chatID, eventID int64) string {
+	return chatAdminPayloadPrefix + pairPayload(chatID, eventID)
 }
 
 // EncryptionPayload formats a tg_encryption NOTIFY payload naming the party to

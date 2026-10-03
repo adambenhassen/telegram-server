@@ -179,6 +179,15 @@ var (
 	// not a participant of the chat, and by an absent chat id — the two are
 	// deliberately indistinguishable.
 	ErrNotMember = errors.New("not a chat member")
+	// ErrChatAdminRequired is returned when a basic-chat administrator change
+	// is attempted by someone other than its creator.
+	ErrChatAdminRequired = errors.New("chat creator required for administrator changes")
+	// ErrChatAdminTargetCreator is returned when an administrator change targets
+	// the basic-chat creator.
+	ErrChatAdminTargetCreator = errors.New("chat creator administrator status is immutable")
+	// ErrChatTargetNotMember is returned when an administrator change targets a
+	// user who is not currently in the chat.
+	ErrChatTargetNotMember = errors.New("target is not a chat member")
 	// ErrChatWriteForbidden is returned when a group or channel default
 	// restriction denies a member's message or invitation.
 	ErrChatWriteForbidden = errors.New("chat write forbidden by default restrictions")

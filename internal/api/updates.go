@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"sort"
 	"time"
 	"unicode/utf8"
@@ -910,6 +911,37 @@ func (h *handlers) handleGetDifference(r *mtproto.Request) (bin.Encoder, error) 
 	return result, err
 }
 
+func appendUniqueDifferenceUsers(existing, additional []tg.UserClass) []tg.UserClass {
+	seen := make(map[int64]bool, len(existing)+len(additional))
+	for _, user := range existing {
+		seen[user.GetID()] = true
+	}
+	for _, user := range additional {
+		if seen[user.GetID()] {
+			continue
+		}
+		seen[user.GetID()] = true
+		existing = append(existing, user)
+	}
+	return existing
+}
+
+func appendUniqueDifferenceChats(existing, additional []tg.ChatClass) []tg.ChatClass {
+	seen := make(map[string]bool, len(existing)+len(additional))
+	for _, chat := range existing {
+		seen[fmt.Sprintf("%T:%d", chat, chat.GetID())] = true
+	}
+	for _, chat := range additional {
+		key := fmt.Sprintf("%T:%d", chat, chat.GetID())
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		existing = append(existing, chat)
+	}
+	return existing
+}
+
 const dialogFilterMarkerGuard = 60 * time.Second
 
 func dialogFilterMarkerWithinGuard(markerAt time.Time, found bool, requestDate int, serverNow time.Time) bool {
@@ -939,6 +971,56 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	if err != nil {
 		h.log.Error("get difference", "user_id", r.UserID, "err", err)
 		return nil, nil, errInternal
+	}
+
+	// Role state is a durable, non-pts snapshot. Pending markers let a member
+	// recover a missed transient notification even after unrelated pts/date
+	// progress; the response-success hook consumes only the versions it carried.
+	adminSnapshots, err := h.store.ChatAdminSnapshotsForMember(r.Ctx, r.UserID, int32(maxDiffEvents+1))
+	if err != nil {
+		h.log.Error("get difference chat admin snapshots", "user_id", r.UserID, "err", err)
+		return nil, nil, errInternal
+	}
+	adminMore := len(adminSnapshots) > maxDiffEvents
+	if adminMore {
+		adminSnapshots = adminSnapshots[:maxDiffEvents]
+	}
+	var adminUpdates []tg.UpdateClass
+	adminEventIDs := make([]int64, 0, len(adminSnapshots))
+	if len(adminSnapshots) > 0 {
+		userIDs := make(map[int64]bool, len(adminSnapshots))
+		chatIDs := make(map[int64]bool, len(adminSnapshots))
+		for _, snapshot := range adminSnapshots {
+			adminEventIDs = append(adminEventIDs, snapshot.EventID)
+			userIDs[snapshot.UserID] = true
+			chatIDs[snapshot.ChatID] = true
+			adminUpdates = append(adminUpdates, &tg.UpdateChatParticipantAdmin{
+				ChatID:  snapshot.ChatID,
+				UserID:  snapshot.UserID,
+				IsAdmin: snapshot.IsAdmin,
+				Version: snapshot.Version,
+			})
+		}
+		users, uerr := h.loadUsers(r.Ctx, userIDs, r.UserID)
+		if uerr != nil {
+			h.log.Error("get difference chat admin users", "user_id", r.UserID, "err", uerr)
+			return nil, nil, errInternal
+		}
+		chats, cerr := h.loadChats(r.Ctx, chatIDs, r.UserID, nil)
+		if cerr != nil {
+			h.log.Error("get difference chat admin chats", "user_id", r.UserID, "err", cerr)
+			return nil, nil, errInternal
+		}
+		b.users = appendUniqueDifferenceUsers(b.users, users)
+		b.chats = appendUniqueDifferenceChats(b.chats, chats)
+	}
+	consumeAdminMarkers := func() {
+		if len(adminEventIDs) == 0 {
+			return
+		}
+		if err := h.store.DeleteChatAdminStateMarkersByEventIDs(r.Ctx, r.UserID, adminEventIDs); err != nil {
+			h.log.Error("consume get difference chat admin markers", "user_id", r.UserID, "err", err)
+		}
 	}
 
 	// Qts gap: fill encrypted messages the client has not yet seen.
@@ -988,7 +1070,7 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	filterRefresh = filterRefresh || dialogFilterMarkerWithinGuard(markerAt, markerFound, req.Date, h.now())
 	includeFilterRefresh := filterRefresh && !b.more && !encMore
 
-	if !b.more && !encMore && len(b.ups) == 0 && len(encMsgs) == 0 && len(secretChats) == 0 && !includeFilterRefresh {
+	if !b.more && !encMore && !adminMore && len(b.ups) == 0 && len(adminUpdates) == 0 && len(encMsgs) == 0 && len(secretChats) == 0 && !includeFilterRefresh {
 		return &tg.UpdatesDifferenceEmpty{Date: b.state.Date, Seq: b.state.Seq}, nil, nil
 	}
 
@@ -1001,6 +1083,7 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 			other = append(other, u)
 		}
 	}
+	other = append(other, adminUpdates...)
 	for _, sc := range secretChats {
 		other = append(other, &tg.UpdateEncryption{
 			Chat: h.encryptedChatFor(sc, r.UserID),
@@ -1016,7 +1099,11 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	st := b.state
 	st.Qts = newQts
 
-	if b.more || encMore {
+	if b.more || encMore || adminMore {
+		var afterReply func()
+		if len(adminEventIDs) > 0 {
+			afterReply = consumeAdminMarkers
+		}
 		return &tg.UpdatesDifferenceSlice{
 			NewMessages:          newMessages,
 			NewEncryptedMessages: encMsgs,
@@ -1024,7 +1111,7 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 			Users:                b.users,
 			Chats:                b.chats,
 			IntermediateState:    *stateToTL(st),
-		}, nil, nil
+		}, afterReply, nil
 	}
 	result := &tg.UpdatesDifference{
 		NewMessages:          newMessages,
@@ -1035,8 +1122,13 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 		State:                *stateToTL(st),
 	}
 	var afterReply func()
-	if c != nil && includeFilterRefresh {
-		afterReply = func() { h.dialogFilterSync.AcknowledgeDifference(c, r, recovery, true) }
+	if len(adminEventIDs) > 0 || c != nil && includeFilterRefresh {
+		afterReply = func() {
+			consumeAdminMarkers()
+			if c != nil && includeFilterRefresh {
+				h.dialogFilterSync.AcknowledgeDifference(c, r, recovery, true)
+			}
+		}
 	}
 	return result, afterReply, nil
 }

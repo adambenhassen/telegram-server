@@ -429,6 +429,14 @@ func chatParticipantsToTL(chat store.Chat, participants []store.Participant) *tg
 			wireParticipants = append(wireParticipants, &tg.ChatParticipantCreator{UserID: participant.UserID})
 			continue
 		}
+		if participant.Admin {
+			wireParticipants = append(wireParticipants, &tg.ChatParticipantAdmin{
+				UserID:    participant.UserID,
+				InviterID: participant.InviterID,
+				Date:      int(participant.Date.Unix()),
+			})
+			continue
+		}
 		wireParticipants = append(wireParticipants, &tg.ChatParticipant{
 			UserID:    participant.UserID,
 			InviterID: participant.InviterID,

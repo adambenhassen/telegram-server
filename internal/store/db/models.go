@@ -138,11 +138,34 @@ type Chat struct {
 	DefaultBannedRights []string
 }
 
+type ChatAdminEvent struct {
+	ID      int64
+	ChatID  int64
+	UserID  int64
+	IsAdmin bool
+	Version int32
+}
+
+type ChatAdminEventRecipient struct {
+	OwnerID  int64
+	ChatID   int64
+	TargetID int64
+	EventID  int64
+}
+
+type ChatAdminStateMarker struct {
+	OwnerID  int64
+	ChatID   int64
+	TargetID int64
+	EventID  int64
+}
+
 type ChatParticipant struct {
 	ChatID    int64
 	UserID    int64
 	InviterID int64
 	Date      pgtype.Timestamptz
+	IsAdmin   bool
 }
 
 type Dialog struct {
