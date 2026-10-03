@@ -655,6 +655,54 @@ assert_execution_input_case() {
   done
 }
 
+assert_reporter_exception_case() {
+  local name="$1" actual expected
+  if ! actual=$(python3 - "$script_dir/smoke-diagnostics.py" "$fixture_root" "$mock_json" <<'PY'
+import contextlib
+import io
+import runpy
+import sys
+
+script_path, root, input_path = sys.argv[1:]
+namespace = runpy.run_path(script_path, run_name="smoke_diagnostics")
+module_globals = namespace["main"].__globals__
+module_globals["sys"].argv = [
+    script_path,
+    "--status",
+    "37",
+    "--package",
+    "github.com/teagramhq/teagram-server/test/e2e",
+    "--root",
+    root,
+    "--profile",
+    "smoke",
+    "--scenario",
+    "peer-disconnect",
+    input_path,
+]
+
+def fail_report(*_args):
+    raise RuntimeError("fixture exception")
+
+module_globals["report_failure"] = fail_report
+captured = io.StringIO()
+with contextlib.redirect_stdout(captured):
+    status = namespace["main"]()
+if status != 0:
+    raise SystemExit("reporter exception changed the test status")
+sys.stdout.write(captured.getvalue())
+PY
+  ); then
+    printf 'reporter exception fixture could not run: %s\n' "$name" >&2
+    exit 1
+  fi
+  expected=$(expected_execution_failure unknown)
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'unexpected execution-failure diagnostic: %s\n' "$name" >&2
+    exit 1
+  fi
+}
+
 write_probe_module() {
   local name="$1" module_path="$2"
   mkdir -p "$probe_root/$name"
@@ -1123,10 +1171,10 @@ race_event=$(json_event output "$race_test" $'WARNING: DATA RACE\n')
 race_stream="$race_event"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
 write_execution_case race-full-suite full-suite race-signature "$race_stream"
 
-build_stream=$(go_build_event build-output example.com/build-probe "compiler output ${canary}")
-build_stream+=$'\n'
-build_stream+=$(go_build_event build-fail example.com/build-probe "build details ${canary}")
-build_stream+=$'\n'
+build_events_stream=$(go_build_event build-output example.com/build-probe "compiler output ${canary}")
+build_events_stream+=$'\n'
+build_events_stream+=$(go_build_event build-fail example.com/build-probe "build details ${canary}")
+build_stream="$build_events_stream"$'\n'
 build_stream+=$(failed_build_terminal "private build value ${canary}")
 write_execution_case build-failure full-suite build-failure-signature "$build_stream"
 
@@ -1219,7 +1267,7 @@ write_execution_case midline-race full-suite unknown "$midline_race"
 race_timeout_stream="$race_event"$'\n'"$timeout_full"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
 write_execution_case overlapping-race-timeout full-suite unknown "$race_timeout_stream"
 
-build_timeout_stream="$build_stream"$'\n'"$timeout_full"$'\n'"$(failure_fixture "TestSmoke/$scenario_failure")"
+build_timeout_stream="$build_events_stream"$'\n'"$timeout_full"$'\n'"$(failed_build_terminal "private build value ${canary}")"
 write_execution_case overlapping-build-timeout full-suite unknown "$build_timeout_stream"
 
 valid_assertion_event=$(json_event output "TestSmoke/$scenario_failure" \
@@ -1244,7 +1292,7 @@ write_execution_case status-without-failure-event full-suite status-without-fail
 
 stream_unavailable="$fixture_root/no-such-directory/input.json"
 assert_execution_input_case unavailable-input smoke stream-unavailable "$stream_unavailable" no
-assert_execution_input_case reporter-read-exception smoke unknown "$fixture_root" no
+assert_reporter_exception_case reporter-read-exception
 
 configuration_input="$fixture_root/configuration-canary.json"
 printf '%s\n%s\n' "$execution_canary_event" "$(json_event pass '')" >"$configuration_input"
