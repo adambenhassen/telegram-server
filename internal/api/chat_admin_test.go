@@ -175,6 +175,119 @@ func TestGetDifferenceConsumesAdminSnapshotAfterReply(t *testing.T) {
 	}
 }
 
+func TestGetDifferenceSlicesPendingAdminSnapshots(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Errorf("close connection: %v", err)
+		}
+	})
+
+	creator := chatUser(t, s, 7301)
+	target := chatUser(t, s, 7302)
+	observer := chatUser(t, s, 7303)
+	const markerCount = 501
+	var seeded int
+	if err := conn.QueryRow(ctx, `
+		WITH new_chats AS (
+			INSERT INTO chats (title, creator_id, version)
+			SELECT 'Admin difference batch ' || seq.n, $1, 2
+			FROM generate_series(1, $4::int) AS seq(n)
+			RETURNING id
+		), members(user_id, is_admin) AS (
+			VALUES ($1::bigint, false), ($2::bigint, true), ($3::bigint, false)
+		), participants AS (
+			INSERT INTO chat_participants (chat_id, user_id, inviter_id, is_admin)
+			SELECT chat.id, member.user_id, $1, member.is_admin
+			FROM new_chats AS chat CROSS JOIN members AS member
+			RETURNING chat_id, user_id
+		), events AS (
+			INSERT INTO chat_admin_events (chat_id, user_id, is_admin, version)
+			SELECT participant.chat_id, $2, true, 2
+			FROM participants AS participant
+			WHERE participant.user_id = $2
+			RETURNING id, chat_id
+		), markers AS (
+			INSERT INTO chat_admin_state_markers (owner_id, chat_id, target_id, event_id)
+			SELECT $3, event.chat_id, $2, event.id
+			FROM events AS event
+			RETURNING event_id
+		)
+		SELECT count(*) FROM markers`, creator.ID, target.ID, observer.ID, markerCount,
+	).Scan(&seeded); err != nil {
+		t.Fatalf("seed pending admin snapshots: %v", err)
+	}
+	if seeded != markerCount {
+		t.Fatalf("seeded pending admin snapshots = %d, want %d", seeded, markerCount)
+	}
+
+	state, err := s.State(ctx, observer.ID)
+	if err != nil {
+		t.Fatalf("observer state: %v", err)
+	}
+	first, err := api.GetDifferenceForTest(s, observer.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts: state.Pts, Qts: state.Qts, Date: state.Date,
+	})
+	if err != nil {
+		t.Fatalf("first getDifference: %v", err)
+	}
+	slice, ok := first.(*tg.UpdatesDifferenceSlice)
+	if !ok {
+		t.Fatalf("first getDifference = %T, want updates.differenceSlice while admin markers remain", first)
+	}
+	if got := countAdminSnapshotUpdates(slice.OtherUpdates); got != 500 {
+		t.Fatalf("first getDifference returned %d admin snapshots, want 500", got)
+	}
+	var pending int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM chat_admin_state_markers WHERE owner_id = $1`, observer.ID).Scan(&pending); err != nil {
+		t.Fatalf("count remaining admin snapshots: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("pending admin snapshots after first slice = %d, want 1", pending)
+	}
+
+	second, err := api.GetDifferenceForTest(s, observer.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts:  slice.IntermediateState.Pts,
+		Qts:  slice.IntermediateState.Qts,
+		Date: slice.IntermediateState.Date,
+	})
+	if err != nil {
+		t.Fatalf("second getDifference: %v", err)
+	}
+	difference, ok := second.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("second getDifference = %T, want updates.difference for remaining marker", second)
+	}
+	if got := countAdminSnapshotUpdates(difference.OtherUpdates); got != 1 {
+		t.Fatalf("second getDifference returned %d admin snapshots, want 1", got)
+	}
+	third, err := api.GetDifferenceForTest(s, observer.ID, &tg.UpdatesGetDifferenceRequest{
+		Pts: difference.State.Pts, Qts: difference.State.Qts, Date: difference.State.Date,
+	})
+	if err != nil {
+		t.Fatalf("third getDifference: %v", err)
+	}
+	if _, ok := third.(*tg.UpdatesDifferenceEmpty); !ok {
+		t.Fatalf("third getDifference = %T (%+v), want empty after all admin snapshots were delivered", third, third)
+	}
+}
+
+func countAdminSnapshotUpdates(updates []tg.UpdateClass) int {
+	count := 0
+	for _, update := range updates {
+		if _, ok := update.(*tg.UpdateChatParticipantAdmin); ok {
+			count++
+		}
+	}
+	return count
+}
+
 func TestGetDifferenceReplyAckKeepsConcurrentAdminChangePending(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

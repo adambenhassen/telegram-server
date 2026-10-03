@@ -114,8 +114,14 @@ JOIN chat_participants AS target
   ON target.chat_id = marker.chat_id
  AND target.user_id = marker.target_id
 WHERE marker.owner_id = $1
-ORDER BY marker.chat_id, marker.target_id
+ORDER BY marker.event_id
+LIMIT $2::int
 `
+
+type ChatAdminSnapshotsForMemberParams struct {
+	OwnerID int64
+	Lim     int32
+}
 
 type ChatAdminSnapshotsForMemberRow struct {
 	EventID int64
@@ -128,8 +134,8 @@ type ChatAdminSnapshotsForMemberRow struct {
 // ChatAdminSnapshotsForMember returns the current role state for each target
 // with a pending pull marker. EventID lets the response-success hook consume
 // only versions included in this response, preserving newer concurrent changes.
-func (q *Queries) ChatAdminSnapshotsForMember(ctx context.Context, ownerID int64) ([]ChatAdminSnapshotsForMemberRow, error) {
-	rows, err := q.db.Query(ctx, chatAdminSnapshotsForMember, ownerID)
+func (q *Queries) ChatAdminSnapshotsForMember(ctx context.Context, arg ChatAdminSnapshotsForMemberParams) ([]ChatAdminSnapshotsForMemberRow, error) {
+	rows, err := q.db.Query(ctx, chatAdminSnapshotsForMember, arg.OwnerID, arg.Lim)
 	if err != nil {
 		return nil, err
 	}

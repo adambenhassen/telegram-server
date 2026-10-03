@@ -59,8 +59,11 @@ func (s *Store) ChatAdminEventRecipientsByEvent(ctx context.Context, eventID int
 // ChatAdminSnapshotsForMember returns pending durable current role state for
 // participants whose admin state the member may observe. It is independent of
 // pts so getDifference can repair a missed push.
-func (s *Store) ChatAdminSnapshotsForMember(ctx context.Context, ownerID int64) ([]ChatAdminSnapshot, error) {
-	rows, err := s.q.ChatAdminSnapshotsForMember(ctx, ownerID)
+func (s *Store) ChatAdminSnapshotsForMember(ctx context.Context, ownerID int64, limit int32) ([]ChatAdminSnapshot, error) {
+	rows, err := s.q.ChatAdminSnapshotsForMember(ctx, db.ChatAdminSnapshotsForMemberParams{
+		OwnerID: ownerID,
+		Lim:     limit,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("chat admin snapshots for member: %w", err)
 	}

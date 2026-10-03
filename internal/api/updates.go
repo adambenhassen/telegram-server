@@ -976,10 +976,14 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	// Role state is a durable, non-pts snapshot. Pending markers let a member
 	// recover a missed transient notification even after unrelated pts/date
 	// progress; the response-success hook consumes only the versions it carried.
-	adminSnapshots, err := h.store.ChatAdminSnapshotsForMember(r.Ctx, r.UserID)
+	adminSnapshots, err := h.store.ChatAdminSnapshotsForMember(r.Ctx, r.UserID, int32(maxDiffEvents+1))
 	if err != nil {
 		h.log.Error("get difference chat admin snapshots", "user_id", r.UserID, "err", err)
 		return nil, nil, errInternal
+	}
+	adminMore := len(adminSnapshots) > maxDiffEvents
+	if adminMore {
+		adminSnapshots = adminSnapshots[:maxDiffEvents]
 	}
 	var adminUpdates []tg.UpdateClass
 	adminEventIDs := make([]int64, 0, len(adminSnapshots))
@@ -1066,7 +1070,7 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	filterRefresh = filterRefresh || dialogFilterMarkerWithinGuard(markerAt, markerFound, req.Date, h.now())
 	includeFilterRefresh := filterRefresh && !b.more && !encMore
 
-	if !b.more && !encMore && len(b.ups) == 0 && len(adminUpdates) == 0 && len(encMsgs) == 0 && len(secretChats) == 0 && !includeFilterRefresh {
+	if !b.more && !encMore && !adminMore && len(b.ups) == 0 && len(adminUpdates) == 0 && len(encMsgs) == 0 && len(secretChats) == 0 && !includeFilterRefresh {
 		return &tg.UpdatesDifferenceEmpty{Date: b.state.Date, Seq: b.state.Seq}, nil, nil
 	}
 
@@ -1095,7 +1099,7 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	st := b.state
 	st.Qts = newQts
 
-	if b.more || encMore {
+	if b.more || encMore || adminMore {
 		var afterReply func()
 		if len(adminEventIDs) > 0 {
 			afterReply = consumeAdminMarkers

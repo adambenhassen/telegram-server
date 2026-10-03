@@ -96,7 +96,8 @@ JOIN chat_participants AS target
   ON target.chat_id = marker.chat_id
  AND target.user_id = marker.target_id
 WHERE marker.owner_id = $1
-ORDER BY marker.chat_id, marker.target_id;
+ORDER BY marker.event_id
+LIMIT sqlc.arg(lim)::int;
 
 -- DeleteChatAdminStateMarkersByEventIDs consumes the exact versions included
 -- in a successfully written difference response.
