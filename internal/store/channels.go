@@ -1401,7 +1401,7 @@ func (s *Store) SetChannelPinnedMessage(ctx context.Context, channelID, callerID
 		if err != nil {
 			return Channel{}, nil, fmt.Errorf("validate channel pin: %w", err)
 		}
-		if post.Deleted {
+		if post.Deleted || post.ActionType != 0 {
 			return Channel{}, nil, ErrMessageInvalid
 		}
 	}
