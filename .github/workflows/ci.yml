@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       actions: write
@@ -196,7 +196,7 @@ jobs:
 
       # Postgres comes from testcontainers inside internal/pgtest, which starts
       # postgres:16-alpine with its own config. Nothing to wire up on the runner
-      # beyond the Docker daemon ubuntu-latest already provides.
+      # beyond the Docker daemon ubuntu-26.04 already provides.
       #
       # Keep the cached non-E2E command in the Makefile unchanged. The E2E
       # invocation still runs once with the same race/count/timeout/package
@@ -230,7 +230,7 @@ jobs:
   # required check reports as skipped rather than passing, which stalls the
   # merge gate on every PR that does not touch internal/admin.
   css:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
 
     steps:
@@ -266,7 +266,7 @@ jobs:
   # that module rather than installing one on the runner — a sqlc release
   # cannot turn the repo red on its own.
   sqlc:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
 
     steps:
@@ -296,7 +296,7 @@ jobs:
   # test/e2e/adminserver builds its own server and Postgres from the pgtest
   # harness, so this check can run beside ci without shared services or files.
   e2e-admin:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The suite is a handful of specs against a local server; this only catches
     # a hang (a browser that never launches, a webServer that never binds).
     timeout-minutes: 20
@@ -686,7 +686,7 @@ jobs:
   # available in the environments the Dockerfile is edited from, so this job is
   # the only place it is ever built — it is the gate that stops it rotting.
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The build is the slow part at roughly a minute; this only catches a hang
     # (a stalled pull, a container that never logs) before it burns six hours.
     timeout-minutes: 15
@@ -820,7 +820,7 @@ jobs:
   # docker-compose.yml is edited from, so this job is the only place it ever
   # runs — the gate that stops it rotting.
   compose:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Two filesystem boots plus one RustFS boot on top of the image build, which
     # is the slow part at roughly a minute; this only catches a hang before it
     # burns six hours.
@@ -1264,7 +1264,7 @@ jobs:
   # TestSmoke uses pgtest's disposable, per-test databases; the hosted runner
   # and its Postgres container are discarded with this job.
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
