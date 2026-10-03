@@ -19,8 +19,6 @@ services:
     security_opt:
       - no-new-privileges:true
     user: "65532:65532"
-    pids_limit: 64
-    mem_limit: 64m
     restart: unless-stopped
     logging:
       driver: json-file
@@ -63,8 +61,6 @@ services:
     security_opt:
       - no-new-privileges:true
     user: "65532:65532"
-    pids_limit: 64
-    mem_limit: 256m
     restart: unless-stopped
     logging:
       driver: json-file

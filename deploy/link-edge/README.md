@@ -8,6 +8,8 @@ selector and landing containers publish ports, both on host loopback. The
 landing container also joins a dedicated bridge for its published port; that
 bridge has IP masquerading disabled and no other service attached. The project
 has no environment, secret, volume, or server-service dependency.
+The target LXC provides the resource boundary; its Docker daemon does not expose
+memory or PID cgroup controllers for nested per-container limits.
 
 ## Validate and build
 

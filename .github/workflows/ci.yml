@@ -132,6 +132,8 @@ jobs:
             and all(.services[]; ((.env_file // []) | length) == 0)
             and all(.services[]; ((.environment // {}) | length) == 0)
             and all(.services[]; .network_mode == null)
+            and all(.services[]; .mem_limit == null)
+            and all(.services[]; .pids_limit == null)
             and all(.services[]; .restart == "unless-stopped")
             and all(.services[]; .logging.driver == "json-file")
             and all(.services[]; .logging.options["max-size"] == "10m")
