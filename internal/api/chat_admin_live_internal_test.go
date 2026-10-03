@@ -109,9 +109,13 @@ func TestChatAdminPushLeavesPtsSlotForNextMessage(t *testing.T) {
 		t.Fatalf("pts watermark after next message = %d, want message pts 1", got)
 	}
 
-	recipient, ok, err := s.MessageByOwnerLocal(ctx, member.ID, sender.PeerLocalID)
-	if err != nil || !ok {
-		t.Fatalf("load member message copy: ok=%v err=%v", ok, err)
+	recipientMessages, err := s.History(ctx, member.ID, store.PeerTypeChat, chat.ID, 0, 1)
+	if err != nil || len(recipientMessages) != 1 {
+		t.Fatalf("load member message copy: messages=%d err=%v", len(recipientMessages), err)
+	}
+	recipient := recipientMessages[0]
+	if recipient.FanoutID != sender.FanoutID {
+		t.Fatalf("member message fanout = %d, want sender fanout %d", recipient.FanoutID, sender.FanoutID)
 	}
 	frames := decodeServerFrames(t, key, transport.framesFrom(0))
 	if len(frames) != 2 || frames[0].push == nil || frames[0].rpc != nil {
