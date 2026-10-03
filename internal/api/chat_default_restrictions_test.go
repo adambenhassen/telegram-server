@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"testing"
 
 	"github.com/gotd/td/bin"
@@ -691,6 +692,89 @@ func TestBasicChatControlDefaultsRemainCreatorOnly(t *testing.T) {
 		Peer: api.InputPeerChat(creator.ID, chat.ID), ID: 1,
 	}); err != nil {
 		t.Fatalf("creator pin under default restriction: %v", err)
+	}
+}
+
+func TestPromotedBasicChatAdminGetsNoExtraChatPowers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() //nolint:errcheck // best-effort close
+
+	creator := chatUser(t, s, 7541)
+	admin := chatUser(t, s, 7542)
+	target := chatUser(t, s, 7543)
+	inviteTarget := chatUser(t, s, 7544)
+	chat, err := s.CreateChat(ctx, creator.ID, "Admin powers", []int64{admin.ID, target.ID})
+	if err != nil {
+		t.Fatalf("create chat: %v", err)
+	}
+	h := fullChannelDispatcher(s)
+	if result, rpc := editChatAdmin(t, h, creator.ID, admin.ID, chat.ID, true); result == nil || rpc != nil {
+		t.Fatalf("promote member: result=%v rpc=%v", result, rpc)
+	}
+	if _, err = api.SendMessageForTest(s, creator.ID, &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerChat(creator.ID, chat.ID), Message: "pin target", RandomID: 75401,
+	}); err != nil {
+		t.Fatalf("create pin target: %v", err)
+	}
+	setChatDefaultRights(t, conn, chat.ID, "change_info", "pin_messages", "invite_users", "send_messages")
+	before, ok, err := s.ChatByID(ctx, chat.ID)
+	if err != nil || !ok {
+		t.Fatalf("read chat before denied admin actions: ok=%v err=%v", ok, err)
+	}
+	users := []int64{creator.ID, admin.ID, target.ID}
+	pts := make(map[int64]int, len(users))
+	for _, userID := range users {
+		pts[userID] = apiPts(t, s, userID)
+	}
+
+	_, err = api.EditChatTitleForTest(s, admin.ID, &tg.MessagesEditChatTitleRequest{
+		ChatID: chat.ID, Title: "admin title",
+	})
+	wantRPC(t, err, "PEER_ID_INVALID")
+	_, err = api.UpdatePinnedMessageForTest(s, admin.ID, &tg.MessagesUpdatePinnedMessageRequest{
+		Peer: api.InputPeerChat(admin.ID, chat.ID), ID: 1,
+	})
+	wantRPC(t, err, "CHAT_ADMIN_REQUIRED")
+	_, err = api.DeleteChatUserForTest(s, admin.ID, &tg.MessagesDeleteChatUserRequest{
+		ChatID: chat.ID, UserID: api.InputUser(admin.ID, target.ID),
+	})
+	wantRPC(t, err, "PEER_ID_INVALID")
+	_, err = api.AddChatUserForTest(s, admin.ID, &tg.MessagesAddChatUserRequest{
+		ChatID: chat.ID, UserID: api.InputUser(admin.ID, inviteTarget.ID),
+	})
+	wantRPC(t, err, "CHAT_WRITE_FORBIDDEN")
+	_, err = api.SendMessageForTest(s, admin.ID, &tg.MessagesSendMessageRequest{
+		Peer: api.InputPeerChat(admin.ID, chat.ID), Message: "admin message", RandomID: 75402,
+	})
+	wantRPC(t, err, "CHAT_WRITE_FORBIDDEN")
+	_, rpc := editChatDefaultRights(t, h, admin.ID, chat.ID, tg.ChatBannedRights{SendPolls: true})
+	if rpc == nil || rpc.ErrorMessage != "PEER_ID_INVALID" {
+		t.Fatalf("admin edit default rights = %v, want PEER_ID_INVALID", rpc)
+	}
+	if result, rpc := editChatAdmin(t, h, admin.ID, target.ID, chat.ID, true); result != nil || rpc == nil || rpc.ErrorMessage != "CHAT_ADMIN_REQUIRED" {
+		t.Fatalf("admin promotion attempt = result:%v rpc:%v, want CHAT_ADMIN_REQUIRED", result, rpc)
+	}
+
+	after, ok, err := s.ChatByID(ctx, chat.ID)
+	if err != nil || !ok {
+		t.Fatalf("read chat after denied admin actions: ok=%v err=%v", ok, err)
+	}
+	if after.Version != before.Version || after.Title != before.Title || !slices.Equal(after.DefaultBannedRights, []string{"change_info", "pin_messages", "invite_users", "send_messages"}) {
+		t.Fatalf("chat after denied admin actions = %+v, want unchanged title/version and default restrictions", after)
+	}
+	if got := apiParticipants(t, s, chat.ID); len(got) != 3 {
+		t.Fatalf("participants after denied actions = %v, want creator, admin, and target", got)
+	}
+	for _, userID := range users {
+		if got := apiPts(t, s, userID); got != pts[userID] {
+			t.Errorf("owner %d pts after denied admin actions = %d, want unchanged %d", userID, got, pts[userID])
+		}
 	}
 }
 
