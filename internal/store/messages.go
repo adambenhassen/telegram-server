@@ -590,6 +590,47 @@ func copyOwners(copies []db.Message) []int64 {
 	return ids
 }
 
+type messageCopyRef struct {
+	ownerID int64
+	localID int64
+}
+
+// lockPollsForDeletedMessageCopies locks every canonical poll referenced by
+// the message rows a delete batch will update. The IDs are sorted before taking
+// row locks so concurrent batches with different message orders share one lock
+// order, and callers must already hold the complete owner-lock set.
+func lockPollsForDeletedMessageCopies(ctx context.Context, qtx *db.Queries, refs []messageCopyRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	owners := make([]int64, len(refs))
+	localIDs := make([]int64, len(refs))
+	for i, ref := range refs {
+		owners[i] = ref.ownerID
+		localIDs[i] = ref.localID
+	}
+	pollIDs, err := qtx.PollIDsForMessageCopies(ctx, db.PollIDsForMessageCopiesParams{
+		OwnerIds: owners,
+		LocalIds: localIDs,
+	})
+	if err != nil {
+		return fmt.Errorf("load polls for delete batch: %w", err)
+	}
+	slices.Sort(pollIDs)
+	pollIDs = slices.Compact(pollIDs)
+	for _, pollID := range pollIDs {
+		if _, err = qtx.PollByIDForUpdate(ctx, pollID); errors.Is(err, pgx.ErrNoRows) {
+			// A concurrent final-copy cleanup may have removed the poll after the
+			// reference query. The corresponding trigger then has no row to lock.
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("lock poll %d for delete batch: %w", pollID, err)
+		}
+	}
+	return nil
+}
+
 // editChatMessage applies an edit to every per-member copy of a chat message,
 // with one edit event and one pts bump per affected owner. Returns the author's
 // new pts.
@@ -788,6 +829,34 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 		members[chatID] = set
 	}
 
+	// Take all canonical poll locks only after the complete owner set is held,
+	// and before the first message update can fire per-copy cleanup triggers.
+	// This extends the existing owner-lock order with a stable poll-ID order for
+	// batches that contain copies of multiple polls.
+	pollRefs := make([]messageCopyRef, 0, len(msgs))
+	for _, m := range msgs {
+		if PeerType(m.PeerType) == PeerTypeChat {
+			copies := fanouts[m.FanoutID]
+			if len(copies) == 0 {
+				pollRefs = append(pollRefs, messageCopyRef{ownerID: ownerID, localID: m.LocalID})
+				continue
+			}
+			for _, c := range copies {
+				if members[m.PeerID][c.OwnerID] {
+					pollRefs = append(pollRefs, messageCopyRef{ownerID: c.OwnerID, localID: c.LocalID})
+				}
+			}
+			continue
+		}
+		pollRefs = append(pollRefs, messageCopyRef{ownerID: ownerID, localID: m.LocalID})
+		if revoke && m.PeerID != ownerID {
+			pollRefs = append(pollRefs, messageCopyRef{ownerID: m.PeerID, localID: m.PeerLocalID})
+		}
+	}
+	if err = lockPollsForDeletedMessageCopies(ctx, qtx, pollRefs); err != nil {
+		return nil, err
+	}
+
 	perOwner := map[int64]int{}
 	for _, m := range msgs {
 		if PeerType(m.PeerType) == PeerTypeChat {
@@ -805,6 +874,9 @@ func (s *Store) DeleteMessages(ctx context.Context, ownerID int64, localIDs []in
 				}
 				if n == 0 {
 					return nil, ErrMessageInvalid
+				}
+				if s.deleteCopyHook != nil {
+					s.deleteCopyHook(ownerID, m.LocalID)
 				}
 				pts, e := qtx.BumpPtsOnly(ctx, ownerID)
 				if e != nil {

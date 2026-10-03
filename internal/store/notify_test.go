@@ -32,6 +32,17 @@ func openDSN(t *testing.T, dsn string) *store.Store {
 	return s
 }
 
+func TestChatAdminPayloadCarriesChatAndEventIDs(t *testing.T) {
+	if got := store.ChatAdminPayload(7, 19); got != "chat_admin|7|19" {
+		t.Fatalf("chat-admin payload = %q, want chat_admin|7|19", got)
+	}
+	ctx := store.WithChatAdminUpdate(context.Background(), 7, 19)
+	chatID, eventID, ok := store.ChatAdminUpdateFromContext(ctx)
+	if !ok || chatID != 7 || eventID != 19 {
+		t.Fatalf("chat-admin context = %d/%d/%t, want 7/19/true", chatID, eventID, ok)
+	}
+}
+
 func TestNotifyReachesRawListener(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

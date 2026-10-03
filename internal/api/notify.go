@@ -30,11 +30,14 @@ type Updater struct {
 	pushRecorder func(store.PushOutcome, time.Time) error
 	// pinSnapshotHook lets tests deterministically commit a repin or unpin after
 	// resolution and before delivery. Production leaves it nil.
-	pinSnapshotHook       func()
-	recoverySlots         chan struct{}
-	recoveryWG            sync.WaitGroup
-	recoveryScanEpoch     uint64
-	recoveryScanRemaining int
+	pinSnapshotHook func()
+	// channelPostSnapshotHook lets tests commit a ban and post after the delivery
+	// snapshot but before its bounded event read. Production leaves it nil.
+	channelPostSnapshotHook func()
+	recoverySlots           chan struct{}
+	recoveryWG              sync.WaitGroup
+	recoveryScanEpoch       uint64
+	recoveryScanRemaining   int
 	// recoveryClaimHook pauses a claimed attempt in deterministic concurrency tests.
 	recoveryClaimHook func(*mtproto.Conn)
 }
@@ -205,6 +208,10 @@ type pendingRPCReadyConn interface {
 // advancing each conn's last-pushed pts. It is best-effort: a push failure is
 // logged and the client's next getDifference backfills.
 func (u *Updater) Deliver(ctx context.Context, userID int64) {
+	if chatID, eventID, ok := store.ChatAdminUpdateFromContext(ctx); ok {
+		u.DeliverChatAdmin(ctx, chatID, eventID)
+		return
+	}
 	conns := u.registry.Conns(userID)
 	if len(conns) > 0 {
 		suppressed, _ := store.SuppressedUpdateFromContext(ctx)
@@ -220,6 +227,55 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 	if channelID, ok := store.ChannelMembershipUpdateFromContext(ctx); ok {
 		u.deliverChannelMembership(ctx, userID, channelID)
 	}
+}
+
+// DeliverChatAdmin pushes one persisted chat-admin event to its currently
+// pending recipients who remain members. Separate durable pull markers let a
+// difference response recover missed pushes without suppressing other sessions.
+func (u *Updater) DeliverChatAdmin(ctx context.Context, chatID, eventID int64) {
+	events, err := u.h.store.ChatAdminEventsByIDs(ctx, []int64{eventID})
+	if err != nil {
+		u.log.Error("deliver chat admin event", "event_id", eventID, "err", err)
+		return
+	}
+	if len(events) != 1 {
+		u.log.Warn("deliver missing chat admin event", "event_id", eventID)
+		return
+	}
+	event := events[0]
+	if event.ChatID != chatID {
+		u.log.Warn("deliver mismatched chat admin event", "event_id", eventID, "chat_id", chatID)
+		return
+	}
+	recipients, err := u.h.store.ChatAdminEventRecipientsByEvent(ctx, eventID)
+	if err != nil {
+		u.log.Error("deliver chat admin recipients", "event_id", eventID, "chat_id", event.ChatID, "err", err)
+		return
+	}
+	update := &tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdateChatParticipantAdmin{
+			ChatID:  event.ChatID,
+			UserID:  event.UserID,
+			IsAdmin: event.IsAdmin,
+			Version: event.Version,
+		}},
+		Date: int(time.Now().Unix()),
+		Seq:  0,
+	}
+	var pushes []transientPush
+	for _, owner := range recipients {
+		for _, conn := range u.registry.Conns(owner) {
+			pushes = append(pushes, transientPush{
+				owner: owner,
+				conn:  conn,
+				enc:   update,
+				onError: func(err error) {
+					u.log.Info("deliver chat admin push", "event_id", eventID, "user_id", owner, "err", err)
+				},
+			})
+		}
+	}
+	u.pushTransientFanout(ctx, pushes)
 }
 
 // deliverChannelMembership pushes a newly invited user their own channel peer
@@ -804,48 +860,38 @@ func (u *Updater) DeliverTyping(ctx context.Context, peerID, fromID int64) {
 // member that holds a live connection on this replica. It is the channelPost
 // callback for StartListener (part 2 of MAIN-96 / MAIN-114).
 //
-// ChannelState is fetched lazily — only on the first member found with a live
-// conn. A replica where nobody is home skips it entirely after one
-// ChannelMembers query and O(members) in-memory registry lookups.
-//
-// The per-connection channel-pts watermark does not exist on Conn. The window
-// is anchored one step below currentPts (or at JoinPts if that is higher),
-// so the triggering event is always included. A duplicate UpdateNewChannelMessage
-// is safe (the client dedups on pts); a missed one is backfilled by the next
-// getChannelDifference.
+// Membership and the event ceiling come from one database statement snapshot.
+// The per-connection channel-pts watermark does not exist on Conn. The window is
+// anchored one step below that ceiling (or at JoinPts if that is higher), so
+// the triggering event is included when it belongs to the snapshot. A duplicate
+// UpdateNewChannelMessage is safe (the client dedups on pts); a missed one is
+// backfilled by the next getChannelDifference.
 func (u *Updater) DeliverChannelPost(ctx context.Context, channelID int64) {
-	members, err := u.h.store.ChannelMembers(ctx, channelID)
+	u.deliverChannelPost(ctx, channelID, func(userID int64) []pushConn {
+		raw := u.registry.Conns(userID)
+		if len(raw) == 0 {
+			return nil
+		}
+		cs := make([]pushConn, len(raw))
+		for i, c := range raw {
+			cs[i] = c
+		}
+		return cs
+	})
+}
+
+func (u *Updater) deliverChannelPost(ctx context.Context, channelID int64, connsFor func(int64) []pushConn) {
+	members, currentPts, err := u.h.store.ChannelDeliverySnapshot(ctx, channelID)
 	if err != nil {
-		u.log.Error("deliver channel post members", "channel_id", channelID, "err", err)
+		u.log.Error("deliver channel post snapshot", "channel_id", channelID, "err", err)
 		return
 	}
-	now := time.Now()
-	var (
-		currentPts int
-		ptsFetched bool
-	)
-	u.deliverChannel(ctx, members, now,
-		func(userID int64) []pushConn {
-			raw := u.registry.Conns(userID)
-			if len(raw) == 0 {
-				return nil
-			}
-			cs := make([]pushConn, len(raw))
-			for i, c := range raw {
-				cs[i] = c
-			}
-			return cs
-		},
+	if u.channelPostSnapshotHook != nil {
+		u.channelPostSnapshotHook()
+	}
+
+	u.deliverChannel(ctx, members, time.Now(), connsFor,
 		func(memberID int64, fromPts int) (channelBatch, error) {
-			if !ptsFetched {
-				pts, serr := u.h.store.ChannelState(ctx, channelID)
-				if serr != nil {
-					u.log.Error("deliver channel post state", "channel_id", channelID, "err", serr)
-					return channelBatch{}, serr
-				}
-				currentPts = pts
-				ptsFetched = true
-			}
 			return u.h.buildChannelUpdates(ctx, channelID, memberID, max(fromPts, currentPts-1), maxDiffEvents, currentPts)
 		},
 	)

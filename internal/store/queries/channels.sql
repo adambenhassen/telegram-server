@@ -64,6 +64,16 @@ SELECT * FROM channels WHERE id = $1 FOR NO KEY UPDATE;
 -- name: ChannelParticipants :many
 SELECT * FROM channel_participants WHERE channel_id = $1 ORDER BY user_id;
 
+-- ChannelDeliverySnapshot binds the member authorization rows and the event
+-- ceiling to one statement snapshot. Live delivery must not authorize from an
+-- older member read and then include events committed after a later state read.
+-- name: ChannelDeliverySnapshot :many
+SELECT participant.*, state.pts
+FROM channel_participants AS participant
+JOIN channel_state AS state ON state.channel_id = participant.channel_id
+WHERE participant.channel_id = $1
+ORDER BY participant.user_id;
+
 -- name: ChannelParticipantByUser :one
 SELECT * FROM channel_participants WHERE channel_id = $1 AND user_id = $2;
 

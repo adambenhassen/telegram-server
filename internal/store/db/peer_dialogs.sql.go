@@ -27,7 +27,7 @@ func (q *Queries) BasicUnreadCountForOwner(ctx context.Context, ownerID int64) (
 }
 
 const chatParticipantsByChatIDs = `-- name: ChatParticipantsByChatIDs :many
-SELECT chat_id, user_id, inviter_id, date FROM chat_participants
+SELECT chat_id, user_id, inviter_id, date, is_admin FROM chat_participants
 WHERE chat_id = ANY($1::bigint[])
 ORDER BY chat_id, user_id
 `
@@ -46,6 +46,7 @@ func (q *Queries) ChatParticipantsByChatIDs(ctx context.Context, chatIds []int64
 			&i.UserID,
 			&i.InviterID,
 			&i.Date,
+			&i.IsAdmin,
 		); err != nil {
 			return nil, err
 		}

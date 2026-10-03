@@ -257,7 +257,7 @@ func TestChannelPostSummaryMigrationIsAdditiveAndTransactional(t *testing.T) {
 	if err = conn.QueryRow(ctx, `SELECT version = 1 AND ready FROM channel_post_summary_state WHERE channel_id = $1`, newChannelID).Scan(&failedSchemaWasRolledBack); err != nil || !failedSchemaWasRolledBack {
 		t.Fatalf("new channel readiness = %v err %v; want ready", failedSchemaWasRolledBack, err)
 	}
-	migrationFunctionBytes, err := os.ReadFile(filepath.Join(migrationsDir, "20261003000052_channel_post_unread_suffix_counts.sql"))
+	migrationFunctionBytes, err := os.ReadFile(filepath.Join(migrationsDir, "20261003000054_channel_post_unread_suffix_counts.sql"))
 	if err != nil {
 		t.Fatalf("read unread suffix function migration: %v", err)
 	}

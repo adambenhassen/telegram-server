@@ -138,11 +138,34 @@ type Chat struct {
 	DefaultBannedRights []string
 }
 
+type ChatAdminEvent struct {
+	ID      int64
+	ChatID  int64
+	UserID  int64
+	IsAdmin bool
+	Version int32
+}
+
+type ChatAdminEventRecipient struct {
+	OwnerID  int64
+	ChatID   int64
+	TargetID int64
+	EventID  int64
+}
+
+type ChatAdminStateMarker struct {
+	OwnerID  int64
+	ChatID   int64
+	TargetID int64
+	EventID  int64
+}
+
 type ChatParticipant struct {
 	ChatID    int64
 	UserID    int64
 	InviterID int64
 	Date      pgtype.Timestamptz
+	IsAdmin   bool
 }
 
 type Dialog struct {
@@ -320,6 +343,49 @@ type PhoneLookup struct {
 	CallerID   int64
 	Phone      string
 	LookedUpAt pgtype.Timestamptz
+}
+
+type Poll struct {
+	ID               int64
+	CreatorID        int64
+	RandomID         int64
+	SourceLocalID    int64
+	Question         []byte
+	PublicVoters     bool
+	MultipleChoice   bool
+	Quiz             bool
+	ShuffleAnswers   bool
+	RevotingDisabled bool
+	Closed           bool
+	CloseDate        pgtype.Timestamptz
+	Solution         []byte
+	CreatedAt        pgtype.Timestamptz
+}
+
+type PollMessageCopy struct {
+	OwnerID int64
+	LocalID int64
+	PollID  int64
+}
+
+type PollOption struct {
+	PollID   int64
+	Option   []byte
+	Text     []byte
+	Correct  bool
+	Position int16
+}
+
+type PollVote struct {
+	PollID       int64
+	VoterID      int64
+	FirstVotedAt pgtype.Timestamptz
+}
+
+type PollVoteOption struct {
+	PollID  int64
+	VoterID int64
+	Option  []byte
 }
 
 type RateLimit struct {

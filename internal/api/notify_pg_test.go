@@ -9,10 +9,9 @@ import (
 	"github.com/teagramhq/teagram-server/internal/pgtest"
 )
 
-// TestDeliverChannelPostNobodyHomeSkipsStateQuery verifies that DeliverChannelPost
-// returns cleanly when no member has a live connection on this replica. With the
-// lazy ChannelState fetch, the state query is skipped entirely in this path.
-func TestDeliverChannelPostNobodyHomeSkipsStateQuery(t *testing.T) {
+// TestDeliverChannelPostNobodyHomeReturns verifies that DeliverChannelPost
+// returns cleanly when no member has a live connection on this replica.
+func TestDeliverChannelPostNobodyHomeReturns(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openStore(t)
@@ -28,6 +27,6 @@ func TestDeliverChannelPostNobodyHomeSkipsStateQuery(t *testing.T) {
 
 	// Empty registry: no live conn for any member on this replica.
 	reg := mtproto.NewSessionRegistry()
-	// Must return cleanly; the lazy state fetch means ChannelState is never called.
+	// Must return cleanly without building updates for any member.
 	api.NewUpdater(s, reg, nil, pgtest.PeerDeriver()).DeliverChannelPost(ctx, ch.ID)
 }

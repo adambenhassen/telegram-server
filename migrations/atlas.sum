@@ -1,4 +1,4 @@
-h1:ExEEd8cig8S82vS+bhNN47BPgSiKuNOYXdAg4KdgZsU=
+h1:vDWjWzcnxi2VlgkYpkdt0YXzJHa1KfK6qIWaCTzsnSA=
 20260721000001_baseline.sql h1:cnO6K1z0Uv3goEvecgJixKSio6ziaB1rF7cQLoCWOxs=
 20260721000002_auth_keys.sql h1:+vNabm6vdEAgu3H5ZGw2Wr8D/Y6i4ikAAUO3JbfZQeE=
 20260721000003_code_hardening.sql h1:8pbAqUpqcwOONUfac+qC51QjfC1JnObNCcXa1HC/dr0=
@@ -54,4 +54,6 @@ h1:ExEEd8cig8S82vS+bhNN47BPgSiKuNOYXdAg4KdgZsU=
 20261003000049_channel_message_actions.sql h1:nSvO2Ls9ceZuwcFPYZZQGNnYGtFJ1Cxs2NArFuPJVbc=
 20261003000050_backfill_empty_channel_create_messages.sql h1:8d6eOkcMKCEOY/BTk6D8HB+iF+wbsop7Fa0rIxwhSxY=
 20261003000051_channel_post_summaries.sql h1:IEq1hTZd1z3txCDLDi1QwldTfTUWnN4Lgijrf95Mtls=
-20261003000052_channel_post_unread_suffix_counts.sql h1:hpErEtXtyqtai7Az+wVYsUYi1mdhXODtgxzBx4WgrbM=
+20261003000052_basic_group_admin.sql h1:VvyZWK3keA3WPGLQMJAPHA1kn+LMOy9NfgB9l9Gns5c=
+20261003000053_polls.sql h1:EJW4Pr8DEQveyr2UYlX73rJKKOcF608RRKAXTGXTMXg=
+20261003000054_channel_post_unread_suffix_counts.sql h1:WXZYH6wiwrBtpVsXnJ76zlHH4h+PbKJmiXDeUQcd+ds=
