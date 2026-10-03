@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -10,9 +11,9 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 const (
@@ -100,10 +101,8 @@ func (h *handlers) inputChannelID(c tg.InputChannelClass, viewerID int64) (int64
 
 // handleCreateChannel serves channels.createChannel.
 //
-// The reply carries no service message and does not move the channel's pts. M7
-// writes no channel service messages at all, and a create that bumped the pts
-// before any client can have read the channel would only make every future
-// getChannelDifference start one step behind.
+// The creator is the channel's first member, so the channel-create service
+// message is written as the first channel event and returned in this reply.
 func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) {
 	var req tg.ChannelsCreateChannelRequest
 	if err := req.Decode(r.Buf); err != nil {
@@ -132,7 +131,7 @@ func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) 
 		return nil, errPeerIDInvalid
 	}
 
-	ch, err := h.store.CreateChannel(r.Ctx, r.UserID, title, about, req.Megagroup)
+	ch, createMessage, pts, err := h.store.CreateChannelWithServiceMessage(r.Ctx, r.UserID, title, about, req.Megagroup)
 	// The per-account channel cap reuses USERS_TOO_MUCH, the same wire error the
 	// chat path returns for its participant cap (internal/api/chats.go:150). It
 	// is the closest existing sentinel, and a distinct one would tell a caller
@@ -145,6 +144,7 @@ func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) 
 		h.log.Error("create channel", "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
+	h.notifyChannelPost(r.Ctx, ch.ID)
 
 	chats, err := h.loadChannels(r.Ctx, map[int64]bool{ch.ID: true}, r.UserID)
 	if err != nil {
@@ -157,10 +157,13 @@ func (h *handlers) handleCreateChannel(r *mtproto.Request) (bin.Encoder, error) 
 		return nil, errInternal
 	}
 	return &tg.Updates{
-		Updates: []tg.UpdateClass{&tg.UpdateChannel{ChannelID: ch.ID}},
-		Chats:   chats,
-		Users:   users,
-		Date:    int(ch.Date.Unix()),
+		Updates: []tg.UpdateClass{
+			&tg.UpdateNewChannelMessage{Message: channelMessageToTL(createMessage, r.UserID, nil), Pts: pts, PtsCount: 1},
+			&tg.UpdateChannel{ChannelID: ch.ID},
+		},
+		Chats: chats,
+		Users: users,
+		Date:  int(createMessage.Date.Unix()),
 	}, nil
 }
 
@@ -222,7 +225,7 @@ func (h *handlers) handleGetFullChannel(r *mtproto.Request) (bin.Encoder, error)
 		full.SetBannedCount(int(snapshot.BannedCount))
 		if snapshot.HasInvite {
 			full.SetExportedInvite(&tg.ChatInviteExported{
-				Link:      inviteLinkPrefix + snapshot.InviteHash,
+				Link:      h.cfg.MeURLPrefix + "+" + snapshot.InviteHash,
 				AdminID:   snapshot.InviteCreatorID,
 				Date:      int(snapshot.InviteDate.Unix()),
 				Permanent: true,
@@ -399,9 +402,7 @@ func (h *handlers) handleInviteToChannel(r *mtproto.Request) (bin.Encoder, error
 		h.log.Error("invite channel members", "channel_id", channelID, "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	for _, targetID := range added {
-		h.notifyChannelMembership(r.Ctx, targetID, channelID)
-	}
+	h.notifyChannelMemberships(r.Ctx, channelID, added)
 
 	chats, err := h.loadChannels(r.Ctx, map[int64]bool{channelID: true}, r.UserID)
 	if err != nil {
@@ -740,6 +741,56 @@ func (h *handlers) handleGetChannelMessages(r *mtproto.Request) (bin.Encoder, er
 	return h.channelMessages(r, channelID, msgs)
 }
 
+// handleExportMessageLink returns an address only for a message that the
+// caller can currently read through channels.getMessages. Channel membership,
+// the per-viewer access hash and bans remain the admission checks; the private
+// channel id in the resulting URL is only an address.
+func (h *handlers) handleExportMessageLink(r *mtproto.Request) (bin.Encoder, error) {
+	var req tg.ChannelsExportMessageLinkRequest
+	if err := req.Decode(r.Buf); err != nil {
+		return nil, errMethodNotImpl
+	}
+	if r.UserID == 0 {
+		return nil, errAuthKeyUnreg
+	}
+	channelID, err := h.inputChannelID(req.Channel, r.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := h.requireChannelMember(r.Ctx, channelID, r.UserID); err != nil {
+		return nil, err
+	}
+	if req.ID <= 0 {
+		return nil, errPeerIDInvalid
+	}
+
+	messages, err := h.store.ChannelMessages(r.Ctx, channelID, []int64{int64(req.ID)})
+	if err != nil {
+		h.log.Error("export channel message link", "user_id", r.UserID, "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	message, found := messages[int64(req.ID)]
+	if !found || message.Deleted {
+		return nil, errPeerIDInvalid
+	}
+
+	channel, found, err := h.store.ChannelByID(r.Ctx, channelID)
+	if err != nil {
+		h.log.Error("export channel message link channel", "user_id", r.UserID, "channel_id", channelID, "err", err)
+		return nil, errInternal
+	}
+	if !found {
+		return nil, errPeerIDInvalid
+	}
+
+	messageID := strconv.Itoa(req.ID)
+	address := "c/" + strconv.FormatInt(channelID, 10) + "/" + messageID
+	if channel.Username != nil && *channel.Username != "" {
+		address = *channel.Username + "/" + messageID
+	}
+	return &tg.ExportedMessageLink{Link: h.cfg.MeURLPrefix + address}, nil
+}
+
 // channelHistory renders one page of a channel's history for the caller, whom
 // requireChannelMember has already established is an unbanned member.
 //
@@ -839,11 +890,9 @@ func (h *handlers) channelMessagesWithCount(
 	}, nil
 }
 
-// inviteLinkPrefix is what a hash is rendered behind. The link is the whole
-// credential, so nothing but the hash may appear after it — an id in the link
-// hands a real channel id to everyone the link travels through, and the hash
-// alone is what admits.
-const inviteLinkPrefix = "https://t.me/+"
+// legacyInviteLinkPrefix is accepted only when revoking links issued before
+// public links used the configured origin.
+const legacyInviteLinkPrefix = "https://t.me/+"
 
 // revokeExportedChatInviteTypeID is the constructor id of
 // messages.revokeExportedChatInvite (0x13db322c). gotd v0.161.0 does not
@@ -932,7 +981,7 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 		return nil, errInternal
 	}
 	return &tg.ChatInviteExported{
-		Link:      inviteLinkPrefix + hash,
+		Link:      h.cfg.MeURLPrefix + "+" + hash,
 		AdminID:   r.UserID,
 		Date:      int(time.Now().Unix()),
 		Permanent: true,
@@ -943,10 +992,9 @@ func (h *handlers) handleExportChatInvite(r *mtproto.Request) (bin.Encoder, erro
 // gotd v0.161.0 does not generate this request type, so the handler decodes
 // it manually (peer, hash) and registers the constructor id directly.
 //
-// Every rejection returns errPeerIDInvalid: no channel row, no participant row,
-// role 0, a live ban, or a hash that the channel never minted. They are ONE
-// error deliberately — a distinguishable "hash not found" would let an account
-// walk the invite space.
+// Authorization failures return errPeerIDInvalid: no channel row, no participant
+// row, role 0, or a live ban. Unknown hashes and links with unrecognized origins
+// revoke nothing and still return success, so invite existence is not disclosed.
 //
 // Role 1 is the floor for the same reason export requires it: a role-0 member
 // able to revoke would be able to confirm which hashes belong to the channel.
@@ -969,8 +1017,18 @@ func (h *handlers) handleRevokeExportedChatInvite(r *mtproto.Request) (bin.Encod
 		return nil, errPeerIDInvalid
 	}
 
-	// Strip link prefix if client sent full link instead of bare hash.
-	hash, _ := strings.CutPrefix(req.Hash, inviteLinkPrefix)
+	// Revoke accepts bare hashes, current configured links, and the exact legacy
+	// link form. Other origins remain part of the hash and cannot revoke an invite.
+	hash := req.Hash
+	if h.cfg.MeURLPrefix != "" {
+		if configuredHash, ok := strings.CutPrefix(hash, h.cfg.MeURLPrefix+"+"); ok {
+			hash = configuredHash
+		} else if legacyHash, ok := strings.CutPrefix(hash, legacyInviteLinkPrefix); ok {
+			hash = legacyHash
+		}
+	} else if legacyHash, ok := strings.CutPrefix(hash, legacyInviteLinkPrefix); ok {
+		hash = legacyHash
+	}
 
 	member, found, err := h.store.ChannelMemberOf(r.Ctx, channelID, r.UserID)
 	if err != nil {
@@ -982,7 +1040,7 @@ func (h *handlers) handleRevokeExportedChatInvite(r *mtproto.Request) (bin.Encod
 	}
 
 	if err = h.store.RevokeChannelInvite(r.Ctx, hash, channelID); err != nil {
-		h.log.Error("revoke exported chat invite", "channel_id", channelID, "hash", hash, "err", err)
+		h.log.Error("revoke exported chat invite", "channel_id", channelID, "err", err)
 		return nil, errInternal
 	}
 

@@ -6,7 +6,7 @@ import (
 
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 func TestFloodWaitError(t *testing.T) {

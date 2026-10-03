@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestDeleteMessagesConcurrentSelfAndRevoke is the overlap the walk's

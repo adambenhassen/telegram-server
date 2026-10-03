@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func plantBlobErasureObject(t *testing.T, s *store.Store, key, body string, at time.Time) {

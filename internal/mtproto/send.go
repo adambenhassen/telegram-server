@@ -95,12 +95,19 @@ type Conn struct {
 
 	// created is touched only by the connection's single serve goroutine.
 	created map[int64]struct{}
+	// systemLangCodeHint is captured from initConnection and read by that same
+	// serve goroutine for help.getConfig. It is bounded and connection-local.
+	systemLangCodeHint string
 
 	// unimplemented bounds what this connection may spend on methods this
 	// server does not implement, and thins the line they produce. Touched only
 	// by the same serve goroutine as created, which is the only one that
 	// dispatches this connection's frames.
 	unimplemented unimplementedBudget
+	// langpack counts calls to the catalog-backed Langpack RPC surface. It is
+	// separate from unimplemented so alternating the two cannot spend one
+	// shared allowance twice or allow one surface to starve the other.
+	langpack langpackBudget
 
 	// lastPushedPts is the highest owner pts delivered to this conn by a push or
 	// accounted for by its send RPC result, so a notification never re-delivers

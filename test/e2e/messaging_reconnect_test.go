@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
 	"github.com/gotd/td/tg"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestMessagingReconnectPushGap(t *testing.T) {

@@ -12,7 +12,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/adambenhassen/telegram-server/utils"
+	"github.com/teagramhq/teagram-server/utils"
 )
 
 type ctxKey string

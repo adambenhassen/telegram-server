@@ -17,13 +17,13 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 type helpPollingFixture struct {
@@ -171,10 +171,17 @@ func TestHelpTermsAndPromoPolling(t *testing.T) {
 				return fmt.Errorf("authorized help.getPromoData call %d: %w", i+1, err)
 			}
 		}
-		if _, err := raw.HelpGetNearestDC(ctx); err == nil {
-			return errors.New("help.getNearestDc succeeded after authorized polling, want INPUT_METHOD_INVALID")
-		} else if !tgerr.Is(err, "INPUT_METHOD_INVALID") {
+		nearest, err := raw.HelpGetNearestDC(ctx)
+		if err != nil {
 			return fmt.Errorf("help.getNearestDc after authorized polling: %w", err)
+		}
+		if nearest.ThisDC != 2 || nearest.NearestDC != 2 || nearest.Country != "" {
+			return fmt.Errorf("help.getNearestDc after authorized polling = %+v, want configured DC 2 only", nearest)
+		}
+		if _, err := raw.HelpGetSupport(ctx); err == nil {
+			return errors.New("help.getSupport succeeded after authorized polling, want INPUT_METHOD_INVALID")
+		} else if !tgerr.Is(err, "INPUT_METHOD_INVALID") {
+			return fmt.Errorf("help.getSupport after authorized polling: %w", err)
 		}
 
 		// Trailing request data is malformed for these argument-free methods

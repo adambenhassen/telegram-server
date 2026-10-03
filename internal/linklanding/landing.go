@@ -20,9 +20,9 @@ const (
 func NewHandler(logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		class := routeClass(r.URL.Path)
-		status, body := responseFor(r.Method, class)
+		status, body := responseFor(r.Method, r.URL.Path)
 
-		setSecurityHeaders(w.Header(), body)
+		SetSecurityHeaders(w.Header(), body)
 		if status == http.StatusMethodNotAllowed {
 			w.Header().Set("Allow", "GET, HEAD")
 		}
@@ -38,25 +38,39 @@ func NewHandler(logger *slog.Logger) http.Handler {
 	})
 }
 
-func responseFor(method, class string) (int, string) {
+func responseFor(method, path string) (int, string) {
 	if method != http.MethodGet && method != http.MethodHead {
 		return http.StatusMethodNotAllowed, methodPage
 	}
-	if class == "admin" {
+	if path == "/admin" || strings.HasPrefix(path, "/admin/") {
 		return http.StatusNotFound, notFoundPage
 	}
 	return http.StatusOK, landingPage
 }
 
+// StaticBodyForStatus returns the fixed landing body for a supported response.
+func StaticBodyForStatus(status int) (string, bool) {
+	switch status {
+	case http.StatusOK:
+		return landingPage, true
+	case http.StatusNotFound:
+		return notFoundPage, true
+	case http.StatusMethodNotAllowed:
+		return methodPage, true
+	default:
+		return "", false
+	}
+}
+
 func routeClass(path string) string {
 	if path == "/admin" || strings.HasPrefix(path, "/admin/") {
-		return "admin"
+		return "landing_other"
 	}
 	if strings.HasPrefix(path, "/+") && !strings.Contains(path[1:], "/") {
 		return "invite"
 	}
 	if path == "/" || !strings.HasPrefix(path, "/") {
-		return "other"
+		return "landing_other"
 	}
 
 	segments := strings.Split(path[1:], "/")
@@ -68,11 +82,12 @@ func routeClass(path string) string {
 	case len(segments) == 3 && segments[0] == "c" && segments[1] != "" && segments[2] != "":
 		return "message"
 	default:
-		return "other"
+		return "landing_other"
 	}
 }
 
-func setSecurityHeaders(header http.Header, body string) {
+// SetSecurityHeaders adds the fixed response headers used by landing pages.
+func SetSecurityHeaders(header http.Header, body string) {
 	header.Set("Cache-Control", "no-store")
 	header.Set("Referrer-Policy", "no-referrer")
 	header.Set("X-Content-Type-Options", "nosniff")

@@ -11,16 +11,20 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/srp"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 type handlers struct {
 	store *store.Store
+	// langpack is the precomputed, immutable RPC view of the latest validated
+	// catalog snapshot. Langpack handlers never query the store.
+	langpack *langpackService
 	// peers derives the per-viewer peer access_hash. Every emission and
 	// verification site in this package goes through it. Nothing constructs
 	// a peer access hash anywhere else.
@@ -199,9 +203,14 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	if len(rateLimitMetrics) > 0 {
 		denialMetrics = rateLimitMetrics[0]
 	}
+	var langpackSnapshot *catalog.Snapshot
+	if s != nil {
+		langpackSnapshot = s.CatalogSnapshot()
+	}
 	h := &handlers{
 		peers:                    peers,
 		store:                    s,
+		langpack:                 newLangpackService(langpackSnapshot, dcID),
 		cfg:                      cfg,
 		dcID:                     dcID,
 		log:                      log,
@@ -236,8 +245,11 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 		dialogFilterSync:         dialogFilterSync,
 	}
 	d := mtproto.NewDispatcher()
-	register(d, tg.HelpGetConfigRequestTypeID, h.handleGetConfig)
+	registerWithConn(d, tg.HelpGetConfigRequestTypeID, func(c *mtproto.Conn, req *mtproto.Request) (bin.Encoder, error) {
+		return h.handleGetConfigWithSystemLangCode(req, c.SystemLangCodeHint())
+	})
 	register(d, tg.HelpGetAppConfigRequestTypeID, h.handleGetAppConfig)
+	registerLangpackMethods(d, h)
 	h.registerHelpPolling(d)
 	register(d, tg.AuthSendCodeRequestTypeID, h.handleSendCode)
 	registerWithConn(d, tg.AuthSignInRequestTypeID, h.handleSignIn)
@@ -300,6 +312,7 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	register(d, tg.MessagesAddChatUserRequestTypeID, h.handleAddChatUser)
 	register(d, tg.MessagesDeleteChatUserRequestTypeID, h.handleDeleteChatUser)
 	register(d, tg.ChannelsGetMessagesRequestTypeID, h.handleGetChannelMessages)
+	register(d, tg.ChannelsExportMessageLinkRequestTypeID, h.handleExportMessageLink)
 	register(d, tg.MessagesExportChatInviteRequestTypeID, h.handleExportChatInvite)
 	register(d, tg.MessagesCheckChatInviteRequestTypeID, h.handleCheckChatInvite)
 	register(d, tg.MessagesImportChatInviteRequestTypeID, h.handleImportChatInvite)
@@ -346,6 +359,14 @@ func NewWithDialogFilterSync(s *store.Store, dcID int, cfg *tg.Config, log *slog
 	register(d, tg.CommunitiesGetJoinedCommunitiesRequestTypeID, h.handleGetJoinedCommunities)
 	d.Fallback(mtproto.HandlerFunc(h.handleUnknownGated))
 	return mtproto.UnpackInvokeWithAfterMsg(d, h.handleInvokeAfterMsgRefusal)
+}
+
+func registerLangpackMethods(d *mtproto.Dispatcher, h *handlers) {
+	registerLangpack(d, tg.HelpGetNearestDCRequestTypeID, "help.getNearestDc", h.handleHelpGetNearestDC)
+	registerLangpack(d, tg.LangpackGetLanguagesRequestTypeID, "langpack.getLanguages", h.handleLangpackGetLanguages)
+	registerLangpack(d, tg.LangpackGetLangPackRequestTypeID, "langpack.getLangPack", h.handleLangpackGetLangPack)
+	registerLangpack(d, tg.LangpackGetStringsRequestTypeID, "langpack.getStrings", h.handleLangpackGetStrings)
+	registerLangpack(d, tg.LangpackGetDifferenceRequestTypeID, "langpack.getDifference", h.handleLangpackGetDifference)
 }
 
 // checkRateLimit checks the per-account rate limit for the given surface.
@@ -463,6 +484,11 @@ func (h *handlers) recordRateLimitDenial(surface string) {
 var provisionalAllowList = map[uint32]bool{
 	tg.HelpGetConfigRequestTypeID:                 true,
 	tg.HelpGetAppConfigRequestTypeID:              true,
+	tg.HelpGetNearestDCRequestTypeID:              true,
+	tg.LangpackGetLanguagesRequestTypeID:          true,
+	tg.LangpackGetLangPackRequestTypeID:           true,
+	tg.LangpackGetStringsRequestTypeID:            true,
+	tg.LangpackGetDifferenceRequestTypeID:         true,
 	tg.AccountGetPasswordRequestTypeID:            true,
 	tg.AccountUpdatePasswordSettingsRequestTypeID: true,
 	tg.AuthLogOutRequestTypeID:                    true,

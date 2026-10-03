@@ -95,7 +95,7 @@ jobs:
           mkdir -p reconnect-diagnostics
           if [[ "$PARALLEL_E2E" == "true" ]]; then
             load_mode=parallel-e2e
-            load_command="GOTOOLCHAIN=go1.26.6 go test -race -json -count=1 -timeout 15m ./test/e2e"
+            load_command="GOTOOLCHAIN=go1.27.1 go test -race -json -count=1 -timeout 15m ./test/e2e"
             load_status=not_run
             load_time=not_run
           else
@@ -109,7 +109,7 @@ jobs:
             printf 'tested_sha=%s\n' "$SOURCE_SHA"
             printf 'repetition_count=%s\n' "$REPETITIONS"
             printf 'load_mode=%s\n' "$load_mode"
-            printf "focused_command=GOTOOLCHAIN=go1.26.6 go test -race -json -count=%s -timeout 15m ./test/e2e -run '^TestMessagingReconnectPushGap$'\n" "$REPETITIONS"
+            printf "focused_command=GOTOOLCHAIN=go1.27.1 go test -race -json -count=%s -timeout 15m ./test/e2e -run '^TestMessagingReconnectPushGap$'\n" "$REPETITIONS"
             printf 'load_command=%s\n' "$load_command"
             printf 'go_version=not_run\n'
             printf 'focused_exit_code=not_run\n'

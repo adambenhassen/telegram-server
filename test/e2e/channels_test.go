@@ -13,14 +13,29 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
+
+const testPublicLinkPrefix = "https://test.example/"
 
 // inviteHash strips the link prefix and returns the bare hash.
 func inviteHash(link string) string {
-	return strings.TrimPrefix(link, "https://t.me/+")
+	return strings.TrimPrefix(link, testPublicLinkPrefix+"+")
+}
+
+func validInviteHash(hash string) bool {
+	if len(hash) != 22 {
+		return false
+	}
+	for i := range len(hash) {
+		c := hash[i]
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // hasChannel reports whether chats contains a *tg.Channel with the given id.
@@ -97,7 +112,11 @@ func exportChannelInvite(t *testing.T, ctx context.Context, viewerID int64, cmds
 		if !ok {
 			return errors.New("exportChatInvite: unexpected response type")
 		}
-		hash = inviteHash(inv.Link)
+		var hasPrefix bool
+		hash, hasPrefix = strings.CutPrefix(inv.Link, testPublicLinkPrefix+"+")
+		if !hasPrefix || !validInviteHash(hash) {
+			return fmt.Errorf("exportChatInvite: link %q has no configured prefix or valid hash", inv.Link)
+		}
 		return nil
 	})
 	return hash
@@ -304,16 +323,16 @@ func testSmokeMegagroupSlowMode(t *testing.T) {
 			if !ok {
 				return fmt.Errorf("first post message = %T, want *tg.Message", post.Message)
 			}
-			if message.Message != "first slow-mode post" || post.Pts != 1 {
-				return fmt.Errorf("first post text/pts = %q/%d, want %q/1", message.Message, post.Pts, "first slow-mode post")
+			if message.Message != "first slow-mode post" || post.Pts != 2 {
+				return fmt.Errorf("first post text/pts = %q/%d, want %q/2", message.Message, post.Pts, "first slow-mode post")
 			}
 			firstID, firstPts = message.ID, post.Pts
 			return nil
 		}
 		return errors.New("first send result has no UpdateNewChannelMessage")
 	})
-	if firstID == 0 || firstPts != 1 {
-		t.Fatalf("first post identity/pts = %d/%d, want nonzero/1", firstID, firstPts)
+	if firstID == 0 || firstPts != 2 {
+		t.Fatalf("first post identity/pts = %d/%d, want nonzero/2", firstID, firstPts)
 	}
 
 	assertChannelRPCErrorPrefix(t, ctx, bCmds, "SLOWMODE_WAIT_", func(ctx context.Context, c *tg.Client) error {
@@ -349,16 +368,16 @@ func testSmokeMegagroupSlowMode(t *testing.T) {
 	})
 
 	pts, err := st.ChannelState(ctx, channelID)
-	if err != nil || pts != 1 {
-		t.Fatalf("channel pts after retry = %d err=%v, want 1", pts, err)
+	if err != nil || pts != 2 {
+		t.Fatalf("channel pts after retry = %d err=%v, want 2", pts, err)
 	}
 	events, err := st.ChannelEventsWindow(ctx, channelID, 0, pts, 10)
-	if err != nil || len(events) != 1 || events[0].Pts != firstPts {
-		t.Fatalf("channel events after retry = %+v err=%v, want only the first event", events, err)
+	if err != nil || len(events) != 2 || events[1].Pts != firstPts {
+		t.Fatalf("channel events after retry = %+v err=%v, want creation and first-post events", events, err)
 	}
 	history, err := st.ChannelHistory(ctx, channelID, 0, 10)
-	if err != nil || len(history) != 1 || history[0].Message != "first slow-mode post" {
-		t.Fatalf("channel history after retry = %+v err=%v, want only the original post", history, err)
+	if err != nil || len(history) != 2 || history[0].Message != "first slow-mode post" || history[0].Action != store.ChannelMessageActionNone || history[1].Action != store.ChannelMessageActionCreate {
+		t.Fatalf("channel history after retry = %+v err=%v, want the original post and creation event", history, err)
 	}
 	execChannel(t, ctx, aCmds, func(ctx context.Context, c *tg.Client) error {
 		return toggleSlowMode(ctx, c, aUserID, 0)
@@ -378,7 +397,7 @@ func testSmokeMegagroupSlowMode(t *testing.T) {
 
 // TestChannelsLifecycle proves gate 1: A creates a broadcast channel, exports
 // an invite, B imports it and is a member, A posts and B receives
-// UpdateNewChannelMessage live with the correct text and Pts=1.
+// UpdateNewChannelMessage live with the correct text and Pts=2 after creation.
 func TestChannelsLifecycle(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -480,8 +499,8 @@ func TestChannelsLifecycle(t *testing.T) {
 		if count, ok := channelFull.GetParticipantsCount(); !ok || count != 1 {
 			return fmt.Errorf("getFullChannel: participant count = %d present=%v, want 1", count, ok)
 		}
-		if channelFull.Pts != 0 {
-			return fmt.Errorf("getFullChannel: pts = %d, want 0", channelFull.Pts)
+		if channelFull.Pts != 1 {
+			return fmt.Errorf("getFullChannel: pts = %d, want 1 for the creation event", channelFull.Pts)
 		}
 		return nil
 	})
@@ -518,7 +537,7 @@ func TestChannelsLifecycle(t *testing.T) {
 		return err
 	})
 
-	// B receives UpdateNewChannelMessage with the correct text and Pts=1.
+	// B joined after creation and receives the first post at Pts=2.
 	select {
 	case upd := <-collB.newChannelMsg:
 		if upd.Msg.Message != "hello channel" {
@@ -531,14 +550,14 @@ func TestChannelsLifecycle(t *testing.T) {
 		if peer.ChannelID != chID {
 			t.Fatalf("B peer channelID = %d, want %d", peer.ChannelID, chID)
 		}
-		if upd.Pts != 1 {
-			t.Fatalf("B UpdateNewChannelMessage Pts = %d, want 1", upd.Pts)
+		if upd.Pts != 2 {
+			t.Fatalf("B UpdateNewChannelMessage Pts = %d, want 2", upd.Pts)
 		}
 	case <-ctx.Done():
 		t.Fatalf("B timed out waiting for channel message: %v", ctx.Err())
 	}
 
-	// The sender receives UpdateNewChannelMessage in the RPC reply. Verify Pts=1.
+	// The sender receives UpdateNewChannelMessage in the RPC reply. Verify Pts=2.
 	// Drain A's own copy from newChannelMsg (sent when A's command loop processed
 	// the RPC response that arrived as an *tg.Updates).
 	//
@@ -559,11 +578,11 @@ func TestChannelsLifecycle(t *testing.T) {
 		if !ok {
 			return errors.New("getChannelDifference: unexpected type")
 		}
-		if diff.Pts != 1 {
-			return errors.New("channel pts after one post != 1")
+		if diff.Pts != 2 {
+			return errors.New("channel pts after creation and one post != 2")
 		}
-		if len(diff.NewMessages) != 1 {
-			return errors.New("channel difference: expected 1 message")
+		if len(diff.NewMessages) != 2 {
+			return errors.New("channel difference: expected creation event and one post")
 		}
 		return nil
 	})
@@ -782,7 +801,7 @@ func TestChannelsMegagroup(t *testing.T) {
 	}
 
 	// B (role 0) posts with the unrestricted default and gets the post in the RPC reply.
-	postAndCheckReply(bUserID, bCmds, "megagroup post by plain member", 5002001, 1)
+	postAndCheckReply(bUserID, bCmds, "megagroup post by plain member", 5002001, 2)
 
 	// B is promoted and saves SendPolls through the same method the Permissions
 	// screen uses. The reply names the channel whose default rights committed.
@@ -1047,7 +1066,7 @@ func TestChannelsAdmissionIsInvite(t *testing.T) {
 //   - B disconnects, A posts twice; B reconnects and getChannelDifference
 //     returns both posts with Final=true.
 //   - D joins fresh; its first getChannelDifference is empty (join_pts floor)
-//     while getHistory returns both posts (the deliberate asymmetry).
+//     while getHistory returns the creation event and both posts.
 func TestChannelsOfflineBackfill(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -1254,12 +1273,12 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 		dUserID = self.ID
 		api := dClient.API()
 
-		// D imports invite (join_pts is set to current channel pts = 2).
+		// D imports invite (join_pts is set to current channel pts = 3).
 		if _, err := api.MessagesImportChatInvite(ctx, hashD); err != nil {
 			return err
 		}
 
-		// D calls getDifference from pts 0; join_pts floor clamps it to 2 = currentPts.
+		// D calls getDifference from pts 0; join_pts floor clamps it to 3 = currentPts.
 		d, err := api.UpdatesGetChannelDifference(ctx, &tg.UpdatesGetChannelDifferenceRequest{
 			Channel: inputChannel(dUserID, chID),
 			Filter:  &tg.ChannelMessagesFilterEmpty{},
@@ -1298,8 +1317,8 @@ func TestChannelsOfflineBackfill(t *testing.T) {
 	if !dDiffEmpty {
 		t.Fatal("D getDifference should be empty (join_pts floor), but got messages")
 	}
-	if len(dHistoryMsgs) != 2 {
-		t.Fatalf("D getHistory = %d messages, want 2", len(dHistoryMsgs))
+	if len(dHistoryMsgs) != 3 {
+		t.Fatalf("D getHistory = %d messages, want creation event and 2 posts (3 total)", len(dHistoryMsgs))
 	}
 }
 
@@ -1787,8 +1806,8 @@ func TestChannelsInviteToChannelPushesViewerChannelAndLivePosts(t *testing.T) {
 	})
 	select {
 	case update := <-collB.newChannelMsg:
-		if update.Msg.Message != "direct invite live post" || update.Pts != 1 {
-			t.Fatalf("B channel post = %q at pts %d, want expected message at pts 1", update.Msg.Message, update.Pts)
+		if update.Msg.Message != "direct invite live post" || update.Pts != 2 {
+			t.Fatalf("B channel post = %q at pts %d, want expected message at pts 2", update.Msg.Message, update.Pts)
 		}
 	case <-ctx.Done():
 		t.Fatalf("B timed out waiting for the post after direct invite: %v", ctx.Err())
@@ -1808,8 +1827,8 @@ func TestChannelsInviteToChannelPushesViewerChannelAndLivePosts(t *testing.T) {
 	})
 	noCtx, noCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	select {
-	case <-collB.newChannelMsg:
-		t.Error("B should not receive a channel post after leaving")
+	case update := <-collB.newChannelMsg:
+		t.Errorf("B received %q at pts %d after leaving", update.Msg.Message, update.Pts)
 	case <-noCtx.Done():
 	}
 	noCancel()

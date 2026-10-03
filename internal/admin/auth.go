@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/admin/assets"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/admin/assets"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // csrfCookieName is the name of the cookie that carries the CSRF token hash.
@@ -194,7 +194,7 @@ type LoginHandlerConfig struct {
 	// Logger is used for structured logging (never logs raw tokens or session ids).
 	Logger *slog.Logger
 	// AdminOrigin is the expected Origin header for login/logout POST requests.
-	// Derived from the admin listen address at startup.
+	// It is fixed from configuration at startup.
 	AdminOrigin string
 	// Events is the shared metrics broadcaster backing GET /admin/events.
 	// A nil value registers the route but reports it unavailable, so the
@@ -344,8 +344,8 @@ func handleLoginPOST(cfg LoginHandlerConfig, rl *rateLimiter, w http.ResponseWri
 	cookie := SessionCookie(sessionIDHex)
 	http.SetCookie(w, cookie)
 
-	// Redirect to metrics dashboard.
-	http.Redirect(w, r, "/admin/metrics", http.StatusFound)
+	// Redirect to the admin dashboard.
+	http.Redirect(w, r, "/admin/dashboard", http.StatusFound)
 }
 
 // handleLogoutPOST processes logout requests.

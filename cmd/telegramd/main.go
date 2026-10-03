@@ -27,17 +27,17 @@ import (
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/tdsync"
 
-	"github.com/adambenhassen/telegram-server/internal/admin"
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/blobscan"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/discovery"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	tsrp "github.com/adambenhassen/telegram-server/internal/srp"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/admin"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blobscan"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/discovery"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	tsrp "github.com/teagramhq/teagram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func main() {
@@ -219,7 +219,27 @@ func readAdminPassword(stdin io.Reader) ([]byte, error) {
 }
 
 func runMaintenanceCommand(args []string, log *slog.Logger, _ io.Writer, stderr io.Writer) (err error) {
-	if len(args) != 1 || args[0] != "assign-operator" {
+	var channelSummaryID int64
+	if len(args) == 0 {
+		return maintenanceUsageError()
+	}
+	switch args[0] {
+	case "assign-operator":
+		if len(args) != 1 {
+			return maintenanceUsageError()
+		}
+	case "initialize-channel-post-summaries":
+		if len(args) != 3 {
+			return maintenanceUsageError()
+		}
+		if args[1] != "--channel-id" {
+			return maintenanceUsageError()
+		}
+		channelSummaryID, err = strconv.ParseInt(args[2], 10, 64)
+		if err != nil || channelSummaryID <= 0 {
+			return maintenanceUsageError()
+		}
+	default:
 		return maintenanceUsageError()
 	}
 
@@ -245,6 +265,15 @@ func runMaintenanceCommand(args []string, log *slog.Logger, _ io.Writer, stderr 
 		}
 	}()
 
+	if channelSummaryID > 0 {
+		if err := st.InitializeChannelPostSummaries(ctx, channelSummaryID); err != nil {
+			return fmt.Errorf("initialize channel post summaries: %w", err)
+		}
+		if _, err := fmt.Fprintf(stderr, "Channel post summaries initialized: %d\n", channelSummaryID); err != nil {
+			return fmt.Errorf("write channel post summary confirmation: %w", err)
+		}
+		return nil
+	}
 	if err := st.AssignOperatorServerAdministrator(ctx); err != nil {
 		return fmt.Errorf("assign operator server administrator: %w", err)
 	}
@@ -255,7 +284,7 @@ func runMaintenanceCommand(args []string, log *slog.Logger, _ io.Writer, stderr 
 }
 
 func maintenanceUsageError() error {
-	return errors.New("usage: telegramd maintenance assign-operator")
+	return errors.New("usage: telegramd maintenance assign-operator | initialize-channel-post-summaries --channel-id <positive-id>")
 }
 
 func writeClientConfigUsage(w io.Writer) error {
@@ -425,7 +454,7 @@ func writeInviteList(w io.Writer, invites []store.RegistrationInvite) error {
 }
 
 func run(log *slog.Logger) error {
-	cfg, err := config.Load(log)
+	cfg, err := config.LoadServerConfig(log)
 	if err != nil {
 		return err
 	}
@@ -543,6 +572,7 @@ func run(log *slog.Logger) error {
 	}
 
 	tgcfg := api.DefaultConfig(cfg.DCID, cfg.AdvertiseHost, cfg.AdvertisePort)
+	tgcfg.MeURLPrefix = cfg.PublicLinkPrefix
 	notifyMetrics := store.NewNotificationMetrics()
 	dialogFilterSync := api.NewDialogFilterSync()
 	handler := api.NewWithDialogFilterSync(st, cfg.DCID, tgcfg, log, cfg.LogLoginCodes, cfg.MaxFileBytes, blobs, cfg.MaxUserStorageBytes, peers, cfg.RateLimits, cfg.RegistrationMode, dialogFilterSync, notifyMetrics)
@@ -604,18 +634,6 @@ func run(log *slog.Logger) error {
 	// Start the admin HTTP server on a separate listener with login, logout,
 	// CSRF protection, rate limiting, and security headers.
 	if cfg.AdminListenAddr != "" {
-		// Derive the admin origin from the listen address for CSRF checks.
-		// When AdminListenAddr is a bare :port (e.g. ":2444"), substitute
-		// localhost so the Origin header matches what a browser sends.
-		adminHost, adminPort, err := net.SplitHostPort(cfg.AdminListenAddr)
-		if err != nil {
-			return fmt.Errorf("admin listen address: %w", err)
-		}
-		if adminHost == "" {
-			adminHost = "localhost"
-		}
-		adminOrigin := "http://" + net.JoinHostPort(adminHost, adminPort)
-
 		// One shared sampler feeds every dashboard stream; it idles while
 		// nobody is connected. Delivery lag state is shared with JSON and the
 		// dashboard so all authenticated surfaces retain the same complete
@@ -636,7 +654,7 @@ func run(log *slog.Logger) error {
 			Store:         st,
 			TokenHash:     cfg.AdminTokenHash,
 			Logger:        log,
-			AdminOrigin:   adminOrigin,
+			AdminOrigin:   cfg.AdminOrigin,
 			Events:        events,
 			NotifyMetrics: notifyMetrics,
 			DeliveryLag:   deliveryLag,

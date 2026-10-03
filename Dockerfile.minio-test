@@ -17,7 +17,8 @@ RUN git init . \
     && mkdir -p /out/licenses \
     && go build -trimpath -o /out/minio . \
     && cp LICENSE NOTICE CREDITS /out/licenses/ \
-    && printf '%s\n%s\n' 'https://github.com/minio/minio' "${MINIO_SOURCE_REVISION}" > /out/licenses/SOURCE
+    && printf '%s\n%s\n' 'https://github.com/minio/minio' "${MINIO_SOURCE_REVISION}" > /out/licenses/SOURCE \
+    && rm -rf /src /go/pkg/mod /root/.cache/go-build
 
 FROM alpine:3.22
 ARG MINIO_SOURCE_REVISION

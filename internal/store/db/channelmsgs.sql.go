@@ -80,7 +80,7 @@ func (q *Queries) ChannelEventsWindow(ctx context.Context, arg ChannelEventsWind
 }
 
 const channelHistoryPage = `-- name: ChannelHistoryPage :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id, action_type
 FROM channel_messages
 WHERE channel_id = $1 AND deleted = false
   AND ($2::bigint = 0 OR local_id < $2::bigint)
@@ -105,6 +105,7 @@ type ChannelHistoryPageRow struct {
 	RandomID     int64
 	FileID       *int64
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPageParams) ([]ChannelHistoryPageRow, error) {
@@ -127,6 +128,7 @@ func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPage
 			&i.RandomID,
 			&i.FileID,
 			&i.ReplyToMsgID,
+			&i.ActionType,
 		); err != nil {
 			return nil, err
 		}
@@ -139,7 +141,7 @@ func (q *Queries) ChannelHistoryPage(ctx context.Context, arg ChannelHistoryPage
 }
 
 const channelMessageByLocal = `-- name: ChannelMessageByLocal :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id, action_type
 FROM channel_messages WHERE channel_id = $1 AND local_id = $2
 `
 
@@ -159,6 +161,7 @@ type ChannelMessageByLocalRow struct {
 	RandomID     int64
 	FileID       *int64
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 func (q *Queries) ChannelMessageByLocal(ctx context.Context, arg ChannelMessageByLocalParams) (ChannelMessageByLocalRow, error) {
@@ -175,12 +178,13 @@ func (q *Queries) ChannelMessageByLocal(ctx context.Context, arg ChannelMessageB
 		&i.RandomID,
 		&i.FileID,
 		&i.ReplyToMsgID,
+		&i.ActionType,
 	)
 	return i, err
 }
 
 const channelMessageByRandomID = `-- name: ChannelMessageByRandomID :one
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id, action_type
 FROM channel_messages WHERE channel_id = $1 AND random_id = $2 AND random_id <> 0
 `
 
@@ -200,6 +204,7 @@ type ChannelMessageByRandomIDRow struct {
 	RandomID     int64
 	FileID       *int64
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 func (q *Queries) ChannelMessageByRandomID(ctx context.Context, arg ChannelMessageByRandomIDParams) (ChannelMessageByRandomIDRow, error) {
@@ -216,12 +221,13 @@ func (q *Queries) ChannelMessageByRandomID(ctx context.Context, arg ChannelMessa
 		&i.RandomID,
 		&i.FileID,
 		&i.ReplyToMsgID,
+		&i.ActionType,
 	)
 	return i, err
 }
 
 const channelMessagesByLocalIDs = `-- name: ChannelMessagesByLocalIDs :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id, action_type
 FROM channel_messages
 WHERE channel_id = $1 AND local_id = ANY($2::bigint[])
 `
@@ -242,6 +248,7 @@ type ChannelMessagesByLocalIDsRow struct {
 	RandomID     int64
 	FileID       *int64
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 func (q *Queries) ChannelMessagesByLocalIDs(ctx context.Context, arg ChannelMessagesByLocalIDsParams) ([]ChannelMessagesByLocalIDsRow, error) {
@@ -264,6 +271,7 @@ func (q *Queries) ChannelMessagesByLocalIDs(ctx context.Context, arg ChannelMess
 			&i.RandomID,
 			&i.FileID,
 			&i.ReplyToMsgID,
+			&i.ActionType,
 		); err != nil {
 			return nil, err
 		}
@@ -277,7 +285,7 @@ func (q *Queries) ChannelMessagesByLocalIDs(ctx context.Context, arg ChannelMess
 
 const channelPostExistsActive = `-- name: ChannelPostExistsActive :one
 SELECT local_id FROM channel_messages
-WHERE channel_id = $1 AND local_id = $2 AND deleted = false
+WHERE channel_id = $1 AND local_id = $2 AND deleted = false AND action_type = 0
 `
 
 type ChannelPostExistsActiveParams struct {
@@ -304,6 +312,7 @@ SELECT count(*)::bigint
 FROM channel_messages post
 WHERE post.channel_id = $1::bigint
   AND post.deleted = false
+  AND post.action_type = 0
   AND EXISTS (
       SELECT 1 FROM channel_participants cp
       WHERE cp.channel_id = post.channel_id
@@ -367,6 +376,28 @@ func (q *Queries) GetChannelState(ctx context.Context, channelID int64) (Channel
 		&i.Date,
 	)
 	return i, err
+}
+
+const insertChannelCreateMessage = `-- name: InsertChannelCreateMessage :exec
+INSERT INTO channel_messages (channel_id, local_id, from_id, message, action_type)
+VALUES ($1, $2, $3, $4, 1)
+`
+
+type InsertChannelCreateMessageParams struct {
+	ChannelID int64
+	LocalID   int64
+	FromID    int64
+	Message   string
+}
+
+func (q *Queries) InsertChannelCreateMessage(ctx context.Context, arg InsertChannelCreateMessageParams) error {
+	_, err := q.db.Exec(ctx, insertChannelCreateMessage,
+		arg.ChannelID,
+		arg.LocalID,
+		arg.FromID,
+		arg.Message,
+	)
+	return err
 }
 
 const insertChannelEvent = `-- name: InsertChannelEvent :exec
@@ -458,9 +489,10 @@ func (q *Queries) NewChannelPostPts(ctx context.Context, arg NewChannelPostPtsPa
 }
 
 const searchChannelPostsPage = `-- name: SearchChannelPostsPage :many
-SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id
+SELECT channel_id, local_id, from_id, date, message, edit_date, deleted, random_id, file_id, reply_to_msg_id, action_type
 FROM channel_messages
 WHERE channel_id = $1 AND deleted = false
+  AND action_type = 0
   AND message_tsv @@ plainto_tsquery('simple', $2)
   AND ($3::bigint = 0 OR local_id < $3::bigint)
 ORDER BY local_id DESC
@@ -485,6 +517,7 @@ type SearchChannelPostsPageRow struct {
 	RandomID     int64
 	FileID       *int64
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 // SearchChannelPostsPage is ChannelHistoryPage narrowed by a full-text match.
@@ -517,6 +550,7 @@ func (q *Queries) SearchChannelPostsPage(ctx context.Context, arg SearchChannelP
 			&i.RandomID,
 			&i.FileID,
 			&i.ReplyToMsgID,
+			&i.ActionType,
 		); err != nil {
 			return nil, err
 		}
@@ -530,10 +564,11 @@ func (q *Queries) SearchChannelPostsPage(ctx context.Context, arg SearchChannelP
 
 const searchFilteredChannelPostsPage = `-- name: SearchFilteredChannelPostsPage :many
 SELECT post.channel_id, post.local_id, post.from_id, post.date, post.message,
-       post.edit_date, post.deleted, post.random_id, post.file_id, post.reply_to_msg_id
+       post.edit_date, post.deleted, post.random_id, post.file_id, post.reply_to_msg_id, post.action_type
 FROM channel_messages post
 WHERE post.channel_id = $1::bigint
   AND post.deleted = false
+  AND post.action_type = 0
   AND EXISTS (
       SELECT 1 FROM channel_participants cp
       WHERE cp.channel_id = post.channel_id
@@ -574,6 +609,7 @@ type SearchFilteredChannelPostsPageRow struct {
 	RandomID     int64
 	FileID       *int64
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 func (q *Queries) SearchFilteredChannelPostsPage(ctx context.Context, arg SearchFilteredChannelPostsPageParams) ([]SearchFilteredChannelPostsPageRow, error) {
@@ -603,6 +639,7 @@ func (q *Queries) SearchFilteredChannelPostsPage(ctx context.Context, arg Search
 			&i.RandomID,
 			&i.FileID,
 			&i.ReplyToMsgID,
+			&i.ActionType,
 		); err != nil {
 			return nil, err
 		}
@@ -616,7 +653,7 @@ func (q *Queries) SearchFilteredChannelPostsPage(ctx context.Context, arg Search
 
 const searchPinnedChannelPostForMember = `-- name: SearchPinnedChannelPostForMember :many
 SELECT post.channel_id, post.local_id, post.from_id, post.date, post.message,
-       post.edit_date, post.deleted, post.random_id, post.file_id, post.reply_to_msg_id
+       post.edit_date, post.deleted, post.random_id, post.file_id, post.reply_to_msg_id, post.action_type
 FROM channels c
 JOIN channel_participants participant
   ON participant.channel_id = c.id
@@ -626,6 +663,7 @@ JOIN channel_messages post
   ON post.channel_id = c.id
  AND post.local_id = c.pinned_message_id
  AND post.deleted = false
+ AND post.action_type = 0
 WHERE c.id = $2::bigint
   AND c.pinned_message_id IS NOT NULL
   AND ($3::text = '' OR post.message_tsv @@ plainto_tsquery('simple', $3))
@@ -653,6 +691,7 @@ type SearchPinnedChannelPostForMemberRow struct {
 	RandomID     int64
 	FileID       *int64
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 // SearchPinnedChannelPostForMember returns the active pinned post only while
@@ -684,6 +723,7 @@ func (q *Queries) SearchPinnedChannelPostForMember(ctx context.Context, arg Sear
 			&i.RandomID,
 			&i.FileID,
 			&i.ReplyToMsgID,
+			&i.ActionType,
 		); err != nil {
 			return nil, err
 		}

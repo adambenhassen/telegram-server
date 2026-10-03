@@ -3,10 +3,12 @@ package api_test
 import (
 	"context"
 	"testing"
+	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // A reaction on a copy its owner has soft-deleted must not be pushed to that
@@ -16,7 +18,7 @@ import (
 func TestDeliverReactionsSkipsDeletedCopy(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := openStore(t)
+	s, dsn := openStoreDSN(t)
 	reg := mtproto.NewSessionRegistry()
 	updater := api.NewUpdater(s, reg, nil, pgtest.PeerDeriver())
 
@@ -47,10 +49,50 @@ func TestDeliverReactionsSkipsDeletedCopy(t *testing.T) {
 	aConn, aFT := newConnFor(t, reg, p.a.ID)
 	_, bFT := newConnFor(t, reg, p.b.ID)
 
-	// DeliverReactions is synchronous, so both pushes have either happened or
-	// not by the time the loop returns.
+	delivered := make(chan struct{}, len(targets))
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(pushCtx context.Context, ownerID, localID, userID int64) {
+			updater.DeliverReactions(pushCtx, ownerID, localID, userID)
+			delivered <- struct{}{}
+		},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start reaction listener: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop reaction listener: %v", err)
+		}
+	})
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for reaction listener: %v", err)
+	}
+
+	// The reaction is committed; the originating RPC closes before its nudges.
+	rpcCtx, cancelRPC := context.WithCancel(ctx)
+	cancelRPC()
+	notifyCtx, cancelNotify := store.NotificationContext(rpcCtx)
+	defer cancelNotify()
 	for _, target := range targets {
-		updater.DeliverReactions(ctx, target.OwnerID, target.LocalID, target.OwnerID)
+		if err := s.Notify(notifyCtx, store.ChannelReactions, store.ReactionPayload(target.OwnerID, target.LocalID, target.OwnerID)); err != nil {
+			t.Fatalf("notify reaction after cancellation: %v", err)
+		}
+	}
+	for range targets {
+		select {
+		case <-delivered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("reaction notification was not delivered")
+		}
 	}
 
 	if bFT.wasSent() {

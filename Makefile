@@ -55,7 +55,7 @@ migrate:
 # contention (observed runtime ~300s). 15m gives 3x headroom while staying
 # inside CI's timeout-minutes: 20 so Go's goroutine dump fires before GitHub
 # cancels the job.
-E2E_PKG := github.com/adambenhassen/telegram-server/test/e2e
+E2E_PKG := github.com/teagramhq/teagram-server/test/e2e
 
 test: docker-bridge
 	$(TESTENV) go test -race $$(go list ./... | grep -v '^$(E2E_PKG)$$')
@@ -64,7 +64,9 @@ test: docker-bridge
 # All packages except e2e. Agent runtimes share the host CPU with sibling
 # workdirs; e2e takes ~300s and starves under contention, producing spurious
 # timeouts that are not code bugs. Use this for fast development-loop feedback.
-# `make test` (including e2e) remains the pre-PR and CI gate.
+# `make test` (including e2e) remains the pre-PR gate. CI runs this unchanged
+# non-e2e command and the same uncached e2e command with JSON output for safe
+# failure attribution.
 test-unit: docker-bridge
 	$(TESTENV) go test -race $$(go list ./... | grep -v '^$(E2E_PKG)$$')
 

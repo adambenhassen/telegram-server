@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blob"
 )
 
 func TestValidateKeyRejectsHostileKeysByClass(t *testing.T) {

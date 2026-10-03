@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // EventType classifies a persisted update in the per-owner event log. Values
@@ -23,7 +23,7 @@ const (
 )
 
 // State is a user's current update sequence, mirroring updates.State on the
-// wire. Date is unix seconds; UnreadCount is summed across basic and channel dialogs.
+// wire. Date is unix seconds; UnreadCount is summed across the user's dialogs.
 type State struct {
 	Pts         int
 	Qts         int
@@ -79,26 +79,51 @@ func (s *Store) EnsureUpdateState(ctx context.Context, userID int64) error {
 	return nil
 }
 
-// State returns the user's current pts/seq/date and total unread count. A user
-// with no update_state row yet reports the zero update state while retaining
-// the total unread count from basic and channel dialogs.
-func (s *Store) State(ctx context.Context, userID int64) (State, error) {
+func (s *Store) readState(ctx context.Context, userID int64) (State, bool, error) {
 	row, err := s.q.GetState(ctx, userID)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return State{}, fmt.Errorf("get state: %w", err)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return State{}, false, nil
 	}
-	hasState := err == nil
-	unread, err := s.q.UnreadCountForOwner(ctx, userID)
 	if err != nil {
+		return State{}, false, fmt.Errorf("get state: %w", err)
+	}
+	return State{
+		Pts:  int(row.Pts),
+		Qts:  int(row.Qts),
+		Seq:  int(row.Seq),
+		Date: int(row.Date.Time.Unix()),
+	}, true, nil
+}
+
+// StateWithoutUnread returns the user's current pts/seq/date without summing
+// the account's dialogs. Live update pushes do not serialize unread totals and
+// use this read to avoid account-wide aggregation during fan-out.
+func (s *Store) StateWithoutUnread(ctx context.Context, userID int64) (State, error) {
+	state, _, err := s.readState(ctx, userID)
+	if err != nil {
+		return State{}, err
+	}
+	return state, nil
+}
+
+// State returns the user's current pts/seq/date and total unread count. A user
+// with no update_state row reports the zero update state without summing dialogs.
+func (s *Store) State(ctx context.Context, userID int64) (State, error) {
+	state, exists, err := s.readState(ctx, userID)
+	if err != nil {
+		return State{}, err
+	}
+	if !exists {
+		return State{}, nil
+	}
+	var unread int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(unread_count), 0) FROM dialogs WHERE owner_id = $1`,
+		userID,
+	).Scan(&unread); err != nil {
 		return State{}, fmt.Errorf("sum unread: %w", err)
 	}
-	state := State{UnreadCount: int(unread)}
-	if hasState {
-		state.Pts = int(row.Pts)
-		state.Qts = int(row.Qts)
-		state.Seq = int(row.Seq)
-		state.Date = int(row.Date.Time.Unix())
-	}
+	state.UnreadCount = unread
 	return state, nil
 }
 

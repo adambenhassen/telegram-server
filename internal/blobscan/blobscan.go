@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blob"
 )
 
 // idBatch is how many ids one row-existence query carries. It bounds the query,

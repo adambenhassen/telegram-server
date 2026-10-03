@@ -3,23 +3,26 @@ package api_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // storeAndEvicts opens a store and a raw connection listening on tg_evict over
 // the same test database. The raw listener is what makes the ordering
 // observable: it sees the moment a revocation is published, not the moment some
 // replica reacts to one, so an assertion never depends on eviction latency.
-func storeAndEvicts(ctx context.Context, t *testing.T) (*store.Store, *pgx.Conn) {
+func storeAndEvicts(ctx context.Context, t *testing.T) (*store.Store, *pgx.Conn, string) {
 	t.Helper()
 	dsn := pgtest.DSN(t)
 	s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithBlobStore(testBlobs(t)))
@@ -39,7 +42,7 @@ func storeAndEvicts(ctx context.Context, t *testing.T) (*store.Store, *pgx.Conn)
 	if _, err := l.Exec(ctx, "LISTEN "+store.ChannelEvict); err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	return s, l
+	return s, l, dsn
 }
 
 // noEvictYet fails if anything has been published on tg_evict. A NOTIFY reaches
@@ -80,6 +83,18 @@ func boundKey(ctx context.Context, t *testing.T, s *store.Store, userID int64, s
 	return k
 }
 
+type evictTestTransport struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (t *evictTestTransport) Send(context.Context, *bin.Buffer) error { return nil }
+func (*evictTestTransport) Recv(context.Context, *bin.Buffer) error   { return errors.New("unused") }
+func (t *evictTestTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
 // savedKey saves a fresh auth key derived from seed, leaving it unbound.
 func savedKey(ctx context.Context, t *testing.T, s *store.Store, seed byte) crypto.AuthKey {
 	t.Helper()
@@ -110,7 +125,7 @@ func savedKey(ctx context.Context, t *testing.T, s *store.Store, seed byte) cryp
 func TestRevocationPublishesEvictAroundTheReply(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s, evicts := storeAndEvicts(ctx, t)
+	s, evicts, _ := storeAndEvicts(ctx, t)
 
 	user, err := s.CreateUser(ctx, "+15551296001")
 	if err != nil {
@@ -190,5 +205,110 @@ func TestRevocationPublishesEvictAroundTheReply(t *testing.T) {
 		if _, ok, err := s.AuthKeyByID(ctx, k.IntID()); err != nil || ok {
 			t.Fatalf("auth key %d still present after revocation: ok=%v err=%v", k.IntID(), ok, err)
 		}
+	}
+}
+
+func TestLogOutEvictionSurvivesCallerCancellation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, evicts, dsn := storeAndEvicts(ctx, t)
+	user, err := s.CreateUser(ctx, "+15551296011")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	revoked := boundKey(ctx, t, s, user.ID, 11)
+	unrelated := boundKey(ctx, t, s, user.ID, 12)
+
+	registry := mtproto.NewSessionRegistry()
+	revokedTransport := &evictTestTransport{closed: make(chan struct{})}
+	revokedConn := mtproto.NewTestConn(revokedTransport, revoked)
+	revokedConn.SetOwner(user.ID)
+	if !registry.Add(user.ID, revokedConn) {
+		t.Fatal("register revoked connection")
+	}
+	t.Cleanup(func() { registry.Remove(user.ID, revokedConn) })
+	unrelatedTransport := &evictTestTransport{closed: make(chan struct{})}
+	unrelatedConn := mtproto.NewTestConn(unrelatedTransport, unrelated)
+	unrelatedConn.SetOwner(user.ID)
+	if !registry.Add(user.ID, unrelatedConn) {
+		t.Fatal("register unrelated connection")
+	}
+	t.Cleanup(func() { registry.Remove(user.ID, unrelatedConn) })
+
+	updater := api.NewUpdater(s, registry, nil, pgtest.PeerDeriver())
+	delivered := make(chan [2]int64, 1)
+	_, stop, err := store.StartListener(ctx, dsn,
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(notifyCtx context.Context, userID, authKeyID int64) {
+			delivered <- [2]int64{userID, authKeyID}
+			updater.Evict(notifyCtx, userID, authKeyID)
+		},
+		func(context.Context, int64) {},
+		func(context.Context, int64, int64) {},
+		func(context.Context, int64, bool) {},
+		func(context.Context, int64, int) {},
+		func(context.Context, int64, int64, int64) {},
+		func(context.Context, store.PeerType, int64, int32) {},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start replica listener: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop replica listener: %v", err)
+		}
+	})
+	if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+		t.Fatalf("wait for replica listener: %v", err)
+	}
+
+	rpcCtx, cancelRPC := context.WithCancel(ctx)
+	res, afterReply, err := api.LogOutWithContextForTest(s, rpcCtx, revoked.ID)
+	if err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+	if _, ok := res.(*tg.AuthLoggedOut); !ok {
+		t.Fatalf("logout result = %T, want *tg.AuthLoggedOut", res)
+	}
+	if afterReply == nil {
+		t.Fatal("logout must defer its evict until after the reply")
+	}
+	noEvictYet(ctx, t, evicts, "logout evicted before its reply")
+	if _, ok, err := s.AuthKeyByID(ctx, revoked.IntID()); err != nil || ok {
+		t.Fatalf("revoked key after logout: exists=%v err=%v", ok, err)
+	}
+	if _, ok, err := s.AuthKeyByID(ctx, unrelated.IntID()); err != nil || !ok {
+		t.Fatalf("unrelated key after logout: exists=%v err=%v", ok, err)
+	}
+
+	// The client closes as soon as it receives the reply. Cancel here, before
+	// running the server's after-reply hook, to make that ordering deterministic.
+	cancelRPC()
+	afterReply()
+	if got, want := nextEvict(ctx, t, evicts, "logout emitted no eviction"), store.EvictPayload(user.ID, revoked.IntID()); got != want {
+		t.Fatalf("evict payload = %q, want %q", got, want)
+	}
+	select {
+	case got := <-delivered:
+		if got != [2]int64{user.ID, revoked.IntID()} {
+			t.Fatalf("delivered eviction = %v, want [%d %d]", got, user.ID, revoked.IntID())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("replica did not deliver the eviction")
+	}
+	select {
+	case <-revokedTransport.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replica did not close the revoked key's connection")
+	}
+	select {
+	case <-unrelatedTransport.closed:
+		t.Fatal("logout closed a connection on an unrelated key")
+	default:
+	}
+	if pushed, err := unrelatedConn.PushTo(ctx, user.ID, &tg.BoolTrue{}, 0); err != nil || !pushed {
+		t.Fatalf("unrelated key could not push after logout: pushed=%v err=%v", pushed, err)
 	}
 }

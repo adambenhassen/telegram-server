@@ -30,6 +30,10 @@ async function login(page: Page): Promise<string> {
     page.locator('form[action="/admin/login"] button[type="submit"]').click(),
   ]);
   expect(response.status(), 'login POST status').toBe(302);
+  expect(response.headers().location, 'login redirect target').toBe('/admin/dashboard');
+  await expect(page).toHaveURL(/\/admin\/dashboard$/);
+  await expect(page.getByRole('heading', { name: 'Operations', level: 1 })).toBeVisible();
+  await expect(page.locator('form.logout-form')).toBeVisible();
 
   const session = (await page.context().cookies()).find((c) => c.name === SESSION_COOKIE);
   expect(session, 'session cookie after login').toBeTruthy();

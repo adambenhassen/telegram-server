@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
 	"github.com/jackc/pgx/v5"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestRunCommandMaintenanceAssignOperator(t *testing.T) {
@@ -59,6 +59,21 @@ func TestRunCommandMaintenanceAssignOperatorRequiresExactInvocation(t *testing.T
 		}
 		stdout.Reset()
 		stderr.Reset()
+	}
+}
+
+func TestRunCommandMaintenanceSummaryInitializerRequiresPositiveChannelID(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"maintenance", "initialize-channel-post-summaries"},
+		{"maintenance", "initialize-channel-post-summaries", "--channel-id", "0"},
+		{"maintenance", "initialize-channel-post-summaries", "--channel-id", "-1"},
+		{"maintenance", "initialize-channel-post-summaries", "--channel-id", "not-an-id"},
+		{"maintenance", "initialize-channel-post-summaries", "--channel-id", "1", "extra"},
+	} {
+		if err := runCommand(args, slog.New(slog.DiscardHandler), &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+			t.Fatalf("runCommand(%v) succeeded, want usage error", args)
+		}
 	}
 }
 

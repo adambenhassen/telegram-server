@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterable
 
 
-PACKAGE = "github.com/adambenhassen/telegram-server/test/e2e"
+PACKAGE = "github.com/teagramhq/teagram-server/test/e2e"
 TARGET = "TestMessagingReconnectPushGap"
 RUN_TEST_PATTERN = f"^{TARGET}$"
 PG_CONTAINER_NAME = "tg-test-pg"
@@ -479,7 +479,7 @@ def _test_environment() -> dict[str, str]:
         if name in os.environ
     }
     env["CI"] = "true"
-    env["GOTOOLCHAIN"] = "go1.26.6"
+    env["GOTOOLCHAIN"] = "go1.27.1"
     env["TESTCONTAINERS_RYUK_DISABLED"] = "true"
     return env
 
@@ -731,11 +731,11 @@ def run_diagnostic(args: argparse.Namespace) -> int:
         f"repetition_count={repetitions}",
         f"load_mode={'parallel-e2e' if parallel_load else 'isolated'}",
         (
-            "focused_command=GOTOOLCHAIN=go1.26.6 go test -race -json "
+            "focused_command=GOTOOLCHAIN=go1.27.1 go test -race -json "
             f"-count={repetitions} -timeout 15m ./test/e2e -run '{RUN_TEST_PATTERN}'"
         ),
         (
-            "load_command=GOTOOLCHAIN=go1.26.6 go test -race -json "
+            "load_command=GOTOOLCHAIN=go1.27.1 go test -race -json "
             "-count=1 -timeout 15m ./test/e2e"
             if parallel_load
             else "load_command=not_requested"

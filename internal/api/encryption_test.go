@@ -11,8 +11,8 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // dhValue renders x as the 256-byte left-zero-padded wire form every integer in
@@ -512,7 +512,7 @@ func TestSendEncryptedMessageRejections(t *testing.T) {
 
 	// active chat
 	waiting := requestChat(t, s, a, b)
-	activeID := int32(waiting.ID) //nolint:gosec
+	activeID := int32(waiting.ID) //nolint:gosec // fresh test-DB chat IDs fit in int32
 	if _, err := api.AcceptEncryptionForTest(s, b, &tg.MessagesAcceptEncryptionRequest{
 		Peer: api.InputEncryptedChat(b, activeID), GB: validGB(), KeyFingerprint: 1,
 	}); err != nil {
@@ -521,11 +521,11 @@ func TestSendEncryptedMessageRejections(t *testing.T) {
 
 	// requested (not yet accepted) chat
 	waiting2 := requestChat(t, s, a, b)
-	requestedID := int32(waiting2.ID) //nolint:gosec
+	requestedID := int32(waiting2.ID) //nolint:gosec // fresh test-DB chat IDs fit in int32
 
 	// discarded chat
 	waiting3 := requestChat(t, s, a, b)
-	discardedID := int32(waiting3.ID) //nolint:gosec
+	discardedID := int32(waiting3.ID) //nolint:gosec // fresh test-DB chat IDs fit in int32
 	if _, err := api.DiscardEncryptionForTest(s, a, &tg.MessagesDiscardEncryptionRequest{ChatID: int(discardedID)}); err != nil {
 		t.Fatalf("discard: %v", err)
 	}

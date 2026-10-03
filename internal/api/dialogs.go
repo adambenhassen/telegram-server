@@ -6,8 +6,8 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // chatMembership holds the precomputed membership and participants result
@@ -59,8 +59,8 @@ const maxPeerDialogs = 100
 
 // channelDialogs builds dialog entries and channel peers for the unbanned
 // memberships of userID, returning the top posts so the caller can hydrate
-// media for the whole reply in one query. Empty channels get top_message 0 and
-// remain discoverable through getDialogs.
+// media for the whole reply in one query. New and backfilled channels use
+// their channel-create service message as the top message until the first post.
 //
 // Single query via ChannelDialogsForUser replaces the previous per-channel
 // ChannelHistory + ChannelState loop (2N queries).

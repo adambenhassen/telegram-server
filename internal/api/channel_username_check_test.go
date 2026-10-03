@@ -10,8 +10,8 @@ import (
 	"github.com/gotd/td/mt"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func checkChannelUsername(
@@ -182,7 +182,11 @@ func TestCheckUsernameValidatesBeforeCharging(t *testing.T) {
 		t.Fatalf("caller: %v", err)
 	}
 
-	for _, username := range []string{"x", "admin", "bad-name"} {
+	routeReserved := routeConflictingUsernameVariants()
+	invalidUsernames := make([]string, 0, 3+len(routeReserved))
+	invalidUsernames = append(invalidUsernames, "x", "admin", "bad-name")
+	invalidUsernames = append(invalidUsernames, routeReserved...)
+	for _, username := range invalidUsernames {
 		if _, rpc := checkChannelUsername(t, s, caller.ID, false, &tg.ChannelsCheckUsernameRequest{
 			Channel: &tg.InputChannelEmpty{}, Username: username,
 		}); rpc == nil || rpc.ErrorMessage != "USERNAME_INVALID" {

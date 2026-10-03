@@ -3,10 +3,14 @@ package e2e_test
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,12 +22,15 @@ import (
 	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/telegram/updates/hook"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/catalogpublish"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestSmoke(t *testing.T) {
@@ -38,6 +45,10 @@ func TestSmoke(t *testing.T) {
 	t.Run("saved-messages", func(t *testing.T) {
 		t.Parallel()
 		testSmokeSavedMessages(t)
+	})
+	t.Run("default-dialog-filter", func(t *testing.T) {
+		t.Parallel()
+		testSmokeDefaultDialogFilter(t)
 	})
 	t.Run("dialog-filters", func(t *testing.T) {
 		t.Parallel()
@@ -59,6 +70,10 @@ func TestSmoke(t *testing.T) {
 		t.Parallel()
 		testSmokeContactsSearch(t)
 	})
+	t.Run("langpack", func(t *testing.T) {
+		t.Parallel()
+		testSmokeLangpack(t)
+	})
 	t.Run("username-registration", func(t *testing.T) {
 		t.Parallel()
 		testSmokeUsernameRegistration(t)
@@ -66,6 +81,9 @@ func TestSmoke(t *testing.T) {
 	t.Run("username-password-reset", func(t *testing.T) {
 		t.Parallel()
 		testSmokeUsernamePasswordReset(t)
+	})
+	t.Run("admin-proxy-login", func(t *testing.T) {
+		testSmokeAdminProxyLogin(t)
 	})
 }
 
@@ -190,6 +208,165 @@ func testSmokeOneToOne(t *testing.T) {
 	assertSmokeReconnect(t, f, b1.session, b1.id, b1.id, a1.id, wantB)
 }
 
+func testSmokeLangpack(t *testing.T) {
+	t.Helper()
+	artifact := langpackSmokeArtifact(t)
+	f := newSmokeFixtureWithSetup(t, config.RegistrationClosed, func(f *smokeFixture) {
+		if _, err := catalogpublish.Publish(f.ctx, f.dsn, artifact, "smoke-source-revision", catalogpublish.PublishOptions{OSUser: "tester"}); err != nil {
+			t.Fatalf("publish language catalog: %v", err)
+		}
+		if err := f.store.RefreshCatalogSnapshot(f.ctx); err != nil {
+			t.Fatalf("refresh language catalog: %v", err)
+		}
+	})
+	storage := &session.StorageMemory{}
+	unboundClient := f.savedSessionClientWithSystemLangCode(storage, "en-US")
+	if err := unboundClient.Run(f.ctx, func(ctx context.Context) error {
+		raw := tg.NewClient(unboundClient)
+		assertLangpackSmokeCalls(t, ctx, raw, f.dcID, artifact)
+		assertHelpConfigSuggestion(t, ctx, raw)
+		if _, err := raw.AccountGetPassword(ctx); err == nil || !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
+			t.Errorf("account.getPassword error = %v, want AUTH_KEY_UNREGISTERED", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("unbound client run: %v", err)
+	}
+
+	data, err := (&session.Loader{Storage: storage}).Load(f.ctx)
+	if err != nil {
+		t.Fatalf("load anonymous client session: %v", err)
+	}
+	var authKeyID [8]byte
+	if len(data.AuthKeyID) != len(authKeyID) {
+		t.Fatalf("auth key id length = %d, want %d", len(data.AuthKeyID), len(authKeyID))
+	}
+	copy(authKeyID[:], data.AuthKeyID)
+	key, ok, err := f.store.AuthKeyByID(f.ctx, mtproto.AuthKeyIDInt64(authKeyID))
+	if err != nil || !ok || key.UserID != 0 || key.PendingUserID != 0 || key.Provisional {
+		t.Fatalf("unbound startup auth key binding = user:%d pending:%d provisional:%v, ok=%v, err=%v", key.UserID, key.PendingUserID, key.Provisional, ok, err)
+	}
+	username := fmt.Sprintf("langpack%d", time.Now().UnixNano())
+	user, err := f.store.CreateUsernameUser(f.ctx, username, "Langpack", "Smoke")
+	if err != nil {
+		t.Fatalf("create provisional user: %v", err)
+	}
+	if err := f.store.ClaimUsername(f.ctx, user.ID, username); err != nil {
+		t.Fatalf("claim provisional username: %v", err)
+	}
+	if err := f.store.BindAuthKeyUser(f.ctx, mtproto.AuthKeyIDInt64(authKeyID), user.ID); err != nil {
+		t.Fatalf("bind auth key to provisional user: %v", err)
+	}
+
+	provisionalClient := f.savedSessionClientWithSystemLangCode(storage, "en_GB")
+	if err := provisionalClient.Run(f.ctx, func(ctx context.Context) error {
+		raw := tg.NewClient(provisionalClient)
+		assertLangpackSmokeCalls(t, ctx, raw, f.dcID, artifact)
+		assertHelpConfigSuggestion(t, ctx, raw)
+		if _, err := raw.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{OffsetPeer: &tg.InputPeerEmpty{}}); err == nil || !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
+			t.Errorf("provisional messages.getDialogs error = %v, want AUTH_KEY_UNREGISTERED", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("provisional client run: %v", err)
+	}
+}
+
+func assertHelpConfigSuggestion(t *testing.T, ctx context.Context, raw *tg.Client) {
+	t.Helper()
+	config, err := raw.HelpGetConfig(ctx)
+	if err != nil {
+		t.Fatalf("help.getConfig: %v", err)
+	}
+	if config.SuggestedLangCode != catalog.LanguageEnglish {
+		t.Fatalf("help.getConfig suggested_lang_code = %q, want %q", config.SuggestedLangCode, catalog.LanguageEnglish)
+	}
+}
+
+func assertLangpackSmokeCalls(t *testing.T, ctx context.Context, raw *tg.Client, dcID int, artifact catalog.Artifact) {
+	t.Helper()
+	const langPack = catalog.PackTDesktop
+	const langCode = catalog.LanguageEnglish
+	wantCount := len(artifact.Entries)
+
+	languages, err := raw.LangpackGetLanguages(ctx, langPack)
+	if err != nil {
+		t.Fatalf("langpack.getLanguages: %v", err)
+	}
+	if len(languages) != 1 {
+		t.Fatalf("langpack.getLanguages returned %d languages, want only English", len(languages))
+	}
+	language := languages[0]
+	if language.Name != artifact.Name || language.NativeName != artifact.NativeName || language.LangCode != langCode || language.PluralCode != artifact.PluralCode ||
+		language.StringsCount != wantCount || language.TranslatedCount != wantCount || !language.Official || language.Rtl || language.Beta || language.BaseLangCode != "" || language.TranslationsURL != "" {
+		t.Fatalf("langpack.getLanguages English metadata = %+v", language)
+	}
+
+	full, err := raw.LangpackGetLangPack(ctx, &tg.LangpackGetLangPackRequest{LangPack: langPack, LangCode: langCode})
+	if err != nil {
+		t.Fatalf("langpack.getLangPack: %v", err)
+	}
+	assertLangpackSmokeDifference(t, full, 0, 1, artifact)
+
+	selected, err := raw.LangpackGetStrings(ctx, &tg.LangpackGetStringsRequest{
+		LangPack: langPack,
+		LangCode: langCode,
+		Keys:     []string{artifact.Entries[0].Key, artifact.Entries[0].Key},
+	})
+	if err != nil {
+		t.Fatalf("langpack.getStrings: %v", err)
+	}
+	if len(selected) != 1 {
+		t.Fatalf("langpack.getStrings returned %d copies, want one", len(selected))
+	}
+	selectedString, ok := selected[0].(*tg.LangPackString)
+	if !ok || selectedString.Key != artifact.Entries[0].Key || selectedString.Value != artifact.Entries[0].Value {
+		t.Fatalf("langpack.getStrings response = %#v", selected[0])
+	}
+
+	difference, err := raw.LangpackGetDifference(ctx, &tg.LangpackGetDifferenceRequest{LangPack: langPack, LangCode: langCode, FromVersion: 0})
+	if err != nil {
+		t.Fatalf("langpack.getDifference: %v", err)
+	}
+	assertLangpackSmokeDifference(t, difference, 0, 1, artifact)
+
+	nearest, err := raw.HelpGetNearestDC(ctx)
+	if err != nil {
+		t.Fatalf("help.getNearestDc: %v", err)
+	}
+	if nearest.ThisDC != dcID || nearest.NearestDC != dcID || nearest.Country != "" {
+		t.Fatalf("help.getNearestDc = %+v, want configured DC %d only", nearest, dcID)
+	}
+}
+
+func assertLangpackSmokeDifference(t *testing.T, difference *tg.LangPackDifference, fromVersion, version int, artifact catalog.Artifact) {
+	t.Helper()
+	if difference.LangCode != catalog.LanguageEnglish || difference.FromVersion != fromVersion || difference.Version != version || len(difference.Strings) != len(artifact.Entries) {
+		t.Fatalf("langpack difference metadata = %+v", difference)
+	}
+	for i, want := range artifact.Entries {
+		got, ok := difference.Strings[i].(*tg.LangPackString)
+		if !ok || got.Key != want.Key || got.Value != want.Value {
+			t.Fatalf("langpack string %d = %#v, want %q=%q", i, difference.Strings[i], want.Key, want.Value)
+		}
+	}
+}
+
+func langpackSmokeArtifact(t *testing.T) catalog.Artifact {
+	t.Helper()
+	raw := []byte("\"SMOKE_GOODBYE\" = \"Goodbye\";\n\"SMOKE_HELLO\" = \"Hello from the published English catalog\";\n")
+	sum := sha256.Sum256(raw)
+	artifact, err := catalog.BuildEnglish(raw, catalog.Source{
+		URL:      "https://example.test/telegramdesktop/lang.strings",
+		Revision: "smoke-revision",
+		SHA256:   hex.EncodeToString(sum[:]),
+	})
+	if err != nil {
+		t.Fatalf("build language catalog smoke artifact: %v", err)
+	}
+	return artifact
+}
+
 func testSmokeSavedMessages(t *testing.T) {
 	t.Helper()
 	f := newSmokeFixture(t)
@@ -217,6 +394,71 @@ func testSmokeSavedMessages(t *testing.T) {
 		t.Fatalf("getHistory for Saved Messages: %v", err)
 	}
 	assertNoMessageFor(t, f.ctx, client.seen.newMsg, "Saved Messages session")
+}
+
+func testSmokeDefaultDialogFilter(t *testing.T) {
+	t.Helper()
+	f := newSmokeFixture(t)
+	const phone = "+15551049003"
+	seedPhoneUsers(t, f.ctx, f.store, phone)
+	client := newSmokeClient(t, f, "A1", phone)
+	otherSession := newSmokeClient(t, f, "A2", phone)
+
+	var listed *tg.MessagesDialogFilters
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		listed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("first get dialog filters: %v", err)
+	}
+	if listed.TagsEnabled || len(listed.Filters) != 5 {
+		t.Fatalf("first get returned %d folders with tags enabled=%v, want All chats and four defaults", len(listed.Filters), listed.TagsEnabled)
+	}
+	if _, ok := listed.Filters[0].(*tg.DialogFilterDefault); !ok {
+		t.Fatalf("first folder = %T, want All chats", listed.Filters[0])
+	}
+	wantTitles := []string{"Personal", "Channels", "Groups", "Unread"}
+	for i, want := range wantTitles {
+		folder, ok := listed.Filters[i+1].(*tg.DialogFilter)
+		if !ok || folder.ID != i+2 || folder.Title.Text != want {
+			t.Fatalf("default folder %d = %#v, want ID %d %s", i, listed.Filters[i+1], i+2, want)
+		}
+		switch want {
+		case "Personal":
+			if !folder.Contacts || !folder.NonContacts || !folder.Bots || folder.Groups || folder.Broadcasts {
+				t.Fatalf("Personal flags = %+v, want contacts, non-contacts and bots", folder)
+			}
+		case "Groups":
+			if !folder.Groups || folder.Contacts || folder.NonContacts || folder.Broadcasts || folder.Bots {
+				t.Fatalf("Groups flags = %+v, want groups only", folder)
+			}
+		case "Channels":
+			if !folder.Broadcasts || folder.Contacts || folder.NonContacts || folder.Groups || folder.Bots {
+				t.Fatalf("Channels flags = %+v, want broadcasts only", folder)
+			}
+		case "Unread":
+			if !folder.Contacts || !folder.NonContacts || !folder.Groups || !folder.Broadcasts || !folder.Bots || !folder.ExcludeRead {
+				t.Fatalf("Unread flags = %+v, want all chat types excluding read chats", folder)
+			}
+		}
+	}
+	var otherListed *tg.MessagesDialogFilters
+	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		otherListed, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("other authorized session refetch: %v", err)
+	}
+	if len(otherListed.Filters) != 5 {
+		t.Fatalf("other authorized session saw %d folders, want All chats and four defaults", len(otherListed.Filters))
+	}
+	select {
+	case update := <-otherSession.push.dialogFilter:
+		t.Fatalf("other session received content-bearing updateDialogFilter: %#v", update)
+	default:
+	}
 }
 
 func testSmokeSharedMediaSearch(t *testing.T) {
@@ -361,10 +603,46 @@ func testSmokeDialogFilters(t *testing.T) {
 	if !filtersEnabledFound || !filtersEnabled {
 		t.Fatal("dialog_filters_enabled is missing or false")
 	}
+	var seeded *tg.MessagesDialogFilters
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		seeded, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("initialize default folders: %v", err)
+	}
+	assertDefaultFolderOrder := func(label string, result *tg.MessagesDialogFilters) {
+		if len(result.Filters) != 5 {
+			t.Fatalf("%s folders = %d, want All chats and four defaults", label, len(result.Filters))
+		}
+		if _, ok := result.Filters[0].(*tg.DialogFilterDefault); !ok {
+			t.Fatalf("%s first folder = %T, want All chats", label, result.Filters[0])
+		}
+		want := []struct {
+			id    int
+			title string
+		}{{2, "Personal"}, {3, "Channels"}, {4, "Groups"}, {5, "Unread"}}
+		for i, expected := range want {
+			folder, ok := result.Filters[i+1].(*tg.DialogFilter)
+			if !ok || folder.ID != expected.id || folder.Title.Text != expected.title {
+				t.Fatalf("%s folder %d = %#v, want ID %d %s", label, i+1, result.Filters[i+1], expected.id, expected.title)
+			}
+		}
+	}
+	assertDefaultFolderOrder("initial", seeded)
+	var repeated *tg.MessagesDialogFilters
+	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		var err error
+		repeated, err = api.MessagesGetDialogFilters(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("repeat default folder read: %v", err)
+	}
+	assertDefaultFolderOrder("repeated", repeated)
 
-	filter := &tg.DialogFilter{ID: 2, Title: tg.TextWithEntities{Text: "Groups"}, Groups: true}
+	filter := &tg.DialogFilter{ID: 6, Title: tg.TextWithEntities{Text: "Groups"}, Groups: true}
 	filter.SetFlags()
-	upsert := &tg.MessagesUpdateDialogFilterRequest{ID: 2, Filter: filter}
+	upsert := &tg.MessagesUpdateDialogFilterRequest{ID: 6, Filter: filter}
 	upsert.SetFlags()
 	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		ok, err := api.MessagesUpdateDialogFilter(ctx, upsert)
@@ -383,17 +661,17 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("list dialog filters: %v", err)
 	}
-	if listed.TagsEnabled || len(listed.Filters) != 2 {
-		t.Fatalf("filters = %d, tags enabled = %v, want default plus ID 2 with tags disabled", len(listed.Filters), listed.TagsEnabled)
+	if listed.TagsEnabled || len(listed.Filters) != 6 {
+		t.Fatalf("filters = %d, tags enabled = %v, want All chats, four defaults and ID 6", len(listed.Filters), listed.TagsEnabled)
 	}
-	custom, ok := listed.Filters[1].(*tg.DialogFilter)
-	if !ok || custom.ID != 2 || custom.Title.Text != "Groups" || !custom.Groups {
-		t.Fatalf("listed custom filter = %#v, want ID 2 Groups", listed.Filters[1])
+	custom, ok := listed.Filters[5].(*tg.DialogFilter)
+	if !ok || custom.ID != 6 || custom.Title.Text != "Groups" || !custom.Groups {
+		t.Fatalf("listed custom filter = %#v, want ID 6 Groups", listed.Filters[5])
 	}
 
-	edit := &tg.DialogFilter{ID: 2, Title: tg.TextWithEntities{Text: "Bots"}, Bots: true}
+	edit := &tg.DialogFilter{ID: 6, Title: tg.TextWithEntities{Text: "Bots"}, Bots: true}
 	edit.SetFlags()
-	editRequest := &tg.MessagesUpdateDialogFilterRequest{ID: 2, Filter: edit}
+	editRequest := &tg.MessagesUpdateDialogFilterRequest{ID: 6, Filter: edit}
 	editRequest.SetFlags()
 	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		ok, err := api.MessagesUpdateDialogFilter(ctx, editRequest)
@@ -411,9 +689,9 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("list edited dialog filters: %v", err)
 	}
-	custom, ok = listed.Filters[1].(*tg.DialogFilter)
-	if !ok || custom.ID != 2 || custom.Title.Text != "Bots" || !custom.Bots || custom.Groups {
-		t.Fatalf("edited custom filter = %#v, want ID 2 Bots", listed.Filters[1])
+	custom, ok = listed.Filters[5].(*tg.DialogFilter)
+	if !ok || custom.ID != 6 || custom.Title.Text != "Bots" || !custom.Bots || custom.Groups {
+		t.Fatalf("edited custom filter = %#v, want ID 6 Bots", listed.Filters[5])
 	}
 	var isolated *tg.MessagesDialogFilters
 	if err := otherOwner.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
@@ -423,15 +701,18 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("other owner get dialog filters: %v", err)
 	}
-	if isolated.TagsEnabled || len(isolated.Filters) != 1 {
-		t.Fatalf("other owner saw %d folders with tags enabled=%v, want only All chats", len(isolated.Filters), isolated.TagsEnabled)
+	if isolated.TagsEnabled || len(isolated.Filters) != 5 {
+		t.Fatalf("other owner saw %d folders with tags enabled=%v, want All chats and four defaults", len(isolated.Filters), isolated.TagsEnabled)
 	}
 	if _, ok := isolated.Filters[0].(*tg.DialogFilterDefault); !ok {
 		t.Fatalf("other owner's first folder = %T, want All chats", isolated.Filters[0])
 	}
+	if personal, ok := isolated.Filters[1].(*tg.DialogFilter); !ok || personal.Title.Text != "Personal" {
+		t.Fatalf("other owner's second folder = %#v, want Personal", isolated.Filters[1])
+	}
 
 	if err := client.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
-		ok, err := api.MessagesUpdateDialogFiltersOrder(ctx, []int{2, 0})
+		ok, err := api.MessagesUpdateDialogFiltersOrder(ctx, []int{6, 0})
 		if err == nil && !ok {
 			return errors.New("folder reorder returned false")
 		}
@@ -446,8 +727,8 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("list reordered dialog filters: %v", err)
 	}
-	if folder, ok := listed.Filters[0].(*tg.DialogFilter); !ok || folder.ID != 2 {
-		t.Fatalf("first reordered filter = %#v, want ID 2", listed.Filters[0])
+	if folder, ok := listed.Filters[0].(*tg.DialogFilter); !ok || folder.ID != 6 {
+		t.Fatalf("first reordered filter = %#v, want ID 6", listed.Filters[0])
 	}
 	f.restart(t)
 	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
@@ -457,12 +738,12 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("other authorized session get edited dialog filters after restart: %v", err)
 	}
-	if len(listed.Filters) != 2 {
-		t.Fatalf("other session saw %d filters after restart, want two", len(listed.Filters))
+	if len(listed.Filters) != 6 {
+		t.Fatalf("other session saw %d filters after restart, want six", len(listed.Filters))
 	}
 	persisted, ok := listed.Filters[0].(*tg.DialogFilter)
-	if !ok || persisted.ID != 2 || persisted.Title.Text != "Bots" || !persisted.Bots || persisted.Groups {
-		t.Fatalf("persisted edited filter = %#v, want ID 2 Bots", listed.Filters[0])
+	if !ok || persisted.ID != 6 || persisted.Title.Text != "Bots" || !persisted.Bots || persisted.Groups {
+		t.Fatalf("persisted edited filter = %#v, want ID 6 Bots", listed.Filters[0])
 	}
 	if err := otherOwner.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		var err error
@@ -471,10 +752,13 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("other owner get dialog filters after restart: %v", err)
 	}
-	if len(isolated.Filters) != 1 {
-		t.Fatalf("other owner saw %d folders after restart, want only All chats", len(isolated.Filters))
+	if len(isolated.Filters) != 5 {
+		t.Fatalf("other owner saw %d folders after restart, want All chats and four defaults", len(isolated.Filters))
 	}
-	deleteRequest := &tg.MessagesUpdateDialogFilterRequest{ID: 2}
+	if personal, ok := isolated.Filters[1].(*tg.DialogFilter); !ok || personal.Title.Text != "Personal" {
+		t.Fatalf("other owner's persisted second folder = %#v, want Personal", isolated.Filters[1])
+	}
+	deleteRequest := &tg.MessagesUpdateDialogFilterRequest{ID: 6}
 	deleteRequest.SetFlags()
 	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		ok, err := api.MessagesUpdateDialogFilter(ctx, deleteRequest)
@@ -492,8 +776,8 @@ func testSmokeDialogFilters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("list dialog filters after delete: %v", err)
 	}
-	if len(listed.Filters) != 1 {
-		t.Fatalf("filters after delete = %d, want only All chats", len(listed.Filters))
+	if len(listed.Filters) != 5 {
+		t.Fatalf("filters after delete = %d, want All chats and four defaults", len(listed.Filters))
 	}
 	var suggested []tg.DialogFilterSuggested
 	if err := otherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
@@ -504,7 +788,7 @@ func testSmokeDialogFilters(t *testing.T) {
 		t.Fatalf("get suggested dialog filters: %v", err)
 	}
 	if len(suggested) != 0 {
-		t.Fatalf("suggested filters = %d, want empty", len(suggested))
+		t.Fatalf("suggested filters = %d, want none because all four default titles remain", len(suggested))
 	}
 }
 
@@ -915,8 +1199,71 @@ func testSmokeChannel(t *testing.T) {
 	seedPhoneUsers(t, f.ctx, f.store, phoneCreator, phoneSubscriber)
 	creator := newSmokeClient(t, f, "A1", phoneCreator)
 	subscriber := newSmokeClient(t, f, "B1", phoneSubscriber)
+	execChannel(t, f.ctx, creator.cmds, func(ctx context.Context, client *tg.Client) error {
+		cfg, err := client.HelpGetConfig(ctx)
+		if err != nil {
+			return err
+		}
+		if cfg.MeURLPrefix != testPublicLinkPrefix {
+			return fmt.Errorf("help.getConfig me_url_prefix = %q, want %q", cfg.MeURLPrefix, testPublicLinkPrefix)
+		}
+		if cfg.DCTxtDomainName != "" {
+			return fmt.Errorf("help.getConfig dc_txt_domain_name = %q, want empty", cfg.DCTxtDomainName)
+		}
+		return nil
+	})
 
 	channelID := createBroadcastChannel(t, f.ctx, creator.cmds, "Smoke channel")
+	if err := creator.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		result, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+			OffsetPeer: &tg.InputPeerEmpty{},
+			Limit:      100,
+		})
+		if err != nil {
+			return err
+		}
+		var dialogs []tg.DialogClass
+		var messages []tg.MessageClass
+		switch page := result.(type) {
+		case *tg.MessagesDialogs:
+			dialogs, messages = page.Dialogs, page.Messages
+		case *tg.MessagesDialogsSlice:
+			dialogs, messages = page.Dialogs, page.Messages
+		default:
+			return fmt.Errorf("getDialogs response = %T, want a dialogs result", result)
+		}
+		for _, item := range dialogs {
+			dialog, ok := item.(*tg.Dialog)
+			if !ok {
+				continue
+			}
+			peer, ok := dialog.Peer.(*tg.PeerChannel)
+			if !ok || peer.ChannelID != channelID {
+				continue
+			}
+			if dialog.TopMessage != 1 {
+				return fmt.Errorf("new channel top message = %d, want 1", dialog.TopMessage)
+			}
+			for _, message := range messages {
+				if message.GetID() != dialog.TopMessage {
+					continue
+				}
+				service, ok := message.(*tg.MessageService)
+				if !ok {
+					return fmt.Errorf("new channel top message = %T, want *tg.MessageService", message)
+				}
+				action, ok := service.Action.(*tg.MessageActionChannelCreate)
+				if !ok || action.Title != "Smoke channel" {
+					return fmt.Errorf("new channel create action = %+v, want title %q", service.Action, "Smoke channel")
+				}
+				return nil
+			}
+			return fmt.Errorf("getDialogs omitted top message %d for newly created channel", dialog.TopMessage)
+		}
+		return fmt.Errorf("new channel %d absent from getDialogs before first post", channelID)
+	}); err != nil {
+		t.Fatalf("new channel getDialogs: %v", err)
+	}
 	hash := exportChannelInvite(t, f.ctx, creator.id, creator.cmds, channelID)
 	if joinedID := importChannelInvite(t, f.ctx, subscriber.cmds, hash); joinedID != channelID {
 		t.Fatalf("subscriber joined channel %d, want %d", joinedID, channelID)
@@ -971,10 +1318,19 @@ func testSmokeChannel(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("channel history response = %T, want *tg.MessagesChannelMessages", result)
 		}
-		if len(history.Messages) != len(posts) {
-			return fmt.Errorf("channel history count = %d, want %d", len(history.Messages), len(posts))
+		if len(history.Messages) != len(posts)+1 {
+			return fmt.Errorf("channel history count = %d, want %d posts plus creation service message", len(history.Messages), len(posts))
 		}
+		var sawCreate bool
 		for _, class := range history.Messages {
+			if service, ok := class.(*tg.MessageService); ok {
+				action, actionOK := service.Action.(*tg.MessageActionChannelCreate)
+				if !actionOK || service.ID != 1 || action.Title != "Smoke channel" {
+					return fmt.Errorf("channel history create service = %+v, want channel creation at id 1", service)
+				}
+				sawCreate = true
+				continue
+			}
 			message, ok := class.(*tg.Message)
 			if !ok {
 				return fmt.Errorf("channel history message = %T, want *tg.Message", class)
@@ -991,6 +1347,9 @@ func testSmokeChannel(t *testing.T) {
 			if !ok || from.UserID != creator.id {
 				return fmt.Errorf("channel history sender = %+v, want creator %d", message.FromID, creator.id)
 			}
+		}
+		if !sawCreate {
+			return errors.New("channel history omitted creation service message")
 		}
 		return nil
 	}); err != nil {
@@ -1029,6 +1388,22 @@ func testSmokeChannel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("subscriber channels.readHistory: %v", err)
 	}
+	if err := subscriber.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
+		exported, err := api.ChannelsExportMessageLink(ctx, &tg.ChannelsExportMessageLinkRequest{
+			Channel: inputChannel(subscriber.id, channelID),
+			ID:      secondPostID,
+		})
+		if err != nil {
+			return err
+		}
+		want := testPublicLinkPrefix + "c/" + strconv.FormatInt(channelID, 10) + "/" + strconv.Itoa(secondPostID)
+		if exported.Link != want {
+			return fmt.Errorf("exported channel message link = %q, want %q", exported.Link, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("subscriber exportMessageLink: %v", err)
+	}
 	checkChannelReadState(subscriber, secondPostID, 0)
 	if err := subscriberOtherSession.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		result, err := api.ChannelsGetFullChannel(ctx, inputChannel(subscriberOtherSession.id, channelID))
@@ -1059,7 +1434,6 @@ func testSmokeChannel(t *testing.T) {
 		t.Fatalf("later channel post = {text:%q id:%d}, want %q with id above %d", laterUpdate.Msg.Message, laterUpdate.Msg.ID, laterPost, secondPostID)
 	}
 	checkChannelReadState(subscriber, secondPostID, 1)
-
 	if err := creator.call(f.ctx, func(ctx context.Context, api *tg.Client) error {
 		fullResult, err := api.ChannelsGetFullChannel(ctx, inputChannel(creator.id, channelID))
 		if err != nil {
@@ -1308,10 +1682,69 @@ func smokePeerUserID(peer tg.PeerClass) int64 {
 	return 0
 }
 
+func testSmokeReservedUsernameSignUp(t *testing.T, f *smokeFixture, username, pendingPhone string) {
+	t.Helper()
+	pending, err := f.store.CreateUser(f.ctx, pendingPhone)
+	if err != nil {
+		t.Fatalf("create pending reserved signup account: %v", err)
+	}
+
+	sess := &session.StorageMemory{}
+	client := f.savedSessionClient(sess)
+	if err := client.Run(f.ctx, func(ctx context.Context) error {
+		api := client.API()
+		codeHash, err := sendCodeUsername(ctx, api, username)
+		if err != nil {
+			return fmt.Errorf("sendCode for reserved signup: %w", err)
+		}
+		code, err := f.codes.wait(ctx, strings.ToLower(username))
+		if err != nil {
+			return fmt.Errorf("wait for in-memory reserved signup code: %w", err)
+		}
+		sessionData, err := (&session.Loader{Storage: sess}).Load(ctx)
+		if err != nil {
+			return fmt.Errorf("load reserved signup session: %w", err)
+		}
+		if len(sessionData.AuthKeyID) != 8 {
+			return fmt.Errorf("reserved signup auth key id length = %d, want 8", len(sessionData.AuthKeyID))
+		}
+		var authKeyID [8]byte
+		copy(authKeyID[:], sessionData.AuthKeyID)
+		if err := f.store.SetPendingUser(ctx, mtproto.AuthKeyIDInt64(authKeyID), pending.ID); err != nil {
+			return fmt.Errorf("stage reserved test signup account: %w", err)
+		}
+
+		response, err := signInUsername(ctx, api, username, codeHash, code)
+		if err != nil {
+			if !isSignUpRequired(err) {
+				return fmt.Errorf("signIn before reserved signup: %w", err)
+			}
+		} else if _, ok := response.(*tg.AuthAuthorizationSignUpRequired); !ok {
+			return fmt.Errorf("signIn before reserved signup response = %T, want signup required", response)
+		}
+
+		if _, err := signUpUsername(ctx, api, username, codeHash, "Smoke", "Reserved"); !isRPCMessage(err, "USERNAME_INVALID") {
+			if err == nil {
+				return errors.New("reserved auth.signUp succeeded")
+			}
+			return fmt.Errorf("reserved auth.signUp: expected USERNAME_INVALID, got %w", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("reject reserved username registration: %v", err)
+	}
+	if _, found, err := f.store.UserByUsernameWithLoginMode(f.ctx, username); err != nil {
+		t.Fatalf("lookup reserved smoke username: %v", err)
+	} else if found {
+		t.Fatalf("reserved username %q was stored", username)
+	}
+}
+
 func testSmokeUsernameRegistration(t *testing.T) {
 	t.Helper()
 	f := newSmokeFixtureWithRegistration(t, config.RegistrationOpen)
 	const username, pendingPhone, password = "smokenewacct", "+15551049003", "smoke-password-1049"
+	testSmokeReservedUsernameSignUp(t, f, "PiNg", "+15551049004")
 	pending, err := f.store.CreateUser(f.ctx, pendingPhone)
 	if err != nil {
 		t.Fatalf("create pending signup account: %v", err)
@@ -1493,6 +1926,11 @@ func newSmokeFixture(t *testing.T) *smokeFixture {
 
 func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMode) *smokeFixture {
 	t.Helper()
+	return newSmokeFixtureWithSetup(t, regMode, nil)
+}
+
+func newSmokeFixtureWithSetup(t *testing.T, regMode config.RegistrationMode, beforeStart func(*smokeFixture)) *smokeFixture {
+	t.Helper()
 	deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancelDeadline)
 	deadlineCtx = withRegistrySnapshotState(deadlineCtx)
@@ -1513,6 +1951,9 @@ func newSmokeFixtureWithRegistration(t *testing.T, regMode config.RegistrationMo
 		}
 	})
 	f := &smokeFixture{ctx: ctx, failures: newClientFailureSignal(cancelFailure), key: key, dsn: dsn, store: st, codes: newMultiCodeSink(), dcID: 2, regMode: regMode}
+	if beforeStart != nil {
+		beforeStart(f)
+	}
 	f.start(t, "127.0.0.1:0")
 	return f
 }
@@ -1553,12 +1994,17 @@ func (f *smokeFixture) managedClient(sess *session.StorageMemory, seen, push *up
 }
 
 func (f *smokeFixture) savedSessionClient(sess *session.StorageMemory) *telegram.Client {
+	return f.savedSessionClientWithSystemLangCode(sess, "en")
+}
+
+func (f *smokeFixture) savedSessionClientWithSystemLangCode(sess *session.StorageMemory, systemLangCode string) *telegram.Client {
 	return telegram.NewClient(1, "hash", telegram.Options{
 		DC:             f.dcID,
 		DCList:         dcs.List{Options: []tg.DCOption{{ID: f.dcID, IPAddress: "127.0.0.1", Port: f.port}}},
 		PublicKeys:     []telegram.PublicKey{{RSA: &f.key.PublicKey}},
 		Resolver:       dcs.Plain(dcs.PlainOptions{}),
 		SessionStorage: sess,
+		Device:         telegram.DeviceConfig{SystemLangCode: systemLangCode},
 	})
 }
 

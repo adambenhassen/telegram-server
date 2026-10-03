@@ -11,10 +11,10 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/srp"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 const (
@@ -70,7 +70,9 @@ func (h *handlers) secretChatHash(viewerID int64, chatID int32) int64 {
 // payload carries no key material: the receiving replica reloads the row and
 // renders it for that viewer.
 func (h *handlers) notifyEncryption(ctx context.Context, userID int64, chatID int32) {
-	if err := h.store.Notify(ctx, store.ChannelEncryption, store.EncryptionPayload(userID, int64(chatID))); err != nil {
+	notifyCtx, cancel := senderNotifyContext(ctx)
+	defer cancel()
+	if err := h.store.Notify(notifyCtx, store.ChannelEncryption, store.EncryptionPayload(userID, int64(chatID))); err != nil {
 		h.log.Error("notify encryption", "user_id", userID, "chat_id", chatID, "err", err)
 	}
 }

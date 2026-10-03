@@ -16,13 +16,13 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/srp"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // Test-only aliases exposing unexported helpers to the external api_test package.
@@ -202,6 +202,8 @@ func GatedUnhandledForTest(log *slog.Logger, c *mtproto.Conn, req *mtproto.Reque
 // production default, so MaxFileParts is the same 200 a real server enforces.
 const TestMaxFileBytes int64 = 100 << 20
 
+const testPublicLinkPrefix = "https://test.example/"
+
 // MaxFileParts exposes the derived part-index bound for the external api_test
 // package, for a handler built with TestMaxFileBytes.
 func MaxFileParts() int {
@@ -217,13 +219,18 @@ var testBlobsDir = os.TempDir() + "/tg-api-test-blobs"
 // the part objects the handlers wrote.
 func BlobsDirForTest() string { return testBlobsDir }
 
-func testHandlers(s *store.Store) *handlers {
+func testHandlers(s *store.Store, linkPrefixes ...string) *handlers {
 	blobs, err := blob.NewLocal(testBlobsDir)
 	if err != nil {
 		panic(err)
 	}
+	linkPrefix := testPublicLinkPrefix
+	if len(linkPrefixes) > 0 {
+		linkPrefix = linkPrefixes[0]
+	}
 	return &handlers{
 		store:                    s,
+		cfg:                      &tg.Config{MeURLPrefix: linkPrefix},
 		log:                      slog.New(slog.DiscardHandler),
 		srp:                      srp.NewChallengeStore(srp.DefaultTTL),
 		maxFileBytes:             TestMaxFileBytes,
@@ -408,7 +415,7 @@ func SaveBigFilePartForTest(s *store.Store, userID int64, req *tg.UploadSaveBigF
 
 // BuildUpdatesForTest exposes buildUpdates for the external api_test package.
 func BuildUpdatesForTest(s *store.Store, userID int64, fromPts int) ([]tg.UpdateClass, []tg.UserClass, store.State, error) {
-	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts)
+	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts, true)
 	return b.ups, b.users, b.state, err
 }
 
@@ -504,7 +511,7 @@ func DocumentToTL(dcID int, f store.File) *tg.Document {
 // BuildUpdatesChatsForTest exposes the user and chat lists a batch carries
 // alongside its updates, which BuildUpdatesForTest partly omits.
 func BuildUpdatesChatsForTest(s *store.Store, userID int64, fromPts int) ([]tg.UpdateClass, []tg.UserClass, []tg.ChatClass, error) {
-	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts)
+	b, err := testHandlers(s).buildUpdates(context.Background(), userID, fromPts, true)
 	return b.ups, b.users, b.chats, err
 }
 
@@ -543,6 +550,15 @@ func GetChannelMessagesForTest(s *store.Store, userID int64, req *tg.ChannelsGet
 		return nil, err
 	}
 	return testHandlers(s).handleGetChannelMessages(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
+}
+
+// ExportMessageLinkForTest encodes req and invokes handleExportMessageLink for the caller.
+func ExportMessageLinkForTest(s *store.Store, userID int64, req *tg.ChannelsExportMessageLinkRequest) (bin.Encoder, error) {
+	var buf bin.Buffer
+	if err := req.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return testHandlers(s).handleExportMessageLink(&mtproto.Request{Ctx: context.Background(), UserID: userID, Buf: &buf})
 }
 
 // GetDifferenceForTest encodes req and invokes handleGetDifference for the caller.
@@ -631,6 +647,18 @@ func LogOutForTest(s *store.Store, authKeyID [8]byte) (bin.Encoder, func(), erro
 	}
 	return testHandlers(s).handleLogOut(&mtproto.Request{
 		Ctx: context.Background(), AuthKeyID: authKeyID, Buf: &buf,
+	})
+}
+
+// LogOutWithContextForTest invokes handleLogOut with the caller context so a
+// test can cancel it after the committed delete and before the reply hook runs.
+func LogOutWithContextForTest(s *store.Store, ctx context.Context, authKeyID [8]byte) (bin.Encoder, func(), error) {
+	var buf bin.Buffer
+	if err := (&tg.AuthLogOutRequest{}).Encode(&buf); err != nil {
+		return nil, nil, err
+	}
+	return testHandlers(s).handleLogOut(&mtproto.Request{
+		Ctx: ctx, AuthKeyID: authKeyID, Buf: &buf,
 	})
 }
 
@@ -1341,9 +1369,14 @@ const ConfigTTL = configTTL
 // GetConfigSeqForTest returns a help.getConfig callable bound to ONE handlers
 // value reading the clock the test supplies, so successive calls can observe the
 // server's clock moving without sleeping through an expiry window.
-func GetConfigSeqForTest(dcID int, host string, port int, now func() time.Time) func() (*tg.Config, error) {
+func GetConfigSeqForTest(dcID int, host string, port int, now func() time.Time, linkPrefixes ...string) func() (*tg.Config, error) {
 	h := testHandlers(nil)
 	h.cfg = DefaultConfig(dcID, host, port)
+	if len(linkPrefixes) > 0 {
+		h.cfg.MeURLPrefix = linkPrefixes[0]
+	} else {
+		h.cfg.MeURLPrefix = testPublicLinkPrefix
+	}
 	h.dcID = dcID
 	h.now = now
 	return func() (*tg.Config, error) {
@@ -1361,4 +1394,37 @@ func GetConfigSeqForTest(dcID int, host string, port int, now func() time.Time) 
 		}
 		return cfg, nil
 	}
+}
+
+// GetConfigSeqWithSystemLangCodeForTest returns a response function and a
+// snapshot of the shared config template. Calls use one handlers value so
+// concurrent requests can verify they only change their response copies.
+func GetConfigSeqWithSystemLangCodeForTest(dcID int, host string, port int, now func() time.Time) (func(string) (*tg.Config, error), func() *tg.Config) {
+	h := testHandlers(nil)
+	h.cfg = DefaultConfig(dcID, host, port)
+	h.cfg.SetSuggestedLangCode("shared")
+	h.cfg.SetLangPackVersion(12)
+	h.cfg.SetBaseLangPackVersion(13)
+	h.dcID = dcID
+	h.now = now
+	getConfig := func(systemLangCode string) (*tg.Config, error) {
+		var buf bin.Buffer
+		if err := (&tg.HelpGetConfigRequest{}).Encode(&buf); err != nil {
+			return nil, err
+		}
+		res, err := h.handleGetConfigWithSystemLangCode(&mtproto.Request{Ctx: context.Background(), Buf: &buf}, systemLangCode)
+		if err != nil {
+			return nil, err
+		}
+		cfg, ok := res.(*tg.Config)
+		if !ok {
+			return nil, fmt.Errorf("help.getConfig returned %T, want *tg.Config", res)
+		}
+		return cfg, nil
+	}
+	configTemplate := func() *tg.Config {
+		cfg := *h.cfg
+		return &cfg
+	}
+	return getConfig, configTemplate
 }

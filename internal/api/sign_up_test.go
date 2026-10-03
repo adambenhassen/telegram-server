@@ -13,9 +13,9 @@ import (
 	"github.com/gotd/td/tgerr"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // isInputRequestInvalid reports whether err is a 400 INPUT_REQUEST_INVALID error.
@@ -145,7 +145,11 @@ func TestSignUpRejectsReservedHandles(t *testing.T) {
 	addr := netip.MustParseAddr("10.0.0.13")
 	limits := store.RateLimitConfig{}
 
-	for i, handle := range []string{"help", "ADMIN", "me"} {
+	routeReserved := routeConflictingUsernameVariants()
+	handles := make([]string, 0, 3+len(routeReserved))
+	handles = append(handles, "help", "ADMIN", "me")
+	handles = append(handles, routeReserved...)
+	for i, handle := range handles {
 		keyID := int64(i + 1)
 		authKeyID := [8]byte{byte(i + 1)}
 		if err := s.SaveAuthKey(ctx, keyID, make([]byte, 256)); err != nil {

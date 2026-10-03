@@ -3,7 +3,7 @@ package mtproto_test
 import (
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 func TestPendingLoginMarkerIsConnectionLocal(t *testing.T) {

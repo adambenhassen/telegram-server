@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/catalog"
 )
 
 func TestBuildCommandProducesCanonicalEnglishArtifactOffline(t *testing.T) {

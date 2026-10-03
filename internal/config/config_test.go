@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // validEncKey is 64 hex chars = 32 bytes, the required master-key length.
@@ -166,6 +166,22 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.RateLimits.UpdateProfile.Window != 24*time.Hour {
 		t.Errorf("UpdateProfile window = %v, want 24h", cfg.RateLimits.UpdateProfile.Window)
+	}
+}
+
+func TestLoadServerConfigPreservesPublicLinkPrefix(t *testing.T) {
+	const prefix = "https://telegram-server.tailaa4918.ts.net/"
+	t.Setenv("TG_PUBLIC_LINK_PREFIX", prefix)
+	t.Setenv("TG_POSTGRES_DSN", "postgres://localhost/tg")
+	t.Setenv("TG_AUTHKEY_ENC_KEY", validEncKey)
+	t.Setenv("TG_AUTHKEY_ENC_KEY_FILE", "")
+
+	cfg, err := config.LoadServerConfig(discardLog())
+	if err != nil {
+		t.Fatalf("LoadServerConfig: %v", err)
+	}
+	if cfg.PublicLinkPrefix != prefix {
+		t.Fatalf("PublicLinkPrefix = %q, want exact configured value %q", cfg.PublicLinkPrefix, prefix)
 	}
 }
 

@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blob"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -240,17 +240,15 @@ func newMinioHarness(t *testing.T) *minioHarness {
 	t.Helper()
 	ctx := context.Background()
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "quay.io/minio/minio:latest",
-			ExposedPorts: []string{"9000/tcp"},
-			Env: map[string]string{
-				"MINIO_ROOT_USER":     "minioadmin",
-				"MINIO_ROOT_PASSWORD": "minioadmin",
-			},
-			Cmd:        []string{"server", "/data"},
-			WaitingFor: wait.ForHTTP("/minio/health/ready").WithPort("9000/tcp"),
+		Image:        "quay.io/minio/minio:latest",
+		ExposedPorts: []string{"9000/tcp"},
+		Env: map[string]string{
+			"MINIO_ROOT_USER":     "minioadmin",
+			"MINIO_ROOT_PASSWORD": "minioadmin",
 		},
-		Started: true,
+		Cmd:        []string{"server", "/data"},
+		WaitingFor: wait.ForHTTP("/minio/health/ready").WithPort("9000/tcp"),
+		Started:    true,
 	})
 	if err != nil {
 		if container != nil {

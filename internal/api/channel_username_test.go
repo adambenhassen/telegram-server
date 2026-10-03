@@ -9,7 +9,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/api"
 )
 
 func execDB(t *testing.T, dsn, sql string, args ...any) {
@@ -19,7 +19,7 @@ func execDB(t *testing.T, dsn, sql string, args ...any) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer conn.Close(ctx) //nolint:errcheck
+	defer conn.Close(ctx) //nolint:errcheck // deferred close is cleanup for this test-owned connection
 	if _, err := conn.Exec(ctx, sql, args...); err != nil {
 		t.Fatalf("exec: %v", err)
 	}
@@ -274,13 +274,22 @@ func TestHandleEditChannelUsernameRejectsReserved(t *testing.T) {
 		t.Fatalf("create channel: %v", err)
 	}
 
-	for _, username := range []string{"admin", "support", "help", "me", "ME", "telegram", "bot"} {
+	routeReserved := routeConflictingUsernameVariants()
+	reserved := make([]string, 0, 7+len(routeReserved))
+	reserved = append(reserved, "admin", "support", "help", "me", "ME", "telegram", "bot")
+	reserved = append(reserved, routeReserved...)
+	for _, username := range reserved {
 		_, err := api.EditChannelUsernameForTest(s, creator.ID, &tg.ChannelsUpdateUsernameRequest{
 			Channel:  api.InputChannel(creator.ID, ch.ID),
 			Username: username,
 		})
 		if msg := rpcMessage(t, err); msg != "USERNAME_INVALID" {
 			t.Errorf("%q: got %s, want USERNAME_INVALID", username, msg)
+		}
+		if _, found, err := s.UsernameByHandle(ctx, username); err != nil {
+			t.Errorf("lookup reserved handle %q: %v", username, err)
+		} else if found {
+			t.Errorf("reserved handle %q was stored", username)
 		}
 	}
 }

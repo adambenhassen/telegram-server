@@ -86,17 +86,33 @@ type unimplementedBudget struct {
 
 // charge records one such call at now and reports what it is owed.
 func (b *unimplementedBudget) charge(now time.Time) UnimplementedVerdict {
+	return chargeConnectionBudget(&b.started, &b.calls, now)
+}
+
+// langpackBudget independently counts the five catalog-backed anonymous RPCs
+// on one connection. It uses the same fixed window and thresholds as
+// unimplemented methods, without sharing their calls or log sampling state.
+type langpackBudget struct {
+	started time.Time
+	calls   int
+}
+
+func (b *langpackBudget) charge(now time.Time) UnimplementedVerdict {
+	return chargeConnectionBudget(&b.started, &b.calls, now)
+}
+
+func chargeConnectionBudget(started *time.Time, calls *int, now time.Time) UnimplementedVerdict {
 	if unimplementedWindow <= 0 {
 		return UnimplementedAnswer
 	}
-	if b.started.IsZero() || now.Sub(b.started) >= unimplementedWindow {
-		b.started, b.calls = now, 0
+	if started.IsZero() || now.Sub(*started) >= unimplementedWindow {
+		*started, *calls = now, 0
 	}
-	b.calls++
+	*calls++
 	switch {
-	case unimplementedCloseAt > 0 && b.calls >= unimplementedCloseAt:
+	case unimplementedCloseAt > 0 && *calls >= unimplementedCloseAt:
 		return UnimplementedClose
-	case unimplementedAnswerBudget > 0 && b.calls > unimplementedAnswerBudget:
+	case unimplementedAnswerBudget > 0 && *calls > unimplementedAnswerBudget:
 		return UnimplementedFloodWait
 	default:
 		return UnimplementedAnswer
@@ -160,6 +176,13 @@ func (b *unimplementedBudget) logClose(now time.Time) (int64, bool) {
 // nothing that has not proved the key gets to spend one.
 func (c *Conn) ChargeUnimplemented() UnimplementedVerdict {
 	return c.unimplemented.charge(c.clock.Now())
+}
+
+// ChargeLangpack records one catalog RPC against this connection's shared
+// langpack request budget. It has the same window and thresholds as
+// unimplemented methods, but calls to the two surfaces are counted separately.
+func (c *Conn) ChargeLangpack() UnimplementedVerdict {
+	return c.langpack.charge(c.clock.Now())
 }
 
 // LogUnimplemented reports whether this connection's line for method may be

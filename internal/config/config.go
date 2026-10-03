@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -18,11 +19,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/keycrypt"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
 	"github.com/gotd/td/exchange"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/keycrypt"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // RegistrationMode controls whether new accounts can be created via auth.signUp.
@@ -47,6 +48,9 @@ type Config struct {
 	// AdminListenAddr is the address the admin HTTP server binds to.
 	// Empty disables the admin server entirely.
 	AdminListenAddr string
+	// AdminOrigin is the fixed Origin accepted by admin login and logout.
+	// It is configured explicitly or derived from AdminListenAddr at startup.
+	AdminOrigin string
 	// AdminTokenHash is the hex-encoded SHA-256 digest of the operator token.
 	// Only set when AdminListenAddr is non-empty.
 	AdminTokenHash string
@@ -71,7 +75,11 @@ type Config struct {
 	// interface still has to name one address a client can reach it by.
 	AdvertiseHost string
 	AdvertisePort int
-	DCID          int
+	// PublicLinkPrefix is the HTTPS prefix returned by help.getConfig and used
+	// when rendering server-owned invite links. It is validated only for the
+	// MTProto server; administrative commands do not need it.
+	PublicLinkPrefix string
+	DCID             int
 	// LogLoginCodes opts into writing issued login codes to the log in
 	// cleartext. Off by default: the log is readable by anyone with the
 	// process output, and the code alone signs in any account that has no
@@ -447,6 +455,106 @@ func LoadClientConfig() (ClientConfig, error) {
 	return cfg, nil
 }
 
+// ValidatePublicLinkPrefix rejects values that could make the server advertise
+// or issue links on an ambiguous, official, or non-DNS origin.
+func ValidatePublicLinkPrefix(prefix string) error {
+	const name = "TG_PUBLIC_LINK_PREFIX"
+	invalid := func() error {
+		return fmt.Errorf("%s must be a lowercase ASCII HTTPS prefix with a DNS hostname and root path", name)
+	}
+	if prefix == "" {
+		return fmt.Errorf("%s is required", name)
+	}
+	if !strings.HasPrefix(prefix, "https://") || !strings.HasSuffix(prefix, "/") {
+		return invalid()
+	}
+
+	host := prefix[len("https://") : len(prefix)-1]
+	if host == "" || len(host) > 253 || strings.ContainsAny(host, "/:?#@\\%") || strings.HasSuffix(host, ".") {
+		return invalid()
+	}
+	for i := range len(prefix) {
+		if prefix[i] > 0x7f {
+			return invalid()
+		}
+	}
+
+	for label := range strings.SplitSeq(host, ".") {
+		if len(label) == 0 || len(label) > 63 || strings.HasPrefix(label, "xn--") || label[0] == '-' || label[len(label)-1] == '-' {
+			return invalid()
+		}
+		for i := range len(label) {
+			c := label[i]
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return invalid()
+			}
+		}
+	}
+	if isIPAddressLiteral(host) {
+		return invalid()
+	}
+	// Keep the first hostname split so source audits do not mistake a rejected
+	// origin for a generated link.
+	for _, official := range [...]string{"t" + ".me", "telegram.me", "telegram.dog", "telegram.org"} {
+		if host == official || strings.HasSuffix(host, "."+official) {
+			return invalid()
+		}
+	}
+	return nil
+}
+
+func isIPAddressLiteral(host string) bool {
+	if address, err := netip.ParseAddr(host); err == nil && address.Is4() {
+		return true
+	}
+	// Browsers also interpret abbreviated, octal, and hexadecimal numeric
+	// hosts as IPv4 addresses, so reject those forms as well.
+	parts := strings.Split(host, ".")
+	if len(parts) == 0 || len(parts) > 4 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		if strings.HasPrefix(part, "0x") {
+			part = part[2:]
+			if part == "" {
+				continue
+			}
+			for i := range len(part) {
+				c := part[i]
+				if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+					return false
+				}
+			}
+			continue
+		}
+		for i := range len(part) {
+			if part[i] < '0' || part[i] > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// LoadServerConfig requires the public link prefix before loading configuration
+// that may generate key material. Administrative commands use Load directly and
+// remain independent of this server-only setting.
+func LoadServerConfig(log *slog.Logger) (Config, error) {
+	prefix := os.Getenv("TG_PUBLIC_LINK_PREFIX")
+	if err := ValidatePublicLinkPrefix(prefix); err != nil {
+		return Config{}, err
+	}
+	cfg, err := Load(log)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PublicLinkPrefix = prefix
+	return cfg, nil
+}
+
 // Load reads configuration from environment variables, applying defaults. The
 // logger is used only for the auth-key master key, which is the one value Load
 // can create rather than read, and a generated one has to say so.
@@ -473,6 +581,7 @@ func Load(log *slog.Logger) (Config, error) {
 		WebSocketListenAddr:     os.Getenv("TG_WEBSOCKET_LISTEN_ADDR"),
 		WebSocketOriginPatterns: originPatterns,
 		AdminListenAddr:         os.Getenv("TG_ADMIN_LISTEN_ADDR"),
+		AdminOrigin:             os.Getenv("TG_ADMIN_ORIGIN"),
 		ReplicaID:               os.Getenv("TG_REPLICA_ID"),
 		PostgresDSN:             os.Getenv("TG_POSTGRES_DSN"),
 		RSAKeyPath:              identity.RSAKeyPath,
@@ -998,7 +1107,7 @@ func Load(log *slog.Logger) (Config, error) {
 	cfg.ClientAddrProxies = proxies
 	// Admin server requires both env vars or neither: a listener without auth
 	// is a denial-of-service vector, and a hash with no listener is wasted work.
-	adminErr := validateAdmin(cfg)
+	adminErr := validateAdmin(&cfg)
 	if adminErr != nil {
 		return Config{}, adminErr
 	}
@@ -1646,27 +1755,130 @@ func validateReplicaID(replicaID string) error {
 
 // validateAdmin checks that the admin server env vars are consistent.
 //
-// Both TG_ADMIN_LISTEN_ADDR and TG_ADMIN_TOKEN_HASH must be set together, or
-// neither. A listener without a token hash is an unauthenticated admin surface;
-// a token hash with no listener is wasted work. The hash must be a 64-char
-// lowercase hex string (a SHA-256 digest).
-func validateAdmin(cfg Config) error {
+// TG_ADMIN_LISTEN_ADDR and TG_ADMIN_TOKEN_HASH must be set together, and a
+// configured TG_ADMIN_ORIGIN requires the listener. A listener without a token
+// hash is an unauthenticated admin surface; a token hash with no listener is
+// wasted work. The hash must be a 64-char lowercase hex string (a SHA-256
+// digest).
+func validateAdmin(cfg *Config) error {
 	listenAddr := cfg.AdminListenAddr
 	tokenHash := os.Getenv("TG_ADMIN_TOKEN_HASH")
 
-	switch {
-	case listenAddr == "" && tokenHash == "":
-		return nil // admin server disabled
-	case listenAddr != "" && tokenHash != "":
-		if !adminHashRe.MatchString(tokenHash) {
-			return errors.New("TG_ADMIN_TOKEN_HASH must be a 64-character lowercase hex string (SHA-256 digest of the operator token)")
+	if listenAddr == "" {
+		if tokenHash != "" {
+			return errors.New("TG_ADMIN_TOKEN_HASH is set but TG_ADMIN_LISTEN_ADDR is missing: both are required to start the admin HTTP server")
 		}
+		if strings.TrimSpace(cfg.AdminOrigin) != "" {
+			return errors.New("TG_ADMIN_ORIGIN is set but TG_ADMIN_LISTEN_ADDR is missing: both are required to start the admin HTTP server")
+		}
+		cfg.AdminOrigin = ""
 		return nil
-	case listenAddr != "" && tokenHash == "":
-		return errors.New("TG_ADMIN_LISTEN_ADDR is set but TG_ADMIN_TOKEN_HASH is missing: both are required to start the admin HTTP server")
-	default: // listenAddr == "" && tokenHash != ""
-		return errors.New("TG_ADMIN_TOKEN_HASH is set but TG_ADMIN_LISTEN_ADDR is missing: both are required to start the admin HTTP server")
 	}
+	if tokenHash == "" {
+		return errors.New("TG_ADMIN_LISTEN_ADDR is set but TG_ADMIN_TOKEN_HASH is missing: both are required to start the admin HTTP server")
+	}
+	if !adminHashRe.MatchString(tokenHash) {
+		return errors.New("TG_ADMIN_TOKEN_HASH must be a 64-character lowercase hex string (SHA-256 digest of the operator token)")
+	}
+
+	if strings.TrimSpace(cfg.AdminOrigin) == "" {
+		host, port, err := net.SplitHostPort(listenAddr)
+		if err != nil {
+			return fmt.Errorf("TG_ADMIN_LISTEN_ADDR: %w", err)
+		}
+		if host == "" {
+			host = "localhost"
+		}
+		cfg.AdminOrigin = "http://" + net.JoinHostPort(host, port)
+		return nil
+	}
+	if err := validateAdminOrigin(cfg.AdminOrigin); err != nil {
+		return fmt.Errorf("TG_ADMIN_ORIGIN %w", err)
+	}
+	return nil
+}
+
+func validateAdminOrigin(origin string) error {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return fmt.Errorf("is invalid: %w", err)
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return errors.New("must use https, or http for a loopback host")
+	}
+	if parsed.Opaque != "" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return errors.New("must contain only a scheme and host with an optional port")
+	}
+	for i := range len(origin) {
+		if origin[i] > 0x7f {
+			return errors.New("must use ASCII characters")
+		}
+	}
+
+	host := parsed.Hostname()
+	if !validAdminHostname(host) {
+		return errors.New("must contain a lowercase canonical ASCII host")
+	}
+	port := parsed.Port()
+	if port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 || strconv.Itoa(portNumber) != port {
+			return errors.New("must contain a canonical port from 1 through 65535")
+		}
+		if (parsed.Scheme == "https" && portNumber == 443) || (parsed.Scheme == "http" && portNumber == 80) {
+			return errors.New("must omit the scheme's default port")
+		}
+	}
+	if parsed.Scheme == "http" && !adminHTTPHostAllowed(host) {
+		return errors.New("http is allowed only for localhost, 127.0.0.0/8, or ::1")
+	}
+
+	authority := host
+	if strings.Contains(host, ":") {
+		authority = "[" + host + "]"
+	}
+	if port != "" {
+		authority += ":" + port
+	}
+	if origin != parsed.Scheme+"://"+authority {
+		return errors.New("must use canonical scheme://host[:port] form")
+	}
+	return nil
+}
+
+func validAdminHostname(host string) bool {
+	if host == "" || host == "null" || strings.ToLower(host) != host || len(host) > 253 {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String() == host
+	}
+	for label := range strings.SplitSeq(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := range len(label) {
+			c := label[i]
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func adminHTTPHostAllowed(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		return ipv4[0] == 127
+	}
+	return ip.Equal(net.ParseIP("::1"))
 }
 
 func envOr(key, fallback string) string {

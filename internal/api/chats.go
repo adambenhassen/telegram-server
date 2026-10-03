@@ -10,8 +10,8 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 const (
@@ -194,9 +194,7 @@ func (h *handlers) handleCreateChat(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("create chat announce", "chat_id", chat.ID, "err", err)
 		return nil, errInternal
 	}
-	for uid := range perOwner {
-		h.notify(r.Ctx, uid)
-	}
+	h.notifyOwners(r.Ctx, perOwner, 0)
 
 	ups, err := h.chatUpdate(r.Ctx, r.UserID, chat, sender, perOwner, memberIDs(perOwner))
 	if err != nil {
@@ -238,9 +236,7 @@ func (h *handlers) handleEditChatTitle(r *mtproto.Request) (bin.Encoder, error) 
 		h.log.Error("edit chat title", "chat_id", req.ChatID, "user_id", r.UserID, "err", err)
 		return nil, errInternal
 	}
-	for uid := range perOwner {
-		h.notify(r.Ctx, uid)
-	}
+	h.notifyOwners(r.Ctx, perOwner, 0)
 
 	ups, err := h.chatUpdate(r.Ctx, r.UserID, chat, sender, perOwner, nil)
 	if err != nil {

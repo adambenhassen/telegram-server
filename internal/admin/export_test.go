@@ -5,8 +5,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // SSEDefaultEvent returns the event name the dashboard subscribes to.

@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // sendStatus creates a 1:1 dialog between from and to by sending a message.
@@ -60,6 +60,7 @@ func TestDeliverStatusPushesToPartnersOnly(t *testing.T) {
 	t.Cleanup(func() { reg.Remove(bob.ID, bobConn) })
 
 	// Alice goes offline → bob should receive updateUserStatus, alice should not.
+	statusReceived := make(chan bool, 1)
 	_, stop, err := store.StartListener(ctx, dsn,
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) {},
@@ -67,6 +68,9 @@ func TestDeliverStatusPushesToPartnersOnly(t *testing.T) {
 		func(context.Context, int64) {},
 		func(context.Context, int64, int64) {},
 		func(_ context.Context, userID int64, online bool) {
+			if userID == alice.ID {
+				statusReceived <- online
+			}
 			updater.DeliverStatus(ctx, userID, online)
 		},
 		func(context.Context, int64, int) {},
@@ -83,8 +87,25 @@ func TestDeliverStatusPushesToPartnersOnly(t *testing.T) {
 		t.Fatalf("wait for listener: %v", err)
 	}
 
-	if err := s.Notify(ctx, store.ChannelStatus, store.StatusPayload(alice.ID, false)); err != nil {
+	// The status mutation committed before the caller disconnected.
+	rpcCtx, cancelRPC := context.WithCancel(ctx)
+	cancelRPC()
+	notifyCtx, cancelNotify := store.NotificationContext(rpcCtx)
+	defer cancelNotify()
+	if err := s.Notify(notifyCtx, store.ChannelStatus, store.StatusPayload(alice.ID, false)); err != nil {
 		t.Fatalf("notify: %v", err)
+	}
+	select {
+	case online := <-statusReceived:
+		if online {
+			t.Fatal("status notification reported online after the committed offline change")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("offline status notification was not delivered")
+	}
+	currentAlice, ok, err := s.UserByID(ctx, alice.ID)
+	if err != nil || !ok || currentAlice.IsOnline {
+		t.Fatalf("stored presence after offline mutation: user=%+v found=%v err=%v", currentAlice, ok, err)
 	}
 
 	if !waitSent(bobFT) {

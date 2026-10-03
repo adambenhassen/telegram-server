@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/blob"
 )
 
 // reachableFlatPartObjects is how many in-flight part objects ordinary load

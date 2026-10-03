@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func participantIDs(t *testing.T, s *store.Store, chatID int64) []int64 {
@@ -865,7 +865,7 @@ func TestSetChatPinnedMessageRejectsWrongPeerMessage(t *testing.T) {
 	}
 
 	// Send a 1:1 DM (not in the chat).
-	dm, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "dm", 1, 0, 0) //nolint:dogsled
+	dm, _, _, _, err := s.SendMessage(ctx, a.ID, b.ID, "dm", 1, 0, 0) //nolint:dogsled // only the direct-message row is pinned below
 	if err != nil {
 		t.Fatalf("send DM: %v", err)
 	}

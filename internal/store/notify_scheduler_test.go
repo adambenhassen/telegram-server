@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestNotificationSchedulerIsolatesBlockedKeys(t *testing.T) {

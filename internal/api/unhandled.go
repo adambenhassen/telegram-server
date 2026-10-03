@@ -7,7 +7,7 @@ import (
 
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // typeNames resolves TL constructor ids to schema names, built once. tg.TypesMap

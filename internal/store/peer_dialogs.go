@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/store/db"
+	"github.com/teagramhq/teagram-server/internal/store/db"
 )
 
 // PeerDialogKey identifies one peer in the namespace accepted by
@@ -373,5 +373,6 @@ func channelMessageFromPeerDialogRow(row db.PeerChannelDialogsForOwnerRow) Chann
 		RandomID:     row.TopRandomID,
 		FileID:       row.TopFileID,
 		ReplyToMsgID: row.TopReplyToMsgID,
+		ActionType:   row.TopActionType,
 	})
 }

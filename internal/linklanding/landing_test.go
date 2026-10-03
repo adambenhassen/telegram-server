@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/linklanding"
+	"github.com/teagramhq/teagram-server/internal/linklanding"
 )
 
 const wantLandingBody = `<!doctype html><html lang="en"><body><main>Open this in Telegramd</main></body></html>`
@@ -132,7 +132,7 @@ func TestHandlerLogsOnlyRouteClassAndStatus(t *testing.T) {
 		{http.MethodGet, "/+synthetic-invite-hash?secret=query-secret", "https://referer-secret.example/", "invite", http.StatusOK},
 		{http.MethodGet, "/synthetic-username-secret/42?secret=query-secret", "https://referer-secret.example/", "message", http.StatusOK},
 		{http.MethodPost, "/username-secret?token=query-secret", "https://referer-secret.example/", "username", http.StatusMethodNotAllowed},
-		{http.MethodGet, "/admin/private-route?secret=query-secret", "https://referer-secret.example/", "admin", http.StatusNotFound},
+		{http.MethodGet, "/admin/private-route?secret=query-secret", "https://referer-secret.example/", "landing_other", http.StatusNotFound},
 	}
 	for _, tc := range cases {
 		request := httptest.NewRequestWithContext(context.Background(), tc.method, tc.target, nil)

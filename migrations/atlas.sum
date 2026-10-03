@@ -1,4 +1,4 @@
-h1:H+oW/9bgzoz2sgw6smW20QE3LqTt6qpT6a0Y+k0QUpk=
+h1:APelBtMzhTdlomtIVWfk2Q2HwD1za+uPN/O+WQKBYQQ=
 20260721000001_baseline.sql h1:cnO6K1z0Uv3goEvecgJixKSio6ziaB1rF7cQLoCWOxs=
 20260721000002_auth_keys.sql h1:+vNabm6vdEAgu3H5ZGw2Wr8D/Y6i4ikAAUO3JbfZQeE=
 20260721000003_code_hardening.sql h1:8pbAqUpqcwOONUfac+qC51QjfC1JnObNCcXa1HC/dr0=
@@ -50,4 +50,7 @@ h1:H+oW/9bgzoz2sgw6smW20QE3LqTt6qpT6a0Y+k0QUpk=
 20261001000045_channel_post_markers.sql h1:lPv40t2c3ZwH+hbn2SKBmOubza2H37JpNdrkrvrZgyA=
 20261001000046_dialog_filters.sql h1:YJyteqR2a3R4jUNq2+1SeWY6sobEw92GsIAS+zRrVSM=
 20261001000047_language_catalog.sql h1:EuvMzKhuTot6qNhwCXVfsV/vESM6Ix0J8pKzEp17pEM=
-20261002000048_channel_read_state.sql h1:x7xpxBPE1/X8u2kDvwT+Kf6Y1GSZ1byXHuFK32gJZr8=
+20261002000048_dialog_filter_defaults_seeded.sql h1:MgqLjubQO1Tc19NHwydPKBnzUdGQa8xHySwDFbYX+VA=
+20261003000049_channel_message_actions.sql h1:nSvO2Ls9ceZuwcFPYZZQGNnYGtFJ1Cxs2NArFuPJVbc=
+20261003000050_backfill_empty_channel_create_messages.sql h1:8d6eOkcMKCEOY/BTk6D8HB+iF+wbsop7Fa0rIxwhSxY=
+20261003000051_channel_post_summaries.sql h1:IEq1hTZd1z3txCDLDi1QwldTfTUWnN4Lgijrf95Mtls=

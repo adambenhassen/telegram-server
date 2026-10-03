@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestSetUserStatusOnlineThenOffline(t *testing.T) {
@@ -195,7 +195,7 @@ func TestDialogPartnersExcludesChatDialogs(t *testing.T) {
 	}
 
 	// Post a message in the chat to create dialog rows for both.
-	_, _, _, err = s.SendChatMessage(ctx, store.FanOut{ChatID: ch.ID, FromID: a.ID, Text: "hello", RandomID: 1}) //nolint:dogsled
+	_, _, _, err = s.SendChatMessage(ctx, store.FanOut{ChatID: ch.ID, FromID: a.ID, Text: "hello", RandomID: 1}) //nolint:dogsled // this assertion only needs the send error
 	if err != nil {
 		t.Fatalf("send chat message: %v", err)
 	}

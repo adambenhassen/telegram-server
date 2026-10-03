@@ -8,8 +8,8 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // resolveTarget resolves an InputUserClass to an existing user id, returning a
@@ -108,9 +108,7 @@ func (h *handlers) handleAddChatUser(r *mtproto.Request) (bin.Encoder, error) {
 	if !added {
 		return &tg.MessagesInvitedUsers{Updates: noUpdates()}, nil
 	}
-	for uid := range perOwner {
-		h.notify(r.Ctx, uid)
-	}
+	h.notifyOwners(r.Ctx, perOwner, 0)
 
 	ups, err := h.chatMembershipUpdates(r.Ctx, r.UserID, target, sender, perOwner)
 	if err != nil {
@@ -148,9 +146,7 @@ func (h *handlers) handleDeleteChatUser(r *mtproto.Request) (bin.Encoder, error)
 	if !removed {
 		return noUpdates(), nil
 	}
-	for uid := range perOwner {
-		h.notify(r.Ctx, uid)
-	}
+	h.notifyOwners(r.Ctx, perOwner, 0)
 
 	ups, err := h.chatMembershipUpdates(r.Ctx, r.UserID, target, sender, perOwner)
 	if err != nil {

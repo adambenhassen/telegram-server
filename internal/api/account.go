@@ -7,8 +7,8 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // authorizationTTLDays is the session lifetime advertised to clients in
@@ -105,7 +105,9 @@ func (h *handlers) handleUpdateStatus(r *mtproto.Request) (bin.Encoder, error) {
 		h.log.Error("update status", "user_id", r.UserID, "online", online, "err", err)
 		return nil, errInternal
 	}
-	if err := h.store.Notify(r.Ctx, store.ChannelStatus, store.StatusPayload(r.UserID, online)); err != nil {
+	notifyCtx, cancel := senderNotifyContext(r.Ctx)
+	defer cancel()
+	if err := h.store.Notify(notifyCtx, store.ChannelStatus, store.StatusPayload(r.UserID, online)); err != nil {
 		h.log.Error("notify status", "user_id", r.UserID, "err", err)
 	}
 	return &tg.BoolTrue{}, nil
@@ -113,18 +115,28 @@ func (h *handlers) handleUpdateStatus(r *mtproto.Request) (bin.Encoder, error) {
 
 // reservedUsernames is the blocklist of handles that must never be claimed.
 var reservedUsernames = map[string]bool{
-	"admin":    true,
-	"support":  true,
-	"help":     true,
-	"me":       true,
-	"settings": true,
-	"telegram": true,
-	"channel":  true,
-	"channels": true,
-	"bot":      true,
-	"bots":     true,
-	"login":    true,
-	"signup":   true,
+	"admin":            true,
+	"apiws":            true,
+	"backgrounds":      true,
+	"download":         true,
+	"hls":              true,
+	"hls_quality_file": true,
+	"hls_stream":       true,
+	"ping":             true,
+	"rtmp":             true,
+	"share":            true,
+	"support":          true,
+	"stream":           true,
+	"help":             true,
+	"me":               true,
+	"settings":         true,
+	"telegram":         true,
+	"channel":          true,
+	"channels":         true,
+	"bot":              true,
+	"bots":             true,
+	"login":            true,
+	"signup":           true,
 }
 
 func isReservedUsername(username string) bool {

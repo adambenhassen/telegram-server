@@ -1,0 +1,87 @@
+name: telegram-link-edge
+
+services:
+  linklanding:
+    build:
+      context: ../..
+      dockerfile: deploy/link-edge/Dockerfile
+      target: linklanding
+    image: telegram-linklanding:local
+    command: ["-listen-address", "0.0.0.0", "-port", "8082"]
+    ports:
+      - "127.0.0.1:8082:8082"
+    networks:
+      - private-edge
+      - landing-publish
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "65532:65532"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/linkprobe", "landing"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  selector:
+    build:
+      context: ../..
+      dockerfile: deploy/link-edge/Dockerfile
+      target: selector
+    image: telegram-linkselector:local
+    command:
+      - "-listen-address"
+      - "0.0.0.0"
+      - "-port"
+      - "8081"
+      - "-web-upstream"
+      - "http://web:8080"
+      - "-landing-upstream"
+      - "http://linklanding:8082"
+    ports:
+      - "127.0.0.1:8081:8081"
+    networks:
+      - web-edge
+      - private-edge
+    depends_on:
+      linklanding:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "65532:65532"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/linkprobe", "selector"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+networks:
+  web-edge:
+    name: telegram-web-edge-net
+    external: true
+  private-edge:
+    internal: true
+  landing-publish:
+    driver: bridge
+    internal: false
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"

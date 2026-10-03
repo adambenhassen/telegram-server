@@ -11,10 +11,11 @@ import (
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestMain(m *testing.M) {
@@ -137,6 +138,80 @@ func TestBuildUpdatesNewMessage(t *testing.T) {
 	st, ok := enc.(*tg.UpdatesState)
 	if !ok || st.Pts != 1 {
 		t.Fatalf("getState = %#v, want pts 1", enc)
+	}
+}
+
+func TestGetStateWithoutUpdateStatePreservesBaseline(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, dsn := openStoreDSN(t)
+	sender, err := s.CreateUser(ctx, "+15551290011")
+	if err != nil {
+		t.Fatalf("create sender: %v", err)
+	}
+	recipient, err := s.CreateUser(ctx, "+15551290012")
+	if err != nil {
+		t.Fatalf("create recipient: %v", err)
+	}
+	if _, _, _, _, err := s.SendMessage(ctx, sender.ID, recipient.ID, "unread", 90011, 0, 0); err != nil {
+		t.Fatalf("send message: %v", err)
+	}
+
+	differenceEnc, err := api.GetDifferenceForTest(s, recipient.ID, &tg.UpdatesGetDifferenceRequest{Pts: 0})
+	if err != nil {
+		t.Fatalf("get difference with update state: %v", err)
+	}
+	difference, ok := differenceEnc.(*tg.UpdatesDifference)
+	if !ok {
+		t.Fatalf("get difference with update state result = %T, want *tg.UpdatesDifference", differenceEnc)
+	}
+	if difference.State.Pts != 1 || difference.State.UnreadCount != 1 {
+		t.Fatalf("getDifference state = %+v, want pts=1 unread=1", difference.State)
+	}
+
+	dbConn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect to remove update state: %v", err)
+	}
+	t.Cleanup(func() { _ = dbConn.Close(context.Background()) }) //nolint:errcheck // teardown
+	if _, err := dbConn.Exec(ctx, `DELETE FROM update_state WHERE user_id = $1`, recipient.ID); err != nil {
+		t.Fatalf("remove update state: %v", err)
+	}
+
+	stateEnc, err := api.GetStateForTest(s, recipient.ID)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	state, ok := stateEnc.(*tg.UpdatesState)
+	if !ok {
+		t.Fatalf("get state result = %T, want *tg.UpdatesState", stateEnc)
+	}
+	if state.Pts != 0 || state.UnreadCount != 0 {
+		t.Fatalf("getState state = %+v, want pts=0 unread=0", state)
+	}
+
+	peerEnc, err := api.GetPeerDialogsForTest(s, recipient.ID, &tg.MessagesGetPeerDialogsRequest{
+		Peers: []tg.InputDialogPeerClass{
+			&tg.InputDialogPeer{Peer: api.InputPeerUser(recipient.ID, sender.ID)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("get peer dialogs: %v", err)
+	}
+	peerDialogs, ok := peerEnc.(*tg.MessagesPeerDialogs)
+	if !ok {
+		t.Fatalf("get peer dialogs result = %T, want *tg.MessagesPeerDialogs", peerEnc)
+	}
+	if peerDialogs.State.Pts != 0 || peerDialogs.State.UnreadCount != 1 {
+		t.Fatalf("getPeerDialogs state = %+v, want pts=0 unread=1", peerDialogs.State)
+	}
+
+	differenceEnc, err = api.GetDifferenceForTest(s, recipient.ID, &tg.UpdatesGetDifferenceRequest{Pts: 0})
+	if err != nil {
+		t.Fatalf("get difference without update state: %v", err)
+	}
+	if _, ok := differenceEnc.(*tg.UpdatesDifferenceEmpty); !ok {
+		t.Fatalf("get difference without update state result = %T, want *tg.UpdatesDifferenceEmpty", differenceEnc)
 	}
 }
 

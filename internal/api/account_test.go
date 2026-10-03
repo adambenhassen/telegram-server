@@ -12,8 +12,8 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestUpdateStatusRefusesUnauthenticated proves an unauthenticated caller
@@ -647,17 +647,25 @@ func TestUpdateUsernameReservedAll(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reserved := []string{
+	routeReserved := routeConflictingUsernameVariants()
+	reserved := make([]string, 0, 12+len(routeReserved))
+	reserved = append(reserved,
 		"admin", "support", "help", "me", "settings",
 		"telegram", "channel", "channels", "bot", "bots",
 		"login", "signup",
-	}
+	)
+	reserved = append(reserved, routeReserved...)
 	for _, r := range reserved {
 		_, err := api.UpdateUsernameForTest(s, user.ID, r)
 		if err == nil {
 			t.Errorf("reserved handle %q was accepted", r)
 		} else if !tgerr.Is(err, "USERNAME_INVALID") {
 			t.Errorf("reserved handle %q: got %v, want USERNAME_INVALID", r, err)
+		}
+		if _, found, err := s.UsernameByHandle(ctx, r); err != nil {
+			t.Errorf("lookup reserved handle %q: %v", r, err)
+		} else if found {
+			t.Errorf("reserved handle %q was stored", r)
 		}
 	}
 }

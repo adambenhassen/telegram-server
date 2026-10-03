@@ -70,6 +70,7 @@ WITH owned AS (
     FROM channel_messages cm
     WHERE cm.channel_id = ANY(sqlc.arg(channel_ids)::bigint[])
       AND cm.deleted = false
+      AND cm.action_type = 0
       AND cm.message_tsv @@ plainto_tsquery('simple', sqlc.arg(query))
       AND EXISTS (
           SELECT 1 FROM channel_participants cp

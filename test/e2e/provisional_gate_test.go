@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adambenhassen/telegram-server/internal/config"
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/config"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/session"
@@ -18,11 +18,11 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/api"
-	"github.com/adambenhassen/telegram-server/internal/blob"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/rsakey"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/api"
+	"github.com/teagramhq/teagram-server/internal/blob"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/rsakey"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // TestProvisionalGateProbe drives a real client whose auth key is bound to a
@@ -170,15 +170,15 @@ func TestProvisionalGateProbe(t *testing.T) {
 			t.Log("account.resetAuthorization blocked as expected")
 		}
 
-		// help.getNearestDc — not registered on the server (handled by fallback).
+		// help.getSupport is not registered on the server (handled by fallback).
 		// The handleUnknownGated fallback must still apply the gate and return
 		// AUTH_KEY_UNREGISTERED rather than INPUT_METHOD_INVALID.
-		if _, err := raw.HelpGetNearestDC(ctx); err == nil {
-			t.Error("help.getNearestDc: expected gate to reject, got success")
+		if _, err := raw.HelpGetSupport(ctx); err == nil {
+			t.Error("help.getSupport: expected gate to reject, got success")
 		} else if !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
-			t.Errorf("help.getNearestDc: err = %v, want AUTH_KEY_UNREGISTERED", err)
+			t.Errorf("help.getSupport: err = %v, want AUTH_KEY_UNREGISTERED", err)
 		} else {
-			t.Log("help.getNearestDc blocked as expected")
+			t.Log("help.getSupport blocked as expected")
 		}
 		return nil
 	}); err != nil {

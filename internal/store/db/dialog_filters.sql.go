@@ -158,6 +158,21 @@ func (q *Queries) DialogFilterChatMemberships(ctx context.Context, arg DialogFil
 	return items, nil
 }
 
+const dialogFilterDefaultsSeeded = `-- name: DialogFilterDefaultsSeeded :one
+SELECT EXISTS (
+    SELECT 1
+    FROM user_dialog_filter_state
+    WHERE owner_id = $1 AND defaults_seeded_at IS NOT NULL
+)
+`
+
+func (q *Queries) DialogFilterDefaultsSeeded(ctx context.Context, ownerID int64) (bool, error) {
+	row := q.db.QueryRow(ctx, dialogFilterDefaultsSeeded, ownerID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const dialogFilterExists = `-- name: DialogFilterExists :one
 SELECT EXISTS (
     SELECT 1 FROM user_dialog_filters
@@ -191,7 +206,7 @@ func (q *Queries) DialogFilterFolderCount(ctx context.Context, ownerID int64) (i
 }
 
 const dialogFilterState = `-- name: DialogFilterState :one
-SELECT owner_id, order_ids, changed_at
+SELECT owner_id, order_ids, changed_at, defaults_seeded_at
 FROM user_dialog_filter_state
 WHERE owner_id = $1
 `
@@ -199,12 +214,17 @@ WHERE owner_id = $1
 func (q *Queries) DialogFilterState(ctx context.Context, ownerID int64) (UserDialogFilterState, error) {
 	row := q.db.QueryRow(ctx, dialogFilterState, ownerID)
 	var i UserDialogFilterState
-	err := row.Scan(&i.OwnerID, &i.OrderIds, &i.ChangedAt)
+	err := row.Scan(
+		&i.OwnerID,
+		&i.OrderIds,
+		&i.ChangedAt,
+		&i.DefaultsSeededAt,
+	)
 	return i, err
 }
 
 const dialogFilterStateForUpdate = `-- name: DialogFilterStateForUpdate :one
-SELECT owner_id, order_ids, changed_at
+SELECT owner_id, order_ids, changed_at, defaults_seeded_at
 FROM user_dialog_filter_state
 WHERE owner_id = $1
 FOR UPDATE
@@ -213,7 +233,12 @@ FOR UPDATE
 func (q *Queries) DialogFilterStateForUpdate(ctx context.Context, ownerID int64) (UserDialogFilterState, error) {
 	row := q.db.QueryRow(ctx, dialogFilterStateForUpdate, ownerID)
 	var i UserDialogFilterState
-	err := row.Scan(&i.OwnerID, &i.OrderIds, &i.ChangedAt)
+	err := row.Scan(
+		&i.OwnerID,
+		&i.OrderIds,
+		&i.ChangedAt,
+		&i.DefaultsSeededAt,
+	)
 	return i, err
 }
 
@@ -225,6 +250,56 @@ ON CONFLICT (owner_id) DO NOTHING
 
 func (q *Queries) EnsureDialogFilterState(ctx context.Context, ownerID int64) error {
 	_, err := q.db.Exec(ctx, ensureDialogFilterState, ownerID)
+	return err
+}
+
+const insertDialogFilter = `-- name: InsertDialogFilter :exec
+INSERT INTO user_dialog_filters (
+    owner_id, filter_id, title, emoticon, color, contacts, non_contacts,
+    groups, broadcasts, bots, exclude_muted, exclude_read, exclude_archived,
+    title_noanimate
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7,
+    $8, $9, $10, $11, $12, $13,
+    $14
+)
+`
+
+type InsertDialogFilterParams struct {
+	OwnerID         int64
+	FilterID        int16
+	Title           string
+	Emoticon        string
+	Color           *int16
+	Contacts        bool
+	NonContacts     bool
+	Groups          bool
+	Broadcasts      bool
+	Bots            bool
+	ExcludeMuted    bool
+	ExcludeRead     bool
+	ExcludeArchived bool
+	TitleNoanimate  bool
+}
+
+func (q *Queries) InsertDialogFilter(ctx context.Context, arg InsertDialogFilterParams) error {
+	_, err := q.db.Exec(ctx, insertDialogFilter,
+		arg.OwnerID,
+		arg.FilterID,
+		arg.Title,
+		arg.Emoticon,
+		arg.Color,
+		arg.Contacts,
+		arg.NonContacts,
+		arg.Groups,
+		arg.Broadcasts,
+		arg.Bots,
+		arg.ExcludeMuted,
+		arg.ExcludeRead,
+		arg.ExcludeArchived,
+		arg.TitleNoanimate,
+	)
 	return err
 }
 
@@ -406,6 +481,17 @@ func (q *Queries) LockUpdateState(ctx context.Context, userID int64) (int64, err
 	var user_id int64
 	err := row.Scan(&user_id)
 	return user_id, err
+}
+
+const markDialogFilterDefaultsSeeded = `-- name: MarkDialogFilterDefaultsSeeded :exec
+UPDATE user_dialog_filter_state
+SET defaults_seeded_at = clock_timestamp()
+WHERE owner_id = $1 AND defaults_seeded_at IS NULL
+`
+
+func (q *Queries) MarkDialogFilterDefaultsSeeded(ctx context.Context, ownerID int64) error {
+	_, err := q.db.Exec(ctx, markDialogFilterDefaultsSeeded, ownerID)
+	return err
 }
 
 const notifyDialogFilterMutation = `-- name: NotifyDialogFilterMutation :exec

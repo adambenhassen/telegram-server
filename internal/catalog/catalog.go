@@ -326,8 +326,7 @@ func parseSource(raw []byte) ([]Entry, error) {
 		if err := validateValue(value); err != nil {
 			return nil, err
 		}
-		if hash := strings.LastIndexByte(key, '#'); hash >= 0 {
-			base, category := key[:hash], key[hash+1:]
+		if base, category, found := strings.CutLast(key, "#"); found {
 			if base == "" || !isPluralCategory(category) {
 				return nil, ErrMalformedPlural
 			}

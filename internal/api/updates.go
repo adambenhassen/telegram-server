@@ -10,9 +10,9 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // replySnippet returns a short preview of the quoted message text, truncated
@@ -118,16 +118,25 @@ func reactionsToTL(reactions []store.Reaction) tg.MessageReactions {
 	return mr
 }
 
-// channelMessageToTL maps a stored channel post to the wire message, the
-// channel counterpart of messageToTL. A channel keeps one row per post rather
-// than one per member, so Out is derived from the viewer here instead of being
-// read off the row, and the peer is always the channel.
+// channelMessageToTL maps a stored channel message to the wire message, the
+// channel counterpart of messageToTL. A channel keeps one row per message
+// rather than one per member, so Out is derived from the viewer here instead of
+// being read off the row, and the peer is always the channel.
 //
-// Channel posts carry no service actions in M7, so this always renders a
-// tg.Message. files is keyed by file id exactly as messageToTL's is, but the
-// "no media" sentinel differs and the trap is worth naming:
+// files is keyed by file id exactly as messageToTL's is, but the "no media"
+// sentinel differs and the trap is worth naming:
 // channel_messages.file_id is NULL for no media, while messages.file_id is 0.
-func channelMessageToTL(m store.ChannelMessage, viewerID int64, files map[int64]*tg.Document) *tg.Message {
+func channelMessageToTL(m store.ChannelMessage, viewerID int64, files map[int64]*tg.Document) tg.MessageClass {
+	if m.Action == store.ChannelMessageActionCreate {
+		return &tg.MessageService{
+			ID:     int(m.LocalID),
+			Out:    m.FromID == viewerID,
+			PeerID: &tg.PeerChannel{ChannelID: m.ChannelID},
+			FromID: &tg.PeerUser{UserID: m.FromID},
+			Date:   int(m.Date.Unix()),
+			Action: &tg.MessageActionChannelCreate{Title: m.Message},
+		}
+	}
 	msg := &tg.Message{
 		ID:      int(m.LocalID),
 		Out:     m.FromID == viewerID,
@@ -400,13 +409,18 @@ func (b updateBatch) above(fromPts int) []tg.UpdateClass {
 
 // buildUpdates hydrates userID's events after fromPts into wire updates plus the
 // referenced users and the state to advertise. It is the single delivery path
-// shared by updates.getDifference and real-time push.
+// shared by updates.getDifference and real-time push. Push envelopes omit the
+// unread total, so their caller leaves it out of the state read as well.
 //
 // State is read first, then events are bounded to (fromPts, state.pts], so the
 // advertised pts never runs past an event omitted from the response (events and
 // their pts bump commit atomically per owner).
-func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int) (updateBatch, error) {
-	state, err := h.store.State(ctx, userID)
+func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int, includeUnreadCount bool) (updateBatch, error) {
+	stateReader := h.store.StateWithoutUnread
+	if includeUnreadCount {
+		stateReader = h.store.State
+	}
+	state, err := stateReader(ctx, userID)
 	if err != nil {
 		return updateBatch{}, err
 	}
@@ -921,7 +935,7 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	if c != nil {
 		recovery = h.dialogFilterSync.Capture(c, r)
 	}
-	b, err := h.buildUpdates(r.Ctx, r.UserID, req.Pts)
+	b, err := h.buildUpdates(r.Ctx, r.UserID, req.Pts, true)
 	if err != nil {
 		h.log.Error("get difference", "user_id", r.UserID, "err", err)
 		return nil, nil, errInternal

@@ -14,7 +14,7 @@ import (
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/transport"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 // The proxy-v2 half of "one silent peer must not hold up anyone else". Socket

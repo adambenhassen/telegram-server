@@ -10,9 +10,9 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/peerhash"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/peerhash"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 // Updater turns LISTEN/NOTIFY nudges into server-initiated pushes. It is the
@@ -214,7 +214,7 @@ func (u *Updater) Deliver(ctx context.Context, userID int64) {
 		}
 		acceptedAt, _ := store.NotificationAcceptedAt(ctx)
 		u.deliverAtSuppressed(ctx, userID, targets, func(fromPts int) (updateBatch, error) {
-			return u.h.buildUpdates(ctx, userID, fromPts)
+			return u.h.buildUpdates(ctx, userID, fromPts, false)
 		}, acceptedAt, suppressed)
 	}
 	if channelID, ok := store.ChannelMembershipUpdateFromContext(ctx); ok {

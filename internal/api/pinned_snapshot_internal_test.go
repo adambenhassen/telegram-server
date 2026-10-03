@@ -4,14 +4,15 @@ import (
 	"context"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/tg"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
-	"github.com/adambenhassen/telegram-server/internal/pgtest"
-	"github.com/adambenhassen/telegram-server/internal/store"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/pgtest"
+	"github.com/teagramhq/teagram-server/internal/store"
 )
 
 func TestDeliverPinnedKeepsOneChatPinSnapshotAcrossMembers(t *testing.T) {
@@ -27,7 +28,8 @@ func TestDeliverPinnedKeepsOneChatPinSnapshotAcrossMembers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
-			s, err := store.Open(ctx, pgtest.DSN(t), pgtest.EncKey(), store.WithoutBlobStore())
+			dsn := pgtest.DSN(t)
+			s, err := store.Open(ctx, dsn, pgtest.EncKey(), store.WithoutBlobStore())
 			if err != nil {
 				t.Fatalf("open store: %v", err)
 			}
@@ -104,6 +106,34 @@ func TestDeliverPinnedKeepsOneChatPinSnapshotAcrossMembers(t *testing.T) {
 			t.Cleanup(func() { registry.Remove(member.ID, memberConn) })
 
 			updater := NewUpdater(s, registry, nil, pgtest.PeerDeriver())
+			delivered := make(chan struct{}, 2)
+			_, stop, err := store.StartListener(ctx, dsn,
+				func(context.Context, int64) {},
+				func(context.Context, int64, int64) {},
+				func(context.Context, int64, int64) {},
+				func(context.Context, int64) {},
+				func(context.Context, int64, int64) {},
+				func(context.Context, int64, bool) {},
+				func(context.Context, int64, int) {},
+				func(context.Context, int64, int64, int64) {},
+				func(pushCtx context.Context, peerType store.PeerType, peerID int64, pinnedMsgID int32) {
+					updater.DeliverPinned(pushCtx, peerType, peerID, pinnedMsgID)
+					delivered <- struct{}{}
+				},
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("start pin listener: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := stop(); err != nil {
+					t.Errorf("stop pin listener: %v", err)
+				}
+			})
+			if err := store.WaitForNotificationListener(ctx, s, 1); err != nil {
+				t.Fatalf("wait for pin listener: %v", err)
+			}
+			rpcCtx, cancelRPC := context.WithCancel(ctx)
 			interleaved := false
 			updater.pinSnapshotHook = func() {
 				if interleaved {
@@ -120,15 +150,29 @@ func TestDeliverPinnedKeepsOneChatPinSnapshotAcrossMembers(t *testing.T) {
 				}
 			}
 
-			updater.DeliverPinned(ctx, store.PeerTypeChat, chat.ID, 0)
+			cancelRPC()
+			notifyPin := func(pinnedMsgID int32) {
+				t.Helper()
+				notifyCtx, cancelNotify := store.NotificationContext(rpcCtx)
+				defer cancelNotify()
+				if err := s.Notify(notifyCtx, store.ChannelPinned, store.PinnedPayload(store.PeerTypeChat, chat.ID, pinnedMsgID)); err != nil {
+					t.Fatalf("notify pin after caller cancellation: %v", err)
+				}
+				select {
+				case <-delivered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("pin notification was not delivered")
+				}
+			}
+			notifyPin(firstPin)
 			if !interleaved {
 				t.Fatal("pin update did not interleave with recipient resolution")
 			}
 
 			assertPinnedSnapshotDelivery(t, s, creatorKey, creatorTransport, 0, creator.ID, true, firstIDs, "first pinned text")
 			assertPinnedSnapshotDelivery(t, s, memberKey, memberTransport, 0, member.ID, true, firstIDs, "first pinned text")
-			updater.DeliverPinned(ctx, store.PeerTypeChat, chat.ID, 0)
 			if tc.unpin {
+				notifyPin(0)
 				assertPinnedSnapshotDelivery(t, s, creatorKey, creatorTransport, 1, creator.ID, false, nil, "")
 				assertPinnedSnapshotDelivery(t, s, memberKey, memberTransport, 1, member.ID, false, nil, "")
 				return
@@ -142,6 +186,7 @@ func TestDeliverPinnedKeepsOneChatPinSnapshotAcrossMembers(t *testing.T) {
 				}
 				secondIDs[userID] = localID
 			}
+			notifyPin(pinnedMessageID(t, second.LocalID))
 			assertPinnedSnapshotDelivery(t, s, creatorKey, creatorTransport, 1, creator.ID, true, secondIDs, "second pinned text")
 			assertPinnedSnapshotDelivery(t, s, memberKey, memberTransport, 1, member.ID, true, secondIDs, "second pinned text")
 		})

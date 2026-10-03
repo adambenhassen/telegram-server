@@ -7,7 +7,7 @@ import (
 
 	gotdsrp "github.com/gotd/td/crypto/srp"
 
-	"github.com/adambenhassen/telegram-server/internal/srp"
+	"github.com/teagramhq/teagram-server/internal/srp"
 )
 
 // newInput mirrors the KDF algo the server advertises: server-chosen salts and

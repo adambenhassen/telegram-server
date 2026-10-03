@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/adambenhassen/telegram-server/internal/catalog"
+	"github.com/teagramhq/teagram-server/internal/catalog"
 )
 
 // PublishOptions carries the reviewed execution identity and the test-only

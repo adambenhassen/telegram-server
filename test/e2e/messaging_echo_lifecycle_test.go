@@ -16,7 +16,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/adambenhassen/telegram-server/internal/mtproto"
+	"github.com/teagramhq/teagram-server/internal/mtproto"
 )
 
 const clientTeardownProbeEnv = "TELEGRAM_TEST_CLIENT_TEARDOWN_PROBE"

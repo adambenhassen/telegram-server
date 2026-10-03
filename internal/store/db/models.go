@@ -76,6 +76,7 @@ type ChannelMessage struct {
 	FileID       *int64
 	MessageTsv   interface{}
 	ReplyToMsgID *int32
+	ActionType   int16
 }
 
 type ChannelParticipant struct {
@@ -92,6 +93,21 @@ type ChannelPostMarker struct {
 	ChannelID  int64
 	UserID     int64
 	LastPostAt pgtype.Timestamptz
+}
+
+type ChannelPostSummary struct {
+	ChannelID int64
+	ScopeKind int16
+	AuthorID  int64
+	Depth     int16
+	Prefix    int64
+	LiveCount int64
+}
+
+type ChannelPostSummaryState struct {
+	ChannelID int64
+	Version   int16
+	Ready     bool
 }
 
 type ChannelReadState struct {
@@ -436,9 +452,10 @@ type UserDialogFilterPeer struct {
 }
 
 type UserDialogFilterState struct {
-	OwnerID   int64
-	OrderIds  []int16
-	ChangedAt pgtype.Timestamptz
+	OwnerID          int64
+	OrderIds         []int16
+	ChangedAt        pgtype.Timestamptz
+	DefaultsSeededAt pgtype.Timestamptz
 }
 
 type UserPassword struct {
