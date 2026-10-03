@@ -46,11 +46,11 @@ docker compose --env-file /dev/null --project-directory deploy/link-edge --file 
 Before changing Serve, verify the health checks and synthetic landing over
 `http://127.0.0.1:8081/` and `http://127.0.0.1:8082/syntheticname`; verify Web
 `/` through the selector. Confirm `docker port` reports only the loopback
-binding for landing and inspect `ss -ltn` for the 8082 listener:
+binding for landing and confirm the 8082 listener with `netstat`:
 
 ```sh
 docker port "$(docker compose --env-file /dev/null --project-directory deploy/link-edge --file deploy/link-edge/compose.yaml ps --quiet linklanding)" 8082/tcp
-ss -ltn 'sport = :8082'
+netstat -ltn | grep -w 8082
 ```
 
 Then change only the HTTPS `/` upstream to `http://127.0.0.1:8081` with the
