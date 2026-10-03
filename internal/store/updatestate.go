@@ -106,6 +106,34 @@ func (s *Store) StateWithoutUnread(ctx context.Context, userID int64) (State, er
 	return state, nil
 }
 
+// StateWithoutChannelUnread returns update state and the ordinary dialog unread
+// total. Difference recovery uses this to preserve 1:1 and group unread counts
+// without depending on channel summary readiness.
+func (s *Store) StateWithoutChannelUnread(ctx context.Context, userID int64) (State, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return State{}, fmt.Errorf("begin update state snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after commit
+	qtx := s.q.WithTx(tx)
+	state, _, err := readState(ctx, qtx, userID)
+	if err != nil {
+		return State{}, err
+	}
+	unread, err := qtx.BasicUnreadCountForOwner(ctx, userID)
+	if err != nil {
+		return State{}, fmt.Errorf("sum basic dialog unread: %w", err)
+	}
+	state.UnreadCount = int(unread)
+	if err = tx.Commit(ctx); err != nil {
+		return State{}, fmt.Errorf("commit update state snapshot: %w", err)
+	}
+	return state, nil
+}
+
 // State returns the user's current pts/seq/date and total unread count from one
 // snapshot. A user with no update_state row keeps the zero update state while
 // the dialog total is still calculated.

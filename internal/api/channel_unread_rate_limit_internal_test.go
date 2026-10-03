@@ -133,6 +133,9 @@ func TestGetDifferenceServesEventsAfterDialogUnreadBudgetIsExhausted(t *testing.
 	if len(difference.NewMessages) != 1 {
 		t.Fatalf("getDifference messages = %d, want 1: %+v", len(difference.NewMessages), difference.NewMessages)
 	}
+	if difference.State.UnreadCount != 1 {
+		t.Errorf("getDifference unread count = %d, want basic-dialog unread 1", difference.State.UnreadCount)
+	}
 	message, ok := difference.NewMessages[0].(*tg.Message)
 	if !ok || message.Message != "missed event" {
 		t.Fatalf("getDifference message = %#v, want missed event", difference.NewMessages[0])

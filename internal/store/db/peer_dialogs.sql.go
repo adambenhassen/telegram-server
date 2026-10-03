@@ -11,6 +11,21 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const basicUnreadCountForOwner = `-- name: BasicUnreadCountForOwner :one
+SELECT COALESCE(SUM(dialog.unread_count), 0)::bigint AS unread_count
+FROM dialogs AS dialog
+WHERE dialog.owner_id = $1::bigint
+`
+
+// BasicUnreadCountForOwner is used by getDifference, which must preserve
+// ordinary dialog unread state without depending on channel summary readiness.
+func (q *Queries) BasicUnreadCountForOwner(ctx context.Context, ownerID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, basicUnreadCountForOwner, ownerID)
+	var unread_count int64
+	err := row.Scan(&unread_count)
+	return unread_count, err
+}
+
 const chatParticipantsByChatIDs = `-- name: ChatParticipantsByChatIDs :many
 SELECT chat_id, user_id, inviter_id, date FROM chat_participants
 WHERE chat_id = ANY($1::bigint[])

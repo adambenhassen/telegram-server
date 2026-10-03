@@ -165,8 +165,8 @@ func TestGetStateWithoutUpdateStatePreservesBaseline(t *testing.T) {
 	if !ok {
 		t.Fatalf("get difference with update state result = %T, want *tg.UpdatesDifference", differenceEnc)
 	}
-	if difference.State.Pts != 1 || difference.State.UnreadCount != 0 {
-		t.Fatalf("getDifference state = %+v, want pts=1 unread=0", difference.State)
+	if difference.State.Pts != 1 || difference.State.UnreadCount != 1 {
+		t.Fatalf("getDifference state = %+v, want pts=1 unread=1", difference.State)
 	}
 
 	dbConn, err := pgx.Connect(ctx, dsn)

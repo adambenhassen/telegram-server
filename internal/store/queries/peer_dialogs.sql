@@ -128,3 +128,10 @@ SELECT ((
        (SELECT COUNT(*)::bigint
         FROM channel_unread
         WHERE channel_unread.total_live < channel_unread.author_live) AS corrupt_channel_count;
+
+-- BasicUnreadCountForOwner is used by getDifference, which must preserve
+-- ordinary dialog unread state without depending on channel summary readiness.
+-- name: BasicUnreadCountForOwner :one
+SELECT COALESCE(SUM(dialog.unread_count), 0)::bigint AS unread_count
+FROM dialogs AS dialog
+WHERE dialog.owner_id = sqlc.arg(owner_id)::bigint;

@@ -409,16 +409,16 @@ func (b updateBatch) above(fromPts int) []tg.UpdateClass {
 
 // buildUpdates hydrates userID's events after fromPts into wire updates plus the
 // referenced users and the state to advertise. It is the single delivery path
-// shared by updates.getDifference and real-time push. Push envelopes omit the
-// unread total, so their caller leaves it out of the state read as well.
+// shared by updates.getDifference and real-time push. Difference includes the
+// basic-dialog unread total; push omits unread totals to avoid account-wide reads.
 //
 // State is read first, then events are bounded to (fromPts, state.pts], so the
 // advertised pts never runs past an event omitted from the response (events and
 // their pts bump commit atomically per owner).
-func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int, includeUnreadCount bool) (updateBatch, error) {
+func (h *handlers) buildUpdates(ctx context.Context, userID int64, fromPts int, includeBasicUnreadCount bool) (updateBatch, error) {
 	stateReader := h.store.StateWithoutUnread
-	if includeUnreadCount {
-		stateReader = h.store.State
+	if includeBasicUnreadCount {
+		stateReader = h.store.StateWithoutChannelUnread
 	}
 	state, err := stateReader(ctx, userID)
 	if err != nil {
@@ -938,7 +938,7 @@ func (h *handlers) handleGetDifferenceForConn(c *mtproto.Conn, r *mtproto.Reques
 	if c != nil {
 		recovery = h.dialogFilterSync.Capture(c, r)
 	}
-	b, err := h.buildUpdates(r.Ctx, r.UserID, req.Pts, false)
+	b, err := h.buildUpdates(r.Ctx, r.UserID, req.Pts, true)
 	if err != nil {
 		h.log.Error("get difference", "user_id", r.UserID, "err", err)
 		return nil, nil, errInternal
